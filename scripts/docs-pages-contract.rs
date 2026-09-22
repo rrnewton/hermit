@@ -25,6 +25,10 @@ const RELEASE_PINS: &str = ".github/compatibility-site-releases.json";
 const PUBLISHER: &str = ".github/scripts/publish-compatibility-site.py";
 const LANDING_PAGE: &str = "docs/site/index.html";
 const PUBLICATION_STEP: &str = "Add reviewed compatibility website";
+const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
+const SERVED_REGISTRY_QUERY: &str =
+    "jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\"";
+const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\"";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
 const LANDING_WORDING: &str = "<strong>Compatibility snapshot:</strong>";
 
@@ -117,9 +121,146 @@ fn require_once(errors: &mut Vec<String>, scope: &str, source: &str, needle: &st
     }
 }
 
+fn checkout_steps(workflow: &str) -> Result<Vec<String>, String> {
+    let lines = workflow.lines().collect::<Vec<_>>();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            matches!(
+                line.trim(),
+                "- uses: actions/checkout@v4" | "uses: actions/checkout@v4"
+            )
+        })
+        .map(|(index, line)| {
+            let start = if line.trim_start().starts_with("- ") {
+                index
+            } else {
+                lines[..index]
+                    .iter()
+                    .rposition(|candidate| {
+                        indentation(candidate) + 2 == indentation(line)
+                            && candidate.trim_start().starts_with("- ")
+                    })
+                    .ok_or("checkout action is not inside a workflow step")?
+            };
+            let end = lines[start + 1..]
+                .iter()
+                .position(|candidate| {
+                    indentation(candidate) == indentation(lines[start])
+                        && candidate.trim_start().starts_with("- ")
+                })
+                .map_or(lines.len(), |offset| start + 1 + offset);
+            Ok(lines[start..end].join("\n"))
+        })
+        .collect()
+}
+
+fn require_checkout_input(
+    errors: &mut Vec<String>,
+    scope: &str,
+    step: &str,
+    key: &str,
+    value: &str,
+) {
+    let lines = step.lines().collect::<Vec<_>>();
+    let expected_indent = indentation(lines[0]) + 4;
+    let mappings = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| indentation(line) + 2 == expected_indent && line.trim() == "with:")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let input_range = mappings.first().map(|start| {
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.trim().is_empty() && indentation(line) + 2 <= expected_indent)
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        start + 1..end
+    });
+    let prefix = format!("{key}:");
+    let fields = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with(&prefix))
+        .collect::<Vec<_>>();
+    if fields.len() != 1
+        || mappings.len() != 1
+        || !input_range.is_some_and(|range| range.contains(&fields[0].0))
+        || indentation(fields[0].1) != expected_indent
+        || fields[0].1.trim() != format!("{key}: {value}")
+    {
+        errors.push(format!(
+            "{scope} must declare exactly one `{key}: {value}` checkout input"
+        ));
+    }
+}
+
 fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
-    require_once(&mut errors, "checkout history", workflow, "fetch-depth: 0");
+    match (
+        checkout_steps(workflow),
+        named_step(workflow, BUILDER_CHECKOUT_STEP),
+    ) {
+        (Ok(checkouts), Ok(builder)) => {
+            let primary = checkouts
+                .iter()
+                .filter(|step| **step != builder)
+                .collect::<Vec<_>>();
+            if checkouts.len() != 2 || primary.len() != 1 || !checkouts.contains(&builder) {
+                errors.push(
+                    "workflow requires exactly the source and reviewed-builder checkout steps"
+                        .into(),
+                );
+            } else {
+                for (scope, step) in [
+                    ("source checkout", primary[0]),
+                    ("reviewed-builder checkout", &builder),
+                ] {
+                    require_checkout_input(&mut errors, scope, step, "fetch-depth", "0");
+                    require_checkout_input(
+                        &mut errors,
+                        scope,
+                        step,
+                        "persist-credentials",
+                        "false",
+                    );
+                }
+                if primary[0].lines().any(|line| {
+                    ["repository:", "ref:", "path:"]
+                        .iter()
+                        .any(|key| line.trim_start().starts_with(key))
+                }) {
+                    errors.push(
+                        "source checkout must use the workflow repository, revision and root"
+                            .into(),
+                    );
+                }
+                require_checkout_input(
+                    &mut errors,
+                    "reviewed-builder checkout",
+                    &builder,
+                    "repository",
+                    "rrnewton/dev-hermit",
+                );
+                require_checkout_input(
+                    &mut errors,
+                    "reviewed-builder checkout",
+                    &builder,
+                    "ref",
+                    "${{ steps.website-source.outputs.parent_commit }}",
+                );
+                require_checkout_input(
+                    &mut errors,
+                    "reviewed-builder checkout",
+                    &builder,
+                    "path",
+                    "_website_source",
+                );
+            }
+        }
+        (Err(error), _) | (_, Err(error)) => errors.push(error),
+    }
     let step = match named_step(workflow, PUBLICATION_STEP) {
         Ok(step) => step,
         Err(error) => return Err(vec![error]),
@@ -209,6 +350,36 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         errors.push("all pinned archives must be extracted before finalization".into());
     }
 
+    // These queries inspect the served directory inventory. Registry selection
+    // and append-only-history validation still belong to the Python publisher.
+    for query in [SERVED_REGISTRY_QUERY, BOOTSTRAP_INVENTORY_QUERY] {
+        require_once(&mut errors, "served registry inventory", &shell, query);
+    }
+    for command in [
+        "python3 .github/scripts/publish-compatibility-site.py select-registry \\\n  \"${selection[@]}\" > \"$candidate\"",
+        "python3 .github/scripts/publish-compatibility-site.py validate-update \\\n  \"$candidate\" \"$pins\" . \"$previous\"",
+    ] {
+        require_once(&mut errors, "registry selection", &shell, command);
+    }
+    let selection = shell.find("publish-compatibility-site.py select-registry");
+    let update = shell.find("publish-compatibility-site.py validate-update");
+    if !matches!((selection, update, extract), (Some(left), Some(middle), Some(right)) if left < middle && middle < right)
+    {
+        errors.push(
+            "publisher registry selection and history validation must precede archive extraction"
+                .into(),
+        );
+    }
+    let other_steps = workflow.replacen(&step, "", 1);
+    let other_queries = shell
+        .replace(SERVED_REGISTRY_QUERY, "")
+        .replace(BOOTSTRAP_INVENTORY_QUERY, "");
+    if other_steps.contains("jq -e ") || other_queries.contains("jq -e ") {
+        errors.push(format!(
+            "workflow must delegate publication semantics to {PUBLISHER}; jq -e is only for the served directory inventory"
+        ));
+    }
+
     for forbidden in [
         "keep_files:",
         "git fetch origin gh-pages",
@@ -216,7 +387,6 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         "refs/heads/gh-pages",
         "cat > \"$publisher\"",
         "<<'PY'",
-        "jq -e '",
     ] {
         if workflow.contains(forbidden) {
             errors.push(format!(
@@ -707,6 +877,114 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
             &landing,
             "fetch-depth: 0",
         );
+    }
+
+    #[test]
+    fn each_checkout_requires_its_own_history_and_identity() {
+        let (workflow, landing) = actual();
+        for checkout in checkout_steps(&workflow).unwrap() {
+            for replacement in ["fetch-depth: 1", "fetch-depth: 0\n        fetch-depth: 1"] {
+                assert_rejected(
+                    &workflow.replacen(
+                        &checkout,
+                        &checkout.replacen("fetch-depth: 0", replacement, 1),
+                        1,
+                    ),
+                    &landing,
+                    "fetch-depth: 0",
+                );
+            }
+            assert_rejected(
+                &workflow.replacen(&checkout, &checkout.replacen("with:", "env:", 1), 1),
+                &landing,
+                "checkout input",
+            );
+        }
+        for (original, changed, diagnostic) in [
+            (
+                "repository: rrnewton/dev-hermit",
+                "repository: fixture/other",
+                "repository",
+            ),
+            (
+                "ref: ${{ steps.website-source.outputs.parent_commit }}",
+                "ref: main",
+                "ref:",
+            ),
+            ("path: _website_source", "path: elsewhere", "path:"),
+        ] {
+            assert_rejected(
+                &workflow.replacen(original, changed, 1),
+                &landing,
+                diagnostic,
+            );
+        }
+        let builder = named_step(&workflow, BUILDER_CHECKOUT_STEP).unwrap();
+        assert_rejected(
+            &workflow.replacen(&builder, "", 1),
+            &landing,
+            BUILDER_CHECKOUT_STEP,
+        );
+        assert_rejected(
+            &format!(
+                "{workflow}\n    - uses: actions/checkout@v4\n      with:\n        fetch-depth: 0\n"
+            ),
+            &landing,
+            "exactly the source and reviewed-builder checkout steps",
+        );
+        assert_rejected(
+            &workflow.replacen(
+                "    - uses: actions/checkout@v4",
+                "    - uses: actions/checkout@v4\n      with:\n        repository: fixture/other",
+                1,
+            ),
+            &landing,
+            "workflow repository",
+        );
+    }
+
+    #[test]
+    fn inventory_queries_cannot_replace_publisher_history_validation() {
+        let (workflow, landing) = actual();
+        let step = named_step(&workflow, PUBLICATION_STEP).unwrap();
+        for (original, changed, diagnostic) in [
+            (
+                "any(.[]; .name == \"releases.json\" and .type == \"file\")",
+                "true",
+                "served registry inventory",
+            ),
+            (
+                "--slurpfile pins \"$pins\"",
+                "--slurpfile pins \"$previous\"",
+                "served registry inventory",
+            ),
+            (
+                "publish-compatibility-site.py select-registry",
+                "publish-compatibility-site.py show-registry",
+                "registry selection",
+            ),
+            (
+                "publish-compatibility-site.py validate-update",
+                "publish-compatibility-site.py show-update",
+                "registry selection",
+            ),
+            (
+                "pins=\"$candidate\"",
+                "pins=\"$candidate\"\n        jq -e 'true' \"$pins\"",
+                "delegate publication semantics",
+            ),
+        ] {
+            let changed_step = step.replacen(original, changed, 1);
+            assert_ne!(
+                changed_step, step,
+                "opponent must mutate the actual publication step"
+            );
+            assert_rejected(
+                &workflow.replacen(&step, &changed_step, 1),
+                &landing,
+                diagnostic,
+            );
+        }
     }
 
     #[test]
