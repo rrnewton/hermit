@@ -15,6 +15,9 @@ use sha2::Sha256;
 
 use crate::runner::FailureClass;
 
+mod cell_verdict;
+pub use cell_verdict::cell_verdict_from_source;
+
 mod schema10;
 pub use schema10::*;
 
