@@ -5836,20 +5836,32 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
             .strip_prefix(PREFIX)
             .and_then(|rest| rest.split_once(&separator))
             .ok_or_else(|| format!("{tag} has an unsupported pinned-root transport"))?;
-        let words = forwarded.split_whitespace().collect::<Vec<_>>();
+        let mut words = forwarded.split_whitespace();
         let mut names = BTreeSet::new();
-        for pair in words.chunks(2) {
-            if pair.len() != 2
-                || pair[0] != "--env"
-                || !pair[1]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-                || !names.insert(pair[1])
-            {
-                return Err(format!("{tag} has an ambiguous pinned-root environment"));
+        let expected_proc_locks_runtime =
+            matches!(tag.as_str(), "e2e.manifest_c_programs" | "quick.e2e_verify");
+        let mut proc_locks_runtime = false;
+        while let Some(option) = words.next() {
+            match option {
+                "--env" => {
+                    let Some(name) = words.next() else {
+                        return Err(format!("{tag} has an ambiguous pinned-root environment"));
+                    };
+                    if !name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    }) || !names.insert(name)
+                    {
+                        return Err(format!("{tag} has an ambiguous pinned-root environment"));
+                    }
+                }
+                "--proc-locks-runtime" if expected_proc_locks_runtime && !proc_locks_runtime => {
+                    proc_locks_runtime = true;
+                }
+                _ => return Err(format!("{tag} has an ambiguous pinned-root environment")),
             }
         }
-        if payload != validate_plan::shell_quote(&guarded)
+        if proc_locks_runtime != expected_proc_locks_runtime
+            || payload != validate_plan::shell_quote(&guarded)
             || ["DAGRUN_TEST_COUNTS_PATH", "E2E_RESULT_ROOT", "E2E_RUN_ID"]
                 .iter()
                 .any(|name| !names.contains(name))
@@ -26266,6 +26278,33 @@ mod raw_census_publication_tests {
         assert_eq!(publishers.len(), 33);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
+            let expects_proc_locks_runtime = matches!(
+                step.tag().as_str(),
+                "e2e.manifest_c_programs" | "quick.e2e_verify"
+            );
+            assert_eq!(
+                step.cmd.matches(" --proc-locks-runtime ").count(),
+                usize::from(expects_proc_locks_runtime),
+                "{}",
+                step.tag()
+            );
+            if expects_proc_locks_runtime {
+                for command in [
+                    step.cmd.replace(" --proc-locks-runtime", ""),
+                    step.cmd.replace(
+                        " --proc-locks-runtime",
+                        " --proc-locks-runtime --proc-locks-runtime",
+                    ),
+                ] {
+                    let mut changed = step.clone();
+                    changed.cmd = command;
+                    assert!(
+                        normal_raw_result_path(&changed, "fixture-run").is_err(),
+                        "{} accepted a missing or duplicate proc-locks runtime",
+                        step.tag()
+                    );
+                }
+            }
             let expected_flag = match step
                 .manifest
                 .as_ref()
@@ -26344,6 +26383,19 @@ mod raw_census_publication_tests {
                 );
             }
         }
+        let mut wrong_tag = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_bin_c")
+            .unwrap()
+            .clone();
+        wrong_tag.cmd = wrong_tag
+            .cmd
+            .replacen(" -- bash -c ", " --proc-locks-runtime -- bash -c ", 1);
+        assert!(
+            normal_raw_result_path(&wrong_tag, "fixture-run").is_err(),
+            "an unrelated publisher accepted the proc-locks runtime option"
+        );
     }
 
     fn failed_publisher() -> (DagConfig, LaneResult, Vec<serde_json::Value>) {

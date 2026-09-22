@@ -376,7 +376,7 @@ PYEOF
         fi
         local wrapper_status=0
         HERMIT_NEXTEST_CPU_CONTROL=1 CARGO_PKG_NAME=suite \
-            NEXTEST_RUN_ID=self-test-nextest __NEXTEST_ATTEMPT=1 \
+            NEXTEST_RUN_ID=self-test-nextest NEXTEST_ATTEMPT=1 \
             HERMIT_NEXTEST_CPU_CONTROL_CWD="$PWD" \
             HERMIT_NEXTEST_CPU_CONTROL_SENTINEL=preserved \
             setsid "$cpu_wrapper" "$fixture_binary" --exact failure --nocapture \

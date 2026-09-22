@@ -106,10 +106,13 @@ fn is_checker_path(path: &str) -> bool {
 
 /// Checker entrypoints whose filenames do not match the repository conventions.
 ///
-/// Keep this exact rather than treating every `*-probe.rs` as a checker: most probes
-/// are tools, while `bisect-probe.rs --self-test` is the assertion-bearing entrypoint
-/// that `lint-checks` must run.
-const CHECKER_PATHS: &[&str] = &["scripts/bisect-probe.rs"];
+/// Keep this exact rather than treating every `*-probe.rs` or nested `check-*` as
+/// a checker: most probes are tools, while these assertion-bearing entrypoints
+/// are required to remain reachable from a real gate.
+const CHECKER_PATHS: &[&str] = &[
+    "ci/hermetic/check-image-provenance.rs",
+    "scripts/bisect-probe.rs",
+];
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
 const CHECKER_PREFIXES: &[&str] = &[
@@ -1334,6 +1337,10 @@ fn self_test() {
     assert!(
         is_checker_path("scripts/bisect-probe.rs"),
         "bisect-probe --self-test must stay in the checker population"
+    );
+    assert!(
+        is_checker_path("ci/hermetic/check-image-provenance.rs"),
+        "the nested hermetic image-provenance gate must stay in the checker population"
     );
     // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening the population to every
     // tracked executable under scripts/ and ci/ was measured 2026-08-26 at 32 checkers
