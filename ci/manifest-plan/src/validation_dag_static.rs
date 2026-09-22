@@ -216,7 +216,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
     ("test.regular_crates", 610),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
-    ("test.hermit_unit", 710),
+    // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
+    ("test.hermit_unit", 723),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     ("test.detcore_unit", 748),
@@ -224,7 +225,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel", 5),
     ("test.hermit_integration", 158),
     ("test.arbitrary_binaries", 4),
-    ("test.cli", 78),
+    ("test.cli", 79),
     ("test.liteinst_strict", 24),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 19),
@@ -234,7 +235,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.rr_suite_contract", 1),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     ("privileged-test.cli_kvm", 31),
-    ("test.cli_on_host", 78),
+    ("test.cli_on_host", 79),
     ("test.hermit_modes_on_host", 19),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 31),
@@ -247,7 +248,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 748),
     ("test.hermit_integration_on_host", 158),
-    ("test.hermit_unit_on_host", 710),
+    ("test.hermit_unit_on_host", 723),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
