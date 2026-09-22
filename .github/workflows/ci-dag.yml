@@ -60,6 +60,32 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # The scorecard self-test retains its complete historical corpus in the
+      # existing public ledger. Prepare only its pinned objects outside this
+      # source checkout; the test itself refuses missing data and never fetches.
+      - name: Prepare pinned scorecard self-test corpus
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          corpus_root="$(mktemp -d "$RUNNER_TEMP/scorecard-self-test-corpus.XXXXXX")"
+          timeout --foreground --kill-after=10s 120s bash -euo pipefail -s -- "$corpus_root" <<'CORPUS'
+          corpus_root=$1
+          corpus_commit=352c54f800e62426fe54bd58c9110e8d93d8daaf
+          archive_blob=c55b6e644a6f32aadfdea8fbbf76dfaddb20de3e
+          identity_blob=cc25483da6bf92e361a0a7596ba87ea33872eb15
+          git init --quiet "$corpus_root"
+          git -C "$corpus_root" remote add origin https://github.com/rrnewton/hermit_test_ledger.git
+          git -C "$corpus_root" config remote.origin.promisor true
+          git -C "$corpus_root" config remote.origin.partialclonefilter blob:none
+          git -C "$corpus_root" -c protocol.version=2 fetch --quiet --no-tags --depth=1 --filter=blob:none origin "$corpus_commit"
+          # Fetch only the two pinned fixture blobs before the no-fetch test begins.
+          for object in "$archive_blob" "$identity_blob"; do
+            git -C "$corpus_root" cat-file -e "$object^{blob}"
+            GIT_NO_LAZY_FETCH=1 git -C "$corpus_root" cat-file -e "$object^{blob}"
+          done
+          CORPUS
+          printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
       - name: Run portable lane as a DAG
         run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
 
