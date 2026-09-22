@@ -558,7 +558,7 @@ be large.
 For a minimally invasive interception trace:
 
 ```bash
-hermit --log=info run --strace-only -- PROGRAM
+hermit --log=info run --strace-only --unsafe-live-network -- PROGRAM
 ```
 
 `--strace-only` does not determinize execution. It exposes host `/tmp` and
@@ -643,15 +643,16 @@ hermit --log=info run --panic-on-unsupported-syscalls -- PROGRAM
 ```
 
 This option intentionally panics and is a diagnostic, not a production mode.
-Compare with `--strace-only` to determine whether interception or Hermit's
-deterministic model causes the failure. Reduce the command to a small reproducer
-before reporting an issue.
+Compare with `--strace-only --unsafe-live-network` to determine whether
+interception or Hermit's deterministic model causes the failure. Reduce the
+command to a small reproducer before reporting an issue.
 
 ### The Guest Hangs
 
 1. Run the command normally to confirm the program itself terminates.
 2. Try `--namespace-only` to test namespace setup without interception.
-3. Try `--strace-only` with `--log=info` to test basic interception.
+3. Try `--strace-only --unsafe-live-network` with `--log=info` to test basic
+   interception.
 4. Try `--no-sequentialize-threads --no-deterministic-io` to isolate scheduler
    and I/O modeling. This weakens determinism and is diagnostic only.
 5. Check whether PMU preemption was disabled. CPU-bound or `sched_yield` loops

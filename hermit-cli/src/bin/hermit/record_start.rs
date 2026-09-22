@@ -19,6 +19,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clap::Args;
+#[cfg(test)]
+use clap::Parser;
 use colored::Colorize;
 use hermit::Backend;
 use hermit::Context;
@@ -43,6 +45,9 @@ use super::container::IdentityGuard;
 use super::container::RunGuarded;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
+use super::container::isolate_replay_network;
+#[cfg(test)]
+use super::container::with_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -411,6 +416,18 @@ impl StartOpts {
         Ok((container, identity_guard))
     }
 
+    /// Build the physical container for full replay.
+    ///
+    /// Recording deliberately retains the controller's network namespace so it
+    /// can capture controlled live traffic. Replay adds an independent Linux
+    /// namespace boundary with loopback down; the shared trace engine is then
+    /// the only source of guest-visible external networking.
+    fn replay_container(&self) -> Result<(Container, IdentityGuard), Error> {
+        let (mut container, identity_guard) = self.configured_container()?;
+        isolate_replay_network(&mut container);
+        Ok((container, identity_guard))
+    }
+
     fn recording_container(
         &self,
         global: &GlobalOpts,
@@ -543,7 +560,7 @@ impl StartOpts {
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
         // Replay the recording.
-        let (mut replay_container, _replay_identity_guard) = self.configured_container()?;
+        let (mut replay_container, _replay_identity_guard) = self.replay_container()?;
         let replay = replay_container
             .run_guarded_at("record_verify.replay", || {
                 // Namespace init: arm the stop guards before anything else.
@@ -679,7 +696,7 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let mut gdb_watch = GdbClientWatch::spawn(gdb_client, gdbserver_port);
-        let (mut container, _identity_guard) = self.configured_container()?;
+        let (mut container, _identity_guard) = self.replay_container()?;
         let ran = container.run_guarded_at("record_verify_debug.replay", || {
             // Namespace init: arm the stop guards before anything else.
             crate::container::arm_container_init_guards()?;
@@ -703,6 +720,42 @@ impl StartOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_namespace_identity() -> Result<PathBuf, Error> {
+        Ok(fs::read_link("/proc/self/ns/net")?)
+    }
+
+    fn network_interfaces_and_loopback_flags() -> Result<(Vec<String>, String), Error> {
+        let mut interfaces = fs::read_dir("/sys/class/net")?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        interfaces.sort();
+        let flags = fs::read_to_string("/sys/class/net/lo/flags")?;
+        Ok((interfaces, flags))
+    }
+
+    #[test]
+    fn full_record_keeps_the_controller_network_namespace() {
+        let options = start_options(Vec::new());
+        let global = GlobalOpts::parse_from(["hermit"]);
+        let expected = network_namespace_identity().unwrap();
+        let (mut container, _identity_guard) = options.recording_container(&global).unwrap();
+        let observed = with_container(&mut container, network_namespace_identity).unwrap();
+        assert_eq!(
+            observed, expected,
+            "recording must retain controlled live networking for capture"
+        );
+    }
+
+    #[test]
+    fn immediate_full_replay_has_only_down_loopback() {
+        let options = start_options(Vec::new());
+        let (mut container, _identity_guard) = options.replay_container().unwrap();
+        let (interfaces, flags) =
+            with_container(&mut container, network_interfaces_and_loopback_flags).unwrap();
+        assert_eq!(interfaces, ["lo"]);
+        assert_eq!(flags.trim(), "0x8", "replay loopback must remain down");
+    }
 
     #[test]
     fn replay_report_is_published_before_success_is_announced() {

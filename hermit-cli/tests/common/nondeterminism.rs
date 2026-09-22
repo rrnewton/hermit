@@ -91,6 +91,7 @@ impl<'a> NondeterminismCase<'a> {
             let output = self.run_noop_passthrough(&[
                 "run",
                 "--strace-only",
+                "--unsafe-live-network",
                 "--verify",
                 "--allow-unsupported-syscalls",
                 "--",
