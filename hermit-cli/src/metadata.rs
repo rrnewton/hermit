@@ -9,9 +9,6 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -19,8 +16,6 @@ use detcore::BlockingMode;
 use detcore::network_replay::NetworkTracePublication;
 use detcore_model::config::Epoch;
 use detcore_model::config::MountInfoRootRewrite;
-use detcore_model::network_trace::MAX_NETWORK_TRACE_PAYLOAD_BYTES;
-use detcore_model::network_trace::NETWORK_TRACE_MAGIC;
 use detcore_model::network_trace::NETWORK_TRACE_VERSION_V2;
 use detcore_model::network_trace::NetworkTrace;
 use detcore_model::network_trace::NetworkTraceConfig;
@@ -184,9 +179,6 @@ const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x118;
 pub(crate) const NETWORK_TRACE_NAME: &str = "network.trace";
 /// Incomplete sidecar name, atomically renamed only after validation.
 pub(crate) const NETWORK_TRACE_PENDING_NAME: &str = ".network.trace.pending";
-const MAX_NETWORK_TRACE_FILE_BYTES: u64 =
-    MAX_NETWORK_TRACE_PAYLOAD_BYTES + NETWORK_TRACE_MAGIC.len() as u64 + 4 + 8;
-
 /// Whether the shared network engine captures or replays a full recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FullReplayPhase {
@@ -542,23 +534,14 @@ fn path_entry_exists(path: &Path) -> Result<bool, Error> {
 /// the tracer stops, validates its framed codec and epoch, and commits it with
 /// a no-replace rename. It never reopens the destination pathname.
 pub(crate) fn finalize_network_trace_recording(
-    mut publication: NetworkTracePublication,
+    publication: NetworkTracePublication,
     expected_epoch: Epoch,
 ) -> Result<NetworkTraceArtifact, Error> {
-    let file = publication.writer();
-    let file_metadata = file.metadata()?;
-    if !file_metadata.file_type().is_file() {
-        return Err(Error::msg("pending network trace is not a regular file"));
-    }
-    let length = file_metadata.len();
-    if length > MAX_NETWORK_TRACE_FILE_BYTES {
-        return Err(Error::msg(format!(
-            "network trace sidecar is too large: {length} bytes"
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut bytes)?;
+    let bytes =
+        detcore::network_replay::read_bounded_network_trace(publication.try_clone_writer()?)
+            .context("Failed to read bounded pending network trace")?;
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| Error::msg("pending network trace length does not fit u64"))?;
     let trace_epoch = match NetworkTrace::read_framed(bytes.as_slice())
         .context("Failed to validate recorded network trace sidecar")?
     {
@@ -593,7 +576,7 @@ pub(crate) fn finalize_network_trace_recording(
 /// checked here in the host namespace. Passing them through the Detcore config
 /// keeps replay from reopening a pathname after container setup.
 pub(crate) fn validate_network_trace_replay(
-    mut file: fs::File,
+    file: fs::File,
     metadata: &Metadata,
 ) -> Result<Vec<u8>, Error> {
     let artifact = metadata
@@ -606,18 +589,8 @@ pub(crate) fn validate_network_trace_replay(
             artifact.codec_version, NETWORK_TRACE_VERSION_V2
         )));
     }
-    let file_metadata = file.metadata()?;
-    if !file_metadata.file_type().is_file() {
-        return Err(Error::msg("network trace sidecar is not a regular file"));
-    }
-    let file_length = file_metadata.len();
-    if file_length > MAX_NETWORK_TRACE_FILE_BYTES {
-        return Err(Error::msg(format!(
-            "network trace sidecar is too large: {file_length} bytes"
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let bytes = detcore::network_replay::read_bounded_network_trace(file)
+        .context("Failed to read bounded network trace sidecar")?;
     let actual_length = u64::try_from(bytes.len())
         .map_err(|_| Error::msg("network trace sidecar length does not fit u64"))?;
     if actual_length != artifact.length {

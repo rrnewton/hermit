@@ -18,7 +18,6 @@ use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -408,6 +407,12 @@ pub struct RunOpts {
 
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
+
+    /// Whether clap sourced `--epoch` from the command line or HERMIT_EPOCH.
+    /// Populated by the top-level parser so guest arguments after `--` cannot
+    /// impersonate Hermit options.
+    #[clap(skip)]
+    epoch_source_explicit: bool,
 
     /// Require Hermit's deterministic defaults and reject incompatible opt-outs. Unsupported
     /// syscalls already fail closed in ordinary runs.
@@ -962,16 +967,6 @@ fn configure_command_network(command: &mut Command, mode: NetworkingMode) {
     }
 }
 
-fn epoch_was_explicit_on_command_line() -> bool {
-    std::env::var_os("HERMIT_EPOCH").is_some()
-        || std::env::args_os().any(|argument| {
-            argument == OsStr::new("--epoch")
-                || argument
-                    .to_str()
-                    .is_some_and(|argument| argument.starts_with("--epoch="))
-        })
-}
-
 fn trace_epoch(trace: &NetworkTrace) -> Epoch {
     match trace {
         NetworkTrace::V1(trace) => trace.epoch,
@@ -1477,21 +1472,35 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
     }
 }
 
+#[cfg(test)]
+fn use_fixed_test_epoch(options: &mut RunOpts) {
+    options.det_opts.det_config.epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+    options.set_epoch_source_explicit(true);
+}
+
 #[test]
 fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
     let mut ro = RunOpts::parse_from(vec.iter());
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1 arg2"
+    );
 }
 
 #[test]
 fn backend_defaults_to_ptrace() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(ro.backend, None);
     assert_eq!(ro.selected_backend(), Backend::Ptrace);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -1505,10 +1514,12 @@ fn backend_values_parse_and_round_trip() {
         ("e9patch", Backend::E9patch),
     ] {
         let mut ro = RunOpts::parse_from(["fakehermit", "--backend", value, "fakeprog"]);
+        use_fixed_test_epoch(&mut ro);
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        let normalized = format!(" --backend={value} -- fakeprog");
+        let normalized =
+            format!(" --backend={value} --epoch=2026-01-01T00:00:00+00:00 -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
     }
 }
@@ -2008,8 +2019,12 @@ fn display_runopts2() {
         "arg2",
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1 arg2"
+    );
 }
 
 #[test]
@@ -2035,29 +2050,42 @@ fn display_runopts3() {
 fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
     let mut ro = RunOpts::parse_from(vec.iter());
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1"
+    );
 }
 
 #[test]
 fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    use_fixed_test_epoch(&mut normal);
     normal.validate_args_with_perf_support(true).unwrap();
     assert!(normal.det_opts.det_config.panic_on_unsupported_syscalls);
     assert!(!normal.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", normal), " -- fakeprog");
+    assert_eq!(
+        format!("{}", normal),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 
     let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
+    use_fixed_test_epoch(&mut strict);
     strict.validate_args_with_perf_support(true).unwrap();
 
     assert!(strict.det_opts.det_config.sequentialize_threads);
     assert!(strict.det_opts.det_config.deterministic_io);
     assert!(!strict.det_opts.det_config.passthru_opt);
     assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
-    assert_eq!(format!("{}", strict), " -- fakeprog");
+    assert_eq!(
+        format!("{}", strict),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 
     let mut compatibility =
         RunOpts::parse_from(["fakehermit", "--allow-unsupported-syscalls", "fakeprog"]);
+    use_fixed_test_epoch(&mut compatibility);
     compatibility.validate_args_with_perf_support(true).unwrap();
     assert!(
         !compatibility
@@ -2067,7 +2095,7 @@ fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     );
     assert_eq!(
         format!("{}", compatibility),
-        " --allow-unsupported-syscalls -- fakeprog"
+        " --allow-unsupported-syscalls --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -2077,9 +2105,13 @@ fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
     assert!(!default.det_opts.det_config.panic_on_rcb_overshoot);
 
     let mut opts = RunOpts::parse_from(["fakehermit", "--panic-on-rbc-overshoot", "fakeprog"]);
+    use_fixed_test_epoch(&mut opts);
     opts.validate_args_with_perf_support(true).unwrap();
     assert!(opts.det_opts.det_config.panic_on_rcb_overshoot);
-    assert_eq!(format!("{}", opts), " --panic-on-rbc-overshoot -- fakeprog");
+    assert_eq!(
+        format!("{}", opts),
+        " --panic-on-rbc-overshoot --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -2090,12 +2122,13 @@ fn passthru_optimization_requires_explicit_compatibility_opt_out() {
         "--passthru-opt",
         "fakeprog",
     ]);
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
 
     assert!(ro.det_opts.det_config.passthru_opt);
     assert_eq!(
         format!("{}", ro),
-        " --allow-unsupported-syscalls --passthru-opt -- fakeprog"
+        " --allow-unsupported-syscalls --passthru-opt --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -2139,6 +2172,7 @@ fn timeslice_flags_parse_and_round_trip() {
         "--target-timeslice=20000",
         "fakeprog",
     ]);
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
 
     assert_eq!(
@@ -2152,7 +2186,7 @@ fn timeslice_flags_parse_and_round_trip() {
     let rendered = format!("{}", ro);
     assert_eq!(
         rendered,
-        " --max-timeslice=100000 --target-timeslice=20000 -- fakeprog"
+        " --epoch=2026-01-01T00:00:00+00:00 --max-timeslice=100000 --target-timeslice=20000 -- fakeprog"
     );
 
     let mut reparsed_args = vec!["fakehermit".to_owned()];
@@ -2172,10 +2206,14 @@ fn timeslice_flags_parse_and_round_trip() {
 #[test]
 fn skid_margin_override_parses_and_round_trips() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=500", "fakeprog"]);
+    use_fixed_test_epoch(&mut opts);
     opts.validate_args_with_perf_support(true).unwrap();
 
     assert_eq!(opts.skid_margin, Some(500));
-    assert_eq!(format!("{opts}"), " --skid-margin=500 -- fakeprog");
+    assert_eq!(
+        format!("{opts}"),
+        " --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -2205,24 +2243,29 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
         "--skid-margin=500",
         "fakeprog",
     ]);
+    use_fixed_test_epoch(&mut opts);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.skid_margin, Some(500));
     assert_eq!(
         format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 -- fakeprog"
+        " --backend=liteinst --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
 #[test]
 fn deprecated_preemption_timeout_alias_round_trips_canonically() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(true).unwrap();
 
     assert_eq!(
         ro.det_opts.det_config.max_timeslice,
         std::num::NonZeroU64::new(100_000)
     );
-    assert_eq!(format!("{}", ro), " --max-timeslice=100000 -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 --max-timeslice=100000 -- fakeprog"
+    );
 }
 
 #[test]
@@ -2230,10 +2273,14 @@ fn deprecated_preemption_timeout_disabled_values_round_trip_canonically() {
     for value in ["disabled", "0"] {
         let flag = format!("--preemption-timeout={value}");
         let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+        use_fixed_test_epoch(&mut ro);
         ro.validate_args_with_perf_support(true).unwrap();
 
         assert_eq!(ro.det_opts.det_config.max_timeslice, None);
-        assert_eq!(format!("{}", ro), " --max-timeslice=disabled -- fakeprog");
+        assert_eq!(
+            format!("{}", ro),
+            " --epoch=2026-01-01T00:00:00+00:00 --max-timeslice=disabled -- fakeprog"
+        );
     }
 }
 
@@ -2340,32 +2387,44 @@ fn strict_rejects_every_route_to_host_networking() {
 #[test]
 fn network_policies_parse_validate_and_render_canonically() {
     let mut denied = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    use_fixed_test_epoch(&mut denied);
     denied.validate_args_with_perf_support(true).unwrap();
     assert_eq!(denied.network, NetworkingMode::None);
     assert_eq!(
         denied.det_opts.det_config.network_trace,
         NetworkTraceConfig::deny()
     );
-    assert_eq!(format!("{denied}"), " -- fakeprog");
+    assert_eq!(
+        format!("{denied}"),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 
     let mut local = RunOpts::parse_from(["fakehermit", "--network=local", "fakeprog"]);
+    use_fixed_test_epoch(&mut local);
     local.validate_args_with_perf_support(true).unwrap();
     assert_eq!(local.network, NetworkingMode::Local);
     assert_eq!(
         local.det_opts.det_config.network_trace,
         NetworkTraceConfig::deny()
     );
-    assert_eq!(format!("{local}"), " --network=local -- fakeprog");
+    assert_eq!(
+        format!("{local}"),
+        " --network=local --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 
     for spelling in ["--network=host", "--unsafe-live-network"] {
         let mut live = RunOpts::parse_from(["fakehermit", spelling, "fakeprog"]);
+        use_fixed_test_epoch(&mut live);
         live.validate_args_with_perf_support(true).unwrap();
         assert_eq!(live.network, NetworkingMode::UnsafeHost);
         assert_eq!(
             live.det_opts.det_config.network_trace,
             NetworkTraceConfig::unsafe_live()
         );
-        assert_eq!(format!("{live}"), " --unsafe-live-network -- fakeprog");
+        assert_eq!(
+            format!("{live}"),
+            " --unsafe-live-network --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+        );
     }
 
     let mut record = RunOpts::parse_from([
@@ -2374,6 +2433,7 @@ fn network_policies_parse_validate_and_render_canonically() {
         "--record-networking=net trace",
         "fakeprog",
     ]);
+    use_fixed_test_epoch(&mut record);
     record.validate_args_with_perf_support(true).unwrap();
     assert_eq!(record.network, NetworkingMode::UnsafeHost);
     assert_eq!(
@@ -2382,20 +2442,34 @@ fn network_policies_parse_validate_and_render_canonically() {
     );
     assert_eq!(
         format!("{record}"),
-        " --record-networking='net trace' -- fakeprog"
+        " --record-networking='net trace' --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 
-    let mut replay =
-        RunOpts::parse_from(["fakehermit", "--replay-networking=net trace", "fakeprog"]);
+    let replay_directory = tempfile::tempdir().unwrap();
+    let replay_path = replay_directory.path().join("net trace");
+    detcore_model::network_trace::NetworkTraceV2 {
+        epoch: "2026-01-01T00:00:00Z".parse().unwrap(),
+        channels: Vec::new(),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+    }
+    .write_framed(File::create(&replay_path).unwrap())
+    .unwrap();
+    let replay_flag = format!("--replay-networking={}", replay_path.display());
+    let mut replay = RunOpts::parse_from(["fakehermit", &replay_flag, "fakeprog"]);
+    use_fixed_test_epoch(&mut replay);
     replay.validate_args_with_perf_support(true).unwrap();
     assert_eq!(replay.network, NetworkingMode::None);
     assert_eq!(
         replay.det_opts.det_config.network_trace,
-        NetworkTraceConfig::replay("net trace", None)
+        NetworkTraceConfig::replay(&replay_path, None)
     );
     assert_eq!(
         format!("{replay}"),
-        " --replay-networking='net trace' -- fakeprog"
+        format!(
+            " --replay-networking={} --epoch=2026-01-01T00:00:00+00:00 -- fakeprog",
+            shell_words::quote(&replay_path.to_string_lossy())
+        )
     );
 }
 
@@ -2558,6 +2632,7 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
         "--unsafe-live-network",
         "fakeprog",
     ]);
+    use_fixed_test_epoch(&mut opts);
     opts.validate_args_with_perf_support(true).unwrap();
 
     assert!(opts.no_namespace);
@@ -2567,7 +2642,7 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     assert!(opts.pin_threads);
     assert_eq!(
         format!("{}", opts),
-        " --unsafe-live-network --no-namespace --tmp=/tmp -- fakeprog"
+        " --unsafe-live-network --no-namespace --tmp=/tmp --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -2850,10 +2925,11 @@ fn strict_help_describes_compatibility_and_opt_outs() {
 #[test]
 fn display_runopts_without_perf_support() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
+    use_fixed_test_epoch(&mut ro);
     ro.validate_args_with_perf_support(false).unwrap();
     assert_eq!(
         format!("{}", ro),
-        " --max-timeslice=disabled -- fakeprog arg1"
+        " --epoch=2026-01-01T00:00:00+00:00 --max-timeslice=disabled -- fakeprog arg1"
     );
 }
 
@@ -3221,6 +3297,18 @@ fn restore_standard_fd_status_flags(before: [Option<libc::c_int>; VERIFY_RESTORE
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
+    pub(crate) fn set_epoch_source_explicit(&mut self, explicit: bool) {
+        self.epoch_source_explicit = explicit;
+    }
+
+    pub(crate) fn epoch_source_explicit(&self) -> bool {
+        self.epoch_source_explicit
+            || self.det_opts.det_config.epoch
+                != detcore_model::config::DEFAULT_EPOCH_STR
+                    .parse::<Epoch>()
+                    .expect("DEFAULT_EPOCH_STR must remain valid RFC3339")
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -3734,27 +3822,24 @@ impl RunOpts {
             ));
         }
 
+        let epoch_source_explicit = self.epoch_source_explicit();
         let config = &mut self.det_opts.det_config;
         config.network_trace = network_trace;
         let replay_epoch = if let Some(path) = &self.replay_networking {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-                .with_context(|| {
-                    format!(
-                        "failed to open network replay trace in the host namespace: {}",
-                        path.display()
-                    )
+            let bytes = detcore::network_replay::open_bounded_network_trace(path)
+                .map_err(|error| {
+                    network_policy_refusal(format!(
+                        "cannot read network replay trace {} as a bounded regular host file: {error}. \
+                         Provide an unmodified trace created by --record-networking",
+                        path.display(),
+                    ))
                 })?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            detcore::network_replay::replay_from_reader(std::io::Cursor::new(&bytes)).map_err(
-                |error| network_policy_refusal(format!("invalid network trace: {error}")),
-            )?;
             let trace =
                 NetworkTrace::read_framed(std::io::Cursor::new(&bytes)).map_err(|error| {
-                    network_policy_refusal(format!("invalid network trace: {error}"))
+                    network_policy_refusal(format!(
+                        "invalid network trace: {error}. Provide an unmodified trace created by \
+                         --record-networking"
+                    ))
                 })?;
             let epoch = trace_epoch(&trace);
             config.network_trace_input = Some(bytes);
@@ -3765,7 +3850,7 @@ impl RunOpts {
         };
         resolve_run_epoch(
             config,
-            epoch_was_explicit_on_command_line(),
+            epoch_source_explicit,
             replay_epoch,
             capture_current_epoch(),
         )?;

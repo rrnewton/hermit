@@ -22,6 +22,7 @@ use std::error::Error;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
@@ -29,6 +30,7 @@ use std::io::SeekFrom;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -36,6 +38,8 @@ use std::sync::atomic::Ordering;
 pub use chrono::DateTime;
 pub use chrono::Utc;
 use detcore_model::fd::OpenFileId;
+use detcore_model::network_trace::MAX_NETWORK_TRACE_PAYLOAD_BYTES;
+use detcore_model::network_trace::NETWORK_TRACE_MAGIC;
 use detcore_model::network_trace::NetworkAddressV1;
 use detcore_model::network_trace::NetworkAddressV2;
 use detcore_model::network_trace::NetworkAncillaryDataV2;
@@ -484,6 +488,57 @@ pub fn replay_from_reader_with_expected_epoch<R: Read>(
 ) -> Result<NetworkReplayEngine, NetworkReplayError> {
     let trace = NetworkTrace::read_framed(reader).map_err(NetworkReplayError::Codec)?;
     NetworkReplayEngine::replay_versioned_with_expected_epoch(trace, expected_epoch)
+}
+
+/// Largest complete framed trace accepted from a host resource.
+const MAX_NETWORK_TRACE_FILE_BYTES: u64 =
+    MAX_NETWORK_TRACE_PAYLOAD_BYTES + NETWORK_TRACE_MAGIC.len() as u64 + 4 + 8;
+
+/// Open a trace once in the host namespace and read it through that exact
+/// descriptor, refusing links, non-regular files, and over-sized inputs before
+/// the codec allocates its payload.
+pub fn open_bounded_network_trace(path: &Path) -> io::Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        // O_NONBLOCK makes opening a FIFO safe: fstat below then refuses it.
+        // Linux ignores this flag for regular files.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    read_bounded_network_trace(file)
+}
+
+/// Read one already-open network trace without trusting its pathname again.
+pub fn read_bounded_network_trace(mut file: File) -> io::Result<Vec<u8>> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "network trace is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_NETWORK_TRACE_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "network trace is too large: {} bytes (maximum {MAX_NETWORK_TRACE_FILE_BYTES})",
+                metadata.len()
+            ),
+        ));
+    }
+
+    // Recheck the bound while reading: a regular file may grow after fstat.
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.seek(SeekFrom::Start(0))?;
+    file.by_ref()
+        .take(MAX_NETWORK_TRACE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_NETWORK_TRACE_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("network trace grew beyond {MAX_NETWORK_TRACE_FILE_BYTES} bytes while reading"),
+        ));
+    }
+    Ok(bytes)
 }
 
 static PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2129,7 +2184,9 @@ impl From<NetworkTraceValidationError> for NetworkReplayError {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::io::Cursor;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
     use chrono::TimeZone;
@@ -2906,5 +2963,32 @@ mod tests {
             Err(NetworkReplayError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
         ));
         assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn bounded_trace_open_refuses_links_fifos_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.trace");
+        std::fs::write(&target, b"trace").unwrap();
+        let link = directory.path().join("link.trace");
+        symlink(&target, &link).unwrap();
+        assert!(open_bounded_network_trace(&link).is_err());
+
+        let fifo = directory.path().join("trace.fifo");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is a valid NUL-terminated pathname in a private directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let fifo_error = open_bounded_network_trace(&fifo).unwrap_err();
+        assert_eq!(fifo_error.kind(), io::ErrorKind::InvalidData);
+        assert!(fifo_error.to_string().contains("regular file"));
+
+        let oversized = directory.path().join("oversized.trace");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_NETWORK_TRACE_FILE_BYTES + 1)
+            .unwrap();
+        let size_error = open_bounded_network_trace(&oversized).unwrap_err();
+        assert_eq!(size_error.kind(), io::ErrorKind::InvalidData);
+        assert!(size_error.to_string().contains("too large"));
     }
 }
