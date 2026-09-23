@@ -101,13 +101,14 @@ const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 5;
 const RUNNER_STEP_OUTPUT_DIR: &str = "runner-profile";
 const PROMOTION_REPETITIONS: usize = 10;
-const REQUIRED_BUILD_TAGS: [&str; 10] = [
+const REQUIRED_BUILD_TAGS: [&str; 11] = [
     "pre.submodules",
     "pre.reverie_pin",
     "build.rust_scripts",
     "setup.manifest_plan",
     "setup.nextest",
     "gate.manifest",
+    "build.recorded_clocks",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -7475,12 +7476,34 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
         return Err("inherited journal seed differs from its actual logger record".into());
     }
     for failed in [None, Some("pre.submodules"), Some("pre.reverie_pin"),
-        Some("build.rust_scripts"), Some("gate.manifest")]
+        Some("build.rust_scripts"), Some("gate.manifest"), Some("build.recorded_clocks")]
     {
+        // The focused producer and workspace share every prerequisite. Keep
+        // both explicit roots even if their ordering edge is accidentally
+        // removed, so the delayed producer failure exposes an early consumer.
+        // The unrelated release branch may run concurrently in the full DAG;
+        // this control does not impose an ordering on that independent work.
+        let selected = if failed == Some("build.recorded_clocks") {
+            let mut tags = BTreeSet::new();
+            let mut pending = vec!["build.recorded_clocks".to_string(), "build.workspace".to_string()];
+            while let Some(tag) = pending.pop() {
+                let step = original.get(&tag)
+                    .ok_or_else(|| format!("focused prerequisite fixture lost {tag}"))?;
+                if tags.insert(tag) {
+                    pending.extend(step.deps.iter().cloned());
+                }
+            }
+            original.iter()
+                .filter(|(tag, _)| tags.contains(*tag))
+                .map(|(tag, step)| (tag.clone(), step.clone()))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            original.clone()
+        };
         let log = scratch.join(format!("prerequisites-{}", failed.unwrap_or("positive")));
         let fixture_results = scratch.join(format!("prerequisites-runner-{}", failed.unwrap_or("positive")));
         let mut fixture = canonical.clone();
-        fixture.steps = original.values().cloned().collect();
+        fixture.steps = selected.values().cloned().collect();
         for step in &mut fixture.steps {
             retain_required_build_dependencies(step, &required)?;
             let tag = step.tag();
@@ -7536,15 +7559,15 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             let mut pending = vec![failed.to_string()];
             while let Some(tag) = pending.pop() {
                 if expected.insert(tag.clone()) {
-                    pending.extend(original[&tag].deps.iter().cloned());
+                    pending.extend(selected[&tag].deps.iter().cloned());
                 }
             }
         } else {
             let execution = result?;
-            if execution.outcomes.len() != 10 || execution.outcomes.iter().any(|outcome| !outcome.ok) {
-                return Err("positive prerequisite fixture did not execute all ten nodes".into());
+            if execution.outcomes.len() != required.len() || execution.outcomes.iter().any(|outcome| !outcome.ok) {
+                return Err("positive prerequisite fixture did not execute every required build node".into());
             }
-            expected.extend(original.keys().cloned());
+            expected.extend(selected.keys().cloned());
         }
         let text = fs::read_to_string(&log)
             .map_err(|e| format!("cannot read prerequisite sentinels: {e}"))?;
@@ -7574,22 +7597,22 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
         }
         let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
         let skipped: BTreeSet<_> = skips.iter().filter_map(|row| row["step"].as_str()).collect();
-        let expected_skipped: BTreeSet<_> = original.keys()
+        let expected_skipped: BTreeSet<_> = selected.keys()
             .map(String::as_str)
             .filter(|step| !expected.iter().any(|ended| ended == step))
             .collect();
         let accounted: BTreeSet<_> = ended.union(&skipped).copied().collect();
-        if ends.len() + skips.len() != original.len()
+        if ends.len() + skips.len() != selected.len()
             || skips.len() != expected_skipped.len()
             || skipped != expected_skipped
-            || accounted != original.keys().map(String::as_str).collect()
+            || accounted != selected.keys().map(String::as_str).collect()
             || skips.iter().any(|row| row["reason"] != "dependency_failed")
         {
             return Err(format!("isolated prerequisite fixture {failed:?} lost its skip accounting"));
         }
     }
-    println!("  prerequisite scheduler: ten-node positive and four failed-preflight controls retain exact execution identities");
-    println!("  prerequisite runner logs: all five fixtures preserve inherited journal/step bytes and restore the log directory");
+    println!("  prerequisite scheduler: eleven-node positive, four failed-preflight controls, and failed recorded-clock producer retain exact execution identities");
+    println!("  prerequisite runner logs: all six fixtures preserve inherited journal/step bytes and restore the log directory");
     Ok(())
 }
 
@@ -8852,6 +8875,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         "setup.manifest_plan",
         "gate.manifest",
         "setup.nextest",
+        "build.recorded_clocks",
         "build.workspace",
         "build.runtime_release",
         "build.e2e_artifact",
@@ -10749,6 +10773,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .collect();
     let recursive_metadata_tags = [
         "e2e.metadata",
+        "build.recorded_clocks",
         "build.workspace",
         "build.e2e_artifact",
     ];
@@ -11215,7 +11240,12 @@ fn self_test(root: &Path) -> Result<(), String> {
             "setup.manifest_plan" => BTreeSet::from(["build.rust_scripts"]),
             "gate.manifest" => BTreeSet::from(["setup.manifest_plan"]),
             "setup.nextest" => BTreeSet::from(["build.rust_scripts", "gate.manifest", "pre.reverie_pin"]),
-            "build.workspace" => BTreeSet::from(["gate.manifest", "pre.reverie_pin", "setup.nextest"]),
+            "build.recorded_clocks" => BTreeSet::from([
+                "gate.manifest", "pre.reverie_pin", "setup.manifest_plan", "setup.nextest",
+            ]),
+            "build.workspace" => BTreeSet::from([
+                "build.recorded_clocks", "gate.manifest", "pre.reverie_pin", "setup.nextest",
+            ]),
             "build.runtime_release" => BTreeSet::from(["gate.manifest", "pre.reverie_pin"]),
             "build.e2e_artifact" => BTreeSet::from([
                 "build.workspace", "build.runtime_release", "gate.manifest", "pre.reverie_pin",
@@ -11257,6 +11287,17 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot restore Nextest marker: {e}"))?;
     if !required_builds_complete(&batch_build_results, &green_batch_metadata) {
         return Err("restoring the Nextest marker did not restore completed batch setup".into());
+    }
+    let clocks_marker = build_marker(&batch_build_results, "build.recorded_clocks");
+    fs::remove_file(&clocks_marker)
+        .map_err(|e| format!("cannot remove recorded-clock producer marker: {e}"))?;
+    if required_builds_complete(&batch_build_results, &green_batch_metadata) {
+        return Err("otherwise complete batch setup accepted missing recorded-clock preparation".into());
+    }
+    fs::write(&clocks_marker, "ok\n")
+        .map_err(|e| format!("cannot restore recorded-clock producer marker: {e}"))?;
+    if !required_builds_complete(&batch_build_results, &green_batch_metadata) {
+        return Err("restoring the recorded-clock marker did not restore completed batch setup".into());
     }
     let green_batch_cell_count = green_batch_dag
         .steps

@@ -235,8 +235,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
     ("test.hermit_integration", 160),
-    // Three captured-clock integration cases plus the retained flock version gate.
-    ("test.recorded_clocks", 4),
+    // Three captured-clock integration cases, the retained flock version gate,
+    // and strict replay of the original exec-continuity and thread-order guests.
+    ("test.recorded_clocks", 6),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
@@ -262,7 +263,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 751),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 160),
-    ("test.recorded_clocks_on_host", 4),
+    ("test.recorded_clocks_on_host", 6),
     ("test.hermit_unit_on_host", 730),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
@@ -2414,14 +2415,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"recorded_clocks"########,
         desc: r########"Ptrace captured clocks and recording-version refusals"########,
-        description: r########"Four exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, and current/pre-flock version admission. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The 1-GiB scheduling baseline and 2-GiB hard memory cap are provisional conservative bounds for these four ptrace cases, not a measured peak; the node has a 300-second wall and 120-second aggregate CPU bound. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions."########,
+        description: r########"Six exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, current/pre-flock version admission, exec continuity, and thread clock ordering. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The aggregate 180-second CPU bound covers six 22-second attempts plus 48 seconds of provisional cleanup and orchestration headroom; failed historical attempts reached 24.011 CPU seconds during teardown. The 420-second wall bound covers six 57-second attempts, six 2-second grace periods, six 5-second hard-reap allowances, and 36 seconds of provisional orchestration headroom. These aggregate bounds and the unchanged 1-GiB scheduling baseline/2-GiB hard memory cap remain provisional, not measured six-case peaks. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
             r########"recorder-clock-focused"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E 'test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate)'"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E 'test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate) | test(=record_c_clock_exec_continuity) | test(=record_rs_clock_total_order)'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -2446,8 +2447,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
-        cpu_timeout: 120,
+        timeout: 420,
+        cpu_timeout: 180,
         jobs_flag: None,
         jobs_env: None,
     },
