@@ -145,6 +145,7 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 12] = [
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
+    "build.recorded_clocks",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -160,6 +161,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.detcore_misc",
     "test.detcore_parallel",
     "test.hermit_integration",
+    "test.recorded_clocks",
     "test.arbitrary_binaries",
     "test.cli",
     "test.isolated_dbt_workdir",
@@ -239,16 +241,21 @@ struct Profile {
 // full then gained one more step, and privileged and hosted-privileged one
 // each, for the privileged system-utils nodes: 271/272, 11/19 and 12/12
 // before.
+// build.recorded_clocks, build.recorded_clocks_in_pinned_root and
+// test.recorded_clocks add three steps to full (272/273 + 3 = 275/276) and
+// to portable (259/260 + 3 = 262/263), and build.recorded_clocks_on_host
+// and test.recorded_clocks_on_host add two to hosted-portable
+// (250/250 + 2 = 252/252).
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 272,
-        selected_steps: 273,
+        direct_steps: 275,
+        selected_steps: 276,
     },
     Profile {
         label: "portable",
-        direct_steps: 259,
-        selected_steps: 260,
+        direct_steps: 262,
+        selected_steps: 263,
     },
     Profile {
         label: "quick",
@@ -267,8 +274,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 250,
-        selected_steps: 250,
+        direct_steps: 252,
+        selected_steps: 252,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -716,10 +723,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
     // 16 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301).
-    if split.len() != 15 {
+    // https://github.com/rrnewton/hermit/issues/3301). test.recorded_clocks
+    // adds one root: 15 + 1 = 16.
+    if split.len() != 16 {
         return Err(format!(
-            "hosted test split has {} roots, expected 15",
+            "hosted test split has {} roots, expected 16",
             split.len()
         ));
     }
@@ -730,6 +738,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // Split the producer before closing over its shared downstream consumers,
     // so no hosted path retains a dependency on the local full producer.
     split.insert("build.workspace".into());
+    split.insert("build.recorded_clocks".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -754,10 +763,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         }
     }
     // 213 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301).
-    if split.len() != 212 {
+    // https://github.com/rrnewton/hermit/issues/3301). build.recorded_clocks
+    // and test.recorded_clocks add two nodes: 212 + 2 = 214.
+    if split.len() != 214 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 212",
+            "hosted test dependency closure has {} nodes, expected 214",
             split.len()
         ));
     }
@@ -1314,9 +1324,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 107 {
+    // test.recorded_clocks and its _on_host twin join main's 107: 107 + 2 = 109.
+    if expected.len() != 109 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 107",
+            "structured result producer registry has {} entries, expected 109",
             expected.len()
         ));
     }
@@ -1325,9 +1336,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 40 {
+    // test.recorded_clocks and its _on_host twin join main's 40: 40 + 2 = 42.
+    if expected_counts.len() != 42 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 40",
+            "Nextest expected-count registry has {} entries, expected 42",
             expected_counts.len()
         ));
     }
@@ -1451,7 +1463,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [69, 34, 2, 2] {
+    // test.recorded_clocks and its _on_host twin are two more Nextest
+    // producers: [69 + 2, 34, 2, 2].
+    if actual_group_counts != [71, 34, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1825,9 +1839,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
     // since check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes.
-    if cfg.steps.len() != 1608 {
+    // This commit's five recorder-clock steps make it 1608 + 5 = 1613.
+    if cfg.steps.len() != 1613 {
         return Err(format!(
-            "superset has {} steps, expected 1608",
+            "superset has {} steps, expected 1613",
             cfg.steps.len()
         ));
     }
@@ -3366,7 +3381,9 @@ sys.exit(37)
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
         // 250 since test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 250);
+        // build.recorded_clocks_on_host and test.recorded_clocks_on_host make
+        // it 250 + 2 = 252.
+        assert_eq!(selected.steps.len(), 252);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3397,6 +3414,7 @@ sys.exit(37)
             "hermit_unit",
             "ignored_syscall_regressions",
             "liteinst_strict",
+            "recorded_clocks",
             "regular_crates",
             "rr_suite_contract",
             "sabre_examples",
@@ -3417,6 +3435,7 @@ sys.exit(37)
             "build.e2e_artifact_on_host".into(),
             "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
+            "build.recorded_clocks_on_host".into(),
             "check.backend_parity_suites_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
@@ -3425,7 +3444,9 @@ sys.exit(37)
         ]);
         // 212 since test.dbt_parity_on_host was retired with its pinned twin
         // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(new_variants.len(), 212);
+        // build.recorded_clocks_on_host and test.recorded_clocks_on_host make
+        // it 212 + 2 = 214.
+        assert_eq!(new_variants.len(), 214);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3523,10 +3544,11 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 249 = the 250 hosted-portable direct steps since slice S13 of
-            // https://github.com/rrnewton/hermit/issues/3301, minus the one
-            // planted loss.
-            error.contains("hosted-portable label has 249 direct steps"),
+            // 251 = the 252 hosted-portable direct steps (250 since slice S13
+            // of https://github.com/rrnewton/hermit/issues/3301, plus
+            // build.recorded_clocks_on_host and test.recorded_clocks_on_host),
+            // minus the one planted loss.
+            error.contains("hosted-portable label has 251 direct steps"),
             "{error}"
         );
     }
@@ -3613,6 +3635,7 @@ sys.exit(37)
                     "test.detcore_parallel",
                     "test.detcore_unit",
                     "test.hermit_integration",
+                    "test.recorded_clocks",
                     "test.hermit_modes",
                     "test.hermit_unit",
                     "test.ignored_syscall_regressions",
