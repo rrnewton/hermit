@@ -142,7 +142,14 @@ impl RecordVersion {
 // recording/replay, even with virtualize_time=false; replaying an older stream
 // under the new projection could change guest control flow and event consumption.
 // Sysinfo remains determinized rather than gaining a recorded event.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11b);
+// 0x11b -> 0x11c: captured clock events retain output bytes even on EFAULT.
+// Older event variants remain structurally decodable, but their errno-only
+// clock failures cannot establish replay fidelity and are refused at admission.
+// Unlanded development heads of https://github.com/rrnewton/hermit/pull/3212
+// stamped 0x11b, 0x11a and, earlier, 0x117 on their clock-event schema. A
+// recording from one of those heads is not main's random-preadv 0x11a or
+// sysinfo-uptime 0x11b format; do not reinterpret that identity.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -167,7 +174,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
