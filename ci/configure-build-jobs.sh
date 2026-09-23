@@ -447,8 +447,17 @@ fi
 # changes; none changes these build inputs. Preserve CMAKE/CMAKE_GENERATOR,
 # the 16-job clamp, and the 1050 effective-job-second threshold. This is
 # source-identity carry, not new calibration or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ae1d1da78d2d89a1fa0454ee2282cf135e2286ed ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ae1d1da78d2d89a1fa0454ee2282cf135e2286ed (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c444c4ff15b6f5985082317e7c93b370e67571c1 (2026-09-23): relative to
+# ae1d1da78d2d89a1fa0454ee2282cf135e2286ed, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, the DynamoRIO vendor tree
+# remains 117d54d744df23921c531d0fe08537249f5a510a, and third-party/
+# remains tree fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. Reverie PR622
+# changes KVM capture handling; PR621 consumes LiteInst2 state descriptors.
+# Neither changes these build inputs. Preserve CMAKE/CMAKE_GENERATOR,
+# the 16-job clamp, and the 1050 effective-job-second threshold. This is
+# source-identity carry, not new calibration or runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c444c4ff15b6f5985082317e7c93b370e67571c1 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c444c4ff15b6f5985082317e7c93b370e67571c1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
