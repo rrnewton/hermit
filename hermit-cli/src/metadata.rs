@@ -131,7 +131,10 @@ impl RecordVersion {
 // events. Old event streams cannot be replayed under this routing.
 // 0x117 and 0x118 identify incompatible retained RNG, clock, and network
 // recordings from parallel development; do not reinterpret those identities.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x119);
+// 0x119 -> 0x11a: captured clock events retain output bytes even on EFAULT.
+// Older event variants remain structurally decodable, but their errno-only
+// clock failures cannot establish replay fidelity and are refused at admission.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -156,7 +159,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x119);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x119;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
