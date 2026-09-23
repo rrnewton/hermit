@@ -2946,7 +2946,7 @@ impl RunOpts {
         };
         global
             .write_controller_diagnostic(
-                format_args!("WARN hermit::virtual_time: {provenance}"),
+                format_args!("{provenance}"),
                 self.epoch_captured_from_host,
             )
             .with_context(|| format!("cannot write epoch provenance to {sink}"))
@@ -4338,11 +4338,11 @@ impl RunOpts {
     // Execution mode corresponding to `run --verify`:
     fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Verification redirects each physical run's diagnostics into private
-        // comparison logs. Emit invocation provenance once through the normal
-        // controller sink before installing either per-run subscriber, so a
-        // successful verification that discards those logs still leaves the
-        // exact replay epoch visible. This event is deliberately outside both
-        // compared streams and therefore cannot affect their equality.
+        // comparison logs. The caller emits invocation provenance once through
+        // the normal controller sink before entering verify(), so a successful
+        // verification that discards those logs still leaves the exact replay
+        // epoch visible. That event is deliberately outside both compared
+        // streams and therefore cannot affect their equality.
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
         // below (a run that fails to start, a rejected first-run status, a SaBRe
         // capture with zero DETLOG) return early without ever reaching

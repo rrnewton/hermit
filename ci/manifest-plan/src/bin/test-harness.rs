@@ -556,14 +556,15 @@ fn validate_args(command: &str, args: &Args) {
             || args.selection.backend.as_deref() != Some("sabre")
             || args.selection.include_manual
             || args.selection.include_occasional
-            || args.ci_only
+            || !args.ci_only
             || args.probe_disabled
             || args.parity_reference.is_some()
         {
             fail(
                 "--require-sabre-packaged-gate requires exactly --lane portable \
                  --category c-programs --test c-programs/add-key-enosys --mode verify \
-                 --backend sabre --prebuilt --jobs 1 without population or parity overrides",
+                 --backend sabre --prebuilt --jobs 1 --ci-only without manual, occasional, \
+                 probe, or parity overrides",
             );
         }
     }
@@ -2586,6 +2587,7 @@ mod tests {
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
+    use super::SABRE_PACKAGED_GATE_TEST;
     use super::VALIDATE_AUDIT_JOBS;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
@@ -2645,6 +2647,31 @@ mod tests {
 
     #[test]
     fn packaged_sabre_gate_requires_every_aggregate_and_execution_field() {
+        let args = parse(
+            [
+                "--lane",
+                "portable",
+                "--category",
+                "c-programs",
+                "--test",
+                SABRE_PACKAGED_GATE_TEST,
+                "--mode",
+                "verify",
+                "--backend",
+                "sabre",
+                "--prebuilt",
+                "--jobs",
+                "1",
+                "--ci-only",
+                "--require-sabre-packaged-gate",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        validate_args("run", &args);
+        assert!(args.ci_only);
+        assert!(args.require_sabre_packaged_gate);
+
         let valid = valid_sabre_packaged_path();
         assert!(validate_gate_path("PASS", &valid).is_ok());
         assert!(validate_gate_path("FAIL", &valid).is_err());

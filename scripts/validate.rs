@@ -270,6 +270,20 @@ fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
     let without_wrapper = after_rust_script_prefix
         .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
         .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?;
+    let mut hoisted_inventory = integration.clone();
+    hoisted_inventory.cmd = bracket_command_with_payload(
+        integration,
+        &format!(
+            "{RUST_SCRIPT_COMMAND_PREFIX}inventory=$(mktemp); \
+             {INTEGRATION_ARTIFACT_WRAPPER}{without_wrapper}"
+        ),
+    )?;
+    if hermit_integration_uses_published_artifact(&hoisted_inventory) {
+        return Err(
+            "full-plan bracket: inventory work hoisted outside the immutable artifact boundary was accepted"
+                .into(),
+        );
+    }
     let mut missing_wrapper = integration.clone();
     missing_wrapper.cmd = bracket_command_with_payload(
         integration,
@@ -5154,6 +5168,7 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         "test.applications_e2e".to_string(),
         "test.dbt_parity".to_string(),
         "test.envelope_levels".to_string(),
+        "test.sabre_manifest_c_gate".to_string(),
     ]);
     if non_nextest_test_nodes != expected_non_nextest {
         return Err(format!(
@@ -5169,6 +5184,10 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         (
             "tests/backend-parity/run_matrix.py",
             "DAGRUN_TEST_COUNTS_PATH",
+        ),
+        (
+            "ci/manifest-plan/src/bin/test-harness.rs",
+            "structured_test_results(&attempt_results)",
         ),
     ] {
         let source = std::fs::read_to_string(root.join(relative))
@@ -13540,6 +13559,32 @@ fn require_resolved_outer_timeout_headroom(
         .map_err(|error| format!("retry bounds: {tag} headroom is too large: {error}"))
 }
 
+fn require_resolved_outer_cpu_headroom(
+    tag: &str,
+    node_cpu_timeout_seconds: i64,
+    resolved_inner_cpu_seconds: u64,
+    attempts: u64,
+    resolved_context: &str,
+) -> Result<i64, String> {
+    let node_cpu_timeout_seconds = u64::try_from(node_cpu_timeout_seconds)
+        .map_err(|_| format!("retry bounds: {tag} has a nonpositive node CPU timeout"))?;
+    if attempts == 0 || resolved_inner_cpu_seconds == 0 {
+        return Err(format!(
+            "retry bounds: {tag} requires a positive attempt count and inner CPU bound"
+        ));
+    }
+    let required_seconds = attempts
+        .checked_mul(resolved_inner_cpu_seconds)
+        .ok_or_else(|| format!("retry bounds: {tag} CPU attempt allowance overflowed"))?;
+    if node_cpu_timeout_seconds <= required_seconds {
+        return Err(format!(
+            "retry bounds: {tag} has a {node_cpu_timeout_seconds}s node CPU timeout but {attempts} inner attempt(s) {resolved_context} can consume {required_seconds}s ({resolved_inner_cpu_seconds}s CPU each)"
+        ));
+    }
+    i64::try_from(node_cpu_timeout_seconds - required_seconds)
+        .map_err(|error| format!("retry bounds: {tag} CPU headroom is too large: {error}"))
+}
+
 // Decode the known pinned-root shell transport before inspecting the actual
 // harness argv. A filename or an outer-wrapper argument named --prebuilt must
 // never remove the fixture-preparation window from timeout accounting.
@@ -13575,7 +13620,7 @@ fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
     Ok(source.to_owned())
 }
 
-fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool), String> {
+fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool, bool), String> {
     let source = manifest_command_source(tag, command)?;
     let argv = shell_words::split(&source)
         .map_err(|error| format!("retry bounds: {tag} has invalid harness quoting: {error}"))?;
@@ -13588,6 +13633,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     }
     let mut selection = Selection::default();
     let mut prebuilt = false;
+    let mut require_sabre_packaged_gate = false;
     let mut parity_reference = None;
     let mut seen = BTreeSet::new();
     let mut index = 2;
@@ -13600,6 +13646,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
         match option.as_str() {
             "--ci-only" => selection.population = Some(Population::Required),
             "--prebuilt" => prebuilt = true,
+            "--require-sabre-packaged-gate" => require_sabre_packaged_gate = true,
             "--allow-empty" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--results"
             | "--junit" | "--jobs" | "--parity-reference" => {
@@ -13650,16 +13697,28 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     // run_cell_inner shares one execution deadline and remaining CPU budget
     // across candidate, reference, and comparison. Parity changes neither the
     // selection nor the prebuilt/non-prebuilt timeout-window accounting.
-    Ok((selection, prebuilt))
+    Ok((selection, prebuilt, require_sabre_packaged_gate))
 }
 
 #[cfg(test)]
 fn manifest_command_is_prebuilt(tag: &str, command: &str) -> Result<bool, String> {
-    manifest_command_policy(tag, command).map(|(_, prebuilt)| prebuilt)
+    manifest_command_policy(tag, command).map(|(_, prebuilt, _)| prebuilt)
 }
 
 fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
-    let (selection, prebuilt) = manifest_command_policy(&step.tag(), &step.cmd)?;
+    let tag = step.tag();
+    let (selection, prebuilt, require_sabre_packaged_gate) =
+        manifest_command_policy(&tag, &step.cmd)?;
+    if require_sabre_packaged_gate != (tag == "test.sabre_manifest_c_gate") {
+        return Err(format!(
+            "retry bounds: {tag} must {} --require-sabre-packaged-gate",
+            if tag == "test.sabre_manifest_c_gate" {
+                "include"
+            } else {
+                "not include"
+            }
+        ));
+    }
     if let Some(manifest) = &step.manifest {
         if selection.lane.as_deref() != Some(&manifest.lane)
             || selection.category.as_deref() != Some(&manifest.category)
@@ -13672,7 +13731,18 @@ fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
                 step.tag()
             ));
         }
-    } else if step.tag() != "quick.e2e_verify" {
+    } else if tag == "test.sabre_manifest_c_gate" {
+        if selection.lane.as_deref() != Some("portable")
+            || selection.category.as_deref() != Some("c-programs")
+            || selection.test.as_deref() != Some("c-programs/add-key-enosys")
+            || selection.mode.as_deref() != Some("verify")
+            || selection.backend.as_deref() != Some("sabre")
+        {
+            return Err(format!(
+                "retry bounds: {tag} changed its exact packaged SaBRe selector"
+            ));
+        }
+    } else if tag != "quick.e2e_verify" {
         return Err(format!(
             "retry bounds: manifest node {} lacks its execution selector",
             step.tag()
@@ -13739,6 +13809,47 @@ fn require_manifest_selection_headroom(
             timeout_multipliers.cpu,
             timeout_multipliers.wall,
             if prebuilt { "prebuilt" } else { "non-prebuilt" }
+        ),
+    )
+    .map(Some)
+}
+
+fn require_manifest_selection_cpu_headroom(
+    manifests: &ManifestSet,
+    tag: &str,
+    node_cpu_timeout_seconds: i64,
+    selection: &Selection,
+    timeout_multipliers: TimeoutMultipliers,
+    attempts: u64,
+) -> Result<Option<i64>, String> {
+    let cells = manifests
+        .select(selection)
+        .map_err(|error| format!("retry bounds: cannot select cells for {tag}: {error}"))?;
+    let mut largest_cpu_seconds = None;
+    for cell in &cells {
+        let resolved = resolved_cell_timeouts(cell, timeout_multipliers).map_err(|error| {
+            format!(
+                "retry bounds: cannot resolve effective timeouts for {tag} cell {:?}: {error}",
+                cell.id
+            )
+        })?;
+        largest_cpu_seconds = Some(
+            largest_cpu_seconds.map_or(resolved.cpu_seconds, |current: u64| {
+                current.max(resolved.cpu_seconds)
+            }),
+        );
+    }
+    let Some(largest_cpu_seconds) = largest_cpu_seconds else {
+        return Ok(None);
+    };
+    require_resolved_outer_cpu_headroom(
+        tag,
+        node_cpu_timeout_seconds,
+        largest_cpu_seconds,
+        attempts,
+        &format!(
+            "after CPU multiplier {} and wall multiplier {}",
+            timeout_multipliers.cpu, timeout_multipliers.wall
         ),
     )
     .map(Some)
@@ -13852,6 +13963,161 @@ mod nextest_timeout_tests {
             names[1].clone(): {"ignored": false, "filter-match": {"status": "matches"}}
         }});
         check(&duplicate, 1);
+    }
+
+    #[test]
+    fn hermit_integration_inventory_guard_pins_ignored_identities() {
+        let root = Path::new(file!()).parent().unwrap().parent().unwrap();
+        let config = validate_plan::validation_config(root).unwrap();
+        let mut filters = Vec::new();
+        for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
+            let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "165");
+            assert!(
+                step.cmd
+                    .contains("cmp -s ci/manifest-plan/hermit-integration-executed-tests.txt")
+            );
+            let mut words = shell_words::split(&step.cmd).unwrap();
+            for _ in 0..2 {
+                if words.iter().any(|word| word == "jq") {
+                    break;
+                }
+                let command = words
+                    .iter()
+                    .find(|word| word.contains("if ! jq -e "))
+                    .unwrap();
+                words = shell_words::split(command).unwrap();
+            }
+            let jq = words.iter().position(|word| word == "jq").unwrap();
+            assert_eq!(words[jq + 1], "-e");
+            assert_eq!(words[jq + 2], "--argjson");
+            assert_eq!(words[jq + 3], "expected");
+            filters.push(words[jq + 5].clone());
+        }
+        assert!(filters.iter().all(|filter| filter == &filters[0]));
+
+        let expected_executed_path =
+            root.join("ci/manifest-plan/hermit-integration-executed-tests.txt");
+        let expected_executed = std::fs::read_to_string(&expected_executed_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert_eq!(expected_executed.len(), 165);
+        assert!(expected_executed.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let ignored = [
+            (
+                "hermit::epoll_determinism",
+                "notification_control_syscalls_reach_strict_verify_l2",
+            ),
+            (
+                "hermit::epoll_determinism",
+                "pinned_root_arguments_are_exact_and_fail_closed",
+            ),
+            (
+                "hermit::python_stdlib",
+                "strict_python_stdlib_is_deterministic",
+            ),
+        ];
+        let mut suites = serde_json::Map::new();
+        for (suite, test) in ignored {
+            suites
+                .entry(suite)
+                .or_insert_with(|| serde_json::json!({"testcases": {}}))["testcases"][test] =
+                serde_json::json!({
+                    "ignored": true,
+                    "filter-match": {"status": "mismatch"}
+                });
+        }
+        for identity in &expected_executed {
+            let (suite, test) = identity.rsplit_once("::").unwrap();
+            suites
+                .entry(suite)
+                .or_insert_with(|| serde_json::json!({"testcases": {}}))["testcases"][test] =
+                serde_json::json!({
+                    "ignored": false,
+                    "filter-match": {"status": "matches"}
+                });
+        }
+        let inventory = serde_json::json!({"rust-suites": suites});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("inventory.json");
+        let actual_path = scratch.path().join("executed-tests.txt");
+        let check = |value: &serde_json::Value, expected_jq_status: i32, expected: bool| {
+            std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            let result = Command::new("jq")
+                .args(["-e", "--argjson", "expected", "165", &filters[0]])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(expected_jq_status),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let mut actual = value["rust-suites"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .flat_map(|(suite, suite_value)| {
+                    suite_value["testcases"]
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, test)| {
+                            test["filter-match"]["status"].as_str() == Some("matches")
+                        })
+                        .map(move |(test, _)| format!("{suite}::{test}"))
+                })
+                .collect::<Vec<_>>();
+            actual.sort();
+            std::fs::write(&actual_path, format!("{}\n", actual.join("\n"))).unwrap();
+            let exact_set = Command::new("cmp")
+                .args(["-s"])
+                .arg(&expected_executed_path)
+                .arg(&actual_path)
+                .status()
+                .unwrap();
+            assert_eq!(result.status.success() && exact_set.success(), expected);
+        };
+        check(&inventory, 0, true);
+
+        // Preserve all three aggregate counts while replacing one ignored test
+        // with a formerly required identity. The exact identity guard, rather
+        // than the counts, must reject this goalpost move.
+        let mut substituted = inventory.clone();
+        substituted["rust-suites"]["hermit::epoll_determinism"]["testcases"]
+            ["notification_control_syscalls_reach_strict_verify_l2"] = serde_json::json!({
+            "ignored": false,
+            "filter-match": {"status": "matches"}
+        });
+        let replacement = &expected_executed[0];
+        let (suite, test) = replacement.rsplit_once("::").unwrap();
+        substituted["rust-suites"][suite]["testcases"][test] = serde_json::json!({
+            "ignored": true,
+            "filter-match": {"status": "mismatch"}
+        });
+        check(&substituted, 1, false);
+
+        // Preserve all counts and every ignored identity while replacing one
+        // selected executable. The committed full-set guard must still refuse.
+        let mut replaced_executed = inventory.clone();
+        let replaced = &expected_executed[0];
+        let (suite, test) = replaced.rsplit_once("::").unwrap();
+        let cases = replaced_executed["rust-suites"][suite]["testcases"]
+            .as_object_mut()
+            .unwrap();
+        cases.remove(test).unwrap();
+        cases.insert(
+            "same_count_unreviewed_replacement".into(),
+            serde_json::json!({
+                "ignored": false,
+                "filter-match": {"status": "matches"}
+            }),
+        );
+        check(&replaced_executed, 0, false);
     }
 
     #[test]
@@ -13992,6 +14258,37 @@ mod nextest_timeout_tests {
             Some(1608),
             "prebuilt cells have no separate fixture-preparation wall window"
         );
+
+        let sabre_gate = validate_plan::validation_config(&root)
+            .unwrap()
+            .steps
+            .into_iter()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .expect("the committed packaged SaBRe gate is present");
+        let (sabre_selection, _) = manifest_step_policy(&sabre_gate).unwrap();
+        assert_eq!(
+            require_manifest_selection_cpu_headroom(
+                &manifests,
+                &sabre_gate.tag(),
+                sabre_gate.cpu_timeout,
+                &sabre_selection,
+                multipliers,
+                validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+            )
+            .unwrap(),
+            Some(4),
+            "the 60s outer CPU cap must derive from two ceil(22s * 1.25) attempts"
+        );
+        let error = require_manifest_selection_cpu_headroom(
+            &manifests,
+            &sabre_gate.tag(),
+            56,
+            &sabre_selection,
+            multipliers,
+            validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+        )
+        .expect_err("an outer CPU cap with no headroom must be refused");
+        assert!(error.contains("can consume 56s"), "{error}");
 
         for (invalid, expected) in [
             (
@@ -14197,10 +14494,16 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .iter()
             .filter(|step| step.cmd.contains("target/debug/test-harness run "))
             .collect::<Vec<_>>();
-        assert_eq!(steps.len(), 33);
+        // 33 manifest-backed execution nodes plus the exact packaged SaBRe
+        // sentinel, whose selector is intentionally enforced by policy rather
+        // than represented as result-manifest ownership.
+        assert_eq!(steps.len(), 34);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
+            if step.tag() == "test.sabre_manifest_c_gate" {
+                continue;
+            }
             let selected = manifests
                 .select(&selection)
                 .unwrap()
@@ -14243,6 +14546,61 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
                 step.tag()
             );
         }
+        let sabre_gate = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap();
+        let (selection, prebuilt, require_sabre_packaged_gate) =
+            manifest_command_policy(&sabre_gate.tag(), &sabre_gate.cmd).unwrap();
+        assert_eq!(selection.population, Some(Population::Required));
+        assert!(prebuilt);
+        assert!(require_sabre_packaged_gate);
+        manifest_step_policy(sabre_gate).unwrap();
+
+        for (label, from, expected) in [
+            (
+                "missing required population",
+                " --ci-only",
+                "must select a named lane with --ci-only",
+            ),
+            (
+                "missing packaged-path assertion",
+                " --require-sabre-packaged-gate",
+                "must include --require-sabre-packaged-gate",
+            ),
+        ] {
+            let mut changed = sabre_gate.clone();
+            changed.cmd = changed.cmd.replacen(from, "", 1);
+            let error = manifest_step_policy(&changed)
+                .expect_err("a weakened packaged SaBRe gate must be refused");
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+        let mut duplicate_gate = sabre_gate.clone();
+        duplicate_gate.cmd = duplicate_gate.cmd.replacen(
+            " --require-sabre-packaged-gate",
+            " --require-sabre-packaged-gate --require-sabre-packaged-gate",
+            1,
+        );
+        let error = manifest_step_policy(&duplicate_gate)
+            .expect_err("a duplicate packaged-path assertion must be refused");
+        assert!(error.contains("supplies --require-sabre-packaged-gate more than once"));
+
+        let mut unrelated_gate = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_data_handling")
+            .unwrap()
+            .clone();
+        unrelated_gate.cmd = unrelated_gate.cmd.replacen(
+            " --ci-only",
+            " --ci-only --require-sabre-packaged-gate",
+            1,
+        );
+        let error = manifest_step_policy(&unrelated_gate)
+            .expect_err("an unrelated manifest node must not claim the SaBRe gate policy");
+        assert!(error.contains("must not include --require-sabre-packaged-gate"));
+
         let base = "target/debug/test-harness run --lane portable --ci-only";
         assert!(!manifest_command_is_prebuilt(
             "quoted-path",
@@ -14789,6 +15147,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map_err(|e| format!("retry bounds: cannot load E2E manifests: {e}"))?;
     let mut checked_manifest_nodes = 0usize;
     let mut tightest_manifest_headroom_s = i64::MAX;
+    let mut tightest_manifest_cpu_headroom_s = i64::MAX;
     let representative_multipliers = TimeoutMultipliers {
         cpu: 1.25,
         wall: 1.5,
@@ -14798,8 +15157,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     for filters in ["", " --mode verify --backend liteinst"] {
         for prebuilt_flag in ["", " --prebuilt"] {
             let command = format!("{parity_command}{filters}{prebuilt_flag}");
-            let (ordinary, ordinary_prebuilt) = manifest_command_policy("parity-control", &command)?;
-            let (parity, parity_prebuilt) = manifest_command_policy(
+            let (ordinary, ordinary_prebuilt, ordinary_sabre_gate) =
+                manifest_command_policy("parity-control", &command)?;
+            let (parity, parity_prebuilt, parity_sabre_gate) = manifest_command_policy(
                 "parity-control",
                 &format!("{command} --parity-reference ptrace"),
             )?;
@@ -14807,6 +15167,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             let parity_cells = manifests.select(&parity)?;
             if ordinary_cells.is_empty()
                 || ordinary_prebuilt != parity_prebuilt
+                || ordinary_sabre_gate
+                || parity_sabre_gate
                 || ordinary_cells.iter().map(|cell| &cell.id).collect::<Vec<_>>()
                     != parity_cells.iter().map(|cell| &cell.id).collect::<Vec<_>>()
             {
@@ -14852,10 +15214,29 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             checked_manifest_nodes += 1;
             tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
         }
+        if let Some(headroom_s) = require_manifest_selection_cpu_headroom(
+            &manifests,
+            &step.tag(),
+            step.cpu_timeout,
+            &selection,
+            effective_multipliers,
+            attempts,
+        )? {
+            tightest_manifest_cpu_headroom_s =
+                tightest_manifest_cpu_headroom_s.min(headroom_s);
+        }
         require_manifest_selection_headroom(
             &manifests, &step.tag(), step.timeout, &selection,
             representative_multipliers, prebuilt, attempts,
             MANIFEST_TERMINATION_GRACE_S as u64,
+        )?;
+        require_manifest_selection_cpu_headroom(
+            &manifests,
+            &step.tag(),
+            step.cpu_timeout,
+            &selection,
+            representative_multipliers,
+            attempts,
         )?;
     }
     let (quick_selection, quick_prebuilt) = manifest_step_policy(quick)?;
@@ -14951,6 +15332,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         || nextest_caps.first().copied() != Some(default_with_grace_s - NEXTEST_TERMINATION_GRACE_S)
         || tightest_nextest_headroom_s == i64::MAX
         || checked_manifest_nodes == 0
+        || tightest_manifest_cpu_headroom_s == i64::MAX
     {
         return Err(format!(
             "retry bounds: attempts={attempts}; default nextest cap including grace=\
@@ -14968,8 +15350,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
          enclosing nextest node; {checked_manifest_nodes} manifest node(s) fit both cell attempts \
          with their production prebuilt/non-prebuilt preparation and execution windows at CPU \
          {}x/wall {}x and representative CPU {}x/wall {}x, leaving at least \
-         {tightest_manifest_headroom_s}s at the configured multipliers; invalid, inverted, and \
-         oversized policies are refused",
+         {tightest_manifest_headroom_s}s wall and {tightest_manifest_cpu_headroom_s}s CPU at the \
+         configured multipliers; invalid, inverted, and oversized policies are refused",
         timeout_multipliers.cpu,
         timeout_multipliers.wall,
         representative_multipliers.cpu,

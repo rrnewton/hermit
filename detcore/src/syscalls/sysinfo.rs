@@ -53,6 +53,12 @@ fn logical_clock_ticks(
     boot: crate::types::LogicalTime,
     uptime_offset_seconds: u64,
 ) -> anyhow::Result<libc::clock_t> {
+    // The programmatic uptime offset can exceed every Linux ABI domain. Keep
+    // one explicit extreme-input policy across the three projections below:
+    // preserve their native ABI behavior (clock_t wraps, signed uptime clamps
+    // high, unsigned btime clamps low) rather than letting Rust arithmetic
+    // panic. These boundary values need not preserve btime + uptime == now;
+    // normal in-domain offsets retain that Linux relationship exactly.
     let elapsed_nanos = now
         .as_nanos()
         .checked_sub(boot.as_nanos())

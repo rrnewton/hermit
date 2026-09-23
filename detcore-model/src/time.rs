@@ -656,8 +656,9 @@ impl DetTime {
         self.rcbs
     }
 
-    /// Project deterministic logical time into a rough number of nanoseconds.
-    pub fn as_nanos(&self) -> LogicalTime {
+    /// Project deterministic logical time into a rough number of nanoseconds,
+    /// refusing a configured scale that cannot be represented by `LogicalTime`.
+    pub fn try_as_nanos(&self) -> anyhow::Result<LogicalTime> {
         // Note: these counts could be pre-collapsed into scalar within the DetTime
         // representation.  But currently we leave them separate for debuggability.
         let syscall_nanos = self
@@ -667,17 +668,40 @@ impl DetTime {
             || self.rcbs as f64 * NANOS_PER_RCB,
             |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
         );
+        let project = |name: &str, value: f64| {
+            if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 {
+                anyhow::bail!(
+                    "local virtual-time {name} projection overflowed its unsigned nanosecond domain"
+                );
+            }
+            Ok(value as u64)
+        };
         let components = [
             self.extra_nanos,
-            (syscall_nanos as f64 * self.multiplier) as u64,
-            (rcb_nanos * self.multiplier) as u64,
-            (self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64,
+            project("syscall", syscall_nanos as f64 * self.multiplier)?,
+            project("RCB", rcb_nanos * self.multiplier)?,
+            project(
+                "nondeterministic-instruction",
+                self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier,
+            )?,
         ];
         let projected = components
             .into_iter()
             .try_fold(self.starting_nanos, u64::checked_add)
-            .expect("virtual time overflowed its unsigned nanosecond domain");
-        LogicalTime(projected)
+            .ok_or_else(|| {
+                anyhow::anyhow!("local virtual time overflowed its unsigned nanosecond domain")
+            })?;
+        Ok(LogicalTime(projected))
+    }
+
+    /// Infallible local projection for guest-side arithmetic.
+    ///
+    /// RPC admission uses [`Self::try_as_nanos`] and turns an unrepresentable
+    /// projection into a run-terminal backend failure. Saturating here keeps a
+    /// guest-side diagnostic or deadline calculation from panicking before the
+    /// authoritative RPC boundary can publish that failure.
+    pub fn as_nanos(&self) -> LogicalTime {
+        self.try_as_nanos().unwrap_or(LogicalTime::MAX)
     }
 
     /// Same as as_nanos but without the starting time.
@@ -762,6 +786,21 @@ mod rcb_multiplier_tests {
         time.add_rcbs(5);
         assert_eq!(time.rcbs(), 15);
         assert_eq!(time.as_nanos(), LogicalTime::from_nanos(100));
+
+        let config = Config {
+            clock_multiplier: Some(1e20),
+            ..Config::default()
+        };
+        let mut overflowing = DetTime::new(&config);
+        assert!(overflowing.try_as_nanos().is_ok());
+        overflowing.add_syscall();
+        let error = overflowing.try_as_nanos().unwrap_err().to_string();
+        assert!(error.contains("syscall projection overflowed"), "{error}");
+        assert_eq!(
+            overflowing.as_nanos(),
+            LogicalTime::MAX,
+            "guest-side projection must not panic before RPC admission can publish the terminal error"
+        );
     }
 }
 
@@ -814,7 +853,7 @@ impl GlobalTime {
         tid: DetTid,
         newtime: LogicalTime,
         inherited: LogicalDuration,
-    ) {
+    ) -> anyhow::Result<()> {
         if newtime < self.starting_nanos {
             panic!(
                 "update_global_time: Cannot set thread {} time to {}, which is before start of container execution {}",
@@ -833,8 +872,8 @@ impl GlobalTime {
             "[tid {}] ticked its global time component to {}",
             tid, newtime,
         );
-        if let Some(old) = self.time_vector.get_mut(&tid) {
-            if *old > newtime {
+        if let Some(old) = self.time_vector.get(&tid).copied() {
+            if old > newtime {
                 panic!(
                     "Attempted to update tid {} time to {}, but was already {}",
                     tid, newtime, old
@@ -845,18 +884,17 @@ impl GlobalTime {
                 .as_nanos()
                 .checked_sub(old.as_nanos())
                 .expect("checked thread clock update regressed");
-            *old = newtime;
+            let total = self.total_after(Duration::from_nanos(diff))?;
+            self.time_vector.insert(tid, newtime);
             // Exec may reload fresh local state. Its first response restores
             // the absolute clock, while this existing component retains the
             // original inherited baseline rather than charging that work again.
-            self.bump_total(Duration::from_nanos(diff));
+            self.total = total;
         } else {
             assert!(
                 inherited <= newtime,
                 "thread {tid} inherited time {inherited} beyond its local duration {newtime}"
             );
-            self.time_vector.insert(tid, newtime);
-            self.inherited_time.insert(tid, inherited);
             // A child's first startup RPC reports its inherited clock before
             // it has executed guest work. Its arrival must contribute zero,
             // whether it precedes or follows the scheduler's time snapshot.
@@ -864,28 +902,37 @@ impl GlobalTime {
                 .as_nanos()
                 .checked_sub(inherited.as_nanos())
                 .expect("checked inherited clock exceeded the child clock");
-            self.bump_total(Duration::from_nanos(own_time));
+            let total = self.total_after(Duration::from_nanos(own_time))?;
+            self.time_vector.insert(tid, newtime);
+            self.inherited_time.insert(tid, inherited);
+            self.total = total;
         }
+        self.sanity()?;
+        Ok(())
     }
 
-    fn sanity(&self) {
-        debug_assert_eq!(self.sum_up(), self.total);
+    fn sanity(&self) -> anyhow::Result<()> {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(self.sum_up()?, self.total);
+        Ok(())
     }
 
-    fn bump_total(&mut self, delta: Duration) {
-        let delta = u64::try_from(delta.as_nanos())
-            .expect("virtual-time progress exceeds the unsigned nanosecond domain");
-        self.total = LogicalTime::from_nanos(
-            self.total
-                .as_nanos()
-                .checked_add(delta)
-                .expect("global virtual time overflowed its unsigned nanosecond domain"),
-        );
-        self.sanity();
+    fn total_after(&self, delta: Duration) -> anyhow::Result<LogicalTime> {
+        let delta = u64::try_from(delta.as_nanos()).map_err(|_| {
+            anyhow::anyhow!("virtual-time progress exceeds the unsigned nanosecond domain")
+        })?;
+        self.total
+            .as_nanos()
+            .checked_add(delta)
+            .map(LogicalTime::from_nanos)
+            .ok_or_else(|| {
+                anyhow::anyhow!("global virtual time overflowed its unsigned nanosecond domain")
+            })
     }
 
     // The expensive way to get the total (internal)
-    fn sum_up(&self) -> LogicalTime {
+    #[cfg(debug_assertions)]
+    fn sum_up(&self) -> anyhow::Result<LogicalTime> {
         let mut sum = self.starting_nanos;
         for (tid, tm) in &self.time_vector {
             sum = LogicalTime::from_nanos(
@@ -895,20 +942,28 @@ impl GlobalTime {
                             .checked_sub(self.inherited_duration(*tid).as_nanos())
                             .expect("thread clock regressed before its inherited baseline"),
                     )
-                    .expect("global virtual time overflowed while summing thread progress"),
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "global virtual time overflowed while summing thread progress"
+                        )
+                    })?,
             );
         }
-        LogicalTime::from_nanos(
+        Ok(LogicalTime::from_nanos(
             sum.as_nanos()
                 .checked_add(self.extra_time.as_nanos())
-                .expect("global virtual time overflowed while summing scheduler progress"),
-        )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "global virtual time overflowed while summing scheduler progress"
+                    )
+                })?,
+        ))
     }
 
     /// Add time that passage is not driven by the internal events within guest threads.
     /// This is effectively used to account for "time" consumed by the scheduler, and to
     /// ensure monotonic increase of global time while scheduling.
-    pub fn add_scheduler_time(&mut self) -> LogicalTime {
+    pub fn add_scheduler_time(&mut self) -> anyhow::Result<LogicalTime> {
         let delta = Duration::from_nanos((NANOS_PER_SCHED * self.multiplier) as u64);
         self.add_extra_time(delta)
     }
@@ -919,29 +974,40 @@ impl GlobalTime {
     ///
     /// The argument is in nanosecods and should have had any clock multiplier
     /// applied alreday.
-    pub fn add_extra_time(&mut self, delta: Duration) -> LogicalTime {
-        let delta_nanos = u64::try_from(delta.as_nanos())
-            .expect("scheduler progress exceeds the unsigned nanosecond domain");
-        self.extra_time = LogicalTime::from_nanos(
+    pub fn add_extra_time(&mut self, delta: Duration) -> anyhow::Result<LogicalTime> {
+        let delta_nanos = u64::try_from(delta.as_nanos()).map_err(|_| {
+            anyhow::anyhow!("scheduler progress exceeds the unsigned nanosecond domain")
+        })?;
+        let extra_time = LogicalTime::from_nanos(
             self.extra_time
                 .as_nanos()
                 .checked_add(delta_nanos)
-                .expect("scheduler virtual time overflowed its unsigned nanosecond domain"),
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "scheduler virtual time overflowed its unsigned nanosecond domain"
+                    )
+                })?,
         );
-        // Update the cached total for efficiency:
-        self.bump_total(delta);
-        self.as_nanos()
+        let total = self.total_after(delta)?;
+        // Commit both projections together so an overflow cannot leave the
+        // cached aggregate and scheduler contribution inconsistent.
+        self.extra_time = extra_time;
+        self.total = total;
+        self.sanity()?;
+        Ok(self.as_nanos())
     }
 
     /// Project a thread's absolute local clock, including its inherited history
     /// and the epoch. Exec recovery and scheduler replay use this projection.
-    pub fn threads_time(&self, dtid: DetTid) -> LogicalTime {
-        LogicalTime::from_nanos(
+    pub fn threads_time(&self, dtid: DetTid) -> anyhow::Result<LogicalTime> {
+        Ok(LogicalTime::from_nanos(
             self.starting_nanos
                 .as_nanos()
                 .checked_add(self.threads_duration(dtid).as_nanos())
-                .expect("thread virtual time overflowed its unsigned nanosecond domain"),
-        )
+                .ok_or_else(|| {
+                    anyhow::anyhow!("thread virtual time overflowed its unsigned nanosecond domain")
+                })?,
+        ))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -958,29 +1024,46 @@ impl GlobalTime {
     ///
     /// Work previously performed by the old leader remains part of aggregate
     /// time, but no longer belongs to the new image's local thread clock.
-    pub fn reassign_thread(&mut self, from: DetTid, to: DetTid) {
+    pub fn reassign_thread(&mut self, from: DetTid, to: DetTid) -> anyhow::Result<()> {
         if from == to {
-            return;
+            return Ok(());
         }
 
-        let survivor_time = self
+        let survivor_time = *self
             .time_vector
-            .remove(&from)
+            .get(&from)
             .unwrap_or_else(|| panic!("cannot reassign missing thread clock {from}"));
-        let survivor_inherited = self.inherited_time.remove(&from).unwrap_or_default();
-        let retired_inherited = self.inherited_time.remove(&to).unwrap_or_default();
-        if let Some(retired_leader_time) = self.time_vector.remove(&to) {
+        let survivor_inherited = self.inherited_time.get(&from).copied().unwrap_or_default();
+        let retired_inherited = self.inherited_time.get(&to).copied().unwrap_or_default();
+        let extra_time = if let Some(retired_leader_time) = self.time_vector.get(&to).copied() {
             let retired_own_time = retired_leader_time
                 .as_nanos()
                 .checked_sub(retired_inherited.as_nanos())
                 .expect("retired leader clock regressed before its inherited baseline");
-            self.extra_time = self.extra_time + LogicalTime::from_nanos(retired_own_time);
-        }
+            LogicalTime::from_nanos(
+                self.extra_time
+                    .as_nanos()
+                    .checked_add(retired_own_time)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "scheduler virtual time overflowed while reassigning an exec survivor"
+                        )
+                    })?,
+            )
+        } else {
+            self.extra_time
+        };
+        self.time_vector.remove(&from);
+        self.inherited_time.remove(&from);
+        self.time_vector.remove(&to);
+        self.inherited_time.remove(&to);
+        self.extra_time = extra_time;
         self.time_vector.insert(to, survivor_time);
         self.inherited_time.insert(to, survivor_inherited);
-        self.sanity();
+        self.sanity()
     }
 
+    #[cfg(debug_assertions)]
     fn inherited_duration(&self, dtid: DetTid) -> LogicalDuration {
         self.inherited_time.get(&dtid).copied().unwrap_or_default()
     }
@@ -1024,7 +1107,8 @@ mod global_time_tests {
     use super::*;
 
     fn publish(time: &mut GlobalTime, tid: DetTid, clock: &DetTime) {
-        time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
+        time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos())
+            .unwrap();
     }
 
     #[test]
@@ -1062,9 +1146,9 @@ mod global_time_tests {
             LogicalTime::from_nanos(1),
         );
         assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::ZERO);
-        time.add_extra_time(Duration::from_nanos(1));
+        time.add_extra_time(Duration::from_nanos(1)).unwrap();
         assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::from_nanos(1));
-        time.add_extra_time(Duration::from_nanos(1));
+        time.add_extra_time(Duration::from_nanos(1)).unwrap();
         assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::from_nanos(2));
     }
 
@@ -1108,7 +1192,7 @@ mod global_time_tests {
         let mut time = GlobalTime::new(&config);
         let origin = time.as_nanos();
         let hundred_years = Duration::from_secs(100 * 365 * 24 * 60 * 60);
-        time.add_extra_time(hundred_years);
+        time.add_extra_time(hundred_years).unwrap();
 
         assert_eq!(origin, LogicalTime::from_nanos(max_epoch_nanos));
         assert_eq!(
@@ -1116,6 +1200,37 @@ mod global_time_tests {
             LogicalTime::ZERO + hundred_years
         );
         assert_eq!(time.as_nanos(), origin + hundred_years);
+
+        // The next representable boundary reports a typed error and commits
+        // neither half of the aggregate/scheduler update.
+        let config = Config::default();
+        let mut time = GlobalTime::new(&config);
+        let headroom = u64::MAX - time.as_nanos().as_nanos();
+        time.add_extra_time(Duration::from_nanos(headroom)).unwrap();
+        assert_eq!(time.as_nanos(), LogicalTime::MAX);
+
+        let extra_before = time.extra_time;
+        let error = time
+            .add_extra_time(Duration::from_nanos(1))
+            .expect_err("overflow must be an error, not a panic or saturation");
+        assert_eq!(
+            error.to_string(),
+            "global virtual time overflowed its unsigned nanosecond domain"
+        );
+        assert_eq!(time.as_nanos(), LogicalTime::MAX);
+        assert_eq!(time.extra_time, extra_before);
+
+        let tid = DetTid::from_raw(3);
+        let thread_time = DetTime::new(&config).as_nanos() + LogicalTime::from_nanos(1);
+        let error = time
+            .update_global_time(tid, thread_time, LogicalTime::ZERO)
+            .expect_err("thread progress beyond the aggregate domain must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "global virtual time overflowed its unsigned nanosecond domain"
+        );
+        assert!(!time.contains_thread(tid));
+        assert_eq!(time.as_nanos(), LogicalTime::MAX);
     }
 
     #[test]
@@ -1141,7 +1256,7 @@ mod global_time_tests {
         assert_eq!(child_clock.as_nanos(), root_clock.as_nanos());
         publish(&mut time, child, &child_clock);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(133));
-        assert_eq!(time.threads_time(child), child_clock.as_nanos());
+        assert_eq!(time.threads_time(child).unwrap(), child_clock.as_nanos());
         child_clock.add_syscall_with_cost(7);
         let mut split_rcbs = child_clock.clone();
         split_rcbs.add_rcbs_with_multiplier(1, RcbTimeMultiplier::from_f64(0.5));
@@ -1171,14 +1286,17 @@ mod global_time_tests {
         grandchild_clock.advance_to(grandchild_clock.as_nanos() + LogicalTime::from_nanos(1));
         publish(&mut time, grandchild, &grandchild_clock);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(245));
-        assert_eq!(time.threads_time(child), child_clock.as_nanos());
-        assert_eq!(time.threads_time(grandchild), grandchild_clock.as_nanos());
+        assert_eq!(time.threads_time(child).unwrap(), child_clock.as_nanos());
+        assert_eq!(
+            time.threads_time(grandchild).unwrap(),
+            grandchild_clock.as_nanos()
+        );
         assert_eq!(
             time.threads_duration(grandchild),
             LogicalTime::from_nanos(245)
         );
 
-        time.add_scheduler_time();
+        time.add_scheduler_time().unwrap();
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_000_245));
     }
 
@@ -1205,16 +1323,16 @@ mod global_time_tests {
         publish(&mut time, worker, &worker_clock);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_350));
 
-        time.reassign_thread(worker, leader);
+        time.reassign_thread(worker, leader).unwrap();
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_350));
-        assert_eq!(time.threads_time(leader), worker_clock.as_nanos());
+        assert_eq!(time.threads_time(leader).unwrap(), worker_clock.as_nanos());
         assert!(!time.contains_thread(worker));
 
         // An in-process backend reloads DetTime after exec and restores its
         // absolute clock from the RPC response. The global component must keep
         // the pre-exec baseline even though this fresh local field is zero.
         let mut reloaded = DetTime::new(&config);
-        reloaded.advance_to(time.threads_time(leader));
+        reloaded.advance_to(time.threads_time(leader).unwrap());
         assert_eq!(reloaded.inherited_nanos(), LogicalTime::ZERO);
         publish(&mut time, leader, &reloaded);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_350));
@@ -1222,9 +1340,9 @@ mod global_time_tests {
         publish(&mut time, leader, &reloaded);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_351));
         // A subsequent leader exec retains the same component and baseline.
-        time.reassign_thread(leader, leader);
+        time.reassign_thread(leader, leader).unwrap();
         let mut leader_reload = DetTime::new(&config);
-        leader_reload.advance_to(time.threads_time(leader));
+        leader_reload.advance_to(time.threads_time(leader).unwrap());
         publish(&mut time, leader, &leader_reload);
         assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_351));
         let mut after_exec = reloaded.clone_for_child();
@@ -1270,7 +1388,8 @@ mod global_time_tests {
             DetTid::from_raw(3),
             time.as_nanos(),
             LogicalTime::from_nanos(1),
-        );
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1282,14 +1401,16 @@ mod global_time_tests {
         let start = DetTime::new(&config).as_nanos();
         let leader_time = start + LogicalTime::from_nanos(100);
         let worker_time = start + LogicalTime::from_nanos(250);
-        time.update_global_time(leader, leader_time, LogicalTime::ZERO);
-        time.update_global_time(worker, worker_time, LogicalTime::ZERO);
+        time.update_global_time(leader, leader_time, LogicalTime::ZERO)
+            .unwrap();
+        time.update_global_time(worker, worker_time, LogicalTime::ZERO)
+            .unwrap();
         let total_before = time.as_nanos();
 
-        time.reassign_thread(worker, leader);
+        time.reassign_thread(worker, leader).unwrap();
 
         assert_eq!(time.as_nanos(), total_before);
-        assert_eq!(time.threads_time(leader), worker_time);
+        assert_eq!(time.threads_time(leader).unwrap(), worker_time);
         assert!(time.contains_thread(leader));
         assert!(!time.contains_thread(worker));
     }

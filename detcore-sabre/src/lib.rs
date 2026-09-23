@@ -368,6 +368,10 @@ impl Plugin {
 }
 
 fn coordinator_compatibility(expected: Option<&str>, ours: &str) -> Result<(), String> {
+    // Unguarded coordinators used to be accepted for compatibility. That is no
+    // longer safe: the same-width starting_micros -> starting_nanos wire change
+    // decodes successfully while changing the value by 1000x, so absence of a
+    // fingerprint must fail closed rather than silently mis-time the guest.
     match expected {
         Some(expected) if expected == ours => Ok(()),
         Some(expected) => Err(format!(

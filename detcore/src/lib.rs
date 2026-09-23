@@ -3544,11 +3544,13 @@ mod thread_cpu_time_tests {
             let mut global = GlobalTime::new(&config);
             let epoch = global.as_nanos();
             for thread in [&parent, &child] {
-                global.update_global_time(
-                    thread.dettid,
-                    thread.thread_logical_time.as_nanos(),
-                    thread.thread_logical_time.inherited_nanos(),
-                );
+                global
+                    .update_global_time(
+                        thread.dettid,
+                        thread.thread_logical_time.as_nanos(),
+                        thread.thread_logical_time.inherited_nanos(),
+                    )
+                    .unwrap();
             }
             assert_eq!(global.as_nanos(), epoch + LogicalTime::from_nanos(171));
         }

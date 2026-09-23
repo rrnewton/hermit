@@ -262,7 +262,14 @@ async fn backend_failure_completes_unstarted_daemon_without_aborting_it() {
     .expect("terminal startup must complete")
     .expect("daemon must not panic or be aborted");
     assert!(state.sched.lock().unwrap().started_up.try_read().is_none());
-    state.clean_up(false, &None).await;
+    assert!(
+        state
+            .clean_up(false, &None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Hermit terminal backend failure")
+    );
 }
 
 #[tokio::test]
@@ -294,7 +301,83 @@ async fn backend_failure_completes_registered_daemon_without_another_request() {
     .expect("daemon must not panic or be aborted");
     assert!(request.try_read().is_none());
     assert_eq!(state.sched.lock().unwrap().turn, 0);
-    state.clean_up(false, &None).await;
+    assert!(
+        state
+            .clean_up(false, &None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Hermit terminal backend failure")
+    );
+
+    // A user-selected multiplier can overflow a local clock before it reaches
+    // aggregate scheduler accounting. Both scheduler modes must accept the
+    // neighboring zero-progress projection, then turn the overflowing RPC into
+    // the same bounded terminal backend failure rather than panic or hang.
+    for sequentialize_threads in [false, true] {
+        let config = Config {
+            sequentialize_threads,
+            clock_multiplier: Some(1e20),
+            ..Config::default()
+        };
+        let mut state = GlobalState::initialize(&config, false);
+        let tid = DetTid::from_raw(17);
+        let process = DetPid::from_raw(17);
+        let mm = MmId::initial(process);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(tid, tid, true);
+        install_test_registration(&state, tid, Ivar::new());
+
+        let valid = tokio::time::timeout(
+            Duration::from_millis(100),
+            state.receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::GlobalTimeLowerBound,
+                ),
+            ),
+        )
+        .await
+        .expect("representable projection must complete without hanging");
+        assert!(matches!(valid.1, GlobalResponse::GlobalTimeLowerBound(_)));
+        assert!(!state.sched.lock().unwrap().backend_failed());
+
+        let mut overflowing = DetTime::new(&config);
+        overflowing.add_syscall();
+        assert!(overflowing.try_as_nanos().is_err());
+        let refused = tokio::time::timeout(
+            Duration::from_millis(100),
+            state.receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (overflowing, mm, GlobalRequest::GlobalTimeLowerBound),
+            ),
+        )
+        .await
+        .expect("overflowing projection must terminate without hanging");
+        assert_eq!(refused, (None, GlobalResponse::ThreadExited));
+        assert!(state.sched.lock().unwrap().backend_failed());
+        assert!(futures::poll!(std::pin::pin!(state.wait_for_backend_failure())).is_ready());
+
+        if let Some(handle) = state.sched_handle.take() {
+            tokio::time::timeout(Duration::from_millis(100), handle)
+                .await
+                .expect("terminal scheduler must complete")
+                .expect("terminal scheduler must not panic");
+        }
+        let error = state.clean_up(false, &None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Hermit terminal backend failure"),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]

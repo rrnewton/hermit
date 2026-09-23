@@ -761,10 +761,35 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    pub async fn clean_up(
+        mut self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let terminal_failure = self
+            .sched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .backend_failure_description();
+        if let Some(failure) = terminal_failure {
+            let cleanup = self.clean_up_after_backend_failure().await;
+            if let Err(error) = cleanup.scheduler {
+                return Err(anyhow::anyhow!(
+                    "Hermit terminal {failure}; scheduler cleanup failed: {error}"
+                ));
+            }
+            if let Err(error) = cleanup.preemption_recording {
+                return Err(anyhow::anyhow!(
+                    "Hermit terminal {failure}; preemption recording cleanup failed: {error}"
+                ));
+            }
+            anyhow::bail!("Hermit terminal {failure}");
+        }
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
-            handle.await.expect("Global scheduler clean shutdown");
+            handle.await.map_err(|error| {
+                anyhow::anyhow!("global scheduler failed during cleanup: {error}")
+            })?;
             debug!("Global state cleanup, continuing...");
         }
         let banner =
@@ -804,6 +829,7 @@ impl GlobalState {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
             }
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -936,7 +962,13 @@ impl GlobalTool for GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
-        let time_from_guest = guest_time.as_nanos();
+        let time_from_guest = match guest_time.try_as_nanos() {
+            Ok(time) => time,
+            Err(error) => {
+                self.report_virtual_time_failure(from, error);
+                return (None, R::ThreadExited);
+            }
+        };
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -972,6 +1004,7 @@ impl GlobalTool for GlobalState {
         // recorded by a successful non-leader exec. Hold the scheduler admission lock through
         // clock accounting so logical teardown cannot linearize between the two.
         let mut tombstoned_deregistration = None;
+        let mut virtual_time_error = None;
         {
             let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
             if exec_reconnect.is_none()
@@ -1046,12 +1079,17 @@ impl GlobalTool for GlobalState {
                 && exec_reconnect.is_none()
                 && !is_thread_reconnect
             {
-                self.global_time.lock().unwrap().update_global_time(
-                    dtid,
-                    time_from_guest,
-                    guest_time.inherited_nanos(),
-                );
+                virtual_time_error = self
+                    .global_time
+                    .lock()
+                    .unwrap()
+                    .update_global_time(dtid, time_from_guest, guest_time.inherited_nanos())
+                    .err();
             }
+        }
+        if let Some(error) = virtual_time_error {
+            self.report_virtual_time_failure(from, error);
+            return (None, R::ThreadExited);
         }
         if let Some(deregistration) = tombstoned_deregistration {
             self.recv_deregister_thread(from, deregistration).await;
@@ -1275,11 +1313,33 @@ impl GlobalTool for GlobalState {
                         child_tid_addr: ctid,
                         reconnect_priority: priority,
                     });
-                    if pending.caller != dettid {
-                        self.global_time
+                    if pending.caller != dettid
+                        && let Err(error) = self
+                            .global_time
                             .lock()
                             .unwrap()
-                            .reassign_thread(pending.caller, dettid);
+                            .reassign_thread(pending.caller, dettid)
+                    {
+                        let (wake, deferred) = (
+                            sched.report_backend_failure(reverie::BackendFailure {
+                                pid: reverie::Pid::from_raw(from.as_raw()),
+                                tid: from,
+                                phase: "global virtual-time accounting",
+                            }),
+                            sched.take_signal_failure_wakes(),
+                        );
+                        error!(
+                            "terminal virtual-time failure for backend task {}: {}",
+                            from, error
+                        );
+                        drop(sched);
+                        for wake in deferred {
+                            let _ = wake.send(());
+                        }
+                        if let Some(wake) = wake {
+                            let _ = wake.send(());
+                        }
+                        return (None, R::ThreadExited);
                     }
                     if !pending.fd_blocking.is_empty() {
                         self.post_exec_fd_blocking
@@ -1604,7 +1664,17 @@ impl GlobalTool for GlobalState {
             return (None, R::ThreadExited);
         }
 
-        let time_from_sched = self.global_time.lock().unwrap().threads_time(dtid);
+        let time_from_sched_result = {
+            let time = self.global_time.lock().unwrap();
+            time.threads_time(dtid)
+        };
+        let time_from_sched = match time_from_sched_result {
+            Ok(time) => time,
+            Err(error) => {
+                self.report_virtual_time_failure(from, error);
+                return (None, R::ThreadExited);
+            }
+        };
         let time_update = match time_from_sched.cmp(&time_from_guest) {
             Ordering::Equal => None,
             Ordering::Less => {
@@ -1620,6 +1690,21 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    fn report_virtual_time_failure(&self, task: Tid, error: anyhow::Error) {
+        error!(
+            "terminal virtual-time failure for backend task {}: {}",
+            task, error
+        );
+        <Self as GlobalTool>::report_backend_failure(
+            self,
+            reverie::BackendFailure {
+                pid: reverie::Pid::from_raw(task.as_raw()),
+                tid: task,
+                phase: "global virtual-time accounting",
+            },
+        );
+    }
+
     async fn recv_resources_with_origin(
         &self,
         from: Tid,
@@ -4999,7 +5084,12 @@ mod tests {
         let first_time = state.sched.lock().unwrap().committed_time;
         assert_eq!(first_time, epoch + LogicalTime::from_nanos(1_001));
         assert_eq!(
-            state.global_time.lock().unwrap().threads_time(child),
+            state
+                .global_time
+                .lock()
+                .unwrap()
+                .threads_time(child)
+                .unwrap(),
             child_clock.as_nanos()
         );
 
@@ -5120,7 +5210,12 @@ mod tests {
         assert_eq!(created, (None, GlobalResponse::CreateChildThread(None)));
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
         assert_eq!(
-            state.global_time.lock().unwrap().threads_time(child),
+            state
+                .global_time
+                .lock()
+                .unwrap()
+                .threads_time(child)
+                .unwrap(),
             child_clock.as_nanos()
         );
 
@@ -5252,7 +5347,12 @@ mod tests {
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
         assert_eq!(
-            state.global_time.lock().unwrap().threads_time(worker),
+            state
+                .global_time
+                .lock()
+                .unwrap()
+                .threads_time(worker)
+                .unwrap(),
             worker_clock.as_nanos()
         );
 
@@ -5351,7 +5451,7 @@ mod tests {
             )
         );
         let global = state.global_time.lock().unwrap();
-        assert_eq!(global.threads_time(leader), fresh.as_nanos());
+        assert_eq!(global.threads_time(leader).unwrap(), fresh.as_nanos());
         assert!(!global.contains_thread(worker));
     }
 
@@ -5412,14 +5512,18 @@ mod tests {
         let mut existing_time = DetTime::new(&config);
         existing_time.add_syscall();
         existing_time.add_syscall();
-        state.global_time.lock().unwrap().update_global_time(
-            dettid,
-            existing_time.as_nanos(),
-            LogicalTime::ZERO,
-        );
+        state
+            .global_time
+            .lock()
+            .unwrap()
+            .update_global_time(dettid, existing_time.as_nanos(), LogicalTime::ZERO)
+            .unwrap();
         let (global_before, thread_before) = {
             let global_time = state.global_time.lock().unwrap();
-            (global_time.as_nanos(), global_time.threads_time(dettid))
+            (
+                global_time.as_nanos(),
+                global_time.threads_time(dettid).unwrap(),
+            )
         };
         let fresh_local_time = DetTime::new(&config);
         let physical_pid = std::process::id() as i32;
@@ -5511,7 +5615,7 @@ mod tests {
         drop(scheduler);
         let global_time = state.global_time.lock().unwrap();
         assert_eq!(global_time.as_nanos(), global_before);
-        assert_eq!(global_time.threads_time(dettid), thread_before);
+        assert_eq!(global_time.threads_time(dettid).unwrap(), thread_before);
     }
 
     #[tokio::test]
@@ -5552,8 +5656,12 @@ mod tests {
         worker_clock.add_syscall();
         {
             let mut global_time = state.global_time.lock().unwrap();
-            global_time.update_global_time(leader, leader_clock.as_nanos(), LogicalTime::ZERO);
-            global_time.update_global_time(worker, worker_clock.as_nanos(), LogicalTime::ZERO);
+            global_time
+                .update_global_time(leader, leader_clock.as_nanos(), LogicalTime::ZERO)
+                .unwrap();
+            global_time
+                .update_global_time(worker, worker_clock.as_nanos(), LogicalTime::ZERO)
+                .unwrap();
         }
         let total_before = state.global_time.lock().unwrap().as_nanos();
         let fd_blocking: ExecFdBlockingOverrides = [42].into_iter().collect();
@@ -5733,7 +5841,10 @@ mod tests {
         {
             let global_time = state.global_time.lock().unwrap();
             assert_eq!(global_time.as_nanos(), total_before);
-            assert_eq!(global_time.threads_time(leader), worker_clock.as_nanos());
+            assert_eq!(
+                global_time.threads_time(leader).unwrap(),
+                worker_clock.as_nanos()
+            );
             assert!(!global_time.contains_thread(worker));
         }
 
@@ -6052,11 +6163,12 @@ mod tests {
         install_test_registration(&state, dettid, Ivar::new());
         let mut current_time = DetTime::new(&config);
         current_time.add_syscall();
-        state.global_time.lock().unwrap().update_global_time(
-            dettid,
-            current_time.as_nanos(),
-            LogicalTime::ZERO,
-        );
+        state
+            .global_time
+            .lock()
+            .unwrap()
+            .update_global_time(dettid, current_time.as_nanos(), LogicalTime::ZERO)
+            .unwrap();
         state
             .sched
             .lock()
@@ -6064,7 +6176,10 @@ mod tests {
             .logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
         let (global_before, thread_before) = {
             let global_time = state.global_time.lock().unwrap();
-            (global_time.as_nanos(), global_time.threads_time(dettid))
+            (
+                global_time.as_nanos(),
+                global_time.threads_time(dettid).unwrap(),
+            )
         };
         let mut late_time = current_time;
         late_time.add_syscall();
@@ -6084,7 +6199,7 @@ mod tests {
         assert!(!state.sched.lock().unwrap().next_turns.contains_key(&dettid));
         let global_time = state.global_time.lock().unwrap();
         assert_eq!(global_time.as_nanos(), global_before);
-        assert_eq!(global_time.threads_time(dettid), thread_before);
+        assert_eq!(global_time.threads_time(dettid).unwrap(), thread_before);
     }
 
     #[tokio::test]
@@ -6093,11 +6208,12 @@ mod tests {
         install_test_registration(&state, dettid, Ivar::new());
         let mut current_time = DetTime::new(&config);
         current_time.add_syscall();
-        state.global_time.lock().unwrap().update_global_time(
-            dettid,
-            current_time.as_nanos(),
-            LogicalTime::ZERO,
-        );
+        state
+            .global_time
+            .lock()
+            .unwrap()
+            .update_global_time(dettid, current_time.as_nanos(), LogicalTime::ZERO)
+            .unwrap();
         state
             .sched
             .lock()
@@ -6105,7 +6221,10 @@ mod tests {
             .logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
         let (global_before, thread_before) = {
             let global_time = state.global_time.lock().unwrap();
-            (global_time.as_nanos(), global_time.threads_time(dettid))
+            (
+                global_time.as_nanos(),
+                global_time.threads_time(dettid).unwrap(),
+            )
         };
         let mut late_time = current_time;
         late_time.add_syscall();
@@ -6192,7 +6311,7 @@ mod tests {
         assert!(!state.sched.lock().unwrap().next_turns.contains_key(&dettid));
         let global_time = state.global_time.lock().unwrap();
         assert_eq!(global_time.as_nanos(), global_before);
-        assert_eq!(global_time.threads_time(dettid), thread_before);
+        assert_eq!(global_time.threads_time(dettid).unwrap(), thread_before);
     }
 
     #[tokio::test]
@@ -6858,7 +6977,8 @@ mod robust_exit_clock_tests {
             {
                 let mut time = state.global_time.lock().unwrap();
                 for (tid, clock) in [(leader, &first_initial), (worker, &second_initial)] {
-                    time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
+                    time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos())
+                        .unwrap();
                 }
             }
             let tool = Detcore::new(Tid::from_raw(leader.as_raw()), &config);
@@ -6886,7 +7006,7 @@ mod robust_exit_clock_tests {
                 } else {
                     &self.initial_clocks[index]
                 };
-                assert_eq!(time.threads_time(owner.dettid), clock.as_nanos());
+                assert_eq!(time.threads_time(owner.dettid).unwrap(), clock.as_nanos());
                 assert_eq!(
                     snapshot["inherited_time"][owner.dettid.as_raw().to_string()],
                     serde_json::to_value(clock.inherited_nanos()).unwrap()
@@ -7195,11 +7315,16 @@ mod robust_exit_clock_tests {
                 );
                 let mut replacement_time = f.owners[0].thread_logical_time.clone();
                 replacement_time.add_syscall_with_cost(500);
-                f.state.global_time.lock().unwrap().update_global_time(
-                    rejected,
-                    replacement_time.as_nanos(),
-                    replacement_time.inherited_nanos(),
-                );
+                f.state
+                    .global_time
+                    .lock()
+                    .unwrap()
+                    .update_global_time(
+                        rejected,
+                        replacement_time.as_nanos(),
+                        replacement_time.inherited_nanos(),
+                    )
+                    .unwrap();
             } else if rejection == "tombstone" {
                 // Use the real cancelling backend gate; keep its matching Mm.
                 let mut sched = f.state.sched.lock().unwrap();
@@ -7256,11 +7381,12 @@ mod robust_exit_clock_tests {
         let owner = &f.owners[0];
         let mut later = owner.thread_logical_time.clone();
         later.add_syscall_with_cost(1);
-        f.state.global_time.lock().unwrap().update_global_time(
-            owner.dettid,
-            later.as_nanos(),
-            later.inherited_nanos(),
-        );
+        f.state
+            .global_time
+            .lock()
+            .unwrap()
+            .update_global_time(owner.dettid, later.as_nanos(), later.inherited_nanos())
+            .unwrap();
         f.exit(0, ExitStatus::Exited(0)).await;
     }
 

@@ -1400,13 +1400,13 @@ fn assert_sabre_manifest_c_gate_contract(cfg: &DagConfig) -> Result<(), String> 
         return Err("packaged SaBRe C gate must not duplicate unrelated hosted work".into());
     }
     if step.labels != ["full".to_string(), "portable".to_string()]
-        || step.timeout != 60
+        || step.timeout != crate::validation_dag_static::SABRE_MANIFEST_C_GATE_WALL_SECONDS
         || step.cpu_timeout != 60
         || step.hint.resources.get("manifest_guest") != Some(&1)
         || step.hint.resources.len() != 1
         || step.hint.preferred_inner_jobs != Some(1)
         || step.manifest.is_some()
-        || step.jobs_flag.is_some()
+        || step.jobs_flag.as_deref() != Some("")
         || step.jobs_env.is_some()
     {
         return Err(format!(
@@ -2280,6 +2280,7 @@ mod tests {
         let mut mutations = Vec::new();
         for (label, from, to) in [
             ("install requirement", "--require-install ", ""),
+            ("required population", " --ci-only", ""),
             (
                 "exact guest",
                 "c-programs/add-key-enosys",
@@ -2319,8 +2320,8 @@ mod tests {
             .iter_mut()
             .find(|step| step.tag() == "test.sabre_manifest_c_gate")
             .unwrap()
-            .timeout = 61;
-        mutations.push(("wall bound", wall));
+            .timeout = 192;
+        mutations.push(("wall bound without strict headroom", wall));
         let mut cpu = committed.clone();
         cpu.steps
             .iter_mut()
@@ -2338,6 +2339,14 @@ mod tests {
             .resources
             .insert("manifest_guest".into(), 2);
         mutations.push(("resource demand", resource));
+        let mut injected_jobs_flag = committed.clone();
+        injected_jobs_flag
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .jobs_flag = None;
+        mutations.push(("dagrun default -j injection", injected_jobs_flag));
         let mut hosted = committed.clone();
         let mut hosted_step = hosted
             .steps

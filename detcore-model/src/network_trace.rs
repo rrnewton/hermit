@@ -917,7 +917,9 @@ mod tests {
         };
 
         assert!(!release.is_eligible(global_time.as_nanos(), 3));
-        global_time.add_extra_time(Duration::from_nanos(10));
+        global_time
+            .add_extra_time(Duration::from_nanos(10))
+            .unwrap();
         assert_eq!(global_time.as_nanos(), release.not_before_global_time);
         assert!(!release.is_eligible(global_time.as_nanos(), 2));
         assert!(release.is_eligible(global_time.as_nanos(), 3));

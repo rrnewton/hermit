@@ -333,29 +333,65 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
 /// Both the generator and its preparation audit inspect the same command bytes
 /// the container's final bash executes, including literal shell quoting.
 pub(super) fn execution_command(step: &dagrun::model::Step) -> Result<String, String> {
-    if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
-        return Ok(step.cmd.clone());
-    }
-    let args = shell_words::split(&step.cmd).map_err(|error| format!("{}: {error}", step.tag()))?;
-    let boundary = args
-        .iter()
-        .position(|arg| arg == "--")
-        .ok_or_else(|| format!("{} omits its pinned-root command boundary", step.tag()))?;
-    match &args[boundary + 1..] {
-        [shell, option, guard, argv0, payload]
-            if shell == "bash"
-                && option == "-c"
-                && argv0 == "bash"
-                && (guard == crate::validation_dag::PINNED_ROOT_COMMAND_GUARD
-                    || guard == crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD) =>
-        {
-            Ok(payload.clone())
+    let command = if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        step.cmd.clone()
+    } else {
+        let args =
+            shell_words::split(&step.cmd).map_err(|error| format!("{}: {error}", step.tag()))?;
+        let boundary = args
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or_else(|| format!("{} omits its pinned-root command boundary", step.tag()))?;
+        match &args[boundary + 1..] {
+            [shell, option, guard, argv0, payload]
+                if shell == "bash"
+                    && option == "-c"
+                    && argv0 == "bash"
+                    && (guard == crate::validation_dag::PINNED_ROOT_COMMAND_GUARD
+                        || guard == crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD) =>
+            {
+                payload.clone()
+            }
+            _ => {
+                return Err(format!(
+                    "{} has an unrecognized pinned-root command",
+                    step.tag()
+                ));
+            }
         }
-        _ => Err(format!(
-            "{} has an unrecognized pinned-root command",
-            step.tag()
-        )),
+    };
+
+    // The integration inventory and its consumer intentionally share the
+    // verified Hermit artifact environment. Recover the bash payload so every
+    // selection/count audit inspects the command that actually executes after
+    // the artifact wrapper, rather than its shell-escaped transport bytes.
+    const RUST_SCRIPT_ENV: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
+    const ARTIFACT_BASH: &str = "./ci/run-with-hermit-e2e-artifact.sh --require-install bash -c ";
+    if matches!(
+        step.tag().as_str(),
+        "test.hermit_integration" | "test.hermit_integration_on_host"
+    ) {
+        if let Some(tail) = command
+            .strip_prefix(RUST_SCRIPT_ENV)
+            .and_then(|command| command.strip_prefix(ARTIFACT_BASH))
+        {
+            if tail.starts_with('"') || tail.starts_with('\'') {
+                let args = shell_words::split(&format!("bash -c {tail}"))
+                    .map_err(|error| format!("{}: {error}", step.tag()))?;
+                match args.as_slice() {
+                    [shell, option, payload] if shell == "bash" && option == "-c" => {
+                        return Ok(format!("{RUST_SCRIPT_ENV}{payload}"));
+                    }
+                    _ => {}
+                }
+                return Err(format!(
+                    "{} has an unrecognized Hermit artifact command",
+                    step.tag()
+                ));
+            }
+        }
     }
+    Ok(command)
 }
 
 fn command_arguments(command: &str, marker: &str) -> Result<Vec<String>, String> {

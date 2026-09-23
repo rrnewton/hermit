@@ -104,8 +104,8 @@ fn run(args: &[&str]) -> Output {
 
 fn expected_epoch_provenance() -> String {
     format!(
-        "WARN hermit::virtual_time: hermit: virtual-time epoch={COMPARISON_EPOCH} \
-         source=explicit; reproduce with --epoch={COMPARISON_EPOCH}"
+        "hermit: virtual-time epoch={COMPARISON_EPOCH} source=explicit; \
+         reproduce with --epoch={COMPARISON_EPOCH}"
     )
 }
 
@@ -113,7 +113,7 @@ fn validate_and_remove_public_log_epoch_provenance(
     bytes: &[u8],
     label: &str,
 ) -> Result<Vec<u8>, String> {
-    let marker = b"WARN hermit::virtual_time: hermit: virtual-time epoch=";
+    let marker = b"hermit: virtual-time epoch=";
     let expected = expected_epoch_provenance();
     let mut provenance_events = 0;
     let mut remaining = Vec::new();

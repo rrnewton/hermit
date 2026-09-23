@@ -149,9 +149,12 @@ impl GlobalOpts {
             self.write_controller_diagnostic_to_selected_sink(message)
                 .context("cannot write to controller stderr")?;
         } else {
-            // A stopped stderr reader must not replace the command's primary
-            // exit status. This shares the existing invocation-wide deadline
-            // with later error reports and preserves the inherited fd flags.
+            // Best-effort diagnostics must not let a stopped stderr reader
+            // replace the command's primary exit status. Host-captured epoch
+            // provenance deliberately takes the fail-closed branch above: if
+            // that value cannot be delivered, the run cannot be reproduced.
+            // This shares the existing invocation-wide deadline with later
+            // error reports and preserves the inherited fd flags.
             let _ = self.write_controller_diagnostic_to_selected_sink(message);
         }
         Ok(())

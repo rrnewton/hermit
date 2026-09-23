@@ -105,17 +105,43 @@ impl GlobalState {
         let validation = sched
             .real_timers
             .validate_effect(pid, tid, mm, identity, dequeue.process);
-        let result = validation.and_then(|live| {
-            if live && !sched.backend_failed() {
-                self.global_time.lock().unwrap().update_global_time(
-                    tid,
-                    guest_time.as_nanos(),
-                    guest_time.inherited_nanos(),
-                );
+        let result = match validation {
+            Ok(live) => {
+                if live
+                    && !sched.backend_failed()
+                    && let Err(error) = self.global_time.lock().unwrap().update_global_time(
+                        tid,
+                        guest_time.as_nanos(),
+                        guest_time.inherited_nanos(),
+                    )
+                {
+                    let (wake, deferred) = (
+                        sched.report_backend_failure(reverie::BackendFailure {
+                            pid: identity.process.tgid,
+                            tid: identity.tid,
+                            phase: "global virtual-time accounting",
+                        }),
+                        sched.take_signal_failure_wakes(),
+                    );
+                    tracing::error!(
+                        "terminal virtual-time failure for backend task {}: {}",
+                        identity.tid,
+                        error
+                    );
+                    drop(sched);
+                    for wake in deferred {
+                        let _ = wake.send(());
+                    }
+                    if let Some(wake) = wake {
+                        let _ = wake.send(());
+                    }
+                    return (None, GlobalResponse::ThreadExited);
+                }
+                let now = self.global_time.lock().unwrap().as_nanos();
+                sched.apply_signal_dequeue(pid, dequeue, now)
             }
-            let now = self.global_time.lock().unwrap().as_nanos();
-            sched.apply_signal_dequeue(pid, dequeue, now)
-        });
+            Err(error) => Err(error),
+        };
         if let Err(error) = result {
             sched.fail_parked(tid, ProtocolFailure::Timer(error));
         }
