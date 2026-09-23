@@ -2336,6 +2336,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Gettimeofday(s) => {
                     if virtualize_time {
                         self.handle_gettimeofday(guest, s).await
+                    } else if record_or_replay::has_captured_clock_handler::<T>(
+                        guest.config(),
+                        call.number(),
+                    ) {
+                        self.record_or_replay_preserving_tool_errors(guest, call)
+                            .await
                     } else {
                         self.handle_unsupported_syscall(
                             guest,
@@ -2349,6 +2355,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Time(s) => {
                     if virtualize_time {
                         self.handle_time(guest, s).await
+                    } else if record_or_replay::has_captured_clock_handler::<T>(
+                        guest.config(),
+                        call.number(),
+                    ) {
+                        self.record_or_replay_preserving_tool_errors(guest, call)
+                            .await
                     } else {
                         self.handle_unsupported_syscall(
                             guest,
@@ -2362,6 +2374,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::ClockGettime(s) => {
                     if virtualize_time {
                         self.handle_clock_gettime(guest, s).await
+                    } else if record_or_replay::has_captured_clock_handler::<T>(
+                        guest.config(),
+                        call.number(),
+                    ) {
+                        self.record_or_replay_preserving_tool_errors(guest, call)
+                            .await
                     } else {
                         self.handle_unsupported_syscall(
                             guest,
