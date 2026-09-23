@@ -128,6 +128,14 @@ Commands:
       divergence position is imported only after current results classify it as
       FRESH, DRIFTED, WRONG, or UNCHECKABLE. This reads existing results; it does
       not execute a guest and it never changes scorecard colour.
+  import-results --bind-attempts-only --result-file FILE --result-sha256 HEX --result-lines N,N
+      [--result-file FILE --result-sha256 HEX --result-lines N,N ...]
+      Append producer-verified outer-attempt bindings for existing comparisons.
+      The whole named file is held and hash-checked; line numbers select witnesses,
+      never attempts. All original history remains
+      unchanged. The normal parent ledger publisher owns this migration. It
+      records compact attestations, not raw logs or new test results, so later
+      projections need only the ledger. Missing or ambiguous evidence refuses.
   project-observations --series-root DIR --refreshed-at STAMP
       Re-derive observations and last_tested from exact comparison and typed
       no-verdict rows in the series store. Historical rows lacking either are
@@ -385,6 +393,11 @@ struct ObservationProjection {
     /// evidence.
     #[serde(default)]
     pre_series_corpus: bool,
+    /// Producer-verified attempt provenance for reconciling immutable series
+    /// with richer direct comparisons. This closed projection envelope makes
+    /// older writers refuse rather than silently discard the new authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison_attempt_bindings_v1: Option<ComparisonAttemptBindings>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3292,6 +3305,16 @@ fn run() -> Result<(), String> {
             observe_results(&root, &result_root)?;
         }
         "import-results" => {
+            let arguments = args.collect::<Vec<_>>();
+            if arguments
+                .first()
+                .is_some_and(|arg| arg == "--bind-attempts-only")
+            {
+                let inputs = parse_attempt_binding_files(&arguments[1..])?;
+                bind_retained_attempts(&root, &inputs)?;
+                return Ok(());
+            }
+            let mut args = arguments.into_iter();
             let mut result_root = None;
             let mut current_summaries = Vec::new();
             while let Some(arg) = args.next() {
@@ -4338,6 +4361,9 @@ enum Writer {
     /// The explicit observation commands own measured evidence but cannot alter
     /// scorecard colour.
     Observations,
+    /// Import may retire ordinary projections, retaining their typed receipts
+    /// as immutable provenance without granting them active evidence credit.
+    ImportResults,
 }
 
 /// REFUSE A WRITE THAT CROSSED THE WRITER BOUNDARY.
@@ -4358,6 +4384,7 @@ fn enforce_writer_boundary(
     after: &TrackedCells,
     writer: Writer,
 ) -> Result<(), String> {
+    preserve_attempt_bindings_for_writer(before, after, writer)?;
     fn index(cells: &TrackedCells) -> BTreeMap<&CellId, &TrackedCell> {
         cells.cells.iter().map(|cell| (&cell.id, cell)).collect()
     }
@@ -4428,7 +4455,7 @@ fn enforce_writer_boundary(
                 }
             }
         }
-        Writer::Observations => {
+        Writer::Observations | Writer::ImportResults => {
             // An observation writer merges evidence into cells that already
             // exist. It may not change the population, and it may not touch a
             // single ratchet field.
@@ -4461,7 +4488,7 @@ fn enforce_writer_boundary(
             }
         }
     }
-    if before.schema != after.schema && writer == Writer::Observations {
+    if before.schema != after.schema && writer != Writer::Update {
         return Err(
             "writer boundary violated: an observation writer changed the schema version".into(),
         );
@@ -4527,6 +4554,7 @@ fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     let path = ledger_root(root, false)?.join(LEDGER_CELLS);
     let cells = read_json(&path).map_err(|error| format!("history unavailable: {error}"))?;
     validate_observation_identity_namespace(&cells)?;
+    validate_attempt_bindings(&cells, None)?;
     Ok(Some(cells))
 }
 
@@ -4954,6 +4982,7 @@ fn publish_history_command(
 
 fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
     validate_observation_identity_namespace(cells)?;
+    validate_attempt_bindings(cells, None)?;
     // ⚠️ THE NORMALISATION HAPPENS HERE, AT THE SINGLE WRITE CHOKE POINT, AND
     // NOT ONLY AT INGEST. `update` carries already-tracked rows forward without
     // re-reading their results, so an ingest-only fix would clean new rows and
@@ -6417,7 +6446,11 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
-    let rows = read_result_candidates(results, &head)?;
+    let census = CurrentResultCensus::open(results)?;
+    let rows = read_result_candidate_files(&census.inputs(), &head)?;
+    let series = snapshot_series_source(&ledger_root(root, false)?.join("series"))?;
+    let events = read_series_rows(&series)?;
+    let binding_snapshot = AttemptBindingSnapshot::captured(&series, &events)?;
     let depth = source_depths(root, &head)?;
     if !depth.contains_key("reverie") {
         println!(
@@ -6445,28 +6478,76 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
             }),
         },
     )?;
+    if tracked.projection.is_none() {
+        tracked.projection = Some(
+            binding_snapshot.projection(
+                events.len(),
+                events
+                    .iter()
+                    .map(|row| row.emitted_at.as_str())
+                    .max()
+                    .unwrap_or(&head)
+                    .to_string(),
+            ),
+        );
+    }
+    append_attempt_bindings(
+        &mut tracked,
+        &[AttemptBindingSource {
+            detcore_tree: &detcore_tree,
+            candidates: &rows,
+        }],
+        &census.inputs(),
+        AttemptBindingContext {
+            producer: &git_head(manifest_tool_root()?)?,
+            snapshot: &binding_snapshot,
+            events: &events,
+            kind: AttemptBindingKind::Current,
+            selected_lines: None,
+        },
+    )?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
+    let verify_inputs = || -> Result<(), String> {
+        census.verify()?;
+        check_observation_worktree(root)?;
+        if git_head(root)? != head {
+            return Err("HEAD moved during result write-back".into());
+        }
+        let current = snapshot_series_source(&ledger_root(root, false)?.join("series"))?;
+        if current.source_commit != series.source_commit
+            || current.source_tree != series.source_tree
+        {
+            return Err("series snapshot moved during result write-back".into());
+        }
+        Ok(())
+    };
     let changed = replace_history_files_with(
         root,
         &original,
         &updated,
         || {
-            check_observation_worktree(root)?;
-            let current_head = git_head(root)?;
-            if current_head != head {
-                return Err(format!(
-                    "HEAD moved from {head} to {current_head} during write-back"
-                ));
-            }
+            verify_inputs()?;
             if read_history_files(root)? != original {
                 return Err("the generated scorecard files changed during write-back".into());
             }
             Ok(())
         },
-        |_| Ok(()),
+        |replacement| {
+            verify_inputs()?;
+            let current = read_history_files(root)?;
+            let expected = if replacement == 1 {
+                &original.scorecard
+            } else {
+                &updated.scorecard
+            };
+            if current.cells != original.cells || &current.scorecard != expected {
+                return Err("the generated scorecard files changed during write-back".into());
+            }
+            Ok(())
+        },
     )?;
     println!(
         "compatibility scorecard: merged {} pass, {} located divergence, and {} unlocated \
@@ -6711,8 +6792,9 @@ fn import_results(
             fold.errored[0]
         ));
     }
+    archive_retired_import_comparisons(&before, &mut tracked)?;
     refresh_measurement(&mut tracked);
-    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    enforce_writer_boundary(&before, &tracked, Writer::ImportResults)?;
 
     let measurement_counts = |cells: &TrackedCells| {
         let mut counts = BTreeMap::new();
@@ -7110,7 +7192,17 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         );
     }
     let rows = read_series_rows(&snapshot)?;
-    let projection = apply_series_rows(root, &mut tracked, &rows, Some(&snapshot.source))?;
+    let attempts = validate_attempt_bindings(&tracked, Some(&rows))?;
+    let representation = direct_representation(&tracked, &rows, &attempts)?;
+    remove_replaceable_projected_observations(&mut tracked, &rows, Some(&snapshot.source))?;
+    let unrepresented = rows
+        .iter()
+        .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut projection =
+        apply_series_rows(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
+    projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
     let rows_read = rows.len() as u64;
@@ -7122,7 +7214,8 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         source_tree: Some(snapshot.source_tree.clone()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
-        pre_series_corpus: projection.pre_series_corpus,
+        pre_series_corpus: rows.is_empty() || representation.has_unrepresented_direct_evidence,
+        comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
     });
     refresh_measurement(&mut tracked);
 
@@ -7710,7 +7803,10 @@ where
             }),
         },
     )?;
-    let current_attempts = current_result_attempts(&preview, &result_rows, &detcore_tree)?;
+    let current_attempts = merge_attempt_maps(
+        validate_attempt_bindings(&preview, Some(&snapshot.rows))?,
+        current_result_attempts(&preview, &result_rows, &detcore_tree)?,
+    )?;
     let preview_representation =
         direct_representation(&preview, &snapshot.rows, &current_attempts)?;
     remove_replaceable_projected_observations(
@@ -7745,6 +7841,7 @@ where
         refreshed_at: refreshed_at.to_string(),
         rows_read,
         pre_series_corpus: true,
+        comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
     });
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     let projected_stamps = tracked
@@ -7829,7 +7926,23 @@ where
         // represented by one snapshot event is not pre-series merely because
         // its richer stored form deliberately has no event_ids.
         pre_series_corpus: rows_read == 0 || representation.has_unrepresented_direct_evidence,
+        comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
     });
+    append_attempt_bindings(
+        &mut tracked,
+        &[AttemptBindingSource {
+            detcore_tree: &detcore_tree,
+            candidates: &result_rows,
+        }],
+        &census.inputs(),
+        AttemptBindingContext {
+            producer: &git_head(manifest_tool_root()?)?,
+            snapshot: &AttemptBindingSnapshot::from_held(&snapshot)?,
+            events: &snapshot.rows,
+            kind: AttemptBindingKind::Current,
+            selected_lines: None,
+        },
+    )?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
@@ -8129,14 +8242,1008 @@ struct DirectRepresentation {
     has_unrepresented_direct_evidence: bool,
 }
 
-type CurrentResultAttempts = BTreeMap<(DirectEvidenceBase, String), u64>;
+type ValidatedComparisonAttempts = BTreeMap<(DirectEvidenceBase, String), u64>;
+
+/// These compact records attest to a producer's checked ResultRow preimage.
+/// They do not claim that a digest reveals an attempt without that check. Raw
+/// streams remain outside Git; a ledger-only reader verifies the attachment
+/// to the original comparison and immutable typed series events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ComparisonAttemptBindings {
+    schema: u64,
+    authority: String,
+    bindings: Vec<ComparisonAttemptBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_canonical_comparisons: Vec<RetiredCanonicalComparison>,
+}
+
+/// Import can replace an ordinary comparison projection. Retaining its exact
+/// typed receipt keeps the binding verifiable without retaining stale grades
+/// or divergence coordinates in the active observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredCanonicalComparison {
+    cell: CellId,
+    provenance: ObservationProvenance,
+    detcore_tree: String,
+    comparison: CanonicalComparison,
+    typed_comparison_sha256: String,
+}
+
+fn retired_comparison_key(retired: &RetiredCanonicalComparison) -> (DirectEvidenceBase, String) {
+    (
+        DirectEvidenceBase {
+            cell: series_cell_key(&retired.cell),
+            identity: SeriesObservationIdentity::DetcoreTree(retired.detcore_tree.clone()),
+            provenance: retired.provenance,
+            hermit_sha: retired.comparison.hermit_sha.clone(),
+            run_id: retired.comparison.run_id.clone(),
+        },
+        retired.comparison.evidence_sha256.clone(),
+    )
+}
+
+fn typed_comparison_digest(comparison: &CanonicalComparison) -> Result<String, String> {
+    let value = serde_json::to_value(comparison).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).map_err(|error| error.to_string())?)
+    ))
+}
+
+fn binding_observations<'a>(
+    tracked: &'a TrackedCells,
+    binding: &'a ComparisonAttemptBinding,
+) -> impl Iterator<Item = &'a Observation> {
+    tracked
+        .cells
+        .iter()
+        .filter(|cell| cell.id == binding.cell)
+        .flat_map(|cell| &cell.observations)
+        .filter(|observation| {
+            observation.event_ids.is_empty()
+                && observation.provenance == binding.provenance
+                && observation.detcore_tree.as_deref() == Some(binding.detcore_tree.as_str())
+        })
+}
+
+fn bound_canonical_comparisons<'a>(
+    tracked: &'a TrackedCells,
+    binding: &'a ComparisonAttemptBinding,
+) -> Vec<&'a CanonicalComparison> {
+    binding_observations(tracked, binding)
+        .flat_map(|observation| &observation.canonical_comparisons)
+        .filter(|comparison| {
+            comparison.hermit_sha == binding.hermit_sha
+                && comparison.run_id == binding.run_id
+                && comparison.evidence_sha256 == binding.evidence_sha256
+                && comparison.result == binding.result
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ComparisonAttemptBinding {
+    cell: CellId,
+    provenance: ObservationProvenance,
+    hermit_sha: String,
+    detcore_tree: String,
+    run_id: String,
+    evidence_sha256: String,
+    attempt: u64,
+    result: ObservedResult,
+    kind: AttemptBindingKind,
+    producer_hermit_sha: String,
+    input: AttemptBindingInput,
+    snapshot: AttemptBindingSnapshot,
+    events: Vec<AttemptBindingEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AttemptBindingKind {
+    Current,
+    Retained,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptBindingInput {
+    file_sha256: String,
+    file_bytes: u64,
+    line: u64,
+    /// Exact UTF-8 result line, excluding its newline terminator.
+    row_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptBindingSnapshot {
+    repository: String,
+    source: String,
+    commit: String,
+    tree: String,
+    rows_sha256: String,
+}
+
+impl AttemptBindingSnapshot {
+    fn from_held(snapshot: &HeldScorecardSeriesSnapshot) -> Result<Self, String> {
+        if snapshot.snapshot.source.repository.as_deref() != Some(TEST_LEDGER_REPOSITORY) {
+            return Err("attempt bindings require an actual canonical ledger snapshot".into());
+        }
+        Ok(Self {
+            repository: TEST_LEDGER_REPOSITORY.into(),
+            source: snapshot.snapshot.source.path.clone(),
+            commit: snapshot.snapshot.source.commit.clone(),
+            tree: snapshot.snapshot.source.tree.clone(),
+            rows_sha256: snapshot.snapshot.rows_sha256.clone(),
+        })
+    }
+
+    fn captured(snapshot: &SeriesSourceSnapshot, rows: &[SeriesRow]) -> Result<Self, String> {
+        if snapshot.source_repository.as_deref() != Some(TEST_LEDGER_REPOSITORY) {
+            return Err("attempt bindings require the canonical ledger repository".into());
+        }
+        let values = rows
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            repository: TEST_LEDGER_REPOSITORY.into(),
+            source: snapshot.source.clone(),
+            commit: snapshot.source_commit.clone(),
+            tree: snapshot.source_tree.clone(),
+            rows_sha256: format!(
+                "{:x}",
+                Sha256::digest(canonical_snapshot_rows_bytes(&values)?)
+            ),
+        })
+    }
+
+    fn projection(&self, rows_read: usize, refreshed_at: String) -> ObservationProjection {
+        ObservationProjection {
+            source: self.source.clone(),
+            source_repository: Some(self.repository.clone()),
+            source_commit: Some(self.commit.clone()),
+            source_tree: Some(self.tree.clone()),
+            refreshed_at,
+            rows_read: rows_read as u64,
+            pre_series_corpus: true,
+            comparison_attempt_bindings_v1: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptBindingEvent {
+    event_id: String,
+    /// Digest of the native typed event's canonical JSON value, not a claim
+    /// that different producer JSON number spellings are identical bytes.
+    typed_event_sha256: String,
+}
+
+const ATTEMPT_BINDING_AUTHORITY: &str = "writer_verified_result_attempt_v1";
+
+fn comparison_attempt_bindings(tracked: &TrackedCells) -> Option<&ComparisonAttemptBindings> {
+    tracked
+        .projection
+        .as_ref()?
+        .comparison_attempt_bindings_v1
+        .as_ref()
+}
+
+fn binding_base(binding: &ComparisonAttemptBinding) -> DirectEvidenceBase {
+    DirectEvidenceBase {
+        cell: series_cell_key(&binding.cell),
+        identity: SeriesObservationIdentity::DetcoreTree(binding.detcore_tree.clone()),
+        provenance: binding.provenance,
+        hermit_sha: binding.hermit_sha.clone(),
+        run_id: binding.run_id.clone(),
+    }
+}
+
+fn binding_key(binding: &ComparisonAttemptBinding) -> (DirectEvidenceBase, String) {
+    (binding_base(binding), binding.evidence_sha256.clone())
+}
+
+fn typed_event_digest(row: &SeriesRow) -> Result<String, String> {
+    let value = serde_json::to_value(row).map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) -> bool {
+    row.producer == SeriesProducer::Validate
+        && row.schema == SeriesSchema::V3
+        && row.cell() == series_cell_key(&binding.cell)
+        && row.series.tree == binding.hermit_sha
+        && row.run_id == binding.run_id
+        && row.series.run_index <= binding.attempt
+        && series_last_run_index(row).is_some_and(|last| binding.attempt <= last)
+}
+
+fn validate_attempt_bindings(
+    tracked: &TrackedCells,
+    rows: Option<&[SeriesRow]>,
+) -> Result<ValidatedComparisonAttempts, String> {
+    let Some(envelope) = comparison_attempt_bindings(tracked) else {
+        return Ok(ValidatedComparisonAttempts::new());
+    };
+    if envelope.schema != 1
+        || envelope.authority != ATTEMPT_BINDING_AUTHORITY
+        || envelope.bindings.is_empty()
+    {
+        return Err("comparison-attempt bindings have unknown or empty authority".into());
+    }
+    if envelope
+        .bindings
+        .windows(2)
+        .any(|pair| binding_key(&pair[0]) >= binding_key(&pair[1]))
+    {
+        return Err("comparison-attempt bindings must have unique canonical ordering".into());
+    }
+    if envelope
+        .retired_canonical_comparisons
+        .windows(2)
+        .any(|pair| retired_comparison_key(&pair[0]) >= retired_comparison_key(&pair[1]))
+    {
+        return Err("retired comparisons must have unique canonical ordering".into());
+    }
+    let mut retired = BTreeMap::new();
+    for comparison in &envelope.retired_canonical_comparisons {
+        let key = retired_comparison_key(comparison);
+        if !envelope
+            .bindings
+            .iter()
+            .any(|binding| binding_key(binding) == key && binding.cell == comparison.cell)
+            || comparison.typed_comparison_sha256
+                != typed_comparison_digest(&comparison.comparison)?
+        {
+            return Err(
+                "retired comparison lacks its exact binding or typed receipt digest".into(),
+            );
+        }
+        retired.insert(key, comparison);
+    }
+    let mut attempts = ValidatedComparisonAttempts::new();
+    let mut unique_attempts = BTreeSet::new();
+    for binding in &envelope.bindings {
+        if binding.provenance != ObservationProvenance::Validate
+            || !is_object_id(&binding.hermit_sha)
+            || !is_object_id(&binding.detcore_tree)
+            || !is_object_id(&binding.producer_hermit_sha)
+            || binding.run_id.trim().is_empty()
+            || binding.attempt == 0
+            || !is_sha256(&binding.evidence_sha256)
+            || !is_sha256(&binding.input.file_sha256)
+            || !is_sha256(&binding.input.row_sha256)
+            || binding.input.file_bytes == 0
+            || binding.input.line == 0
+            || binding.snapshot.repository != TEST_LEDGER_REPOSITORY
+            || binding.snapshot.source != SCORECARD_SERIES_SNAPSHOT_SOURCE
+            || !is_object_id(&binding.snapshot.commit)
+            || !is_object_id(&binding.snapshot.tree)
+            || !is_sha256(&binding.snapshot.rows_sha256)
+        {
+            return Err("comparison-attempt binding has invalid typed provenance".into());
+        }
+        let base = binding_base(binding);
+        let live = binding_observations(tracked, binding)
+            .flat_map(direct_comparison_receipts)
+            .filter(|(head, run, digest, _)| {
+                *head == binding.hermit_sha
+                    && *run == binding.run_id
+                    && *digest == binding.evidence_sha256
+            })
+            .collect::<Vec<_>>();
+        let archived = retired.get(&binding_key(binding));
+        if live.len() > 1
+            || live
+                .iter()
+                .any(|(_, _, _, result)| *result != binding.result)
+            || (live.is_empty() && archived.is_none())
+        {
+            return Err("comparison-attempt binding has no unique original comparison".into());
+        }
+        if let Some(archived) = archived {
+            if archived.comparison.result != binding.result
+                || (!live.is_empty()
+                    && bound_canonical_comparisons(tracked, binding).as_slice()
+                        != [&archived.comparison])
+            {
+                return Err("retired comparison conflicts with its binding or live receipt".into());
+            }
+        }
+        // Retired-only attestations retain provenance and event checks, but
+        // provide no active attempt mapping and cannot suppress a series row.
+        if !live.is_empty() {
+            attempts.insert(
+                (base.clone(), binding.evidence_sha256.clone()),
+                binding.attempt,
+            );
+        }
+        if !unique_attempts.insert((base, binding.attempt)) {
+            return Err("comparison-attempt bindings duplicate or conflict on an identity".into());
+        }
+        if binding.kind == AttemptBindingKind::Retained && binding.events.is_empty() {
+            return Err("retained attempt binding has no original event".into());
+        }
+        let mut event_ids = BTreeSet::new();
+        for event in &binding.events {
+            if event.event_id.trim().is_empty()
+                || !is_sha256(&event.typed_event_sha256)
+                || !event_ids.insert(&event.event_id)
+            {
+                return Err("comparison-attempt binding repeats or corrupts an event".into());
+            }
+            if let Some(rows) = rows {
+                let matching = rows
+                    .iter()
+                    .filter(|row| row.event_id == event.event_id)
+                    .collect::<Vec<_>>();
+                let [row] = matching.as_slice() else {
+                    return Err("comparison-attempt binding requires its original event".into());
+                };
+                if !binding_matches_event(binding, row)
+                    || row.series.result != Some(binding.result)
+                    || typed_event_digest(row)? != event.typed_event_sha256
+                {
+                    return Err(
+                        "comparison-attempt binding disagrees with its original event".into(),
+                    );
+                }
+            }
+        }
+    }
+    // Validate stored attachments only. A caller may already have added
+    // current comparisons, so global coverage waits until their validated
+    // attempts have been merged with this map.
+    Ok(attempts)
+}
+
+fn preserve_attempt_bindings(before: &TrackedCells, after: &TrackedCells) -> Result<(), String> {
+    preserve_attempt_bindings_for_writer(before, after, Writer::Observations)
+}
+
+fn preserve_attempt_bindings_for_writer(
+    before: &TrackedCells,
+    after: &TrackedCells,
+    writer: Writer,
+) -> Result<(), String> {
+    let old = comparison_attempt_bindings(before);
+    let new = comparison_attempt_bindings(after);
+    if let Some(old) = old {
+        let new = new.ok_or("writer dropped comparison-attempt binding authority")?;
+        if old.schema != new.schema
+            || old.authority != new.authority
+            || old
+                .bindings
+                .iter()
+                .any(|binding| !new.bindings.contains(binding))
+            || old
+                .retired_canonical_comparisons
+                .iter()
+                .any(|receipt| !new.retired_canonical_comparisons.contains(receipt))
+        {
+            return Err("writer changed or removed an immutable comparison-attempt binding or retired receipt".into());
+        }
+        for binding in &old.bindings {
+            if writer != Writer::ImportResults
+                && !bound_canonical_comparisons(before, binding).is_empty()
+                && bound_canonical_comparisons(after, binding).is_empty()
+            {
+                return Err("only import may retire an active bound canonical comparison".into());
+            }
+        }
+    }
+    if let Some(new) = new {
+        for retired in &new.retired_canonical_comparisons {
+            if old.is_some_and(|old| old.retired_canonical_comparisons.contains(retired)) {
+                continue;
+            }
+            let binding = old
+                .and_then(|old| {
+                    old.bindings
+                        .iter()
+                        .find(|binding| binding_key(binding) == retired_comparison_key(retired))
+                })
+                .ok_or("retired comparison requires an existing immutable binding")?;
+            if writer != Writer::ImportResults
+                || bound_canonical_comparisons(before, binding).as_slice() != [&retired.comparison]
+                || !bound_canonical_comparisons(after, binding).is_empty()
+            {
+                return Err(
+                    "only import may archive the exact original comparison it retires".into(),
+                );
+            }
+        }
+    }
+    validate_attempt_bindings(after, None)?;
+    Ok(())
+}
+
+fn archive_retired_import_comparisons(
+    before: &TrackedCells,
+    after: &mut TrackedCells,
+) -> Result<(), String> {
+    let Some(old) = comparison_attempt_bindings(before) else {
+        return Ok(());
+    };
+    let mut additions = Vec::new();
+    for binding in &old.bindings {
+        if old
+            .retired_canonical_comparisons
+            .iter()
+            .any(|retired| retired_comparison_key(retired) == binding_key(binding))
+            || !bound_canonical_comparisons(after, binding).is_empty()
+        {
+            continue;
+        }
+        if let [comparison] = bound_canonical_comparisons(before, binding).as_slice() {
+            additions.push(RetiredCanonicalComparison {
+                cell: binding.cell.clone(),
+                provenance: binding.provenance,
+                detcore_tree: binding.detcore_tree.clone(),
+                comparison: (*comparison).clone(),
+                typed_comparison_sha256: typed_comparison_digest(comparison)?,
+            });
+        }
+    }
+    if !additions.is_empty() {
+        let envelope = after
+            .projection
+            .as_mut()
+            .and_then(|projection| projection.comparison_attempt_bindings_v1.as_mut())
+            .ok_or("import dropped comparison-attempt binding authority")?;
+        envelope.retired_canonical_comparisons.extend(additions);
+        envelope
+            .retired_canonical_comparisons
+            .sort_by_key(retired_comparison_key);
+    }
+    Ok(())
+}
+
+fn merge_attempt_maps(
+    mut old: ValidatedComparisonAttempts,
+    current: ValidatedComparisonAttempts,
+) -> Result<ValidatedComparisonAttempts, String> {
+    for (key, attempt) in current {
+        if old
+            .insert(key, attempt)
+            .is_some_and(|prior| prior != attempt)
+        {
+            return Err("current rows contradict a retained attempt binding".into());
+        }
+    }
+    Ok(old)
+}
+
+struct RetainedBindingInput {
+    path: PathBuf,
+    sha256: String,
+    lines: BTreeSet<usize>,
+}
+
+fn parse_attempt_binding_files(arguments: &[String]) -> Result<Vec<RetainedBindingInput>, String> {
+    let mut files = Vec::new();
+    let mut paths = BTreeSet::new();
+    if arguments.is_empty() || !arguments.len().is_multiple_of(6) {
+        return Err("bind-attempts-only requires --result-file FILE --result-sha256 HEX --result-lines N,N groups".into());
+    }
+    for group in arguments.as_chunks::<6>().0 {
+        if group[0] != "--result-file"
+            || group[2] != "--result-sha256"
+            || group[4] != "--result-lines"
+            || group[1].is_empty()
+            || !is_sha256(&group[3])
+            || !paths.insert(group[1].clone())
+        {
+            return Err("bind-attempts-only has duplicate or invalid exact-file operands".into());
+        }
+        let mut lines = BTreeSet::new();
+        for value in group[5].split(',') {
+            let line = value
+                .parse::<usize>()
+                .map_err(|_| "result-lines requires positive line numbers")?;
+            if line == 0 || !lines.insert(line) {
+                return Err("result-lines repeats a line or names line zero".into());
+            }
+        }
+        files.push(RetainedBindingInput {
+            path: PathBuf::from(&group[1]),
+            sha256: group[3].clone(),
+            lines,
+        });
+    }
+    Ok(files)
+}
+
+/// Select literal lines only after authenticating the whole original file.
+/// A line number locates a witness; the typed row alone supplies its attempt.
+fn selected_binding_input(
+    file: &HeldEvidenceFile,
+    lines: &BTreeSet<usize>,
+) -> Result<Vec<u8>, String> {
+    if lines.is_empty() || !file.bytes.ends_with(b"\n") {
+        return Err("retained binding input is empty or truncated".into());
+    }
+    let mut selected = Vec::new();
+    let mut found = BTreeSet::new();
+    for (index, line) in file
+        .bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        if lines.contains(&(index + 1)) {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                return Err("selected binding line is empty".into());
+            }
+            selected.extend_from_slice(line);
+            found.insert(index + 1);
+        }
+    }
+    if &found != lines {
+        return Err("selected binding line is absent".into());
+    }
+    Ok(selected)
+}
+
+fn retained_binding_candidates(
+    inputs: &[(PathBuf, &[u8])],
+) -> Result<BTreeMap<String, BTreeMap<CellId, Vec<ResultCandidate>>>, String> {
+    let mut grouped = BTreeMap::<(String, CellId, String), Vec<ResultCandidate>>::new();
+    for (path, bytes) in inputs {
+        let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+        if !bytes.ends_with(b"\n") {
+            return Err("retained binding input is empty or truncated".into());
+        }
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            serde_json::from_str::<UniqueJsonFields>(line).map_err(|error| error.to_string())?;
+            let mut row: ResultRow =
+                serde_json::from_str(line).map_err(|error| error.to_string())?;
+            if row.schema != CELL_RESULT_SCHEMA
+                || row.source_tree_dirty
+                || row.attempt == 0
+                || !is_object_id(&row.hermit_sha)
+                || row.run_id.trim().is_empty()
+            {
+                return Err(
+                    "retained binding row lacks clean exact source/attempt authority".into(),
+                );
+            }
+            row.validate_timeout_policy()?;
+            normalise_recorded_root(&mut row);
+            if let Some(prefix) = path
+                .ancestors()
+                .find(|p| p.file_name().is_some_and(|n| n == "ignored"))
+                .and_then(Path::parent)
+                .and_then(Path::to_str)
+            {
+                normalise_recorded_prefix(&mut row, prefix);
+            }
+            let id = row.id().ok_or("retained binding row has no backend")?;
+            grouped
+                .entry((row.hermit_sha.clone(), id, row.run_id.clone()))
+                .or_default()
+                .push(ResultCandidate {
+                    evidence_identity: row.evidence_identity()?,
+                    path: path.clone(),
+                    row,
+                    parity_history: false,
+                });
+        }
+    }
+    let mut by_source = BTreeMap::<String, BTreeMap<CellId, Vec<ResultCandidate>>>::new();
+    for ((head, id, _run), rows) in grouped {
+        let rows = bind_parity_history(&id, rows, ResultInput::Retained)?;
+        for row in &rows {
+            match row.evidence(&id, ResultInput::Retained)? {
+                ValidateRowEvidence::Matched { .. }
+                | ValidateRowEvidence::Diverged { .. }
+                | ValidateRowEvidence::ParityMatched { .. }
+                | ValidateRowEvidence::ParityDiverged { .. } => {}
+                _ => {
+                    return Err(
+                        "retained binding input lacks an established typed comparison".into(),
+                    );
+                }
+            }
+        }
+        by_source
+            .entry(head)
+            .or_default()
+            .entry(id)
+            .or_default()
+            .extend(rows);
+    }
+    if by_source.is_empty() {
+        return Err("retained binding input contains no comparisons".into());
+    }
+    Ok(by_source)
+}
+
+fn bind_retained_attempts(root: &Path, inputs: &[RetainedBindingInput]) -> Result<(), String> {
+    let _lock = acquire_history_write_lock(root)?;
+    let worktree = observation_worktree_state(root)?;
+    worktree.ensure_clean()?;
+    let held = inputs
+        .iter()
+        .map(|input| HeldEvidenceFile::open(&input.path, Some(&input.sha256)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let files = held
+        .iter()
+        .map(|file| (file.path.clone(), file.bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let selected = held
+        .iter()
+        .zip(inputs)
+        .map(|(file, input)| {
+            selected_binding_input(file, &input.lines).map(|bytes| (file.path.clone(), bytes))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_inputs = selected
+        .iter()
+        .map(|(path, bytes)| (path.clone(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let candidates = retained_binding_candidates(&selected_inputs)?;
+    let ledger = ledger_root(root, false)?;
+    let source = snapshot_series_source(&ledger.join("series"))?;
+    let events = read_series_rows(&source)?;
+    let snapshot = AttemptBindingSnapshot::captured(&source, &events)?;
+    let original = read_history_files(root)?;
+    let derived = check_tracked(root)?;
+    let mut tracked: TrackedCells =
+        serde_json::from_slice(&original.cells).map_err(|error| error.to_string())?;
+    let before = tracked.clone();
+    if tracked.projection.is_none() {
+        tracked.projection = Some(snapshot.projection(events.len(), source.source_commit.clone()));
+    }
+    let selection = held
+        .iter()
+        .zip(inputs)
+        .map(|(file, input)| (file.path.clone(), input.lines.clone()))
+        .collect::<SelectedBindingLines>();
+    let producer = git_head(manifest_tool_root()?)?;
+    let mut source_rows = Vec::new();
+    for (head, rows) in candidates {
+        if !git_is_ancestor(root, &head, &worktree.head)? {
+            return Err(
+                "retained binding source is not on the receiving checkout's history".into(),
+            );
+        }
+        let tree = git_no_replace_rev_parse(root, &format!("{head}:detcore"))?;
+        source_rows.push((tree, rows));
+    }
+    let sources = source_rows
+        .iter()
+        .map(|(tree, candidates)| AttemptBindingSource {
+            detcore_tree: tree,
+            candidates,
+        })
+        .collect::<Vec<_>>();
+    append_attempt_bindings(
+        &mut tracked,
+        &sources,
+        &files,
+        AttemptBindingContext {
+            producer: &producer,
+            snapshot: &snapshot,
+            events: &events,
+            kind: AttemptBindingKind::Retained,
+            selected_lines: Some(&selection),
+        },
+    )?;
+    // Migration attaches provenance only. It never imports or rewrites an old
+    // observation, even if a new producer could serialize that evidence anew.
+    if serde_json::to_vec(&before.cells).map_err(|error| error.to_string())?
+        != serde_json::to_vec(&tracked.cells).map_err(|error| error.to_string())?
+    {
+        return Err("attempt-binding migration changed original observations".into());
+    }
+    preserve_attempt_bindings(&before, &tracked)?;
+    let attempts = validate_attempt_bindings(&tracked, Some(&events))?;
+    let _ = direct_representation(&tracked, &events, &attempts)?;
+    let updated = generated_files(&derived, &tracked)?;
+    let mut unchanged: JsonValue =
+        serde_json::from_slice(&original.cells).map_err(|error| error.to_string())?;
+    let proposed: JsonValue =
+        serde_json::from_slice(&updated.cells).map_err(|error| error.to_string())?;
+    unchanged["projection"] = proposed["projection"].clone();
+    if unchanged != proposed {
+        return Err("attempt-binding migration altered data outside projection metadata".into());
+    }
+    let verify = || -> Result<(), String> {
+        observation_worktree_state(root)?.ensure_clean()?;
+        if git_head(root)? != worktree.head {
+            return Err("binding source HEAD moved".into());
+        }
+        for file in &held {
+            file.verify()?;
+        }
+        let current = snapshot_series_source(&ledger.join("series"))?;
+        if current.source_commit != source.source_commit
+            || current.source_tree != source.source_tree
+        {
+            return Err("binding series snapshot moved before publication".into());
+        }
+        Ok(())
+    };
+    replace_history_files_with(
+        root,
+        &original,
+        &updated,
+        || {
+            verify()?;
+            if read_history_files(root)? != original {
+                return Err("binding history changed before publication".into());
+            }
+            Ok(())
+        },
+        |replacement| {
+            verify()?;
+            let current = read_history_files(root)?;
+            let expected_scorecard = if replacement == 1 {
+                &original.scorecard
+            } else {
+                &updated.scorecard
+            };
+            if current.cells != original.cells || &current.scorecard != expected_scorecard {
+                return Err("binding history changed during publication".into());
+            }
+            Ok(())
+        },
+    )?;
+    println!(
+        "compatibility scorecard: appended validated attempt bindings; original observations unchanged"
+    );
+    Ok(())
+}
+
+type AttemptInputWitnesses = BTreeMap<(CellId, String, String, String), AttemptBindingInput>;
+type SelectedBindingLines = BTreeMap<PathBuf, BTreeSet<usize>>;
+
+/// Index exact held input lines without retaining streams in the ledger.
+fn attempt_input_witnesses(
+    inputs: &[(PathBuf, &[u8])],
+    retained: bool,
+    selected_lines: Option<&SelectedBindingLines>,
+) -> Result<AttemptInputWitnesses, String> {
+    let mut witnesses = AttemptInputWitnesses::new();
+    for (path, bytes) in inputs {
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            return Err("attempt-binding input has a truncated JSONL tail".into());
+        }
+        let file_sha256 = format!("{:x}", Sha256::digest(bytes));
+        let selected = selected_lines
+            .map(|lines| {
+                lines
+                    .get(path)
+                    .ok_or("held binding input has no explicit line selection")
+            })
+            .transpose()?;
+        for (index, raw_line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+            if selected.is_some_and(|lines| !lines.contains(&(index + 1))) {
+                continue;
+            }
+            let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            let line = std::str::from_utf8(raw_line).map_err(|error| error.to_string())?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            serde_json::from_str::<UniqueJsonFields>(line).map_err(|error| error.to_string())?;
+            let mut row: ResultRow =
+                serde_json::from_str(line).map_err(|error| error.to_string())?;
+            normalise_recorded_root(&mut row);
+            if retained {
+                if let Some(prefix) = path
+                    .ancestors()
+                    .find(|p| p.file_name().is_some_and(|n| n == "ignored"))
+                    .and_then(Path::parent)
+                    .and_then(Path::to_str)
+                {
+                    normalise_recorded_prefix(&mut row, prefix);
+                }
+            }
+            let key = (
+                row.id().ok_or("attempt-binding row has no backend")?,
+                row.hermit_sha.clone(),
+                row.run_id.clone(),
+                row.evidence_identity()?,
+            );
+            let witness = AttemptBindingInput {
+                file_sha256: file_sha256.clone(),
+                file_bytes: bytes.len() as u64,
+                line: index as u64 + 1,
+                row_sha256: format!("{:x}", Sha256::digest(line.as_bytes())),
+            };
+            if let Some(previous) = witnesses.get(&key) {
+                // Current ingestion already admits identical repeated rows.
+                // The census sorts files, and this loop walks original lines,
+                // so retain the first exact witness without adding an attempt.
+                // Retained migration still requires an unambiguous selector.
+                if !retained && previous.row_sha256 == witness.row_sha256 {
+                    continue;
+                }
+                return Err("attempt-binding inputs duplicate an exact result identity".into());
+            }
+            witnesses.insert(key, witness);
+        }
+    }
+    Ok(witnesses)
+}
+
+struct AttemptBindingSource<'a> {
+    detcore_tree: &'a str,
+    candidates: &'a BTreeMap<CellId, Vec<ResultCandidate>>,
+}
+
+struct AttemptBindingContext<'a> {
+    producer: &'a str,
+    snapshot: &'a AttemptBindingSnapshot,
+    events: &'a [SeriesRow],
+    kind: AttemptBindingKind,
+    selected_lines: Option<&'a SelectedBindingLines>,
+}
+
+fn append_attempt_bindings(
+    tracked: &mut TrackedCells,
+    sources: &[AttemptBindingSource<'_>],
+    inputs: &[(PathBuf, &[u8])],
+    context: AttemptBindingContext<'_>,
+) -> Result<(), String> {
+    let AttemptBindingContext {
+        producer,
+        snapshot,
+        events,
+        kind,
+        selected_lines,
+    } = context;
+    let witnesses =
+        attempt_input_witnesses(inputs, kind == AttemptBindingKind::Retained, selected_lines)?;
+    let previous = validate_attempt_bindings(tracked, Some(events))?;
+    // Coverage is global: every supplied source must contribute its validated
+    // attempts before any source's retry group is reconciled. Per-source
+    // reconciliation would refuse another supplied head before seeing its map.
+    let mut combined = previous.clone();
+    for source in sources {
+        combined = merge_attempt_maps(
+            combined,
+            current_result_attempts(tracked, source.candidates, source.detcore_tree)?,
+        )?;
+    }
+    let representation = direct_representation(tracked, events, &combined)?;
+    let mut additions = Vec::new();
+    let mut staged_current_keys = BTreeSet::new();
+    for source in sources {
+        let detcore_tree = source.detcore_tree;
+        for (id, rows) in source.candidates {
+            for candidate in rows {
+                let row = &candidate.row;
+                let base = DirectEvidenceBase {
+                    cell: series_cell_key(id),
+                    identity: SeriesObservationIdentity::DetcoreTree(detcore_tree.into()),
+                    provenance: ObservationProvenance::Validate,
+                    hermit_sha: row.hermit_sha.clone(),
+                    run_id: row.run_id.clone(),
+                };
+                let key = (base, candidate.evidence_identity.clone());
+                // Only existing, typed direct comparisons receive these bindings.
+                let results = tracked
+                    .cells
+                    .iter()
+                    .filter(|cell| &cell.id == id)
+                    .flat_map(|cell| &cell.observations)
+                    .filter(|observation| {
+                        observation.event_ids.is_empty()
+                            && observation.detcore_tree.as_deref() == Some(detcore_tree)
+                            && observation.provenance == ObservationProvenance::Validate
+                    })
+                    .flat_map(direct_comparison_receipts)
+                    .filter(|(head, run, digest, _)| {
+                        *head == row.hermit_sha
+                            && *run == row.run_id
+                            && *digest == candidate.evidence_identity
+                    })
+                    .map(|(_, _, _, result)| result)
+                    .collect::<Vec<_>>();
+                if results.is_empty() && kind == AttemptBindingKind::Current {
+                    continue;
+                }
+                let [result] = results.as_slice() else {
+                    return Err("attempt binding requires one existing validated comparison".into());
+                };
+                if previous
+                    .get(&key)
+                    .is_some_and(|attempt| *attempt == row.attempt)
+                {
+                    continue;
+                }
+                // The raw witness index has already refused nonidentical
+                // duplicates, and the complete attempt map checked conflicts.
+                // Ordinary current ingestion can retain repeated candidates;
+                // emit one binding for the one comparison they identify.
+                if kind == AttemptBindingKind::Current && !staged_current_keys.insert(key) {
+                    continue;
+                }
+                let input_key = (
+                    id.clone(),
+                    row.hermit_sha.clone(),
+                    row.run_id.clone(),
+                    candidate.evidence_identity.clone(),
+                );
+                let mut binding = ComparisonAttemptBinding {
+                    cell: id.clone(),
+                    provenance: ObservationProvenance::Validate,
+                    hermit_sha: row.hermit_sha.clone(),
+                    detcore_tree: detcore_tree.into(),
+                    run_id: row.run_id.clone(),
+                    evidence_sha256: candidate.evidence_identity.clone(),
+                    attempt: row.attempt,
+                    result: *result,
+                    kind,
+                    producer_hermit_sha: producer.into(),
+                    input: witnesses
+                        .get(&input_key)
+                        .ok_or("validated row has no held raw witness")?
+                        .clone(),
+                    snapshot: snapshot.clone(),
+                    events: Vec::new(),
+                };
+                let matching_events = events
+                    .iter()
+                    .filter(|event| binding_matches_event(&binding, event))
+                    .collect::<Vec<_>>();
+                for event in matching_events {
+                    if !representation
+                        .represented_event_ids
+                        .contains(&event.event_id)
+                    {
+                        return Err("binding does not have complete exact event coverage".into());
+                    }
+                    binding.events.push(AttemptBindingEvent {
+                        event_id: event.event_id.clone(),
+                        typed_event_sha256: typed_event_digest(event)?,
+                    });
+                }
+                if kind == AttemptBindingKind::Retained && binding.events.is_empty() {
+                    return Err("retained binding has no captured series event".into());
+                }
+                additions.push(binding);
+            }
+        }
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let projection = tracked
+        .projection
+        .as_mut()
+        .ok_or("attempt bindings require an actual series projection")?;
+    let envelope = projection
+        .comparison_attempt_bindings_v1
+        .get_or_insert_with(|| ComparisonAttemptBindings {
+            schema: 1,
+            authority: ATTEMPT_BINDING_AUTHORITY.into(),
+            bindings: Vec::new(),
+            retired_canonical_comparisons: Vec::new(),
+        });
+    envelope.bindings.extend(additions);
+    envelope.bindings.sort_by_key(binding_key);
+    let complete = validate_attempt_bindings(tracked, Some(events))?;
+    let _ = direct_representation(tracked, events, &complete)?;
+    Ok(())
+}
 
 fn current_result_attempts(
     validated: &TrackedCells,
     rows: &BTreeMap<CellId, Vec<ResultCandidate>>,
     detcore_tree: &str,
-) -> Result<CurrentResultAttempts, String> {
-    let mut attempts = CurrentResultAttempts::new();
+) -> Result<ValidatedComparisonAttempts, String> {
+    let mut attempts = ValidatedComparisonAttempts::new();
     for (id, candidates) in rows {
         if !validated.cells.iter().any(|cell| &cell.id == id) {
             continue;
@@ -8196,7 +9303,7 @@ fn direct_comparison_receipts(
 
 fn bound_direct_attempts(
     tracked: &TrackedCells,
-    current: &CurrentResultAttempts,
+    current: &ValidatedComparisonAttempts,
 ) -> Result<BTreeMap<DirectEvidenceKey, BTreeSet<u64>>, String> {
     let mut bound = BTreeMap::<DirectEvidenceKey, BTreeSet<u64>>::new();
     for cell in &tracked.cells {
@@ -8371,7 +9478,7 @@ fn source_direct_evidence_key(
 fn current_comparison_representation(
     tracked: &TrackedCells,
     rows: &[SeriesRow],
-    current: &CurrentResultAttempts,
+    current: &ValidatedComparisonAttempts,
     direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
 ) -> Result<(BTreeSet<String>, BTreeSet<DirectEvidenceKey>), String> {
     let mut bound = BTreeMap::<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>::new();
@@ -8506,7 +9613,7 @@ fn current_comparison_representation(
 fn direct_representation(
     tracked: &TrackedCells,
     rows: &[SeriesRow],
-    current_attempts: &CurrentResultAttempts,
+    current_attempts: &ValidatedComparisonAttempts,
 ) -> Result<DirectRepresentation, String> {
     let (direct, opaque) = direct_evidence_keys(tracked)?;
     let (mut represented_event_ids, mut represented_direct) =
@@ -9998,6 +11105,7 @@ fn scorecard_snapshot_fixture_value(
     Ok(serde_json::json!({
         "schema": SCORECARD_SERIES_SNAPSHOT_SCHEMA,
         "source": {
+            "repository": TEST_LEDGER_REPOSITORY,
             "path": SCORECARD_SERIES_SNAPSHOT_SOURCE,
             "commit": source_commit,
             "tree": source_tree,
@@ -14927,6 +16035,27 @@ fn self_test() -> Result<(), String> {
         &fixture_history.scorecard,
     )
     .map_err(|error| error.to_string())?;
+    fs::create_dir_all(fixture_ledger.join("series/hermit/fixture"))
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        fixture_ledger.join("series/hermit/fixture/2026-09.jsonl"),
+        b"",
+    )
+    .map_err(|error| error.to_string())?;
+    git_ok(&fixture_ledger, &["add", "series", "scorecard"])?;
+    git_ok(
+        &fixture_ledger,
+        &[
+            "-c",
+            "user.email=scorecard@example.invalid",
+            "-c",
+            "user.name=Scorecard Self-Test",
+            "commit",
+            "--quiet",
+            "-m",
+            "captured empty fixture series",
+        ],
+    )?;
     let publication_lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -15856,6 +16985,7 @@ fn self_test() -> Result<(), String> {
         refreshed_at: "fixture-before-current".into(),
         rows_read: 1,
         pre_series_corpus: false,
+        comparison_attempt_bindings_v1: None,
     });
     refresh_measurement(&mut projected_seed);
     let replaced_projection = reconcile_control(
@@ -15869,7 +16999,7 @@ fn self_test() -> Result<(), String> {
     let unbound_error = direct_representation(
         &before_publication,
         &different_rows,
-        &CurrentResultAttempts::new(),
+        &ValidatedComparisonAttempts::new(),
     )
     .expect_err("a compact historical PASS was assumed to prove outer attempt one");
     if !unbound_error.contains("disagree") {
@@ -20988,7 +22118,7 @@ fn self_test() -> Result<(), String> {
     let unrelated_representation = direct_representation(
         &duplicate_history,
         &[unrelated_source_row],
-        &CurrentResultAttempts::new(),
+        &ValidatedComparisonAttempts::new(),
     )?;
     if !unrelated_representation.represented_event_ids.is_empty()
         || !unrelated_representation.has_unrepresented_direct_evidence
@@ -21002,7 +22132,7 @@ fn self_test() -> Result<(), String> {
     let claimed_duplicate_error = direct_representation(
         &duplicate_history,
         &[claimed_source_row],
-        &CurrentResultAttempts::new(),
+        &ValidatedComparisonAttempts::new(),
     )
     .expect_err("a source event claimed duplicate retained direct evidence");
     if !claimed_duplicate_error.contains("2 records for that exact identity")
@@ -21196,6 +22326,7 @@ fn self_test() -> Result<(), String> {
                 refreshed_at: "fixture-no-verdict".into(),
                 rows_read: captured_rows.len() as u64,
                 pre_series_corpus: outcome.pre_series_corpus,
+                comparison_attempt_bindings_v1: None,
             });
             refresh_measurement(&mut tracked);
             Ok((tracked, outcome))
@@ -21718,6 +22849,7 @@ fn self_test() -> Result<(), String> {
                 refreshed_at: "fixture-stamp".into(),
                 rows_read: ambient_rows.len() as u64,
                 pre_series_corpus: false,
+                comparison_attempt_bindings_v1: None,
             }),
             cells: vec![target_cell],
         };
@@ -21913,6 +23045,7 @@ fn self_test() -> Result<(), String> {
             refreshed_at: "fixture-stamp".into(),
             rows_read: 7,
             pre_series_corpus: false,
+            comparison_attempt_bindings_v1: None,
         }),
         cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
     };
@@ -23846,7 +24979,7 @@ mod post_verdict_transaction_tests {
         );
     }
 
-    fn result_row(sha: &str) -> JsonValue {
+    pub(super) fn result_row(sha: &str) -> JsonValue {
         let output = serde_json::json!({"exit_code":0,"signal":null,
             "stdout_sha256":"e".repeat(64),"stdout_bytes":1,"stderr_sha256":"f".repeat(64),"stderr_bytes":0});
         let report = serde_json::to_string(&serde_json::json!({
@@ -24052,6 +25185,527 @@ mod post_verdict_transaction_tests {
         fn cells(&self) -> TrackedCells {
             read_json(&self.ledger.join(LEDGER_CELLS)).unwrap()
         }
+    }
+
+    #[test]
+    fn import_retires_bound_ordinary_comparison_without_losing_provenance() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let fixture = Fixture::new();
+        let row = result_row(&fixture.options.expected_head);
+        fs::write(
+            fixture.options.results.join("results.jsonl"),
+            format!("{}\n", serde_json::to_string(&row).unwrap()),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.ledger.join("series/hermit/fixture")).unwrap();
+        fs::write(
+            fixture.ledger.join("series/hermit/fixture/2026-09.jsonl"),
+            b"",
+        )
+        .unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        commit(&fixture.ledger, "captured empty fixture series");
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        let before = fixture.cells();
+        assert_eq!(
+            comparison_attempt_bindings(&before).unwrap().bindings.len(),
+            1
+        );
+        let mut replacement = row.clone();
+        replacement["run_id"] = "replacement-import".into();
+        fs::write(
+            fixture.options.results.join("results.jsonl"),
+            format!("{}\n", serde_json::to_string(&replacement).unwrap()),
+        )
+        .unwrap();
+        let summary = fixture._directory.path().join("current-summary.json");
+        fs::write(
+            &summary,
+            serde_json::to_vec(&PressureSummary {
+                schema: PRESSURE_SUMMARY_SCHEMA,
+                hermit_sha: fixture.options.expected_head.clone(),
+                detcore_tree: git_rev_parse(&fixture.root, "HEAD:detcore").unwrap(),
+                source_tree_dirty: false,
+                rows: vec![PressureSummaryRow {
+                    cell: fixture.id.clone(),
+                    repetition: Some(1),
+                    attempt: 1,
+                    result: "pass".into(),
+                    verification: None,
+                    evidence_errors: Vec::new(),
+                    invocation: None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        import_results(
+            &fixture.root,
+            &fixture.options.results,
+            std::slice::from_ref(&summary),
+        )
+        .unwrap();
+        let retired = fixture.cells();
+        let envelope = comparison_attempt_bindings(&retired).unwrap();
+        assert_eq!(
+            envelope.bindings,
+            comparison_attempt_bindings(&before).unwrap().bindings
+        );
+        assert_eq!(envelope.retired_canonical_comparisons.len(), 1);
+        let binding = &envelope.bindings[0];
+        assert_eq!(
+            bound_canonical_comparisons(&before, binding),
+            [&envelope.retired_canonical_comparisons[0].comparison]
+        );
+        assert!(bound_canonical_comparisons(&retired, binding).is_empty());
+        assert!(
+            validate_attempt_bindings(&retired, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        let once = read_history_files(&fixture.root).unwrap();
+        import_results(
+            &fixture.root,
+            &fixture.options.results,
+            std::slice::from_ref(&summary),
+        )
+        .unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == once);
+        // Re-observing the exact retired input reactivates its original binding,
+        // while preserving the immutable archive and never adding a duplicate.
+        fs::write(
+            fixture.options.results.join("results.jsonl"),
+            format!("{}\n", serde_json::to_string(&row).unwrap()),
+        )
+        .unwrap();
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        let reactivated = fixture.cells();
+        assert_eq!(comparison_attempt_bindings(&reactivated), Some(envelope));
+        assert_eq!(
+            validate_attempt_bindings(&reactivated, Some(&[]))
+                .unwrap()
+                .len(),
+            1
+        );
+        let active_once = read_history_files(&fixture.root).unwrap();
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == active_once);
+        assert_eq!(
+            fs::read(fixture.ledger.join("series/hermit/fixture/2026-09.jsonl")).unwrap(),
+            b""
+        );
+    }
+
+    fn historical_retry_row(head: &str, run: &str, attempt: u64) -> JsonValue {
+        let mut failed = result_row(head);
+        failed["run_id"] = run.into();
+        failed["attempt"] = attempt.into();
+        failed["outcome"] = "FAIL".into();
+        failed["result"] = "replay-failure".into();
+        failed["failure_class"] = "product_failure".into();
+        failed["first_divergent_record"] = 1.into();
+        failed["first_divergent_syscall"] = 1.into();
+        failed["attempts"][0]["outcome"] = "FAIL".into();
+        failed["attempts"][0]["status"] = 1.into();
+        let mut report: JsonValue = serde_json::from_str(
+            failed["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report["verified"] = false.into();
+        report["bitwise_parity"] = false.into();
+        report["verdict"] = "diverged".into();
+        report["first_divergent_record"] = 1.into();
+        report["first_divergent_syscall"] = 1.into();
+        report["first_divergent_left_message"] = "INFO detcore: result=1".into();
+        report["first_divergent_right_message"] = "INFO detcore: result=2".into();
+        let report = serde_json::to_string(&report).unwrap();
+        failed["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        failed["attempts"][0]["verification_report"] = report.into();
+        failed
+    }
+
+    #[test]
+    fn retained_retry_bindings_reconcile_all_historical_heads_together() {
+        // The relative-operand controls change cwd. Isolate the whole fixture
+        // in one test process so default parallel cargo tests cannot observe it.
+        const CHILD: &str = "HERMIT_SCORECARD_RELATIVE_BINDING_TEST_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "post_verdict_transaction_tests::retained_retry_bindings_reconcile_all_historical_heads_together", "--nocapture"])
+                .env(CHILD, "1")
+                .current_dir(directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let fixture = Fixture::new();
+        let mut tracked = fixture.cells();
+        let heads = [
+            fixture.options.results_head.as_ref().unwrap().clone(),
+            fixture.options.expected_head.clone(),
+        ];
+        let mut inputs = Vec::new();
+        let mut events = Vec::new();
+        for (index, head) in heads.iter().enumerate() {
+            let tree = git_rev_parse(&fixture.root, &format!("{head}:detcore")).unwrap();
+            let run = format!("historical-retry-{index}");
+            let path = fixture
+                ._directory
+                .path()
+                .join(format!("historical-{index}.jsonl"));
+            let mut raw = Vec::new();
+            for attempt in 1..=2 {
+                raw.extend(serde_json::to_vec(&historical_retry_row(head, &run, attempt)).unwrap());
+                raw.push(b'\n');
+                events.push(serde_json::from_value::<SeriesRow>(serde_json::json!({
+                    "schema":"stress-series/v3","event_id":format!("historical-{index}-{attempt}"),
+                    "event_type":"series.observation","emitted_at":"2026-09-23T00:00:00Z",
+                    "team":"hermit","host":"fixture","producer":"validate","run_id":run,
+                    "series":{"cell":series_cell_key(&fixture.id),"tree":head,"detcore_tree":tree,
+                        "run_index":attempt,"num_runs":1,"result":"replay-failure","outcome":"diverged",
+                        "failure_class":"product_failure","source_tree_dirty":false,
+                        "machine_shortname":"fixture","kernel_version":"fixture",
+                        "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic"},
+                            "kvm":{"present":false,"evidence":"synthetic"}}}
+                })).unwrap());
+            }
+            fs::write(&path, &raw).unwrap();
+            let files = [(path.clone(), raw.as_slice())];
+            let candidates = retained_binding_candidates(&files).unwrap();
+            apply_validate_results_from(
+                &mut tracked,
+                &candidates[head],
+                head,
+                &tree,
+                &source_depths(&fixture.root, head).unwrap(),
+                ValidateInput {
+                    reports: ResultInput::Retained,
+                    store_invocation: true,
+                    store_positions: true,
+                    applicability: None,
+                },
+            )
+            .unwrap();
+            inputs.push(RetainedBindingInput {
+                path,
+                sha256: format!("{:x}", Sha256::digest(&raw)),
+                lines: BTreeSet::from([1, 2]),
+            });
+        }
+        let series_path = fixture.ledger.join("series/hermit/fixture/2026-09.jsonl");
+        fs::create_dir_all(series_path.parent().unwrap()).unwrap();
+        let mut series_bytes = Vec::new();
+        for event in &events {
+            series_bytes.extend(serde_json::to_vec(event).unwrap());
+            series_bytes.push(b'\n');
+        }
+        fs::write(&series_path, &series_bytes).unwrap();
+        fs::write(
+            fixture.ledger.join(LEDGER_CELLS),
+            encoded_cells(&tracked).unwrap(),
+        )
+        .unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        commit(&fixture.ledger, "historical retry witnesses");
+        let before = read_history_files(&fixture.root).unwrap();
+        let original = fixture.cells();
+        // Partial input must not make the still-unbound second source disappear.
+        assert!(bind_retained_attempts(&fixture.root, &inputs[..1]).is_err());
+        assert!(read_history_files(&fixture.root).unwrap() == before);
+        // Relative CLI operands select the same held original lines and full
+        // file hashes. Fixture commands share this lock; restore cwd on panic.
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                env::set_current_dir(&self.0).unwrap();
+            }
+        }
+        {
+            let _restore = RestoreCwd(env::current_dir().unwrap());
+            env::set_current_dir(fixture._directory.path()).unwrap();
+            let mut arguments = Vec::new();
+            for (index, input) in inputs.iter().enumerate() {
+                arguments.extend([
+                    "--result-file".into(),
+                    format!("historical-{index}.jsonl"),
+                    "--result-sha256".into(),
+                    input.sha256.clone(),
+                    "--result-lines".into(),
+                    "1,2".into(),
+                ]);
+            }
+            let mut bad = arguments.clone();
+            bad[3] = "0".repeat(64);
+            assert!(
+                bind_retained_attempts(&fixture.root, &parse_attempt_binding_files(&bad).unwrap())
+                    .is_err()
+            );
+            assert!(read_history_files(&fixture.root).unwrap() == before);
+            bind_retained_attempts(
+                &fixture.root,
+                &parse_attempt_binding_files(&arguments).unwrap(),
+            )
+            .unwrap();
+        }
+        let bound = fixture.cells();
+        assert_eq!(bound.cells, original.cells);
+        assert_eq!(
+            comparison_attempt_bindings(&bound).unwrap().bindings.len(),
+            4
+        );
+        let attempts = validate_attempt_bindings(&bound, Some(&events)).unwrap();
+        assert_eq!(
+            direct_representation(&bound, &events, &attempts)
+                .unwrap()
+                .represented_event_ids
+                .len(),
+            4
+        );
+        assert!(
+            comparison_attempt_bindings(&bound)
+                .unwrap()
+                .bindings
+                .iter()
+                .all(|binding| binding.result == ObservedResult::ReplayFailure)
+        );
+        assert_eq!(fs::read(&series_path).unwrap(), series_bytes);
+        let once = read_history_files(&fixture.root).unwrap();
+        bind_retained_attempts(&fixture.root, &inputs).unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == once);
+    }
+
+    #[test]
+    fn identical_current_rows_retain_one_binding_and_one_comparison() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let fixture = Fixture::new();
+        let row = result_row(&fixture.options.expected_head);
+        let raw = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
+        let repeated = [raw.as_slice(), raw.as_slice()].concat();
+        fs::write(fixture.options.results.join("results.jsonl"), &repeated).unwrap();
+        fs::create_dir_all(fixture.ledger.join("series/hermit/fixture")).unwrap();
+        fs::write(
+            fixture.ledger.join("series/hermit/fixture/2026-09.jsonl"),
+            b"",
+        )
+        .unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        commit(&fixture.ledger, "captured empty fixture series");
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        let tracked = fixture.cells();
+        let envelope = comparison_attempt_bindings(&tracked).unwrap();
+        assert_eq!(envelope.bindings.len(), 1);
+        assert_eq!(envelope.bindings[0].input.line, 1);
+        assert_eq!(envelope.bindings[0].input.file_bytes, repeated.len() as u64);
+        assert_eq!(
+            envelope.bindings[0].input.file_sha256,
+            format!("{:x}", Sha256::digest(&repeated))
+        );
+        let cell = tracked
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        assert_eq!(
+            cell.observations
+                .iter()
+                .flat_map(direct_comparison_receipts)
+                .count(),
+            1
+        );
+        let once = read_history_files(&fixture.root).unwrap();
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == once);
+
+        let changed = [raw.as_slice(), b" ", raw.as_slice()].concat();
+        fs::write(fixture.options.results.join("results.jsonl"), changed).unwrap();
+        let error = observe_results(&fixture.root, &fixture.options.results).unwrap_err();
+        assert!(
+            error.contains("duplicate an exact result identity"),
+            "{error}"
+        );
+        assert!(read_history_files(&fixture.root).unwrap() == once);
+    }
+
+    #[test]
+    fn retained_bindings_and_current_retry_events_reconcile_together() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        fixture.publish().unwrap();
+        let retained = fixture.cells();
+        assert_eq!(
+            comparison_attempt_bindings(&retained)
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+        let mut failed = fixture.row.clone();
+        failed["run_id"] = "current-retry-run".into();
+        failed["outcome"] = "FAIL".into();
+        failed["result"] = "replay-failure".into();
+        failed["failure_class"] = "product_failure".into();
+        failed["first_divergent_record"] = 1.into();
+        failed["first_divergent_syscall"] = 1.into();
+        failed["attempts"][0]["outcome"] = "FAIL".into();
+        failed["attempts"][0]["status"] = 1.into();
+        let mut report: JsonValue = serde_json::from_str(
+            failed["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report["verified"] = false.into();
+        report["bitwise_parity"] = false.into();
+        report["verdict"] = "diverged".into();
+        report["first_divergent_record"] = 1.into();
+        report["first_divergent_syscall"] = 1.into();
+        report["first_divergent_left_message"] = "INFO detcore: result=1".into();
+        report["first_divergent_right_message"] = "INFO detcore: result=2".into();
+        let report = serde_json::to_string(&report).unwrap();
+        failed["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        failed["attempts"][0]["verification_report"] = report.into();
+        let mut second_failure = failed.clone();
+        second_failure["run_id"] = "current-retry-run".into();
+        second_failure["attempt"] = 2.into();
+        fixture.row = failed.clone();
+        fixture.publish_rows(&[failed, second_failure]);
+        let detcore_tree = git_rev_parse(
+            &fixture.root,
+            &format!("{}:detcore", fixture.row["hermit_sha"].as_str().unwrap()),
+        )
+        .unwrap();
+        let events=(1..=2).map(|attempt| serde_json::from_value::<SeriesRow>(serde_json::json!({
+            "schema":"stress-series/v3","event_id":format!("current-retry-{attempt}"),
+            "event_type":"series.observation","emitted_at":"2026-09-23T00:00:00Z",
+            "team":"hermit","host":"fixture","producer":"validate","run_id":"current-retry-run",
+            "series":{"cell":series_cell_key(&fixture.id),"tree":fixture.row["hermit_sha"],"detcore_tree":detcore_tree,
+                "run_index":attempt,"num_runs":1,"result":"replay-failure",
+                "outcome":"diverged",
+                "failure_class":"product_failure",
+                "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic"},
+                    "kvm":{"present":false,"evidence":"synthetic"}}}
+        })).unwrap()).collect::<Vec<_>>();
+        let snapshot =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &events).unwrap();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &snapshot).unwrap();
+        fixture.publish().unwrap();
+        let current = fixture.cells();
+        preserve_attempt_bindings(&retained, &current).unwrap();
+        assert_eq!(
+            comparison_attempt_bindings(&current)
+                .unwrap()
+                .bindings
+                .len(),
+            3
+        );
+        let attempts = validate_attempt_bindings(&current, Some(&events)).unwrap();
+        assert_eq!(
+            direct_representation(&current, &events, &attempts)
+                .unwrap()
+                .represented_event_ids
+                .len(),
+            2
+        );
+        let cell = current
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        let outcomes = cell
+            .observations
+            .iter()
+            .flat_map(direct_comparison_receipts)
+            .filter(|(_, run, _, _)| *run == "current-retry-run")
+            .map(|(_, _, _, result)| result)
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|result| *result == ObservedResult::ReplayFailure)
+        );
+    }
+
+    #[test]
+    fn attempt_bindings_survive_normal_projection_and_current_ingestion() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        fixture.publish().unwrap();
+        let first = comparison_attempt_bindings(&fixture.cells())
+            .unwrap()
+            .clone();
+        assert_eq!(first.bindings.len(), 1);
+        fixture.row["run_id"] = "successor-current-run".into();
+        fixture.publish_inputs();
+        fixture.publish().unwrap();
+        let successor = fixture.cells();
+        assert_eq!(
+            comparison_attempt_bindings(&successor)
+                .unwrap()
+                .bindings
+                .len(),
+            2
+        );
+        assert!(
+            comparison_attempt_bindings(&successor)
+                .unwrap()
+                .bindings
+                .contains(&first.bindings[0])
+        );
+
+        // Ordinary nightly projection has only the ledger. Its current empty
+        // series is a real captured Git snapshot, not a fabricated fallback.
+        fs::create_dir_all(fixture.ledger.join("series/hermit/fixture")).unwrap();
+        fs::write(
+            fixture.ledger.join("series/hermit/fixture/2026-09.jsonl"),
+            b"",
+        )
+        .unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        commit(&fixture.ledger, "portable fixture history");
+        fs::remove_dir_all(&fixture.options.results).unwrap();
+        project_observations(&fixture.root, &fixture.ledger.join("series"), "nightly").unwrap();
+        let projected = read_history_files(&fixture.root).unwrap();
+        assert_eq!(fixture.cells().cells, successor.cells);
+        assert_eq!(
+            comparison_attempt_bindings(&fixture.cells()),
+            comparison_attempt_bindings(&successor)
+        );
+        project_observations(&fixture.root, &fixture.ledger.join("series"), "nightly").unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == projected);
+        update_observations(&fixture.root, &[], false).unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == projected);
+
+        // The supported current-only ingest route also emits authority and
+        // keeps both previous rows when the receiving head differs.
+        fs::create_dir(&fixture.options.results).unwrap();
+        fixture.row["hermit_sha"] = fixture.options.expected_head.clone().into();
+        fixture.row["run_id"] = "direct-current-run".into();
+        fixture.publish_inputs();
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        let current = fixture.cells();
+        assert_eq!(
+            comparison_attempt_bindings(&current)
+                .unwrap()
+                .bindings
+                .len(),
+            3
+        );
+        preserve_attempt_bindings(&successor, &current).unwrap();
     }
 
     #[test]
@@ -24656,6 +26310,523 @@ mod post_verdict_transaction_tests {
 }
 
 #[cfg(test)]
+mod attempt_binding_tests {
+    use super::*;
+
+    fn fixture() -> (TrackedCells, Vec<SeriesRow>) {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let id = CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: "fixture/retry".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        };
+        let receipts = ["c".repeat(64), "d".repeat(64)].iter().map(|digest| serde_json::json!({
+            "hermit_sha":head,"hermit_commits":2,"hermit_first_parent":2,"run_id":"old-run",
+            "evidence_sha256":digest,"result":"determinism-failure","left_info_messages":[17],"right_info_messages":[17]
+        })).collect::<Vec<_>>();
+        let mut tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":id.lane,"category":id.category,"test":id.test,
+                "mode":id.mode,"backend":id.backend,"status":"red","observations":[{
+                    "detcore_tree":tree,"provenance":"validate","hermit_shas":[head],
+                    "results":["determinism-failure"],"canonical_comparisons":receipts,"invocations":[]
+                }]}]
+        })).unwrap();
+        let events = (1..=2).map(|attempt| serde_json::from_value::<SeriesRow>(serde_json::json!({
+            "schema":"stress-series/v3","event_id":format!("old-{attempt}"),"event_type":"series.observation",
+            "emitted_at":"2026-09-22T00:00:00Z","team":"hermit","host":"fixture","producer":"validate","run_id":"old-run",
+            "series":{"cell":series_cell_key(&id),"tree":head,"detcore_tree":tree,"run_index":attempt,"num_runs":1,
+                "result":"determinism-failure","outcome":"diverged","failure_class":"product_failure",
+                "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic"},"kvm":{"present":false,"evidence":"synthetic"}}}
+        })).unwrap()).collect::<Vec<_>>();
+        let snapshot = AttemptBindingSnapshot {
+            repository: TEST_LEDGER_REPOSITORY.into(),
+            source: "series".into(),
+            commit: "e".repeat(40),
+            tree: "f".repeat(40),
+            rows_sha256: "1".repeat(64),
+        };
+        tracked.projection = Some(snapshot.projection(2, "fixture".into()));
+        tracked
+            .projection
+            .as_mut()
+            .unwrap()
+            .comparison_attempt_bindings_v1 = Some(ComparisonAttemptBindings {
+            schema: 1,
+            authority: ATTEMPT_BINDING_AUTHORITY.into(),
+            retired_canonical_comparisons: Vec::new(),
+            bindings: ["c".repeat(64), "d".repeat(64)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, digest)| ComparisonAttemptBinding {
+                    cell: id.clone(),
+                    provenance: ObservationProvenance::Validate,
+                    hermit_sha: head.clone(),
+                    detcore_tree: tree.clone(),
+                    run_id: "old-run".into(),
+                    evidence_sha256: digest,
+                    attempt: index as u64 + 1,
+                    result: ObservedResult::DeterminismFailure,
+                    kind: AttemptBindingKind::Retained,
+                    producer_hermit_sha: "2".repeat(40),
+                    input: AttemptBindingInput {
+                        file_sha256: "3".repeat(64),
+                        file_bytes: 100,
+                        line: index as u64 + 1,
+                        row_sha256: "4".repeat(64),
+                    },
+                    snapshot: snapshot.clone(),
+                    events: vec![AttemptBindingEvent {
+                        event_id: events[index].event_id.clone(),
+                        typed_event_sha256: typed_event_digest(&events[index]).unwrap(),
+                    }],
+                })
+                .collect(),
+        });
+        refresh_measurement(&mut tracked);
+        (tracked, events)
+    }
+
+    #[test]
+    fn ledger_only_historical_retry_replay_preserves_original_failures() {
+        let (tracked, events) = fixture();
+        let mut without = tracked.clone();
+        without
+            .projection
+            .as_mut()
+            .unwrap()
+            .comparison_attempt_bindings_v1 = None;
+        let before = serde_json::to_vec(&without).unwrap();
+        let error = apply_series_rows(
+            Path::new("/absent-host-results"),
+            &mut without,
+            &events,
+            Some("series"),
+        )
+        .unwrap_err();
+        assert!(error.contains("source_rows=2"), "{error}");
+        assert_eq!(serde_json::to_vec(&without).unwrap(), before);
+        // A new process has only serialized ledger data, not ResultRows or a
+        // temporary host pathname. Both original adverse attempts survive.
+        let encoded = serde_json::to_vec(&tracked).unwrap();
+        let mut fresh: TrackedCells = serde_json::from_slice(&encoded).unwrap();
+        let attempts = validate_attempt_bindings(&fresh, Some(&events)).unwrap();
+        let represented = direct_representation(&fresh, &events, &attempts).unwrap();
+        assert_eq!(represented.represented_event_ids.len(), 2);
+        let unrepresented = events
+            .iter()
+            .filter(|row| !represented.represented_event_ids.contains(&row.event_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        apply_series_rows(
+            Path::new("/absent-host-results"),
+            &mut fresh,
+            &unrepresented,
+            Some("series"),
+        )
+        .unwrap();
+        assert_eq!(fresh.cells, tracked.cells);
+        assert_eq!(serde_json::to_vec(&fresh).unwrap(), encoded);
+    }
+
+    #[test]
+    fn retired_binding_receipts_preserve_provenance_without_suppressing_series() {
+        let (before, events) = fixture();
+        let mut after = before.clone();
+        remove_imported_validate_projection(&mut after.cells[0]);
+        refresh_measurement(&mut after);
+        assert!(
+            validate_attempt_bindings(&after, Some(&events)).is_err(),
+            "bare orphans refuse"
+        );
+        archive_retired_import_comparisons(&before, &mut after).unwrap();
+        assert!(enforce_writer_boundary(&before, &after, Writer::Observations).is_err());
+        assert!(enforce_writer_boundary(&before, &after, Writer::Update).is_err());
+        enforce_writer_boundary(&before, &after, Writer::ImportResults).unwrap();
+        let active = validate_attempt_bindings(&after, Some(&events)).unwrap();
+        assert!(active.is_empty());
+        assert!(
+            direct_representation(&after, &events, &active)
+                .unwrap()
+                .represented_event_ids
+                .is_empty()
+        );
+        assert_eq!(
+            comparison_attempt_bindings(&before).unwrap().bindings,
+            comparison_attempt_bindings(&after).unwrap().bindings
+        );
+        assert_eq!(
+            comparison_attempt_bindings(&after)
+                .unwrap()
+                .retired_canonical_comparisons
+                .len(),
+            2
+        );
+        let encoded = serde_json::to_vec(&after).unwrap();
+        let decoded = serde_json::from_slice::<TrackedCells>(&encoded).unwrap();
+        assert!(
+            validate_attempt_bindings(&decoded, Some(&events))
+                .unwrap()
+                .is_empty()
+        );
+        archive_retired_import_comparisons(&after.clone(), &mut after).unwrap();
+        assert_eq!(serde_json::to_vec(&after).unwrap(), encoded);
+        for case in 0..8 {
+            let mut bad = after.clone();
+            let archive = &mut bad
+                .projection
+                .as_mut()
+                .unwrap()
+                .comparison_attempt_bindings_v1
+                .as_mut()
+                .unwrap()
+                .retired_canonical_comparisons;
+            match case {
+                0 => {
+                    archive.pop();
+                }
+                1 => archive.push(archive[0].clone()),
+                2 => archive[0].comparison.evidence_sha256 = "9".repeat(64),
+                3 => archive[0]
+                    .comparison
+                    .left_info_messages
+                    .insert(99)
+                    .then_some(())
+                    .unwrap(),
+                4 => archive[0].cell.test = "forged/cell".into(),
+                5 => {
+                    archive[0].comparison.left_info_messages.insert(99);
+                    archive[0].typed_comparison_sha256 =
+                        typed_comparison_digest(&archive[0].comparison).unwrap();
+                }
+                6 => archive[0].cell.lane = "forged-lane".into(),
+                7 => archive[0].cell.category = "forged-category".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                preserve_attempt_bindings(&after, &bad).is_err(),
+                "immutable archive case {case}"
+            );
+            assert!(
+                enforce_writer_boundary(&before, &bad, Writer::ImportResults).is_err(),
+                "creation proof case {case}"
+            );
+            if case != 5 {
+                assert!(
+                    validate_attempt_bindings(&bad, Some(&events)).is_err(),
+                    "archive case {case}"
+                );
+            }
+        }
+        let mut wrong_events = events.clone();
+        wrong_events[0].series.result = Some(ObservedResult::Pass);
+        assert!(validate_attempt_bindings(&after, Some(&wrong_events)).is_err());
+        let mut reactivated = after.clone();
+        reactivated.cells = before.cells.clone();
+        preserve_attempt_bindings(&after, &reactivated).unwrap();
+        assert_eq!(
+            validate_attempt_bindings(&reactivated, Some(&events))
+                .unwrap()
+                .len(),
+            2
+        );
+        // An already archived receipt may be reactivated identically, but its
+        // next retirement still requires the importer rather than any writer.
+        assert!(enforce_writer_boundary(&reactivated, &after, Writer::Observations).is_err());
+        assert!(enforce_writer_boundary(&reactivated, &after, Writer::Update).is_err());
+        enforce_writer_boundary(&reactivated, &after, Writer::ImportResults).unwrap();
+        let first = reactivated.cells[0].observations[0]
+            .canonical_comparisons
+            .pop_first()
+            .unwrap();
+        let mut changed = first;
+        changed.left_info_messages.insert(99);
+        reactivated.cells[0].observations[0]
+            .canonical_comparisons
+            .insert(changed);
+        assert!(
+            validate_attempt_bindings(&reactivated, Some(&events)).is_err(),
+            "reactivation must have the exact typed receipt"
+        );
+    }
+
+    #[test]
+    fn hostile_bindings_and_event_changes_refuse_without_mutation() {
+        let (tracked, events) = fixture();
+        for case in 0..14 {
+            let mut bad = tracked.clone();
+            let envelope = bad
+                .projection
+                .as_mut()
+                .unwrap()
+                .comparison_attempt_bindings_v1
+                .as_mut()
+                .unwrap();
+            match case {
+                0 => envelope.schema = 2,
+                1 => envelope.authority = "unverified-claim".into(),
+                2 => {
+                    envelope.bindings.pop();
+                }
+                3 => envelope.bindings.push(envelope.bindings[0].clone()),
+                4 => envelope.bindings[0].attempt = 2,
+                5 => envelope.bindings[0].evidence_sha256 = "5".repeat(64),
+                6 => envelope.bindings[0].detcore_tree = "6".repeat(40),
+                7 => envelope.bindings[0].hermit_sha = "7".repeat(40),
+                8 => envelope.bindings[0].run_id = "another-run".into(),
+                9 => envelope.bindings[0].cell.backend = "kvm".into(),
+                10 => envelope.bindings[0].result = ObservedResult::Pass,
+                11 => envelope.bindings[0].events.clear(),
+                12 => envelope.bindings[0].events[0].typed_event_sha256 = "8".repeat(64),
+                13 => envelope.bindings[0].input.row_sha256 = "bad".into(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            assert!(
+                validate_attempt_bindings(&bad, Some(&events))
+                    .and_then(|attempts| direct_representation(&bad, &events, &attempts))
+                    .is_err(),
+                "case {case}"
+            );
+            assert_eq!(serde_json::to_vec(&bad).unwrap(), bytes);
+        }
+        for case in 0..5 {
+            let mut bad = events.clone();
+            match case {
+                0 => {
+                    bad.pop();
+                }
+                1 => bad.push(bad[1].clone()),
+                2 => bad[0].series.result = Some(ObservedResult::Pass),
+                3 => bad[0].series.attempt = Some(2),
+                4 => bad[0].series.detcore_tree = Some("9".repeat(40)),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_attempt_bindings(&tracked, Some(&bad)).is_err(),
+                "event case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_projection_replacement_must_retain_binding_authority() {
+        let (tracked, events) = fixture();
+        let mut rewritten = tracked.clone();
+        let snapshot = tracked
+            .projection
+            .as_ref()
+            .unwrap()
+            .comparison_attempt_bindings_v1
+            .as_ref()
+            .unwrap()
+            .bindings[0]
+            .snapshot
+            .clone();
+        rewritten.projection = Some(snapshot.projection(events.len(), "later".into()));
+        assert!(preserve_attempt_bindings(&tracked, &rewritten).is_err());
+        rewritten
+            .projection
+            .as_mut()
+            .unwrap()
+            .comparison_attempt_bindings_v1 = comparison_attempt_bindings(&tracked).cloned();
+        preserve_attempt_bindings(&tracked, &rewritten).unwrap();
+        validate_attempt_bindings(&rewritten, Some(&events)).unwrap();
+    }
+
+    #[test]
+    fn exact_input_hashes_and_duplicate_rows_are_not_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("results.jsonl");
+        let row = post_verdict_transaction_tests::result_row(&"a".repeat(40));
+        let bytes = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
+        fs::write(&path, &bytes).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        assert!(HeldEvidenceFile::open(&path, Some(&"0".repeat(64))).is_err());
+        let held = HeldEvidenceFile::open(&path, Some(&digest)).unwrap();
+        assert_eq!(
+            selected_binding_input(&held, &BTreeSet::from([1])).unwrap(),
+            bytes
+        );
+        assert!(selected_binding_input(&held, &BTreeSet::from([2])).is_err());
+        assert!(selected_binding_input(&held, &BTreeSet::new()).is_err());
+        let inputs = vec![(path.clone(), held.bytes.as_slice())];
+        assert_eq!(retained_binding_candidates(&inputs).unwrap().len(), 1);
+        assert_eq!(
+            attempt_input_witnesses(&inputs, true, None).unwrap().len(),
+            1
+        );
+        let repeated = [bytes.as_slice(), bytes.as_slice()].concat();
+        assert!(
+            attempt_input_witnesses(&[(path.clone(), repeated.as_slice())], true, None).is_err()
+        );
+        let mixed = [
+            b"not JSON\xff\n".as_slice(),
+            bytes.as_slice(),
+            bytes.as_slice(),
+        ]
+        .concat();
+        let selections = BTreeMap::from([(path.clone(), BTreeSet::from([2]))]);
+        let indexed =
+            attempt_input_witnesses(&[(path.clone(), mixed.as_slice())], true, Some(&selections))
+                .unwrap();
+        assert_eq!(indexed.len(), 1);
+        let witness = indexed.values().next().unwrap();
+        assert_eq!(witness.line, 2);
+        assert_eq!(witness.file_bytes, mixed.len() as u64);
+        assert_eq!(witness.file_sha256, format!("{:x}", Sha256::digest(&mixed)));
+        assert!(attempt_input_witnesses(&[(path.clone(), mixed.as_slice())], true, None).is_err());
+        fs::write(&path, b"changed\n").unwrap();
+        assert!(held.verify().is_err());
+        assert!(parse_attempt_binding_files(&[]).is_err());
+        let args = vec![
+            "--result-file".into(),
+            path.to_string_lossy().into_owned(),
+            "--result-sha256".into(),
+            digest,
+            "--result-lines".into(),
+            "1".into(),
+        ];
+        assert_eq!(parse_attempt_binding_files(&args).unwrap().len(), 1);
+        assert!(parse_attempt_binding_files(&[args.clone(), args].concat()).is_err());
+    }
+
+    #[test]
+    fn current_duplicate_witnesses_require_identical_raw_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let row = post_verdict_transaction_tests::result_row(&"a".repeat(40));
+        let raw = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
+        let repeated = [raw.as_slice(), raw.as_slice()].concat();
+        // Creation order is deliberately the opposite of census order.
+        for (name, bytes) in [("z", raw.as_slice()), ("a", repeated.as_slice())] {
+            let path = directory.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("results.jsonl"), bytes).unwrap();
+        }
+        let census = CurrentResultCensus::open(directory.path()).unwrap();
+        let inputs = census.inputs();
+        assert_eq!(inputs[0].0, directory.path().join("a/results.jsonl"));
+        let witnesses = attempt_input_witnesses(&inputs, false, None).unwrap();
+        assert_eq!(witnesses.len(), 1);
+        let witness = witnesses.values().next().unwrap();
+        assert_eq!(witness.line, 1);
+        assert_eq!(witness.file_bytes, repeated.len() as u64);
+        assert_eq!(
+            witness.file_sha256,
+            format!("{:x}", Sha256::digest(&repeated))
+        );
+        assert!(attempt_input_witnesses(&inputs, true, None).is_err());
+
+        // Equal normalized evidence is insufficient: changed raw bytes refuse.
+        let changed = [raw.as_slice(), b" ", raw.as_slice()].concat();
+        assert!(
+            attempt_input_witnesses(
+                &[(directory.path().join("changed.jsonl"), changed.as_slice())],
+                false,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validated_current_rows_create_idempotent_portable_bindings() {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let row = post_verdict_transaction_tests::result_row(&head);
+        let raw = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
+        let path = PathBuf::from("/absent-after-ingestion/results.jsonl");
+        let files = vec![(path, raw.as_slice())];
+        let rows = read_result_candidate_files(&files, &head).unwrap();
+        let id = rows.keys().next().unwrap();
+        let mut tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":id.lane,"category":id.category,"test":id.test,
+                "mode":id.mode,"backend":id.backend,"status":"red","observations":[]}]
+        }))
+        .unwrap();
+        apply_validate_results_from(
+            &mut tracked,
+            &rows,
+            &head,
+            &tree,
+            &BTreeMap::from([(
+                "hermit".into(),
+                SourceDepth {
+                    commits: 2,
+                    first_parent: 2,
+                },
+            )]),
+            ValidateInput {
+                reports: ResultInput::Current,
+                store_invocation: true,
+                store_positions: true,
+                applicability: None,
+            },
+        )
+        .unwrap();
+        let snapshot = AttemptBindingSnapshot {
+            repository: TEST_LEDGER_REPOSITORY.into(),
+            source: "series".into(),
+            commit: "c".repeat(40),
+            tree: "d".repeat(40),
+            rows_sha256: "e".repeat(64),
+        };
+        tracked.projection = Some(snapshot.projection(0, "synthetic empty snapshot".into()));
+        append_attempt_bindings(
+            &mut tracked,
+            &[AttemptBindingSource {
+                detcore_tree: &tree,
+                candidates: &rows,
+            }],
+            &files,
+            AttemptBindingContext {
+                producer: &head,
+                snapshot: &snapshot,
+                events: &[],
+                kind: AttemptBindingKind::Current,
+                selected_lines: None,
+            },
+        )
+        .unwrap();
+        let saved = serde_json::to_vec(&tracked).unwrap();
+        append_attempt_bindings(
+            &mut tracked,
+            &[AttemptBindingSource {
+                detcore_tree: &tree,
+                candidates: &rows,
+            }],
+            &files,
+            AttemptBindingContext {
+                producer: &head,
+                snapshot: &snapshot,
+                events: &[],
+                kind: AttemptBindingKind::Current,
+                selected_lines: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&tracked).unwrap(), saved);
+        drop(rows);
+        drop(raw);
+        let restored: TrackedCells = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            validate_attempt_bindings(&restored, Some(&[]))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !String::from_utf8(saved)
+                .unwrap()
+                .contains("verification_report")
+        );
+    }
+}
+
+#[cfg(test)]
 mod evidence_identity_tests {
     use super::*;
 
@@ -24691,7 +26862,7 @@ mod evidence_identity_tests {
                 hermit_sha: head.clone(),
                 run_id: "current-retries".into(),
             };
-            let attempts = CurrentResultAttempts::from([
+            let attempts = ValidatedComparisonAttempts::from([
                 ((base.clone(), digests[0].clone()), 1),
                 ((base.clone(), digests[1].clone()), 2),
             ]);
@@ -24806,7 +26977,7 @@ mod evidence_identity_tests {
             // No current digest binding means no new authority to suppress a
             // historical event merely because its run and result look alike.
             assert!(
-                direct_representation(&tracked, &events, &CurrentResultAttempts::new())
+                direct_representation(&tracked, &events, &ValidatedComparisonAttempts::new())
                     .unwrap()
                     .represented_event_ids
                     .is_empty()
@@ -24951,7 +27122,8 @@ mod evidence_identity_tests {
         }))
         .unwrap();
         let rows = [source];
-        let exact = direct_representation(&tracked, &rows, &CurrentResultAttempts::new()).unwrap();
+        let exact =
+            direct_representation(&tracked, &rows, &ValidatedComparisonAttempts::new()).unwrap();
         assert_eq!(
             exact.represented_event_ids,
             BTreeSet::from([rows[0].event_id.clone()])
@@ -24962,8 +27134,8 @@ mod evidence_identity_tests {
         old.evidence_sha256 = Some(NULL_ERA.into());
         observations[0].invocations.insert(old);
         let before = serde_json::to_vec(&tracked).unwrap();
-        let error =
-            direct_representation(&tracked, &rows, &CurrentResultAttempts::new()).unwrap_err();
+        let error = direct_representation(&tracked, &rows, &ValidatedComparisonAttempts::new())
+            .unwrap_err();
         assert!(
             error.contains("disagrees with its exact direct result or outer attempt"),
             "{error}"
