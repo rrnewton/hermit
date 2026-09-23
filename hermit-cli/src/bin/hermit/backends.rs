@@ -658,6 +658,7 @@ fn run_dbt_legacy_verify(
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
+    config: &Config,
     verify_allow: VerifyAllow,
     summary: bool,
     stdin_is_terminal: bool,
@@ -675,6 +676,7 @@ fn run_dbt_legacy_verify(
             runner,
             guest,
             drrun,
+            config,
             TeeReader {
                 input,
                 replay: replay.try_clone()?,
@@ -684,12 +686,13 @@ fn run_dbt_legacy_verify(
             runner,
             guest,
             drrun,
+            config,
             TeeReader {
                 input: std::io::stdin(),
                 replay: replay.try_clone()?,
             },
         )?,
-        (None, _) => run_once_with_terminal_input(runner, guest, drrun)?,
+        (None, _) => run_once_with_terminal_input(runner, guest, drrun, config)?,
     };
     if !verify_allow.satisfies(process_status(first.status)) {
         write_output(&first)?;
@@ -708,9 +711,9 @@ fn run_dbt_legacy_verify(
     let second = match replay.as_mut() {
         Some(replay) => {
             replay.seek(SeekFrom::Start(0))?;
-            run_once(runner, guest, drrun, replay.try_clone()?)?
+            run_once(runner, guest, drrun, config, replay.try_clone()?)?
         }
-        None => run_once_with_terminal_input(runner, guest, drrun)?,
+        None => run_once_with_terminal_input(runner, guest, drrun, config)?,
     };
     if !verify_allow.satisfies(process_status(second.status)) {
         write_output(&second)?;
@@ -858,9 +861,7 @@ pub(super) fn run_dbt(
 
     if !verify {
         if stdin_is_terminal {
-            let status = runner
-                .status(&guest)
-                .map_err(|error| dbt_run_error(&drrun, error))?;
+            let status = run_status(&runner, &guest, &drrun, config)?;
             if summary {
                 eprintln!(
                     ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
@@ -869,7 +870,7 @@ pub(super) fn run_dbt(
             }
             return Ok(process_status(status));
         }
-        let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
+        let output = run_once(&runner, &guest, &drrun, config, std::io::stdin())?;
         write_output(&output)?;
         if summary {
             match detcore_summary(&output) {
@@ -885,6 +886,7 @@ pub(super) fn run_dbt(
             &runner.clone().summary(true),
             &guest,
             &drrun,
+            config,
             verify_allow,
             summary,
             stdin_is_terminal,
@@ -932,12 +934,13 @@ pub(super) fn run_dbt(
             &runner1,
             &guest,
             &drrun,
+            config,
             TeeReader {
                 input,
                 replay: replay.try_clone()?,
             },
         ),
-        None => run_once(&runner1, &guest, &drrun, std::io::empty()),
+        None => run_once(&runner1, &guest, &drrun, config, std::io::empty()),
     };
     let first_raw = match first_raw {
         Ok(output) => output,
@@ -991,7 +994,7 @@ pub(super) fn run_dbt(
 
     replay.seek(SeekFrom::Start(0))?;
     eprintln!(":: DBT Run2...");
-    let second_raw = match run_once(&runner2, &guest, &drrun, replay.try_clone()?) {
+    let second_raw = match run_once(&runner2, &guest, &drrun, config, replay.try_clone()?) {
         Ok(output) => output,
         Err(error) => {
             if keep_logs {
@@ -1156,11 +1159,21 @@ fn run_once<R: Read + Send + 'static>(
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
+    config: &Config,
     input: R,
 ) -> Result<Output, Error> {
-    runner
-        .output_with_detached_reader(guest, input)
-        .map_err(|error| dbt_run_error(drrun, error))
+    let runtime = dbt_coordinator_runtime()?;
+    let (output, global) = runtime
+        .block_on(
+            runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
+                guest,
+                input,
+                config.clone(),
+            ),
+        )
+        .map_err(|error| dbt_run_error(drrun, error))?;
+    clean_up_dbt_global(&runtime, &output.status, global);
+    Ok(output)
 }
 
 #[cfg(feature = "dbt")]
@@ -1168,10 +1181,55 @@ fn run_once_with_terminal_input(
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
+    config: &Config,
 ) -> Result<Output, Error> {
-    runner
-        .output_with_inherited_stdin(guest)
-        .map_err(|error| dbt_run_error(drrun, error))
+    let runtime = dbt_coordinator_runtime()?;
+    let (output, global) = runtime
+        .block_on(
+            runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
+                guest,
+                config.clone(),
+            ),
+        )
+        .map_err(|error| dbt_run_error(drrun, error))?;
+    clean_up_dbt_global(&runtime, &output.status, global);
+    Ok(output)
+}
+#[cfg(feature = "dbt")]
+fn dbt_coordinator_runtime() -> Result<tokio::runtime::Runtime, Error> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|error| Error::msg(format!("failed to start the DBT coordinator: {error}")))
+}
+
+#[cfg(feature = "dbt")]
+fn run_status(
+    runner: &DbtRunner,
+    guest: &StdCommand,
+    drrun: &Path,
+    config: &Config,
+) -> Result<std::process::ExitStatus, Error> {
+    let runtime = dbt_coordinator_runtime()?;
+    let (status, global) = runtime
+        .block_on(runner.status_with_global::<detcore::GlobalState>(guest, config.clone()))
+        .map_err(|error| dbt_run_error(drrun, error))?;
+    clean_up_dbt_global(&runtime, &status, global);
+    Ok(status)
+}
+
+#[cfg(feature = "dbt")]
+fn clean_up_dbt_global(
+    runtime: &tokio::runtime::Runtime,
+    status: &std::process::ExitStatus,
+    global: detcore::GlobalState,
+) {
+    // TODO-HUMAN-REVIEW(PR-TBD): Review DBT coordinator shutdown ordering.
+    if !status.success() {
+        global.force_shutdown_with_error();
+    }
+    runtime.block_on(global.clean_up(false, &None));
 }
 
 /// Name the stage that actually failed.

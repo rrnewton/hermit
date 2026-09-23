@@ -1519,7 +1519,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, self.detpid).await;
+        // TODO-HUMAN-REVIEW(PR-TBD): Review child-state identity at DBT thread start.
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
+        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Finish the delayed initialization of the full threadstate:
         {

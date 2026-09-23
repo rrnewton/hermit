@@ -419,6 +419,12 @@ struct Runtime {
 
 struct ThreadRuntime {
     tid: Pid,
+    host_pid: Pid,
+    ppid: Option<Pid>,
+    context: usize,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
     state: DetcoreThreadState,
     initialized: bool,
     post_exec_pending: bool,
@@ -1017,7 +1023,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     context: *mut c_void,
     tid: i32,
     pid: i32,
-    _in_tree_ppid: i32,
+    in_tree_ppid: i32,
     branch_count: u64,
     defer_runtime: i32,
     invoke_syscall: SyscallInvoker,
@@ -1063,6 +1069,23 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+    // TODO-HUMAN-REVIEW(PR-TBD): Review copied-process ownership and DBT lineage handoff.
+    // A separate-VM child owns its inherited COW copy of the parent's runtime
+    // allocation. Consume that snapshot exactly once. Shared-VM clone and
+    // vfork are deliberately excluded because a Box cannot have two owners.
+    let inherited_flags = CloneFlags::from_bits_truncate(scratch.pending_clone_flags);
+    let copied_process_child = host_tid == host_pid
+        && in_tree_ppid > 0
+        && !scratch.runtime_state.is_null()
+        && !inherited_flags.intersects(CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD);
+    let mut inherited_parent = copied_process_child.then(|| {
+        let parent = unsafe { Box::from_raw(scratch.runtime_state) };
+        scratch.runtime_state = std::ptr::null_mut();
+        parent
+    });
+    if let Some(parent) = inherited_parent.as_mut() {
+        parent.state.clone_flags = Some(inherited_flags);
+    }
     let parent = if host_tid == host_pid {
         None
     } else {
@@ -1078,21 +1101,34 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     let Some(det_tid) = dbt_scheduler_tid(host_tid) else {
         return -1;
     };
-    let parent_ref = parent
+    let parent_ref = inherited_parent
         .as_ref()
-        .map(|parent| (parent.parent_tid, &parent.state));
+        .map(|parent| (Tid::from_raw(parent.tid.into()), &parent.state))
+        .or_else(|| {
+            parent
+                .as_ref()
+                .map(|parent| (parent.parent_tid, &parent.state))
+        });
     let det_pid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
+    let parent_pid = (in_tree_ppid > 0).then(|| Pid::from_raw(in_tree_ppid));
     let mut state = tool.init_thread_state(det_tid, parent_ref);
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
         tid: det_pid,
+        host_pid,
+        ppid: parent_pid,
+        context: context as usize,
+        invoke_syscall,
+        read_registers,
+        write_registers,
         state,
         initialized: false,
-        post_exec_pending: host_tid == pid,
+        post_exec_pending: host_tid == pid && inherited_parent.is_none(),
     });
+    reverie_dbt::set_current_process_parent(parent_pid);
     if reverie_dbt::run_tool_thread_start(
         tool,
         context as usize,
@@ -1112,6 +1148,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     }
     thread.initialized = true;
     scratch.runtime_state = Box::into_raw(thread);
+    scratch.pending_clone_flags = 0;
     0
 }
 
@@ -1221,6 +1258,12 @@ fn successful_process_clone_result(sysnum: i64, result: i64) -> bool {
         )
 }
 
+fn should_register_process_child(sysnum: i64, result: i64, flags: CloneFlags) -> bool {
+    result > 0
+        && matches!(sysnum, libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3)
+        && !flags.intersects(CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD)
+}
+
 /// Applies the result of a native process-clone syscall after the kernel returns.
 ///
 /// Successful process clones share inherited open file descriptions, while the
@@ -1238,11 +1281,54 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
     result: i64,
 ) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
-    if successful_process_clone_result(sysnum, result) && !scratch.runtime_state.is_null() {
-        unsafe { &mut *scratch.runtime_state }
-            .state
-            .forget_flock_modes();
+    if scratch.runtime_state.is_null() {
+        return;
     }
+
+    let flags = CloneFlags::from_bits_truncate(scratch.pending_clone_flags);
+    let parent = unsafe { &mut *scratch.runtime_state };
+    if successful_process_clone_result(sysnum, result) {
+        parent.state.forget_flock_modes();
+    }
+
+    if !should_register_process_child(sysnum, result, flags) {
+        return;
+    }
+
+    let Ok(child_tid) = i32::try_from(result) else {
+        return;
+    };
+    let runtime = current_runtime();
+    let tool = runtime
+        .tool
+        .get()
+        .expect("Detcore DBT tool was initialized");
+    parent.state.clone_flags = Some(flags);
+    {
+        let mut guest = DbtGuest::new(
+            parent.context,
+            parent.tid,
+            parent.host_pid,
+            parent.ppid,
+            scratch.branches,
+            &mut parent.state,
+            &runtime.global,
+            &runtime.config,
+            parent.invoke_syscall,
+            parent.read_registers,
+            parent.write_registers,
+        );
+        run_ready(tool.register_external_child(&mut guest, Tid::from_raw(child_tid), 0, flags));
+    }
+    let child_pedigree = parent.state.pedigree.fork_mut();
+    tracing::debug!(
+        parent_tid = %parent.tid,
+        child_tid,
+        %child_pedigree,
+        parent_pedigree = %parent.state.pedigree,
+        "registered separate-VM DBT process child"
+    );
+    parent.state.clone_flags = None;
 }
 
 /// Releases Detcore state owned by a DynamoRIO application thread.
@@ -1252,7 +1338,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
 /// `scratch` must be the pointer initialized by
 /// [`reverie_dbt_runtime_thread_init`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(scratch: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    _tid: i32,
+    invoke_syscall: SyscallInvoker,
+) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
         return;
@@ -1270,8 +1361,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(scratch: *mut c_void) {
             .tool
             .get()
             .expect("Detcore DBT tool was initialized");
-        let _ = reverie_dbt::run_tool_thread_exit(
+        let _ = reverie_dbt::run_tool_thread_exit_from_guest(
             tool,
+            context as usize,
+            invoke_syscall,
             tid,
             state,
             &runtime.global,
@@ -1584,6 +1677,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         }
         scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
             tid,
+            host_pid: pid,
+            ppid: None,
+            context: context as usize,
+            invoke_syscall,
+            read_registers,
+            write_registers,
             state,
             initialized: false,
             post_exec_pending: true,
@@ -1850,6 +1949,37 @@ mod tests {
                 -libc::EINVAL as i64
             ));
         }
+    }
+
+    #[test]
+    fn process_child_registration_excludes_failed_child_and_shared_vm_results() {
+        for sysnum in [libc::SYS_fork, libc::SYS_clone, libc::SYS_clone3] {
+            assert!(should_register_process_child(
+                sysnum,
+                42,
+                CloneFlags::empty()
+            ));
+            assert!(!should_register_process_child(
+                sysnum,
+                0,
+                CloneFlags::empty()
+            ));
+            assert!(!should_register_process_child(
+                sysnum,
+                -libc::EINVAL as i64,
+                CloneFlags::empty()
+            ));
+        }
+        assert!(!should_register_process_child(
+            libc::SYS_vfork,
+            42,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_VFORK
+        ));
+        assert!(!should_register_process_child(
+            libc::SYS_clone,
+            42,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD
+        ));
     }
 
     #[test]
