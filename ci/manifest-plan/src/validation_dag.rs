@@ -81,6 +81,7 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
+    "build.recorded_clocks",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -96,6 +97,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.detcore_misc",
     "test.detcore_parallel",
     "test.hermit_integration",
+    "test.recorded_clocks",
     "test.arbitrary_binaries",
     "test.cli",
     "test.isolated_dbt_workdir",
@@ -162,13 +164,13 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 270,
-        selected_steps: 271,
+        direct_steps: 273,
+        selected_steps: 274,
     },
     Profile {
         label: "portable",
-        direct_steps: 261,
-        selected_steps: 262,
+        direct_steps: 264,
+        selected_steps: 265,
     },
     Profile {
         label: "quick",
@@ -187,8 +189,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 252,
-        selected_steps: 252,
+        direct_steps: 254,
+        selected_steps: 254,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -635,9 +637,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         })
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
-    if split.len() != 16 {
+    if split.len() != 17 {
         return Err(format!(
-            "hosted test split has {} roots, expected 16",
+            "hosted test split has {} roots, expected 17",
             split.len()
         ));
     }
@@ -648,6 +650,7 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // Split the producer before closing over its shared downstream consumers,
     // so no hosted path retains a dependency on the local full producer.
     split.insert("build.workspace".into());
+    split.insert("build.recorded_clocks".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -671,9 +674,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    if split.len() != 213 {
+    if split.len() != 215 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 213",
+            "hosted test dependency closure has {} nodes, expected 215",
             split.len()
         ));
     }
@@ -1228,9 +1231,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 106 {
+    if expected.len() != 108 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 106",
+            "structured result producer registry has {} entries, expected 108",
             expected.len()
         ));
     }
@@ -1239,9 +1242,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 38 {
+    if expected_counts.len() != 40 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 38",
+            "Nextest expected-count registry has {} entries, expected 40",
             expected_counts.len()
         ));
     }
@@ -1365,7 +1368,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [67, 33, 2, 2, 2] {
+    if actual_group_counts != [69, 33, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1677,9 +1680,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1606 {
+    if cfg.steps.len() != 1611 {
         return Err(format!(
-            "superset has {} steps, expected 1606",
+            "superset has {} steps, expected 1611",
             cfg.steps.len()
         ));
     }
@@ -2962,7 +2965,7 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        assert_eq!(selected.steps.len(), 252);
+        assert_eq!(selected.steps.len(), 254);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -2995,6 +2998,7 @@ sys.exit(37)
             "hermit_unit",
             "ignored_syscall_regressions",
             "liteinst_strict",
+            "recorded_clocks",
             "regular_crates",
             "rr_suite_contract",
             "sabre_examples",
@@ -3015,13 +3019,14 @@ sys.exit(37)
             "build.e2e_artifact_on_host".into(),
             "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
+            "build.recorded_clocks_on_host".into(),
             "check.backend_parity_suites_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
-        assert_eq!(new_variants.len(), 213);
+        assert_eq!(new_variants.len(), 215);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3116,7 +3121,7 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            error.contains("hosted-portable label has 251 direct steps"),
+            error.contains("hosted-portable label has 253 direct steps"),
             "{error}"
         );
     }
@@ -3203,6 +3208,7 @@ sys.exit(37)
                     "test.detcore_parallel",
                     "test.detcore_unit",
                     "test.hermit_integration",
+                    "test.recorded_clocks",
                     "test.hermit_modes",
                     "test.hermit_unit",
                     "test.ignored_syscall_regressions",
