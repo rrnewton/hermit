@@ -375,8 +375,16 @@ fi
 # build-relevant and still requires fresh validation. This carry is source
 # evidence for the build budget, not a new timing or Hermit guest measurement,
 # and it does not reuse an earlier pin's receipt.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f97b7be1de4e2ef10ecc24cee5d8cc47f2fd254f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f97b7be1de4e2ef10ecc24cee5d8cc47f2fd254f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO b5e2ab49 (2026-09-18): the KVM repairs through
+# https://github.com/rrnewton/reverie/pull/587 preserve the entire reverie-dbt
+# subtree from f97b7be1, including build.rs and the DynamoRIO gitlink. Root
+# Cargo.toml, rust-toolchain.toml, third-party and .gitmodules also match.
+# No CMAKE or CMAKE_GENERATOR selection changes here. Carry the existing
+# b0247764df7f recipe, 1050 effective-job-second threshold and 16-job clamp.
+# This is source identity evidence, not a new timing or Hermit guest result;
+# the original single-sample and failed-enclosing-check limitations remain.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b5e2ab49cd99e5d456fa0238b8cebd75958c529f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b5e2ab49cd99e5d456fa0238b8cebd75958c529f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
