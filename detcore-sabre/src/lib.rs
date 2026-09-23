@@ -291,23 +291,8 @@ impl Plugin {
         let expected = unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
             .map(|v| v.to_string_lossy().into_owned());
         let ours = config_wire_fingerprint();
-        match expected {
-            Some(expected) if expected == ours => {}
-            Some(expected) => panic!(
-                "Detcore SaBRe plugin/coordinator MISMATCH: this plugin's Config and clock RPC \
-                 definitions have fingerprint {ours}, the coordinator expects {expected}. \
-                 The plugin is a separate artifact in the same target directory and is stale -- rebuild \
-                 it against this coordinator: cargo build -p detcore-sabre"
-            ),
-            // An older coordinator does not publish the fingerprint. Say so and
-            // continue: refusing here would break pairs that are actually fine,
-            // and a guard that rejects matched pairs is worse than no guard.
-            None => eprintln!(
-                "detcore-sabre: coordinator published no configuration and clock RPC fingerprint \
-                 ({CONFIG_FINGERPRINT_ENV} unset); proceeding unguarded. This plugin's fingerprint \
-                 is {ours}."
-            ),
-        }
+        coordinator_compatibility(expected.as_deref(), &ours)
+            .unwrap_or_else(|message| panic!("{message}"));
     }
 
     fn connect() -> Self {
@@ -379,6 +364,24 @@ impl Plugin {
         self.adapter
             .handle_syscall(Syscall::from_raw(sysno, args))
             .map_or_else(|errno| -errno.into_raw(), |result| result as i32)
+    }
+}
+
+fn coordinator_compatibility(expected: Option<&str>, ours: &str) -> Result<(), String> {
+    match expected {
+        Some(expected) if expected == ours => Ok(()),
+        Some(expected) => Err(format!(
+            "Detcore SaBRe plugin/coordinator MISMATCH: this plugin's Config and clock RPC \
+             definitions have fingerprint {ours}, the coordinator expects {expected}. \
+             The plugin is a separate artifact in the same target directory and is stale -- rebuild \
+             it against this coordinator: cargo build -p detcore-sabre"
+        )),
+        None => Err(format!(
+            "Detcore SaBRe plugin/coordinator compatibility cannot be established: the \
+             coordinator published no configuration and clock RPC fingerprint \
+             ({CONFIG_FINGERPRINT_ENV} unset), while this plugin's fingerprint is {ours}. \
+             Rebuild and launch Hermit and detcore-sabre as one matched artifact set."
+        )),
     }
 }
 
@@ -534,6 +537,27 @@ mod tests {
     use std::ffi::CStr;
 
     use super::*;
+
+    #[test]
+    fn matched_coordinator_fingerprint_is_accepted() {
+        assert_eq!(coordinator_compatibility(Some("same"), "same"), Ok(()));
+    }
+
+    #[test]
+    fn mismatched_coordinator_fingerprint_is_refused() {
+        let error = coordinator_compatibility(Some("old"), "current").unwrap_err();
+        assert!(error.contains("MISMATCH"), "{error}");
+        assert!(error.contains("current"), "{error}");
+        assert!(error.contains("old"), "{error}");
+    }
+
+    #[test]
+    fn missing_coordinator_fingerprint_is_refused() {
+        let error = coordinator_compatibility(None, "current").unwrap_err();
+        assert!(error.contains(CONFIG_FINGERPRINT_ENV), "{error}");
+        assert!(error.contains("cannot be established"), "{error}");
+        assert!(error.contains("current"), "{error}");
+    }
 
     #[test]
     fn initial_generation_accepts_raw_worker_comm_and_rejects_invalid_identity() {

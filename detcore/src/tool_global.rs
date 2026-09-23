@@ -31,7 +31,6 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
 use std::time::SystemTime;
 
-use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
@@ -60,6 +59,7 @@ use tracing::trace;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::config::epoch_nanos;
 use crate::consts::ROOT_DETPID;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
@@ -827,22 +827,8 @@ impl GlobalState {
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
             let final_time_ns = final_time.as_nanos();
-            let nanos = self
-                .cfg
-                .epoch
-                .timestamp_nanos_opt()
-                .expect("epoch cannot be represented in a timestamp with nanosecond precision")
-                as u64;
-            let epoch_ns = LogicalTime::from_nanos(nanos);
             summary.virttime_final = final_time_ns.as_nanos();
-            summary.virttime_elapsed = if final_time_ns.as_nanos() >= epoch_ns.as_nanos() {
-                (final_time_ns - epoch_ns).as_nanos()
-            } else {
-                bail!(
-                    "Internal invariant violated! Global time is before epoch start {}",
-                    epoch_ns
-                );
-            }
+            summary.virttime_elapsed = final_time.elapsed_nanos().as_nanos();
         }
 
         Ok((summary, info_reprio_descrip))
@@ -2329,12 +2315,7 @@ impl GlobalState {
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
         // Here we establish a policy that when we first see a file its mtime is epoch.
-        let nanos = self
-            .cfg
-            .epoch
-            .timestamp_nanos_opt()
-            .expect("epoch cannot be represented in a timestamp with nanosecond precision")
-            as u64;
+        let nanos = epoch_nanos(&self.cfg.epoch).expect(crate::config::EPOCH_RANGE_ERROR);
         let (dino, ns) = self
             .inodes
             .lock()
@@ -2406,9 +2387,8 @@ impl GlobalState {
             // In this scenario, virtualize_metadata is set and virtualize_time isn't.
             // We virtualize initial mtimes, but update using realtime.
             let dt: DateTime<Utc> = Utc::now();
-            let nanos = dt.timestamp_nanos_opt().expect(
-                "current time cannot be represented in a timestamp with nanosecond precision",
-            ) as u64;
+            let nanos = epoch_nanos(&dt)
+                .expect("current time exceeds Hermit's signed-nanosecond epoch cap");
             LogicalTime::from_nanos(nanos)
         };
         trace!(
@@ -2416,19 +2396,15 @@ impl GlobalState {
             from, ino, mtime,
         );
         let mut mg = self.inodes.lock().unwrap();
-        let dino =
-            if let Some(d) = mg.inodes.get(&ino) {
-                *d
-            } else {
-                // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
-                // stat on it), so we just-in-time add it.
-                let nanos =
-                    self.cfg.epoch.timestamp_nanos_opt().expect(
-                        "epoch cannot be represented in a timestamp with nanosecond precision",
-                    ) as u64;
-                let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
-                d
-            };
+        let dino = if let Some(d) = mg.inodes.get(&ino) {
+            *d
+        } else {
+            // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
+            // stat on it), so we just-in-time add it.
+            let nanos = epoch_nanos(&self.cfg.epoch).expect(crate::config::EPOCH_RANGE_ERROR);
+            let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
+            d
+        };
         let info = mg
             .detinodes_info
             .get_mut(&dino)
@@ -4032,6 +4008,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_work_fractional_epoch_summary_uses_the_exact_global_origin() {
+        let config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let expected_final = DetTime::new(&config).as_nanos().as_nanos();
+        let summary = GlobalState::initialize(&config, false)
+            .into_run_summary()
+            .expect("an exact fractional origin must summarize without preceding itself");
+
+        assert_eq!(summary.virttime_final, expected_final);
+        assert_eq!(summary.virttime_elapsed, 0);
+    }
+
     #[test]
     fn schedule_event_host_markers_require_command_bootstrap_provenance() {
         let event = SchedEvent::branches(DetTid::from_raw(3), 223)

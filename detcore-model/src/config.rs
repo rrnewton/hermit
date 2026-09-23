@@ -9,7 +9,6 @@
 //! Detcore configuration and widely used types.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -18,6 +17,8 @@ use std::time::SystemTime;
 
 use chrono::DateTime;
 use chrono::Utc;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
 use serde::Deserialize;
 use serde::Serialize;
@@ -768,6 +769,7 @@ impl Config {
 
     /// Check invariants that must hold at every execution boundary without mutating the config.
     pub fn validate_invariants(&self) {
+        assert!(epoch_nanos(&self.epoch).is_some(), "{EPOCH_RANGE_ERROR}");
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1289,6 +1291,18 @@ impl std::error::Error for ParseTimesliceError {
 /// original unix epoch (time zero).
 pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 
+/// Latest accepted virtual-time origin, in exact nanoseconds since Unix epoch.
+///
+/// Capping origins at signed-nanosecond max keeps the wire value conventional
+/// and deliberately reserves `2^63` nanoseconds (about 292 years) for continuous
+/// deterministic progress in the surrounding unsigned clock domain.
+pub const MAX_EPOCH_NANOS: u64 = i64::MAX as u64;
+
+/// User-facing invariant shared by CLI and internal validation boundaries.
+pub const EPOCH_RANGE_ERROR: &str = "epoch must be between 1970-01-01T00:00:00Z and \
+2262-04-11T23:47:16.854775807Z inclusive, leaving at least 2^63 nanoseconds of \
+representable virtual-time progress";
+
 /// Convert one invocation's captured host instant without losing subsecond
 /// precision. CLI and comparison orchestration share this input conversion;
 /// guest clock progression never reads the host clock through it.
@@ -1296,14 +1310,24 @@ pub fn epoch_from_host_time(now: SystemTime) -> DateTime<Utc> {
     DateTime::<Utc>::from(now)
 }
 
+/// Convert an epoch to Hermit's supported exact nanosecond origin domain.
+///
+/// The signed-nanosecond upper bound preserves every fractional nanosecond while
+/// reserving half of the surrounding unsigned domain for future progress.
+/// Actual clock additions are checked separately and fail rather than wrapping
+/// or silently saturating at the end of that larger domain.
+pub fn epoch_nanos(epoch: &DateTime<Utc>) -> Option<u64> {
+    let seconds = u64::try_from(epoch.timestamp()).ok()?;
+    let nanos = seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::from(epoch.timestamp_subsec_nanos()))?;
+    (nanos <= MAX_EPOCH_NANOS).then_some(nanos)
+}
+
 impl Config {
     /// Construct the config using environment variables only, not CLI args.
     pub fn from_env() -> Self {
-        let args: [OsString; 2] = [
-            OsString::from("CMD"), // Silly/unused.
-            OsString::from(format!("--epoch={}", DEFAULT_EPOCH_STR)),
-        ];
-        Config::parse_from(args.iter())
+        Config::parse_from(["detcore"])
     }
 
     /// Returns effective "rng-seed" parameter taking in account "seed"
@@ -1415,13 +1439,35 @@ fn fingerprint_of_config_material(
 
 impl Default for Config {
     fn default() -> Self {
-        let v: Vec<String> = vec![];
-        Config::parse_from(v.iter())
+        // `clap` normally reads `env = ...` inputs even when parsing an empty
+        // argv. A Rust `Default` must be stable process state: it is serialized
+        // into the coordinator/plugin wire fingerprint, and the coordinator's
+        // guest environment is intentionally not the plugin's environment.
+        // Disable every clap environment source generically so a future
+        // env-backed field cannot silently reintroduce that split. Explicit
+        // user-facing parsing and `from_env` continue to honor the environment.
+        let mut command = Config::command();
+        let environment_backed: Vec<_> = command
+            .get_arguments()
+            .filter(|argument| argument.get_env().is_some())
+            .map(|argument| argument.get_id().clone())
+            .collect();
+        for id in environment_backed {
+            command = command.mut_arg(id, |argument| argument.env(None::<&str>));
+        }
+        let matches = command
+            .try_get_matches_from(["detcore"])
+            .expect("Config defaults must satisfy clap");
+        Config::from_arg_matches(&matches).expect("Config defaults must decode from clap matches")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
+    use chrono::TimeZone;
+
     use super::*;
 
     #[test]
@@ -1429,6 +1475,49 @@ mod tests {
         assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
         let epoch = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
         assert_eq!(epoch.timestamp(), 1_767_225_600);
+    }
+
+    #[test]
+    fn config_default_and_wire_fingerprint_ignore_process_environment() {
+        const CHILD: &str = "HERMIT_CONFIG_DEFAULT_ENV_NEUTRAL_CHILD";
+        const EXPECTED_FINGERPRINT: &str = "HERMIT_CONFIG_DEFAULT_EXPECTED_FINGERPRINT";
+        const ENV_EPOCH: &str = "2030-04-05T06:07:08.123456789Z";
+
+        if std::env::var_os(CHILD).is_some() {
+            let default = Config::default();
+            assert_eq!(
+                default.epoch,
+                DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()
+            );
+            assert_eq!(default.seed, 0);
+            assert_eq!(
+                config_wire_fingerprint(),
+                std::env::var(EXPECTED_FINGERPRINT).unwrap(),
+            );
+
+            let explicit_environment = Config::from_env();
+            assert_eq!(
+                explicit_environment.epoch,
+                ENV_EPOCH.parse::<DateTime<Utc>>().unwrap()
+            );
+            assert_eq!(explicit_environment.seed, 41);
+            return;
+        }
+
+        let fingerprint = config_wire_fingerprint();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::config_default_and_wire_fingerprint_ignore_process_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(EXPECTED_FINGERPRINT, fingerprint)
+            .env("HERMIT_EPOCH", ENV_EPOCH)
+            .env("HERMIT_PRNG", "41")
+            .status()
+            .unwrap();
+        assert!(status.success(), "environment-isolation child failed");
     }
 
     #[test]
@@ -1447,6 +1536,30 @@ mod tests {
         );
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.epoch, epoch);
+    }
+
+    #[test]
+    fn epoch_nanoseconds_are_exact_and_checked_at_both_domain_boundaries() {
+        let unix_epoch = Utc.timestamp_opt(0, 0).unwrap();
+        let before_unix_epoch = Utc.timestamp_opt(-1, 999_999_999).unwrap();
+        let last_accepted = Utc
+            .timestamp_opt(
+                (MAX_EPOCH_NANOS / 1_000_000_000) as i64,
+                (MAX_EPOCH_NANOS % 1_000_000_000) as u32,
+            )
+            .unwrap();
+        let first_refused = Utc
+            .timestamp_opt(
+                (MAX_EPOCH_NANOS / 1_000_000_000) as i64,
+                (MAX_EPOCH_NANOS % 1_000_000_000 + 1) as u32,
+            )
+            .unwrap();
+
+        assert_eq!(epoch_nanos(&unix_epoch), Some(0));
+        assert_eq!(epoch_nanos(&before_unix_epoch), None);
+        assert_eq!(epoch_nanos(&last_accepted), Some(MAX_EPOCH_NANOS));
+        assert_eq!(epoch_nanos(&first_refused), None);
+        assert_eq!(u64::MAX - MAX_EPOCH_NANOS, 1_u64 << 63);
     }
 
     #[test]

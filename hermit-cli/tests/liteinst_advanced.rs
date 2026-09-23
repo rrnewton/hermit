@@ -29,6 +29,7 @@ static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 3]> = OnceLock::new();
+const COMPARISON_EPOCH_ARG: &str = "--epoch=2026-09-23T02:39:52.970859833+00:00";
 
 const COMPAT_FIXTURE_CONTENT: &[u8] = b"liteinst compatibility fixture\n";
 const COMPAT_FIXTURE_SHA256: &str =
@@ -173,6 +174,7 @@ fn liteinst_command(log_level: &str) -> Command {
         "--backend",
         "liteinst",
         "--strict",
+        COMPARISON_EPOCH_ARG,
         "--base-env=minimal",
         "--mount=type=tmpfs,target=/test",
         "--workdir=/test",
@@ -195,6 +197,7 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
             "--backend",
             "liteinst",
             "--strict",
+            COMPARISON_EPOCH_ARG,
             "--base-env=minimal",
             "--mount=type=tmpfs,target=/test",
             "--workdir=/test",
@@ -252,8 +255,29 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
     assert_eq!(output.stdout, expected_stdout);
 }
 
+fn assert_clock_progress_trajectory(output: &Output) {
+    let rendered = std::str::from_utf8(&output.stdout)
+        .expect("clock-progress trajectory should be UTF-8")
+        .trim();
+    let mut fields = rendered.split_whitespace();
+    assert_eq!(fields.next(), Some("clock-progress-deltas"));
+    let samples: Vec<u64> = fields
+        .map(|field| {
+            field
+                .parse()
+                .unwrap_or_else(|error| panic!("invalid clock-progress delta {field:?}: {error}"))
+        })
+        .collect();
+    assert_eq!(samples.len(), 8, "clock-progress must expose every sample");
+    assert_eq!(samples[0], 0, "trajectory must be relative to sample zero");
+    assert!(
+        samples.windows(2).all(|pair| pair[0] < pair[1]),
+        "clock-progress trajectory froze or rewound: {samples:?}",
+    );
+}
+
 fn assert_liteinst_virtual_time_is_continuous() {
-    const EPOCH_SECONDS: u64 = 1_767_225_600;
+    const EPOCH_SECONDS: u64 = 1_790_131_192;
     const MAX_STARTUP_SECONDS: u64 = 60;
 
     // Whole seconds remain stable across verified LiteInst runs. Do not assert
@@ -275,11 +299,8 @@ fn assert_liteinst_virtual_time_is_continuous() {
         "guest startup consumed an implausible amount of virtual time: {timestamp}"
     );
     // Verify continuous progression independently of the startup offset.
-    assert_liteinst_strict_verify(
-        advanced_guest(),
-        &["clock-progress"],
-        b"clock-progress-ok\n",
-    );
+    let trajectory = run_liteinst_strict_verify(advanced_guest(), &["clock-progress"]);
+    assert_clock_progress_trajectory(&trajectory);
 }
 
 #[test]

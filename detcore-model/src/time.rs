@@ -21,6 +21,8 @@ use serde::Serialize;
 use tracing::trace;
 
 use crate::config::Config;
+use crate::config::EPOCH_RANGE_ERROR;
+use crate::config::epoch_nanos;
 use crate::pid::DetTid;
 
 // Time conversion constants from https://doc.rust-lang.org/stable/src/core/time.rs.html#26-30
@@ -460,8 +462,12 @@ pub struct DetTime {
     #[serde(default)]
     extra_nanos: u64,
 
-    /// Baseline amount of time to add.
-    starting_micros: Microseconds,
+    /// Exact nanosecond baseline to add.
+    ///
+    /// This remains a positional `u64` in the non-self-describing Reverie RPC.
+    /// Coordinators and plugins from different source fingerprints are already
+    /// refused before exchanging `DetTime` values.
+    starting_nanos: u64,
 
     /// Multiplier for all time advances.
     multiplier: f64,
@@ -483,7 +489,7 @@ impl Default for DetTime {
             weighted_rcbs: None,
             nondet_instrs: 0,
             extra_nanos: 0,
-            starting_micros: 0,
+            starting_nanos: 0,
             multiplier: 1.0,
             inherited_nanos: LogicalTime::ZERO,
         }
@@ -523,15 +529,11 @@ impl From<&DateTime<Utc>> for DetTime {
             weighted_rcbs: None,
             nondet_instrs: 0,
             extra_nanos: 0,
-            starting_micros: micros_from_utc(dt),
+            starting_nanos: epoch_nanos(dt).expect(EPOCH_RANGE_ERROR),
             multiplier: 1.0,
             inherited_nanos: LogicalTime::ZERO,
         }
     }
-}
-
-fn micros_from_utc(dt: &DateTime<Utc>) -> Microseconds {
-    dt.timestamp() as Microseconds * 1_000_000 + dt.timestamp_subsec_micros() as Microseconds
 }
 
 // implementing From<DetTime> for Timespec is not possible due to dependency graph
@@ -571,7 +573,7 @@ impl DetTime {
             weighted_rcbs: None,
             nondet_instrs: 0,
             extra_nanos: 0,
-            starting_micros: 0,
+            starting_nanos: 0,
             multiplier: 1.0,
             inherited_nanos: LogicalTime::ZERO,
         }
@@ -665,19 +667,23 @@ impl DetTime {
             || self.rcbs as f64 * NANOS_PER_RCB,
             |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
         );
-        LogicalTime(
-            (self.starting_micros * 1000)
-                + self.extra_nanos
-                + ((syscall_nanos as f64 * self.multiplier) as u64)
-                + ((rcb_nanos * self.multiplier) as u64)
-                + ((self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64),
-        )
+        let components = [
+            self.extra_nanos,
+            (syscall_nanos as f64 * self.multiplier) as u64,
+            (rcb_nanos * self.multiplier) as u64,
+            (self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64,
+        ];
+        let projected = components
+            .into_iter()
+            .try_fold(self.starting_nanos, u64::checked_add)
+            .expect("virtual time overflowed its unsigned nanosecond domain");
+        LogicalTime(projected)
     }
 
     /// Same as as_nanos but without the starting time.
     pub fn without_starting(&self) -> LogicalDuration {
         let LogicalTime(t1) = self.as_nanos();
-        LogicalTime(t1 - (self.starting_micros * 1000))
+        LogicalTime(t1 - self.starting_nanos)
     }
 
     // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
@@ -715,7 +721,7 @@ impl DetTime {
 
     /// Project deterministic time duration from imaginary starting point of deterministic time creation
     pub fn as_duration(&self) -> std::time::Duration {
-        std::time::Duration::from_nanos(self.as_nanos().0 - self.starting_micros * 1000)
+        std::time::Duration::from_nanos(self.as_nanos().0 - self.starting_nanos)
     }
 }
 
@@ -786,12 +792,15 @@ impl GlobalTime {
     /// Create a fresh global time, respecting the `Config`.
     pub fn new(cfg: &Config) -> Self {
         let base = DetTime::new(cfg);
+        let starting_nanos = base.as_nanos();
         GlobalTime {
-            starting_nanos: LogicalTime::from_micros(micros_from_utc(&cfg.epoch)),
+            // Keep one clock origin. In particular, fractional explicit epochs
+            // must use the same precision here and in each local `DetTime`.
+            starting_nanos,
             time_vector: HashMap::new(),
             inherited_time: HashMap::new(),
             extra_time: LogicalTime::from_nanos(0),
-            total: base.as_nanos(),
+            total: starting_nanos,
             multiplier: cfg.clock_multiplier.unwrap_or(1.0),
         }
     }
@@ -849,7 +858,14 @@ impl GlobalTime {
     }
 
     fn bump_total(&mut self, delta: Duration) {
-        self.total = self.total + delta;
+        let delta = u64::try_from(delta.as_nanos())
+            .expect("virtual-time progress exceeds the unsigned nanosecond domain");
+        self.total = LogicalTime::from_nanos(
+            self.total
+                .as_nanos()
+                .checked_add(delta)
+                .expect("global virtual time overflowed its unsigned nanosecond domain"),
+        );
         self.sanity();
     }
 
@@ -857,9 +873,17 @@ impl GlobalTime {
     fn sum_up(&self) -> LogicalTime {
         let mut sum = self.starting_nanos;
         for (tid, tm) in &self.time_vector {
-            sum = sum + (*tm - self.inherited_duration(*tid));
+            sum = LogicalTime::from_nanos(
+                sum.as_nanos()
+                    .checked_add((*tm - self.inherited_duration(*tid)).as_nanos())
+                    .expect("global virtual time overflowed while summing thread progress"),
+            );
         }
-        sum + self.extra_time
+        LogicalTime::from_nanos(
+            sum.as_nanos()
+                .checked_add(self.extra_time.as_nanos())
+                .expect("global virtual time overflowed while summing scheduler progress"),
+        )
     }
 
     /// Add time that passage is not driven by the internal events within guest threads.
@@ -877,7 +901,14 @@ impl GlobalTime {
     /// The argument is in nanosecods and should have had any clock multiplier
     /// applied alreday.
     pub fn add_extra_time(&mut self, delta: Duration) -> LogicalTime {
-        self.extra_time = self.extra_time + delta;
+        let delta_nanos = u64::try_from(delta.as_nanos())
+            .expect("scheduler progress exceeds the unsigned nanosecond domain");
+        self.extra_time = LogicalTime::from_nanos(
+            self.extra_time
+                .as_nanos()
+                .checked_add(delta_nanos)
+                .expect("scheduler virtual time overflowed its unsigned nanosecond domain"),
+        );
         // Update the cached total for efficiency:
         self.bump_total(delta);
         self.as_nanos()
@@ -886,7 +917,12 @@ impl GlobalTime {
     /// Project a thread's absolute local clock, including its inherited history
     /// and the epoch. Exec recovery and scheduler replay use this projection.
     pub fn threads_time(&self, dtid: DetTid) -> LogicalTime {
-        self.starting_nanos + self.threads_duration(dtid)
+        LogicalTime::from_nanos(
+            self.starting_nanos
+                .as_nanos()
+                .checked_add(self.threads_duration(dtid).as_nanos())
+                .expect("thread virtual time overflowed its unsigned nanosecond domain"),
+        )
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -945,14 +981,93 @@ impl GlobalTime {
     pub fn as_nanos(&self) -> LogicalTime {
         self.total
     }
+
+    /// Project aggregate progress since this clock's own immutable origin.
+    pub fn elapsed_nanos(&self) -> LogicalDuration {
+        self.total - self.starting_nanos
+    }
 }
 
 #[cfg(test)]
 mod global_time_tests {
+    use chrono::TimeZone;
+
     use super::*;
 
     fn publish(time: &mut GlobalTime, tid: DetTid, clock: &DetTime) {
         time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
+    }
+
+    #[test]
+    fn fractional_epochs_remain_distinct_and_keep_nanosecond_progress() {
+        let first_config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let second_config = Config {
+            epoch: "2026-09-23T02:39:52.970859834Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let first_local = DetTime::new(&first_config);
+        let second_local = DetTime::new(&second_config);
+        assert_eq!(
+            second_local.as_nanos() - first_local.as_nanos(),
+            LogicalTime::from_nanos(1),
+        );
+        let named = serde_json::to_value(&first_local).unwrap();
+        assert_eq!(named["starting_nanos"], first_local.as_nanos().as_nanos());
+        assert!(named.get("starting_micros").is_none());
+        let wire = bincode::serde::encode_to_vec(&first_local, bincode::config::legacy()).unwrap();
+        let (restored, consumed): (DetTime, usize) =
+            bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, wire.len());
+        assert_eq!(restored.as_nanos(), first_local.as_nanos());
+
+        let mut time = GlobalTime::new(&first_config);
+        let second_time = GlobalTime::new(&second_config);
+
+        assert_eq!(time.as_nanos(), first_local.as_nanos());
+        assert_eq!(second_time.as_nanos(), second_local.as_nanos());
+        assert_eq!(
+            second_time.as_nanos() - time.as_nanos(),
+            LogicalTime::from_nanos(1),
+        );
+        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO);
+        time.add_extra_time(Duration::from_nanos(1));
+        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(1));
+        time.add_extra_time(Duration::from_nanos(1));
+        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(2));
+    }
+
+    #[test]
+    fn last_accepted_epoch_retains_centuries_of_exact_scheduler_progress() {
+        let max_epoch_nanos = crate::config::MAX_EPOCH_NANOS;
+        let last_accepted = chrono::Utc
+            .timestamp_opt(
+                (max_epoch_nanos / 1_000_000_000) as i64,
+                (max_epoch_nanos % 1_000_000_000) as u32,
+            )
+            .unwrap();
+        let first_refused = chrono::Utc
+            .timestamp_opt(
+                (max_epoch_nanos / 1_000_000_000) as i64,
+                (max_epoch_nanos % 1_000_000_000 + 1) as u32,
+            )
+            .unwrap();
+        assert_eq!(epoch_nanos(&first_refused), None);
+
+        let config = Config {
+            epoch: last_accepted,
+            ..Config::default()
+        };
+        let mut time = GlobalTime::new(&config);
+        let origin = time.as_nanos();
+        let hundred_years = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+        time.add_extra_time(hundred_years);
+
+        assert_eq!(origin, LogicalTime::from_nanos(max_epoch_nanos));
+        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO + hundred_years);
+        assert_eq!(time.as_nanos(), origin + hundred_years);
     }
 
     #[test]
@@ -1021,7 +1136,10 @@ mod global_time_tests {
 
     #[test]
     fn exec_preserves_inherited_baselines_and_each_retired_threads_work() {
-        let config = Config::default();
+        let config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
         let ancestor = DetTid::from_raw(3);
         let leader = DetTid::from_raw(4);
         let worker = DetTid::from_raw(5);

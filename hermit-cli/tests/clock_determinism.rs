@@ -113,12 +113,19 @@ fn run_clock_matrix(iteration: usize) -> Vec<u8> {
     output.stdout
 }
 
-fn run_date_at_epoch(epoch: Option<&str>) -> Output {
+fn run_date_at_epoch(epoch: Option<&str>) -> (Output, String) {
+    let diagnostic_log = tempfile::Builder::new()
+        .prefix("clock-epoch-provenance-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create epoch provenance log");
     let mut command = Command::new(hermit_binary::hermit_binary());
     // Keep the omitted-input case independent of the caller's valid override.
     // Environment precedence is covered separately in isolated parser children.
     command.env_remove("HERMIT_EPOCH");
     command.args([
+        "--log=warn",
+        "--log-file",
+        diagnostic_log.path().to_str().unwrap(),
         "run",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
@@ -128,7 +135,15 @@ fn run_date_at_epoch(epoch: Option<&str>) -> Output {
         command.arg(format!("--epoch={epoch}"));
     }
     command.args(["--", "/bin/date", "+%s.%N"]);
-    command_output(command, "virtual epoch date probe")
+    let output = command_output(command, "virtual epoch date probe");
+    let diagnostics =
+        fs::read_to_string(diagnostic_log.path()).expect("failed to read epoch provenance log");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("virtual-time epoch="),
+        "controller epoch provenance leaked into guest stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (output, diagnostics)
 }
 
 #[test]
@@ -138,7 +153,7 @@ fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
-    let output = run_date_at_epoch(None);
+    let (output, diagnostics) = run_date_at_epoch(None);
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -151,17 +166,19 @@ fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
         observed >= before && observed <= after + 1.0,
         "default virtual epoch {observed} was not captured near host now [{before}, {after}]"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("virtual-time epoch="), "{stderr}");
-    assert!(stderr.contains("source=host-now"), "{stderr}");
-    assert!(stderr.contains("reproduce with --epoch="), "{stderr}");
+    assert!(diagnostics.contains("virtual-time epoch="), "{diagnostics}");
+    assert!(diagnostics.contains("source=host-now"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("reproduce with --epoch="),
+        "{diagnostics}"
+    );
 }
 
 #[test]
 fn explicit_virtual_epoch_reproduces_identical_observed_time() {
     let _guard = hermit_clock_lock();
-    let first = run_date_at_epoch(Some(REPEATABLE_EPOCH));
-    let second = run_date_at_epoch(Some(REPEATABLE_EPOCH));
+    let (first, first_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));
+    let (second, second_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));
     assert_eq!(first.stdout, second.stdout);
     let rendered = String::from_utf8_lossy(&first.stdout);
     let (seconds, nanos) = rendered.trim().split_once('.').unwrap();
@@ -171,11 +188,43 @@ fn explicit_virtual_epoch_reproduces_identical_observed_time() {
         (epoch..epoch + 1_000_000_000).contains(&observed),
         "explicit epoch did not seed the expected virtual-time trajectory: {observed}"
     );
-    for output in [first, second] {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("source=explicit"), "{stderr}");
+    for diagnostics in [first_diagnostics, second_diagnostics] {
+        assert!(diagnostics.contains("source=explicit"), "{diagnostics}");
         assert!(
-            stderr.contains("2000-12-31T23:59:59.123456789+00:00"),
+            diagnostics.contains("2000-12-31T23:59:59.123456789+00:00"),
+            "{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn epochs_outside_the_signed_nanosecond_origin_cap_are_refused() {
+    for epoch in [
+        "1969-12-31T23:59:59.999999999Z",
+        "2262-04-11T23:47:16.854775808Z",
+    ] {
+        let output = Command::new(hermit_binary::hermit_binary())
+            .args([
+                "run",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                &format!("--epoch={epoch}"),
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start invalid epoch probe: {error}"));
+        assert!(
+            !output.status.success(),
+            "invalid epoch {epoch} was accepted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--epoch must be between 1970-01-01T00:00:00Z"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("leaving at least 2^63 nanoseconds"),
             "{stderr}"
         );
     }
