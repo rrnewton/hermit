@@ -2219,6 +2219,20 @@ fn record_timer_slack_proc_read_write() {
     );
 }
 
+#[test]
+fn record_c_clock_exec_continuity() {
+    let _guard = hermit_record_lock();
+    let guest = workload("c_clock_exec_continuity");
+    canonical_record_replay_command(guest.name, &guest.path, &[]);
+}
+
+#[test]
+fn record_rs_clock_total_order() {
+    let _guard = hermit_record_lock();
+    let guest = workload("rustbin_clock_total_order");
+    canonical_record_replay_command(guest.name, &guest.path, &[]);
+}
+
 macro_rules! record_replay_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
@@ -2236,8 +2250,6 @@ record_replay_tests! {
     record_c_fd_reuse_after_close => "c_record_replay_fd_close",
     record_c_execveat_paths => "c_record_replay_execveat_paths",
     record_c_sigpipe_siginfo => "c_sigpipe_siginfo",
-    record_c_clock_exec_continuity => "c_clock_exec_continuity",
-    record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",
     record_rs_futex_timeout => "rustbin_futex_timeout",
