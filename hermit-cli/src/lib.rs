@@ -30,6 +30,9 @@ mod interp;
 pub mod liteinst_bootstrap;
 pub mod liteinst_record;
 mod metadata;
+/// Owned external network-service startup; ordinary FD capability remains inactive.
+pub mod network_container;
+pub mod network_provider_package;
 pub mod run_evidence;
 
 pub use canonical_verdict::Verdict;
@@ -390,7 +393,9 @@ use nix::sys::signal::SigHandler;
 use nix::sys::signal::SigSet;
 use nix::sys::signal::Signal;
 use nix::sys::signal::sigaction;
+pub use record::PreparedFullRecordTrace;
 use record::Record;
+pub use replay::PreparedFullReplayTrace;
 use replay::Replay;
 pub use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -1746,9 +1751,19 @@ async fn run_sabre(
     if requires_forced_shutdown {
         global.cancel_internal_scheduler().await;
     }
-    global
+    let primary = if detcore_never_engaged {
+        Err(anyhow!(
+            "{}",
+            sabre_uninstrumented_guest_message(&output.status)
+        ))
+    } else {
+        Ok(())
+    };
+    let cleanup = global
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    let cleanup = finish_backend_cleanup("SaBRe", output.status, requires_forced_shutdown, cleanup);
+    crate::error::finish_run_with_cleanup(primary, cleanup)?;
     tracing::info!(
         target: "hermit::sabre::fallback",
         ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
@@ -1756,12 +1771,6 @@ async fn run_sabre(
         guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
         "SaBRe ptrace fallback completed",
     );
-    if detcore_never_engaged {
-        return Err(anyhow!(
-            "{}",
-            sabre_uninstrumented_guest_message(&output.status)
-        ));
-    }
     Ok(output)
 }
 
@@ -2158,7 +2167,7 @@ async fn finish_kvm_tool_completion(
             completion
                 .global_state
                 .clean_up(print_summary, print_summary_to_json_file)
-                .await;
+                .await?;
             Ok(output)
         }
         Err(error) => {
@@ -2196,6 +2205,25 @@ mod kvm_failure_tests;
 #[cfg(all(test, feature = "kvm-execution-tests"))]
 mod kvm_execution_tests;
 
+/// Refuse network policies that DBT's ordinary host-process launcher cannot enforce.
+///
+/// Shared by CLI validation and the public library dispatch, before preparing
+/// or spawning the DBT runtime. DBT currently requires explicit live networking.
+#[doc(hidden)]
+pub fn validate_dbt_network_policy(
+    policy: detcore_model::network_trace::NetworkPolicy,
+) -> Result<(), Error> {
+    if policy != detcore_model::network_trace::NetworkPolicy::UnsafeLive {
+        return Err(anyhow!(
+            "backend `dbt` bypasses Hermit's network namespace and cannot enforce denied or \
+             isolated-loopback networking or network trace capture/replay. Select \
+             --backend=ptrace for those policies, or add --unsafe-live-network only when \
+             nondeterministic host networking is intentional."
+        ));
+    }
+    Ok(())
+}
+
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
 #[cfg(feature = "dbt")]
 fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
@@ -2218,6 +2246,8 @@ async fn run_dbt(
              --no-sequentialize-threads (or --strace-only) to run under --backend dbt"
         ));
     }
+
+    validate_dbt_network_policy(config.network_trace.policy)?;
 
     let config_json = serde_json::to_string(&config)
         .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
@@ -2268,7 +2298,7 @@ async fn run_dbt(
             );
             global.force_shutdown_with_error();
             global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await;
+            global.clean_up(false, &None).await?;
             (output, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
             })?;
@@ -2292,7 +2322,7 @@ async fn run_dbt(
             );
             global.force_shutdown_with_error();
             global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await;
+            global.clean_up(false, &None).await?;
             (status, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
             })?;
@@ -2304,7 +2334,7 @@ async fn run_dbt(
         global.force_shutdown_with_error();
         global.cancel_internal_scheduler().await;
     }
-    global.clean_up(print_summary, &None).await;
+    global.clean_up(print_summary, &None).await?;
     Ok(Output {
         status: status.into(),
         stdout,
@@ -2375,6 +2405,33 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend_timeout_and_network_resources(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        None,
+    )
+}
+
+/// The existing bounded runner with an owned, authenticated network runtime
+/// endpoint. Config serialization cannot supply or reconstruct this resource.
+/// This entry does not grant incomplete descriptor-mutation capability.
+#[doc(hidden)]
+pub fn run_with_backend_timeout_and_network_resources(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
+) -> Result<ExitStatus, Error> {
+    if network_runtime.is_some() && !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+        anyhow::bail!("network controller runtime requires actual ptrace dispatch");
+    }
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
@@ -2387,6 +2444,7 @@ pub fn run_with_backend_timeout(
         print_summary_to_json_file,
         backend,
         timeout,
+        network_runtime,
     );
     skid_overshoot_report.finish(result)
 }
@@ -2394,6 +2452,11 @@ pub fn run_with_backend_timeout(
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
 pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+    // Only these dispatch paths run the Tool global state in the owned ptrace
+    // controller. In-process plugins/other backends have no proven whole-run
+    // termination contract merely because their guest is inside a container.
+    config.controller_can_exit_on_network_refusal &=
+        matches!(backend, Backend::Ptrace | Backend::E9patch);
     config.discover_live_file_metadata = backend == Backend::Sabre;
     // Guest-visible wall and monotonic clocks must stay in the same global
     // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
@@ -2419,6 +2482,10 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.backend_runs_exit_robust_list = backend == Backend::Ptrace;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     config.backend_is_kvm = backend == Backend::Kvm;
+    // Only actual ptrace dispatch authenticates host task/file-table identity.
+    // This capability is independent of sequentialization and does not claim
+    // that NoSeq socket-pin lifecycle has already been qualified.
+    config.backend_supports_host_socket_pin = matches!(backend, Backend::Ptrace | Backend::E9patch);
     config.kvm_shared_dequeue_timers = config.backend_is_kvm && config.sequentialize_threads;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
@@ -2473,6 +2540,26 @@ fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
             // "killed by signal N".
             (122..=127).contains(&code) || detcore_model::signal_from_exit_status(code).is_some()
         }
+    }
+}
+
+// The caller passes its already-established shutdown branch, not an inferred
+// error origin. A guest may choose a reserved status too; that existing
+// ambiguity is unchanged. Successful cleanup preserves every original status.
+// A failed forced cleanup was previously an internal panic, and secondary
+// replay residue must not turn it into a policy refusal.
+fn finish_backend_cleanup(
+    backend: &str,
+    status: ExitStatus,
+    forced_shutdown: bool,
+    cleanup: Result<(), Error>,
+) -> Result<(), Error> {
+    if forced_shutdown {
+        cleanup.map_err(|error| anyhow!(
+            "{backend} finalization failed after forced shutdown with status {status:?}: {error:#}"
+        ))
+    } else {
+        cleanup
     }
 }
 
@@ -2699,6 +2786,7 @@ async fn run_with_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<ExitStatus, Error> {
     with_run_deadline(timeout, async {
         dispatch_backend(
@@ -2707,6 +2795,7 @@ async fn run_with_backend_inner(
             print_summary,
             print_summary_to_json_file,
             backend,
+            network_runtime,
         )
         .await
     })
@@ -2719,6 +2808,7 @@ async fn dispatch_backend(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<ExitStatus, Error> {
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -2760,13 +2850,15 @@ async fn dispatch_backend(
                 command, config, preload,
             )
             .await?;
-        if liteinst_requires_forced_shutdown(exit_status) {
+        let forced_shutdown = liteinst_requires_forced_shutdown(exit_status);
+        if forced_shutdown {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
         }
-        global_state
+        let cleanup = global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
+        finish_backend_cleanup("LiteInst", exit_status, forced_shutdown, cleanup)?;
         return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
@@ -2786,10 +2878,19 @@ async fn dispatch_backend(
             builder = builder.sequentialized_guest();
         }
     }
-    let (exit_status, global_state) = builder.spawn().await?.wait().await?;
+    let tracer = match network_runtime {
+        Some(resource) => {
+            detcore::network_runtime::with_network_runtime_resources(resource, async {
+                builder.spawn().await.map_err(Error::from)
+            })
+            .await?
+        }
+        None => builder.spawn().await?,
+    };
+    let (exit_status, global_state) = tracer.wait().await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await; // Before it's dropped by this function.
+        .await?; // Before it's dropped by this function.
     backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
@@ -2869,6 +2970,32 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(Output, u64), Error> {
+    run_with_output_backend_timeout_and_network_resources(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        None,
+    )
+}
+
+/// Output-capturing counterpart of the owned network runtime runner. It retains
+/// the existing overshoot count and timeout, and grants no backend capability.
+#[doc(hidden)]
+pub fn run_with_output_backend_timeout_and_network_resources(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
+) -> Result<(Output, u64), Error> {
+    if network_runtime.is_some() && !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+        anyhow::bail!("network controller runtime requires actual ptrace dispatch");
+    }
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         // Reserve before the Tokio runtime can reuse a closed fd 0. KVM
@@ -2884,6 +3011,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         print_summary_to_json_file,
         backend,
         timeout,
+        network_runtime,
     );
     skid_overshoot_report.finish_with_count(result)
 }
@@ -2896,6 +3024,7 @@ async fn run_with_output_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<Output, Error> {
     let Some(limit) = timeout else {
         return dispatch_output_backend(
@@ -2904,6 +3033,7 @@ async fn run_with_output_backend_inner(
             print_summary,
             print_summary_to_json_file,
             backend,
+            network_runtime,
         )
         .await;
     };
@@ -2916,6 +3046,7 @@ async fn run_with_output_backend_inner(
             print_summary,
             print_summary_to_json_file,
             backend,
+            network_runtime,
         ),
     )
     .await
@@ -2931,6 +3062,7 @@ async fn dispatch_output_backend(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         return run_kvm(
@@ -2975,13 +3107,15 @@ async fn dispatch_output_backend(
             )
             .await?;
         let status = output.status;
-        if liteinst_requires_forced_shutdown(status) {
+        let forced_shutdown = liteinst_requires_forced_shutdown(status);
+        if forced_shutdown {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
         }
-        global_state
+        let cleanup = global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
+        finish_backend_cleanup("LiteInst", status, forced_shutdown, cleanup)?;
         return Ok(Output {
             status,
             stdout: output.stdout,
@@ -3008,10 +3142,19 @@ async fn dispatch_output_backend(
             builder = builder.sequentialized_guest();
         }
     }
-    let (output, global_state) = builder.spawn().await?.wait_with_output().await?;
+    let tracer = match network_runtime {
+        Some(resource) => {
+            detcore::network_runtime::with_network_runtime_resources(resource, async {
+                builder.spawn().await.map_err(Error::from)
+            })
+            .await?
+        }
+        None => builder.spawn().await?,
+    };
+    let (output, global_state) = tracer.wait_with_output().await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await;
+        .await?;
     backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }
@@ -3111,8 +3254,24 @@ impl HermitData {
         command: Command,
         mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     ) -> Result<Recording, Error> {
+        self.record_with_mountinfo_at_epoch(
+            command,
+            mountinfo_root_rewrites,
+            detcore_model::config::capture_current_epoch(),
+        )
+    }
+
+    /// Records with mount provenance at one already-resolved logical epoch.
+    pub fn record_with_mountinfo_at_epoch(
+        &self,
+        command: Command,
+        mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+        epoch: detcore_model::config::Epoch,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to_with_mountinfo(command, data.path(), mountinfo_root_rewrites)?;
+        let prepared = PreparedFullRecordTrace::reserve(data.path())?;
+        let exit_status =
+            record_to_with_mountinfo(command, prepared, mountinfo_root_rewrites, epoch)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -3149,14 +3308,17 @@ impl HermitData {
 
     /// Replays the given recording ID.
     pub fn replay(&self, id: Id) -> Result<ExitStatus, Error> {
-        let data = self.data_dir.join(id.to_string());
-        replay_from(&data)
+        replay_from(self.prepare_replay(id)?)
     }
 
     /// Replays the given recording ID with a gdbserver available to attach to.
     pub fn replay_with_gdbserver(&self, id: Id, port: u16) -> Result<ExitStatus, Error> {
-        let data = self.data_dir.join(id.to_string());
-        replay_with_gdbserver(&data, port)
+        replay_with_gdbserver(self.prepare_replay(id)?, port)
+    }
+
+    /// Open and validate one full replay in the current host namespace.
+    pub fn prepare_replay(&self, id: Id) -> Result<PreparedFullReplayTrace, Error> {
+        PreparedFullReplayTrace::open(&self.data_dir.join(id.to_string()))
     }
 
     /// Returns an iterator over the recordings.
@@ -3290,38 +3452,55 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// [`record_to_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    record_to_async(command, dir, Vec::new(), None).await
+    let prepared = PreparedFullRecordTrace::reserve(dir)?;
+    record_to_async(
+        command,
+        prepared,
+        Vec::new(),
+        None,
+        detcore_model::config::capture_current_epoch(),
+    )
+    .await
 }
 
 /// Records to the specified directory with exact mountinfo provenance.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to_with_mountinfo(
     command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<ExitStatus, Error> {
     let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
     record_to_async(
         command,
-        dir,
+        prepared_trace,
         mountinfo_root_rewrites,
         Some(mountinfo_mount_ids),
+        epoch,
     )
     .await
 }
 
 async fn record_to_async(
     command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait()
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            prepared_trace,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            epoch,
+        )
+        .await?
+        .wait()
+        .await
     }
     .await;
     skid_overshoot_report.finish(result)
@@ -3336,31 +3515,42 @@ async fn record_to_async(
 /// [`record_with_output_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
-    record_with_output_async(command, dir, Vec::new(), None).await
+    let prepared = PreparedFullRecordTrace::reserve(dir)?;
+    record_with_output_async(
+        command,
+        prepared,
+        Vec::new(),
+        None,
+        detcore_model::config::capture_current_epoch(),
+    )
+    .await
 }
 
 /// Records with captured output and exact mountinfo provenance.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_with_output_with_mountinfo(
     command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<Output, Error> {
     let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
     record_with_output_async(
         command,
-        dir,
+        prepared_trace,
         mountinfo_root_rewrites,
         Some(mountinfo_mount_ids),
+        epoch,
     )
     .await
 }
 
 async fn record_with_output_async(
     mut command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
@@ -3368,10 +3558,16 @@ async fn record_with_output_async(
     command.stderr(Stdio::piped());
 
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait_with_output()
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            prepared_trace,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            epoch,
+        )
+        .await?
+        .wait_with_output()
+        .await
     }
     .await;
     skid_overshoot_report.finish(result)
@@ -3379,18 +3575,27 @@ async fn record_with_output_async(
 
 /// Replays from the specified directory.
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
+pub async fn replay_from(prepared: PreparedFullReplayTrace) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async { Ok(Replay::spawn(dir, false, None, &[]).await?.wait().await?) }.await;
+    let result = async {
+        Ok(Replay::spawn(prepared, false, None, &[])
+            .await?
+            .wait()
+            .await?)
+    }
+    .await;
     skid_overshoot_report.finish(result)
 }
 
 /// Replays with a gdb server.
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
+pub async fn replay_with_gdbserver(
+    prepared: PreparedFullReplayTrace,
+    port: u16,
+) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, false, Some(port), &[])
+        Ok(Replay::spawn(prepared, false, Some(port), &[])
             .await?
             .wait()
             .await?)
@@ -3402,13 +3607,13 @@ pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, 
 /// Replays with a gdb server and applies mounts inside the replay chroot.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_gdbserver_and_mounts(
-    dir: &Path,
+    prepared: PreparedFullReplayTrace,
     port: u16,
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, false, Some(port), mounts)
+        Ok(Replay::spawn(prepared, false, Some(port), mounts)
             .await?
             .wait()
             .await?)
@@ -3421,9 +3626,10 @@ pub async fn replay_with_gdbserver_and_mounts(
 /// stderr/stdout of the replay is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
+    let prepared = PreparedFullReplayTrace::open(dir)?;
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, true, None, &[])
+        Ok(Replay::spawn(prepared, true, None, &[])
             .await?
             .wait_with_output()
             .await?)
@@ -3434,10 +3640,13 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 
 /// Replays with captured output and applies the requested mounts inside the replay chroot.
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
+pub async fn replay_with_output_and_mounts(
+    prepared: PreparedFullReplayTrace,
+    mounts: &[Mount],
+) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, true, None, mounts)
+        Ok(Replay::spawn(prepared, true, None, mounts)
             .await?
             .wait_with_output()
             .await?)
@@ -3748,6 +3957,79 @@ mod tests {
         assert_eq!(value, 7);
         assert_eq!(count, 1);
         assert_eq!(reverie::take_skid_overshoot_count(), 0);
+    }
+
+    #[test]
+    fn forced_backend_cleanup_keeps_status_and_internal_failure_precedence() {
+        use detcore::network_failure::NetworkFailurePhase;
+        use detcore::network_failure::NetworkRpcError;
+        use detcore::network_replay::NetworkReplayError;
+        use detcore_model::network_trace::NetworkPolicy;
+
+        use crate::error::FailureKind;
+        use crate::error::SerializableError;
+
+        let refusal = || {
+            NetworkRpcError::from_engine(
+                NetworkPolicy::Replay,
+                NetworkFailurePhase::Completion,
+                NetworkReplayError::UnconsumedTrace,
+            )
+            .into_error()
+        };
+        for status in [
+            ExitStatus::Exited(0),
+            ExitStatus::Exited(1),
+            ExitStatus::Exited(121),
+            ExitStatus::Exited(122),
+            ExitStatus::Exited(125),
+            ExitStatus::Exited(127),
+            ExitStatus::Exited(128),
+            ExitStatus::Exited(130),
+            ExitStatus::Exited(192),
+            ExitStatus::Exited(193),
+            ExitStatus::Exited(200),
+            ExitStatus::Signaled(nix::sys::signal::Signal::SIGKILL, false),
+        ] {
+            for (backend, forced) in [
+                ("LiteInst", liteinst_requires_forced_shutdown(status)),
+                ("SaBRe", !status.success()),
+            ] {
+                let completed =
+                    finish_backend_cleanup(backend, status, forced, Ok(())).map(|()| status);
+                assert_eq!(completed.unwrap(), status);
+                let error =
+                    finish_backend_cleanup(backend, status, forced, Err(refusal())).unwrap_err();
+                let detail = format!("{error:#}");
+                assert!(detail.contains("UnconsumedTrace"));
+                if forced {
+                    assert!(detail.contains(&format!("{status:?}")));
+                    assert!(detail.contains(backend));
+                }
+                assert_eq!(
+                    SerializableError::from(error).kind(),
+                    if forced {
+                        FailureKind::Error
+                    } else {
+                        FailureKind::PolicyRefusal
+                    }
+                );
+                let internal = finish_backend_cleanup(
+                    backend,
+                    status,
+                    forced,
+                    Err(anyhow!("internal-finalization-defect")),
+                )
+                .unwrap_err();
+                assert_eq!(SerializableError::from(internal).kind(), FailureKind::Error);
+            }
+        }
+        let primary = Err::<(), _>(anyhow!("SaBRe Detcore never engaged"));
+        let error = crate::error::finish_run_with_cleanup(primary, Err(refusal())).unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("SaBRe Detcore never engaged"));
+        assert!(detail.contains("UnconsumedTrace"));
+        assert_eq!(SerializableError::from(error).kind(), FailureKind::Error);
     }
 
     /// ⚠️ THE REGRESSION agent(hermit-007)'s CODEX LANE CAUGHT, PINNED FOR THE
@@ -4211,6 +4493,57 @@ mod tests {
     }
 
     #[test]
+    fn host_socket_pin_capability_is_owned_by_actual_ptrace_dispatch() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::E9patch,
+            Backend::Liteinst,
+            Backend::Sabre,
+            Backend::Kvm,
+            Backend::Dbt,
+        ] {
+            for claimed in [false, true] {
+                for sequentialize_threads in [false, true] {
+                    let requested = super::DetConfig {
+                        backend_supports_host_socket_pin: claimed,
+                        sequentialize_threads,
+                        ..super::DetConfig::default()
+                    };
+                    assert_eq!(
+                        prepare_backend_config(requested, backend).backend_supports_host_socket_pin,
+                        matches!(backend, Backend::Ptrace | Backend::E9patch)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_refusal_exit_capability_never_spreads_to_plugin_backends() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::E9patch,
+            Backend::Liteinst,
+            Backend::Sabre,
+            Backend::Kvm,
+            Backend::Dbt,
+        ] {
+            assert!(
+                !prepare_backend_config(super::DetConfig::default(), backend)
+                    .controller_can_exit_on_network_refusal
+            );
+            let requested = super::DetConfig {
+                controller_can_exit_on_network_refusal: true,
+                ..super::DetConfig::default()
+            };
+            assert_eq!(
+                prepare_backend_config(requested, backend).controller_can_exit_on_network_refusal,
+                matches!(backend, Backend::Ptrace | Backend::E9patch)
+            );
+        }
+    }
+
+    #[test]
     fn liteinst_host_backend_preserves_ptrace_rcb_timeslices() {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
@@ -4613,6 +4946,68 @@ mod tests {
     }
 
     #[test]
+    fn dbt_network_admission_requires_explicit_live_policy() {
+        use detcore_model::network_trace::NetworkPolicy;
+
+        for policy in [
+            NetworkPolicy::Deny,
+            NetworkPolicy::Record,
+            NetworkPolicy::Replay,
+        ] {
+            let error = super::validate_dbt_network_policy(policy).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("backend `dbt`"), "{message}");
+            assert!(message.contains("--backend=ptrace"), "{message}");
+            assert!(message.contains("--unsafe-live-network"), "{message}");
+        }
+        super::validate_dbt_network_policy(NetworkPolicy::UnsafeLive).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_public_dispatch_refuses_network_policy_before_guest_preparation() {
+        use detcore_model::network_trace::NetworkTraceConfig;
+
+        for network_trace in [
+            NetworkTraceConfig::deny(),
+            NetworkTraceConfig::record("absent-record.trace"),
+            NetworkTraceConfig::replay("absent-replay.trace", None),
+        ] {
+            let config = super::DetConfig {
+                network_trace,
+                sequentialize_threads: true,
+                ..Default::default()
+            };
+            // Neither entry point may prepare a client or try to start this
+            // nonexistent guest under a policy the backend cannot honor.
+            let error = super::run_with_backend(
+                super::Command::new("/nonexistent-hermit-dbt-policy-guest"),
+                config.clone(),
+                false,
+                &None,
+                Backend::Dbt,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("cannot enforce denied"),
+                "{error:#}"
+            );
+            let error = super::run_with_output_backend(
+                super::Command::new("/nonexistent-hermit-dbt-policy-guest"),
+                config,
+                false,
+                &None,
+                Backend::Dbt,
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("cannot enforce denied"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(feature = "dbt")]
     fn dbt_retries_only_the_pre_guest_bootstrap_failure() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -4658,6 +5053,9 @@ mod tests {
         command.arg("hello");
         let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
+        // This launch control explicitly accepts DBT's host network; denied
+        // policies are separately required to fail before guest preparation.
+        config.network_trace = detcore_model::network_trace::NetworkTraceConfig::unsafe_live();
         config.validate();
         let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
             .expect("run /bin/echo through DbtGuest<Detcore>");
@@ -4692,6 +5090,9 @@ mod tests {
         let command = super::Command::new("/bin/true");
         let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
+        // This launch control explicitly accepts DBT's host network; denied
+        // policies are separately required to fail before guest preparation.
+        config.network_trace = detcore_model::network_trace::NetworkTraceConfig::unsafe_live();
         config.validate();
         let status = super::run_with_backend(command, config, true, &None, Backend::Dbt)
             .expect("run /bin/true through DbtGuest<Detcore>");

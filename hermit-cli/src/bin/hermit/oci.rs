@@ -104,6 +104,20 @@ fn require_store() -> Result<PodmanStore, Error> {
 }
 
 impl OciOpts {
+    pub(crate) fn set_run_epoch_source_explicit(&mut self, explicit: bool) {
+        if let OciSubcommand::Run(opts) = &mut self.command {
+            opts.run.set_epoch_source_explicit(explicit);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_epoch_source_explicit_for_test(&self) -> bool {
+        let OciSubcommand::Run(opts) = &self.command else {
+            panic!("expected OCI run")
+        };
+        opts.run.epoch_source_explicit()
+    }
+
     /// Resolve the embedded run's omitted epoch at the same outer process
     /// boundary as a top-level `hermit run` invocation.
     pub(crate) fn capture_default_run_epoch(

@@ -19,6 +19,9 @@ use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
+use std::io::Cursor;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::os::fd::FromRawFd;
@@ -34,6 +37,23 @@ use std::time::SystemTime;
 use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
+use detcore_model::network_trace::FreshStreamSocketProfileV3;
+use detcore_model::network_trace::NetworkAddressV2;
+use detcore_model::network_trace::NetworkAncillaryDataV2;
+use detcore_model::network_trace::NetworkChannelId;
+use detcore_model::network_trace::NetworkChannelV2;
+use detcore_model::network_trace::NetworkConnectionResultV2;
+use detcore_model::network_trace::NetworkDatagramV2;
+use detcore_model::network_trace::NetworkInputEventV2;
+use detcore_model::network_trace::NetworkInputKindV2;
+use detcore_model::network_trace::NetworkOutputEventV2;
+use detcore_model::network_trace::NetworkOutputKindV2;
+use detcore_model::network_trace::NetworkPolicy;
+use detcore_model::network_trace::NetworkReadinessV2;
+use detcore_model::network_trace::NetworkReleaseV2;
+use detcore_model::network_trace::NetworkShutdownV2;
+use detcore_model::network_trace::NetworkTrace;
+use detcore_model::network_trace::StreamSocketKeyV3;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
@@ -62,6 +82,37 @@ use tracing::warn;
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::ivar::Ivar;
+use crate::network_failure::NetworkFailurePhase;
+use crate::network_failure::NetworkPolicyRefusal;
+use crate::network_failure::NetworkRpcError;
+use crate::network_replay::ConnectionOutcome;
+use crate::network_replay::DatagramReceiveOutcome;
+use crate::network_replay::NetworkChannelBinding;
+pub use crate::network_replay::NetworkIngressObservation;
+use crate::network_replay::NetworkReceiveOptions;
+use crate::network_replay::NetworkReplayEngine;
+use crate::network_replay::NetworkReplayError;
+use crate::network_replay::NetworkShadowProbe;
+use crate::network_replay::NetworkSocketControl;
+use crate::network_replay::NetworkSocketControlFinish;
+use crate::network_replay::NetworkStreamCall;
+use crate::network_replay::NetworkStreamCallId;
+pub use crate::network_replay::NetworkStreamChunk;
+pub use crate::network_replay::NetworkStreamChunkDisposition;
+pub use crate::network_replay::NetworkStreamLeaseId;
+use crate::network_replay::NetworkStreamNamespace;
+use crate::network_replay::NetworkStreamOwner;
+use crate::network_replay::NetworkStreamPhysicalEffect;
+use crate::network_replay::NetworkStreamPhysicalResult;
+use crate::network_replay::NetworkStreamPinOutcome;
+pub use crate::network_replay::NetworkStreamQueueStatus;
+use crate::network_replay::NetworkStreamSocketOption;
+use crate::network_replay::NetworkStreamSocketState;
+use crate::network_replay::NetworkZeroStreamReceive;
+use crate::network_replay::NetworkZeroStreamWaitId;
+use crate::network_replay::StreamReceiveOutcome;
+use crate::network_replay::StreamTransmitOutcome;
+use crate::network_replay::replay_from_reader_with_expected_epoch;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
 use crate::record_or_replay::RecordOrReplay;
@@ -147,9 +198,7 @@ struct ChildRegistration {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingExecState {
-    caller: DetTid,
-    process: DetPid,
-    mm: MmId,
+    receipt: ExecFilesReceipt,
     fd_blocking: ExecFdBlockingOverrides,
 }
 
@@ -422,6 +471,41 @@ impl DevicePool {
     }
 }
 
+fn initialize_network_engine(
+    cfg: &Config,
+) -> Result<Option<Arc<Mutex<NetworkReplayEngine>>>, String> {
+    let engine = match cfg.network_trace.policy {
+        NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => return Ok(None),
+        NetworkPolicy::Record => {
+            if !cfg.epoch_explicit {
+                return Err(
+                    "network record epoch was not resolved before engine startup".to_owned(),
+                );
+            }
+            NetworkReplayEngine::record_shadow(cfg.epoch)
+        }
+        NetworkPolicy::Replay => {
+            if !cfg.epoch_explicit {
+                return Err(
+                    "network replay epoch was not resolved before engine startup".to_owned(),
+                );
+            }
+            let bytes = cfg.network_trace_input.as_ref().ok_or_else(|| {
+                "network replay policy omitted verified host trace bytes".to_owned()
+            })?;
+            replay_from_reader_with_expected_epoch(Cursor::new(bytes), cfg.epoch)
+                .map_err(|error| format!("cannot initialize network replay: {error}"))?
+        }
+    };
+    Ok(Some(Arc::new(Mutex::new(engine))))
+}
+
+#[derive(Debug, Default)]
+struct NetworkRecordProgress {
+    inbound_stream: u64,
+    outbound_stream: u64,
+}
+
 /// Global state associated with the detcore tool.
 ///
 /// This is a singleton, and the one object of this type lives inside a central
@@ -429,6 +513,16 @@ impl DevicePool {
 #[derive(Debug)]
 pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
+
+    /// One run-global network engine shared by every guest task and scheduler wait.
+    network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
+
+    /// Actual owned startup resources; never reconstructed from Config or an FD number.
+    network_runtime: Option<crate::network_runtime::NetworkRuntimeResources>,
+
+    /// Stream offsets are run-global so competing aliases cannot assign them
+    /// according to thread-local syscall order.
+    network_record_progress: Mutex<BTreeMap<OpenFileId, NetworkRecordProgress>>,
 
     inodes: Arc<Mutex<InodePool>>,
 
@@ -465,6 +559,22 @@ pub struct GlobalState {
     /// Pre-exec identity and descriptor state awaiting a SaBRe exec reload.
     // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
     pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
+
+    /// One checked, never-rewound allocator for every exec in this run.
+    exec_files_allocator: Mutex<FilesIdAllocator>,
+
+    /// Address spaces derived at accepted clone/root registration and updated
+    /// only by authenticated successful exec. The PrepareExec payload is not
+    /// its own authority for a pre-exec address space.
+    registered_exec_mms: Mutex<BTreeMap<DetTid, MmId>>,
+
+    /// Contending sibling execs wait without retaining any scheduler lock.
+    exec_preparation_changed: tokio::sync::Notify,
+    network_stream_changed: tokio::sync::Notify,
+
+    /// The same reservation returned before injection, awaiting post-exec
+    /// delivery after a backend reentered thread-start.
+    post_exec_files: Mutex<BTreeMap<DetTid, ExecFilesReceipt>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
     post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
@@ -512,6 +622,232 @@ impl Drop for GlobalState {
 }
 
 impl GlobalState {
+    async fn recv_enroll_accepted_listener(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        fd: i32,
+    ) -> GlobalResponse {
+        let Some(runtime) = &self.network_runtime else {
+            return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                "listener provider runtime absent",
+            )));
+        };
+        let prepared = {
+            let sched = self.sched.lock().unwrap();
+            if sched.backend_failed()
+                || sched.thread_is_logically_killed(owner.thread)
+                || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+            {
+                return GlobalResponse::ThreadExited;
+            }
+            (|| -> Result<_, NetworkRpcError> {
+                let engine = self
+                    .network_engine
+                    .as_ref()
+                    .ok_or_else(|| NetworkRpcError::internal("listener engine absent"))?
+                    .lock()
+                    .unwrap();
+                let (open_file, state) = engine
+                    .accepted_listener_enrollment_target(owner, call)
+                    .map_err(|error| NetworkRpcError::internal(error.to_string()))?;
+                if engine.accepted_listener_enrolled(open_file) {
+                    return Ok(None);
+                }
+                runtime
+                    .capture_accepted_listener(owner, call, open_file, fd)
+                    .map_err(|error| NetworkRpcError::internal(error.to_string()))?;
+                Ok(Some((open_file, state, sched.backend_failure_waiter())))
+            })()
+        };
+        let (open_file, state, backend_failed) = match prepared {
+            Ok(Some(value)) => value,
+            Ok(None) => return GlobalResponse::Network(Ok(NetworkReply::Unit)),
+            Err(error) => return GlobalResponse::Network(Err(error)),
+        };
+        let evidence = tokio::select! {
+            evidence=runtime.enroll_accepted_listener(owner,open_file,&state)=>evidence,
+            _=backend_failed=>return GlobalResponse::ThreadExited,
+        };
+        let sched = self.sched.lock().unwrap();
+        if sched.backend_failed()
+            || sched.thread_is_logically_killed(owner.thread)
+            || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+            || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+        {
+            return GlobalResponse::ThreadExited;
+        }
+        let outcome = evidence
+            .map_err(|error| NetworkRpcError::internal(error.to_string()))
+            .and_then(|evidence| {
+                self.network_engine
+                    .as_ref()
+                    .ok_or_else(|| NetworkRpcError::internal("listener engine disappeared"))?
+                    .lock()
+                    .unwrap()
+                    .confirm_provider_listener_enrollment(owner, call, evidence)
+                    .map_err(|error| NetworkRpcError::internal(error.to_string()))
+            });
+        GlobalResponse::Network(outcome.map(|()| NetworkReply::Unit))
+    }
+
+    async fn recv_resolve_accepted_provider(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+    ) -> GlobalResponse {
+        let Some(runtime) = &self.network_runtime else {
+            return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                "accepted match runtime absent",
+            )));
+        };
+        let backend_failed = {
+            let sched = self.sched.lock().unwrap();
+            if sched.backend_failed()
+                || sched.thread_is_logically_killed(owner.thread)
+                || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+            {
+                return GlobalResponse::ThreadExited;
+            }
+            let result = self
+                .network_engine
+                .as_ref()
+                .ok_or_else(|| NetworkRpcError::internal("accepted match engine absent"))
+                .and_then(|engine| {
+                    engine
+                        .lock()
+                        .unwrap()
+                        .accepted_capture_call(owner, lease)
+                        .map_err(|error| NetworkRpcError::internal(error.to_string()))
+                });
+            if let Err(error) = result {
+                return GlobalResponse::Network(Err(error));
+            }
+            sched.backend_failure_waiter()
+        };
+        let matched = tokio::select! {
+            result=runtime.resolve_accepted_pin(owner,lease)=>result,
+            _=backend_failed=>return GlobalResponse::ThreadExited,
+        };
+        let matched = match matched {
+            Ok(matched) => matched,
+            Err(error) => {
+                return GlobalResponse::Network(Err(NetworkRpcError::internal(error.to_string())));
+            }
+        };
+        // Successful kernel accept already proves this child became queued.
+        // Observer fexit may trail queue publication. Reobserve that pending
+        // phase; never convert it into no-connection or an installed slot.
+        loop {
+            let backend_failed = {
+                let sched = self.sched.lock().unwrap();
+                if sched.backend_failed()
+                    || sched.thread_is_logically_killed(owner.thread)
+                    || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                    || self.registered_exec_mms.lock().unwrap().get(&owner.thread)
+                        != Some(&owner.mm)
+                {
+                    return GlobalResponse::ThreadExited;
+                }
+                let engine = self.network_engine.as_ref().unwrap().lock().unwrap();
+                if let Err(error) = engine.accepted_capture_call(owner, lease) {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        error.to_string(),
+                    )));
+                }
+                match engine.provider_child_published(matched) {
+                    Ok(true) => return GlobalResponse::Network(Ok(NetworkReply::Unit)),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                            error.to_string(),
+                        )));
+                    }
+                }
+                sched.backend_failure_waiter()
+            };
+            let next = tokio::select! {
+                next=runtime.next_accepted_creation(owner)=>next,
+                _=backend_failed=>return GlobalResponse::ThreadExited,
+            };
+            let publication = match next {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        "accepted observation completed without a queued or terminal receipt",
+                    )));
+                }
+                Err(error) => {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        error.to_string(),
+                    )));
+                }
+            };
+            let sched = self.sched.lock().unwrap();
+            if sched.backend_failed()
+                || sched.thread_is_logically_killed(owner.thread)
+                || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+            {
+                return GlobalResponse::ThreadExited;
+            }
+            let mut engine = self.network_engine.as_ref().unwrap().lock().unwrap();
+            if let Err(error) = engine.accepted_capture_call(owner, lease).and_then(|_| {
+                engine.confirm_provider_child_creation(
+                    &publication.evidence,
+                    self.global_time.lock().unwrap().as_nanos(),
+                )
+            }) {
+                return GlobalResponse::Network(Err(NetworkRpcError::internal(error.to_string())));
+            }
+            // No await separates publication and exact runtime cursor ACK.
+            if let Err(error) = publication.acknowledge() {
+                return GlobalResponse::Network(Err(NetworkRpcError::internal(error.to_string())));
+            }
+            self.network_stream_changed.notify_waiters();
+        }
+    }
+
+    fn recv_capture_accepted_return(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+        result: Result<i32, i32>,
+    ) -> GlobalResponse {
+        let sched = self.sched.lock().unwrap();
+        let may_publish = !sched.backend_failed()
+            && !sched.thread_is_logically_killed(owner.thread)
+            && sched.rpc_incarnation_matches(owner.thread, owner.mm)
+            && self.registered_exec_mms.lock().unwrap().get(&owner.thread) == Some(&owner.mm);
+        let outcome = (|| -> Result<NetworkReply, NetworkRpcError> {
+            let runtime = self.network_runtime.as_ref().ok_or_else(|| {
+                NetworkRpcError::internal("accept capture has no authenticated runtime")
+            })?;
+            let engine = self
+                .network_engine
+                .as_ref()
+                .ok_or_else(|| NetworkRpcError::internal("accept capture has no engine"))?;
+            let engine = engine.lock().unwrap();
+            // Exact lease+original owner/MM is recovery authority even when a
+            // later scheduler transition has revoked semantic publication.
+            engine
+                .accepted_capture_recovery_call(owner, lease)
+                .map_err(|error| NetworkRpcError::internal(error.to_string()))?;
+            let may_acquire = may_publish && engine.accepted_capture_call(owner, lease).is_ok();
+            runtime
+                .capture_accept_return(owner, lease, result, may_acquire)
+                .map_err(|error| NetworkRpcError::internal(error.to_string()))?;
+            Ok(NetworkReply::Unit)
+        })();
+        if may_publish {
+            GlobalResponse::Network(outcome)
+        } else {
+            GlobalResponse::ThreadExited
+        }
+    }
+
     /// Ordinary RPC mutation must linearize before terminal publication under
     /// the same mutex as scheduler grants. A losing callback stays pending for
     /// the backend's failure subscription to drop; no normal reply is invented.
@@ -531,6 +867,71 @@ impl GlobalState {
         .await
     }
 
+    async fn recv_prepare_exec(
+        &self,
+        caller: DetTid,
+        process: DetPid,
+        request_mm: MmId,
+        mm: MmId,
+        old_files: FilesId,
+        fd_blocking: ExecFdBlockingOverrides,
+    ) -> GlobalResponse {
+        loop {
+            let changed = self.exec_preparation_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                // This direct lock lets a waiter observe terminal failure;
+                // lock_rpc_scheduler(false) intentionally stays pending there.
+                let sched = self.sched.lock().unwrap();
+                if sched.backend_failed()
+                    || sched.thread_is_logically_killed(caller)
+                    || sched.registered_process(caller) != Some(process)
+                    || request_mm != mm
+                    || !sched.rpc_incarnation_matches(caller, mm)
+                    || self.registered_exec_mms.lock().unwrap().get(&caller) != Some(&mm)
+                {
+                    return GlobalResponse::ThreadExited;
+                }
+                let mut pending = self.pending_exec_states.lock().unwrap();
+                if let Some(active) = pending.get(&process) {
+                    assert_ne!(
+                        active.receipt.caller, caller,
+                        "one caller cannot prepare exec twice without completing its attempt"
+                    );
+                } else {
+                    let new_files = self
+                        .exec_files_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_exec(caller);
+                    let receipt = ExecFilesReceipt {
+                        caller,
+                        process,
+                        mm,
+                        old_files,
+                        new_files,
+                    };
+                    trace!(
+                        "[detcore, dtid {}] preparing exec with table receipt {:?}",
+                        caller, receipt
+                    );
+                    pending.insert(
+                        process,
+                        PendingExecState {
+                            receipt,
+                            fd_blocking,
+                        },
+                    );
+                    return GlobalResponse::PrepareExec(receipt);
+                }
+            }
+            // The active caller can cancel or complete without acquiring a
+            // lock held by this waiter. A wake never itself admits the caller.
+            changed.await;
+        }
+    }
+
     /// Return the producer-observed mount identity order after a run.
     ///
     /// The first vector is the exact mountinfo row/parent order. The second is
@@ -542,7 +943,15 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
-        let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
+        // Replay is decoded and fully validated before the first guest task can
+        // start.  There is no live-network fallback for a missing or malformed
+        // trace.
+        let network_engine = initialize_network_engine(cfg).unwrap_or_else(|error| {
+            panic!("network capture/replay initialization failed: {error}")
+        });
+        let mut scheduler = Scheduler::new(cfg);
+        scheduler.set_network_engine(network_engine.clone());
+        let sched = Arc::new(Mutex::new(scheduler));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
             // Announce before spawning, not from inside the spawned task. The
@@ -589,6 +998,9 @@ impl GlobalState {
 
         Self {
             sched,
+            network_engine,
+            network_runtime: None,
+            network_record_progress: Mutex::new(BTreeMap::new()),
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
@@ -598,6 +1010,11 @@ impl GlobalState {
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             pending_exec_states: Mutex::new(BTreeMap::new()),
+            exec_files_allocator: Mutex::new(FilesIdAllocator::default()),
+            registered_exec_mms: Mutex::new(BTreeMap::new()),
+            exec_preparation_changed: tokio::sync::Notify::new(),
+            network_stream_changed: tokio::sync::Notify::new(),
+            post_exec_files: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -643,7 +1060,9 @@ impl GlobalState {
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
+        self.post_exec_files.lock().unwrap().remove(&detpid);
         self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
+        self.exec_preparation_changed.notify_waiters();
         if self
             .sched
             .lock()
@@ -661,7 +1080,9 @@ impl GlobalState {
     /// tracee and no guest thread can race another lifecycle event.
     pub fn release_all_physical_process_exits(&self) {
         self.pending_exec_states.lock().unwrap().clear();
+        self.post_exec_files.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
+        self.exec_preparation_changed.notify_waiters();
         let released = self
             .sched
             .lock()
@@ -701,6 +1122,36 @@ impl GlobalState {
             }
         };
         info!("Scheduler state at exit:\n{}", sched.full_summary());
+    }
+
+    /// Inspect unfinished work without acknowledging effects, consuming receipts,
+    /// removing the engine, or publishing a trace. This reports the first pending
+    /// operation (if any), before the ordinary unconsumed-trace checks.
+    fn network_refusal_state_diagnostic(&self) -> String {
+        match &self.network_engine {
+            None => "network engine unavailable".to_owned(),
+            Some(engine) => match engine.try_lock() {
+                Ok(engine) => format!("read-only completion check: {:?}", engine.finish()),
+                Err(error) => format!("network state unavailable: {error}"),
+            },
+        }
+    }
+
+    fn shutdown_for_network_refusal(&self, refusal: &NetworkPolicyRefusal) -> ! {
+        // The explicit controller capability proves exiting this process ends
+        // the owned PID namespace. Do not await a guest RPC/turn or run normal
+        // finalization: unresolved effects remain unresolved and nothing is
+        // published as a successful recording. Synchronous stderr preserves
+        // the typed reason when process::exit bypasses tracing guard drops.
+        let _ = writeln!(
+            crate::util::RetryingStderr,
+            "hermit: network replay policy refusal ({:?}): {refusal}\nhermit: network state not finalized or published; {}",
+            refusal.reason(),
+            self.network_refusal_state_diagnostic(),
+        );
+        // Existing diagnostic lock acquisition is bounded to one second.
+        self.force_shutdown_with_error();
+        exit_owned_controller(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -761,12 +1212,17 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    pub async fn clean_up(
+        mut self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
+        self.finalize_network_trace()?;
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
@@ -802,6 +1258,76 @@ impl GlobalState {
             );
             if let Some(x) = rt {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish the shared engine and durably close its sidecar before a caller
+    /// publishes successful run metadata.  Replay refuses unconsumed input or
+    /// output; record validates the complete V2 trace before writing it.
+    pub fn finalize_network_trace(&mut self) -> anyhow::Result<()> {
+        let Some(engine) = self.network_engine.take() else {
+            return Ok(());
+        };
+        let scheduler_engine = self
+            .sched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_network_engine();
+        if let Some(scheduler_engine) = &scheduler_engine
+            && !Arc::ptr_eq(&engine, scheduler_engine)
+        {
+            bail!("scheduler and RPC paths used different network engines");
+        }
+        drop(scheduler_engine);
+        let engine = Arc::try_unwrap(engine)
+            .map_err(|_| anyhow::anyhow!("network engine still has live users at finalization"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("network engine mutex was poisoned"))?;
+        match self.cfg.network_trace.policy {
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => {
+                bail!("non-engine network policy unexpectedly owned an engine")
+            }
+            NetworkPolicy::Replay => engine.finish().map_err(|error| {
+                NetworkRpcError::from_engine(
+                    self.cfg.network_trace.policy,
+                    NetworkFailurePhase::Completion,
+                    error,
+                )
+                .into_error()
+            }),
+            NetworkPolicy::Record => {
+                let trace = engine
+                    .into_recorded_versioned_trace()
+                    .map_err(|error| anyhow::anyhow!("invalid recorded network trace: {error}"))?;
+                let no_channels = match &trace {
+                    NetworkTrace::V1(trace) => trace.channels.is_empty(),
+                    NetworkTrace::V2(trace) => trace.channels.is_empty(),
+                    NetworkTrace::V3(trace) => trace.history.channels.is_empty(),
+                };
+                if no_channels && !self.cfg.recordreplay_modes {
+                    bail!("network recording captured no external channels");
+                }
+                let inherited = self.cfg.network_trace_output_fd.ok_or_else(|| {
+                    anyhow::anyhow!("network record policy omitted its reserved host output")
+                })?;
+                let duplicate = unsafe { libc::fcntl(inherited, libc::F_DUPFD_CLOEXEC, inherited) };
+                if duplicate < 0 {
+                    bail!(
+                        "cannot duplicate reserved network trace output: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                // SAFETY: fcntl returned a fresh owned descriptor.
+                let mut file = unsafe { File::from_raw_fd(duplicate) };
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                trace.write_framed(&mut file).map_err(|error| {
+                    anyhow::anyhow!("cannot encode reserved network trace output: {error}")
+                })?;
+                file.sync_all()?;
+                Ok(())
             }
         }
     }
@@ -885,7 +1411,11 @@ impl GlobalTool for GlobalState {
 
     /// Called once during startup.
     async fn init_global_state(cfg: &Config) -> GlobalState {
-        GlobalState::initialize(cfg, true)
+        let runtime = crate::network_runtime::take_network_runtime_resources()
+            .expect("one scoped runtime resource belongs to exactly one global initializer");
+        let mut state = GlobalState::initialize(cfg, true);
+        state.network_runtime = runtime;
+        state
     }
 
     fn install_backend_signal_control(
@@ -917,6 +1447,7 @@ impl GlobalTool for GlobalState {
                 sched.take_signal_failure_wakes(),
             )
         };
+        self.exec_preparation_changed.notify_waiters();
         for wake in deferred {
             let _ = wake.send(());
         }
@@ -951,6 +1482,32 @@ impl GlobalTool for GlobalState {
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
         let time_from_guest = guest_time.as_nanos();
+        if let GlobalRequest::Network(NetworkRequest::CaptureAcceptedReturn {
+            lease,
+            kernel_result,
+        }) = &request
+        {
+            // Ptrace's GlobalRPC forwards inline. This branch contains no await:
+            // its first poll latches the return and actual pin before yielding.
+            return (
+                None,
+                self.recv_capture_accepted_return(
+                    NetworkStreamOwner {
+                        thread: dtid,
+                        mm: request_mm,
+                    },
+                    *lease,
+                    *kernel_result,
+                ),
+            );
+        }
+        if matches!(request, GlobalRequest::NetworkOwnerGone) {
+            self.recv_network_owner_gone(NetworkStreamOwner {
+                thread: dtid,
+                mm: request_mm,
+            });
+            return (None, R::NetworkOwnerGone);
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -977,7 +1534,8 @@ impl GlobalTool for GlobalState {
                 _ => None,
             };
             let is_exec_caller_after_local_mm_swap = pending.values().any(|state| {
-                state.caller == dtid && state.mm.for_exec(state.process) == request_mm
+                state.receipt.caller == dtid
+                    && state.receipt.mm.for_exec(state.receipt.process) == request_mm
             });
             (reconnect, is_exec_caller_after_local_mm_swap)
         };
@@ -990,7 +1548,13 @@ impl GlobalTool for GlobalState {
             let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
             if exec_reconnect.is_none()
                 && !is_exec_caller_after_local_mm_swap
-                && !sched.rpc_incarnation_matches(dtid, request_mm)
+                && (!sched.rpc_incarnation_matches(dtid, request_mm)
+                    || self
+                        .registered_exec_mms
+                        .lock()
+                        .unwrap()
+                        .get(&dtid)
+                        .is_some_and(|registered| *registered != request_mm))
             {
                 debug!(
                     "[detcore, dtid {}] rejecting {:?} RPC from retired exec incarnation {:?}",
@@ -1164,62 +1728,70 @@ impl GlobalTool for GlobalState {
                 }
                 R::ReportUnsupportedSyscall(())
             }
-            GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
-                if mm != request_mm {
-                    return (None, R::ThreadExited);
+            GlobalRequest::PrepareExec(process, mm, old_files, fd_blocking) => {
+                let result = self
+                    .recv_prepare_exec(dtid, process, request_mm, mm, old_files, fd_blocking)
+                    .await;
+                if result == R::ThreadExited {
+                    return (None, result);
                 }
-                trace!(
-                    "[detcore, dtid {}] preparing exec for process {} with mm {:?} and logically blocking descriptors {:?}",
-                    dtid, process, mm, fd_blocking,
-                );
-                self.pending_exec_states.lock().unwrap().insert(
-                    process,
-                    PendingExecState {
-                        caller: dtid,
-                        process,
-                        mm,
-                        fd_blocking,
-                    },
-                );
-                R::PrepareExec(())
+                result
             }
-            GlobalRequest::CancelExec(process) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+            GlobalRequest::CancelExec(receipt) => {
+                let sched = self.lock_rpc_scheduler(false).await;
                 let mut pending = self.pending_exec_states.lock().unwrap();
-                if pending
-                    .get(&process)
-                    .is_some_and(|state| state.caller == dtid)
+                if receipt.caller == dtid
+                    && sched.registered_process(dtid) == Some(receipt.process)
+                    && request_mm == receipt.mm
+                    && pending
+                        .get(&receipt.process)
+                        .is_some_and(|state| state.receipt == receipt)
                 {
-                    pending.remove(&process);
+                    pending.remove(&receipt.process);
+                    self.exec_preparation_changed.notify_waiters();
                 }
                 R::CancelExec(())
             }
+            GlobalRequest::UpdateExecFdBlocking(receipt, fd_blocking) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let mut pending = self.pending_exec_states.lock().unwrap();
+                let updated = receipt.caller == dtid
+                    && sched.registered_process(dtid) == Some(receipt.process)
+                    && request_mm == receipt.mm
+                    && pending
+                        .get(&receipt.process)
+                        .is_some_and(|state| state.receipt == receipt);
+                if updated {
+                    pending
+                        .get_mut(&receipt.process)
+                        .expect("checked preparation")
+                        .fd_blocking = fd_blocking;
+                }
+                R::UpdateExecFdBlocking(updated)
+            }
             GlobalRequest::MarkPastFirstExecve(signal_identity) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
+                let pid = sched.registered_process(dtid);
+                let mut consumed_files = None;
                 if self.cfg.kvm_shared_dequeue_timers {
                     let result = (|| {
                         let identity = signal_identity.ok_or(ProtocolFailure::Identity)?;
-                        let pid = sched
-                            .registered_process(dtid)
-                            .ok_or(ProtocolFailure::Identity)?;
+                        let pid = pid.ok_or(ProtocolFailure::Identity)?;
                         let mut pending = self.pending_exec_states.lock().unwrap();
                         if let Some(prepared) = pending.get(&pid) {
-                            if prepared.caller != dtid || prepared.process != pid {
+                            if prepared.receipt.caller != dtid || prepared.receipt.process != pid {
                                 return Err(ProtocolFailure::Identity);
                             }
                             sched.complete_signal_exec(
                                 pid,
                                 dtid,
-                                prepared.mm,
+                                prepared.receipt.mm,
                                 request_mm,
                                 identity,
                             )?;
-                            pending.remove(&pid);
+                            consumed_files =
+                                Some(pending.remove(&pid).expect("checked preparation").receipt);
                         } else {
-                            // A backend that re-enters thread-start already bound
-                            // the new image. A lifecycle notification alone cannot
-                            // authorize a new address space or backend generation.
                             sched
                                 .real_timers
                                 .validate_task(pid, dtid, request_mm, identity)?;
@@ -1228,8 +1800,63 @@ impl GlobalTool for GlobalState {
                     })();
                     if let Err(error) = result {
                         sched.fail_parked(dtid, error);
+                        self.exec_preparation_changed.notify_waiters();
                         return (None, R::ThreadExited);
                     }
+                } else if let Some(pid) = pid {
+                    let mut pending = self.pending_exec_states.lock().unwrap();
+                    if let Some(prepared) = pending.get(&pid) {
+                        if prepared.receipt.caller != dtid
+                            || prepared.receipt.process != pid
+                            || prepared.receipt.mm.for_exec(pid) != request_mm
+                        {
+                            return (None, R::ThreadExited);
+                        }
+                        consumed_files =
+                            Some(pending.remove(&pid).expect("checked preparation").receipt);
+                    }
+                }
+                if let Some(files) = consumed_files {
+                    self.commit_network_exec_files(
+                        files,
+                        &ExecReconnect {
+                            caller: files.caller,
+                            new_leader: dtid,
+                            detpid: files.process,
+                            pre_exec_mm: files.mm,
+                            post_exec_mm: request_mm,
+                            child_tid_addr: 0,
+                            reconnect_priority: None,
+                        },
+                    );
+                    let mut mms = self.registered_exec_mms.lock().unwrap();
+                    let retired_owners: Vec<_> = mms
+                        .iter()
+                        .filter(|(tid, mm)| {
+                            sched.registered_process(**tid) == Some(files.process)
+                                && (**tid != dtid || **mm != request_mm)
+                        })
+                        .map(|(tid, mm)| NetworkStreamOwner {
+                            thread: *tid,
+                            mm: *mm,
+                        })
+                        .collect();
+                    self.abandon_network_owners(retired_owners.into_iter().chain(std::iter::once(
+                        NetworkStreamOwner {
+                            thread: files.caller,
+                            mm: files.mm,
+                        },
+                    )));
+                    mms.retain(|tid, _| sched.registered_process(*tid) != Some(files.process));
+                    mms.insert(dtid, request_mm);
+                    self.exec_preparation_changed.notify_waiters();
+                    assert!(
+                        !self.post_exec_files.lock().unwrap().contains_key(&dtid),
+                        "exec cannot complete through two lifecycle paths"
+                    );
+                    consumed_files = Some(files);
+                } else {
+                    consumed_files = self.post_exec_files.lock().unwrap().remove(&dtid);
                 }
                 self.past_first_execve.store(true, SeqCst);
                 let overrides = self
@@ -1240,9 +1867,9 @@ impl GlobalTool for GlobalState {
                     .unwrap_or_default();
                 trace!(
                     "[detcore, dtid {}] restoring logically blocking descriptors after exec: {:?}",
-                    dtid, overrides,
+                    dtid, overrides
                 );
-                R::MarkPastFirstExecve(overrides)
+                R::MarkPastFirstExecve(overrides, consumed_files)
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(
@@ -1262,10 +1889,10 @@ impl GlobalTool for GlobalState {
                             return (None, R::ThreadExited);
                         };
                         assert_eq!(&pending, prepared);
-                        let post_exec_mm = pending.mm.for_exec(pending.process);
+                        let post_exec_mm = pending.receipt.mm.for_exec(pending.receipt.process);
                         (pending, post_exec_mm)
                     };
-                    assert_eq!(pending.process, parent_detpid);
+                    assert_eq!(pending.receipt.process, parent_detpid);
                     if let Some((physical_pid, physical_tid)) = physical_ids
                         && let Err(open_error) = sched.register_physical_thread(
                             dettid,
@@ -1280,20 +1907,22 @@ impl GlobalTool for GlobalState {
                         );
                         return (None, R::ThreadExited);
                     }
-                    let retired = sched.reconnect_after_exec(ExecReconnect {
-                        caller: pending.caller,
+                    let event = ExecReconnect {
+                        caller: pending.receipt.caller,
                         new_leader: dettid,
                         detpid: parent_detpid,
-                        pre_exec_mm: pending.mm,
+                        pre_exec_mm: pending.receipt.mm,
                         post_exec_mm,
                         child_tid_addr: ctid,
                         reconnect_priority: priority,
-                    });
-                    if pending.caller != dettid {
+                    };
+                    self.commit_network_exec_files(pending.receipt, &event);
+                    let retired = sched.reconnect_after_exec(event);
+                    if pending.receipt.caller != dettid {
                         self.global_time
                             .lock()
                             .unwrap()
-                            .reassign_thread(pending.caller, dettid);
+                            .reassign_thread(pending.receipt.caller, dettid);
                     }
                     if !pending.fd_blocking.is_empty() {
                         self.post_exec_fd_blocking
@@ -1303,9 +1932,35 @@ impl GlobalTool for GlobalState {
                     }
                     debug!(
                         "[detcore, dtid {}] reconciled successful exec from caller {}; retired prior identities {:?}",
-                        dtid, pending.caller, retired
+                        dtid, pending.receipt.caller, retired
                     );
-                    R::CreateChildThread(Some(post_exec_mm))
+                    let mut mms = self.registered_exec_mms.lock().unwrap();
+                    let retired_owners: Vec<_> = retired
+                        .iter()
+                        .filter_map(|tid| {
+                            mms.get(tid).map(|mm| NetworkStreamOwner {
+                                thread: *tid,
+                                mm: *mm,
+                            })
+                        })
+                        .collect();
+                    self.abandon_network_owners(retired_owners.into_iter().chain(std::iter::once(
+                        NetworkStreamOwner {
+                            thread: pending.receipt.caller,
+                            mm: pending.receipt.mm,
+                        },
+                    )));
+                    for retired in &retired {
+                        mms.remove(retired);
+                    }
+                    mms.insert(dettid, post_exec_mm);
+                    drop(mms);
+                    self.post_exec_files
+                        .lock()
+                        .unwrap()
+                        .insert(dettid, pending.receipt);
+                    self.exec_preparation_changed.notify_waiters();
+                    R::CreateChildThread(Some((post_exec_mm, pending.receipt)))
                 } else {
                     match self
                         .recv_create_child_thread(
@@ -1432,6 +2087,113 @@ impl GlobalTool for GlobalState {
             GlobalRequest::GlobalTimeLowerBound => {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
+            }
+            GlobalRequest::Network(request) => match request {
+                NetworkRequest::ResolveAcceptedProvider { lease } => {
+                    self.recv_resolve_accepted_provider(
+                        NetworkStreamOwner {
+                            thread: dtid,
+                            mm: request_mm,
+                        },
+                        lease,
+                    )
+                    .await
+                }
+
+                NetworkRequest::EnrollAcceptedListener { call, fd } => {
+                    self.recv_enroll_accepted_listener(
+                        NetworkStreamOwner {
+                            thread: dtid,
+                            mm: request_mm,
+                        },
+                        call,
+                        fd,
+                    )
+                    .await
+                }
+
+                request @ (NetworkRequest::BeginStreamIngress { .. }
+                | NetworkRequest::CompleteStreamIngress { .. }
+                | NetworkRequest::StreamQueueStatus { .. }
+                | NetworkRequest::ReserveStreamChunk { .. }
+                | NetworkRequest::ReadStreamChunkView { .. }
+                | NetworkRequest::FinishStreamChunk { .. }
+                | NetworkRequest::ShadowMode
+                | NetworkRequest::AcceptedMode
+                | NetworkRequest::RegisterAcceptedFreshSend { .. }
+                | NetworkRequest::BeginAcceptedSocket { .. }
+                | NetworkRequest::SubmitAcceptedSocket { .. }
+                | NetworkRequest::CaptureAcceptedReturn { .. }
+                | NetworkRequest::CancelAcceptedSocket { .. }
+                | NetworkRequest::CompleteAcceptedSocket { .. }
+                | NetworkRequest::AcceptedEndpoint { .. }
+                | NetworkRequest::RegisterStreamSocket { .. }
+                | NetworkRequest::StreamSocketState { .. }
+                | NetworkRequest::StreamCallSocketState { .. }
+                | NetworkRequest::BeginSocketControl { .. }
+                | NetworkRequest::BeginSocketControls { .. }
+                | NetworkRequest::FinishSocketControl { .. }
+                | NetworkRequest::BeginStreamCall { .. }
+                | NetworkRequest::ConfirmStreamCallPin { .. }
+                | NetworkRequest::BeginStreamCallRelease { .. }
+                | NetworkRequest::FinishStreamCallRelease { .. }
+                | NetworkRequest::StreamCallQueueStatus { .. }
+                | NetworkRequest::BeginShadowProbe { .. }
+                | NetworkRequest::SubmitStreamPhysical { .. }
+                | NetworkRequest::ConfirmStreamPhysical { .. }
+                | NetworkRequest::CompleteShadowProbe { .. }
+                | NetworkRequest::ReserveStreamCallChunk { .. }
+                | NetworkRequest::ZeroStreamReceive { .. }
+                | NetworkRequest::BeginRecordDrain { .. }
+                | NetworkRequest::FinishRecordDrain { .. }
+                | NetworkRequest::BeginZeroStreamWait { .. }
+                | NetworkRequest::FinishZeroStreamWait { .. }
+                | NetworkRequest::InspectZeroStreamWait { .. }
+                | NetworkRequest::CancelZeroStreamWait { .. }
+                | NetworkRequest::PreviewSocketOption { .. }
+                | NetworkRequest::FdPublication(..)
+                | NetworkRequest::FdMutation(..)) => {
+                    self.recv_stream_operation(
+                        NetworkStreamOwner {
+                            thread: dtid,
+                            mm: request_mm,
+                        },
+                        request,
+                    )
+                    .await
+                }
+                request => R::Network(self.recv_network_request(request)),
+            },
+            GlobalRequest::NetworkOwnerGone => {
+                unreachable!("consuming path handled before admission")
+            }
+            GlobalRequest::RegisterNetworkPhysicalTask { process, thread } => {
+                // This is independent of StartNewThread's cfgseq path. The
+                // runtime capability is issued only at an actual ptrace spawn;
+                // untrusted numeric IDs or a Config bool cannot create it.
+                let sched = self.lock_rpc_scheduler(false).await;
+                let owner = NetworkStreamOwner {
+                    thread: dtid,
+                    mm: request_mm,
+                };
+                let authenticated = thread == dtid.as_raw()
+                    && sched.rpc_incarnation_matches(dtid, request_mm)
+                    && !sched.thread_is_logically_killed(dtid)
+                    && sched
+                        .registered_process(dtid)
+                        .is_some_and(|pid| pid.as_raw() as i32 == process)
+                    && self.registered_exec_mms.lock().unwrap().get(&dtid) == Some(&request_mm);
+                if !authenticated {
+                    R::ThreadExited
+                } else {
+                    R::RegisterNetworkPhysicalTask(match &self.network_runtime {
+                        None => Ok(false),
+                        Some(runtime) => runtime
+                            .register_ptrace_task(owner, process, thread)
+                            .map(|()| true)
+                            .map_err(|error| error.to_string()),
+                    })
+                }
             }
             GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap) => {
                 match self
@@ -1616,6 +2378,20 @@ impl GlobalTool for GlobalState {
             };
         if resp == R::ThreadExited || sender_became_terminal {
             return (None, R::ThreadExited);
+        }
+
+        // The handler locks are released and the existing late-incarnation
+        // revalidation above has admitted this response. A Tool-error
+        // unwind can leave classic ptrace awaiting parked sibling tasks; an
+        // owned controller must terminate before returning to the guest handler.
+        // Direct library and plugin configurations retain ordinary typed errors.
+        if let R::Network(Err(error)) = &resp
+            && let Some(refusal) = error.refusal_for_owned_controller(
+                self.cfg.network_trace.policy,
+                self.cfg.controller_can_exit_on_network_refusal,
+            )
+        {
+            self.shutdown_for_network_refusal(refusal);
         }
 
         let time_from_sched = self.global_time.lock().unwrap().threads_time(dtid);
@@ -1930,6 +2706,67 @@ impl GlobalState {
                 }
             }
 
+            let child_mm = if flags.is_none() {
+                request_mm
+            } else {
+                MmId::for_clone(
+                    request_mm,
+                    child_dettid,
+                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
+                )
+            };
+            let previous_mm = self
+                .registered_exec_mms
+                .lock()
+                .unwrap()
+                .insert(child_dettid, child_mm);
+            assert!(
+                previous_mm.is_none_or(|previous| previous == child_mm),
+                "child registration cannot change an admitted address space"
+            );
+
+            if let Some(engine) = &self.network_engine {
+                let parent_mm = flags.map(|_| {
+                    *self
+                        .registered_exec_mms
+                        .lock()
+                        .unwrap()
+                        .get(&parent_dettid)
+                        .expect("authenticated clone parent MM")
+                });
+                let mut engine = engine.lock().unwrap();
+                if engine.fd_table_capability() {
+                    let child = NetworkStreamOwner {
+                        thread: child_dettid,
+                        mm: child_mm,
+                    };
+                    if let Some(flags) = flags {
+                        let parent_mm = parent_mm.expect("clone branch");
+                        let process = if flags.contains(CloneFlags::CLONE_THREAD) {
+                            parent_detpid
+                        } else {
+                            child_dettid
+                        };
+                        engine
+                            .register_cloned_fd_table(
+                                NetworkStreamOwner {
+                                    thread: parent_dettid,
+                                    mm: parent_mm,
+                                },
+                                child,
+                                process,
+                                flags,
+                            )
+                            .expect("authenticated child consumes exact pre-clone table receipt");
+                    } else {
+                        engine
+                            .register_initial_fd_table(child, parent_detpid)
+                            .expect("authenticated initial table registration");
+                    }
+                    self.network_stream_changed.notify_waiters();
+                }
+            }
+
             // Record this thread in deterministic creation order so a
             // happens-before anchor addressed by `spawn_ordinal` resolves to it.
             sched.hb_note_spawn(child_dettid);
@@ -2190,17 +3027,29 @@ impl GlobalState {
         // Retire that one-shot preparation before scheduler-incarnation admission rejects the
         // candidate image's final cleanup RPC.
         let mut pending = self.pending_exec_states.lock().unwrap();
-        if pending.get(&detpid).is_some_and(|state| {
-            state.caller == dettid && (mm == state.mm || mm == state.mm.for_exec(state.process))
-        }) {
+        let abandoned_exec = pending.get(&detpid).is_some_and(|state| {
+            state.receipt.caller == dettid
+                && (mm == state.receipt.mm
+                    || mm == state.receipt.mm.for_exec(state.receipt.process))
+        });
+        if abandoned_exec {
             pending.remove(&detpid);
         }
         drop(pending);
+        self.exec_preparation_changed.notify_waiters();
 
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
         let mut sched = self.sched.lock().unwrap();
-        if !sched.rpc_incarnation_matches(dettid, mm) {
+        let registered_mm = self
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .get(&dettid)
+            .copied();
+        if !sched.rpc_incarnation_matches(dettid, mm)
+            || (!abandoned_exec && registered_mm.is_some_and(|current| current != mm))
+        {
             debug!(
                 "[detcore, dtid {}] ignoring deregistration from retired exec incarnation {:?}",
                 dettid, mm,
@@ -2225,7 +3074,10 @@ impl GlobalState {
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
+        self.registered_exec_mms.lock().unwrap().remove(&dettid);
+        self.post_exec_files.lock().unwrap().remove(&dettid);
         drop(sched);
+        self.exec_preparation_changed.notify_waiters();
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -2657,6 +3509,721 @@ impl GlobalState {
         );
         SchedulerRpcResult::Continue(())
     }
+
+    /// Complete or acquire one runtime stream receipt. In sequential mode the
+    /// adapter enters this only within its granted foreground turn; it never
+    /// holds an ingress receipt across a blocking physical wait or a scheduler
+    /// resource request. Waiting on Notify here would otherwise deadlock the
+    /// owner of that turn. Nonsequential owners make independent progress.
+    async fn recv_stream_operation(
+        &self,
+        owner: NetworkStreamOwner,
+        request: NetworkRequest,
+    ) -> GlobalResponse {
+        let acquiring = matches!(
+            request,
+            NetworkRequest::BeginStreamIngress { .. }
+                | NetworkRequest::ReserveStreamChunk { .. }
+                | NetworkRequest::BeginSocketControl { .. }
+                | NetworkRequest::BeginSocketControls { .. }
+                | NetworkRequest::BeginShadowProbe { .. }
+                | NetworkRequest::ReserveStreamCallChunk { .. }
+                | NetworkRequest::ZeroStreamReceive { .. }
+                | NetworkRequest::FdPublication(
+                    crate::network_replay::NetworkFdPublicationRequest::Acquire { .. }
+                )
+                | NetworkRequest::FdMutation(
+                    crate::network_replay::NetworkFdMutationRequest::Begin { .. }
+                )
+        );
+        loop {
+            let changed = self.network_stream_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (result, backend_failed) = {
+                // Same admission order as the scheduler: scheduler, engine.
+                // No lock survives an await, and a notification never admits
+                // a stale owner without another complete condition check.
+                let sched = self.sched.lock().unwrap();
+                if sched.backend_failed()
+                    || sched.thread_is_logically_killed(owner.thread)
+                    || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                    || self
+                        .registered_exec_mms
+                        .lock()
+                        .unwrap()
+                        .get(&owner.thread)
+                        .is_some_and(|registered| *registered != owner.mm)
+                {
+                    return GlobalResponse::ThreadExited;
+                }
+                // Receipt bytes alone are not ownership authority. Recheck the
+                // existing registered process/MM preparation on each admission
+                // attempt, including after a NoSeq waiter was notified.
+                if let NetworkRequest::FdMutation(
+                    crate::network_replay::NetworkFdMutationRequest::Begin {
+                        kind: crate::network_replay::NetworkFdMutationKind::Exec { receipt },
+                        ..
+                    },
+                ) = &request
+                {
+                    if sched.registered_process(owner.thread) != Some(receipt.process)
+                        || receipt.caller != owner.thread
+                        || receipt.mm != owner.mm
+                        || !self
+                            .pending_exec_states
+                            .lock()
+                            .unwrap()
+                            .get(&receipt.process)
+                            .is_some_and(|pending| pending.receipt == *receipt)
+                    {
+                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                            "exec mutation lacks the current authenticated preparation",
+                        )));
+                    }
+                }
+                let backend_failed = sched.backend_failure_waiter();
+                let Some(engine) = self.network_engine.as_ref() else {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        "stream operation without a network engine",
+                    )));
+                };
+                let Ok(mut engine) = engine.lock() else {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        "network engine mutex was poisoned",
+                    )));
+                };
+                let observed_at = self.global_time.lock().unwrap().as_nanos();
+                // Shared child creation becomes eligible before an inheritable
+                // guest mutation can commit at this logical cut. No accepter is
+                // selected by this release and unrelated channels never gate it.
+                if engine.accepted_mode()
+                    && engine.mode() == crate::network_replay::NetworkEngineMode::Replay
+                {
+                    if let Err(error) = engine.release_eligible(observed_at) {
+                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                            error.to_string(),
+                        )));
+                    }
+                }
+                let result = match &request {
+                    NetworkRequest::FdMutation(request) => engine
+                        .recv_fd_mutation(owner, request.clone())
+                        .map(NetworkReply::FdMutation),
+                    NetworkRequest::FdPublication(request) => {
+                        use crate::network_replay::NetworkFdPublicationReply as P;
+                        use crate::network_replay::NetworkFdPublicationRequest as Q;
+                        match request {
+                            Q::Acquire { files } => engine
+                                .acquire_fd_publication(owner, *files)
+                                .map(P::Admitted),
+                            Q::Publish { permit, batch } => engine
+                                .publish_fd_publication(owner, *permit, batch)
+                                .map(P::Published),
+                            Q::Acknowledge { permit, batch } => engine
+                                .acknowledge_fd_publication(owner, *permit, batch)
+                                .map(|()| P::Released),
+                            Q::ReleaseEmpty { permit } => engine
+                                .release_empty_fd_publication(owner, *permit)
+                                .map(|()| P::Released),
+                        }
+                        .map(NetworkReply::FdPublication)
+                    }
+                    NetworkRequest::BeginStreamIngress { open_file } => engine
+                        .begin_stream_ingress(owner, *open_file, observed_at)
+                        .map(NetworkReply::IngressLease),
+                    NetworkRequest::CompleteStreamIngress { lease, observation } => engine
+                        .complete_stream_ingress(owner, *lease, observed_at, observation.clone())
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::StreamQueueStatus { open_file } => engine
+                        .stream_queue_status(*open_file)
+                        .map(NetworkReply::StreamQueueStatus),
+                    NetworkRequest::ReserveStreamChunk {
+                        open_file,
+                        maximum,
+                        peek_offset,
+                    } => engine
+                        .reserve_stream_chunk(owner, *open_file, *maximum, *peek_offset)
+                        .map(NetworkReply::StreamChunk),
+                    NetworkRequest::ReadStreamChunkView {
+                        lease,
+                        offset,
+                        maximum,
+                    } => engine
+                        .read_stream_chunk_view(owner, *lease, *offset, *maximum)
+                        .map(NetworkReply::StreamChunkView),
+                    NetworkRequest::FinishStreamChunk { lease, disposition } => engine
+                        .finish_stream_chunk(owner, *lease, *disposition)
+                        .map(|()| NetworkReply::Unit),
+
+                    NetworkRequest::ShadowMode => {
+                        Ok(NetworkReply::ShadowMode(engine.shadow_mode()))
+                    }
+                    NetworkRequest::AcceptedMode => {
+                        Ok(NetworkReply::AcceptedMode(engine.accepted_mode()))
+                    }
+                    NetworkRequest::RegisterAcceptedFreshSend { key, observed } => engine
+                        .register_accepted_fresh_send(*key, *observed)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::BeginAcceptedSocket { call } => engine
+                        .begin_accepted_socket(owner, *call)
+                        .map(NetworkReply::AcceptedChild),
+                    NetworkRequest::SubmitAcceptedSocket { lease } => engine
+                        .submit_accepted_socket(owner, *lease)
+                        .and_then(|()| {
+                            if let Some(runtime) = &self.network_runtime {
+                                runtime
+                                    .submit_accept(
+                                        owner,
+                                        *lease,
+                                        engine.accepted_capture_call(owner, *lease)?,
+                                    )
+                                    .map_err(|_| NetworkReplayError::UnresolvedAccept(*lease))?;
+                            }
+                            Ok(())
+                        })
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::ResolveAcceptedProvider { .. }
+                    | NetworkRequest::EnrollAcceptedListener { .. } => {
+                        unreachable!("listener enrollment uses authenticated asynchronous dispatch")
+                    }
+                    NetworkRequest::CaptureAcceptedReturn { .. } => {
+                        unreachable!("synchronous capture uses early dispatch")
+                    }
+                    NetworkRequest::CancelAcceptedSocket { lease } => engine
+                        .cancel_accepted_socket(owner, *lease)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::CompleteAcceptedSocket {
+                        lease,
+                        kernel_result,
+                        installed_open_file,
+                    } => engine
+                        .complete_accepted_socket(
+                            owner,
+                            *lease,
+                            *kernel_result,
+                            *installed_open_file,
+                            observed_at,
+                        )
+                        .map(NetworkReply::AcceptedCompletion),
+                    NetworkRequest::AcceptedEndpoint { open_file, peer } => engine
+                        .accepted_endpoint(*open_file, *peer)
+                        .map(NetworkReply::AcceptedEndpoint),
+                    NetworkRequest::RegisterStreamSocket {
+                        open_file,
+                        key,
+                        namespace,
+                        observed_profile,
+                    } => engine
+                        .register_stream_socket(
+                            *open_file,
+                            *key,
+                            *namespace,
+                            observed_profile.clone(),
+                        )
+                        .map(|state| NetworkReply::StreamSocketState(Some(state))),
+                    NetworkRequest::StreamSocketState { open_file } => engine
+                        .stream_socket_state(*open_file)
+                        .map(NetworkReply::StreamSocketState),
+                    NetworkRequest::StreamCallSocketState { call } => engine
+                        .stream_call_socket_state(owner, *call)
+                        .map(|state| NetworkReply::StreamSocketState(Some(state))),
+                    NetworkRequest::BeginSocketControl { open_file } => engine
+                        .begin_socket_controls(owner, vec![*open_file])
+                        .and_then(|controls| engine.socket_control_view(owner, controls[0].1))
+                        .map(NetworkReply::SocketControl),
+                    NetworkRequest::BeginSocketControls { open_files } => engine
+                        .begin_socket_controls(owner, open_files.clone())
+                        .and_then(|controls| {
+                            controls
+                                .into_iter()
+                                .map(|(ofd, lease)| {
+                                    engine
+                                        .socket_control_view(owner, lease)
+                                        .map(|view| (ofd, view))
+                                })
+                                .collect()
+                        })
+                        .map(NetworkReply::SocketControls),
+                    NetworkRequest::FinishSocketControl { lease, disposition } => engine
+                        .finish_socket_control(owner, *lease, *disposition)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::BeginStreamCall { control_lease } => engine
+                        .begin_stream_call(owner, *control_lease)
+                        .map(NetworkReply::StreamCall),
+                    NetworkRequest::ConfirmStreamCallPin { id, outcome } => engine
+                        .confirm_stream_call_pin(owner, *id, *outcome)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::BeginStreamCallRelease { id } => engine
+                        .begin_stream_call_release(owner, *id)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::FinishStreamCallRelease { id } => engine
+                        .finish_stream_call_release(owner, *id)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::StreamCallQueueStatus { call } => engine
+                        .stream_call_queue_status(owner, *call)
+                        .map(NetworkReply::StreamQueueStatus),
+                    NetworkRequest::BeginShadowProbe { call } => engine
+                        .begin_shadow_probe(owner, *call, observed_at)
+                        .map(NetworkReply::ShadowProbe),
+                    NetworkRequest::SubmitStreamPhysical { lease, effect } => engine
+                        .submit_stream_physical(owner, *lease, effect.clone())
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::ConfirmStreamPhysical { lease, result } => engine
+                        .confirm_stream_physical(owner, *lease, result.clone())
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::CompleteShadowProbe { lease, bytes, eof } => engine
+                        .complete_shadow_probe(owner, *lease, observed_at, bytes.clone(), *eof)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::ReserveStreamCallChunk {
+                        call,
+                        maximum,
+                        peek_offset,
+                    } => engine
+                        .reserve_stream_call_chunk(owner, *call, *maximum, *peek_offset)
+                        .map(NetworkReply::StreamChunk),
+                    NetworkRequest::ZeroStreamReceive { call, peek_offset } => engine
+                        .prepare_zero_stream_receive(owner, *call, *peek_offset)
+                        .map(NetworkReply::ZeroStreamReceive),
+                    NetworkRequest::BeginRecordDrain { lease } => engine
+                        .begin_record_drain(owner, *lease)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::FinishRecordDrain { lease } => engine
+                        .finish_record_drain(owner, *lease)
+                        .map(|()| NetworkReply::Unit),
+                    NetworkRequest::BeginZeroStreamWait {
+                        call,
+                        record_operation,
+                    } => engine
+                        .begin_zero_stream_wait(owner, *call, *record_operation)
+                        .map(NetworkReply::ZeroStreamWait),
+                    NetworkRequest::FinishZeroStreamWait { id } => engine
+                        .finish_zero_stream_wait(owner, *id)
+                        .map(NetworkReply::ZeroStreamWaitEntered),
+                    NetworkRequest::InspectZeroStreamWait { id } => engine
+                        .zero_stream_wait_entered(owner, *id)
+                        .map(NetworkReply::ZeroStreamWaitEntered),
+                    NetworkRequest::CancelZeroStreamWait { id } => engine
+                        .cancel_zero_stream_wait(owner, *id)
+                        .map(|()| NetworkReply::Unit),
+
+                    NetworkRequest::PreviewSocketOption { lease, option } => engine
+                        .preview_socket_option(owner, *lease, option)
+                        .map(NetworkReply::SocketOptionResult),
+                    _ => unreachable!("only stream receipt operations enter this helper"),
+                };
+                self.release_lifetime_ports(engine.take_lifetime_retired_ports());
+                (result, backend_failed)
+            };
+            match result {
+                Err(NetworkReplayError::StreamOperationBusy(_))
+                    if acquiring && !self.cfg.sequentialize_threads =>
+                {
+                    tokio::select! {
+                        _ = changed => {},
+                        _ = backend_failed => return GlobalResponse::ThreadExited,
+                    }
+                }
+                result => {
+                    // A successful finish can unblock either kind of waiter.
+                    // No notification promises readiness or proves no effects.
+                    if matches!(
+                        result,
+                        Ok(NetworkReply::Unit
+                            | NetworkReply::FdMutation(
+                                crate::network_replay::NetworkFdMutationReply::Unit
+                            )
+                            | NetworkReply::FdPublication(
+                                crate::network_replay::NetworkFdPublicationReply::Released
+                            ))
+                    ) {
+                        self.network_stream_changed.notify_waiters();
+                    }
+                    return GlobalResponse::Network(result.map_err(|error| {
+                        NetworkRpcError::from_engine(
+                            self.cfg.network_trace.policy,
+                            NetworkFailurePhase::Other,
+                            error,
+                        )
+                    }));
+                }
+            }
+        }
+    }
+
+    fn release_lifetime_ports(&self, retired: impl IntoIterator<Item = OpenFileId>) {
+        let mut ports = self.used_ports.lock().unwrap();
+        let mut mappings = self.open_file_to_port.lock().unwrap();
+        for open_file in retired {
+            if let Some(port) = mappings.remove(&open_file) {
+                ports.remove(&port);
+            }
+        }
+    }
+
+    fn commit_network_exec_files(&self, receipt: ExecFilesReceipt, event: &ExecReconnect) {
+        if let Some(engine) = &self.network_engine {
+            let mut engine = engine.lock().unwrap();
+            engine
+                .commit_exec_fd_table(receipt, event)
+                .expect("authenticated backend exec event must match admitted FD transition");
+            self.release_lifetime_ports(engine.take_lifetime_retired_ports());
+        }
+    }
+
+    fn abandon_network_owners(&self, owners: impl IntoIterator<Item = NetworkStreamOwner>) {
+        if let Some(engine) = &self.network_engine {
+            let mut engine = engine.lock().unwrap();
+            for owner in owners {
+                engine.retire_fd_table_owner(owner);
+                engine.stream_owner_gone(owner);
+            }
+            self.release_lifetime_ports(engine.take_lifetime_retired_ports());
+        }
+        self.network_stream_changed.notify_waiters();
+    }
+
+    /// Consuming cleanup runs before ordinary RPC tombstone/clock admission.
+    /// The backend supplies the sender identity; a stale MmId marks only stale
+    /// receipts. A pending candidate-MM cleanup also identifies its exact
+    /// prepared caller, never every task sharing the old address space.
+    fn recv_network_owner_gone(&self, owner: NetworkStreamOwner) {
+        if let Some(runtime) = &self.network_runtime {
+            runtime.forget_task(owner);
+        }
+        let previous = self
+            .pending_exec_states
+            .lock()
+            .unwrap()
+            .values()
+            .find(|pending| {
+                pending.receipt.caller == owner.thread
+                    && pending.receipt.mm.for_exec(pending.receipt.process) == owner.mm
+            })
+            .map(|pending| NetworkStreamOwner {
+                thread: owner.thread,
+                mm: pending.receipt.mm,
+            });
+        self.abandon_network_owners(std::iter::once(owner).chain(previous));
+    }
+
+    fn recv_network_request(
+        &self,
+        request: NetworkRequest,
+    ) -> Result<NetworkReply, NetworkRpcError> {
+        let phase = match &request {
+            NetworkRequest::EnsureChannel { .. } => NetworkFailurePhase::Binding,
+            NetworkRequest::TransmitStream { .. } | NetworkRequest::TransmitDatagram { .. } => {
+                NetworkFailurePhase::Transmit
+            }
+            NetworkRequest::Shutdown(..) => NetworkFailurePhase::Shutdown,
+            _ => NetworkFailurePhase::Other,
+        };
+        let engine = self.network_engine.as_ref().ok_or_else(|| {
+            NetworkRpcError::internal("network engine request under deny/unsafe-live policy")
+        })?;
+        let mut engine = engine
+            .lock()
+            .map_err(|_| NetworkRpcError::internal("network engine mutex was poisoned"))?;
+        let result = match request {
+            NetworkRequest::BeginStreamIngress { .. }
+            | NetworkRequest::CompleteStreamIngress { .. }
+            | NetworkRequest::StreamQueueStatus { .. }
+            | NetworkRequest::ReserveStreamChunk { .. }
+            | NetworkRequest::ReadStreamChunkView { .. }
+            | NetworkRequest::FinishStreamChunk { .. }
+            | NetworkRequest::ShadowMode
+            | NetworkRequest::AcceptedMode
+            | NetworkRequest::RegisterAcceptedFreshSend { .. }
+            | NetworkRequest::BeginAcceptedSocket { .. }
+            | NetworkRequest::SubmitAcceptedSocket { .. }
+            | NetworkRequest::ResolveAcceptedProvider { .. }
+            | NetworkRequest::EnrollAcceptedListener { .. }
+            | NetworkRequest::CaptureAcceptedReturn { .. }
+            | NetworkRequest::CancelAcceptedSocket { .. }
+            | NetworkRequest::CompleteAcceptedSocket { .. }
+            | NetworkRequest::AcceptedEndpoint { .. }
+            | NetworkRequest::RegisterStreamSocket { .. }
+            | NetworkRequest::StreamSocketState { .. }
+            | NetworkRequest::StreamCallSocketState { .. }
+            | NetworkRequest::BeginSocketControl { .. }
+            | NetworkRequest::BeginSocketControls { .. }
+            | NetworkRequest::FinishSocketControl { .. }
+            | NetworkRequest::BeginStreamCall { .. }
+            | NetworkRequest::ConfirmStreamCallPin { .. }
+            | NetworkRequest::BeginStreamCallRelease { .. }
+            | NetworkRequest::FinishStreamCallRelease { .. }
+            | NetworkRequest::StreamCallQueueStatus { .. }
+            | NetworkRequest::BeginShadowProbe { .. }
+            | NetworkRequest::SubmitStreamPhysical { .. }
+            | NetworkRequest::ConfirmStreamPhysical { .. }
+            | NetworkRequest::CompleteShadowProbe { .. }
+            | NetworkRequest::ReserveStreamCallChunk { .. }
+            | NetworkRequest::ZeroStreamReceive { .. }
+            | NetworkRequest::BeginRecordDrain { .. }
+            | NetworkRequest::FinishRecordDrain { .. }
+            | NetworkRequest::BeginZeroStreamWait { .. }
+            | NetworkRequest::FinishZeroStreamWait { .. }
+            | NetworkRequest::InspectZeroStreamWait { .. }
+            | NetworkRequest::CancelZeroStreamWait { .. }
+            | NetworkRequest::PreviewSocketOption { .. }
+            | NetworkRequest::FdPublication(..)
+            | NetworkRequest::FdMutation(..) => {
+                unreachable!("stream receipt RPC uses authenticated async path")
+            }
+            NetworkRequest::RecordChannel(channel) => {
+                engine.record_channel(channel).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::RecordInput(input) => {
+                engine.record_input(input).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::PublishIngress { open_file, input } => engine
+                .publish_ingress(open_file, input)
+                .map(|()| NetworkReply::Unit),
+            NetworkRequest::EnsureChannel { open_file, binding } => engine
+                .ensure_channel(open_file, binding)
+                .map(|channel| NetworkReply::Channel(Some(channel))),
+            NetworkRequest::RecordOutput(output) => {
+                engine.record_output(output).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::CaptureStreamInput {
+                open_file,
+                observed_at,
+                input,
+            } => (|| -> Result<NetworkReply, NetworkReplayError> {
+                let channel = engine
+                    .channel_for(open_file)
+                    .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                let mut progress = self.network_record_progress.lock().unwrap();
+                let progress = progress.entry(open_file).or_default();
+                let event = match input {
+                    NetworkCapturedStreamInput::Bytes(bytes) => NetworkInputKindV2::StreamBytes {
+                        stream_offset: progress.inbound_stream,
+                        bytes,
+                    },
+                    NetworkCapturedStreamInput::EndOfFile => NetworkInputKindV2::PeerShutdown {
+                        stream_offset: progress.inbound_stream,
+                        direction: NetworkShutdownV2::Write,
+                    },
+                    NetworkCapturedStreamInput::Error(errno) => NetworkInputKindV2::SocketError {
+                        stream_offset: progress.inbound_stream,
+                        errno,
+                    },
+                    NetworkCapturedStreamInput::Connect(result) => {
+                        NetworkInputKindV2::Connect(result)
+                    }
+                };
+                let byte_count = match &event {
+                    NetworkInputKindV2::StreamBytes { bytes, .. } => bytes.len() as u64,
+                    _ => 0,
+                };
+                engine.record_input(NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: observed_at,
+                        after_transmitted_offset: progress.outbound_stream,
+                    },
+                    event,
+                })?;
+                progress.inbound_stream = progress
+                    .inbound_stream
+                    .checked_add(byte_count)
+                    .ok_or(NetworkReplayError::Overflow)?;
+                Ok(NetworkReply::Unit)
+            })(),
+            NetworkRequest::CaptureStreamOutput { open_file, output } => {
+                (|| -> Result<NetworkReply, NetworkReplayError> {
+                    let channel = engine
+                        .channel_for(open_file)
+                        .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                    let mut progress = self.network_record_progress.lock().unwrap();
+                    let progress = progress.entry(open_file).or_default();
+                    let (event, byte_count) = match output {
+                        NetworkCapturedStreamOutput::Bytes(bytes) => {
+                            let byte_count = bytes.len() as u64;
+                            (
+                                NetworkOutputKindV2::StreamBytes {
+                                    stream_offset: progress.outbound_stream,
+                                    bytes,
+                                },
+                                byte_count,
+                            )
+                        }
+                        NetworkCapturedStreamOutput::Error(errno) => (
+                            NetworkOutputKindV2::SocketError {
+                                stream_offset: progress.outbound_stream,
+                                errno,
+                            },
+                            0,
+                        ),
+                        NetworkCapturedStreamOutput::Shutdown(direction) => (
+                            NetworkOutputKindV2::Shutdown {
+                                stream_offset: progress.outbound_stream,
+                                direction,
+                            },
+                            0,
+                        ),
+                    };
+                    engine.record_output(NetworkOutputEventV2 { channel, event })?;
+                    progress.outbound_stream = progress
+                        .outbound_stream
+                        .checked_add(byte_count)
+                        .ok_or(NetworkReplayError::Overflow)?;
+                    Ok(NetworkReply::Unit)
+                })()
+            }
+            NetworkRequest::CaptureReadiness {
+                open_file,
+                observed_at,
+                readiness,
+            } => (|| -> Result<NetworkReply, NetworkReplayError> {
+                let channel = engine
+                    .channel_for(open_file)
+                    .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                let outbound_stream = self
+                    .network_record_progress
+                    .lock()
+                    .unwrap()
+                    .get(&open_file)
+                    .map_or(0, |progress| progress.outbound_stream);
+                engine.record_input(NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: observed_at,
+                        after_transmitted_offset: outbound_stream,
+                    },
+                    event: NetworkInputKindV2::Readiness(readiness),
+                })?;
+                Ok(NetworkReply::Unit)
+            })(),
+            NetworkRequest::Bind(open_file, channel) => {
+                engine.bind(open_file, channel).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::Retire(open_file) => {
+                Ok(NetworkReply::Channel(engine.retire_open_file(open_file)))
+            }
+            NetworkRequest::ReleaseEligible(now) => engine
+                .release_eligible(now)
+                .map(|channels| NetworkReply::ReadyChannels(channels.into_iter().collect())),
+            NetworkRequest::ReceiveStream {
+                open_file,
+                maximum,
+                nonblocking,
+                flags,
+                receive_low_water,
+            } => engine
+                .receive_stream_with_options(
+                    open_file,
+                    NetworkReceiveOptions {
+                        maximum,
+                        nonblocking,
+                        flags,
+                        receive_low_water,
+                    },
+                )
+                .map(|outcome| {
+                    NetworkReply::StreamReceive(match outcome {
+                        StreamReceiveOutcome::Bytes(bytes) => NetworkStreamReceive::Bytes(bytes),
+                        StreamReceiveOutcome::EndOfFile => NetworkStreamReceive::EndOfFile,
+                        StreamReceiveOutcome::Error(errno) => NetworkStreamReceive::Error(errno),
+                        StreamReceiveOutcome::WouldBlock => NetworkStreamReceive::WouldBlock,
+                        StreamReceiveOutcome::Pending => NetworkStreamReceive::Pending,
+                    })
+                }),
+            NetworkRequest::ReceiveDatagram {
+                open_file,
+                maximum,
+                nonblocking,
+            } => engine
+                .receive_datagram(open_file, maximum, nonblocking)
+                .map(|outcome| {
+                    NetworkReply::DatagramReceive(match outcome {
+                        DatagramReceiveOutcome::Datagram(delivery) => {
+                            NetworkDatagramReceive::Datagram(NetworkDatagramDelivery {
+                                bytes: delivery.bytes,
+                                original_len: delivery.original_len,
+                                source: delivery.source,
+                                destination: delivery.destination,
+                                ancillary: delivery.ancillary,
+                                message_flags: delivery.message_flags,
+                            })
+                        }
+                        DatagramReceiveOutcome::Error(errno) => {
+                            NetworkDatagramReceive::Error(errno)
+                        }
+                        DatagramReceiveOutcome::WouldBlock => NetworkDatagramReceive::WouldBlock,
+                        DatagramReceiveOutcome::Pending => NetworkDatagramReceive::Pending,
+                    })
+                }),
+            NetworkRequest::TransmitStream { open_file, bytes } => {
+                engine.transmit_stream(open_file, &bytes).map(|outcome| {
+                    NetworkReply::StreamTransmit(match outcome {
+                        StreamTransmitOutcome::Accepted(count) => {
+                            NetworkStreamTransmit::Accepted(count)
+                        }
+                        StreamTransmitOutcome::Error(errno) => NetworkStreamTransmit::Error(errno),
+                    })
+                })
+            }
+            NetworkRequest::TransmitDatagram {
+                open_file,
+                datagram,
+            } => engine
+                .transmit_datagram(open_file, &datagram)
+                .map(|()| NetworkReply::Unit),
+            NetworkRequest::Shutdown(open_file, direction) => engine
+                .shutdown(open_file, direction)
+                .map(|()| NetworkReply::Unit),
+            NetworkRequest::TakeConnectionOutcome(open_file) => {
+                (|| -> Result<NetworkReply, NetworkReplayError> {
+                    let outcome = engine.take_connection_outcome(open_file)?;
+                    let outcome = match outcome {
+                        Some(ConnectionOutcome::Connect(result)) => {
+                            Some(NetworkConnection::Connect(result))
+                        }
+                        Some(ConnectionOutcome::Accept {
+                            accepted,
+                            peer,
+                            ancillary,
+                        }) => Some(NetworkConnection::Accept {
+                            accepted,
+                            peer,
+                            ancillary,
+                        }),
+                        None => match engine.receive_stream_with_options(
+                            open_file,
+                            NetworkReceiveOptions {
+                                maximum: 0,
+                                nonblocking: true,
+                                flags: 0,
+                                receive_low_water: 1,
+                            },
+                        )? {
+                            StreamReceiveOutcome::Error(errno) => {
+                                Some(NetworkConnection::Error(errno))
+                            }
+                            StreamReceiveOutcome::WouldBlock
+                            | StreamReceiveOutcome::Pending
+                            | StreamReceiveOutcome::Bytes(_)
+                            | StreamReceiveOutcome::EndOfFile => None,
+                        },
+                    };
+                    Ok(NetworkReply::Connection(outcome))
+                })()
+            }
+            NetworkRequest::Readiness(open_file) => {
+                engine.readiness(open_file).map(NetworkReply::Readiness)
+            }
+            NetworkRequest::ChannelFor(open_file) => {
+                Ok(NetworkReply::Channel(engine.channel_for(open_file)))
+            }
+        };
+        result.map_err(|error| {
+            NetworkRpcError::from_engine(self.cfg.network_trace.policy, phase, error)
+        })
+    }
 }
 
 /// Identity and final accounting for an asynchronous scheduler deregistration.
@@ -2671,6 +4238,525 @@ pub struct ThreadDeregistration {
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
+}
+
+/// The one normalized request vocabulary used by all engine-owned socket and
+/// readiness syscalls.  It contains no thread identity or syscall ordinal.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkRequest {
+    /// Authenticated descriptor installation prefix protocol.
+    FdPublication(crate::network_replay::NetworkFdPublicationRequest),
+    /// Exact physical descriptor mutation protocol.
+    FdMutation(crate::network_replay::NetworkFdMutationRequest),
+    /// Declare a trace-stable channel while capturing.
+    RecordChannel(NetworkChannelV2),
+    /// Append one legacy journal-only observation after its guest syscall.
+    RecordInput(NetworkInputEventV2),
+    /// Append one guest output observation while capturing.
+    RecordOutput(NetworkOutputEventV2),
+    /// Atomically assign offsets and append a live stream observation.
+    CaptureStreamInput {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Continuous logical time at host observation.
+        observed_at: LogicalTime,
+        /// Normalized input result.
+        input: NetworkCapturedStreamInput,
+    },
+    /// Atomically assign offsets and append guest stream output.
+    CaptureStreamOutput {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Normalized output result.
+        output: NetworkCapturedStreamOutput,
+    },
+    /// Append one host readiness observation with engine-owned release gates.
+    CaptureReadiness {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Continuous logical time at host observation.
+        observed_at: LogicalTime,
+        /// Complete level-readiness snapshot, including clear transitions.
+        readiness: NetworkReadinessV2,
+    },
+    /// Bind a stable open-file description to a trace channel.
+    Bind(OpenFileId, NetworkChannelId),
+    /// Retire the binding after the final descriptor alias closes.
+    Retire(OpenFileId),
+    /// Release replay input eligible at this exact logical time.
+    ReleaseEligible(LogicalTime),
+    /// Consume available stream input without matching a caller identity.
+    ReceiveStream {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Guest buffer capacity.
+        maximum: usize,
+        /// Whether absence returns `WouldBlock` instead of `Pending`.
+        nonblocking: bool,
+        /// Linux receive flags relevant to data movement.
+        flags: i32,
+        /// Effective `SO_RCVLOWAT` value.
+        receive_low_water: usize,
+    },
+    /// Consume one complete datagram boundary.
+    ReceiveDatagram {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Guest payload capacity.
+        maximum: usize,
+        /// Whether absence returns `WouldBlock` instead of `Pending`.
+        nonblocking: bool,
+    },
+    /// Validate and advance outbound stream progress.
+    TransmitStream {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Guest-provided bytes in stream order.
+        bytes: Vec<u8>,
+    },
+    /// Validate one outbound datagram and its metadata.
+    TransmitDatagram {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Complete datagram boundary and addressing metadata.
+        datagram: NetworkDatagramV2,
+    },
+    /// Validate an outbound half/full-close transition.
+    Shutdown(OpenFileId, NetworkShutdownV2),
+    /// Consume one released connect or accept result.
+    TakeConnectionOutcome(OpenFileId),
+    /// Query modeled readiness without consuming availability.
+    Readiness(OpenFileId),
+    /// Resolve the trace channel currently bound to an open file.
+    ChannelFor(OpenFileId),
+    /// Publish a physical stream observation to the journal and shared queue.
+    /// The transport caller must serialize ingress before guest delivery; this
+    /// is deliberately not used by the legacy post-syscall capture adapter.
+    PublishIngress {
+        /// Stable OFD whose binding must match the observation's channel.
+        open_file: OpenFileId,
+        /// Bytes, peer shutdown or a transport-origin error at the engine's
+        /// ingress frontier. Consumer-local EAGAIN/EINTR/EFAULT are refused.
+        input: NetworkInputEventV2,
+    },
+    /// Allocate or match a channel by endpoint facts, never by caller-derived
+    /// trace ID. Existing bindings undergo the same metadata checks.
+    EnsureChannel {
+        /// Stable OFD shared by all descriptor aliases.
+        open_file: OpenFileId,
+        /// Exact endpoint facts, known local constraints and accept selection.
+        binding: NetworkChannelBinding,
+    },
+    /// Latch possible physical receive effects before kernel submission.
+    BeginStreamIngress {
+        /// Stable OFD shared by all descriptor aliases.
+        open_file: OpenFileId,
+    },
+    /// Publish a known scratch result before guest delivery.
+    CompleteStreamIngress {
+        /// Receipt returned before the corresponding kernel submission.
+        lease: NetworkStreamLeaseId,
+        /// Known result recovered from that exact physical operation.
+        observation: NetworkIngressObservation,
+    },
+    /// Contiguous payload and terminal conditions for threshold-aware waits.
+    StreamQueueStatus {
+        /// Stable OFD whose payload and terminal conditions are inspected.
+        open_file: OpenFileId,
+    },
+    /// Reserve an immutable bounded payload or terminal view.
+    ReserveStreamChunk {
+        /// Stable OFD whose next publication unit is selected.
+        open_file: OpenFileId,
+        /// Remaining guest request length; does not determine RPC allocation size.
+        maximum: usize,
+        /// Payload offset for a continuing nonconsuming peek.
+        peek_offset: usize,
+    },
+    /// Fetch a bounded view while retaining the entire selected copy unit.
+    ReadStreamChunkView {
+        /// Existing immutable selection owned by this authenticated caller.
+        lease: NetworkStreamLeaseId,
+        /// Offset within the selected unit, not within the whole stream.
+        offset: usize,
+        /// View capacity, which must not exceed 512 bytes.
+        maximum: usize,
+    },
+    /// Resolve the whole selected copy unit without inferring consumption from writes.
+    FinishStreamChunk {
+        /// Exact selection receipt being acknowledged once.
+        lease: NetworkStreamLeaseId,
+        /// Known whole-selection outcome, distinct from guest bytes written.
+        disposition: NetworkStreamChunkDisposition,
+    },
+    /// Query explicit V3 enrollment without upgrading legacy traces.
+    ShadowMode,
+    /// Register actual fresh socket options before any guest mutation.
+    RegisterStreamSocket {
+        /// Exact stable socket open-file identity.
+        open_file: OpenFileId,
+        /// Exact fresh kernel socket class.
+        key: StreamSocketKeyV3,
+        /// Authenticated run-local namespace identity.
+        namespace: NetworkStreamNamespace,
+        /// Record observation; Replay must supply None.
+        observed_profile: Option<FreshStreamSocketProfileV3>,
+    },
+    /// Inspect enrolled state without consulting a Replay placeholder.
+    StreamSocketState {
+        /// Exact stable socket open-file identity.
+        open_file: OpenFileId,
+    },
+    /// Inspect the socket through an admitted call after final descriptor close.
+    StreamCallSocketState {
+        /// Exact active-call reference owned by this task/MM.
+        call: NetworkStreamCallId,
+    },
+    /// Acquire short exact-OFD exclusion and return its current facts.
+    BeginSocketControl {
+        /// Exact stable socket open-file identity.
+        open_file: OpenFileId,
+    },
+    /// Acquire the unique sorted set atomically, with none retained on contention.
+    BeginSocketControls {
+        /// Stable OFD identities acquired as one sorted set.
+        open_files: Vec<OpenFileId>,
+    },
+    /// Finish one short control after physical/lifetime reconciliation.
+    FinishSocketControl {
+        /// Exact owned operation receipt.
+        lease: NetworkStreamLeaseId,
+        /// Known completion, distinct from future destruction.
+        disposition: NetworkSocketControlFinish,
+    },
+    /// Allocate an active-call reference before physical host pin acquisition.
+    BeginStreamCall {
+        /// Existing short exclusion receipt.
+        control_lease: NetworkStreamLeaseId,
+    },
+    /// Publish the exact physical pin acquisition outcome.
+    ConfirmStreamCallPin {
+        /// Exact owned call or wait identity.
+        id: NetworkStreamCallId,
+        /// Matched physical pin acquisition result.
+        outcome: NetworkStreamPinOutcome,
+    },
+    /// Latch a physical host pin release before performing it.
+    BeginStreamCallRelease {
+        /// Exact owned call or wait identity.
+        id: NetworkStreamCallId,
+    },
+    /// Confirm actual host pin release; Drop is not confirmation.
+    FinishStreamCallRelease {
+        /// Exact owned call or wait identity.
+        id: NetworkStreamCallId,
+    },
+    /// Inspect queues through a still-active call.
+    StreamCallQueueStatus {
+        /// Exact active-call reference owned by this task/MM.
+        call: NetworkStreamCallId,
+    },
+    /// Acquire the nonconsuming physical shadow observation receipt.
+    BeginShadowProbe {
+        /// Exact active-call reference owned by this task/MM.
+        call: NetworkStreamCallId,
+    },
+    /// Latch the next exact physical operation before executing it.
+    SubmitStreamPhysical {
+        /// Exact owned operation receipt.
+        lease: NetworkStreamLeaseId,
+        /// Next physical operation, latched before execution.
+        effect: NetworkStreamPhysicalEffect,
+    },
+    /// Confirm only the submitted physical operation's actual result.
+    ConfirmStreamPhysical {
+        /// Exact owned operation receipt.
+        lease: NetworkStreamLeaseId,
+        /// Actual result of the submitted operation.
+        result: NetworkStreamPhysicalResult,
+    },
+    /// Atomically publish the observed suffix at the paid completion boundary.
+    CompleteShadowProbe {
+        /// Exact owned operation receipt.
+        lease: NetworkStreamLeaseId,
+        /// New nonconsumed suffix from the validated observation.
+        bytes: Vec<u8>,
+        /// Terminal claim requiring matched physical evidence.
+        eof: bool,
+    },
+    /// Select one whole declared copy unit through an active call.
+    ReserveStreamCallChunk {
+        /// Exact active-call reference owned by this task/MM.
+        call: NetworkStreamCallId,
+        /// Remaining guest length; individual views remain bounded.
+        maximum: usize,
+        /// Logical nonconsuming offset within queued input.
+        peek_offset: usize,
+    },
+    /// Resolve zero receive availability/error atomically without a byte receipt.
+    ZeroStreamReceive {
+        /// Exact active-call reference owned by this task/MM.
+        call: NetworkStreamCallId,
+        /// Logical nonconsuming offset within queued input.
+        peek_offset: usize,
+    },
+    /// Begin exact physical drain only after full selected-unit guest copy.
+    BeginRecordDrain {
+        /// Exact owned operation receipt.
+        lease: NetworkStreamLeaseId,
+    },
+    /// Commit the selected unit only after its exact drain has been confirmed.
+    FinishRecordDrain {
+        /// Exact owned operation receipt.
+        lease: NetworkStreamLeaseId,
+    },
+    /// Associate the zero receive with a transient scheduler wait receipt.
+    BeginZeroStreamWait {
+        /// Exact active-call reference owned by this task/MM.
+        call: NetworkStreamCallId,
+        /// Exact Record background operation; absent in Replay.
+        record_operation: Option<crate::resources::ExternalOpId>,
+    },
+    /// Read and consume the scheduler's logical entry receipt.
+    FinishZeroStreamWait {
+        /// Exact owned call or wait identity.
+        id: NetworkZeroStreamWaitId,
+    },
+
+    /// Explicit appended receive-model variant, never inferred from a listener.
+    AcceptedMode,
+    /// Pin and enroll the exact admitted listener before its first physical listen.
+    EnrollAcceptedListener {
+        /// Authenticated active listener reference.
+        call: NetworkStreamCallId,
+        /// Original guest descriptor, used only at the stopped ptrace boundary.
+        fd: i32,
+    },
+    /// Fresh send-timeout observation before any mutation; no old V3 default.
+    RegisterAcceptedFreshSend {
+        /// Exact socket class.
+        key: StreamSocketKeyV3,
+        /// Record's actual fresh observation; absent in Replay.
+        observed: Option<detcore_model::network_trace::ReceiveTimeoutV3>,
+    },
+    /// Reserve an eligible shared child while retaining the listener call.
+    BeginAcceptedSocket {
+        /// Authenticated active listener reference.
+        call: NetworkStreamCallId,
+    },
+    /// Latch possible physical descriptor allocation before kernel injection.
+    SubmitAcceptedSocket {
+        /// Exact owned accept receipt.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+    },
+    /// Synchronously latch the actual return and acquire controller custody before continuation.
+    CaptureAcceptedReturn {
+        /// Previously submitted receipt, qualified by RPC owner and MM.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+        /// Original physical return; errors do not imply absence of dequeue.
+        kernel_result: Result<i32, i32>,
+    },
+    /// Match an already captured accepted pin to its provider creation occurrence.
+    ResolveAcceptedProvider {
+        /// Exact submitted return/custody receipt, authenticated by owner/MM.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+    },
+    /// Cancel only before physical submission, without consuming a connection.
+    CancelAcceptedSocket {
+        /// Exact owned accept receipt.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+    },
+    /// Compare the kernel return with already-confirmed installation authority.
+    CompleteAcceptedSocket {
+        /// Exact owned accept receipt.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+        /// Actual returned FD or positive errno; this is not a slot certificate.
+        kernel_result: Result<i32, i32>,
+        /// Local metadata claim, compared with the service's exact fact before mutation.
+        installed_open_file: Option<OpenFileId>,
+    },
+    /// Obtain a bound accepted endpoint without placeholder host queries.
+    AcceptedEndpoint {
+        /// Exact enrolled open file.
+        open_file: OpenFileId,
+        /// Peer when true, bound local endpoint otherwise.
+        peer: bool,
+    },
+    /// Read-only normalized setter result under exact control exclusion.
+    PreviewSocketOption {
+        /// Exact owned short control.
+        lease: NetworkStreamLeaseId,
+        /// Raw guest option after ABI validation.
+        option: NetworkStreamSocketOption,
+    },
+    /// Inspect actual wait entry while retaining its arrival-generation receipt.
+    InspectZeroStreamWait {
+        /// Exact wait owned by the authenticated active call.
+        id: NetworkZeroStreamWaitId,
+    },
+    /// Resolve a prepared wait only if the scheduler never entered it.
+    CancelZeroStreamWait {
+        /// Exact wait owned by the authenticated active call.
+        id: NetworkZeroStreamWaitId,
+    },
+}
+
+/// Live stream input normalized before entering the capture engine.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkCapturedStreamInput {
+    /// Newly observed bytes.
+    Bytes(Vec<u8>),
+    /// Peer write-side shutdown.
+    EndOfFile,
+    /// Positive Linux errno.
+    Error(i32),
+    /// Completion of an outbound connect attempt.
+    Connect(NetworkConnectionResultV2),
+}
+
+/// Guest stream output normalized before entering the capture engine.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkCapturedStreamOutput {
+    /// Successfully transmitted bytes.
+    Bytes(Vec<u8>),
+    /// Positive Linux errno.
+    Error(i32),
+    /// Local shutdown transition.
+    Shutdown(NetworkShutdownV2),
+}
+
+/// Serializable result of one replayed stream receive attempt.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkStreamReceive {
+    /// Bytes removed from currently available stream input.
+    Bytes(Vec<u8>),
+    /// Peer write shutdown after all preceding bytes were consumed.
+    EndOfFile,
+    /// Exact recorded Linux errno.
+    Error(i32),
+    /// A nonblocking attempt has no current availability.
+    WouldBlock,
+    /// A blocking attempt must register a scheduler wait.
+    Pending,
+}
+
+/// Serializable result of validating one stream transmit.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkStreamTransmit {
+    /// Byte count accepted before an error or trace boundary.
+    Accepted(usize),
+    /// Exact recorded Linux errno at current outbound progress.
+    Error(i32),
+}
+
+/// One replayed datagram after applying the guest payload bound.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct NetworkDatagramDelivery {
+    /// Bytes copied to guest memory, possibly truncated.
+    pub bytes: Vec<u8>,
+    /// Complete recorded datagram length.
+    pub original_len: usize,
+    /// Recorded sender address.
+    pub source: Option<NetworkAddressV2>,
+    /// Recorded destination address.
+    pub destination: Option<NetworkAddressV2>,
+    /// Control bytes plus object-relocation metadata.
+    pub ancillary: Option<NetworkAncillaryDataV2>,
+    /// Recorded message flags before adapter truncation flags.
+    pub message_flags: i32,
+}
+
+/// Serializable result of one replayed datagram receive attempt.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkDatagramReceive {
+    /// One complete recorded datagram boundary.
+    Datagram(NetworkDatagramDelivery),
+    /// Exact recorded Linux errno.
+    Error(i32),
+    /// A nonblocking attempt has no current datagram.
+    WouldBlock,
+    /// A blocking attempt must register a scheduler wait.
+    Pending,
+}
+
+/// Serializable released connection-control observation.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkConnection {
+    /// Completion of an outbound connect.
+    Connect(NetworkConnectionResultV2),
+    /// Completion of an accept with a new trace channel.
+    Accept {
+        /// Trace identity of the accepted socket.
+        accepted: NetworkChannelId,
+        /// Peer address returned to guest memory.
+        peer: Option<NetworkAddressV2>,
+        /// Creation-time ancillary relocation metadata.
+        ancillary: Option<NetworkAncillaryDataV2>,
+    },
+    /// Exact recorded error from an accept attempt.
+    Error(i32),
+}
+
+/// Response vocabulary for the normalized network engine RPC.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkReply {
+    /// Exact global descriptor installation publication receipt.
+    FdPublication(crate::network_replay::NetworkFdPublicationReply),
+    /// Exact physical descriptor mutation response.
+    FdMutation(crate::network_replay::NetworkFdMutationReply),
+    /// Mutation completed without a value.
+    Unit,
+    /// Optional channel from lookup or retirement.
+    Channel(Option<NetworkChannelId>),
+    /// Channels whose replay observations became eligible.
+    ReadyChannels(Vec<NetworkChannelId>),
+    /// Stream receive outcome.
+    StreamReceive(NetworkStreamReceive),
+    /// Stream transmit outcome.
+    StreamTransmit(NetworkStreamTransmit),
+    /// Datagram receive outcome.
+    DatagramReceive(NetworkDatagramReceive),
+    /// Optional connect or accept observation.
+    Connection(Option<NetworkConnection>),
+    /// Current modeled readiness bits.
+    Readiness(NetworkReadinessV2),
+    /// Durable physical receive receipt.
+    IngressLease(NetworkStreamLeaseId),
+    /// Current queue facts, including reservation availability.
+    StreamQueueStatus(NetworkStreamQueueStatus),
+    /// Bounded delivery receipt or no currently available outcome.
+    StreamChunk(NetworkStreamChunk),
+    /// At most the bounded view limit from an existing reservation.
+    StreamChunkView(Vec<u8>),
+    /// Whether this engine was explicitly created/decoded as V3.
+    ShadowMode(bool),
+    /// Actual profile state, with None only for an unenrolled OFD.
+    StreamSocketState(Option<NetworkStreamSocketState>),
+    /// One short control with its exact admission snapshot.
+    SocketControl(NetworkSocketControl),
+    /// Atomic sorted set of controls and their admission snapshots.
+    SocketControls(Vec<(OpenFileId, NetworkSocketControl)>),
+    /// The active syscall reference and its physical pin requirement.
+    StreamCall(NetworkStreamCall),
+    /// Persistent nonconsuming observation receipt.
+    ShadowProbe(NetworkShadowProbe),
+    /// Atomic zero-receive outcome.
+    ZeroStreamReceive(NetworkZeroStreamReceive),
+    /// Transient scheduler wait identity.
+    ZeroStreamWait(NetworkZeroStreamWaitId),
+    /// Whether the scheduler admitted the logical wait.
+    ZeroStreamWaitEntered(bool),
+
+    /// Whether explicit accepted inheritance is declared.
+    AcceptedMode(bool),
+    /// An eligible exact child reservation, or no current connection.
+    AcceptedChild(Option<crate::network_replay::NetworkAcceptReservation>),
+    /// Reconciled accepted FD/OFD/channel; None for known no-connection effects.
+    AcceptedCompletion(Option<crate::network_replay::NetworkAcceptedCompletion>),
+    /// Exact modeled endpoint; None for an unmanaged socket.
+    AcceptedEndpoint(Option<NetworkAddressV2>),
+    /// Normalized setter result, without committing a mutation.
+    SocketOptionResult(Result<(), i32>),
 }
 
 /// Messages to the global object.
@@ -2713,10 +4799,10 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Save the caller, address-space identity, and logically blocking descriptors before a
     /// backend reloads its tool across exec.
-    PrepareExec(DetPid, MmId, ExecFdBlockingOverrides),
+    PrepareExec(DetPid, MmId, FilesId, ExecFdBlockingOverrides),
 
     /// Clear the saved transition after an exec attempt returns with an error.
-    CancelExec(DetPid),
+    CancelExec(ExecFilesReceipt),
 
     /// Mark the initial image transition complete for backends that begin post-exec.
     MarkPastFirstExecve(Option<reverie::SignalTaskIdentity>),
@@ -2798,6 +4884,9 @@ pub enum GlobalRequest {
     /// Retrieve global time.
     GlobalTimeLowerBound,
 
+    /// Run one normalized operation against the shared network engine.
+    Network(NetworkRequest),
+
     /// Record scheduling event in a total order.
     // Logging provenance only; never serialized into a schedule artifact.
     TraceSchedEvent(SchedEvent, DetPid, bool),
@@ -2861,6 +4950,18 @@ pub enum GlobalRequest {
     /// Deliver robust-futex wakes collected before exit after the backend has
     /// confirmed that Linux's physical task cleanup completed.
     RobustListWakes(Vec<(DetTid, FutexID)>),
+
+    /// Publish the descriptor snapshot taken after exact exec admission.
+    UpdateExecFdBlocking(ExecFilesReceipt, ExecFdBlockingOverrides),
+    /// Backend-owned exit cleanup, independent of cfgseq scheduler registration.
+    NetworkOwnerGone,
+    /// Register actual ptrace task custody independently of scheduler signal identity.
+    RegisterNetworkPhysicalTask {
+        /// Callback process identity, compared with registered scheduler process.
+        process: i32,
+        /// Callback task identity, compared with the authenticated RPC sender.
+        thread: i32,
+    },
 }
 
 /// Responses from the global object
@@ -2882,10 +4983,10 @@ pub enum GlobalResponse {
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
     ReportUnsupportedSyscall(()),
-    PrepareExec(()),
+    PrepareExec(ExecFilesReceipt),
     CancelExec(()),
-    MarkPastFirstExecve(ExecFdBlockingOverrides),
-    CreateChildThread(Option<MmId>),
+    MarkPastFirstExecve(ExecFdBlockingOverrides, Option<ExecFilesReceipt>),
+    CreateChildThread(Option<(MmId, ExecFilesReceipt)>),
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
@@ -2901,6 +5002,7 @@ pub enum GlobalResponse {
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
+    Network(Result<NetworkReply, NetworkRpcError>),
     TraceSchedEvent(TraceSchedEventResponse),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -2931,6 +5033,10 @@ pub enum GlobalResponse {
     ReleasePort(Option<u16>),
     PortFull,
     RobustListWakes(Vec<u64>),
+    UpdateExecFdBlocking(bool),
+    /// Exact owner was marked terminal without acknowledging possible effects.
+    NetworkOwnerGone,
+    RegisterNetworkPhysicalTask(Result<bool, String>),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2954,15 +5060,56 @@ pub fn format_unsupported_syscall_warning(syscalls: &BTreeSet<String>) -> Option
 /// backend that handles `execve` outside Detcore's syscall handler must call
 /// this before the native syscall so the next image reconnects to the existing
 /// scheduler identity and logical clock.
-pub async fn prepare_exec<G, T>(guest: &mut G, mm: MmId, fd_blocking: ExecFdBlockingOverrides)
+pub async fn prepare_exec<G, T>(
+    guest: &mut G,
+    mm: MmId,
+    fd_blocking: ExecFdBlockingOverrides,
+) -> ExecFilesReceipt
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     let detpid = guest.thread_state().detpid.expect("detpid unset");
-    let (_, response) =
-        send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_blocking)).await;
-    assert_eq!(response, GlobalResponse::PrepareExec(()));
+    assert!(
+        guest.thread_state().pending_exec_files.is_none(),
+        "exec already prepared locally"
+    );
+    let old_files = guest.thread_state().file_metadata.lock().unwrap().files_id;
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::PrepareExec(detpid, mm, old_files, fd_blocking),
+    )
+    .await;
+    let GlobalResponse::PrepareExec(receipt) = response else {
+        unreachable!()
+    };
+    assert_eq!(
+        (receipt.process, receipt.mm, receipt.old_files),
+        (detpid, mm, old_files)
+    );
+    guest.thread_state_mut().pending_exec_files = Some(receipt);
+    receipt
+}
+
+pub(crate) async fn update_exec_fd_blocking<G, T>(
+    guest: &mut G,
+    receipt: ExecFilesReceipt,
+    overrides: ExecFdBlockingOverrides,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    assert_eq!(guest.thread_state().pending_exec_files, Some(receipt));
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::UpdateExecFdBlocking(receipt, overrides),
+    )
+    .await;
+    assert_eq!(
+        response,
+        GlobalResponse::UpdateExecFdBlocking(true),
+        "exec override publication lost its exact reservation"
+    );
 }
 
 pub async fn cancel_exec<G, T>(guest: &mut G)
@@ -2970,9 +5117,16 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let detpid = guest.thread_state().detpid.expect("detpid unset");
-    let (_, response) = send_and_update_time(guest, GlobalRequest::CancelExec(detpid)).await;
+    let receipt = guest
+        .thread_state()
+        .pending_exec_files
+        .expect("exec cancellation must name its preparation");
+    let (_, response) = send_and_update_time(guest, GlobalRequest::CancelExec(receipt)).await;
     assert_eq!(response, GlobalResponse::CancelExec(()));
+    assert_eq!(
+        guest.thread_state_mut().pending_exec_files.take(),
+        Some(receipt)
+    );
 }
 
 pub async fn mark_past_first_execve<G, T>(guest: &mut G)
@@ -2988,7 +5142,12 @@ where
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve(signal_identity)).await;
     let overrides = match response {
-        GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
+        GlobalResponse::MarkPastFirstExecve(overrides, files) => {
+            if let Some(files) = files {
+                guest.thread_state_mut().finish_exec_files(files);
+            }
+            overrides
+        }
         _ => unreachable!(),
     };
     if guest.config().kvm_shared_dequeue_timers {
@@ -3060,6 +5219,51 @@ where
             .advance_to(time);
     }
     resp
+}
+
+/// Register actual callback task identity even when cfgseq is disabled. An
+/// ordinary run with no owned startup runtime returns false and opens no pidfd.
+pub(crate) async fn register_network_physical_task<G, T>(
+    guest: &mut G,
+) -> Result<bool, reverie::Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let request = GlobalRequest::RegisterNetworkPhysicalTask {
+        process: guest.pid().as_raw(),
+        thread: guest.tid().as_raw(),
+    };
+    match send_and_update_time(guest, request).await.1 {
+        GlobalResponse::RegisterNetworkPhysicalTask(result) => {
+            result.map_err(|message| reverie::Error::Tool(anyhow::anyhow!(message)))
+        }
+        _ => Err(reverie::Error::Tool(anyhow::anyhow!(
+            "unexpected custody registration reply"
+        ))),
+    }
+}
+
+/// Send one engine-owned network operation through the single global path.
+/// An unexpected response is an internal protocol failure, never permission to
+/// fall back to a live syscall.
+pub async fn network_request<G, T>(
+    guest: &mut G,
+    request: NetworkRequest,
+) -> Result<NetworkReply, NetworkRpcError>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::Network(request))
+        .await
+        .1
+    {
+        GlobalResponse::Network(result) => result,
+        response => Err(NetworkRpcError::internal(format!(
+            "network engine RPC returned unexpected response {response:?}"
+        ))),
+    }
 }
 
 /// When the thread resumes after a potentially-blocking scheduler request, is it a normal
@@ -3203,7 +5407,7 @@ pub async fn create_child_thread<G, T>(
     flags: Option<CloneFlags>,
     exit_signal: libc::c_int,
     physical_ids: Option<(i32, i32)>,
-) -> Option<MmId>
+) -> Option<(MmId, ExecFilesReceipt)>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3315,6 +5519,23 @@ pub async fn create_vfork_child_thread<G, T>(
     match resp.1 {
         GlobalResponse::CreateChildThread(_) => (),
         _ => unreachable!(),
+    }
+}
+
+/// Consume this exact backend-owned task incarnation independently of scheduler
+/// registration. Drop/cancellation is not a zero-effect acknowledgement.
+pub(crate) async fn network_owner_gone<R>(cfg: &Config, thread_time: DetTime, mm: MmId, backend: &R)
+where
+    R: GlobalRPC<GlobalState>,
+{
+    if matches!(
+        cfg.network_trace.policy,
+        NetworkPolicy::Record | NetworkPolicy::Replay
+    ) {
+        let response = backend
+            .send_rpc((thread_time, mm, GlobalRequest::NetworkOwnerGone))
+            .await;
+        assert_eq!(response, (None, GlobalResponse::NetworkOwnerGone));
     }
 }
 
@@ -4009,6 +6230,13 @@ where
             .await;
     }
 
+    exit_owned_controller(status)
+}
+
+/// Shared terminal boundary for existing unrecoverable shutdown and an
+/// explicitly owned controller's typed network refusal. No cleanup success is
+/// claimed: exiting the PID namespace init kills its remaining guest tasks.
+fn exit_owned_controller(status: i32) -> ! {
     // In this scenario a backtrace doesn't really help us.
     //
     // ⚠️ THE STATUS IS THE ONLY THING THAT CROSSES THIS BOUNDARY, SO IT HAS TO
@@ -4212,9 +6440,22 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::os::fd::OwnedFd;
     use std::sync::Mutex;
+    use std::task::Poll;
     use std::time::Duration;
 
+    use detcore_model::fd::OpenFileId;
+    use detcore_model::network_trace::NetworkAddressV2;
+    use detcore_model::network_trace::NetworkChannelId;
+    use detcore_model::network_trace::NetworkChannelV2;
+    use detcore_model::network_trace::NetworkInputEventV2;
+    use detcore_model::network_trace::NetworkInputKindV2;
+    use detcore_model::network_trace::NetworkOutputEventV2;
+    use detcore_model::network_trace::NetworkOutputKindV2;
+    use detcore_model::network_trace::NetworkPolicy;
+    use detcore_model::network_trace::NetworkReleaseV2;
+    use detcore_model::network_trace::NetworkShutdownV2;
     use nix::sys::signal::Signal;
+    use reverie::ExitStatus;
     use reverie::GlobalRPC;
     use reverie::GlobalTool;
     use reverie::Guest;
@@ -4226,6 +6467,21 @@ mod tests {
     use super::GlobalResponse;
     use super::GlobalState;
     use super::MountIdPool;
+    use super::NetworkChannelBinding;
+    use super::NetworkIngressObservation;
+    use super::NetworkReplayEngine;
+    use super::NetworkReply;
+    use super::NetworkRequest;
+    use super::NetworkRpcError;
+    use super::NetworkSocketControlFinish;
+    use super::NetworkStreamLeaseId;
+    use super::NetworkStreamNamespace;
+    use super::NetworkStreamOwner;
+    use super::NetworkStreamPhysicalEffect;
+    use super::NetworkStreamPhysicalResult;
+    use super::NetworkStreamQueueStatus;
+    use super::NetworkStreamSocketOption;
+    use super::NetworkStreamTransmit;
     use super::PendingExecState;
     use super::ResumeStatus;
     use super::RpcIncarnation;
@@ -4252,6 +6508,9 @@ mod tests {
     use crate::types::DetPid;
     use crate::types::DetTid;
     use crate::types::DetTime;
+    use crate::types::ExecFilesReceipt;
+    use crate::types::FilesId;
+    use crate::types::FilesIdAllocator;
     use crate::types::FutexID;
     use crate::types::LogicalTime;
     use crate::types::MmId;
@@ -4349,6 +6608,1828 @@ mod tests {
         assert_eq!(replay.determinize(700, None), Some(3));
     }
 
+    fn network_refusal_state(with_input: bool, with_output: bool) -> (GlobalState, OpenFileId) {
+        use detcore_model::network_trace::NetworkEndpointRoleV2;
+        use detcore_model::network_trace::NetworkTraceV2;
+        use detcore_model::network_trace::NetworkTransportV2;
+        let mut config = Config {
+            sequentialize_threads: false,
+            epoch_explicit: true,
+            ..Config::default()
+        };
+        config.network_trace.policy = NetworkPolicy::Replay;
+        let channel = NetworkChannelId(1);
+        let peer = NetworkAddressV2::Inet4 {
+            address: [192, 0, 2, 1],
+            port: 443,
+        };
+        let mut trace = NetworkTraceV2 {
+            epoch: config.epoch,
+            channels: vec![NetworkChannelV2 {
+                id: channel,
+                transport: NetworkTransportV2::Tcp,
+                role: NetworkEndpointRoleV2::OutboundClient,
+                local_address: None,
+                peer_address: Some(peer.clone()),
+                accepted_from: None,
+            }],
+            inputs: vec![],
+            outputs: vec![],
+        };
+        if with_input {
+            trace.inputs.push(NetworkInputEventV2 {
+                ordinal: 0,
+                channel,
+                release: NetworkReleaseV2 {
+                    not_before_global_time: trace.epoch_global_time().unwrap(),
+                    after_transmitted_offset: 0,
+                },
+                event: NetworkInputKindV2::StreamBytes {
+                    stream_offset: 0,
+                    bytes: b"input".to_vec(),
+                },
+            });
+        }
+        if with_output {
+            trace.outputs.push(NetworkOutputEventV2 {
+                channel,
+                event: NetworkOutputKindV2::StreamBytes {
+                    stream_offset: 0,
+                    bytes: b"expected".to_vec(),
+                },
+            });
+        }
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        config.network_trace_input = Some(bytes);
+        let state = GlobalState::initialize(&config, false);
+        let ofd = OpenFileId::new_socket(DetTid::from_raw(1), 0);
+        assert_eq!(
+            state.recv_network_request(NetworkRequest::EnsureChannel {
+                open_file: ofd,
+                binding: NetworkChannelBinding {
+                    transport: NetworkTransportV2::Tcp,
+                    role: NetworkEndpointRoleV2::OutboundClient,
+                    peer_address: Some(peer),
+                    requested_local_constraint: None,
+                    observed_local_address: None,
+                    accepted_from: None,
+                    selected_channel: None,
+                },
+            }),
+            Ok(NetworkReply::Channel(Some(channel)))
+        );
+        (state, ofd)
+    }
+
+    #[tokio::test]
+    async fn network_refusal_diagnostic_preserves_pending_effects_and_output() {
+        use crate::network_replay::NetworkReplayError;
+        let (config, state) = stream_rpc_state(false);
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(1),
+            mm: MmId::initial(DetTid::from_raw(1)),
+        };
+        let ofd = OpenFileId::new_socket(owner.thread, 0);
+        stream_rpc_bind(&state, &config, owner, ofd).await;
+        let lease = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginStreamIngress { open_file: ofd },
+            )
+            .await,
+        );
+        let engine = state.network_engine.as_ref().unwrap();
+        let expected =
+            format!("read-only completion check: Err(UnresolvedStreamOperation({lease:?}))");
+        assert_eq!(state.network_refusal_state_diagnostic(), expected);
+        assert_eq!(state.network_refusal_state_diagnostic(), expected);
+        assert!(
+            matches!(engine.lock().unwrap().finish(), Err(NetworkReplayError::UnresolvedStreamOperation(actual)) if actual == lease)
+        );
+        {
+            let _held = engine.lock().unwrap();
+            assert!(
+                state
+                    .network_refusal_state_diagnostic()
+                    .starts_with("network state unavailable:")
+            );
+        }
+        assert_eq!(state.network_refusal_state_diagnostic(), expected);
+
+        let (state, ofd) = network_refusal_state(false, true);
+        let expected = "read-only completion check: Err(UnconsumedChannel(NetworkChannelId(1)))";
+        assert_eq!(state.network_refusal_state_diagnostic(), expected);
+        assert_eq!(state.network_refusal_state_diagnostic(), expected);
+        assert_eq!(
+            state.recv_network_request(NetworkRequest::TransmitStream {
+                open_file: ofd,
+                bytes: b"expected".to_vec(),
+            }),
+            Ok(NetworkReply::StreamTransmit(
+                NetworkStreamTransmit::Accepted(8)
+            ))
+        );
+        assert_eq!(
+            state.network_refusal_state_diagnostic(),
+            "read-only completion check: Ok(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_dispatch_mismatch_is_typed_but_unknown_ofd_remains_internal() {
+        use crate::network_failure::NetworkRefusalReason;
+        let (state, ofd) = network_refusal_state(false, true);
+        let error = state
+            .recv_network_request(NetworkRequest::TransmitStream {
+                open_file: ofd,
+                bytes: b"different".to_vec(),
+            })
+            .unwrap_err();
+        let GlobalResponse::Network(Err(NetworkRpcError::Refusal(refusal))) =
+            serde_json::from_slice(
+                &serde_json::to_vec(&GlobalResponse::Network(Err(error))).unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!(
+                "actual outbound comparison must preserve refusal through response serialization"
+            );
+        };
+        assert_eq!(refusal.reason(), NetworkRefusalReason::OutboundMismatch);
+        let unknown = OpenFileId::new_socket(DetTid::from_raw(1), 99);
+        assert!(matches!(
+            state.recv_network_request(NetworkRequest::TransmitStream {
+                open_file: unknown,
+                bytes: b"expected".to_vec(),
+            }),
+            Err(NetworkRpcError::Internal(_))
+        ));
+        // A rejected transmit did not consume the expected bytes.
+        assert_eq!(
+            state.recv_network_request(NetworkRequest::TransmitStream {
+                open_file: ofd,
+                bytes: b"expected".to_vec(),
+            }),
+            Ok(NetworkReply::StreamTransmit(
+                NetworkStreamTransmit::Accepted(8)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn network_cleanup_refuses_unconsumed_trace_without_publishing_summary() {
+        use crate::network_failure::NetworkPolicyRefusal;
+        use crate::network_failure::NetworkRefusalReason;
+        for (with_input, expected) in [
+            (true, NetworkRefusalReason::UnconsumedTrace),
+            (false, NetworkRefusalReason::UnconsumedChannel),
+        ] {
+            let (state, _) = network_refusal_state(with_input, !with_input);
+            let directory = tempfile::tempdir().unwrap();
+            let summary = directory.path().join("summary.json");
+            let error = state
+                .clean_up(false, &Some(summary.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<NetworkPolicyRefusal>()
+                    .unwrap()
+                    .reason(),
+                expected
+            );
+            assert!(
+                !summary.exists(),
+                "refused completion must not publish a successful summary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn network_cleanup_accepts_consumed_output_and_rejects_internal_ownership() {
+        use crate::network_failure::NetworkPolicyRefusal;
+        let (state, ofd) = network_refusal_state(false, true);
+        assert_eq!(
+            state.recv_network_request(NetworkRequest::TransmitStream {
+                open_file: ofd,
+                bytes: b"expected".to_vec(),
+            }),
+            Ok(NetworkReply::StreamTransmit(
+                NetworkStreamTransmit::Accepted(8)
+            ))
+        );
+        state.clean_up(false, &None).await.unwrap();
+
+        let (state, _) = network_refusal_state(false, false);
+        let outstanding = state.network_engine.as_ref().unwrap().clone();
+        let error = state.clean_up(false, &None).await.unwrap_err();
+        assert!(error.downcast_ref::<NetworkPolicyRefusal>().is_none());
+        assert!(error.to_string().contains("live users at finalization"));
+        drop(outstanding);
+
+        let (_, state) = stream_rpc_state(false);
+        let error = state.clean_up(false, &None).await.unwrap_err();
+        assert!(error.downcast_ref::<NetworkPolicyRefusal>().is_none());
+        assert!(error.to_string().contains("captured no external channels"));
+    }
+
+    #[tokio::test]
+    async fn fd_publication_global_gate_waits_for_exact_owner_cleanup_and_revalidates() {
+        use crate::network_replay::NetworkFdPublicationReply as P;
+        use crate::network_replay::NetworkFdPublicationRequest as Q;
+        let (config, state) = stream_rpc_state(false);
+        let first = NetworkStreamOwner {
+            thread: DetTid::from_raw(41),
+            mm: MmId::initial(DetTid::from_raw(41)),
+        };
+        let sibling = NetworkStreamOwner {
+            thread: DetTid::from_raw(42),
+            mm: first.mm,
+        };
+        let files = {
+            let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+            let files = engine.fd_publication_fixture_register(first, None);
+            assert_eq!(
+                engine.fd_publication_fixture_register(sibling, Some(first)),
+                files
+            );
+            files
+        };
+        let first_permit = match stream_rpc(
+            &state,
+            &config,
+            first,
+            NetworkRequest::FdPublication(Q::Acquire { files }),
+        )
+        .await
+        .unwrap()
+        {
+            NetworkReply::FdPublication(P::Admitted(value)) => value.permit,
+            reply => panic!("unexpected reply {reply:?}"),
+        };
+        let mut blocked = std::pin::pin!(stream_rpc(
+            &state,
+            &config,
+            sibling,
+            NetworkRequest::FdPublication(Q::Acquire { files })
+        ));
+        assert!(matches!(futures::poll!(blocked.as_mut()), Poll::Pending));
+        // A stale incarnation's cleanup must neither release this permit nor
+        // make the awakened contender runnable through an unchecked path.
+        let stale = NetworkStreamOwner {
+            thread: first.thread,
+            mm: first.mm.for_exec(first.thread),
+        };
+        state.abandon_network_owners([stale]);
+        assert!(matches!(futures::poll!(blocked.as_mut()), Poll::Pending));
+        state.abandon_network_owners([first]);
+        let successor = match blocked.await.unwrap() {
+            NetworkReply::FdPublication(P::Admitted(value)) => value.permit,
+            reply => panic!("unexpected successor reply {reply:?}"),
+        };
+        assert_ne!(successor.lease, first_permit.lease);
+        assert_eq!(successor.owner, sibling);
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::FdPublication(Q::ReleaseEmpty { permit: successor })
+            )
+            .await,
+            Ok(NetworkReply::FdPublication(P::Released))
+        );
+        assert!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .release_empty_fd_publication(sibling, first_permit)
+                .is_err()
+        );
+    }
+
+    fn fd_lifecycle_exec_fixture() -> (Config, GlobalState, NetworkStreamOwner, FilesId) {
+        let (config, state) = stream_rpc_state(false);
+        let tid = DetTid::from_raw(61);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(tid, tid, true);
+        install_test_registration(&state, tid, Ivar::new());
+        let owner = NetworkStreamOwner {
+            thread: tid,
+            mm: MmId::initial(tid),
+        };
+        let files = FilesId::initial(tid);
+        {
+            let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+            engine.fd_table_fixture_enable();
+            assert!(engine.register_initial_fd_table(owner, tid).unwrap());
+        }
+        (config, state, owner, files)
+    }
+    #[tokio::test]
+    async fn custody_task_registration_checks_sender_process_mm_without_cfgseq() {
+        let (config, state, owner, _) = fd_lifecycle_exec_fixture();
+        assert!(!config.sequentialize_threads);
+        let call = |mm, process, thread| {
+            state.receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::RegisterNetworkPhysicalTask { process, thread },
+                ),
+            )
+        };
+        // No runtime capability means no host pidfd opens, even for an otherwise
+        // authenticated task. An ordinary library run remains inactive.
+        assert_eq!(
+            call(owner.mm, owner.thread.as_raw(), owner.thread.as_raw())
+                .await
+                .1,
+            GlobalResponse::RegisterNetworkPhysicalTask(Ok(false))
+        );
+        assert_eq!(
+            call(owner.mm, owner.thread.as_raw() + 1, owner.thread.as_raw())
+                .await
+                .1,
+            GlobalResponse::ThreadExited
+        );
+        assert_eq!(
+            call(owner.mm, owner.thread.as_raw(), owner.thread.as_raw() + 1)
+                .await
+                .1,
+            GlobalResponse::ThreadExited
+        );
+        assert_eq!(
+            call(
+                owner.mm.for_exec(owner.thread),
+                owner.thread.as_raw(),
+                owner.thread.as_raw()
+            )
+            .await
+            .1,
+            GlobalResponse::ThreadExited
+        );
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .physical_thread_identity(owner.thread)
+                .is_none()
+        );
+    }
+
+    async fn fd_lifecycle_exec_admit(
+        state: &GlobalState,
+        config: &Config,
+        owner: NetworkStreamOwner,
+        receipt: ExecFilesReceipt,
+    ) -> crate::network_replay::NetworkFdMutationAdmission {
+        use crate::network_replay::NetworkFdMutationBegin as B;
+        use crate::network_replay::NetworkFdMutationKind;
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let reply = stream_rpc(
+            state,
+            config,
+            owner,
+            NetworkRequest::FdMutation(Q::Begin {
+                files: receipt.old_files,
+                kind: NetworkFdMutationKind::Exec { receipt },
+            }),
+        )
+        .await
+        .unwrap();
+        let NetworkReply::FdMutation(P::Begin(B::Admitted(a))) = reply else {
+            panic!("missing admission {reply:?}");
+        };
+        assert_eq!(
+            stream_rpc(
+                state,
+                config,
+                owner,
+                NetworkRequest::FdMutation(Q::Submit {
+                    permit: a.publication.permit,
+                })
+            )
+            .await
+            .unwrap(),
+            NetworkReply::FdMutation(P::Unit)
+        );
+        a
+    }
+
+    #[tokio::test]
+    async fn fd_lifecycle_exec_rejects_canceled_receipt_before_engine_mutation() {
+        use crate::network_replay::NetworkFdMutationKind;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let (config, state, owner, files) = fd_lifecycle_exec_fixture();
+        let old = prepare_test_rpc(&state, &config, owner.thread, owner.thread).await;
+        cancel_test_rpc(&state, &config, old).await;
+        let current = prepare_test_rpc(&state, &config, owner.thread, owner.thread).await;
+        let before = format!(
+            "{:?}",
+            state.network_engine.as_ref().unwrap().lock().unwrap()
+        );
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FdMutation(Q::Begin {
+                    files,
+                    kind: NetworkFdMutationKind::Exec { receipt: old },
+                })
+            )
+            .await,
+            Err(NetworkRpcError::Internal(_))
+        ));
+        assert_eq!(
+            format!(
+                "{:?}",
+                state.network_engine.as_ref().unwrap().lock().unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            state.pending_exec_states.lock().unwrap()[&owner.thread].receipt,
+            current
+        );
+        fd_lifecycle_exec_admit(&state, &config, owner, current).await;
+    }
+
+    #[tokio::test]
+    async fn fd_lifecycle_exec_mark_callback_commits_same_table_receipt() {
+        let (config, state, owner, files) = fd_lifecycle_exec_fixture();
+        let receipt = prepare_test_rpc(&state, &config, owner.thread, owner.thread).await;
+        fd_lifecycle_exec_admit(&state, &config, owner, receipt).await;
+        let new_mm = owner.mm.for_exec(owner.thread);
+        let (_, reply) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    new_mm,
+                    GlobalRequest::MarkPastFirstExecve(None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            reply,
+            GlobalResponse::MarkPastFirstExecve(Default::default(), Some(receipt))
+        );
+        let engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+        assert_eq!(
+            engine.fd_table_fixture_files(NetworkStreamOwner {
+                mm: new_mm,
+                ..owner
+            }),
+            Some(receipt.new_files)
+        );
+        assert_eq!(engine.fd_table_fixture_files(owner), None);
+        assert_ne!(files, receipt.new_files);
+    }
+
+    #[tokio::test]
+    async fn fd_lifecycle_exec_reconnect_callback_then_mark_consumes_same_receipt_once() {
+        let (config, state, owner, _) = fd_lifecycle_exec_fixture();
+        let receipt = prepare_test_rpc(&state, &config, owner.thread, owner.thread).await;
+        fd_lifecycle_exec_admit(&state, &config, owner, receipt).await;
+        let new_mm = owner.mm.for_exec(owner.thread);
+        let (_, reply) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    new_mm,
+                    GlobalRequest::CreateChildThread(
+                        owner.thread,
+                        owner.thread,
+                        0,
+                        None,
+                        libc::SIGCHLD,
+                        None,
+                        None,
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            reply,
+            GlobalResponse::CreateChildThread(Some((new_mm, receipt)))
+        );
+        assert_eq!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .fd_table_fixture_files(NetworkStreamOwner {
+                    mm: new_mm,
+                    ..owner
+                }),
+            Some(receipt.new_files)
+        );
+        let (_, reply) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    new_mm,
+                    GlobalRequest::MarkPastFirstExecve(None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            reply,
+            GlobalResponse::MarkPastFirstExecve(Default::default(), Some(receipt))
+        );
+        assert!(state.post_exec_files.lock().unwrap().is_empty());
+        let (_, reply) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    new_mm,
+                    GlobalRequest::MarkPastFirstExecve(None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            reply,
+            GlobalResponse::MarkPastFirstExecve(Default::default(), None)
+        );
+    }
+
+    fn stream_rpc_state(sequential: bool) -> (Config, GlobalState) {
+        let mut config = Config {
+            sequentialize_threads: sequential,
+            epoch_explicit: true,
+            ..Config::default()
+        };
+        config.network_trace.policy = NetworkPolicy::Record;
+        let state = GlobalState::initialize(&config, false);
+        // These existing tests exercise V2 BeginStreamIngress, not V3 Socket
+        // enrollment. Keep their explicit legacy engine and every assertion.
+        // Replace only the pristine fixture contents; the scheduler and RPC
+        // continue to share the original single installed engine allocation.
+        *state.network_engine.as_ref().unwrap().lock().unwrap() =
+            NetworkReplayEngine::record(config.epoch);
+        (config, state)
+    }
+
+    async fn stream_rpc(
+        state: &GlobalState,
+        config: &Config,
+        owner: NetworkStreamOwner,
+        request: NetworkRequest,
+    ) -> Result<NetworkReply, NetworkRpcError> {
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(config),
+                    owner.mm,
+                    GlobalRequest::Network(request),
+                ),
+            )
+            .await;
+        match response {
+            GlobalResponse::Network(reply) => reply,
+            reply => panic!("unexpected RPC {reply:?}"),
+        }
+    }
+
+    async fn stream_rpc_bind(
+        state: &GlobalState,
+        config: &Config,
+        owner: NetworkStreamOwner,
+        ofd: OpenFileId,
+    ) {
+        let binding = NetworkChannelBinding {
+            transport: detcore_model::network_trace::NetworkTransportV2::Tcp,
+            role: detcore_model::network_trace::NetworkEndpointRoleV2::OutboundClient,
+            peer_address: Some(NetworkAddressV2::Inet4 {
+                address: [192, 0, 2, 1],
+                port: 443,
+            }),
+            requested_local_constraint: None,
+            observed_local_address: None,
+            accepted_from: None,
+            selected_channel: None,
+        };
+        assert!(matches!(
+            stream_rpc(
+                state,
+                config,
+                owner,
+                NetworkRequest::EnsureChannel {
+                    open_file: ofd,
+                    binding
+                }
+            )
+            .await,
+            Ok(NetworkReply::Channel(Some(_)))
+        ));
+    }
+
+    fn ingress_receipt(reply: Result<NetworkReply, NetworkRpcError>) -> NetworkStreamLeaseId {
+        match reply {
+            Ok(NetworkReply::IngressLease(receipt)) => receipt,
+            other => panic!("expected receipt {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_rpc_contention_rechecks_after_publication_without_holding_locks() {
+        let (config, state) = stream_rpc_state(false);
+        let first = NetworkStreamOwner {
+            thread: DetTid::from_raw(41),
+            mm: MmId::initial(DetTid::from_raw(41)),
+        };
+        let second = NetworkStreamOwner {
+            thread: DetTid::from_raw(42),
+            mm: first.mm,
+        };
+        let ofd = OpenFileId::new_socket(first.thread, 0);
+        stream_rpc_bind(&state, &config, first, ofd).await;
+        let a = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                first,
+                NetworkRequest::BeginStreamIngress { open_file: ofd },
+            )
+            .await,
+        );
+        let mut blocked = std::pin::pin!(stream_rpc(
+            &state,
+            &config,
+            second,
+            NetworkRequest::BeginStreamIngress { open_file: ofd }
+        ));
+        assert!(matches!(futures::poll!(blocked.as_mut()), Poll::Pending));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                first,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: a,
+                    observation: NetworkIngressObservation::Bytes(b"abc".to_vec()),
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        let b = ingress_receipt(blocked.await);
+        assert_ne!(a, b);
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                second,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: b,
+                    observation: NetworkIngressObservation::NoArrival,
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                second,
+                NetworkRequest::StreamQueueStatus { open_file: ofd }
+            )
+            .await,
+            Ok(NetworkReply::StreamQueueStatus(NetworkStreamQueueStatus {
+                queued_bytes: 3,
+                ingress_busy: false,
+                ..
+            }))
+        ));
+    }
+
+    struct NetworkExitRpc<'a> {
+        state: &'a GlobalState,
+        sender: DetTid,
+    }
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for NetworkExitRpc<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.state
+                .receive_rpc(Tid::from_raw(self.sender.as_raw()), request)
+                .await
+        }
+        fn config(&self) -> &Config {
+            &self.state.cfg
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_stream_acquire_rechecks_registered_mm_after_notify_without_scheduler_mm() {
+        let (config, state) = stream_rpc_state(false);
+        let first = NetworkStreamOwner {
+            thread: DetTid::from_raw(45),
+            mm: MmId::initial(DetTid::from_raw(45)),
+        };
+        let old = NetworkStreamOwner {
+            thread: DetTid::from_raw(46),
+            mm: first.mm,
+        };
+        let new = NetworkStreamOwner {
+            thread: old.thread,
+            mm: old.mm.for_exec(old.thread),
+        };
+        let ofd = OpenFileId::new_socket(first.thread, 0);
+        stream_rpc_bind(&state, &config, first, ofd).await;
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(old.thread, old.mm);
+        let receipt = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                first,
+                NetworkRequest::BeginStreamIngress { open_file: ofd },
+            )
+            .await,
+        );
+        let mut stale = std::pin::pin!(state.receive_rpc(
+            Tid::from_raw(old.thread.as_raw()),
+            (
+                DetTime::new(&config),
+                old.mm,
+                GlobalRequest::Network(NetworkRequest::BeginStreamIngress { open_file: ofd })
+            )
+        ));
+        assert!(matches!(futures::poll!(stale.as_mut()), Poll::Pending));
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .rpc_incarnation_matches(old.thread, old.mm)
+        );
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(old.thread, new.mm);
+        state.network_stream_changed.notify_waiters();
+        assert_eq!(stale.await, (None, GlobalResponse::ThreadExited));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                first,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: receipt,
+                    observation: NetworkIngressObservation::NoArrival,
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        let fresh = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                new,
+                NetworkRequest::BeginStreamIngress { open_file: ofd },
+            )
+            .await,
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                new,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: fresh,
+                    observation: NetworkIngressObservation::NoArrival,
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_nonsequential_thread_exit_wakes_waiter_but_retains_unresolved_effects() {
+        use reverie::Tool;
+        let (config, state) = stream_rpc_state(false);
+        let first = DetTid::from_raw(51);
+        let tool: Detcore = Detcore::new(Tid::from_raw(first.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(first.as_raw()), None);
+        thread.detpid = Some(first);
+        let owner = NetworkStreamOwner {
+            thread: first,
+            mm: thread.mm_id,
+        };
+        let other = NetworkStreamOwner {
+            thread: DetTid::from_raw(52),
+            mm: owner.mm,
+        };
+        let ofd = OpenFileId::new_socket(first, 0);
+        stream_rpc_bind(&state, &config, owner, ofd).await;
+        let receipt = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginStreamIngress { open_file: ofd },
+            )
+            .await,
+        );
+        let mut waiting = std::pin::pin!(stream_rpc(
+            &state,
+            &config,
+            other,
+            NetworkRequest::BeginStreamIngress { open_file: ofd }
+        ));
+        assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+        let rpc = NetworkExitRpc {
+            state: &state,
+            sender: first,
+        };
+        tool.on_exit_thread(
+            Tid::from_raw(first.as_raw()),
+            &rpc,
+            thread,
+            ExitStatus::Exited(0),
+        )
+        .await
+        .unwrap();
+        let NetworkRpcError::Internal(message) = waiting.await.unwrap_err() else {
+            panic!("unresolved physical effect must remain an internal failure");
+        };
+        assert!(message.contains("UnresolvedStreamOperation"));
+        assert!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: receipt,
+                    observation: NetworkIngressObservation::NoArrival,
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .stream_queue_status(ofd)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_owner_gone_rpc_cannot_abandon_a_new_incarnation_receipt() {
+        let (config, state) = stream_rpc_state(false);
+        let tid = DetTid::from_raw(61);
+        let old = MmId::initial(tid);
+        let owner = NetworkStreamOwner {
+            thread: tid,
+            mm: old.for_exec(tid),
+        };
+        let ofd = OpenFileId::new_socket(tid, 0);
+        stream_rpc_bind(&state, &config, owner, ofd).await;
+        let receipt = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginStreamIngress { open_file: ofd },
+            )
+            .await,
+        );
+        assert_eq!(
+            state
+                .receive_rpc(
+                    Tid::from_raw(tid.as_raw()),
+                    (DetTime::new(&config), old, GlobalRequest::NetworkOwnerGone)
+                )
+                .await,
+            (None, GlobalResponse::NetworkOwnerGone)
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: receipt,
+                    observation: NetworkIngressObservation::NoArrival,
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_exec_marks_real_siblings_but_preserves_same_mm_other_process_receipt() {
+        let (config, state) = stream_rpc_state(true);
+        let leader = DetTid::from_raw(71);
+        let sibling = DetTid::from_raw(72);
+        let survivor = DetTid::from_raw(73);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(leader, leader, true);
+            sched.thread_tree.add_child(leader, sibling, false);
+            sched.thread_tree.add_child(leader, survivor, true);
+        }
+        for tid in [leader, sibling, survivor] {
+            install_test_registration(&state, tid, Ivar::new());
+        }
+        let old_mm = MmId::initial(leader);
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(survivor, old_mm);
+        let sibling_owner = NetworkStreamOwner {
+            thread: sibling,
+            mm: old_mm,
+        };
+        let survivor_owner = NetworkStreamOwner {
+            thread: survivor,
+            mm: old_mm,
+        };
+        let sibling_fd = OpenFileId::new_socket(sibling, 0);
+        let survivor_fd = OpenFileId::new_socket(survivor, 0);
+        stream_rpc_bind(&state, &config, sibling_owner, sibling_fd).await;
+        stream_rpc_bind(&state, &config, survivor_owner, survivor_fd).await;
+        let _sibling_receipt = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                sibling_owner,
+                NetworkRequest::BeginStreamIngress {
+                    open_file: sibling_fd,
+                },
+            )
+            .await,
+        );
+        let survivor_receipt = ingress_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                survivor_owner,
+                NetworkRequest::BeginStreamIngress {
+                    open_file: survivor_fd,
+                },
+            )
+            .await,
+        );
+        let prepared = prepare_test_rpc(&state, &config, leader, leader).await;
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(leader.as_raw()),
+                (
+                    DetTime::new(&config),
+                    old_mm.for_exec(leader),
+                    GlobalRequest::MarkPastFirstExecve(None),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(response, GlobalResponse::MarkPastFirstExecve(_, Some(receipt)) if receipt == prepared)
+        );
+        assert!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .stream_queue_status(sibling_fd)
+                .is_err()
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                survivor_owner,
+                NetworkRequest::CompleteStreamIngress {
+                    lease: survivor_receipt,
+                    observation: NetworkIngressObservation::NoArrival,
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+    }
+
+    fn shadow_rpc_state() -> (Config, GlobalState) {
+        let mut config = Config {
+            sequentialize_threads: false,
+            epoch_explicit: true,
+            ..Config::default()
+        };
+        config.network_trace.policy = NetworkPolicy::Record;
+        let state = GlobalState::initialize(&config, false);
+        assert!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .shadow_mode()
+        );
+        (config, state)
+    }
+    async fn shadow_rpc_register(
+        state: &GlobalState,
+        config: &Config,
+        owner: NetworkStreamOwner,
+        ofd: OpenFileId,
+    ) {
+        use detcore_model::network_trace::*;
+        let profile = FreshStreamSocketProfileV3 {
+            key: StreamSocketKeyV3 {
+                transport: NetworkTransportV2::Tcp,
+                domain: libc::AF_INET,
+                socket_type: libc::SOCK_STREAM,
+                protocol: libc::IPPROTO_TCP,
+            },
+            normalization: LinuxReceiveNormalizationV3 {
+                hz: LinuxReceiveHzV3::Hz1000,
+                peek_offset_set_supported: true,
+                system_rmem_max: 20_971_520,
+                namespace_tcp_rmem_max: 6_291_456,
+                minimum_receive_buffer: 2304,
+            },
+            initial: StreamSocketOptionsV3 {
+                peek_offset: Some(-1),
+                receive_low_water: 1,
+                receive_timeout: ReceiveTimeoutV3::Infinite,
+                receive_buffer: ReceiveBufferStateV3 {
+                    bytes: 262_144,
+                    user_locked: false,
+                    tcp_scaling_ratio: 128,
+                },
+            },
+        };
+        assert!(matches!(
+            stream_rpc(
+                state,
+                config,
+                owner,
+                NetworkRequest::RegisterStreamSocket {
+                    open_file: ofd,
+                    key: profile.key,
+                    namespace: NetworkStreamNamespace {
+                        device: 4,
+                        inode: 100
+                    },
+                    observed_profile: Some(profile)
+                }
+            )
+            .await,
+            Ok(NetworkReply::StreamSocketState(Some(_)))
+        ));
+    }
+    fn socket_control_receipt(
+        reply: Result<NetworkReply, NetworkRpcError>,
+    ) -> NetworkStreamLeaseId {
+        match reply {
+            Ok(NetworkReply::SocketControl(control)) => control.lease,
+            other => panic!("expected control: {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn v3_production_rpc_requires_enrollment_and_applies_exact_timeout_state() {
+        use detcore_model::network_trace::ReceiveTimeoutV3;
+        let (config, state) = shadow_rpc_state();
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(301),
+            mm: MmId::initial(DetTid::from_raw(301)),
+        };
+        let ofd = OpenFileId::new_socket(owner.thread, 0);
+        let binding = NetworkChannelBinding {
+            transport: detcore_model::network_trace::NetworkTransportV2::Tcp,
+            role: detcore_model::network_trace::NetworkEndpointRoleV2::OutboundClient,
+            peer_address: Some(NetworkAddressV2::Inet4 {
+                address: [192, 0, 2, 1],
+                port: 443,
+            }),
+            requested_local_constraint: None,
+            observed_local_address: None,
+            accepted_from: None,
+            selected_channel: None,
+        };
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::EnsureChannel {
+                    open_file: ofd,
+                    binding
+                }
+            )
+            .await,
+            Err(NetworkRpcError::Internal { .. })
+        ));
+        assert_eq!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .channel_for(ofd),
+            None
+        );
+        shadow_rpc_register(&state, &config, owner, ofd).await;
+        stream_rpc_bind(&state, &config, owner, ofd).await;
+        let lease = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        for (seconds, microseconds, result) in [(-1, 0, Ok(())), (-1, -1, Err(libc::EDOM))] {
+            let option = NetworkStreamSocketOption::ReceiveTimeout {
+                seconds,
+                microseconds,
+            };
+            assert_eq!(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::PreviewSocketOption {
+                        lease,
+                        option: option.clone()
+                    }
+                )
+                .await,
+                Ok(NetworkReply::SocketOptionResult(result))
+            );
+            assert_eq!(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::SubmitStreamPhysical {
+                        lease,
+                        effect: NetworkStreamPhysicalEffect::SetSocketOption { option }
+                    }
+                )
+                .await,
+                Ok(NetworkReply::Unit)
+            );
+            assert_eq!(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::ConfirmStreamPhysical {
+                        lease,
+                        result: NetworkStreamPhysicalResult::SocketOption { result }
+                    }
+                )
+                .await,
+                Ok(NetworkReply::Unit)
+            );
+            let NetworkReply::StreamSocketState(Some(current)) = stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::StreamSocketState { open_file: ofd },
+            )
+            .await
+            .unwrap() else {
+                panic!("missing options")
+            };
+            assert_eq!(
+                current.options.receive_timeout,
+                ReceiveTimeoutV3::FiniteTicks(0)
+            );
+            assert_eq!(
+                current
+                    .options
+                    .receive_timeout
+                    .exposed_timeval(current.normalization.hz),
+                (0, 0)
+            );
+        }
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FinishSocketControl {
+                    lease,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+    }
+    #[tokio::test]
+    async fn v3_control_contention_wakes_and_rechecks_registered_mm() {
+        let (config, state) = shadow_rpc_state();
+        let first = NetworkStreamOwner {
+            thread: DetTid::from_raw(302),
+            mm: MmId::initial(DetTid::from_raw(302)),
+        };
+        let second = NetworkStreamOwner {
+            thread: DetTid::from_raw(303),
+            mm: first.mm,
+        };
+        let ofd = OpenFileId::new_socket(first.thread, 0);
+        shadow_rpc_register(&state, &config, first, ofd).await;
+        let lease = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                first,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        let mut waiter = std::pin::pin!(stream_rpc(
+            &state,
+            &config,
+            second,
+            NetworkRequest::BeginSocketControl { open_file: ofd }
+        ));
+        assert!(matches!(futures::poll!(waiter.as_mut()), Poll::Pending));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                first,
+                NetworkRequest::FinishSocketControl {
+                    lease,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        let acquired = socket_control_receipt(waiter.await);
+        assert_ne!(lease, acquired);
+        let old = NetworkStreamOwner {
+            thread: DetTid::from_raw(304),
+            mm: first.mm,
+        };
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(old.thread, old.mm);
+        let mut stale = std::pin::pin!(state.receive_rpc(
+            Tid::from_raw(old.thread.as_raw()),
+            (
+                DetTime::new(&config),
+                old.mm,
+                GlobalRequest::Network(NetworkRequest::BeginSocketControl { open_file: ofd })
+            )
+        ));
+        assert!(matches!(futures::poll!(stale.as_mut()), Poll::Pending));
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(old.thread, old.mm.for_exec(old.thread));
+        state.network_stream_changed.notify_waiters();
+        assert_eq!(stale.await, (None, GlobalResponse::ThreadExited));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                second,
+                NetworkRequest::FinishSocketControl {
+                    lease: acquired,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+    }
+    #[tokio::test]
+    async fn v3_owner_exit_wakes_contender_without_erasing_pending_option() {
+        let (config, state) = shadow_rpc_state();
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(305),
+            mm: MmId::initial(DetTid::from_raw(305)),
+        };
+        let other = NetworkStreamOwner {
+            thread: DetTid::from_raw(306),
+            mm: owner.mm,
+        };
+        let ofd = OpenFileId::new_socket(owner.thread, 0);
+        shadow_rpc_register(&state, &config, owner, ofd).await;
+        let lease = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::SubmitStreamPhysical {
+                    lease,
+                    effect: NetworkStreamPhysicalEffect::SetSocketOption {
+                        option: NetworkStreamSocketOption::ReceiveLowWater(3)
+                    }
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        let mut waiter = std::pin::pin!(stream_rpc(
+            &state,
+            &config,
+            other,
+            NetworkRequest::BeginSocketControl { open_file: ofd }
+        ));
+        assert!(matches!(futures::poll!(waiter.as_mut()), Poll::Pending));
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::NetworkOwnerGone,
+                ),
+            )
+            .await;
+        assert!(matches!(response, GlobalResponse::NetworkOwnerGone));
+        assert!(matches!(
+            waiter.await,
+            Err(NetworkRpcError::Internal { .. })
+        ));
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::ConfirmStreamPhysical {
+                    lease,
+                    result: NetworkStreamPhysicalResult::SocketOption { result: Ok(()) }
+                }
+            )
+            .await,
+            Err(NetworkRpcError::Internal { .. })
+        ));
+        assert!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .finish()
+                .is_err()
+        );
+    }
+
+    async fn zero_rpc_call(
+        state: &GlobalState,
+        config: &Config,
+        owner: NetworkStreamOwner,
+    ) -> crate::network_replay::NetworkStreamCallId {
+        let ofd = OpenFileId::new_socket(owner.thread, 0);
+        shadow_rpc_register(state, config, owner, ofd).await;
+        stream_rpc_bind(state, config, owner, ofd).await;
+        let control = socket_control_receipt(
+            stream_rpc(
+                state,
+                config,
+                owner,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        let NetworkReply::StreamCall(call) = stream_rpc(
+            state,
+            config,
+            owner,
+            NetworkRequest::BeginStreamCall {
+                control_lease: control,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("missing call")
+        };
+        assert!(call.physical_pin_required);
+        assert_eq!(
+            stream_rpc(
+                state,
+                config,
+                owner,
+                NetworkRequest::ConfirmStreamCallPin {
+                    id: call.id,
+                    outcome: crate::network_replay::NetworkStreamPinOutcome::Acquired
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert_eq!(
+            stream_rpc(
+                state,
+                config,
+                owner,
+                NetworkRequest::FinishSocketControl {
+                    lease: control,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        call.id
+    }
+
+    #[tokio::test]
+    async fn v3_zero_receive_short_contention_wakes_after_shutdown_and_refuses_stale_mm() {
+        use crate::network_replay::NetworkStreamPhysicalEffect;
+        use crate::network_replay::NetworkStreamPhysicalResult;
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let (config, state) = shadow_rpc_state();
+        assert!(!config.sequentialize_threads);
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(311),
+            mm: MmId::initial(DetTid::from_raw(311)),
+        };
+        let sibling = NetworkStreamOwner {
+            thread: DetTid::from_raw(312),
+            mm: owner.mm,
+        };
+        let call = zero_rpc_call(&state, &config, owner).await;
+        let ofd = OpenFileId::new_socket(owner.thread, 0);
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(owner.thread, owner.mm);
+        let lease = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        let mut waiter = std::pin::pin!(stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::ZeroStreamReceive {
+                call,
+                peek_offset: 8
+            }
+        ));
+        assert!(matches!(futures::poll!(waiter.as_mut()), Poll::Pending));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::SubmitStreamPhysical {
+                    lease,
+                    effect: NetworkStreamPhysicalEffect::Shutdown {
+                        direction: NetworkShutdownV2::Read
+                    }
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert!(matches!(futures::poll!(waiter.as_mut()), Poll::Pending));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::ConfirmStreamPhysical {
+                    lease,
+                    result: NetworkStreamPhysicalResult::Shutdown { result: Ok(()) }
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        // A notification does not bypass the still-held short OFD control.
+        assert!(matches!(futures::poll!(waiter.as_mut()), Poll::Pending));
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::FinishSocketControl {
+                    lease,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert_eq!(
+            waiter.await,
+            Ok(NetworkReply::ZeroStreamReceive(
+                NetworkZeroStreamReceive::EndOfFile
+            ))
+        );
+        let lease = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        let mut stale = std::pin::pin!(state.receive_rpc(
+            Tid::from_raw(owner.thread.as_raw()),
+            (
+                DetTime::new(&config),
+                owner.mm,
+                GlobalRequest::Network(NetworkRequest::ZeroStreamReceive {
+                    call,
+                    peek_offset: 8
+                })
+            )
+        ));
+        assert!(matches!(futures::poll!(stale.as_mut()), Poll::Pending));
+        let before = format!(
+            "{:?}",
+            state.network_engine.as_ref().unwrap().lock().unwrap()
+        );
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(owner.thread, owner.mm.for_exec(owner.thread));
+        state.network_stream_changed.notify_waiters();
+        assert_eq!(stale.await, (None, GlobalResponse::ThreadExited));
+        assert_eq!(
+            format!(
+                "{:?}",
+                state.network_engine.as_ref().unwrap().lock().unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                sibling,
+                NetworkRequest::FinishSocketControl {
+                    lease,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_zero_receive_rpc_requires_authenticated_resolution_before_pin_release() {
+        use detcore_model::network_trace::NetworkTrace;
+
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let (config, state) = shadow_rpc_state();
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(307),
+            mm: MmId::initial(DetTid::from_raw(307)),
+        };
+        let call = zero_rpc_call(&state, &config, owner).await;
+        let NetworkReply::ZeroStreamReceive(NetworkZeroStreamReceive::Waiting(id)) = stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::ZeroStreamReceive {
+                call,
+                peek_offset: 8,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("missing atomic receipt")
+        };
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::InspectZeroStreamWait { id }
+            )
+            .await,
+            Ok(NetworkReply::ZeroStreamWaitEntered(false))
+        );
+        assert!(
+            matches!(stream_rpc(&state, &config, owner, NetworkRequest::BeginStreamCallRelease { id: call }).await, Err(NetworkRpcError::Internal(message)) if message.contains("UnresolvedZeroStreamWait"))
+        );
+        let stale = NetworkStreamOwner {
+            thread: owner.thread,
+            mm: owner.mm.for_exec(owner.thread),
+        };
+        let before = format!(
+            "{:?}",
+            state.network_engine.as_ref().unwrap().lock().unwrap()
+        );
+        assert!(
+            stream_rpc(
+                &state,
+                &config,
+                stale,
+                NetworkRequest::CancelZeroStreamWait { id }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                state.network_engine.as_ref().unwrap().lock().unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::CancelZeroStreamWait { id }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginStreamCallRelease { id: call }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FinishStreamCallRelease { id: call }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::InspectZeroStreamWait { id }
+            )
+            .await
+            .is_err()
+        );
+        // Exercise the Record finalizer, not Replay-only engine.finish().
+        let mut state = state;
+        let mut output = tempfile::tempfile().unwrap();
+        state.cfg.network_trace_output_fd = Some(std::os::fd::AsRawFd::as_raw_fd(&output));
+        state.finalize_network_trace().unwrap();
+        std::io::Seek::rewind(&mut output).unwrap();
+        assert!(matches!(
+            NetworkTrace::read_framed(&mut output).unwrap(),
+            NetworkTrace::V3(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v3_zero_receive_rpc_owner_exit_preserves_unresolved_receipt_and_rejects_ack() {
+        use crate::network_replay::NetworkReplayError;
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let (config, state) = shadow_rpc_state();
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(308),
+            mm: MmId::initial(DetTid::from_raw(308)),
+        };
+        let call = zero_rpc_call(&state, &config, owner).await;
+        let NetworkReply::ZeroStreamReceive(NetworkZeroStreamReceive::Waiting(id)) = stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::ZeroStreamReceive {
+                call,
+                peek_offset: 0,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("missing atomic receipt")
+        };
+        let operation = ExternalOpId::new(owner.thread, 19);
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginZeroStreamWait {
+                    call,
+                    record_operation: Some(operation)
+                }
+            )
+            .await,
+            Ok(NetworkReply::ZeroStreamWait(id))
+        );
+        // Scheduler entry has its own tests; dispatch must not fabricate it.
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::InspectZeroStreamWait { id }
+            )
+            .await,
+            Ok(NetworkReply::ZeroStreamWaitEntered(false))
+        );
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::NetworkOwnerGone,
+                ),
+            )
+            .await;
+        assert!(matches!(response, GlobalResponse::NetworkOwnerGone));
+        assert!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FinishZeroStreamWait { id }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::CancelZeroStreamWait { id }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            matches!(state.network_engine.as_ref().unwrap().lock().unwrap().finish(), Err(NetworkReplayError::UnresolvedZeroStreamWait(actual)) if actual == id)
+        );
+    }
+
     fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {
         let config = Config {
             sequentialize_threads: true,
@@ -4382,6 +8463,15 @@ mod tests {
         );
         scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
         scheduler.runqueue_push_back(dettid);
+        let process = scheduler
+            .registered_process(dettid)
+            .expect("test task has a process");
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .entry(dettid)
+            .or_insert(MmId::initial(process));
     }
 
     // Exercise the real external registration method and global RPC without a
@@ -5198,6 +9288,374 @@ mod tests {
         );
     }
 
+    fn exec_siblings() -> (Config, GlobalState, DetTid, DetTid) {
+        let (config, state, leader, _) = cancellation_test_state();
+        let sibling = DetTid::from_raw(leader.as_raw() + 1);
+        install_test_registration(&state, leader, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(leader, sibling, false);
+        install_test_registration(&state, sibling, Ivar::new());
+        (config, state, leader, sibling)
+    }
+
+    async fn prepare_test_rpc(
+        state: &GlobalState,
+        config: &Config,
+        tid: DetTid,
+        pid: DetPid,
+    ) -> ExecFilesReceipt {
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::new(config),
+                    MmId::initial(pid),
+                    GlobalRequest::PrepareExec(
+                        pid,
+                        MmId::initial(pid),
+                        FilesId::initial(tid),
+                        Default::default(),
+                    ),
+                ),
+            )
+            .await;
+        let GlobalResponse::PrepareExec(receipt) = response else {
+            panic!("unexpected preparation {response:?}")
+        };
+        receipt
+    }
+
+    async fn cancel_test_rpc(state: &GlobalState, config: &Config, receipt: ExecFilesReceipt) {
+        assert_eq!(
+            state
+                .receive_rpc(
+                    Tid::from_raw(receipt.caller.as_raw()),
+                    (
+                        DetTime::new(config),
+                        receipt.mm,
+                        GlobalRequest::CancelExec(receipt),
+                    )
+                )
+                .await,
+            (None, GlobalResponse::CancelExec(()))
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "one caller cannot prepare exec twice")]
+    async fn duplicate_exec_from_one_caller_is_an_internal_protocol_error() {
+        let (config, state, leader, _) = exec_siblings();
+        prepare_test_rpc(&state, &config, leader, leader).await;
+        prepare_test_rpc(&state, &config, leader, leader).await;
+    }
+
+    #[tokio::test]
+    async fn exec_admission_rejects_unregistered_sender_process_and_mm_before_allocation() {
+        let (_, state, leader, sibling) = exec_siblings();
+        let mm = MmId::initial(leader);
+        let wrong_mm = mm.for_exec(leader);
+        for (sender, process, envelope, asserted) in [
+            (DetTid::from_raw(99), leader, mm, mm),
+            (sibling, sibling, mm, mm),
+            (leader, leader, wrong_mm, mm),
+            (leader, leader, wrong_mm, wrong_mm),
+        ] {
+            assert_eq!(
+                state
+                    .recv_prepare_exec(
+                        sender,
+                        process,
+                        envelope,
+                        asserted,
+                        FilesId::initial(sender),
+                        Default::default()
+                    )
+                    .await,
+                GlobalResponse::ThreadExited
+            );
+            assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        }
+        let expected = ExecFilesReceipt {
+            caller: leader,
+            process: leader,
+            mm,
+            old_files: FilesId::initial(leader),
+            new_files: FilesIdAllocator::default().allocate_exec(leader),
+        };
+        assert_eq!(
+            state
+                .recv_prepare_exec(
+                    leader,
+                    leader,
+                    mm,
+                    mm,
+                    expected.old_files,
+                    Default::default()
+                )
+                .await,
+            GlobalResponse::PrepareExec(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_exec_waits_without_locks_and_stale_cancel_cannot_release_retry() {
+        let (config, state, leader, sibling) = exec_siblings();
+        let first = prepare_test_rpc(&state, &config, leader, leader).await;
+        let waiting = prepare_test_rpc(&state, &config, sibling, leader);
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert!(state.sched.try_lock().is_ok());
+        assert!(state.pending_exec_states.try_lock().is_ok());
+        // A notification without any state transition must not admit a sibling.
+        state.exec_preparation_changed.notify_waiters();
+        assert!(futures::poll!(&mut waiting).is_pending());
+        cancel_test_rpc(&state, &config, first).await;
+        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("cancellation must wake the registered sibling");
+        assert_ne!(first.new_files, second.new_files);
+        assert_eq!(
+            state.pending_exec_states.lock().unwrap()[&leader].receipt,
+            second
+        );
+        cancel_test_rpc(&state, &config, first).await;
+        assert_eq!(
+            state.pending_exec_states.lock().unwrap()[&leader].receipt,
+            second
+        );
+        cancel_test_rpc(&state, &config, second).await;
+        let third = prepare_test_rpc(&state, &config, leader, leader).await;
+        let mut expected = FilesIdAllocator::default();
+        assert_eq!(first.new_files, expected.allocate_exec(leader));
+        assert_eq!(second.new_files, expected.allocate_exec(sibling));
+        assert_eq!(third.new_files, expected.allocate_exec(leader));
+    }
+
+    #[tokio::test]
+    async fn canceled_exec_override_update_cannot_mutate_the_new_attempt() {
+        let (config, state, leader, _) = exec_siblings();
+        let first = prepare_test_rpc(&state, &config, leader, leader).await;
+        cancel_test_rpc(&state, &config, first).await;
+        let second = prepare_test_rpc(&state, &config, leader, leader).await;
+        for (receipt, overrides, accepted) in [
+            (second, BTreeSet::from([7]), true),
+            (first, BTreeSet::from([99]), false),
+        ] {
+            assert_eq!(
+                state
+                    .receive_rpc(
+                        Tid::from_raw(leader.as_raw()),
+                        (
+                            DetTime::new(&config),
+                            receipt.mm,
+                            GlobalRequest::UpdateExecFdBlocking(receipt, overrides),
+                        )
+                    )
+                    .await,
+                (None, GlobalResponse::UpdateExecFdBlocking(accepted))
+            );
+        }
+        let pending = state.pending_exec_states.lock().unwrap();
+        assert_eq!(pending[&leader].receipt, second);
+        assert_eq!(pending[&leader].fd_blocking, BTreeSet::from([7]));
+    }
+
+    #[tokio::test]
+    async fn successful_exec_wakes_and_revalidates_waiting_sibling() {
+        let (config, state, leader, sibling) = exec_siblings();
+        let receipt = prepare_test_rpc(&state, &config, leader, leader).await;
+        let waiting = state.recv_prepare_exec(
+            sibling,
+            leader,
+            receipt.mm,
+            receipt.mm,
+            FilesId::initial(sibling),
+            Default::default(),
+        );
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let completed = state
+            .receive_rpc(
+                Tid::from_raw(leader.as_raw()),
+                (
+                    DetTime::new(&config),
+                    receipt.mm.for_exec(leader),
+                    GlobalRequest::MarkPastFirstExecve(None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            completed,
+            (
+                None,
+                GlobalResponse::MarkPastFirstExecve(Default::default(), Some(receipt))
+            )
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap(),
+            GlobalResponse::ThreadExited
+        );
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert_eq!(
+            state.registered_exec_mms.lock().unwrap().get(&leader),
+            Some(&receipt.mm.for_exec(leader))
+        );
+        assert!(
+            !state
+                .registered_exec_mms
+                .lock()
+                .unwrap()
+                .contains_key(&sibling)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_deregistration_after_retained_exec_keeps_current_table_receipt() {
+        let (config, state, leader, _) = exec_siblings();
+        let first = prepare_test_rpc(&state, &config, leader, leader).await;
+        let current_mm = first.mm.for_exec(leader);
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(leader.as_raw()),
+                (
+                    DetTime::new(&config),
+                    current_mm,
+                    GlobalRequest::MarkPastFirstExecve(None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            response,
+            GlobalResponse::MarkPastFirstExecve(Default::default(), Some(first))
+        );
+        let response = state
+            .recv_prepare_exec(
+                leader,
+                leader,
+                current_mm,
+                current_mm,
+                first.new_files,
+                Default::default(),
+            )
+            .await;
+        let GlobalResponse::PrepareExec(second) = response else {
+            panic!("{response:?}")
+        };
+        let stale_time = state.global_time.lock().unwrap().as_nanos();
+        let mut advanced_stale_clock = DetTime::new(&config);
+        advanced_stale_clock.advance_to(stale_time + LogicalTime::from_nanos(99));
+        assert_eq!(
+            state
+                .receive_rpc(
+                    Tid::from_raw(leader.as_raw()),
+                    (
+                        advanced_stale_clock,
+                        first.mm,
+                        GlobalRequest::ReportUnsupportedSyscall("stale-image-effect".into()),
+                    )
+                )
+                .await,
+            (None, GlobalResponse::ThreadExited)
+        );
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), stale_time);
+        assert!(
+            !state
+                .unsupported_syscalls
+                .lock()
+                .unwrap()
+                .contains("stale-image-effect")
+        );
+        state
+            .recv_deregister_thread(
+                Tid::from_raw(leader.as_raw()),
+                ThreadDeregistration {
+                    dettid: leader,
+                    detpid: leader,
+                    mm: first.mm,
+                    thread_start_entered: true,
+                    timeslice_stats: TimesliceStats::default(),
+                    syscall_count: 0,
+                    chaos_epochs: Vec::new(),
+                },
+            )
+            .await;
+        assert_eq!(
+            state.registered_exec_mms.lock().unwrap().get(&leader),
+            Some(&current_mm)
+        );
+        assert_eq!(
+            state.pending_exec_states.lock().unwrap()[&leader].receipt,
+            second
+        );
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_is_logically_killed(leader)
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_owner_exit_and_backend_failure_release_registered_waiters() {
+        for backend_failure in [false, true] {
+            let (config, state, leader, sibling) = exec_siblings();
+            let receipt = prepare_test_rpc(&state, &config, sibling, leader).await;
+            let waiting = state.recv_prepare_exec(
+                leader,
+                leader,
+                receipt.mm,
+                receipt.mm,
+                FilesId::initial(leader),
+                Default::default(),
+            );
+            tokio::pin!(waiting);
+            assert!(futures::poll!(&mut waiting).is_pending());
+            if backend_failure {
+                state.report_backend_failure(reverie::BackendFailure {
+                    pid: Tid::from_raw(leader.as_raw()),
+                    tid: Tid::from_raw(sibling.as_raw()),
+                    phase: "exec contention test",
+                });
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), waiting)
+                        .await
+                        .unwrap(),
+                    GlobalResponse::ThreadExited
+                );
+            } else {
+                state
+                    .recv_deregister_thread(
+                        Tid::from_raw(sibling.as_raw()),
+                        ThreadDeregistration {
+                            dettid: sibling,
+                            detpid: leader,
+                            mm: receipt.mm,
+                            thread_start_entered: true,
+                            timeslice_stats: TimesliceStats::default(),
+                            syscall_count: 0,
+                            chaos_epochs: Vec::new(),
+                        },
+                    )
+                    .await;
+                let response = tokio::time::timeout(Duration::from_secs(1), waiting)
+                    .await
+                    .unwrap();
+                let GlobalResponse::PrepareExec(next) = response else {
+                    panic!("live sibling must remain eligible: {response:?}")
+                };
+                assert_eq!(next.caller, leader);
+                assert_ne!(next.new_files, receipt.new_files);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn exec_reconnect_retains_inherited_work_accounting_across_local_reload() {
         let (config, state, leader, detpid) = cancellation_test_state();
@@ -5234,26 +9692,43 @@ mod tests {
         }
         let total = state.global_time.lock().unwrap().as_nanos();
         assert_eq!(total, epoch + LogicalTime::from_nanos(1_350));
+        let mut expected_allocator = FilesIdAllocator::default();
+        let first_files = ExecFilesReceipt {
+            caller: worker,
+            process: detpid,
+            mm: old_mm,
+            old_files: FilesId::initial(worker),
+            new_files: expected_allocator.allocate_exec(worker),
+        };
         // A failed exec cancels its pending transfer without changing either
         // inherited component. The next successful attempt must use the same
         // clocks, not charge either component's inherited work again.
-        let _ = state
+        let first_prepared = state
             .receive_rpc(
                 Tid::from_raw(worker.as_raw()),
                 (
                     worker_clock.clone(),
                     old_mm,
-                    GlobalRequest::PrepareExec(detpid, old_mm, Default::default()),
+                    GlobalRequest::PrepareExec(
+                        detpid,
+                        old_mm,
+                        FilesId::initial(worker),
+                        Default::default(),
+                    ),
                 ),
             )
             .await;
+        assert_eq!(
+            first_prepared,
+            (None, GlobalResponse::PrepareExec(first_files))
+        );
         let cancelled = state
             .receive_rpc(
                 Tid::from_raw(worker.as_raw()),
                 (
                     worker_clock.clone(),
                     old_mm,
-                    GlobalRequest::CancelExec(detpid),
+                    GlobalRequest::CancelExec(first_files),
                 ),
             )
             .await;
@@ -5271,11 +9746,23 @@ mod tests {
                 (
                     worker_clock.clone(),
                     old_mm,
-                    GlobalRequest::PrepareExec(detpid, old_mm, Default::default()),
+                    GlobalRequest::PrepareExec(
+                        detpid,
+                        old_mm,
+                        FilesId::initial(worker),
+                        Default::default(),
+                    ),
                 ),
             )
             .await;
-        assert_eq!(prepared, (None, GlobalResponse::PrepareExec(())));
+        let expected_files = ExecFilesReceipt {
+            new_files: expected_allocator.allocate_exec(worker),
+            ..first_files
+        };
+        assert_eq!(
+            prepared,
+            (None, GlobalResponse::PrepareExec(expected_files))
+        );
 
         let mut fresh = DetTime::new(&config);
         let recreated = state
@@ -5300,7 +9787,7 @@ mod tests {
             recreated,
             (
                 Some(worker_clock.as_nanos()),
-                GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+                GlobalResponse::CreateChildThread(Some((old_mm.for_exec(detpid), expected_files)))
             )
         );
         // A delayed request from the destroyed image must be rejected before
@@ -5437,9 +9924,17 @@ mod tests {
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
-                caller: dettid,
-                process: detpid,
-                mm: old_mm,
+                receipt: ExecFilesReceipt {
+                    caller: dettid,
+                    process: detpid,
+                    mm: old_mm,
+                    old_files: FilesId::initial(dettid),
+                    new_files: state
+                        .exec_files_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_exec(dettid),
+                },
                 fd_blocking: Default::default(),
             },
         );
@@ -5463,6 +9958,7 @@ mod tests {
             GlobalResponse::ReportUnsupportedSyscall(())
         );
 
+        let expected_files = state.pending_exec_states.lock().unwrap()[&detpid].receipt;
         let create_response = state
             .receive_rpc(
                 reverie::Tid::from_raw(dettid.as_raw()),
@@ -5485,7 +9981,7 @@ mod tests {
             create_response,
             (
                 Some(thread_before),
-                GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+                GlobalResponse::CreateChildThread(Some((old_mm.for_exec(detpid), expected_files)))
             )
         );
         assert_eq!(
@@ -5569,14 +10065,23 @@ mod tests {
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
-                caller: worker,
-                process: detpid,
-                mm: old_mm,
+                receipt: ExecFilesReceipt {
+                    caller: worker,
+                    process: detpid,
+                    mm: old_mm,
+                    old_files: FilesId::initial(worker),
+                    new_files: state
+                        .exec_files_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_exec(worker),
+                },
                 fd_blocking: fd_blocking.clone(),
             },
         );
         let fresh_local_time = DetTime::new(&config);
 
+        let expected_files = state.pending_exec_states.lock().unwrap()[&detpid].receipt;
         let create_response = state
             .receive_rpc(
                 reverie::Tid::from_raw(leader.as_raw()),
@@ -5599,7 +10104,7 @@ mod tests {
             create_response,
             (
                 Some(worker_clock.as_nanos()),
-                GlobalResponse::CreateChildThread(Some(old_mm.for_exec(detpid)))
+                GlobalResponse::CreateChildThread(Some((old_mm.for_exec(detpid), expected_files)))
             )
         );
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
@@ -5758,7 +10263,7 @@ mod tests {
             .await;
         assert_eq!(
             mark_response.1,
-            GlobalResponse::MarkPastFirstExecve(fd_blocking)
+            GlobalResponse::MarkPastFirstExecve(fd_blocking, Some(expected_files))
         );
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
     }
@@ -5783,11 +10288,23 @@ mod tests {
                 (
                     clock.clone(),
                     MmId::initial(leader),
-                    GlobalRequest::PrepareExec(detpid, MmId::initial(detpid), Default::default()),
+                    GlobalRequest::PrepareExec(
+                        detpid,
+                        MmId::initial(detpid),
+                        FilesId::initial(leader),
+                        Default::default(),
+                    ),
                 ),
             )
             .await;
-        assert_eq!(prepared.1, GlobalResponse::PrepareExec(()));
+        let expected_files = ExecFilesReceipt {
+            caller: leader,
+            process: detpid,
+            mm: MmId::initial(detpid),
+            old_files: FilesId::initial(leader),
+            new_files: FilesIdAllocator::default().allocate_exec(leader),
+        };
+        assert_eq!(prepared.1, GlobalResponse::PrepareExec(expected_files));
         assert!(
             state
                 .pending_exec_states
@@ -5802,7 +10319,7 @@ mod tests {
                 (
                     clock,
                     MmId::initial(leader),
-                    GlobalRequest::CancelExec(detpid),
+                    GlobalRequest::CancelExec(expected_files),
                 ),
             )
             .await;
@@ -5818,9 +10335,17 @@ mod tests {
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
-                caller: leader,
-                process: detpid,
-                mm: MmId::initial(detpid),
+                receipt: ExecFilesReceipt {
+                    caller: leader,
+                    process: detpid,
+                    mm: MmId::initial(detpid),
+                    old_files: FilesId::initial(leader),
+                    new_files: state
+                        .exec_files_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_exec(leader),
+                },
                 fd_blocking: Default::default(),
             },
         );
@@ -5849,9 +10374,17 @@ mod tests {
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
-                caller: leader,
-                process: detpid,
-                mm: MmId::initial(detpid),
+                receipt: ExecFilesReceipt {
+                    caller: leader,
+                    process: detpid,
+                    mm: MmId::initial(detpid),
+                    old_files: FilesId::initial(leader),
+                    new_files: state
+                        .exec_files_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_exec(leader),
+                },
                 fd_blocking: Default::default(),
             },
         );
@@ -5874,9 +10407,17 @@ mod tests {
         state.pending_exec_states.lock().unwrap().insert(
             detpid,
             PendingExecState {
-                caller: leader,
-                process: detpid,
-                mm: MmId::initial(detpid),
+                receipt: ExecFilesReceipt {
+                    caller: leader,
+                    process: detpid,
+                    mm: MmId::initial(detpid),
+                    old_files: FilesId::initial(leader),
+                    new_files: state
+                        .exec_files_allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_exec(leader),
+                },
                 fd_blocking: Default::default(),
             },
         );
@@ -6563,7 +11104,7 @@ mod tests {
         assert!(
             tokio::time::timeout(Duration::from_millis(100), cleanup)
                 .await
-                .is_ok(),
+                .is_ok_and(|result| result.is_ok()),
             "cleanup waited for a scheduler whose guest never registered"
         );
     }
@@ -6602,7 +11143,7 @@ mod tests {
                 state.clean_up(false, &summary_path),
             )
             .await
-            .is_ok(),
+            .is_ok_and(|result| result.is_ok()),
             "cleanup waited after cancelling a registered scheduler"
         );
     }
@@ -6632,6 +11173,735 @@ mod tests {
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+    async fn accepted_capture_rpc_fixture() -> (
+        Config,
+        GlobalState,
+        NetworkStreamOwner,
+        crate::network_replay::NetworkAcceptLeaseId,
+    ) {
+        use detcore_model::network_trace::*;
+
+        use crate::network_replay::accepted::AcceptedBackendCapability;
+        let (config, mut state) = shadow_rpc_state();
+        let thread = DetTid::from_raw(491);
+        let owner = NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(thread, thread, true);
+        let ofd = OpenFileId::new_socket(thread, 0);
+        *state.network_engine.as_ref().unwrap().lock().unwrap() =
+            NetworkReplayEngine::record_shadow_accepted(
+                config.epoch,
+                AcceptedBackendCapability::controlled_fixture(),
+            );
+        let key = StreamSocketKeyV3 {
+            transport: NetworkTransportV2::Tcp,
+            domain: libc::AF_INET,
+            socket_type: libc::SOCK_STREAM,
+            protocol: libc::IPPROTO_TCP,
+        };
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::RegisterAcceptedFreshSend {
+                    key,
+                    observed: Some(ReceiveTimeoutV3::Infinite)
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        shadow_rpc_register(&state, &config, owner, ofd).await;
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::EnsureChannel {
+                    open_file: ofd,
+                    binding: NetworkChannelBinding {
+                        transport: NetworkTransportV2::Tcp,
+                        role: NetworkEndpointRoleV2::Listener,
+                        peer_address: None,
+                        requested_local_constraint: None,
+                        observed_local_address: None,
+                        accepted_from: None,
+                        selected_channel: None,
+                    }
+                }
+            )
+            .await,
+            Ok(NetworkReply::Channel(Some(_)))
+        ));
+        let control = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginSocketControl { open_file: ofd },
+            )
+            .await,
+        );
+        let Ok(NetworkReply::StreamCall(call)) = stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::BeginStreamCall {
+                control_lease: control,
+            },
+        )
+        .await
+        else {
+            panic!("missing listener call")
+        };
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::ConfirmStreamCallPin {
+                    id: call.id,
+                    outcome: crate::network_replay::NetworkStreamPinOutcome::Acquired
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FinishSocketControl {
+                    lease: control,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        let Ok(NetworkReply::AcceptedChild(Some(reservation))) = stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::BeginAcceptedSocket { call: call.id },
+        )
+        .await
+        else {
+            panic!("missing accept receipt")
+        };
+        assert!(reservation.child.is_none());
+        assert_eq!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::SubmitAcceptedSocket {
+                    lease: reservation.lease
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        );
+        // Model state uses the actual admission RPCs. Only physical capture is
+        // replaced: this resource has no task fd, so any attempted acquisition
+        // fails before a host syscall rather than contacting an arbitrary task.
+        state.network_runtime = Some(
+            crate::network_runtime::NetworkRuntimeResources::accepted_custody_fixture(
+                owner,
+                reservation.lease,
+                call.id,
+            ),
+        );
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(thread, owner.mm);
+        (config, state, owner, reservation.lease)
+    }
+
+    #[tokio::test]
+    async fn accepted_late_capture_rpc_retains_original_return_after_owner_exit_or_terminal_transition()
+     {
+        for cause in ["owner gone", "killed", "new mm", "backend failure"] {
+            let (config, state, owner, lease) = accepted_capture_rpc_fixture().await;
+            match cause {
+                "owner gone" => assert_eq!(
+                    state
+                        .receive_rpc(
+                            Tid::from_raw(owner.thread.as_raw()),
+                            (
+                                DetTime::new(&config),
+                                owner.mm,
+                                GlobalRequest::NetworkOwnerGone
+                            )
+                        )
+                        .await,
+                    (None, GlobalResponse::NetworkOwnerGone)
+                ),
+                "killed" => state.sched.lock().unwrap().logically_kill_thread(
+                    &owner.thread,
+                    &owner.thread,
+                    owner.mm,
+                ),
+                "new mm" => {
+                    state
+                        .registered_exec_mms
+                        .lock()
+                        .unwrap()
+                        .insert(owner.thread, owner.mm.for_exec(owner.thread));
+                }
+                "backend failure" => state.report_backend_failure(reverie::BackendFailure {
+                    pid: Tid::from_raw(owner.thread.as_raw()),
+                    tid: Tid::from_raw(owner.thread.as_raw()),
+                    phase: "accepted late return control",
+                }),
+                _ => unreachable!(),
+            }
+            let mut capture = Box::pin(state.receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::Network(NetworkRequest::CaptureAcceptedReturn {
+                        lease,
+                        kernel_result: Ok(9),
+                    }),
+                ),
+            ));
+            let result = futures::poll!(capture.as_mut());
+            assert!(
+                matches!(result, Poll::Ready(_)),
+                "late capture suspended: {cause}"
+            );
+            assert_eq!(
+                state
+                    .network_runtime
+                    .as_ref()
+                    .unwrap()
+                    .accepted_recovery_result(owner, lease)
+                    .unwrap(),
+                Some(Ok(9)),
+                "lost exact late result: {cause}"
+            );
+            assert!(
+                state
+                    .network_engine
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .finish()
+                    .is_err(),
+                "terminal receipt fabricated completion: {cause}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_late_capture_rpc_rejects_wrong_lease_owner_without_erasing_rightful_result() {
+        let (config, state, owner, lease) = accepted_capture_rpc_fixture().await;
+        let wrong = NetworkStreamOwner {
+            mm: owner.mm.for_exec(owner.thread),
+            ..owner
+        };
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    wrong.mm,
+                    GlobalRequest::Network(NetworkRequest::CaptureAcceptedReturn {
+                        lease,
+                        kernel_result: Ok(6),
+                    }),
+                ),
+            )
+            .await;
+        assert!(matches!(
+            response,
+            (None, GlobalResponse::ThreadExited) | (None, GlobalResponse::Network(Err(_)))
+        ));
+        assert_eq!(
+            state
+                .network_runtime
+                .as_ref()
+                .unwrap()
+                .accepted_recovery_result(owner, lease)
+                .unwrap(),
+            None
+        );
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::Network(NetworkRequest::CaptureAcceptedReturn {
+                        lease,
+                        kernel_result: Err(libc::EFAULT),
+                    }),
+                ),
+            )
+            .await;
+        assert!(matches!(
+            response,
+            (None, GlobalResponse::Network(Ok(NetworkReply::Unit)))
+        ));
+        assert_eq!(
+            state
+                .network_runtime
+                .as_ref()
+                .unwrap()
+                .accepted_recovery_result(owner, lease)
+                .unwrap(),
+            Some(Err(libc::EFAULT))
+        );
+        assert!(
+            state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .finish()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_listener_rpc_requires_current_owner_before_any_physical_capture() {
+        let (config, state, owner, lease) = accepted_capture_rpc_fixture().await;
+        let call = state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .accepted_capture_call(owner, lease)
+            .unwrap();
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(owner.thread, owner.mm.for_exec(owner.thread));
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::Network(NetworkRequest::EnrollAcceptedListener { call, fd: 4 }),
+                ),
+            )
+            .await;
+        assert!(matches!(response.1, GlobalResponse::ThreadExited));
+        let engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+        let ofd = engine.stream_call_open_file(owner, call).unwrap();
+        assert!(!engine.accepted_listener_enrolled(ofd));
+    }
+
+    #[tokio::test]
+    async fn accepted_listener_rpc_missing_physical_task_never_publishes_enrollment() {
+        let (config, state, owner, lease) = accepted_capture_rpc_fixture().await;
+        let call = state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .accepted_capture_call(owner, lease)
+            .unwrap();
+        // The actual runtime fixture has no task pidfd. The shared capture path
+        // must stop at its authority lookup, before pidfd_getfd or transport IO.
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::Network(NetworkRequest::EnrollAcceptedListener { call, fd: 4 }),
+                ),
+            )
+            .await;
+        assert!(matches!(response.1, GlobalResponse::Network(Err(_))));
+        let engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+        let ofd = engine.stream_call_open_file(owner, call).unwrap();
+        assert!(!engine.accepted_listener_enrolled(ofd));
+    }
+
+    #[tokio::test]
+    async fn accepted_rpc_enrolls_exact_child_and_initializes_explicit_replay_variant() {
+        use detcore_model::network_trace::NetworkTransportV2;
+        use detcore_model::network_trace::ReceiveTimeoutV3;
+        use detcore_model::network_trace::StreamSocketKeyV3;
+
+        use crate::network_replay::NetworkStreamPinOutcome;
+        use crate::network_replay::accepted::AcceptedBackendCapability;
+        use crate::network_replay::accepted::AcceptedInstallationFact;
+        use crate::network_replay::accepted::AcceptedPhysicalIdentity;
+        use crate::network_replay::accepted::ChildCreationCertificate;
+        let (mut config, state) = shadow_rpc_state();
+        let thread = DetTid::from_raw(391);
+        let owner = NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        let listener = OpenFileId::new_socket(thread, 0);
+        assert!(matches!(
+            stream_rpc(&state, &config, owner, NetworkRequest::AcceptedMode).await,
+            Ok(NetworkReply::AcceptedMode(false))
+        ));
+        let cap = AcceptedBackendCapability::controlled_fixture();
+        *state.network_engine.as_ref().unwrap().lock().unwrap() =
+            NetworkReplayEngine::record_shadow_accepted(
+                config.epoch,
+                AcceptedBackendCapability::controlled_fixture(),
+            );
+        let key = StreamSocketKeyV3 {
+            transport: NetworkTransportV2::Tcp,
+            domain: libc::AF_INET,
+            socket_type: libc::SOCK_STREAM,
+            protocol: libc::IPPROTO_TCP,
+        };
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::RegisterAcceptedFreshSend {
+                    key,
+                    observed: Some(ReceiveTimeoutV3::Infinite)
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        shadow_rpc_register(&state, &config, owner, listener).await;
+        let local = NetworkAddressV2::Inet4 {
+            address: [127, 0, 0, 1],
+            port: 12345,
+        };
+        let peer = NetworkAddressV2::Inet4 {
+            address: [127, 0, 0, 1],
+            port: 54321,
+        };
+        let binding = NetworkChannelBinding {
+            transport: NetworkTransportV2::Tcp,
+            role: detcore_model::network_trace::NetworkEndpointRoleV2::Listener,
+            peer_address: None,
+            requested_local_constraint: None,
+            observed_local_address: Some(local.clone()),
+            accepted_from: None,
+            selected_channel: None,
+        };
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::EnsureChannel {
+                    open_file: listener,
+                    binding
+                }
+            )
+            .await,
+            Ok(NetworkReply::Channel(Some(_)))
+        ));
+        for option in [
+            NetworkStreamSocketOption::ReceiveLowWater(3),
+            NetworkStreamSocketOption::SendTimeout {
+                seconds: 2,
+                microseconds: 0,
+            },
+        ] {
+            let lease = socket_control_receipt(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::BeginSocketControl {
+                        open_file: listener,
+                    },
+                )
+                .await,
+            );
+            assert!(matches!(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::SubmitStreamPhysical {
+                        lease,
+                        effect: NetworkStreamPhysicalEffect::SetSocketOption { option }
+                    }
+                )
+                .await,
+                Ok(NetworkReply::Unit)
+            ));
+            assert!(matches!(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::ConfirmStreamPhysical {
+                        lease,
+                        result: NetworkStreamPhysicalResult::SocketOption { result: Ok(()) }
+                    }
+                )
+                .await,
+                Ok(NetworkReply::Unit)
+            ));
+            assert!(matches!(
+                stream_rpc(
+                    &state,
+                    &config,
+                    owner,
+                    NetworkRequest::FinishSocketControl {
+                        lease,
+                        disposition: NetworkSocketControlFinish::Unchanged
+                    }
+                )
+                .await,
+                Ok(NetworkReply::Unit)
+            ));
+        }
+        let physical = AcceptedPhysicalIdentity {
+            provider: 1,
+            object: 2,
+            namespace: 3,
+        };
+        let child = {
+            let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+            engine
+                .enroll_accepted_listener(
+                    listener,
+                    AcceptedPhysicalIdentity {
+                        object: 1,
+                        ..physical
+                    },
+                    &cap,
+                )
+                .unwrap();
+            let inherited = engine.stream_socket_state(listener).unwrap().unwrap();
+            engine
+                .observe_child_creation(
+                    listener,
+                    ChildCreationCertificate {
+                        sequence: 1,
+                        listener: AcceptedPhysicalIdentity {
+                            object: 1,
+                            ..physical
+                        },
+                        child: physical,
+                        listener_generation: inherited.option_generation,
+                        inherited,
+                        local: local.clone(),
+                        peer: peer.clone(),
+                    },
+                    state.global_time.lock().unwrap().as_nanos(),
+                    &cap,
+                )
+                .unwrap()
+        };
+        let control = socket_control_receipt(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginSocketControl {
+                    open_file: listener,
+                },
+            )
+            .await,
+        );
+        let call = match stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::BeginStreamCall {
+                control_lease: control,
+            },
+        )
+        .await
+        {
+            Ok(NetworkReply::StreamCall(call)) => call,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::ConfirmStreamCallPin {
+                    id: call.id,
+                    outcome: NetworkStreamPinOutcome::Acquired
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FinishSocketControl {
+                    lease: control,
+                    disposition: NetworkSocketControlFinish::Unchanged
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        let receipt = match stream_rpc(
+            &state,
+            &config,
+            owner,
+            NetworkRequest::BeginAcceptedSocket { call: call.id },
+        )
+        .await
+        {
+            Ok(NetworkReply::AcceptedChild(Some(receipt))) => receipt,
+            other => panic!("{other:?}"),
+        };
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::SubmitAcceptedSocket {
+                    lease: receipt.lease
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        let installed = OpenFileId::new_socket(thread, 1);
+        // The controlled fixture seeds the service's matched fact. No production
+        // installation authority is inferred from this test or an RPC payload.
+        state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .confirm_accepted_installation(
+                owner,
+                receipt.lease,
+                AcceptedInstallationFact::Installed {
+                    child,
+                    fd: 17,
+                    open_file: installed,
+                    slot_generation: 1,
+                    physical,
+                },
+                &cap,
+            )
+            .unwrap();
+        assert!(
+            matches!(stream_rpc(&state,&config,owner,NetworkRequest::CompleteAcceptedSocket {lease:receipt.lease,kernel_result:Ok(17),installed_open_file:Some(installed)}).await,Ok(NetworkReply::AcceptedCompletion(Some(done))) if done.fd==17 && done.open_file==installed)
+        );
+        assert!(
+            matches!(stream_rpc(&state,&config,owner,NetworkRequest::StreamSocketState {open_file:installed}).await,Ok(NetworkReply::StreamSocketState(Some(socket))) if socket.options.receive_low_water==3 && socket.send_timeout==Some(ReceiveTimeoutV3::FiniteTicks(2000)))
+        );
+        assert!(
+            matches!(stream_rpc(&state,&config,owner,NetworkRequest::AcceptedEndpoint {open_file:installed,peer:true}).await,Ok(NetworkReply::AcceptedEndpoint(Some(address))) if address==peer)
+        );
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::BeginStreamCallRelease { id: call.id }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        assert!(matches!(
+            stream_rpc(
+                &state,
+                &config,
+                owner,
+                NetworkRequest::FinishStreamCallRelease { id: call.id }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        let engine = std::mem::replace(
+            &mut *state.network_engine.as_ref().unwrap().lock().unwrap(),
+            NetworkReplayEngine::record(config.epoch),
+        );
+        let trace = engine.into_recorded_versioned_trace().unwrap();
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        config.network_trace.policy = NetworkPolicy::Replay;
+        config.network_trace_input = Some(bytes);
+        let replay = GlobalState::initialize(&config, false);
+        assert!(matches!(
+            stream_rpc(&replay, &config, owner, NetworkRequest::AcceptedMode).await,
+            Ok(NetworkReply::AcceptedMode(true))
+        ));
+        assert!(matches!(
+            stream_rpc(
+                &replay,
+                &config,
+                owner,
+                NetworkRequest::RegisterAcceptedFreshSend {
+                    key,
+                    observed: None
+                }
+            )
+            .await,
+            Ok(NetworkReply::Unit)
+        ));
+        assert!(
+            matches!(stream_rpc(&replay,&config,owner,NetworkRequest::RegisterStreamSocket {open_file:listener,key,
+            namespace:NetworkStreamNamespace {device:4,inode:100},observed_profile:None}).await,Ok(NetworkReply::StreamSocketState(Some(socket))) if socket.send_timeout==Some(ReceiveTimeoutV3::Infinite))
+        );
+    }
+    #[tokio::test]
+    async fn accepted_rpc_rejects_stale_mm_before_mode_or_custody_mutation() {
+        let (config, state) = shadow_rpc_state();
+        let thread = DetTid::from_raw(392);
+        let old = MmId::initial(thread);
+        state
+            .registered_exec_mms
+            .lock()
+            .unwrap()
+            .insert(thread, old.for_exec(thread));
+        let before = format!(
+            "{:?}",
+            state.network_engine.as_ref().unwrap().lock().unwrap()
+        );
+        let (_, response) = state
+            .receive_rpc(
+                Tid::from_raw(thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    old,
+                    GlobalRequest::Network(NetworkRequest::AcceptedMode),
+                ),
+            )
+            .await;
+        assert!(matches!(response, GlobalResponse::ThreadExited));
+        assert_eq!(
+            format!(
+                "{:?}",
+                state.network_engine.as_ref().unwrap().lock().unwrap()
+            ),
+            before
+        );
     }
 }
 

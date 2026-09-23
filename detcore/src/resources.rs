@@ -24,6 +24,7 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::OpenFileId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
@@ -69,6 +70,33 @@ pub struct ExternalOpId {
     pub tid: DetTid,
     /// Per-thread syscall sequence number.
     pub sequence: u64,
+}
+
+/// Modeled network condition which can make a parked socket operation runnable.
+///
+/// The condition is deliberately keyed by open-file description rather than a
+/// raw descriptor or calling thread. Every dup/fork alias therefore observes
+/// the same availability, and a numeric fd reused for another socket cannot
+/// inherit an old wait.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub enum NetworkWaitKind {
+    /// Stream bytes, one datagram, EOF, an error, connect, or accept is ready.
+    Readable,
+    /// A transmit can make progress or return its recorded error.
+    Writable,
+    /// Any readiness transition is observable by poll/select/epoll.
+    Any,
+    /// Stream payload threshold, or pending EOF/error even after partial bytes.
+    ReadableAtLeast(usize),
+    /// Only full hangup or an error; neither writable nor ordinary data wakes.
+    Terminal,
+    /// Peer FIN or local SHUT_RD, with ordinary ERR/HUP wake semantics.
+    ReceiveHalfClosed,
+    /// V3 poll threshold; error/hangup do not fabricate a receive errno.
+    PollReadableAtLeast(usize),
+    /// V3 poll rechecks the OFD's current SO_RCVLOWAT at every wake decision.
+    /// Appended to preserve the existing serialized variant indices.
+    PollReadable,
 }
 
 impl ExternalOpId {
@@ -244,6 +272,23 @@ pub enum ResourceID {
     /// i.e. converted into a polling strategy.
     InternalIOPolling,
 
+    /// Wait for modeled network availability on one stable open-file description.
+    NetworkWait {
+        /// Socket open-file description shared by every descriptor alias.
+        open_file: OpenFileId,
+        /// Availability condition requested by the syscall adapter.
+        kind: NetworkWaitKind,
+    },
+
+    /// Wait until any modeled socket condition becomes ready or an exact
+    /// continuous-virtual-time deadline expires.
+    NetworkWaitSet {
+        /// Stable OFD interests. Raw descriptor reuse cannot retarget them.
+        interests: Vec<(OpenFileId, NetworkWaitKind)>,
+        /// Absolute timeout; `None` represents an indefinite wait.
+        deadline: Option<LogicalTime>,
+    },
+
     /// An internal event that is only used when implementing context switches under tracereplay.
     /// It should not bump global time.
     TraceReplay,
@@ -320,6 +365,21 @@ pub enum ResourceID {
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.
     BlockingRtSigsuspend(ExternalOpId),
+
+    /// A real network syscall whose external outcome is being captured. It
+    /// completes through `BlockedExternalContinue`, like `BlockingExternalIO`,
+    /// but an otherwise idle recorder must let real elapsed time reach timers
+    /// instead of jumping ahead of this outstanding external operation.
+    BlockingNetworkCapture(ExternalOpId),
+    /// Active-call identities survive numeric descriptor reuse and final close.
+    NetworkCallWaitSet {
+        /// Exact calls admitted for this task/MM, rechecked at every wake.
+        interests: Vec<(crate::network_replay::NetworkStreamCallId, NetworkWaitKind)>,
+        /// Exact logical deadline, without rounding or periodic virtual ticks.
+        deadline: Option<crate::types::LogicalTime>,
+        /// Transient receipt only for zero-capacity stream receives.
+        zero_wait: Option<crate::network_replay::NetworkZeroStreamWaitId>,
+    },
 }
 
 /// Permission to a device, which behaves like a predefined "inode".

@@ -60,6 +60,7 @@ use crate::tool_global::resource_request;
 use crate::tool_global::set_child_tid_address;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::update_exec_fd_blocking;
 use crate::tool_global::wait_for_child_lifecycle;
 use crate::tool_global::yield_once;
 use crate::tool_local::Detcore;
@@ -873,9 +874,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let backend_uninstrumented_thread =
             flags.contains(CloneFlags::CLONE_THREAD) && !self.cfg.backend_dispatches_thread_tools;
 
+        // Publication and table ownership are established before the physical
+        // clone, not when its returned TID is observed after a vfork child ran.
+        let fd_clone = self
+            .begin_network_fd_mutation(
+                guest,
+                crate::network_replay::NetworkFdMutationKind::Clone { flags },
+            )
+            .await?;
+
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
+        assert!(ts.pending_fd_clone.is_none());
+        ts.pending_fd_clone = fd_clone
+            .as_ref()
+            .map(|admission| admission.publication.permit);
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
@@ -922,6 +936,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
+        let observed_res = self
+            .observe_network_fd_result(guest, fd_clone.as_ref(), maybe_res)
+            .await;
 
         if parent_blocks_for_child && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
@@ -957,8 +974,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ts = guest.thread_state_mut();
         ts.clone_flags = None; // Unset, now that it has been read by the child.
         ts.pending_vfork = None;
+        ts.pending_fd_clone = None;
 
-        let res = maybe_res?;
+        let res = observed_res?;
 
         if !flags.contains(CloneFlags::CLONE_THREAD) {
             // Only a successful process clone can let another process mutate
@@ -1446,38 +1464,45 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Execveat,
     ) -> Result<i64, Error> {
-        let (old_metadata, old_memory_metadata, table_is_shared, dettid, detpid, old_mm_id) = {
+        let (old_metadata, old_memory_metadata, table_is_shared, detpid, old_mm_id) = {
             let thread_state = guest.thread_state();
             (
                 Arc::clone(&thread_state.file_metadata),
                 Arc::clone(&thread_state.memory_metadata),
                 Arc::strong_count(&thread_state.file_metadata) > 1,
-                thread_state.dettid,
                 thread_state.detpid.expect("detpid unset"),
                 thread_state.mm_id,
             )
         };
+        // Admission may wait for a sibling's failed attempt. Take no descriptor
+        // snapshot until the exact reservation is granted.
+        let files = prepare_exec(guest, old_mm_id, Default::default()).await;
+        let fd_admission = self
+            .begin_network_fd_mutation(
+                guest,
+                crate::network_replay::NetworkFdMutationKind::Exec { receipt: files },
+            )
+            .await?;
         let (new_metadata, closed_open_files, exec_fd_blocking) = {
             let metadata = old_metadata.lock().unwrap();
-            let new_metadata = metadata.for_exec(dettid);
-            (
-                new_metadata.clone(),
-                metadata.open_files_closed_on_exec(table_is_shared),
-                new_metadata.exec_blocking_overrides(),
-            )
-        };
-        let preserve_exec_fd_status = guest.thread_state().discover_live_file_metadata;
-
-        prepare_exec(
-            guest,
-            old_mm_id,
-            if preserve_exec_fd_status {
-                exec_fd_blocking
+            assert_eq!(metadata.files_id, files.old_files);
+            let candidate = metadata.for_exec(files.new_files);
+            let blocking = if guest.thread_state().discover_live_file_metadata {
+                candidate.exec_blocking_overrides()
             } else {
                 Default::default()
-            },
-        )
-        .await;
+            };
+            (
+                candidate,
+                if fd_admission.is_some() {
+                    Vec::new()
+                } else {
+                    metadata.open_files_closed_on_exec(table_is_shared)
+                },
+                blocking,
+            )
+        };
+        update_exec_fd_blocking(guest, files, exec_fd_blocking).await;
 
         let mut released_ports = Vec::new();
         for open_file_id in closed_open_files {
@@ -1509,13 +1534,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.restore_robust_list_after_failed_exec(old_robust_list_head);
         }
 
+        // Restore the exact old MM/table before reporting the kernel error.
+        // Successful exec never returns here; its backend lifecycle callback
+        // commits the same global receipt and only then retires closed aliases.
+        let observed = self
+            .observe_network_fd_result(guest, fd_admission.as_ref(), Err(errno))
+            .await;
         cancel_exec(guest).await;
         for (open_file_id, port) in released_ports {
             self.restore_port_for_open_file(guest, open_file_id, port)
                 .await;
         }
 
-        Err(errno.into())
+        observed
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

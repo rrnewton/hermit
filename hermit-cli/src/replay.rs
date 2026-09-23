@@ -6,13 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -37,13 +40,105 @@ use crate::event::ExecTarget;
 use crate::event::SyscallEvent;
 use crate::event_stream::EventReader;
 use crate::event_stream::EventStreamId;
+use crate::metadata::FullReplayPhase;
 use crate::metadata::Metadata;
+use crate::metadata::NETWORK_TRACE_NAME;
 use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
+use crate::metadata::validate_network_trace_replay;
 use crate::replayer::Replayer;
 
 type ReplayTool = detcore::Detcore<Replayer>;
 type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
+
+fn open_host_recording_directory(path: &Path) -> Result<OwnedFd, Error> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Error::msg("recording directory contains NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Failed to open the full-replay recording directory in the host namespace");
+    }
+    // SAFETY: open returned a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_recording_regular_file(directory: &OwnedFd, name: &str) -> Result<File, Error> {
+    let name = CString::new(name).expect("recording artifact name has no NUL");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("Failed to open full-replay artifact {name:?}"));
+    }
+    // SAFETY: openat returned a fresh owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.file_type().is_file() {
+        return Err(Error::msg("full-replay artifact is not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Host-opened, integrity-checked inputs for one full replay.
+///
+/// Construct this before entering any Hermit container. Metadata and network
+/// trace bytes are read through no-follow descriptors anchored at one pinned
+/// recording directory, so replay cannot reinterpret either pathname later.
+#[derive(Debug)]
+pub struct PreparedFullReplayTrace {
+    data: PathBuf,
+    _directory: OwnedFd,
+    metadata: Metadata,
+    network_trace_input: Vec<u8>,
+    controller_can_exit_on_network_refusal: bool,
+}
+
+impl PreparedFullReplayTrace {
+    /// Open and validate full-replay metadata and its network sidecar.
+    pub fn open(data: &Path) -> Result<Self, Error> {
+        let directory = open_host_recording_directory(data)?;
+        let metadata_file = open_recording_regular_file(&directory, METADATA_NAME)?;
+        let metadata: Metadata = serde_json::from_reader(metadata_file)
+            .context("Failed to parse full-replay metadata")?;
+
+        if !RECORD_VERSION.compatible_with(&metadata.version) {
+            return Err(Error::msg(format!(
+                "Version mismatch, recording version {:?}, replayer version {:?}",
+                metadata.version, RECORD_VERSION
+            )));
+        }
+        let network_file = open_recording_regular_file(&directory, NETWORK_TRACE_NAME)?;
+        let network_trace_input = validate_network_trace_replay(network_file, &metadata)?;
+        Ok(Self {
+            data: data.to_path_buf(),
+            _directory: directory,
+            metadata,
+            network_trace_input,
+            controller_can_exit_on_network_refusal: false,
+        })
+    }
+
+    /// Enable whole-controller termination on a typed replay refusal.
+    ///
+    /// Call only inside an already isolated, owned PID-container controller.
+    /// Full replay uses ptrace; ordinary library callers must retain the
+    /// default typed-error return instead of allowing their process to exit.
+    #[doc(hidden)]
+    pub fn with_owned_controller_shutdown(mut self) -> Self {
+        self.controller_can_exit_on_network_refusal = true;
+        self
+    }
+}
 
 /// Represents a replay that is currently running.
 pub struct Replay {
@@ -63,27 +158,19 @@ impl Replay {
     /// Spawns a new replay using the provided base directory where the replay
     /// data is stored.
     pub async fn spawn(
-        dir: &Path,
+        prepared_trace: PreparedFullReplayTrace,
         capture_output: bool,
         gdbserver: Option<u16>,
         mounts: &[Mount],
     ) -> Result<Self, Error> {
-        let metadata_path = dir.join(METADATA_NAME);
-
-        let metadata: Metadata = serde_json::from_reader(
-            fs::File::open(&metadata_path)
-                .with_context(|| format!("Failed to open {:?}", metadata_path))?,
-        )
-        .with_context(|| format!("Failed to parse {:?}", metadata_path))?;
-
-        let recording_version = &metadata.version;
-        let replayer_version = &RECORD_VERSION;
-        if !replayer_version.compatible_with(recording_version) {
-            return Err(anyhow::anyhow!(format!(
-                "Version mismatch, recording version {:?}, replayer version {:?}",
-                recording_version, replayer_version
-            )));
-        }
+        let PreparedFullReplayTrace {
+            data,
+            _directory,
+            metadata,
+            network_trace_input,
+            controller_can_exit_on_network_refusal,
+        } = prepared_trace;
+        let dir = data.as_path();
 
         let mut command = metadata.command();
 
@@ -93,7 +180,9 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let mut config = record_or_replay_config(dir);
+        let mut config = record_or_replay_config(dir, FullReplayPhase::Replay, metadata.epoch);
+        config.network_trace_input = Some(network_trace_input);
+        config.controller_can_exit_on_network_refusal = controller_can_exit_on_network_refusal;
         // Recorder events contain the raw bytes from the recording namespace.
         // Reapply Detcore's sanitizer with the recording-time mount IDs, not
         // the unrelated IDs of this fresh replay namespace.
@@ -172,16 +261,18 @@ impl Replay {
     /// Waits for the replay to finish and returns its exit status.
     pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
         let (exit_status, global_state) = self.tracer.wait().await?;
-        self.chroot.remove()?;
-        global_state.clean_up(false, &None).await;
+        let remove = self.chroot.remove().map_err(Error::from);
+        let cleanup = global_state.clean_up(false, &None).await;
+        crate::error::finish_run_with_cleanup(remove, cleanup).map_err(reverie::Error::Tool)?;
         Ok(exit_status)
     }
 
     /// Waits for the replay to finish and collects its output.
     pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
         let (output, global_state) = self.tracer.wait_with_output().await?;
-        self.chroot.remove()?;
-        global_state.clean_up(false, &None).await;
+        let remove = self.chroot.remove().map_err(Error::from);
+        let cleanup = global_state.clean_up(false, &None).await;
+        crate::error::finish_run_with_cleanup(remove, cleanup).map_err(reverie::Error::Tool)?;
         Ok(output)
     }
 }
@@ -538,6 +629,89 @@ fn stage_recorded_exec_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_replay_defaults_to_returning_errors_until_controller_opt_in() {
+        use detcore_model::network_trace::NETWORK_TRACE_VERSION_V2;
+        use detcore_model::network_trace::NetworkTraceV2;
+
+        use crate::metadata::NetworkTraceArtifact;
+
+        let directory = tempfile::tempdir().unwrap();
+        let epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+        let trace = NetworkTraceV2 {
+            epoch,
+            channels: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        fs::write(directory.path().join(NETWORK_TRACE_NAME), &bytes).unwrap();
+        let mut metadata =
+            Metadata::new(&reverie::process::Command::new("/bin/true"), epoch).unwrap();
+        metadata.network_trace = Some(NetworkTraceArtifact {
+            codec_version: NETWORK_TRACE_VERSION_V2,
+            length: u64::try_from(bytes.len()).unwrap(),
+            digest: detcore::Digest::new(&bytes),
+        });
+        serde_json::to_writer(
+            fs::File::create(directory.path().join(METADATA_NAME)).unwrap(),
+            &metadata,
+        )
+        .unwrap();
+
+        let prepared = PreparedFullReplayTrace::open(directory.path()).unwrap();
+        assert!(!prepared.controller_can_exit_on_network_refusal);
+        let prepared = prepared.with_owned_controller_shutdown();
+        assert!(prepared.controller_can_exit_on_network_refusal);
+        assert_eq!(prepared.network_trace_input, bytes);
+        assert_eq!(prepared.data, directory.path());
+        assert_eq!(prepared.metadata.epoch, epoch);
+        assert_eq!(prepared.metadata.network_trace, metadata.network_trace);
+        let fresh = PreparedFullReplayTrace::open(directory.path()).unwrap();
+        assert!(!fresh.controller_can_exit_on_network_refusal);
+    }
+
+    #[test]
+    fn prepared_replay_refuses_a_symlinked_recording_directory() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = outer.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let error = PreparedFullReplayTrace::open(&alias).unwrap_err();
+        assert!(
+            error.to_string().contains("host namespace"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn prepared_replay_refuses_metadata_and_trace_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&victim, directory.path().join(METADATA_NAME)).unwrap();
+        assert!(PreparedFullReplayTrace::open(directory.path()).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+
+        fs::remove_file(directory.path().join(METADATA_NAME)).unwrap();
+        let metadata = Metadata::new(
+            &reverie::process::Command::new("/bin/true"),
+            "2026-01-01T00:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        serde_json::to_writer(
+            fs::File::create(directory.path().join(METADATA_NAME)).unwrap(),
+            &metadata,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&victim, directory.path().join(NETWORK_TRACE_NAME)).unwrap();
+        assert!(PreparedFullReplayTrace::open(directory.path()).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+    }
 
     #[test]
     fn private_bootstrap_path_is_long_enough_without_oversized_components() {

@@ -311,6 +311,9 @@ pub struct Replayer {
     stdout_error: Option<String>,
     #[serde(skip)]
     stderr_error: Option<String>,
+    /// New-format network syscalls must be consumed by Detcore, not this
+    /// per-thread legacy event stream.
+    network_trace_owned_by_detcore: bool,
 }
 
 impl Default for Replayer {
@@ -323,6 +326,7 @@ impl Default for Replayer {
             stderr_output_lock: tokio::sync::Mutex::new(()),
             stdout_error: None,
             stderr_error: None,
+            network_trace_owned_by_detcore: false,
         }
     }
 }
@@ -343,6 +347,7 @@ impl Tool for Replayer {
             stderr_output_lock: tokio::sync::Mutex::new(()),
             stdout_error,
             stderr_error,
+            network_trace_owned_by_detcore: cfg.network_trace.uses_trace(),
         }
     }
 
@@ -379,6 +384,12 @@ impl Tool for Replayer {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        if self.network_trace_owned_by_detcore && crate::recorder::shared_network_syscall(&syscall)
+        {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "shared network engine forwarded a network syscall to the legacy Replayer event stream"
+            )));
+        }
         self.expect_syscall(guest, syscall);
 
         // NOTE: This match statement should be identical to the one in the

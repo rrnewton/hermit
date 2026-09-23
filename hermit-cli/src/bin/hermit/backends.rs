@@ -1342,7 +1342,7 @@ fn run_once<R: Read + Send + 'static>(
                 ),
             )
             .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&output.status, global));
+        runtime.block_on(clean_up_dbt_global(&output.status, global))?;
         Ok(output)
     })
 }
@@ -1365,7 +1365,7 @@ fn run_once_with_terminal_input(
                 ),
             )
             .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&output.status, global));
+        runtime.block_on(clean_up_dbt_global(&output.status, global))?;
         Ok(output)
     })
 }
@@ -1383,20 +1383,23 @@ fn run_status(
         let (status, global) = runtime
             .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
             .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&status, global));
+        runtime.block_on(clean_up_dbt_global(&status, global))?;
         Ok(status)
     })
 }
 
 #[cfg(feature = "dbt")]
-async fn clean_up_dbt_global(status: &std::process::ExitStatus, mut global: detcore::GlobalState) {
+async fn clean_up_dbt_global(
+    status: &std::process::ExitStatus,
+    mut global: detcore::GlobalState,
+) -> Result<(), Error> {
     if !status.success() {
         global.force_shutdown_with_error();
         // The physical supervisor and RPC owner drain have finished. A client
         // that failed before registration cannot start the owned scheduler.
         global.cancel_internal_scheduler().await;
     }
-    global.clean_up(false, &None).await;
+    global.clean_up(false, &None).await
 }
 
 /// Name the stage that actually failed.
@@ -1619,7 +1622,7 @@ mod tests {
                 super::clean_up_dbt_global(&status, global),
             )
             .await
-            .is_ok();
+            .is_ok_and(|result| result.is_ok());
             assert_eq!(status.into_raw(), raw_status);
             outcomes.push((name, completed));
         }
@@ -1649,7 +1652,7 @@ mod tests {
                 super::clean_up_dbt_global(&status, global),
             )
             .await
-            .is_ok(),
+            .is_ok_and(|result| result.is_ok()),
             "cleanup without an owned scheduler did not complete"
         );
         let config = detcore::Config {

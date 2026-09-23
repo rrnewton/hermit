@@ -131,10 +131,10 @@ impl SerializableError {
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
 fn is_policy_refusal(err: &Error) -> bool {
-    if err
-        .chain()
-        .any(|cause| cause.is::<detcore::UnsupportedSyscallError>())
-    {
+    if err.chain().any(|cause| {
+        cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<detcore::network_failure::NetworkPolicyRefusal>()
+    }) {
         return true;
     }
     // The wrapper case: reverie hands the tool's error back inside `Tool`, whose
@@ -143,12 +143,17 @@ fn is_policy_refusal(err: &Error) -> bool {
         cause
             .downcast_ref::<reverie::Error>()
             .and_then(|reverie_error| match reverie_error {
-                reverie::Error::Tool(inner) => {
-                    inner.downcast_ref::<detcore::UnsupportedSyscallError>()
-                }
+                reverie::Error::Tool(inner) => Some(
+                    inner
+                        .downcast_ref::<detcore::UnsupportedSyscallError>()
+                        .is_some()
+                        || inner
+                            .downcast_ref::<detcore::network_failure::NetworkPolicyRefusal>()
+                            .is_some(),
+                ),
                 _ => None,
             })
-            .is_some()
+            .unwrap_or(false)
     })
 }
 
@@ -197,9 +202,102 @@ impl From<SerializableError> for Error {
     }
 }
 
+/// Complete cleanup without allowing a secondary error to replace a primary
+/// runtime or persistence failure. Secondary text remains diagnostic context;
+/// its type must not override the primary failure's classification.
+pub(crate) fn finish_run_with_cleanup<T>(
+    primary: Result<T, Error>,
+    cleanup: Result<(), Error>,
+) -> Result<T, Error> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("secondary cleanup failure: {cleanup:#}")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_refusal() -> Error {
+        detcore::network_failure::NetworkRpcError::from_engine(
+            detcore_model::network_trace::NetworkPolicy::Replay,
+            detcore::network_failure::NetworkFailurePhase::Transmit,
+            detcore::network_replay::NetworkReplayError::OutboundMismatch {
+                channel: detcore_model::network_trace::NetworkChannelId(7),
+                offset: 23,
+            },
+        )
+        .into_error()
+    }
+
+    #[test]
+    fn network_refusal_survives_tool_context_and_serialization() {
+        for error in [
+            network_refusal(),
+            network_refusal().context("guest send failed"),
+            Error::new(reverie::Error::Tool(network_refusal())),
+            Error::new(reverie::Error::Tool(
+                network_refusal().context("guest send failed"),
+            ))
+            .context("tracer failed"),
+        ] {
+            let classified = SerializableError::from(error);
+            assert_eq!(classified.kind(), FailureKind::PolicyRefusal);
+            let encoded = serde_json::to_vec(&classified).unwrap();
+            let decoded: SerializableError = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, classified);
+            assert!(format!("{:#}", Error::from(decoded)).contains("OutboundMismatch"));
+        }
+        let internal = SerializableError::from(Error::msg(network_refusal().to_string()));
+        assert_eq!(internal.kind(), FailureKind::Error);
+        let panic = SerializableError::from(network_refusal()).into_panic();
+        assert_eq!(panic.kind(), FailureKind::Panic);
+    }
+
+    #[test]
+    fn cleanup_refusal_cannot_replace_an_internal_primary_error() {
+        let error = finish_run_with_cleanup::<()>(
+            Err(Error::msg("primary backend failure")),
+            Err(network_refusal()),
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("primary backend failure"));
+        assert!(text.contains("OutboundMismatch"));
+        assert_eq!(SerializableError::from(error).kind(), FailureKind::Error);
+    }
+
+    #[test]
+    fn cleanup_completion_matrix_preserves_the_primary_class() {
+        assert_eq!(finish_run_with_cleanup(Ok(17), Ok(())).unwrap(), 17);
+        for cleanup in [Ok(()), Err(Error::msg("secondary disk failure"))] {
+            let error = finish_run_with_cleanup::<()>(Err(network_refusal()), cleanup).unwrap_err();
+            assert_eq!(
+                SerializableError::from(error).kind(),
+                FailureKind::PolicyRefusal
+            );
+        }
+        let error = finish_run_with_cleanup::<()>(Ok(()), Err(network_refusal())).unwrap_err();
+        assert_eq!(
+            SerializableError::from(error).kind(),
+            FailureKind::PolicyRefusal
+        );
+        let error =
+            finish_run_with_cleanup::<()>(Ok(()), Err(Error::msg("disk failure"))).unwrap_err();
+        assert_eq!(SerializableError::from(error).kind(), FailureKind::Error);
+        let error = finish_run_with_cleanup::<()>(
+            Err(Error::msg("primary internal failure")),
+            Err(Error::msg("secondary internal failure")),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("secondary internal failure"));
+        assert!(format!("{error:#}").contains("primary internal failure"));
+        assert_eq!(SerializableError::from(error).kind(), FailureKind::Error);
+    }
 
     #[test]
     fn into_serializable_error() {

@@ -11,11 +11,11 @@
 //! The valid cross-product contains 60 configurations: relaxed mode varies
 //! thread sequentialization and deterministic I/O, strict mode keeps both on,
 //! and both modes vary the three valid time/metadata states, CPUID
-//! virtualization, and verification. `--strace-only` (with and without
-//! verification) and `--namespace-only` add three explicit passthrough
-//! endpoints. Every configuration runs an exec/exit program, a fixed-output
-//! program, and a threaded observation program that exercises clocks,
-//! metadata, CPUID, and randomness.
+//! virtualization, and verification. `--strace-only --unsafe-live-network`
+//! (with and without verification) and `--namespace-only` add three explicit
+//! passthrough endpoints. Every configuration runs an exec/exit program, a
+//! fixed-output program, and a threaded observation program that exercises
+//! clocks, metadata, CPUID, and randomness.
 
 use std::env;
 use std::fs;
@@ -144,13 +144,13 @@ fn matrix_configurations() -> Vec<Configuration> {
     configurations.extend([
         Configuration {
             name: "strace-only_verify-off".to_owned(),
-            args: vec!["run", "--strace-only"],
+            args: vec!["run", "--strace-only", "--unsafe-live-network"],
             verify: false,
             strict_without_virtual_time: false,
         },
         Configuration {
             name: "strace-only_verify-on".to_owned(),
-            args: vec!["run", "--strace-only", "--verify"],
+            args: vec!["run", "--strace-only", "--unsafe-live-network", "--verify"],
             verify: true,
             strict_without_virtual_time: false,
         },

@@ -450,6 +450,20 @@ pub fn default_container(pin_threads: bool) -> Container {
     container
 }
 
+/// Deny physical host networking for an offline replay container.
+///
+/// Detcore's trace engine is the semantic authority for replayed socket I/O,
+/// but the Linux namespace remains an independent fail-closed boundary: a
+/// missed or newly introduced network syscall must not escape to the host.
+/// Leaving loopback down also prevents an uncaptured local server from becoming
+/// an accidental input. Remounting sysfs makes `/sys/class/net` describe this
+/// new network namespace rather than the namespace inherited from the parent.
+pub(super) fn isolate_replay_network(container: &mut Container) {
+    container
+        .unshare(Namespace::NETWORK)
+        .mount(Mount::sysfs("/sys"));
+}
+
 /// PROTOTYPE: a container whose root filesystem is a materialized OCI image
 /// rootfs. This is the *filesystem half* of hermit-as-container-runtime: the
 /// guest's file inputs come deterministically from the pinned image rather than
@@ -559,13 +573,14 @@ pub(super) fn image_container(
     Ok((container, identity_sources))
 }
 
-/// A [`default_container`] hardened with the deterministic identity mounts
-/// (frozen `/etc/group`, hidden nscd cache) that `run` mode applies. Record and
-/// replay use this so guest NSS resolution matches `run` and does not reach
-/// nondeterministic host identity state. The returned [`IdentityGuard`] must be
-/// held until after `Container::run` returns.
+/// A [`default_container`] hardened for full replay with deterministic identity
+/// mounts and a physically isolated network namespace. The shared trace engine
+/// supplies recorded networking; the namespace ensures replay cannot fall back
+/// to the live host. The returned [`IdentityGuard`] must be held until after
+/// `Container::run` returns.
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
     let mut container = default_container(true);
+    isolate_replay_network(&mut container);
     let (mounts, identity_guard) = identity_hardening_mounts()?;
     container.mounts(mounts);
     Ok((container, identity_guard))
@@ -697,10 +712,10 @@ fn install_container_init_stop_handlers() -> Result<(), Error> {
 /// Why this is public rather than folded into [`with_container`]: `hermit record`
 /// -- every spelling, including `record --verify` -- calls [`Container::run`]
 /// directly at six sites in `record_start.rs` and never goes through
-/// `with_container`. Those containers come from `recording_container()` ->
-/// `deterministic_container()` -> `default_container(true)`, which unshares
-/// `Namespace::PID`, so each one is a namespace init with exactly the bug the
-/// guards exist to fix. An adversarial review of the original change caught this:
+/// `with_container`. Those containers ultimately come from
+/// `default_container(true)`, which unshares `Namespace::PID`, so each one is a
+/// namespace init with exactly the bug the guards exist to fix. An adversarial
+/// review of the original change caught this:
 /// the claim that "all entry points funnel through `with_container`" was FALSE,
 /// and `record --verify` is precisely the long-running command an external
 /// deadline most needs to be able to end.
@@ -1175,6 +1190,67 @@ impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_network_refusal_crosses_container_boundary_without_relabeling_internal_errors() {
+        fn failure() -> hermit::Error {
+            detcore::network_failure::NetworkRpcError::from_engine(
+                detcore_model::network_trace::NetworkPolicy::Replay,
+                detcore::network_failure::NetworkFailurePhase::Transmit,
+                detcore::network_replay::NetworkReplayError::OutboundMismatch {
+                    channel: detcore_model::network_trace::NetworkChannelId(7),
+                    offset: 23,
+                },
+            )
+            .into_error()
+        }
+        let typed = hermit::Error::new(reverie::Error::Tool(failure())).context("tracer failed");
+        let serialized = SerializableError::from(typed);
+        let bytes = bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): (SerializableError, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, serialized);
+        let error = classify_container_result::<()>(Ok(Err(decoded))).unwrap_err();
+        assert_eq!(
+            crate::failure_exit_code(&error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+        );
+        assert_eq!(
+            crate::classify_failure(&error),
+            "HERMIT_POLICY_REFUSAL class=policy-refusal"
+        );
+        assert!(format!("{error:#}").contains("OutboundMismatch"));
+        assert!(error.downcast_ref::<ContainerChildPanic>().is_none());
+
+        for internal in [
+            SerializableError::from(hermit::Error::msg(failure().to_string())),
+            SerializableError::from(failure()).into_panic(),
+        ] {
+            let error = classify_container_result::<()>(Ok(Err(internal))).unwrap_err();
+            assert_eq!(
+                crate::failure_exit_code(&error),
+                hermit::HERMIT_INTERNAL_FAILURE_EXIT
+            );
+            assert!(crate::classify_failure(&error).starts_with("HERMIT_INTERNAL_FAILURE"));
+        }
+    }
+
+    #[test]
+    fn standalone_full_replay_has_only_down_loopback() {
+        let (mut container, _identity_guard) = deterministic_container().unwrap();
+        let (mut interfaces, flags) = with_container(&mut container, || {
+            let interfaces = fs::read_dir("/sys/class/net")?
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let flags = fs::read_to_string("/sys/class/net/lo/flags")?;
+            Ok((interfaces, flags))
+        })
+        .unwrap();
+        interfaces.sort();
+        assert_eq!(interfaces, ["lo"]);
+        assert_eq!(flags.trim(), "0x8", "replay loopback must remain down");
+    }
 
     /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for
     /// one release the two channels disagreed about what happened.

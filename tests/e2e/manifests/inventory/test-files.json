@@ -1405,6 +1405,24 @@
       "why": "tests/c/netns_cookie_udp4.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/network_channel_identity.c",
+      "runner": "hermit-cli/tests/record_replay.rs network_channel_identity module",
+      "why": "tests/c/network_channel_identity.c is owned by the network_channel_identity driver: it supplies controller scenarios, ports, socket creation and connection orders, and wrong-peer arguments; the driver checks exact native endpoint payloads, offline strict replay, and bounded no-contact refusals. It is not a standalone no-argument guest."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/network_poll_lowat.c",
+      "runner": "hermit-cli/tests/record_replay.rs network_only::lowat module",
+      "why": "tests/c/network_poll_lowat.c is owned by the network_only::lowat driver: it supplies controller/client mode and a port, proves the native blocked syscall, and records then strictly replays LOWAT changes across the fixed schedule population; it is not a standalone no-argument guest."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/network_replay_tcp_bracket.c",
+      "runner": "hermit-cli/tests/record_replay.rs network_only module",
+      "why": "tests/c/network_replay_tcp_bracket.c is owned by hermit-cli/tests/record_replay.rs network_only module: the integration driver starts its bounded external controller, records one exact TCP stream, replays it offline across a fixed scheduler population, and checks cross-run invariants and fail-closed mismatches that a standalone manifest cell cannot express."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/numa_node_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",

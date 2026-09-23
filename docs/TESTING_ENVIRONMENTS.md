@@ -67,9 +67,10 @@ passthrough endpoints. The 60-state cross-product is:
 | CPUID | virtualized; host behavior |
 | Verification | off; two-run verification on |
 
-Three endpoint configurations add `--strace-only`, `--strace-only --verify`,
-and `--namespace-only`. Verification is invalid with `--namespace-only` and is
-therefore not presented as a runnable state. Each of the 63 configurations runs
+Three endpoint configurations add `--strace-only --unsafe-live-network`,
+`--strace-only --unsafe-live-network --verify`, and `--namespace-only`.
+Verification is invalid with `--namespace-only` and is therefore not presented
+as a runnable state. Each of the 63 configurations runs
 `/bin/true`, fixed stdio, and a threaded workload that observes clocks, file
 metadata, CPUID, and randomness: 189 bounded cases in total.
 

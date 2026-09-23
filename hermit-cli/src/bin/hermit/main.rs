@@ -16,6 +16,7 @@
 
 use core::arch::global_asm;
 
+mod accepted_service;
 mod analyze;
 mod backends;
 mod bisect;
@@ -235,6 +236,7 @@ fn args_from_matches_with_clock(
         })
         .and_then(|run| run.value_source("epoch"));
     let mut args = Args::from_arg_matches(matches)?;
+    apply_argument_provenance(&mut args, matches);
     if run_epoch_source == Some(ValueSource::DefaultValue) {
         match &mut args.command {
             Subcommand::Run(run) => run.capture_default_epoch(capture_now),
@@ -436,8 +438,45 @@ impl Subcommand {
     }
 }
 
+fn epoch_source_is_explicit(source: Option<ValueSource>) -> bool {
+    matches!(
+        source,
+        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+    )
+}
+
+fn apply_argument_provenance(args: &mut Args, matches: &ArgMatches) {
+    let epoch_source = matches
+        .subcommand_matches("run")
+        .or_else(|| {
+            matches
+                .subcommand_matches("oci")
+                .and_then(|oci| oci.subcommand_matches("run"))
+        })
+        .and_then(|run| run.value_source("epoch"));
+    let explicit = epoch_source_is_explicit(epoch_source);
+    match &mut args.command {
+        Subcommand::Run(run) => run.set_epoch_source_explicit(explicit),
+        Subcommand::Oci(oci) => oci.set_run_epoch_source_explicit(explicit),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+fn try_parse_args_with_provenance<I, T>(arguments: I) -> Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Args::command().try_get_matches_from(arguments)?;
+    args_from_matches_with_clock(&matches, std::time::SystemTime::now)
+}
+
 #[fbinit::main]
 fn main() {
+    if accepted_service::requested() {
+        accepted_service::run(startup_stdin());
+    }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
     // shared mapping that children inherit across fork. A mapping made after the
@@ -671,6 +710,7 @@ fn display_error(error: Error) {
 mod tests {
     use clap::CommandFactory;
     use clap::Parser;
+    use clap::parser::ValueSource;
     use hermit::Backend;
     use hermit::BackendUnavailable;
     use hermit::Error;
@@ -679,7 +719,9 @@ mod tests {
     use super::Subcommand;
     use super::args_from_matches_with_clock;
     use super::classify_failure;
+    use super::epoch_source_is_explicit;
     use super::failure_exit_code;
+    use super::try_parse_args_with_provenance;
 
     #[test]
     fn clap_configuration_is_valid() {
@@ -959,6 +1001,161 @@ mod tests {
             assert!(!reparsed.epoch_capture_for_test().1);
             assert_eq!(reparsed.det_opts.det_config.seed, 71);
         }
+    }
+
+    #[test]
+    fn captured_run_epoch_is_not_an_explicit_replay_constraint_or_resampled() {
+        let calls = std::cell::Cell::new(0);
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_933_135_628);
+        let matches = command_without_epoch_env()
+            .try_get_matches_from(["hermit", "run", "/bin/true"])
+            .unwrap();
+        let mut args = args_from_matches_with_clock(&matches, || {
+            calls.set(calls.get() + 1);
+            now
+        })
+        .unwrap();
+        let Subcommand::Run(run) = &mut args.command else {
+            panic!("expected run")
+        };
+        let captured = run.epoch_capture_for_test();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(captured, ("2031-04-05T06:07:08+00:00".to_owned(), true));
+        assert!(!run.epoch_source_explicit());
+        run.validate_args().unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(run.epoch_capture_for_test(), captured);
+        assert!(!run.epoch_source_explicit());
+        let rendered = run.to_string();
+        assert_eq!(rendered.matches("--epoch=").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn replay_parser_replaces_only_an_implicit_epoch_without_another_clock_sample() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("network.trace");
+        let recorded = "2000-01-02T03:04:05Z";
+        detcore_model::network_trace::NetworkTraceV2 {
+            epoch: recorded.parse().unwrap(),
+            channels: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+        .write_framed(std::fs::File::create(&path).unwrap())
+        .unwrap();
+        for explicit in [None, Some("2026-01-01T00:00:00Z"), Some(recorded)] {
+            let calls = std::cell::Cell::new(0);
+            let mut argv = vec![
+                "hermit".to_owned(),
+                "run".to_owned(),
+                format!("--replay-networking={}", path.display()),
+            ];
+            if let Some(epoch) = explicit {
+                argv.push(format!("--epoch={epoch}"));
+            }
+            argv.push("/bin/true".into());
+            let matches = command_without_epoch_env()
+                .try_get_matches_from(argv)
+                .unwrap();
+            let args = args_from_matches_with_clock(&matches, || {
+                calls.set(calls.get() + 1);
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_933_135_628)
+            })
+            .unwrap();
+            let Subcommand::Run(mut run) = args.command else {
+                panic!("expected run")
+            };
+            assert_eq!(calls.get(), usize::from(explicit.is_none()));
+            assert_eq!(run.epoch_source_explicit(), explicit.is_some());
+            let result = run.validate_args();
+            if explicit.is_some_and(|epoch| epoch != recorded) {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not match network trace epoch"),
+                    "{error}"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(run.epoch_capture_for_test().0, "2000-01-02T03:04:05+00:00");
+                run.validate_args().unwrap();
+                assert_eq!(run.epoch_capture_for_test().0, "2000-01-02T03:04:05+00:00");
+                assert_eq!(run.to_string().matches("--epoch=").count(), 1);
+            }
+            assert_eq!(calls.get(), usize::from(explicit.is_none()));
+        }
+    }
+
+    #[test]
+    fn oci_explicit_default_epoch_keeps_its_source_provenance() {
+        let matches = command_without_epoch_env()
+            .try_get_matches_from([
+                "hermit",
+                "oci",
+                "run",
+                "example.invalid/image:tag",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                "/bin/true",
+            ])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("explicit OCI epoch sampled host time")
+        })
+        .unwrap();
+        let Subcommand::Oci(oci) = args.command else {
+            panic!("expected OCI run")
+        };
+        assert!(oci.run_epoch_source_explicit_for_test());
+        assert_eq!(
+            oci.run_epoch_capture_for_test(),
+            ("2026-01-01T00:00:00+00:00".to_owned(), false, true)
+        );
+    }
+
+    #[test]
+    fn epoch_provenance_respects_guest_boundary_and_explicit_sources() {
+        let before = detcore_model::config::capture_current_epoch();
+        let mut guest_argument = try_parse_args_with_provenance([
+            "hermit",
+            "run",
+            "--",
+            "/bin/echo",
+            "--epoch=guest-data",
+        ])
+        .unwrap();
+        let Subcommand::Run(run) = &mut guest_argument.command else {
+            panic!("run command was not parsed")
+        };
+        assert!(!run.epoch_source_explicit());
+        run.validate_args().unwrap();
+        let after = detcore_model::config::capture_current_epoch();
+        assert!(before <= run.det_opts.det_config.epoch);
+        assert!(run.det_opts.det_config.epoch <= after);
+
+        let mut explicit = try_parse_args_with_provenance([
+            "hermit",
+            "run",
+            "--epoch=2000-01-02T03:04:05Z",
+            "--",
+            "/bin/echo",
+        ])
+        .unwrap();
+        let Subcommand::Run(run) = &mut explicit.command else {
+            panic!("run command was not parsed")
+        };
+        assert!(run.epoch_source_explicit());
+        run.validate_args().unwrap();
+        assert_eq!(
+            run.det_opts.det_config.epoch,
+            "2000-01-02T03:04:05Z"
+                .parse::<detcore_model::config::Epoch>()
+                .unwrap()
+        );
+
+        assert!(epoch_source_is_explicit(Some(ValueSource::EnvVariable)));
+        assert!(!epoch_source_is_explicit(Some(ValueSource::DefaultValue)));
     }
 
     #[test]

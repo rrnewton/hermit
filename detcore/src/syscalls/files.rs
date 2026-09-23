@@ -738,6 +738,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         open_file_id: OpenFileId,
     ) -> Option<u16> {
+        if open_file_id.is_socket() && guest.config().network_trace.uses_trace() {
+            match network_request(guest, NetworkRequest::Retire(open_file_id)).await {
+                Ok(NetworkReply::Channel(_)) => {}
+                Ok(other) => panic!("unexpected network-retirement response: {other:?}"),
+                Err(error) => panic!("network open-file retirement failed: {error}"),
+            }
+        }
         let response = send_and_update_time(guest, GlobalRequest::ReleasePort(open_file_id)).await;
         match response.1 {
             GlobalResponse::ReleasePort(port) => port,
@@ -2720,48 +2727,63 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match call.cmd() {
             F_GETFL => {
-                let physical_flags = self.record_or_replay(guest, call).await?;
-                let logical_nonblocking = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
-                let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
-                if logical_nonblocking {
-                    Ok(physical_flags | nonblocking)
-                } else {
-                    Ok(physical_flags & !nonblocking)
+                let control = self.begin_shadow_fd_control(guest, fd).await?;
+                let result = async {
+                    let physical_flags = self.record_or_replay(guest, call).await?;
+                    let logical_nonblocking = guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
+                    let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
+                    if logical_nonblocking {
+                        Ok(physical_flags | nonblocking)
+                    } else {
+                        Ok(physical_flags & !nonblocking)
+                    }
                 }
+                .await;
+                self.finish_shadow_fd_control(guest, control, result).await
             }
             F_SETFL(flags) => {
-                let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
-                let force_nonblocking = self.cfg.use_nonblocking_sockets()
-                    && !self.cfg.recordreplay_modes
-                    && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
-                let physical_flags = if force_nonblocking {
-                    flags | OFlag::O_NONBLOCK.bits()
-                } else {
-                    flags
-                };
-                let result = self
-                    .record_or_replay(guest, call.with_cmd(F_SETFL(physical_flags)))
-                    .await?;
-                guest.thread_state().with_detfd(fd, |detfd| {
-                    // Record the guest's *logical* status flags (derives logical
-                    // nonblocking); when we forced O_NONBLOCK physically without the
-                    // guest asking, mark the description physically nonblocking too.
-                    detfd.set_status_flags(flags);
-                    if force_nonblocking {
-                        detfd.set_physically_nonblocking();
-                    }
-                })?;
-                Ok(result)
+                let control = self.begin_shadow_fd_control(guest, fd).await?;
+                let shadow_managed = control.is_some();
+                let result = async {
+                    let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
+                    let force_nonblocking = !shadow_managed
+                        && self.cfg.use_nonblocking_sockets()
+                        && !self.cfg.recordreplay_modes
+                        && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
+                    let physical_flags = if force_nonblocking {
+                        flags | OFlag::O_NONBLOCK.bits()
+                    } else {
+                        flags
+                    };
+                    let result = self
+                        .record_or_replay(guest, call.with_cmd(F_SETFL(physical_flags)))
+                        .await?;
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        // Record the guest's *logical* status flags (derives logical
+                        // nonblocking); when we forced O_NONBLOCK physically without the
+                        // guest asking, mark the description physically nonblocking too.
+                        detfd.set_status_flags(flags);
+                        if force_nonblocking {
+                            detfd.set_physically_nonblocking();
+                        }
+                    })?;
+                    Ok(result)
+                }
+                .await;
+                self.finish_shadow_fd_control(guest, control, result).await
             }
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
-                let newfd = self.record_or_replay(guest, call).await? as RawFd;
-                let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
-                if let Some(open_file_id) = replaced {
-                    self.release_port_for_open_file(guest, open_file_id).await;
-                }
-                Ok(newfd as i64)
+                self.network_fd_alias_syscall(
+                    guest,
+                    call,
+                    fd,
+                    None,
+                    o_cloexec,
+                    crate::network_replay::NetworkFdInstallKind::FcntlDup,
+                )
+                .await
             }
             F_SETFD(flags) => {
                 let result = self.record_or_replay(guest, call).await?;
@@ -2833,39 +2855,50 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => (None, None),
         };
 
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-1013): Review logical FIONBIO handling for forced fds.
-        // Detcore already keeps scheduler-managed fds physically nonblocking. Satisfy
-        // FIONBIO logically instead of forwarding it: some backends cannot apply the
-        // ioctl to their proxied pipe fd, and clearing it would violate the scheduler's
-        // nonblockize-and-retry invariant. This mirrors F_SETFL's forced state split.
-        if let Some(enabled) = nonblocking {
-            let (fd_type, physically_nonblocking) = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
-            let force_nonblocking = self.cfg.use_nonblocking_sockets()
-                && !self.cfg.recordreplay_modes
-                && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
-            if force_nonblocking && physically_nonblocking {
-                guest.thread_state().with_detfd(fd, |detfd| {
-                    detfd.set_logical_nonblocking(enabled);
-                })?;
-                return Ok(0);
+        let control = if nonblocking.is_some() {
+            self.begin_shadow_fd_control(guest, fd).await?
+        } else {
+            None
+        };
+        let shadow_managed = control.is_some();
+        let result = async {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-1013): Review logical FIONBIO handling for forced fds.
+            // Detcore already keeps scheduler-managed fds physically nonblocking. Satisfy
+            // FIONBIO logically instead of forwarding it: some backends cannot apply the
+            // ioctl to their proxied pipe fd, and clearing it would violate the scheduler's
+            // nonblockize-and-retry invariant. This mirrors F_SETFL's forced state split.
+            if let Some(enabled) = nonblocking {
+                let (fd_type, physically_nonblocking) = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
+                let force_nonblocking = !shadow_managed
+                    && self.cfg.use_nonblocking_sockets()
+                    && !self.cfg.recordreplay_modes
+                    && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
+                if force_nonblocking && physically_nonblocking {
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        detfd.set_logical_nonblocking(enabled);
+                    })?;
+                    return Ok(0);
+                }
             }
-        }
 
-        let result = self.record_or_replay(guest, call).await?;
-        if cloexec.is_some() || nonblocking.is_some() {
-            guest.thread_state().with_detfd(fd, |detfd| {
-                if let Some(enabled) = cloexec {
-                    detfd.set_cloexec(enabled);
-                }
-                if let Some(enabled) = nonblocking {
-                    detfd.set_nonblocking(enabled);
-                }
-            })?;
+            let result = self.record_or_replay(guest, call).await?;
+            if cloexec.is_some() || nonblocking.is_some() {
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    if let Some(enabled) = cloexec {
+                        detfd.set_cloexec(enabled);
+                    }
+                    if let Some(enabled) = nonblocking {
+                        detfd.set_nonblocking(enabled);
+                    }
+                })?;
+            }
+            Ok(result)
         }
-        Ok(result)
+        .await;
+        self.finish_shadow_fd_control(guest, control, result).await
     }
 
     /// statfs: report deterministic filesystem statistics.
@@ -3143,51 +3176,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Dup,
-    ) -> Result<i64, Errno> {
-        let old_fd = call.oldfd();
-        let new_fd = self.record_or_replay(guest, call).await? as RawFd;
-        let replaced = guest
-            .thread_state_mut()
-            .dup_fd(old_fd, new_fd, OFlag::empty())?;
-        if let Some(open_file_id) = replaced {
-            self.release_port_for_open_file(guest, open_file_id).await;
-        }
-        Ok(new_fd as i64)
+    ) -> Result<i64, Error> {
+        self.network_fd_alias_syscall(
+            guest,
+            call,
+            call.oldfd(),
+            None,
+            OFlag::empty(),
+            crate::network_replay::NetworkFdInstallKind::Dup,
+        )
+        .await
     }
 
-    /// dup2 system call.
+    /// dup2 system call. Successful same-FD calls preserve the installation.
     pub async fn handle_dup2<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Dup2,
-    ) -> Result<i64, Errno> {
-        let old_fd = call.oldfd();
-        let new_fd = call.newfd();
-        let res = self.record_or_replay(guest, call).await?;
-        let replaced = guest
-            .thread_state_mut()
-            .dup_fd(old_fd, new_fd, OFlag::empty())?;
-        if let Some(open_file_id) = replaced {
-            self.release_port_for_open_file(guest, open_file_id).await;
-        }
-        Ok(res)
+    ) -> Result<i64, Error> {
+        self.network_fd_alias_syscall(
+            guest,
+            call,
+            call.oldfd(),
+            Some(call.newfd()),
+            OFlag::empty(),
+            crate::network_replay::NetworkFdInstallKind::Dup2,
+        )
+        .await
     }
 
-    /// dup3 system call.
+    /// dup3 system call. Failed replacements preserve the destination.
     pub async fn handle_dup3<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Dup3,
-    ) -> Result<i64, Errno> {
-        let old_fd = call.oldfd();
-        let new_fd = call.newfd();
-        let flags = call.flags();
-        let res = self.record_or_replay(guest, call).await?;
-        let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
-        if let Some(open_file_id) = replaced {
-            self.release_port_for_open_file(guest, open_file_id).await;
-        }
-        Ok(res)
+    ) -> Result<i64, Error> {
+        self.network_fd_alias_syscall(
+            guest,
+            call,
+            call.oldfd(),
+            Some(call.newfd()),
+            call.flags(),
+            crate::network_replay::NetworkFdInstallKind::Dup3,
+        )
+        .await
     }
 
     /// pipe2 system call.
@@ -3495,6 +3527,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Setsockopt,
     ) -> Result<i64, Error> {
+        if let Some(result) = self.try_shadow_setsockopt(guest, call).await? {
+            return Ok(result);
+        }
         Ok(self.record_or_replay(guest, call).await?)
     }
 
@@ -3517,6 +3552,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockname,
     ) -> Result<i64, Error> {
+        if let Some(result) = self
+            .try_accepted_endpoint(
+                guest,
+                call.fd(),
+                call.usockaddr(),
+                call.usockaddr_len(),
+                false,
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         Ok(self.record_or_replay(guest, call).await?)
     }
 
@@ -3528,6 +3575,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getpeername,
     ) -> Result<i64, Error> {
+        if let Some(result) = self
+            .try_accepted_endpoint(
+                guest,
+                call.fd(),
+                call.usockaddr(),
+                call.usockaddr_len(),
+                true,
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         Ok(self.record_or_replay(guest, call).await?)
     }
 
@@ -3541,6 +3600,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getsockopt,
     ) -> Result<i64, Error> {
+        if let Some(result) = self.try_shadow_getsockopt(guest, call).await? {
+            return Ok(result);
+        }
         // TODO-HUMAN-REVIEW(PR-894): Review deterministic network-namespace identity.
         let requested_length =
             if call.level() == libc::SOL_SOCKET && call.optname() == libc::SO_NETNS_COOKIE {
@@ -3841,15 +3903,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Signalfd4,
     ) -> Result<i64, Error> {
         let signalfd = self.record_or_replay(guest, call).await? as RawFd;
-        self.add_fd(
-            guest,
-            signalfd,
-            OFlag::from_bits_truncate(
-                call.flags().bits() & (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK),
-            ),
-            FdType::Signalfd,
-        )
-        .await?;
+        // An existing signalfd only changes its signal mask. Its OFD, slot
+        // incarnation, FD_CLOEXEC and O_NONBLOCK are unchanged; creation flags
+        // apply only when Linux allocates a new descriptor for fd == -1.
+        if call.fd() == -1 {
+            self.add_fd(
+                guest,
+                signalfd,
+                OFlag::from_bits_truncate(
+                    call.flags().bits() & (libc::SFD_CLOEXEC | libc::SFD_NONBLOCK),
+                ),
+                FdType::Signalfd,
+            )
+            .await?;
+        }
         Ok(signalfd as i64)
     }
 

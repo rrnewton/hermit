@@ -29,6 +29,14 @@ use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
 use crate::time::RcbTimeMultiplier;
 
+/// Resolved logical epoch shared by CLI metadata, Config, and network traces.
+pub type Epoch = DateTime<Utc>;
+
+/// Capture the wall clock exactly once at a CLI/run boundary.
+pub fn capture_current_epoch() -> Epoch {
+    Utc::now()
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -163,6 +171,13 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub backend_requires_thread_directed_process_signals: bool,
+
+    /// Actual backend dispatch authenticates Guest::tid as a host ptrace task
+    /// whose files table supports PIDFD_THREAD/pidfd_getfd socket pinning.
+    /// False by default: numeric guest IDs never establish this capability.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_supports_host_socket_pin: bool,
 
     /// Identifies KVM for its run-installed process alarm control.
     #[serde(default)]
@@ -463,6 +478,14 @@ pub struct Config {
     #[clap(skip)]
     pub shutdown_on_unsupported_syscall: bool,
 
+    /// The Tool global state runs in an owned PID-container controller that
+    /// may exit the whole run on a typed network replay refusal. Only contained
+    /// CLI ptrace/E9 controller bodies enable this; library and plugin callers
+    /// must leave it false. This is independent of strict/unsupported policy.
+    #[serde(default)]
+    #[clap(skip)]
+    pub controller_can_exit_on_network_refusal: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-644): Review the internal cross-process warning report channel.
     /// Internal inherited file descriptor used to aggregate unsupported syscalls.
@@ -554,6 +577,26 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub network_trace: NetworkTraceConfig,
+
+    /// Exact trace bytes opened and verified in the host namespace before the
+    /// container is entered. Record/replay policies must not reopen a path.
+    #[serde(default)]
+    #[clap(skip)]
+    pub network_trace_input: Option<Vec<u8>>,
+
+    /// Inherited descriptor for a host-reserved private publication file.
+    /// Detcore duplicates it before writing; the CLI retains publication
+    /// authority and performs the atomic no-replace commit afterward.
+    #[serde(default)]
+    #[clap(skip)]
+    pub network_trace_output_fd: Option<i32>,
+
+    /// Whether the logical epoch came from an explicit user/replay value.
+    /// False means the run boundary must resolve and store one wall-clock value
+    /// before the engine or container starts.
+    #[serde(default)]
+    #[clap(skip)]
+    pub epoch_explicit: bool,
 
     /// Configure the probability for the Sticky Random scheduler to stay in a thread.
     /// For value 0.0, we are behaving like Random.
@@ -742,7 +785,7 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 }
 
 impl Config {
-    /// Whether the epoch is the stable library default omitted by `Display`.
+    /// Whether the epoch equals the stable library default.
     pub fn has_default_epoch(&self) -> bool {
         self.epoch == DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()
     }
@@ -913,7 +956,7 @@ impl fmt::Display for Config {
             RunsPostFork::Parent => write!(f, " --runs-post-fork=parent")?,
             RunsPostFork::Random => write!(f, " --runs-post-fork=random")?,
         }
-        if !self.has_default_epoch() {
+        if self.epoch_explicit || !self.has_default_epoch() {
             write!(f, " --epoch={}", self.epoch.to_rfc3339())?;
         }
         if self.seed != 0 {
@@ -1095,17 +1138,7 @@ impl fmt::Display for Config {
 }
 
 /// Which side of an ordinary fork/clone receives the first post-registration turn.
-#[derive(
-    Debug,
-    Default,
-    Clone,
-    Copy,
-    Serialize,
-    Deserialize,
-    Parser,
-    PartialEq,
-    Eq
-)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Parser, PartialEq, Eq)]
 pub enum RunsPostFork {
     /// Run the newly registered child before its parent resumes.
     #[default]
@@ -1174,17 +1207,7 @@ impl FromStr for BlockingMode {
     }
 }
 
-#[derive(
-    Debug,
-    Default,
-    Clone,
-    Copy,
-    Serialize,
-    Deserialize,
-    Parser,
-    PartialEq,
-    Eq
-)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Parser, PartialEq, Eq)]
 /// Apply a specialized scheduling heuristic which may help exercise certain bugs.
 pub enum SchedHeuristic {
     /// Don't modify the scheduling algorithm.
@@ -1425,6 +1448,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_socket_pin_capability_defaults_false_in_legacy_wire_data() {
+        let default = Config::default();
+        assert!(!default.backend_supports_host_socket_pin);
+        let mut json = serde_json::to_value(&default).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("backend_supports_host_socket_pin");
+        let absent: Config = serde_json::from_value(json).unwrap();
+        assert!(!absent.backend_supports_host_socket_pin);
+        for enabled in [false, true] {
+            let config = Config {
+                backend_supports_host_socket_pin: enabled,
+                ..Config::default()
+            };
+            let encoded = serde_json::to_value(&config).unwrap();
+            assert_eq!(encoded["backend_supports_host_socket_pin"], enabled);
+            let restored: Config = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.backend_supports_host_socket_pin, enabled);
+        }
+    }
+
+    #[test]
+    fn network_refusal_controller_capability_is_explicit_and_wire_visible() {
+        let default = Config::default();
+        assert!(!default.controller_can_exit_on_network_refusal);
+        let mut old_json = serde_json::to_value(&default).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("controller_can_exit_on_network_refusal");
+        let absent: Config = serde_json::from_value(old_json).unwrap();
+        assert!(!absent.controller_can_exit_on_network_refusal);
+
+        for enabled in [false, true] {
+            let config = Config {
+                controller_can_exit_on_network_refusal: enabled,
+                ..Config::default()
+            };
+            let json = serde_json::to_value(&config).unwrap();
+            assert_eq!(json["controller_can_exit_on_network_refusal"], enabled);
+            let restored: Config = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.controller_can_exit_on_network_refusal, enabled);
+            let bytes = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (restored, consumed): (Config, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(restored.controller_can_exit_on_network_refusal, enabled);
+        }
+        assert!(
+            Config::try_parse_from(["hermit", "--controller-can-exit-on-network-refusal"]).is_err()
+        );
+    }
+
+    #[test]
     fn default_epoch_is_2026() {
         assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
         let epoch = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
@@ -1472,11 +1549,7 @@ mod tests {
         };
         assert_eq!(config.network_trace.network_perturb_seed, None);
 
-        config.network_trace = NetworkTraceConfig {
-            mode: crate::network_trace::NetworkTraceMode::Replay,
-            path: Some("network.trace".into()),
-            network_perturb_seed: Some(43),
-        };
+        config.network_trace = NetworkTraceConfig::replay("network.trace", Some(43));
         assert_eq!(config.seed, 41);
         assert_eq!(config.sched_seed(), 42);
         assert_eq!(config.network_trace.network_perturb_seed, Some(43));
