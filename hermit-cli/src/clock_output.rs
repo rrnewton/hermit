@@ -21,6 +21,8 @@ fn failure(message: &str) -> Error {
     Error::Tool(anyhow::anyhow!("captured clock output: {message}"))
 }
 
+// TODO-HUMAN-REVIEW(PR-pending): Replace the pending identifier when the
+// introducing PR exists; review captured clock copyout and errno fidelity.
 pub(crate) fn capture<M: MemoryAccess, T: Copy>(
     memory: &M,
     address: Option<AddrMut<'_, T>>,
