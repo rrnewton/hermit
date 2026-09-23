@@ -2945,6 +2945,30 @@ impl RunOpts {
         }
     }
 
+    /// Emit verify-wide provenance before either comparison subscriber exists.
+    ///
+    /// `tracing` installs a process-global subscriber that cannot be replaced
+    /// by the synchronous per-run subscribers. For `--log-file`, write through
+    /// the already-opened host descriptor instead; otherwise use controller
+    /// stderr. Both forms stay outside guest output and the compared logs.
+    fn emit_top_level_epoch_provenance(&self, global: &GlobalOpts) -> Result<(), Error> {
+        let Some(provenance) = self.virtual_epoch_provenance() else {
+            return Ok(());
+        };
+        if let Some(handle) = &global.log_file_handle {
+            let mut file = handle
+                .try_clone()
+                .context("cannot duplicate the host log file descriptor for epoch provenance")?;
+            writeln!(file, "WARN hermit::virtual_time: {provenance}")
+                .context("cannot write epoch provenance to --log-file")?;
+            file.flush()
+                .context("cannot flush epoch provenance to --log-file")?;
+        } else {
+            eprintln!("WARN hermit::virtual_time: {provenance}");
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -3256,14 +3280,10 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbt => {
-                // DBT owns a separate launcher and typed guest Output. Its
-                // ordinary adapter has no controller log-file sink, so retain
-                // the top-level provenance on controller stderr without ever
-                // adding it to the guest Output that verification compares.
-                let epoch_provenance = self.virtual_epoch_provenance();
-                if let Some(provenance) = &epoch_provenance {
-                    eprintln!("WARN hermit::virtual_time: {provenance}");
-                }
+                // DBT owns a separate launcher and typed guest Output, but its
+                // invocation provenance has the same public controller sink as
+                // every other backend and never enters either compared log.
+                self.emit_top_level_epoch_provenance(global)?;
                 let environment = self.guest_command()?.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
@@ -3283,7 +3303,6 @@ impl RunOpts {
                     self.backend_engagement_json.as_deref(),
                     global.log,
                     global.log_file.as_deref(),
-                    epoch_provenance.as_deref(),
                     &config,
                     environment,
                     self.workdir.as_deref().map(Path::new),
@@ -4331,6 +4350,13 @@ impl RunOpts {
 
     // Execution mode corresponding to `run --verify`:
     fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Verification redirects each physical run's diagnostics into private
+        // comparison logs. Emit invocation provenance once through the normal
+        // controller sink before installing either per-run subscriber, so a
+        // successful verification that discards those logs still leaves the
+        // exact replay epoch visible. This event is deliberately outside both
+        // compared streams and therefore cannot affect their equality.
+        self.emit_top_level_epoch_provenance(global)?;
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
         // below (a run that fails to start, a rejected first-run status, a SaBRe
         // capture with zero DETLOG) return early without ever reaching
@@ -5175,8 +5201,6 @@ impl RunOpts {
             BoundedWriter::new(log_file, limit),
             self.runtime_backend(),
         );
-        self.emit_virtual_epoch_provenance(true);
-
         let command = self.guest_command()?;
 
         let mut config = self.effective_det_config();

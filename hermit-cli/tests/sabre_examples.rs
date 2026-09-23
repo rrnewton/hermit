@@ -792,12 +792,14 @@ fn assert_sabre_verify(program: &Path, args: &[&str], epoch: &str, loader: &Path
         &format!("SaBRe strict portable verification for {label}"),
         None,
     );
-    assert!(
-        !String::from_utf8_lossy(&verify.stderr).contains("virtual-time epoch="),
-        "SaBRe verify leaked controller epoch provenance into guest stderr for {label}:\n{}",
-        String::from_utf8_lossy(&verify.stderr),
+    let expected_provenance = epoch_diagnostic(epoch);
+    let verify_stderr = String::from_utf8_lossy(&verify.stderr);
+    assert_eq!(
+        verify_stderr.matches(&expected_provenance).count(),
+        1,
+        "SaBRe verify must expose exactly one top-level epoch reproducer for {label}:\n{verify_stderr}",
     );
-    let mut provenance_logs = 0;
+    let mut comparison_logs = 0;
     for entry in std::fs::read_dir(&retained_logs)
         .unwrap_or_else(|error| panic!("failed to read retained logs for {label}: {error}"))
     {
@@ -812,13 +814,16 @@ fn assert_sabre_verify(program: &Path, args: &[&str], epoch: &str, loader: &Path
                     path.display()
                 )
             });
-            assert_epoch_diagnostic(&verify, &diagnostics, epoch, label);
-            provenance_logs += 1;
+            assert!(
+                !diagnostics.contains("virtual-time epoch="),
+                "SaBRe comparison log must exclude controller epoch provenance for {label}:\n{diagnostics}",
+            );
+            comparison_logs += 1;
         }
     }
     assert_eq!(
-        provenance_logs, 2,
-        "SaBRe verify must retain one provenance-bearing log per physical run for {label}",
+        comparison_logs, 2,
+        "SaBRe verify must retain one comparison log per physical run for {label}",
     );
     let diagnostics = format!(
         "{}{}",
