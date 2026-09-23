@@ -261,9 +261,10 @@ struct Envelope {
 
 pub fn prepared_envelope(paths: &BTreeMap<String, PathBuf>) -> Result<String, String> {
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
-        return Err(
-            "prepared record workload population must contain exactly all 42 aliases".into(),
-        );
+        return Err(format!(
+            "prepared record workload population must contain exactly all {} aliases",
+            names().count()
+        ));
     }
     let workloads = paths
         .iter()
@@ -310,9 +311,10 @@ pub fn consume_prepared(
         }
     }
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
-        return Err(
-            "prepared record workload population must contain exactly all 42 aliases".into(),
-        );
+        return Err(format!(
+            "prepared record workload population must contain exactly all {} aliases",
+            names().count()
+        ));
     }
     Ok(Some(
         names()

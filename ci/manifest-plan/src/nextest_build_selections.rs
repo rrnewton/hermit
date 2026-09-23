@@ -44,6 +44,14 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_parallelism"])
         }
+        "test.recorded_clocks" => Some(&[
+            "-p",
+            "hermit",
+            "--test",
+            "record_replay",
+            "--test",
+            "flock_exclusion",
+        ]),
         "test.hermit_integration" => Some(&[
             "-p",
             "hermit",
@@ -649,6 +657,68 @@ mod tests {
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }
+        // The focused preparation remains an ordinary committed producer.
+        // Full preparation must publish last because both use current.json.
+        let focused =
+            crate::nextest_binaries::config_selections(&graph, "recorder-clock-focused").unwrap();
+        let clock_args = for_step("test.recorded_clocks")
+            .unwrap()
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(focused.len(), 1);
+        assert_eq!(focused.values().next(), Some(&clock_args));
+        assert!(!clock_args.iter().any(|arg| arg == "--features"));
+        for suffix in ["", "_in_pinned_root", "_on_host"] {
+            let workspace = graph
+                .steps
+                .iter()
+                .find(|step| step.tag() == format!("build.workspace{suffix}"))
+                .unwrap();
+            assert!(
+                workspace
+                    .deps
+                    .contains(&format!("build.recorded_clocks{suffix}"))
+            );
+        }
+        for (consumer, producer) in [
+            (
+                "test.recorded_clocks",
+                "build.recorded_clocks_in_pinned_root",
+            ),
+            (
+                "test.recorded_clocks_on_host",
+                "build.recorded_clocks_on_host",
+            ),
+        ] {
+            let step = graph
+                .steps
+                .iter()
+                .find(|step| step.tag() == consumer)
+                .unwrap();
+            assert_command_selection(step).unwrap();
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "4");
+            assert!(step.deps.iter().any(|dependency| dependency == producer));
+            let args: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
+            assert_eq!(args, clock_args);
+        }
+        // A consumer with only the focused producer must be covered. Removing
+        // that edge refuses even while broad producers exist elsewhere.
+        // Keep the committed graph here: preparation resolves its label there,
+        // independently of the execution-time --only subgraph.
+        let mut focused_only = graph.clone();
+        focused_only
+            .steps
+            .sort_by_key(|step| step.tag() != "test.recorded_clocks_on_host");
+        focused_only.steps[0].deps = vec!["build.recorded_clocks_on_host".into()];
+        assert_preparation_dependencies(&focused_only).unwrap();
+        focused_only.steps[0].deps.clear();
+        let error = assert_preparation_dependencies(&focused_only).unwrap_err();
+        assert!(
+            error.starts_with("test.recorded_clocks_on_host")
+                && error.contains("same filesystem root"),
+            "{error}"
+        );
         for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
             let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
             let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();

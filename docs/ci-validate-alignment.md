@@ -77,6 +77,27 @@ configuration is never read.
 
 ## DAG wiring
 
+The focused `test.recorded_clocks` node runs four maintained ptrace cases:
+captured clock output/errno replay, uncaptured clock refusal, previous-clock
+format refusal, and the existing pre-flock format refusal. Its hosted twin is
+assigned to the portable workflow's integration shard; both require exactly
+four executed tests. The `recorder-clock-focused` label prepares only the two
+default-feature harnesses and the 43 source-bound `record_replay` workloads.
+The flock fixture retains its existing runtime `cc` compilation inside the
+unchanged per-test bounds; it is not part of that prepared workload population.
+`build.recorded_clocks` runs before `build.workspace`, so full preparation is
+the last metadata publisher in broad profiles. An explicit focused selection
+must include the focused producer and test, in the same filesystem root;
+selecting only the test does not supply its prepared artifacts. The new
+producer adds a provisional 1200-second cold-build bound to the hosted debug
+job's existing 1800-second critical path. The selected path is now
+`setup.nextest` (600 seconds), focused preparation (1200 seconds), then
+`build.workspace` (1200 seconds). Its 55-minute outer budget covers those 3000
+seconds plus 300 seconds of setup and artifact overhead. The CI audit derives
+this path from the actual selected DAG nodes and compares it with the workflow
+bound; these are declared budgets, not a measured cold-build duration. The
+four tests retain their existing 22-second CPU and 57-second wall limits.
+
 `ci/dag/validate.json` is the single committed validation graph. Its `portable`
 label selects one metadata node and one resource-serialized E2E node per
 category, plus their dependency closure. Its `privileged` label selects:

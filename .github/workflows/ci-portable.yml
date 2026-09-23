@@ -448,10 +448,13 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    # The selected debug DAG has a 1560s critical path after e2e.metadata's
-    # measured budget rose from 60s to 180s. Keep the hosted job
-    # outside that path plus at least 300s for setup and artifact overhead.
-    timeout-minutes: 35
+    # The actual selected debug path is setup.nextest (600s), focused recorder
+    # preparation (1200s), then build.workspace (1200s): 3000s total. The
+    # 55-minute job adds 300s for setup/artifact overhead. test-harness audits
+    # this path from the selected DAG nodes and this outer bound. The new
+    # producer's cold-build bound is provisional, not a measured duration;
+    # its limits and the clock tests' 22s CPU/57s wall stay intact.
+    timeout-minutes: 55
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       e2e_count: ${{ steps.cells.outputs.count }}
