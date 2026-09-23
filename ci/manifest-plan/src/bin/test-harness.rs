@@ -48,6 +48,7 @@ const VALIDATE_AUDIT_JOBS: usize = 2;
 const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
 const SCHEDULED_BUILD_JOBS: &str = "CARGO_BUILD_JOBS";
 const DEFAULT_BUILD_JOBS: usize = 16;
+const SABRE_PACKAGED_GATE_TEST: &str = "c-programs/add-key-enosys";
 
 const HELP: &str = "\
 Usage: test-harness <COMMAND> [OPTIONS]
@@ -81,6 +82,7 @@ Selection options:
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
+  --require-sabre-packaged-gate   Require the exact packaged SaBRe C path gate (run only)
   --allow-empty                    Permit an empty explicit CI selection
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
@@ -196,6 +198,7 @@ fn print_command_help(command: &str) -> bool {
              --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
              --parity-reference <ptrace>       Compare non-ptrace verify cells; other selected cells run normally\n  \
              --prebuilt                       Reuse prepared test programs\n  \
+             --require-sabre-packaged-gate   Require the exact packaged SaBRe C path gate\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
              --junit <PATH>                   Write JUnit output to PATH\n  \
@@ -252,6 +255,7 @@ struct Args {
     allow_empty: bool,
     ci_only: bool,
     probe_disabled: bool,
+    require_sabre_packaged_gate: bool,
     parity_reference: Option<String>,
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
@@ -314,6 +318,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.probe_disabled = true;
                 args.selection.population = Some(Population::Disabled);
             }
+            "--require-sabre-packaged-gate" => args.require_sabre_packaged_gate = true,
             "--parity-reference" => set_once(
                 &mut args.parity_reference,
                 &mut values,
@@ -536,6 +541,30 @@ fn validate_args(command: &str, args: &Args) {
         }
         if args.selection.backend.as_deref() == Some(reference) {
             fail("--parity-reference must differ from the explicit candidate --backend");
+        }
+    }
+    if args.require_sabre_packaged_gate {
+        if command != "run" {
+            fail("--require-sabre-packaged-gate is accepted by run only");
+        }
+        if !args.prebuilt
+            || args.jobs != Some(1)
+            || args.selection.lane.as_deref() != Some("portable")
+            || args.selection.category.as_deref() != Some("c-programs")
+            || args.selection.test.as_deref() != Some(SABRE_PACKAGED_GATE_TEST)
+            || args.selection.mode.as_deref() != Some("verify")
+            || args.selection.backend.as_deref() != Some("sabre")
+            || args.selection.include_manual
+            || args.selection.include_occasional
+            || args.ci_only
+            || args.probe_disabled
+            || args.parity_reference.is_some()
+        {
+            fail(
+                "--require-sabre-packaged-gate requires exactly --lane portable \
+                 --category c-programs --test c-programs/add-key-enosys --mode verify \
+                 --backend sabre --prebuilt --jobs 1 without population or parity overrides",
+            );
         }
     }
     if args.allow_empty {
@@ -2153,6 +2182,112 @@ fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) 
     }
 }
 
+fn require_json_bool(value: &JsonValue, field: &str, expected: bool) -> Result<(), String> {
+    match value.get(field).and_then(JsonValue::as_bool) {
+        Some(actual) if actual == expected => Ok(()),
+        actual => Err(format!(
+            "SaBRe packaged gate requires {field}={expected}, got {actual:?}"
+        )),
+    }
+}
+
+fn require_json_u64(value: &JsonValue, field: &str, expected: u64) -> Result<(), String> {
+    match value.get(field).and_then(JsonValue::as_u64) {
+        Some(actual) if actual == expected => Ok(()),
+        actual => Err(format!(
+            "SaBRe packaged gate requires {field}={expected}, got {actual:?}"
+        )),
+    }
+}
+
+fn require_empty_json_array(value: &JsonValue, field: &str) -> Result<(), String> {
+    match value.get(field).and_then(JsonValue::as_array) {
+        Some(actual) if actual.is_empty() => Ok(()),
+        actual => Err(format!(
+            "SaBRe packaged gate requires {field} to be present and empty, got {actual:?}"
+        )),
+    }
+}
+
+fn validate_sabre_packaged_gate_row(
+    test: &str,
+    lane: &str,
+    category: &str,
+    mode: &str,
+    backend: Option<&str>,
+    outcome: &str,
+    execution_path: Option<&JsonValue>,
+) -> Result<(), String> {
+    if (test, lane, category, mode, backend)
+        != (
+            SABRE_PACKAGED_GATE_TEST,
+            "portable",
+            "c-programs",
+            "verify",
+            Some("sabre"),
+        )
+    {
+        return Err(format!(
+            "SaBRe packaged gate returned the wrong cell: {lane}/{category}/{test}/{mode}@{}",
+            backend.unwrap_or("native")
+        ));
+    }
+    if outcome != "PASS" {
+        return Err(format!("SaBRe packaged gate requires PASS, got {outcome}"));
+    }
+    let path = execution_path.ok_or("SaBRe packaged gate omitted execution_path")?;
+    require_json_u64(path, "schema", 1)?;
+    require_json_bool(path, "complete", true)?;
+    require_json_u64(path, "expected_execution_count", 2)?;
+    require_json_u64(path, "execution_count", 2)?;
+    require_json_bool(path, "guest_rpc_observed", true)?;
+    require_json_u64(path, "ptrace_fallback_sites", 0)?;
+    require_json_u64(path, "trusted_shared_object_sites", 0)?;
+    require_empty_json_array(path, "trusted_shared_objects")?;
+    require_json_bool(path, "eligible", true)?;
+    let executions = path
+        .get("executions")
+        .and_then(JsonValue::as_array)
+        .ok_or("SaBRe packaged gate execution_path.executions is not an array")?;
+    if executions.len() != 2 {
+        return Err(format!(
+            "SaBRe packaged gate requires exactly 2 execution records, got {}",
+            executions.len()
+        ));
+    }
+    for (index, execution) in executions.iter().enumerate() {
+        require_json_u64(execution, "schema", 1)
+            .map_err(|error| format!("execution {}: {error}", index + 1))?;
+        require_json_bool(execution, "guest_rpc_observed", true)
+            .map_err(|error| format!("execution {}: {error}", index + 1))?;
+        require_json_u64(execution, "ptrace_fallback_sites", 0)
+            .map_err(|error| format!("execution {}: {error}", index + 1))?;
+        require_json_u64(execution, "trusted_shared_object_sites", 0)
+            .map_err(|error| format!("execution {}: {error}", index + 1))?;
+        require_empty_json_array(execution, "trusted_shared_objects")
+            .map_err(|error| format!("execution {}: {error}", index + 1))?;
+    }
+    Ok(())
+}
+
+fn validate_sabre_packaged_gate(results: &[CellResult]) -> Result<(), String> {
+    let [result] = results else {
+        return Err(format!(
+            "SaBRe packaged gate requires exactly one terminal cell, got {}",
+            results.len()
+        ));
+    };
+    validate_sabre_packaged_gate_row(
+        &result.test,
+        &result.lane,
+        &result.category,
+        &result.mode,
+        result.backend.as_deref(),
+        &result.outcome,
+        result.execution_path.as_ref(),
+    )
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -2357,6 +2492,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .into_iter()
         .map(|(_, result)| result)
         .collect::<Vec<_>>();
+    if args.require_sabre_packaged_gate {
+        match validate_sabre_packaged_gate(&results) {
+            Ok(()) => println!(
+                "PASS: packaged SaBRe C gate reached Detcore through both strict-verification executions"
+            ),
+            Err(error) => {
+                eprintln!("test-harness: {error}");
+                failed = true;
+            }
+        }
+    }
     if expected > 0 {
         println!(
             "test-harness: completed {} cell(s) with up to {} concurrent worker(s)",
@@ -2460,7 +2606,128 @@ mod tests {
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
     use super::validate_args;
+    use super::validate_sabre_packaged_gate_row;
     use super::validation_audit_worker_capacity;
+
+    fn valid_sabre_packaged_path() -> serde_json::Value {
+        let execution = serde_json::json!({
+            "schema": 1,
+            "guest_rpc_observed": true,
+            "ptrace_fallback_sites": 0,
+            "trusted_shared_object_sites": 0,
+            "trusted_shared_objects": [],
+        });
+        serde_json::json!({
+            "schema": 1,
+            "expected_execution_count": 2,
+            "complete": true,
+            "execution_count": 2,
+            "guest_rpc_observed": true,
+            "ptrace_fallback_sites": 0,
+            "trusted_shared_object_sites": 0,
+            "trusted_shared_objects": [],
+            "eligible": true,
+            "executions": [execution.clone(), execution],
+        })
+    }
+
+    fn validate_gate_path(outcome: &str, path: &serde_json::Value) -> Result<(), String> {
+        validate_sabre_packaged_gate_row(
+            "c-programs/add-key-enosys",
+            "portable",
+            "c-programs",
+            "verify",
+            Some("sabre"),
+            outcome,
+            Some(path),
+        )
+    }
+
+    #[test]
+    fn packaged_sabre_gate_requires_every_aggregate_and_execution_field() {
+        let valid = valid_sabre_packaged_path();
+        assert!(validate_gate_path("PASS", &valid).is_ok());
+        assert!(validate_gate_path("FAIL", &valid).is_err());
+        assert!(
+            validate_sabre_packaged_gate_row(
+                "c-programs/rcx-canonicalization",
+                "portable",
+                "c-programs",
+                "verify",
+                Some("sabre"),
+                "PASS",
+                Some(&valid),
+            )
+            .is_err()
+        );
+
+        let mut mutations = Vec::new();
+        for (field, value) in [
+            ("schema", serde_json::json!(2)),
+            ("complete", serde_json::json!(false)),
+            ("expected_execution_count", serde_json::json!(1)),
+            ("execution_count", serde_json::json!(1)),
+            ("guest_rpc_observed", serde_json::json!(false)),
+            ("ptrace_fallback_sites", serde_json::json!(1)),
+            ("trusted_shared_object_sites", serde_json::json!(1)),
+            ("eligible", serde_json::json!(false)),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
+            mutations.push((format!("aggregate {field}"), changed));
+        }
+        let mut short = valid.clone();
+        short["executions"].as_array_mut().unwrap().pop();
+        mutations.push(("missing execution".into(), short));
+        for (index, field, value) in [
+            (0, "schema", serde_json::json!(2)),
+            (0, "guest_rpc_observed", serde_json::json!(false)),
+            (1, "ptrace_fallback_sites", serde_json::json!(1)),
+            (1, "trusted_shared_object_sites", serde_json::json!(1)),
+        ] {
+            let mut changed = valid.clone();
+            changed["executions"][index][field] = value;
+            mutations.push((format!("execution {} {field}", index + 1), changed));
+        }
+        let mut absent = valid.clone();
+        absent.as_object_mut().unwrap().remove("eligible");
+        mutations.push(("missing eligible".into(), absent));
+        for (label, field) in [
+            ("aggregate trusted objects", "trusted_shared_objects"),
+            (
+                "aggregate missing trusted objects",
+                "trusted_shared_objects",
+            ),
+        ] {
+            let mut changed = valid.clone();
+            if label.contains("missing") {
+                changed.as_object_mut().unwrap().remove(field);
+            } else {
+                changed[field] = serde_json::json!(["/lib/forbidden.so"]);
+            }
+            mutations.push((label.into(), changed));
+        }
+        let mut execution_objects = valid.clone();
+        execution_objects["executions"][0]["trusted_shared_objects"] =
+            serde_json::json!(["/lib/forbidden.so"]);
+        mutations.push(("execution trusted objects".into(), execution_objects));
+        let mut missing_execution_objects = valid.clone();
+        missing_execution_objects["executions"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("trusted_shared_objects");
+        mutations.push((
+            "execution missing trusted objects".into(),
+            missing_execution_objects,
+        ));
+
+        for (label, mutation) in mutations {
+            assert!(
+                validate_gate_path("PASS", &mutation).is_err(),
+                "mutation {label} was accepted: {mutation}"
+            );
+        }
+    }
 
     #[test]
     fn ptrace_parity_policy_is_explicit_and_independent_of_selection() {
