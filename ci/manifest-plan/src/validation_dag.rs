@@ -1264,7 +1264,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         };
         let command = crate::nextest_build_selections::execution_command(step)?;
-        if command.contains("NEXTEST_EXPECTED_EXECUTED") {
+        if command.contains("NEXTEST_EXPECTED_EXECUTED=") {
             return Err(format!(
                 "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
             ));

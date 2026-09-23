@@ -435,7 +435,8 @@ fn proc_uptime_uses_virtual_time() {
 
     // Snapshot construction computes every shared procfs context field even
     // when the selected file does not render btime. A valid early epoch must
-    // therefore neither fail this unrelated read nor lose signed boot time.
+    // therefore neither fail this unrelated read nor emit the negative btime
+    // token Linux's unsigned procfs field cannot represent.
     let epoch_zero = "1970-01-01T00:00:00Z";
     assert_eq!(
         read_procfs_at_epoch("/proc/uptime", Some(epoch_zero)),
@@ -443,9 +444,9 @@ fn proc_uptime_uses_virtual_time() {
     );
     let stat = read_procfs_at_epoch("/proc/stat", Some(epoch_zero));
     assert!(
-        stat.windows(b"btime -120\n".len())
-            .any(|window| window == b"btime -120\n"),
-        "epoch-zero proc stat omitted signed btime: {}",
+        stat.windows(b"btime 0\n".len())
+            .any(|window| window == b"btime 0\n"),
+        "epoch-zero proc stat did not clamp btime to Linux's unsigned domain: {}",
         String::from_utf8_lossy(&stat),
     );
 }

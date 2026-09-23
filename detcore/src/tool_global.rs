@@ -828,7 +828,7 @@ impl GlobalState {
             let final_time = self.global_time.lock().unwrap();
             let final_time_ns = final_time.as_nanos();
             summary.virttime_final = final_time_ns.as_nanos();
-            summary.virttime_elapsed = final_time.elapsed_nanos().as_nanos();
+            summary.virttime_elapsed = final_time.elapsed_nanos()?.as_nanos();
         }
 
         Ok((summary, info_reprio_descrip))

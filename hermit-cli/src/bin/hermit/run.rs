@@ -2929,23 +2929,7 @@ impl RunOpts {
         })
     }
 
-    /// Record the selected epoch in the active controller diagnostic sink.
-    ///
-    /// The default controller-stderr form deliberately has no host timestamp:
-    /// it is stable invocation provenance, not guest output. When a log-file
-    /// sink is active, use its tracing subscriber so the event follows that
-    /// sink's normal framing and remains out of process stderr.
-    fn emit_virtual_epoch_provenance(&self, log_file_sink: bool) {
-        if let Some(provenance) = self.virtual_epoch_provenance() {
-            if log_file_sink {
-                tracing::warn!(target: "hermit::virtual_time", "{provenance}");
-            } else {
-                eprintln!("WARN hermit::virtual_time: {provenance}");
-            }
-        }
-    }
-
-    /// Emit verify-wide provenance before either comparison subscriber exists.
+    /// Emit invocation-wide provenance before any per-run subscriber exists.
     ///
     /// `tracing` installs a process-global subscriber that cannot be replaced
     /// by the synchronous per-run subscribers. For `--log-file`, write through
@@ -3269,6 +3253,11 @@ impl RunOpts {
         } else {
             None
         };
+        // Emit exactly once for both ordinary and verified runs. In particular,
+        // do this outside `run_in_container`: tracing subscribers deliberately
+        // swallow writer failures, but losing the only replayable epoch must
+        // fail the invocation closed.
+        self.emit_top_level_epoch_provenance(global)?;
         // });
 
         // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
@@ -3283,7 +3272,6 @@ impl RunOpts {
                 // DBT owns a separate launcher and typed guest Output, but its
                 // invocation provenance has the same public controller sink as
                 // every other backend and never enters either compared log.
-                self.emit_top_level_epoch_provenance(global)?;
                 let environment = self.guest_command()?.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
@@ -4356,7 +4344,6 @@ impl RunOpts {
         // successful verification that discards those logs still leaves the
         // exact replay epoch visible. This event is deliberately outside both
         // compared streams and therefore cannot affect their equality.
-        self.emit_top_level_epoch_provenance(global)?;
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
         // below (a run that fails to start, a rejected first-run status, a SaBRe
         // capture with zero DETLOG) return early without ever reaching
@@ -5086,10 +5073,6 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
-        self.emit_virtual_epoch_provenance(
-            global.log_file.is_some() || global.log_file_handle.is_some(),
-        );
-
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
         }

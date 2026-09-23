@@ -683,7 +683,10 @@ impl DetTime {
     /// Same as as_nanos but without the starting time.
     pub fn without_starting(&self) -> LogicalDuration {
         let LogicalTime(t1) = self.as_nanos();
-        LogicalTime(t1 - self.starting_nanos)
+        LogicalTime(
+            t1.checked_sub(self.starting_nanos)
+                .expect("local virtual time regressed before its immutable origin"),
+        )
     }
 
     // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
@@ -721,7 +724,7 @@ impl DetTime {
 
     /// Project deterministic time duration from imaginary starting point of deterministic time creation
     pub fn as_duration(&self) -> std::time::Duration {
-        std::time::Duration::from_nanos(self.as_nanos().0 - self.starting_nanos)
+        std::time::Duration::from_nanos(self.without_starting().as_nanos())
     }
 }
 
@@ -820,7 +823,12 @@ impl GlobalTime {
         }
 
         // TODO(T136359599): change to duration_since, and store durations in time_vector:
-        let newtime = newtime - self.starting_nanos;
+        let newtime = LogicalTime::from_nanos(
+            newtime
+                .as_nanos()
+                .checked_sub(self.starting_nanos.as_nanos())
+                .expect("checked thread clock still preceded its immutable origin"),
+        );
         trace!(
             "[tid {}] ticked its global time component to {}",
             tid, newtime,
@@ -833,7 +841,10 @@ impl GlobalTime {
                 );
             }
             // Update the cached total for efficiency:
-            let LogicalTime(diff) = newtime - *old;
+            let diff = newtime
+                .as_nanos()
+                .checked_sub(old.as_nanos())
+                .expect("checked thread clock update regressed");
             *old = newtime;
             // Exec may reload fresh local state. Its first response restores
             // the absolute clock, while this existing component retains the
@@ -849,7 +860,11 @@ impl GlobalTime {
             // A child's first startup RPC reports its inherited clock before
             // it has executed guest work. Its arrival must contribute zero,
             // whether it precedes or follows the scheduler's time snapshot.
-            self.bump_total(Duration::from_nanos((newtime - inherited).0));
+            let own_time = newtime
+                .as_nanos()
+                .checked_sub(inherited.as_nanos())
+                .expect("checked inherited clock exceeded the child clock");
+            self.bump_total(Duration::from_nanos(own_time));
         }
     }
 
@@ -875,7 +890,11 @@ impl GlobalTime {
         for (tid, tm) in &self.time_vector {
             sum = LogicalTime::from_nanos(
                 sum.as_nanos()
-                    .checked_add((*tm - self.inherited_duration(*tid)).as_nanos())
+                    .checked_add(
+                        tm.as_nanos()
+                            .checked_sub(self.inherited_duration(*tid).as_nanos())
+                            .expect("thread clock regressed before its inherited baseline"),
+                    )
                     .expect("global virtual time overflowed while summing thread progress"),
             );
         }
@@ -951,7 +970,11 @@ impl GlobalTime {
         let survivor_inherited = self.inherited_time.remove(&from).unwrap_or_default();
         let retired_inherited = self.inherited_time.remove(&to).unwrap_or_default();
         if let Some(retired_leader_time) = self.time_vector.remove(&to) {
-            self.extra_time = self.extra_time + (retired_leader_time - retired_inherited);
+            let retired_own_time = retired_leader_time
+                .as_nanos()
+                .checked_sub(retired_inherited.as_nanos())
+                .expect("retired leader clock regressed before its inherited baseline");
+            self.extra_time = self.extra_time + LogicalTime::from_nanos(retired_own_time);
         }
         self.time_vector.insert(to, survivor_time);
         self.inherited_time.insert(to, survivor_inherited);
@@ -983,13 +1006,14 @@ impl GlobalTime {
     }
 
     /// Project aggregate progress since this clock's own immutable origin.
-    pub fn elapsed_nanos(&self) -> LogicalDuration {
-        LogicalTime::from_nanos(
-            self.total
-                .as_nanos()
-                .checked_sub(self.starting_nanos.as_nanos())
-                .expect("global virtual time regressed before its immutable origin"),
-        )
+    pub fn elapsed_nanos(&self) -> anyhow::Result<LogicalDuration> {
+        self.total
+            .as_nanos()
+            .checked_sub(self.starting_nanos.as_nanos())
+            .map(LogicalTime::from_nanos)
+            .ok_or_else(|| {
+                anyhow::anyhow!("global virtual time regressed before its immutable origin")
+            })
     }
 }
 
@@ -1037,15 +1061,14 @@ mod global_time_tests {
             second_time.as_nanos() - time.as_nanos(),
             LogicalTime::from_nanos(1),
         );
-        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO);
+        assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::ZERO);
         time.add_extra_time(Duration::from_nanos(1));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(1));
+        assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::from_nanos(1));
         time.add_extra_time(Duration::from_nanos(1));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(2));
+        assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::from_nanos(2));
     }
 
     #[test]
-    #[should_panic(expected = "global virtual time regressed before its immutable origin")]
     fn elapsed_nanos_rejects_time_before_immutable_origin() {
         let config = Config {
             epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
@@ -1054,7 +1077,11 @@ mod global_time_tests {
         let mut time = GlobalTime::new(&config);
         time.total = LogicalTime::ZERO;
 
-        let _ = time.elapsed_nanos();
+        let error = time.elapsed_nanos().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "global virtual time regressed before its immutable origin"
+        );
     }
 
     #[test]
@@ -1084,7 +1111,10 @@ mod global_time_tests {
         time.add_extra_time(hundred_years);
 
         assert_eq!(origin, LogicalTime::from_nanos(max_epoch_nanos));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO + hundred_years);
+        assert_eq!(
+            time.elapsed_nanos().unwrap(),
+            LogicalTime::ZERO + hundred_years
+        );
         assert_eq!(time.as_nanos(), origin + hundred_years);
     }
 
