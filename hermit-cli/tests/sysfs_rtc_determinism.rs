@@ -88,6 +88,7 @@ fn assert_l2(case: &ProgramCase) {
             "--verify",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
+            "--epoch=2026-01-01T00:00:00Z",
             "--",
         ])
         .arg(program)

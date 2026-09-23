@@ -64,6 +64,7 @@ impl ReplayOpts {
                 .last_id()
                 .context("Failed to find last recording ID")?,
         };
+        let mut prepared_replay = Some(hermit.prepare_replay(id)?);
 
         if self.autopilot || self.serve_only {
             let (mut container, identity) = deterministic_container()?;
@@ -72,12 +73,17 @@ impl ReplayOpts {
             let resources = format!("replay {} and identity mounts", hermit.data_dir().display());
             super::owned_container::run(
                 &mut container,
-                (identity, hermit),
+                (identity, hermit, prepared_replay),
                 resources,
                 true,
                 "with_container",
                 None,
-                move |(_, hermit)| options.container_main(&global, options.autopilot, hermit, id),
+                move |(_, _, prepared)| {
+                    let prepared = prepared
+                        .take()
+                        .ok_or_else(|| Error::msg("replay trace reservation was consumed twice"))?;
+                    options.container_main(&global, options.autopilot, prepared)
+                },
             )
             .map(|(value, _guards)| value)
         } else {
@@ -120,7 +126,7 @@ impl ReplayOpts {
             // landed commit message where it cannot be edited.
             let gdb_watch = GdbClientWatch::spawn(gdb_command, self.gdbserver_port)?;
             let (mut container, identity) = deterministic_container()?;
-            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch)));
+            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch, prepared_replay)));
             let resources = format!(
                 "replay {}, identity mounts and GDB watcher",
                 guards.borrow().1.data_dir().display()
@@ -135,7 +141,11 @@ impl ReplayOpts {
                 "with_container",
                 None,
                 move |guards| {
-                    options.container_main(&global, options.autopilot, &guards.borrow().1, id)
+                    let prepared =
+                        guards.borrow_mut().3.take().ok_or_else(|| {
+                            Error::msg("replay trace reservation was consumed twice")
+                        })?;
+                    options.container_main(&global, options.autopilot, prepared)
                 },
             );
             // On unresolved cleanup the factory retains the SAME guard scope.
@@ -163,15 +173,16 @@ impl ReplayOpts {
         &self,
         global: &GlobalOpts,
         autopilot: bool,
-        hermit: &HermitData,
-        id: Id,
+        prepared_replay: hermit::PreparedFullReplayTrace,
     ) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
+        // Both callers enter through deterministic_container/with_container.
+        let prepared_replay = prepared_replay.with_owned_controller_shutdown();
 
         if autopilot {
-            hermit.replay(id)
+            hermit::replay_from(prepared_replay)
         } else {
-            hermit.replay_with_gdbserver(id, self.gdbserver_port)
+            hermit::replay_with_gdbserver(prepared_replay, self.gdbserver_port)
         }
     }
 }

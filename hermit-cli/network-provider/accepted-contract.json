@@ -1,0 +1,194 @@
+{
+  "schema": 1,
+  "abi_version": "4150525553540001",
+  "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
+  "maps": 17,
+  "programs": 25,
+  "links": 25,
+  "source_files": [
+    "provider.bpf.c",
+    "driver.c",
+    "provider.h",
+    "provider-abi.h",
+    "auth-diagnostic.h",
+    "setter-level.h",
+    "adapter-abi.c",
+    "fd-effects.h",
+    "fd-effects.bpf.h",
+    "fd-effects-driver.h"
+  ],
+  "hooks": {
+    "sk_getsockopt": [
+      [
+        8,
+        4,
+        4,
+        16,
+        16
+      ],
+      7,
+      4
+    ],
+    "sk_setsockopt": [
+      [
+        8,
+        4,
+        4,
+        16,
+        4
+      ],
+      6,
+      4
+    ],
+    "tcp_setsockopt": [
+      [
+        8,
+        4,
+        4,
+        16,
+        4
+      ],
+      6,
+      4
+    ],
+    "tcp_v4_syn_recv_sock": [
+      [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      7,
+      8
+    ],
+    "inet_csk_complete_hashdance": [
+      [
+        8,
+        8,
+        8,
+        1
+      ],
+      4,
+      8
+    ],
+    "__sk_free": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "__sys_accept4": [
+      [
+        4,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "inet_accept": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ],
+    "inet_csk_accept": [
+      [
+        8,
+        8
+      ],
+      2,
+      8
+    ],
+    "do_accept": [
+      [
+        8,
+        8,
+        8,
+        8,
+        4
+      ],
+      5,
+      8
+    ],
+    "fd_install": [
+      [
+        4,
+        8
+      ],
+      2,
+      0
+    ],
+    "file_close_fd_locked": [
+      [
+        8,
+        4
+      ],
+      2,
+      8
+    ],
+    "do_dup2": [
+      [
+        8,
+        8,
+        4,
+        4
+      ],
+      4,
+      4
+    ],
+    "filp_close": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "__fput": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "do_close_on_exec": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "dup_fd": [
+      [
+        8,
+        8
+      ],
+      2,
+      8
+    ],
+    "put_files_struct": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "kmem_cache_free": [
+      [
+        8,
+        8
+      ],
+      2,
+      0
+    ]
+  }
+}

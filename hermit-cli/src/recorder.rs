@@ -305,6 +305,19 @@ fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> b
     saw_any && !compared
 }
 
+/// Syscalls which Detcore's shared network engine owns for new recordings.
+pub(crate) fn shared_network_syscall(syscall: &Syscall) -> bool {
+    matches!(
+        syscall,
+        Syscall::Socket(_)
+            | Syscall::Connect(_)
+            | Syscall::Sendto(_)
+            | Syscall::Sendmsg(_)
+            | Syscall::Recvfrom(_)
+            | Syscall::Recvmsg(_)
+    )
+}
+
 /// A Reverie tool that records syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
@@ -326,6 +339,9 @@ pub struct Recorder {
     stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
     #[serde(skip)]
     stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
+    /// New-format network syscalls must be consumed by Detcore, not this
+    /// per-thread legacy event stream.
+    network_trace_owned_by_detcore: bool,
 }
 
 impl Default for Recorder {
@@ -336,6 +352,7 @@ impl Default for Recorder {
             stderr: None,
             stdout_ofd: Mutex::new(None),
             stderr_ofd: Mutex::new(None),
+            network_trace_owned_by_detcore: false,
         }
     }
 }
@@ -352,6 +369,7 @@ impl Tool for Recorder {
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
             stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
             stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            network_trace_owned_by_detcore: cfg.network_trace.uses_trace(),
         }
     }
 
@@ -466,6 +484,11 @@ impl Tool for Recorder {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
+        if self.network_trace_owned_by_detcore && shared_network_syscall(&syscall) {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "shared network engine forwarded a network syscall to the legacy Recorder event stream"
+            )));
+        }
         self.record_raw_syscall(guest, syscall);
 
         Ok(match syscall {

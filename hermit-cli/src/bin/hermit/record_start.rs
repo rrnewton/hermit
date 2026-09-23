@@ -21,6 +21,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use clap::Args;
+#[cfg(test)]
+use clap::Parser;
 use colored::Colorize;
 use hermit::Backend;
 use hermit::Context;
@@ -42,6 +44,9 @@ use reverie::process::MountFlags;
 use super::container::IdentityGuard;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
+use super::container::isolate_replay_network;
+#[cfg(test)]
+use super::container::with_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
@@ -410,6 +415,18 @@ impl StartOpts {
         Ok((container, identity_guard))
     }
 
+    /// Build the physical container for full replay.
+    ///
+    /// Recording deliberately retains the controller's network namespace so it
+    /// can capture controlled live traffic. Replay adds an independent Linux
+    /// namespace boundary with loopback down; the shared trace engine is then
+    /// the only source of guest-visible external networking.
+    fn replay_container(&self) -> Result<(Container, IdentityGuard), Error> {
+        let (mut container, identity_guard) = self.configured_container()?;
+        isolate_replay_network(&mut container);
+        Ok((container, identity_guard))
+    }
+
     fn recording_container(
         &self,
         global: &GlobalOpts,
@@ -442,18 +459,21 @@ impl StartOpts {
         } else {
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
+            let epoch = detcore_model::config::capture_current_epoch();
+            let data = hermit.create_recording_dir()?;
+            let data_path = data.path().to_path_buf();
+            let mut prepared_trace = Some(hermit::PreparedFullRecordTrace::reserve(&data_path)?);
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
             // Parent-owned for BOTH deadline and unbounded spellings. No
             // metadata/last-id commit occurs before real successful completion.
-            let data = hermit.create_recording_dir()?;
             let resources = format!("recording {} and identity mounts", data.path().display());
             let options = self.clone();
             let global = global.clone();
-            let (exit_status, (data, _identity)) = super::owned_container::run(
+            let (exit_status, (data, _identity, _prepared)) = super::owned_container::run(
                 &mut container,
-                (data, identity_guard),
+                (data, identity_guard, prepared_trace),
                 resources,
                 true,
                 if record_timeout.is_some() {
@@ -462,15 +482,20 @@ impl StartOpts {
                     "record.main"
                 },
                 None,
-                move |(data, identity)| {
+                move |(data, identity, prepared)| {
                     let _guard = global.init_tracing();
                     let command = options.guest_command()?;
                     let mountinfo = identity.mountinfo_root_rewrites()?;
+                    let prepared = prepared
+                        .take()
+                        .ok_or_else(|| Error::msg("record trace reservation was consumed twice"))?;
                     match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
-                            hermit::record_to_with_mountinfo(command, data.path(), mountinfo)
+                            hermit::record_to_with_mountinfo(command, prepared, mountinfo, epoch)
                         }),
-                        None => hermit::record_to_with_mountinfo(command, data.path(), mountinfo),
+                        None => {
+                            hermit::record_to_with_mountinfo(command, prepared, mountinfo, epoch)
+                        }
                     }
                 },
             )?;
@@ -514,50 +539,64 @@ impl StartOpts {
             temp_data_dir.path().display()
         );
         let record_timeout = self.record_timeout();
+        let epoch = detcore_model::config::capture_current_epoch();
+        let prepared_trace = Some(hermit::PreparedFullRecordTrace::reserve(
+            temp_data_dir.path(),
+        )?);
         let options = self.clone();
         let record_global = global1.clone();
-        let (recording, (temp_data_dir, _record_identity, log1, log2)) =
+        let (recording, (temp_data_dir, _record_identity, log1, log2, _prepared)) =
             super::owned_container::run(
                 &mut recording_container,
-                (temp_data_dir, record_identity_guard, log1, log2),
+                (
+                    temp_data_dir,
+                    record_identity_guard,
+                    log1,
+                    log2,
+                    prepared_trace,
+                ),
                 resources.clone(),
                 true,
                 "record_verify.record",
                 None,
-                move |(data, identity, _, _)| {
+                move |(data, identity, _, _, prepared)| {
                     let _guard = record_global.init_tracing();
                     let command = options.guest_command()?;
                     let mountinfo = identity.mountinfo_root_rewrites()?;
+                    let prepared = prepared
+                        .take()
+                        .ok_or_else(|| Error::msg("record trace reservation was consumed twice"))?;
                     match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
                             hermit::record_with_output_with_mountinfo(
-                                command,
-                                data.path(),
-                                mountinfo,
+                                command, prepared, mountinfo, epoch,
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
-                            command,
-                            data.path(),
-                            mountinfo,
+                            command, prepared, mountinfo, epoch,
                         ),
                     }
                 },
             )?;
         eprintln!(":: {}", "Replaying...".yellow().bold());
-        let (mut replay_container, replay_identity) = self.configured_container()?;
+        let prepared_replay = Some(hermit::PreparedFullReplayTrace::open(temp_data_dir.path())?);
+        let (mut replay_container, replay_identity) = self.replay_container()?;
         let mounts = self.mount.clone();
         let replay_global = global2.clone();
-        let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
+        let (replay, (_data, _identity, log1, log2, _prepared)) = super::owned_container::run(
             &mut replay_container,
-            (temp_data_dir, replay_identity, log1, log2),
+            (temp_data_dir, replay_identity, log1, log2, prepared_replay),
             resources,
             true,
             "record_verify.replay",
             None,
-            move |(data, _, _, _)| {
+            move |(_, _, _, _, prepared)| {
                 let _guard = replay_global.init_tracing();
-                hermit::replay_with_output_and_mounts(data.path(), &mounts)
+                let prepared = prepared
+                    .take()
+                    .ok_or_else(|| Error::msg("replay trace reservation was consumed twice"))?
+                    .with_owned_controller_shutdown();
+                hermit::replay_with_output_and_mounts(prepared, &mounts)
             },
         )?;
 
@@ -617,34 +656,42 @@ impl StartOpts {
 
         let temp_data_dir = tempfile::tempdir()?;
         let record_timeout = self.record_timeout();
+        let epoch = detcore_model::config::capture_current_epoch();
+        let prepared_trace = Some(hermit::PreparedFullRecordTrace::reserve(
+            temp_data_dir.path(),
+        )?);
         let options = self.clone();
         let record_global = global.clone();
         let resources = format!(
             "debug recording {}, identity mounts and GDB watcher",
             temp_data_dir.path().display()
         );
-        let (_, (temp_data_dir, _identity)) = super::owned_container::run(
+        let (_, (temp_data_dir, _identity, _prepared)) = super::owned_container::run(
             &mut container,
-            (temp_data_dir, identity_guard),
+            (temp_data_dir, identity_guard, prepared_trace),
             resources.clone(),
             true,
             "record_verify_debug.record",
             None,
-            move |(data, identity)| {
+            move |(_, identity, prepared)| {
                 let _guard = record_global.init_tracing();
                 let command = options.guest_command()?;
                 let mountinfo = identity.mountinfo_root_rewrites()?;
+                let prepared = prepared
+                    .take()
+                    .ok_or_else(|| Error::msg("record trace reservation was consumed twice"))?;
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_to_with_mountinfo(command, data.path(), mountinfo)
+                        hermit::record_to_with_mountinfo(command, prepared, mountinfo, epoch)
                     }),
-                    None => hermit::record_to_with_mountinfo(command, data.path(), mountinfo),
+                    None => hermit::record_to_with_mountinfo(command, prepared, mountinfo, epoch),
                 }
             },
         )?;
         let data_dir = temp_data_dir.path();
 
         eprintln!(":: {}", "Replaying...".yellow().bold());
+        let mut prepared_replay = Some(hermit::PreparedFullReplayTrace::open(data_dir)?);
 
         // Find the path to the executable so that GDB can use it to resolve
         // symbols.
@@ -687,8 +734,13 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        let (mut container, identity) = self.configured_container()?;
-        let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
+        let (mut container, identity) = self.replay_container()?;
+        let guards = Rc::new(RefCell::new((
+            temp_data_dir,
+            identity,
+            gdb_watch,
+            prepared_replay,
+        )));
         let replay_global = global.clone();
         let mounts = self.mount.clone();
         let result = super::owned_container::run(
@@ -700,11 +752,13 @@ impl StartOpts {
             None,
             move |guards| {
                 let _guard = replay_global.init_tracing();
-                hermit::replay_with_gdbserver_and_mounts(
-                    guards.borrow().0.path(),
-                    gdbserver_port,
-                    &mounts,
-                )
+                let prepared = guards
+                    .borrow_mut()
+                    .3
+                    .take()
+                    .ok_or_else(|| Error::msg("replay trace reservation was consumed twice"))?
+                    .with_owned_controller_shutdown();
+                hermit::replay_with_gdbserver_and_mounts(prepared, gdbserver_port, &mounts)
             },
         );
         if result.as_ref().is_err_and(|e| {
@@ -729,6 +783,42 @@ impl StartOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn network_namespace_identity() -> Result<PathBuf, Error> {
+        Ok(fs::read_link("/proc/self/ns/net")?)
+    }
+
+    fn network_interfaces_and_loopback_flags() -> Result<(Vec<String>, String), Error> {
+        let mut interfaces = fs::read_dir("/sys/class/net")?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        interfaces.sort();
+        let flags = fs::read_to_string("/sys/class/net/lo/flags")?;
+        Ok((interfaces, flags))
+    }
+
+    #[test]
+    fn full_record_keeps_the_controller_network_namespace() {
+        let options = start_options(Vec::new());
+        let global = GlobalOpts::parse_from(["hermit"]);
+        let expected = network_namespace_identity().unwrap();
+        let (mut container, _identity_guard) = options.recording_container(&global).unwrap();
+        let observed = with_container(&mut container, network_namespace_identity).unwrap();
+        assert_eq!(
+            observed, expected,
+            "recording must retain controlled live networking for capture"
+        );
+    }
+
+    #[test]
+    fn immediate_full_replay_has_only_down_loopback() {
+        let options = start_options(Vec::new());
+        let (mut container, _identity_guard) = options.replay_container().unwrap();
+        let (interfaces, flags) =
+            with_container(&mut container, network_interfaces_and_loopback_flags).unwrap();
+        assert_eq!(interfaces, ["lo"]);
+        assert_eq!(flags.trim(), "0x8", "replay loopback must remain down");
+    }
 
     #[test]
     fn replay_report_is_published_before_success_is_announced() {
