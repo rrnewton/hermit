@@ -149,7 +149,15 @@ impl RecordVersion {
 // instant rather than from the clock minus uptime. Detcore recomputes these
 // fields over the recorded procfs bytes during recording and replay, so an older
 // stream replayed under the new projection could show the guest different bytes.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11c);
+// 0x11c -> 0x11d: captured clock events retain output bytes even on EFAULT.
+// Older event variants remain structurally decodable, but their errno-only
+// clock failures cannot establish replay fidelity and are refused at admission.
+// Unlanded development heads of https://github.com/rrnewton/hermit/pull/3212
+// stamped 0x11c, 0x11b, 0x11a and, earlier, 0x117 on their clock-event schema.
+// A recording from one of those heads is not main's random-preadv 0x11a,
+// sysinfo-uptime 0x11b or /proc/uptime 0x11c format; do not reinterpret that
+// identity.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -174,7 +182,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
