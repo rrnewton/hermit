@@ -2517,17 +2517,18 @@ fn validate_and_surface_safehermit_report(path: &Path, description: &str) -> Res
         .lines()
         .filter(|line| line.starts_with("safehermit: bound."))
         .collect::<Vec<_>>();
-    if bound_lines.is_empty()
-        || bound_lines.iter().any(|line| line.contains("NOT_APPLIED"))
-        || !bound_lines
-            .iter()
-            .any(|line| line.starts_with("safehermit: bound.wall=APPLIED:"))
-        || !bound_lines
-            .iter()
-            .any(|line| line.starts_with("safehermit: bound.cgroup=APPLIED:"))
-    {
+    let required_bounds = ["wall", "cgroup", "disk", "bytes"];
+    let required_missing = required_bounds.iter().any(|bound| {
+        let prefix = format!("safehermit: bound.{bound}=APPLIED:");
+        !bound_lines.iter().any(|line| line.starts_with(&prefix))
+    });
+    let unexpected_unapplied = bound_lines.iter().any(|line| {
+        line.contains("NOT_APPLIED")
+            && !line.starts_with("safehermit: bound.logfilter=NOT_APPLIED:by owner ruling")
+    });
+    if required_missing || unexpected_unapplied {
         return Err(format!(
-            "safehermit report for {description} lacks applied wall/cgroup bounds: {}",
+            "safehermit report for {description} lacks applied wall/cgroup/disk/bytes bounds: {}",
             path.display()
         ));
     }
@@ -2811,7 +2812,34 @@ fn verify_report(
             counts.right
         ));
     }
+    if let Some(runtime) = &report.runtime {
+        if runtime.run1 != runtime.run2 {
+            return Err(format!(
+                "strict verify report {} has unequal run1/run2 runtime summaries",
+                path.display()
+            ));
+        }
+    }
     Ok(report)
+}
+
+fn equal_cross_candidate_report_semantics(
+    cargo: &VerificationReport,
+    buck: &VerificationReport,
+) -> bool {
+    let mut cargo = cargo.clone();
+    let mut buck = buck.clone();
+    for report in [&mut cargo, &mut buck] {
+        if let Some(runtime) = &mut report.runtime {
+            if let Some(run1) = &mut runtime.run1 {
+                run1.virtual_nanoseconds = 0;
+            }
+            if let Some(run2) = &mut runtime.run2 {
+                run2.virtual_nanoseconds = 0;
+            }
+        }
+    }
+    cargo == buck
 }
 
 fn behavioral_parity(
@@ -2891,7 +2919,7 @@ fn behavioral_parity(
         )?;
         let cargo_typed = verify_report(&cargo_report, true)?;
         let buck_typed = verify_report(&buck_report, true)?;
-        if cargo_typed != buck_typed {
+        if !equal_cross_candidate_report_semantics(&cargo_typed, &buck_typed) {
             return Err(format!(
                 "Cargo/Buck {backend} typed strict report mismatch; inspect retained reports"
             ));
@@ -2965,7 +2993,7 @@ fn behavioral_parity(
     require_equal("ptrace record/replay stdout", &cargo.stdout, &buck.stdout)?;
     let cargo_typed = verify_report(&cargo_record_report, false)?;
     let buck_typed = verify_report(&buck_record_report, false)?;
-    if cargo_typed != buck_typed {
+    if !equal_cross_candidate_report_semantics(&cargo_typed, &buck_typed) {
         return Err(
             "Cargo/Buck ptrace record/replay typed strict report mismatch; inspect retained reports"
                 .to_owned(),
@@ -4570,12 +4598,12 @@ fn verify_retained_candidate_evidence(
 
     let cargo_run = verify_report(&evidence_dir.join("cargo-ptrace-verify.json"), true)?;
     let buck_run = verify_report(&evidence_dir.join("buck-ptrace-verify.json"), true)?;
-    if cargo_run != buck_run {
+    if !equal_cross_candidate_report_semantics(&cargo_run, &buck_run) {
         return Err("retained Cargo/Buck ptrace strict reports differ".to_owned());
     }
     let cargo_record = verify_report(&evidence_dir.join("cargo-ptrace-record-verify.json"), false)?;
     let buck_record = verify_report(&evidence_dir.join("buck-ptrace-record-verify.json"), false)?;
-    if cargo_record != buck_record {
+    if !equal_cross_candidate_report_semantics(&cargo_record, &buck_record) {
         return Err("retained Cargo/Buck ptrace record reports differ".to_owned());
     }
     Ok(RetainedCandidateEvidence {
@@ -6561,6 +6589,73 @@ mod tests {
     }
 
     #[test]
+    fn cross_candidate_reports_ignore_only_per_invocation_virtual_time() {
+        use hermit_manifest_plan::canonical_verdict::RuntimeStats;
+        use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
+
+        let mut cargo: VerificationReport = serde_json::from_value(canonical_report(true)).unwrap();
+        cargo.runtime = Some(VerificationRuntime {
+            run1: Some(RuntimeStats {
+                scheduler_turns: 5,
+                virtual_nanoseconds: 3_512_925,
+                syscalls: Some(33),
+            }),
+            run2: Some(RuntimeStats {
+                scheduler_turns: 5,
+                virtual_nanoseconds: 3_512_925,
+                syscalls: Some(33),
+            }),
+        });
+        let mut buck = cargo.clone();
+        let buck_runtime = buck.runtime.as_mut().unwrap();
+        buck_runtime.run1.as_mut().unwrap().virtual_nanoseconds = 3_512_447;
+        buck_runtime.run2.as_mut().unwrap().virtual_nanoseconds = 3_512_447;
+        assert!(equal_cross_candidate_report_semantics(&cargo, &buck));
+
+        let mut different_turns = buck.clone();
+        different_turns
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .scheduler_turns += 1;
+        assert!(!equal_cross_candidate_report_semantics(
+            &cargo,
+            &different_turns
+        ));
+
+        let mut different_syscalls = buck.clone();
+        different_syscalls
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .syscalls = Some(34);
+        assert!(!equal_cross_candidate_report_semantics(
+            &cargo,
+            &different_syscalls
+        ));
+
+        buck.compared_log_messages.as_mut().unwrap().left += 1;
+        assert!(!equal_cross_candidate_report_semantics(&cargo, &buck));
+
+        let root = fixture_root("unstable-runtime-report");
+        fs::create_dir(&root).unwrap();
+        let mut unstable = canonical_report(true);
+        unstable["runtime"] = serde_json::json!({
+            "run1": {"scheduler_turns": 5, "virtual_nanoseconds": 10, "syscalls": 33},
+            "run2": {"scheduler_turns": 5, "virtual_nanoseconds": 11, "syscalls": 33}
+        });
+        let path = write_report(&root, "unstable.json", &unstable);
+        assert!(verify_report(&path, true).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn malformed_stripped_or_no_result_reports_are_refused() {
         let root = env::temp_dir().join(format!("buck-report-refusal-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -6806,11 +6901,28 @@ mod tests {
         let report = root.join("report");
         fs::write(
             &report,
-            "safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\n",
+            "safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\nsafehermit: bound.disk=APPLIED:8G for log_dir only\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
         )
         .unwrap();
         validate_and_surface_safehermit_report(&report, "fixture").unwrap();
-        fs::write(&report, "safehermit: bound.wall=NOT_APPLIED:test\n").unwrap();
+        for missing in ["wall", "cgroup", "disk", "bytes"] {
+            let text = fs::read_to_string(&report).unwrap();
+            fs::write(
+                &report,
+                text.replace(
+                    &format!("safehermit: bound.{missing}=APPLIED:"),
+                    &format!("safehermit: bound.{missing}=NOT_APPLIED:"),
+                ),
+            )
+            .unwrap();
+            assert!(validate_and_surface_safehermit_report(&report, "fixture").is_err());
+            fs::write(&report, text).unwrap();
+        }
+        fs::write(
+            &report,
+            "safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.future=NOT_APPLIED:test\n",
+        )
+        .unwrap();
         assert!(validate_and_surface_safehermit_report(&report, "fixture").is_err());
         fs::remove_dir_all(root).unwrap();
     }
@@ -6827,7 +6939,7 @@ mod tests {
             fs::write(invocation.join("stderr"), b"stderr\n").unwrap();
             fs::write(
                 invocation.join("safehermit.report"),
-                b"safehermit: bound.wall=APPLIED:10s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\n",
+                b"safehermit: bound.wall=APPLIED:10s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
             )
             .unwrap();
         }
@@ -6837,7 +6949,7 @@ mod tests {
         let original = fs::read(&report).unwrap();
         fs::write(
             &report,
-            b"safehermit: bound.wall=NOT_APPLIED:test\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\n",
+            b"safehermit: bound.wall=NOT_APPLIED:test\nsafehermit: bound.cgroup=APPLIED:MemoryMax=1G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
         )
         .unwrap();
         assert!(verify_candidate_invocation_reports(&root).is_err());
@@ -7128,7 +7240,7 @@ mod tests {
             fs::write(invocation.join("stderr"), format!("{name} stderr\n")).unwrap();
             fs::write(
                 invocation.join("safehermit.report"),
-                b"safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\n",
+                b"safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
             )
             .unwrap();
         }
@@ -7184,7 +7296,7 @@ mod tests {
         let original_report = fs::read(&report).unwrap();
         fs::write(
             &report,
-            b"safehermit: bound.wall=APPLIED:119s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\n",
+            b"safehermit: bound.wall=APPLIED:119s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
         )
         .unwrap();
         assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
@@ -7226,7 +7338,7 @@ mod tests {
             fs::write(invocation.join("stderr"), b"extra stderr\n").unwrap();
             fs::write(
                 invocation.join("safehermit.report"),
-                b"safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\n",
+                b"safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
             )
             .unwrap();
         }
