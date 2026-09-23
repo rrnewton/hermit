@@ -24,6 +24,7 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileExt as UnixFileExt;
 use std::os::unix::fs::MetadataExt;
@@ -11826,6 +11827,56 @@ impl Drop for HistoryFixtureEnvironment {
     }
 }
 
+// Failure diagnostics must not wait for EOF: a surviving descendant can still
+// hold the pipe's writer after the direct child has been killed and reaped.
+fn snapshot_pipe_diagnostic(pipe: &impl AsRawFd) -> String {
+    const LIMIT: usize = 4096;
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the borrowed pipe keeps this descriptor open throughout capture.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return format!(
+            "retained=0; flags unavailable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: preserve the descriptor's flags and only make reads nonblocking.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return format!(
+            "retained=0; cannot make capture nonblocking: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut bytes = Vec::new();
+    let end = loop {
+        if bytes.len() == LIMIT {
+            break "byte cap reached; remaining output unknown".to_string();
+        }
+        let mut chunk = [0u8; 1024];
+        let capacity = chunk.len().min(LIMIT - bytes.len());
+        // SAFETY: chunk has capacity writable bytes and fd remains borrowed.
+        let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), capacity) };
+        if count == 0 {
+            break "EOF".to_string();
+        }
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            break if error.kind() == std::io::ErrorKind::WouldBlock {
+                "would block; writer remains open".to_string()
+            } else {
+                // Do not retry Interrupted indefinitely in a timeout report.
+                format!("read error: {error}")
+            };
+        }
+        bytes.extend_from_slice(&chunk[..count as usize]);
+    };
+    format!(
+        "retained={}; end={end}; output={:?}",
+        bytes.len(),
+        String::from_utf8_lossy(&bytes)
+    )
+}
+
 fn self_test() -> Result<(), String> {
     let (summary_paths, retained) = parse_update_observations_args(
         [
@@ -15103,6 +15154,7 @@ fn self_test() -> Result<(), String> {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("cannot start snapshot command control: {error}"))?;
+        let started = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match child.try_wait() {
@@ -15113,9 +15165,13 @@ fn self_test() -> Result<(), String> {
                 status => {
                     let killed = child.kill();
                     let reaped = child.wait();
+                    let stdout = child.stdout.as_ref().map(snapshot_pipe_diagnostic);
+                    let stderr = child.stderr.as_ref().map(snapshot_pipe_diagnostic);
                     return Err(format!(
-                        "snapshot command control {} did not complete: {status:?}; kill={killed:?}; reap={reaped:?}",
-                        path.display()
+                        "snapshot command control {} did not complete: {status:?}; kill={killed:?}; reap={reaped:?}; pid={}; elapsed={:.3}s; stdout={stdout:?}; stderr={stderr:?}",
+                        path.display(),
+                        child.id(),
+                        started.elapsed().as_secs_f64()
                     ));
                 }
             }
@@ -22868,6 +22924,45 @@ mod catalogue_ledger_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn snapshot_timeout_output_remains_bounded_with_an_open_writer() {
+        fn pipe() -> (File, File) {
+            let mut fds = [-1; 2];
+            // SAFETY: pipe2 initializes two descriptors in this live array.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: each new descriptor is transferred to one owning File.
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+        }
+
+        let (stdout, mut stdout_writer) = pipe();
+        let (stderr, mut stderr_writer) = pipe();
+        stdout_writer.write_all(b"partial stdout\n").unwrap();
+        stderr_writer.write_all(b"partial stderr\n").unwrap();
+        for (reader, expected) in [(&stdout, "partial stdout"), (&stderr, "partial stderr")] {
+            let captured = snapshot_pipe_diagnostic(reader);
+            assert!(captured.contains(expected), "{captured}");
+            assert!(
+                captured.contains("would block; writer remains open"),
+                "{captured}"
+            );
+        }
+        drop(stdout_writer);
+        assert!(snapshot_pipe_diagnostic(&stdout).contains("retained=0; end=EOF"));
+
+        // A full prefix must be labelled capped even if no further byte is
+        // currently queued. The still-open writer cannot force a wait for EOF.
+        stderr_writer.write_all(&[b'x'; 4096]).unwrap();
+        let capped = snapshot_pipe_diagnostic(&stderr);
+        assert!(
+            capped.contains("retained=4096; end=byte cap reached"),
+            "{capped}"
+        );
+        assert!(snapshot_pipe_diagnostic(&stderr).contains("retained=0; end=would block"));
+        // A valid write-only descriptor exercises capture failure, not EOF.
+        let error = snapshot_pipe_diagnostic(&stderr_writer);
+        assert!(error.contains("retained=0; end=read error:"), "{error}");
+    }
 
     fn git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
