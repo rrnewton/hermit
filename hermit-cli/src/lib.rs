@@ -35,6 +35,9 @@ pub mod network_container;
 pub mod network_provider_package;
 mod ptrace_completion;
 pub mod run_evidence;
+pub mod unix_guard;
+pub mod unix_guard_control;
+pub mod unix_guard_package;
 
 pub use canonical_verdict::Verdict;
 
@@ -385,12 +388,6 @@ use goblin::elf::header;
 use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
-use nix::sys::signal::SaFlags;
-use nix::sys::signal::SigAction;
-use nix::sys::signal::SigHandler;
-use nix::sys::signal::SigSet;
-use nix::sys::signal::Signal;
-use nix::sys::signal::sigaction;
 pub use ptrace_completion::HermitCleanupStage;
 pub use ptrace_completion::HermitCleanupUnconfirmed;
 pub use ptrace_completion::HermitPtraceFailure;
@@ -2626,8 +2623,18 @@ where
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn run_with_backend_inner(
+// Keep the executor's by-value future small on the container's fixed stack.
+// The backend future is polled on this same current-thread runtime; boxing
+// changes storage, not task spawning, cancellation, or the deadline boundary.
+fn run_current_thread<F: std::future::Future>(future: std::pin::Pin<Box<F>>) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(future)
+}
+
+fn run_with_backend_inner(
     command: Command,
     config: DetConfig,
     print_summary: bool,
@@ -2636,8 +2643,9 @@ async fn run_with_backend_inner(
     timeout: Option<Duration>,
     network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<ExitStatus, Error> {
-    with_run_deadline(timeout, async {
-        dispatch_backend(
+    run_current_thread(Box::pin(with_run_deadline(
+        timeout,
+        Box::pin(dispatch_backend(
             command,
             config,
             print_summary,
@@ -2645,10 +2653,8 @@ async fn run_with_backend_inner(
             backend,
             network_runtime,
             None,
-        )
-        .await
-    })
-    .await
+        )),
+    )))
 }
 
 async fn dispatch_backend(
@@ -2902,8 +2908,7 @@ pub fn run_with_output_backend_timeout_and_network_resources(
     skid_overshoot_report.finish_with_count(result)
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn run_with_output_backend_inner(
+fn run_with_output_backend_inner(
     command: Command,
     config: DetConfig,
     print_summary: bool,
@@ -2912,8 +2917,8 @@ async fn run_with_output_backend_inner(
     timeout: Option<Duration>,
     network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<Output, Error> {
-    let Some(limit) = timeout else {
-        return dispatch_output_backend(
+    run_current_thread(Box::pin(async move {
+        let guest = Box::pin(dispatch_output_backend(
             command,
             config,
             print_summary,
@@ -2921,26 +2926,15 @@ async fn run_with_output_backend_inner(
             backend,
             network_runtime,
             None,
-        )
-        .await;
-    };
-    match tokio::time::timeout(
-        limit,
-        dispatch_output_backend(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            backend,
-            network_runtime,
-            None,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
-    }
+        ));
+        let Some(limit) = timeout else {
+            return guest.await;
+        };
+        match tokio::time::timeout(limit, guest).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+        }
+    }))
 }
 
 async fn dispatch_output_backend(

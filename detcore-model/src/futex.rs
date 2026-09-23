@@ -20,6 +20,13 @@ pub struct MmId {
 }
 
 impl MmId {
+    /// Exec generation within this exact logical memory-space owner. Physical
+    /// provider receipts also bind the full owner and the held task lifetime;
+    /// this scalar alone does not identify an address space.
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
     /// Create the initial address space owned by a task.
     pub const fn initial(creator: DetTid) -> Self {
         Self {

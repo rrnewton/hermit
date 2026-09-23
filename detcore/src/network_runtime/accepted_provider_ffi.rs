@@ -102,6 +102,58 @@ pub struct Status {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FdAccept {
+    pub command: u64,
+    pub accept_lease: u64,
+    pub owner_mm: u64,
+    pub task: u64,
+    pub task_start: u64,
+    pub table: u64,
+    pub file: u64,
+    pub install_begin: u64,
+    pub install_end: u64,
+    pub listener: Identity,
+    pub child: Identity,
+    pub creation: u64,
+    pub cookie: u64,
+    pub phases: u64,
+    pub problem: u64,
+    pub requested_fd: i32,
+    pub flags: i32,
+    pub returned_fd: i32,
+    pub do_accept_errno: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FdEvent {
+    pub sequence: u64,
+    pub kind: u64,
+    pub task: u64,
+    pub task_start: u64,
+    pub table: u64,
+    pub file: u64,
+    pub previous_file: u64,
+    pub dependency: u64,
+    pub accept_command: u64,
+    pub fd: i32,
+    pub returned: i32,
+    pub complete: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FdStatus {
+    pub problem: u64,
+    pub next_table: u64,
+    pub next_file: u64,
+    pub next_event: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcceptedEffect {
+    pub command: CommandResult,
+    pub installation: FdAccept,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceId {
     /// 0 = map, 1 = program, 2 = link. Not the native runner's 1-based kind.
     pub kind: u32,
@@ -140,6 +192,12 @@ const _: () = {
     assert!(offset_of!(CommandResult, phase) == 120);
     assert!(size_of::<Status>() == 88);
     assert!(size_of::<ResourceId>() == 8);
+    assert!(size_of::<FdAccept>() == 168);
+    assert!(offset_of!(FdAccept, listener) == 72);
+    assert!(offset_of!(FdAccept, phases) == 136);
+    assert!(offset_of!(FdAccept, requested_fd) == 152);
+    assert!(size_of::<FdEvent>() == 88 && offset_of!(FdEvent, complete) == 80);
+    assert!(size_of::<FdStatus>() == 32);
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +316,22 @@ impl Drop for LibraryHandle {
 }
 type SessionPtr = *mut c_void;
 struct Api {
+    prepare_accept: unsafe extern "C" fn(
+        SessionPtr,
+        c_int,
+        Identity,
+        u64,
+        u64,
+        c_int,
+        c_int,
+        *mut u64,
+    ) -> c_int,
+    collect_accept:
+        unsafe extern "C" fn(SessionPtr, c_int, u64, *mut CommandResult, *mut FdAccept) -> c_int,
+    read_fd_status: unsafe extern "C" fn(SessionPtr, *mut FdStatus) -> c_int,
+    read_fd_event: unsafe extern "C" fn(SessionPtr, u64, *mut FdEvent) -> c_int,
+    ack_fd_event: unsafe extern "C" fn(SessionPtr, *const FdEvent) -> c_int,
+
     open: unsafe extern "C" fn(*const c_char, u64, *mut SessionPtr) -> c_int,
     register_task: unsafe extern "C" fn(SessionPtr, c_int) -> c_int,
     enroll_listener:
@@ -322,6 +396,42 @@ impl Library {
             return Err(LoadError("provider adapter ABI version mismatch".into()));
         }
         let api = Api {
+            prepare_accept: symbol!(
+                "ap_prepare_accept",
+                unsafe extern "C" fn(
+                    SessionPtr,
+                    c_int,
+                    Identity,
+                    u64,
+                    u64,
+                    c_int,
+                    c_int,
+                    *mut u64,
+                ) -> c_int
+            ),
+            collect_accept: symbol!(
+                "ap_collect_accept",
+                unsafe extern "C" fn(
+                    SessionPtr,
+                    c_int,
+                    u64,
+                    *mut CommandResult,
+                    *mut FdAccept,
+                ) -> c_int
+            ),
+            read_fd_status: symbol!(
+                "ap_read_fd_status",
+                unsafe extern "C" fn(SessionPtr, *mut FdStatus) -> c_int
+            ),
+            read_fd_event: symbol!(
+                "ap_read_fd_event",
+                unsafe extern "C" fn(SessionPtr, u64, *mut FdEvent) -> c_int
+            ),
+            ack_fd_event: symbol!(
+                "ap_ack_fd_event",
+                unsafe extern "C" fn(SessionPtr, *const FdEvent) -> c_int
+            ),
+
             open: symbol!(
                 "ap_open",
                 unsafe extern "C" fn(*const c_char, u64, *mut SessionPtr) -> c_int
@@ -531,6 +641,76 @@ impl Session {
             status: CallStatus::capture("ap_finish_setter", rc),
             raw,
         }
+    }
+    pub fn prepare_accept(
+        &mut self,
+        guest_task_pidfd: BorrowedFd<'_>,
+        listener: Identity,
+        lease: u64,
+        mm: u64,
+        fd: i32,
+        flags: i32,
+    ) -> Observation<u64> {
+        let mut raw = 0;
+        let rc = unsafe {
+            (self.library.api.prepare_accept)(
+                self.pointer(),
+                guest_task_pidfd.as_raw_fd(),
+                listener,
+                lease,
+                mm,
+                fd,
+                flags,
+                &mut raw,
+            )
+        };
+        Observation {
+            status: CallStatus::capture("ap_prepare_accept", rc),
+            raw,
+        }
+    }
+    /// Reads the originally submitted effect. Failure preserves both partial
+    /// outputs and never submits another command or infers an installation.
+    pub fn collect_accept(
+        &mut self,
+        guest_task_pidfd: BorrowedFd<'_>,
+        command: u64,
+    ) -> Observation<AcceptedEffect> {
+        let mut raw = AcceptedEffect::default();
+        let rc = unsafe {
+            (self.library.api.collect_accept)(
+                self.pointer(),
+                guest_task_pidfd.as_raw_fd(),
+                command,
+                &mut raw.command,
+                &mut raw.installation,
+            )
+        };
+        Observation {
+            status: CallStatus::capture("ap_collect_accept", rc),
+            raw,
+        }
+    }
+    pub fn read_fd_status(&mut self) -> Observation<FdStatus> {
+        let mut raw = FdStatus::default();
+        let rc = unsafe { (self.library.api.read_fd_status)(self.pointer(), &mut raw) };
+        Observation {
+            status: CallStatus::capture("ap_read_fd_status", rc),
+            raw,
+        }
+    }
+    pub fn read_fd_event(&mut self, sequence: u64) -> Observation<FdEvent> {
+        let mut raw = FdEvent::default();
+        let rc = unsafe { (self.library.api.read_fd_event)(self.pointer(), sequence, &mut raw) };
+        Observation {
+            status: CallStatus::capture("ap_read_fd_event", rc),
+            raw,
+        }
+    }
+    pub fn ack_fd_event(&mut self, receipt: &FdEvent) -> CallStatus {
+        CallStatus::capture("ap_ack_fd_event", unsafe {
+            (self.library.api.ack_fd_event)(self.pointer(), receipt)
+        })
     }
     pub fn resolve_accepted(
         &mut self,

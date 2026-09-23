@@ -3389,6 +3389,18 @@ impl RunOpts {
             && !self.hb_list_events
     }
 
+    /// Effective input after validation. A recorded epoch does not turn an
+    /// originally implicit CLI input into an explicit replay constraint.
+    pub(crate) fn epoch_source_label(&self) -> &'static str {
+        if self.replay_networking.is_some() {
+            "network-trace"
+        } else if self.epoch_captured_from_host {
+            "host-now"
+        } else {
+            "explicit"
+        }
+    }
+
     fn epoch_rfc3339(&self) -> String {
         self.det_opts.det_config.epoch.to_rfc3339()
     }
@@ -3636,11 +3648,7 @@ impl RunOpts {
         self.validate_args()?;
         if self.uses_virtual_time_determinization() {
             let epoch = self.epoch_rfc3339();
-            let source = if self.epoch_captured_from_host {
-                "host-now"
-            } else {
-                "explicit"
-            };
+            let source = self.epoch_source_label();
             global.write_controller_diagnostic(format_args!(
                 "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
             ))?;
@@ -3924,6 +3932,22 @@ impl RunOpts {
                 .map_err(|error| network_policy_refusal(error.to_string()))?;
         }
 
+        // Reject incompatible modes before touching a replay trace.
+        if self.det_opts.det_config.gdbserver && self.record_networking.is_some() {
+            return Err(network_policy_refusal(
+                "--gdbserver cannot be combined with --record-networking because debugger traffic \
+                 would become ambiguous network input. Record without --gdbserver, or run a \
+                 separate explicitly unsafe debug session.",
+            ));
+        }
+        if self.det_opts.det_config.gdbserver && self.replay_networking.is_some() {
+            return Err(network_policy_refusal(
+                "--gdbserver cannot be combined with --replay-networking because replay denies the \
+                 live host network. Replay without --gdbserver, or use `hermit replay --serve-only` \
+                 for the full-recording debugger workflow.",
+            ));
+        }
+
         let epoch_source_explicit = self.epoch_source_explicit();
         let config = &mut self.det_opts.det_config;
         config.network_trace = network_trace;
@@ -4096,20 +4120,6 @@ impl RunOpts {
 
         // A host gdb client cannot reach a listener in an isolated namespace.
         // Never turn networking on as a side effect of asking for a debugger.
-        if self.det_opts.det_config.gdbserver && self.record_networking.is_some() {
-            return Err(network_policy_refusal(
-                "--gdbserver cannot be combined with --record-networking because debugger traffic \
-                 would become ambiguous network input. Record without --gdbserver, or run a \
-                 separate explicitly unsafe debug session.",
-            ));
-        }
-        if self.det_opts.det_config.gdbserver && self.replay_networking.is_some() {
-            return Err(network_policy_refusal(
-                "--gdbserver cannot be combined with --replay-networking because replay denies the \
-                 live host network. Replay without --gdbserver, or use `hermit replay --serve-only` \
-                 for the full-recording debugger workflow.",
-            ));
-        }
         if self.det_opts.det_config.gdbserver && self.network != NetworkingMode::UnsafeHost {
             if self.analyze_networking {
                 return Err(network_policy_refusal(

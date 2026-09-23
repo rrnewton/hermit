@@ -158,6 +158,10 @@ impl From<CommandResult> for ffi::CommandResult {
         }
     }
 }
+wire!(FdAccept,ffi::FdAccept,{command:u64,accept_lease:u64,owner_mm:u64,task:u64,task_start:u64,table:u64,file:u64,install_begin:u64,install_end:u64,listener:Identity,child:Identity,creation:u64,cookie:u64,phases:u64,problem:u64,requested_fd:i32,flags:i32,returned_fd:i32,do_accept_errno:i32,});
+wire!(AcceptedEffect,ffi::AcceptedEffect,{command:CommandResult,installation:FdAccept,});
+wire!(FdEvent,ffi::FdEvent,{sequence:u64,kind:u64,task:u64,task_start:u64,table:u64,file:u64,previous_file:u64,dependency:u64,accept_command:u64,fd:i32,returned:i32,complete:u64,});
+wire!(FdStatus,ffi::FdStatus,{problem:u64,next_table:u64,next_file:u64,next_event:u64,});
 wire!(Status,ffi::Status,{
     fatal:u64,next_object:u64,next_creation:u64,clone_entries:u64,clone_null_returns:u64,
     created:u64,queued:u64,retired:u64,matched:u64,setters_entered:u64,setters_exited:u64,
@@ -192,6 +196,17 @@ impl<T, U: From<T>> From<ffi::Observation<T>> for Observation<U> {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum Request {
+    PrepareAccept {
+        identity: Identity,
+        lease: u64,
+        mm: u64,
+        fd: i32,
+        flags: i32,
+    },
+    CollectAccept {
+        command: u64,
+        prepared_request: u64,
+    },
     Enroll {
         generation: u64,
     },
@@ -221,6 +236,7 @@ pub(super) enum Request {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum Reply {
+    AcceptedEffect(Observation<AcceptedEffect>),
     Command(Observation<CommandResult>),
     Prepared(Observation<u64>),
     Status(Observation<Status>),
@@ -246,16 +262,24 @@ fn acknowledge_response(
         Operation::EnrollListener => 1,
         Operation::MatchAccepted => 2,
         Operation::FinishSetter => 3,
+        Operation::CollectAccept => 4,
         _ => {
             return Err(io::Error::other(
                 "provider ACK requested for a different effect",
             ));
         }
     };
-    let Reply::Command(observation) = serde_json::from_slice(body)? else {
-        return Err(io::Error::other(
-            "provider ACK lacks a retained Command response",
-        ));
+    let observation = match serde_json::from_slice(body)? {
+        Reply::Command(observation) if expected_operation != 4 => observation,
+        Reply::AcceptedEffect(observation) if expected_operation == 4 => Observation {
+            status: observation.status,
+            raw: observation.raw.command,
+        },
+        _ => {
+            return Err(io::Error::other(
+                "provider ACK lacks its retained effect response",
+            ));
+        }
     };
     let ack = if observation.status.returned != 0 {
         // C still owns any unknown/quarantined cell. Do not ACK even if a
@@ -269,8 +293,8 @@ fn acknowledge_response(
             || raw.task == 0
             || raw.start_boottime == 0
             || raw.identity.provider != incarnation
-            || raw.identity.object == 0
-            || raw.identity.namespace == 0
+            || (expected_operation != 4
+                && (raw.identity.object == 0 || raw.identity.namespace == 0))
             || raw.reserved != 0
         {
             return Err(io::Error::other(
@@ -514,7 +538,10 @@ impl Provider {
             .ok_or_else(|| io::Error::other("accepted provider session is not ready"))?;
         if matches!(
             envelope.operation,
-            Operation::PrepareSetter | Operation::FinishSetter
+            Operation::PrepareSetter
+                | Operation::FinishSetter
+                | Operation::PrepareAccept
+                | Operation::CollectAccept
         ) {
             return self.registrations.dispatch_physical(
                 session,

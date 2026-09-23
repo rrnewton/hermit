@@ -1738,6 +1738,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
         }
 
+        // Except for the root task, let's block until it's our turn to go:
+        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
+
         // One owned ptrace startup resource authenticates custody for accepted
         // sockets and descriptor publication, independently of signal identity
         // and cfgseq. Do not register the same task twice when both are active.
@@ -1749,7 +1752,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 detcore_model::network_trace::NetworkPolicy::Record
                     | detcore_model::network_trace::NetworkPolicy::Replay
             );
-        if needs_fd_runtime || needs_accepted_runtime {
+        let needs_initial_guard_check =
+            is_root_thread && guest.config().backend_supports_host_socket_pin;
+        if needs_fd_runtime || needs_accepted_runtime || needs_initial_guard_check {
             let registered = tool_global::register_network_physical_task(guest).await?;
             if needs_fd_runtime && !registered {
                 return Err(Error::Tool(anyhow::anyhow!(
@@ -1757,9 +1762,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 )));
             }
         }
-
-        // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Descriptor ownership is granted by actual global registration, not
         // by a deserialized local tracking bit or the network trace flag.

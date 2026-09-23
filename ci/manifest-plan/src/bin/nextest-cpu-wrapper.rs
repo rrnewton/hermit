@@ -47,6 +47,10 @@ use hermit_manifest_plan::nextest_cpu::write_attempt_atomic;
 use hermit_manifest_plan::nextest_cpu::write_binary_map_atomic;
 use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 
+#[cfg(test)]
+#[path = "../nextest_attempt.rs"]
+mod nextest_attempt;
+
 const ATTEMPT_ENV: &str = "NEXTEST_ATTEMPT";
 // cargo-nextest 0.9.116 replaced this private variable with the public one
 // above. The pinned validation image deliberately retains the declared 0.9.100
@@ -2254,7 +2258,8 @@ fn control_command_with_limits(
         .env(CPU_REPORT_PATH_ENV, scratch.join("unused-report.json"))
         .env(RUN_ID_ENV, "self-test-run")
         .env(PACKAGE_ENV, "fixture")
-        .env(ATTEMPT_ENV, attempt.to_string())
+        .env_remove(ATTEMPT_ENV)
+        .env(LEGACY_ATTEMPT_ENV, attempt.to_string())
         .env(CONTROL_ARM_ENV, "1")
         .env_remove(CONTROL_ENTRY_DEADLINE_NS_ENV)
         .env_remove(CONTROL_ENTRY_REACHED_FILE_ENV)
@@ -2286,7 +2291,8 @@ fn measurement_control_command(
         .env(CPU_REPORT_PATH_ENV, scratch.join("unused-report.json"))
         .env(RUN_ID_ENV, "self-test-run")
         .env(PACKAGE_ENV, "fixture")
-        .env(ATTEMPT_ENV, attempt.to_string())
+        .env_remove(ATTEMPT_ENV)
+        .env(LEGACY_ATTEMPT_ENV, attempt.to_string())
         .env(CONTROL_ARM_ENV, "1")
         .env_remove(CONTROL_ENTRY_DEADLINE_NS_ENV)
         .env_remove(CONTROL_ENTRY_REACHED_FILE_ENV)
@@ -3581,6 +3587,44 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("nextest-cpu-wrapper: {error}");
             ExitCode::from(INFRASTRUCTURE_EXIT)
+        }
+    }
+}
+
+#[cfg(test)]
+mod attempt_fixture_tests {
+    use super::*;
+
+    #[test]
+    fn controlled_legacy_attempts_do_not_inherit_a_public_attempt() {
+        for attempt in [1, 2, 3, 4] {
+            let commands = [
+                control_command_with_limits(
+                    Path::new("/unused/wrapper"),
+                    Path::new("/unused/test"),
+                    Path::new("/unused/scratch"),
+                    "success",
+                    attempt,
+                    10_000_000,
+                    2_000,
+                ),
+                measurement_control_command(
+                    Path::new("/unused/wrapper"),
+                    Path::new("/unused/test"),
+                    Path::new("/unused/scratch"),
+                    "success",
+                    attempt,
+                ),
+            ];
+            for command in commands {
+                let environment = command.get_envs().collect::<BTreeMap<_, _>>();
+                assert_eq!(environment.get(OsStr::new(ATTEMPT_ENV)), Some(&None));
+                let expected = OsString::from(attempt.to_string());
+                assert_eq!(
+                    environment.get(OsStr::new(LEGACY_ATTEMPT_ENV)),
+                    Some(&Some(expected.as_os_str()))
+                );
+            }
         }
     }
 }

@@ -29,14 +29,23 @@ pub(super) enum Operation {
     MatchAccepted,
     ReleaseAccepted,
     Reply,
+    PrepareAccept,
+    CollectAccept,
 }
 
 impl Operation {
     fn rights(self) -> usize {
         match self {
             Self::Bootstrap => 2, // actual controller pidfd + private controller endpoint
-            Self::EnrollListener | Self::PrepareSetter | Self::MatchAccepted => 2, // socket + task pidfd
-            Self::DrainCreations | Self::FinishSetter | Self::ReleaseAccepted | Self::Reply => 0,
+            Self::EnrollListener
+            | Self::PrepareSetter
+            | Self::MatchAccepted
+            | Self::PrepareAccept => 2, // socket + task pidfd
+            Self::DrainCreations
+            | Self::FinishSetter
+            | Self::ReleaseAccepted
+            | Self::Reply
+            | Self::CollectAccept => 0,
         }
     }
 }
@@ -262,7 +271,10 @@ impl<T> Inbox<T> {
             .ok_or_else(|| protocol("unknown provider command acknowledgement"))?;
         if !matches!(
             entry.envelope.operation,
-            Operation::EnrollListener | Operation::MatchAccepted | Operation::FinishSetter
+            Operation::EnrollListener
+                | Operation::MatchAccepted
+                | Operation::FinishSetter
+                | Operation::CollectAccept
         ) {
             return Err(protocol(
                 "read-only/preparation request is not a completed provider command",

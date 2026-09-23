@@ -247,7 +247,9 @@ impl ParentAcceptedService {
             unit: &self.unit,
             executable: &self.launch.helper,
             arguments: &arguments,
-            maximum_seconds: self.launch.maximum_seconds,
+            lifetime: super::capability_unit::CapabilityServiceLifetime::Bounded(
+                self.launch.maximum_seconds,
+            ),
             writable_directories: &[],
         }
         .command(&stdin, &self.launch.stdout, &self.launch.stderr)?

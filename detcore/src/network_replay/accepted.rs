@@ -724,6 +724,20 @@ impl NetworkReplayEngine {
         }
         Ok(operation.listener_call)
     }
+    pub(crate) fn accepted_provider_effect_target(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> Result<(OpenFileId, AcceptedPhysicalIdentity), NetworkReplayError> {
+        let call = self.accepted_capture_call(owner, lease)?;
+        let open_file = self.stream_call_open_file(owner, call)?;
+        let physical = *self
+            .accepted()?
+            .physical_listeners
+            .get(&open_file)
+            .ok_or(NetworkReplayError::InvalidAcceptedReceipt)?;
+        Ok((open_file, physical))
+    }
     /// Recovery authenticates the original submitted receipt even after owner
     /// retirement. This grants neither a new physical pin nor channel mutation.
     pub(crate) fn accepted_capture_recovery_call(
@@ -738,6 +752,17 @@ impl NetworkReplayEngine {
             .filter(|op| op.owner == owner && op.submitted)
             .ok_or(NetworkReplayError::InvalidAcceptedReceipt)?;
         Ok(op.listener_call)
+    }
+    /// Retirement revokes a normal reply even when NoSeq retains historical
+    /// scheduler/MM registration. The exact original lease still permits
+    /// collection of an already-submitted physical effect.
+    pub(crate) fn accepted_capture_owner_retired(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> Result<bool, NetworkReplayError> {
+        self.accepted_capture_recovery_call(owner, lease)?;
+        Ok(self.accepted()?.operations[&lease].abandoned)
     }
     fn remove_accept_reservation(&mut self, lease: NetworkAcceptLeaseId) {
         let runtime = self.accepted_mut().unwrap();

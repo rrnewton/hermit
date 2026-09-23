@@ -5,11 +5,9 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
-
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
 
 use super::accepted_provider::Reply;
 use super::accepted_provider::Request;
@@ -27,6 +25,8 @@ use crate::types::OpenFileId;
 pub(super) enum Effect {
     Listener(OpenFileId),
     Match(NetworkAcceptLeaseId),
+    PrepareAccept(NetworkAcceptLeaseId),
+    CollectAccept(NetworkAcceptLeaseId),
     PrepareSetter(NetworkStreamLeaseId),
     FinishSetter(NetworkStreamLeaseId),
     // Observation cuts get a run-owned identity, not a guest TID/syscall order.
@@ -159,16 +159,114 @@ pub(super) struct Controller {
     state: Mutex<State>,
     // This readiness-only alias and the session's endpoint refer to the same
     // private socket. No task future can own either descriptor's last reference.
-    ready: AsyncFd<OwnedFd>,
+    ready: OwnedFd,
     run: [u8; 16],
     changed: tokio::sync::Notify,
 }
 impl Controller {
+    /// The owned native driver calls this even if every RPC future was dropped.
+    /// IO is nonblocking under the mutex; the bounded poll holds no model lock.
+    pub(super) fn drive_once(&self) -> io::Result<()> {
+        let writable = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(error) = &state.failure {
+                return Err(io::Error::other(error.clone()));
+            }
+            if let Err(error) = Self::progress_io(&mut state, &self.changed) {
+                state.failure = Some(error.to_string());
+                self.changed.notify_waiters();
+                return Err(error);
+            }
+            !state.pending_send.is_empty()
+        };
+        let mut descriptor = libc::pollfd {
+            fd: self.ready.as_raw_fd(),
+            events: libc::POLLIN | if writable { libc::POLLOUT } else { 0 },
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                self.fail(&error);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn retained_response(&self, sequence: u64) -> io::Result<Option<Reply>> {
+        let state = self.state.lock().unwrap();
+        // A known response remains available after a later transport failure.
+        if let Some(bytes) = state.session.response(sequence)? {
+            return serde_json::from_slice(bytes)
+                .map(Some)
+                .map_err(io::Error::other);
+        }
+        if let Some(error) = &state.failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn fail(&self, error: &io::Error) {
+        self.state
+            .lock()
+            .unwrap()
+            .failure
+            .get_or_insert_with(|| error.to_string());
+        self.changed.notify_waiters();
+    }
+
+    pub(super) fn quiescent(&self) -> io::Result<bool> {
+        let state = self.state.lock().unwrap();
+        if let Some(error) = &state.failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        if !state.pending_send.is_empty() {
+            return Ok(false);
+        }
+        for request in state.requests.0.values() {
+            let Some(sequence) = request.sequence else {
+                return Err(io::Error::other("retained request has no known submission"));
+            };
+            if state.session.response(sequence)?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn accepted_preparations(
+        &self,
+    ) -> io::Result<Vec<(NetworkStreamOwner, NetworkAcceptLeaseId, u64)>> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .0
+            .iter()
+            .filter_map(|(effect, request)| {
+                let Effect::PrepareAccept(lease) = effect else {
+                    return None;
+                };
+                Some(
+                    request
+                        .sequence
+                        .map(|sequence| (request.owner, *lease, sequence))
+                        .ok_or_else(|| {
+                            io::Error::other("accepted preparation submission is unresolved")
+                        }),
+                )
+            })
+            .collect()
+    }
+
     pub(super) fn new(endpoint: OwnedFd, run: [u8; 16]) -> io::Result<Self> {
         // The runtime retains its original endpoint through this setup. Closing
         // an unused duplicate on failure cannot release the original channel.
         let readiness = endpoint.as_fd().try_clone_to_owned()?;
-        let ready = AsyncFd::new(readiness)?;
+        let ready = readiness;
         let session = AcceptedSession::new(endpoint, run).map_err(|(error, _)| error)?;
         Ok(Self {
             state: Mutex::new(State {
@@ -202,9 +300,13 @@ impl Controller {
             Request::PrepareSetter { .. } => Operation::PrepareSetter,
             Request::FinishSetter { .. } => Operation::FinishSetter,
             Request::ResolveAccepted => Operation::MatchAccepted,
+            Request::PrepareAccept { .. } => Operation::PrepareAccept,
+            Request::CollectAccept { .. } => Operation::CollectAccept,
         };
         let accept = match key {
-            Effect::Match(lease) => Some(lease),
+            Effect::Match(lease) | Effect::PrepareAccept(lease) | Effect::CollectAccept(lease) => {
+                Some(lease)
+            }
             _ => None,
         };
         let body = serde_json::to_vec(request)?;
@@ -283,46 +385,16 @@ impl Controller {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let interest = {
-                let mut state = self.state.lock().unwrap();
-                if let Some(error) = &state.failure {
-                    return Err(io::Error::other(error.clone()));
-                }
-                let outcome = Self::progress(&mut state, sequence, &self.changed);
-                match outcome {
-                    Ok(Some(reply)) => return Ok(reply),
-                    Ok(None) => {
-                        if state.pending_send.is_empty() {
-                            Interest::READABLE
-                        } else {
-                            Interest::READABLE | Interest::WRITABLE
-                        }
-                    }
-                    Err(error) => {
-                        state.failure = Some(error.to_string());
-                        return Err(error);
-                    }
-                }
-            };
-            // No semantic lease or blocking std::Mutex guard spans this await.
-            // A sibling may drive the same pending queue after cancellation.
-            tokio::select! {
-                _ = changed => {},
-                ready = self.ready.ready(interest) => {ready?.clear_ready();}
+            if let Some(reply) = self.retained_response(sequence)? {
+                return Ok(reply);
             }
+            // Only the native run-owned driver advances transport. This wait
+            // needs no Tokio reactor and cancellation transfers no FD owner.
+            changed.await;
         }
     }
 
-    fn progress(
-        state: &mut State,
-        sequence: u64,
-        changed: &tokio::sync::Notify,
-    ) -> io::Result<Option<Reply>> {
-        if let Some(bytes) = state.session.response(sequence)? {
-            return serde_json::from_slice(bytes)
-                .map(Some)
-                .map_err(io::Error::other);
-        }
+    fn progress_io(state: &mut State, changed: &tokio::sync::Notify) -> io::Result<()> {
         while let Some(next) = state.pending_send.front().copied() {
             if !state.session.try_send(next)? {
                 break;
@@ -340,12 +412,7 @@ impl Controller {
                 ));
             }
         }
-        state
-            .session
-            .response(sequence)?
-            .map(serde_json::from_slice)
-            .transpose()
-            .map_err(io::Error::other)
+        Ok(())
     }
 }
 

@@ -1,0 +1,34 @@
+extern crate self as detcore;
+extern crate self as reverie;
+extern crate self as detcore_model;
+pub const HERMIT_POLICY_REFUSAL_EXIT: i32 = 122;
+pub mod process {
+    #[derive(Clone, Copy)] pub enum ExitStatus { Exited(i32) }
+    impl ExitStatus { pub const SUCCESS: Self=Self::Exited(0); pub fn success(self)->bool { matches!(self,Self::Exited(0)) } }
+}
+pub mod util {
+    pub struct RetryingStderr;
+    impl std::io::Write for RetryingStderr {
+        fn write(&mut self,b:&[u8])->std::io::Result<usize> { Ok(b.len()) }
+        fn flush(&mut self)->std::io::Result<()> { Ok(()) }
+    }
+}
+pub mod tool_global { pub fn exit_owned_controller(status:i32)->! { std::panic::panic_any(status) } }
+pub mod network_runtime { #[path="@GUARD_API@"] pub mod guard; }
+pub mod unix_guard {
+    #[derive(Clone,Copy,Default,Debug)] pub struct GuardDenial {
+        pub phase:u64,pub incarnation:u64,pub task_start:u64,pub pid_tgid:u64,
+        pub source_generation:u64,pub peer_generation:u64,pub injection:u64,pub hook:u32,pub reason:u32
+    }
+    #[derive(Clone,Copy,Default,Debug)] pub struct GuardEvidence {
+        pub secondary_monitor_failures:u64,pub secondary_guard_faults:u64,pub denial:GuardDenial
+    }
+    #[derive(Clone,Copy,Debug)] pub enum GuardOutcome {Pending,Running,Policy(GuardEvidence),Internal(GuardEvidence)}
+    pub struct ControllerGuard;
+    impl ControllerGuard {
+        pub unsafe fn register_stopped_initial(&mut self,_:std::os::fd::BorrowedFd<'_>,_:std::time::Instant)->std::io::Result<()> { panic!("actual native monitor must not run") }
+        pub fn observe_guard(&mut self)->GuardOutcome { panic!("actual native monitor must not run") }
+        pub fn snapshot_guard(&mut self)->GuardOutcome { panic!("actual native monitor must not run") }
+    }
+}
+#[path="copied-unix-guard-control.rs"] mod actual;

@@ -835,6 +835,11 @@ use self::replayer::DesyncStats;
 use self::replayer::Replayer;
 
 impl ThreadTree {
+    /// The original backend-published root, not a guessed numeric PID.
+    pub(crate) fn is_root(&self, thread: DetTid) -> bool {
+        self.root == Some(thread)
+    }
+
     /// Internal helper. Add a [child] process to the tree, with the parent being `None`
     /// if it's the root of the tree.
     fn add_edge(&mut self, parent: Option<DetTid>, child: DetTid) {
