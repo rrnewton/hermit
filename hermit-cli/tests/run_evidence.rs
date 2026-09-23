@@ -131,6 +131,12 @@ fn validate_and_remove_public_log_epoch_provenance(
                     String::from_utf8_lossy(payload),
                 ));
             }
+            if start != 0 {
+                remaining.extend_from_slice(&line[..start]);
+                if line.ends_with(b"\n") {
+                    remaining.push(b'\n');
+                }
+            }
         } else {
             remaining.extend_from_slice(line);
         }
@@ -169,7 +175,18 @@ fn public_log_epoch_provenance_requires_the_exact_reproducer_payload() {
     let valid = format!("2026-09-23T00:00:00Z  {expected}\nkept\n");
     assert_eq!(
         validate_and_remove_public_log_epoch_provenance(valid.as_bytes(), "valid log").unwrap(),
-        b"kept\n",
+        b"2026-09-23T00:00:00Z  \nkept\n",
+    );
+
+    let distinct_prefix = format!("2026-09-23T00:00:01Z  {expected}\nkept\n");
+    assert_ne!(
+        validate_and_remove_public_log_epoch_provenance(
+            distinct_prefix.as_bytes(),
+            "distinct-prefix log",
+        )
+        .unwrap(),
+        b"2026-09-23T00:00:00Z  \nkept\n",
+        "provenance removal must retain bytes that precede the event",
     );
 
     let wrong_epoch = expected.replacen(

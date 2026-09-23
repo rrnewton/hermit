@@ -790,10 +790,8 @@ fn materialize_dbt_comparison_log(
     if materialized != expected_materialized {
         return Err(Error::msg(format!(
             "DBT canonical evidence log holds {materialized} newline-delimited entries but \
-             {expected_materialized} \
-             were required from {} decoded records; the comparison publishes the \
+             {expected_materialized} decoded records were required; the comparison publishes the \
              dbt_evidence_transport_v1 envelope and must not drop any authenticated record",
-            records.len(),
         )));
     }
 

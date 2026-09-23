@@ -271,7 +271,7 @@ fn ordinary_run_refuses_to_lose_epoch_provenance_to_an_unwritable_log() {
 }
 
 #[test]
-fn ordinary_run_refuses_to_lose_host_now_epoch_provenance_to_unwritable_stderr() {
+fn ordinary_run_requires_host_now_but_not_explicit_epoch_provenance_delivery() {
     let _guard = hermit_clock_lock();
     let args = [
         "run",
@@ -305,6 +305,29 @@ fn ordinary_run_refuses_to_lose_host_now_epoch_provenance_to_unwritable_stderr()
     assert!(
         !status.success(),
         "host-now run succeeded after losing its only epoch reproducer to /dev/full",
+    );
+
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("failed to reopen /dev/full");
+    let explicit_status = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args([
+            "run",
+            &format!("--epoch={REPEATABLE_EPOCH}"),
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ])
+        .stderr(full)
+        .status()
+        .expect("failed to start the explicit-epoch unwritable-stderr probe");
+    assert!(
+        explicit_status.success(),
+        "an explicit epoch is already reproducible and must retain best-effort stderr semantics",
     );
 }
 

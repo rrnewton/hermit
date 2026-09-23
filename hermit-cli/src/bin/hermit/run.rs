@@ -2947,7 +2947,7 @@ impl RunOpts {
         global
             .write_controller_diagnostic(
                 format_args!("WARN hermit::virtual_time: {provenance}"),
-                true,
+                self.epoch_captured_from_host,
             )
             .with_context(|| format!("cannot write epoch provenance to {sink}"))
     }

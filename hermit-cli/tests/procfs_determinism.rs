@@ -28,7 +28,9 @@ use reverie::process::Namespace;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const RUNS: usize = 5;
-const COMPARISON_EPOCH: &str = "2026-09-23T02:39:52.970859833+00:00";
+// The fixed accounting expectations below use this explicit fractional input.
+// Other procfs probes continue to exercise the ordinary host-captured default.
+const ACCOUNTING_EPOCH: &str = "2026-09-23T02:39:52.970859833+00:00";
 
 fn compile_c(source: &Path, output: &Path) {
     let rendered = format!("cc -O0 -g {} -o {}", source.display(), output.display());
@@ -82,10 +84,6 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn read_procfs(path: &str) -> Vec<u8> {
-    read_procfs_at_epoch(path, Some(COMPARISON_EPOCH))
 }
 
 fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
@@ -192,13 +190,17 @@ fn first_mountinfo_row_difference(left: &[u8], right: &[u8]) -> String {
 }
 
 fn assert_deterministic(path: &str, validate: impl Fn(&[u8])) {
+    assert_deterministic_at_epoch(path, None, validate);
+}
+
+fn assert_deterministic_at_epoch(path: &str, epoch: Option<&str>, validate: impl Fn(&[u8])) {
     let _guard = hermit_run_lock();
-    let first = read_procfs(path);
+    let first = read_procfs_at_epoch(path, epoch);
     assert!(!first.is_empty(), "{path} unexpectedly returned no data");
     validate(&first);
 
     for run in 2..=RUNS {
-        let output = read_procfs(path);
+        let output = read_procfs_at_epoch(path, epoch);
         assert_eq!(
             first,
             output,
@@ -299,7 +301,7 @@ fn proc_self_cmdline_is_deterministic() {
 // TODO-HUMAN-REVIEW(PR-843): Review process and system accounting coverage.
 #[test]
 fn proc_system_cpu_accounting_is_deterministic() {
-    assert_deterministic("/proc/stat", |contents| {
+    assert_deterministic_at_epoch("/proc/stat", Some(ACCOUNTING_EPOCH), |contents| {
         let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
         let cpu_lines = text
             .lines()
@@ -429,7 +431,7 @@ fn proc_loadavg_uses_virtual_values() {
 
 #[test]
 fn proc_uptime_uses_virtual_time() {
-    assert_deterministic("/proc/uptime", |contents| {
+    assert_deterministic_at_epoch("/proc/uptime", Some(ACCOUNTING_EPOCH), |contents| {
         assert_eq!(contents, b"120.00 0.00\n");
     });
 

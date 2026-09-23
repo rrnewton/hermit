@@ -231,7 +231,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // One DBT controller-provenance materialization regression retains all 723 prior IDs.
-    ("test.hermit_unit", 724),
+    // One required-delivery stderr regression retains all 724 prior IDs.
+    ("test.hermit_unit", 725),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // One fractional zero-work summary regression retains all 748 prior IDs.
@@ -270,7 +271,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 752),
     ("test.hermit_integration_on_host", 165),
-    ("test.hermit_unit_on_host", 724),
+    // The host node carries the same required-delivery stderr regression.
+    ("test.hermit_unit_on_host", 725),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
