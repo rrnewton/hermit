@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 const OBJECT: &str = "accepted-provider.bpf.o";
 const LIBRARY: &str = "libhermit_accepted_provider.so";
-const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 const ACCEPTED_CONTRACT: &str = include_str!("../network-provider/accepted-contract.json");
 
 #[derive(Debug, Deserialize)]
@@ -53,7 +53,7 @@ struct Manifest {
     links: usize,
 }
 
-fn digest_hex(text: &str) -> io::Result<[u8; 32]> {
+pub(crate) fn digest_hex(text: &str) -> io::Result<[u8; 32]> {
     if text.len() != 64
         || !text
             .bytes()
@@ -71,7 +71,7 @@ fn digest_hex(text: &str) -> io::Result<[u8; 32]> {
     Ok(result)
 }
 
-fn read_regular(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn read_regular(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let file = File::options()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -199,7 +199,7 @@ impl PackagedAcceptedProvider {
     }
 }
 
-fn validate_elf(bytes: &[u8], machine: u16) -> io::Result<()> {
+pub(crate) fn validate_elf(bytes: &[u8], machine: u16) -> io::Result<()> {
     if bytes.len() < 64
         || bytes[..6] != *b"\x7fELF\x02\x01"
         || u16::from_le_bytes([bytes[18], bytes[19]]) != machine
@@ -213,7 +213,7 @@ fn validate_elf(bytes: &[u8], machine: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn sealed_file(name: &std::ffi::CStr, bytes: &[u8], executable: bool) -> io::Result<File> {
+pub(crate) fn sealed_file(name: &std::ffi::CStr, bytes: &[u8], executable: bool) -> io::Result<File> {
     let flags = libc::MFD_CLOEXEC
         | libc::MFD_ALLOW_SEALING
         | if executable {

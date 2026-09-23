@@ -66,6 +66,10 @@ struct Accept<T> {
     matched: Option<AcceptedPhysicalIdentity>,
     resolved: Option<Resolved>,
     abandoned: bool,
+    prepared_effect: Option<(u64, u64)>,
+    physical_effect:
+        Option<super::accepted_provider::Observation<super::accepted_provider::AcceptedEffect>>,
+    collection: Option<Result<(u64, Option<Result<(), String>>), String>>,
 }
 
 #[derive(Debug)]
@@ -86,6 +90,39 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 impl<T> AcceptedCustody<T> {
+    #[cfg(test)]
+    pub(super) fn collection_effect_status(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<Option<(i32, i32)>> {
+        Ok(self
+            .receipt(owner, lease)?
+            .physical_effect
+            .as_ref()
+            .map(|effect| (effect.status.returned, effect.raw.command.returned)))
+    }
+    pub(super) fn captured_return_matches(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        result: Result<i32, i32>,
+    ) -> bool {
+        self.receipt(owner, lease)
+            .is_ok_and(|operation| operation.returned == Some(result))
+    }
+
+    pub(super) fn collection_result(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<()> {
+        match &self.receipt(owner, lease)?.collection {
+            Some(Ok((_, Some(result)))) => result.clone().map_err(io::Error::other),
+            Some(Err(error)) => Err(io::Error::other(error.clone())),
+            _ => Err(invalid("accepted collection remains unresolved")),
+        }
+    }
     #[cfg(test)]
     pub(super) fn recovery_result(
         &self,
@@ -118,6 +155,9 @@ impl<T> AcceptedCustody<T> {
                 matched: None,
                 resolved: None,
                 abandoned: false,
+                prepared_effect: None,
+                physical_effect: None,
+                collection: None,
             },
         );
         Ok(())
@@ -191,6 +231,167 @@ impl<T> AcceptedCustody<T> {
         if let Err(error) = validate_pin(op.pin.as_ref().unwrap()) {
             op.capture_error = Some(error.to_string());
             return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepared_effect(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<(u64, u64)> {
+        self.receipt(owner, lease)?
+            .prepared_effect
+            .ok_or_else(|| invalid("accept provider command not prepared"))
+    }
+
+    pub(super) fn collection_submission(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<Option<Result<u64, String>>> {
+        let operation = self.receipt(owner, lease)?;
+        if operation.returned.is_none() {
+            return Err(invalid("collection precedes captured kernel return"));
+        }
+        Ok(operation.collection.as_ref().map(|result| {
+            result
+                .as_ref()
+                .map(|(sequence, _)| *sequence)
+                .map_err(Clone::clone)
+        }))
+    }
+
+    pub(super) fn retain_collection_submission(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        result: Result<u64, String>,
+    ) -> io::Result<()> {
+        if self.collection_submission(owner, lease)?.is_some() {
+            return Err(invalid("accepted collection submission already retained"));
+        }
+        self.operations.get_mut(&lease).unwrap().collection =
+            Some(result.map(|sequence| (sequence, None)));
+        Ok(())
+    }
+
+    pub(super) fn pending_collections(
+        &self,
+    ) -> Vec<(NetworkStreamOwner, NetworkAcceptLeaseId, u64)> {
+        self.operations
+            .iter()
+            .filter_map(|(lease, operation)| match &operation.collection {
+                Some(Ok((sequence, None))) => Some((operation.owner, *lease, *sequence)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Store the complete provider reply/error independently of a live caller.
+    /// A failed collection remains failed and cannot trigger another dispatch.
+    pub(super) fn complete_collection(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        sequence: u64,
+        reply: Result<super::accepted_provider::Reply, String>,
+    ) -> io::Result<()> {
+        match &self.receipt(owner, lease)?.collection {
+            Some(Ok((actual, None))) if *actual == sequence => {}
+            Some(Ok((actual, Some(_)))) if *actual == sequence => return Ok(()),
+            _ => return Err(invalid("accepted collection completion changed request")),
+        }
+        let outcome = match reply {
+            Ok(super::accepted_provider::Reply::AcceptedEffect(effect)) => self
+                .retain_physical_effect(owner, lease, effect)
+                .map_err(|error| error.to_string()),
+            Ok(_) => Err(
+                "accepted collection returned a different effect; reply retained in transport"
+                    .into(),
+            ),
+            Err(error) => Err(error),
+        };
+        self.operations.get_mut(&lease).unwrap().collection = Some(Ok((sequence, Some(outcome))));
+        Ok(())
+    }
+
+    pub(super) fn collections_settled(&self) -> io::Result<bool> {
+        let mut pending = false;
+        for operation in self.operations.values() {
+            match &operation.collection {
+                None if operation.returned.is_some() || operation.prepared_effect.is_some() => {
+                    return Err(invalid(
+                        "prepared or captured accept has no collection receipt",
+                    ));
+                }
+                Some(Ok((_, None))) => pending = true,
+                Some(Err(error)) | Some(Ok((_, Some(Err(error))))) => {
+                    return Err(io::Error::other(error.clone()));
+                }
+                _ => {}
+            }
+        }
+        Ok(!pending)
+    }
+    pub(super) fn retain_preparation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        request: u64,
+        command: u64,
+    ) -> io::Result<()> {
+        let prior = self.receipt(owner, lease)?;
+        if request == 0
+            || command == 0
+            || prior
+                .prepared_effect
+                .is_some_and(|p| p != (request, command))
+        {
+            return Err(invalid("accepted provider preparation changed"));
+        }
+        self.operations.get_mut(&lease).unwrap().prepared_effect = Some((request, command));
+        Ok(())
+    }
+    /// Recovery stores the provider's partial/error response even after owner
+    /// abandonment. This does not grant permission to install or recapture.
+    pub(super) fn retain_physical_effect(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        effect: super::accepted_provider::Observation<super::accepted_provider::AcceptedEffect>,
+    ) -> io::Result<()> {
+        let prior = self.receipt(owner, lease)?;
+        if prior.physical_effect.as_ref().is_some_and(|p| p != &effect) {
+            return Err(invalid("accepted physical effect changed after receipt"));
+        }
+        self.operations.get_mut(&lease).unwrap().physical_effect = Some(effect.clone());
+        let prior = self.receipt(owner, lease)?;
+        let (_, command) = prior
+            .prepared_effect
+            .ok_or_else(|| invalid("accepted physical receipt lacks preparation"))?;
+        if effect.status.returned != 0 {
+            return Err(invalid(
+                "accepted provider collection failed; partial receipt retained",
+            ));
+        }
+        let raw = &effect.raw;
+        let returned = if raw.command.returned >= 0 {
+            Ok(raw.command.returned)
+        } else {
+            Err(-raw.command.returned)
+        };
+        if raw.command.command != command
+            || raw.command.operation != 4
+            || raw.command.phase != 1
+            || raw.installation.command != command
+            || raw.installation.accept_lease != lease.0
+            || raw.installation.owner_mm != owner.mm.generation()
+            || prior.returned != Some(returned)
+        {
+            return Err(invalid(
+                "accepted provider effect differs from exact submitted kernel return",
+            ));
         }
         Ok(())
     }
@@ -554,5 +755,82 @@ mod resolved_tests {
             }
             assert!(Resolved::checked(9, observed).is_err(), "{cause}");
         }
+    }
+
+    #[test]
+    fn accepted_effect_retains_late_partial_result_after_owner_abandonment() {
+        use super::super::accepted_provider::CallStatus;
+        use super::super::accepted_provider::Observation;
+        use super::super::accepted_provider_ffi as ffi;
+        let thread = crate::types::DetTid::from_raw(7);
+        let who = NetworkStreamOwner {
+            thread,
+            mm: crate::types::MmId::initial(thread),
+        };
+        let lease = NetworkAcceptLeaseId(29);
+        let mut custody = AcceptedCustody::<u64>::default();
+        custody
+            .submit(who, lease, NetworkStreamCallId::controlled_fixture(5))
+            .unwrap();
+        custody.retain_preparation(who, lease, 7, 11).unwrap();
+        custody.abandon(who);
+        assert!(
+            custody
+                .capture(
+                    who,
+                    lease,
+                    Ok(8),
+                    |_| panic!("reacquired after abandonment"),
+                    |_| Ok(())
+                )
+                .is_err()
+        );
+        assert!(custody.returned(who, lease).is_err());
+        assert_eq!(custody.receipt(who, lease).unwrap().returned, Some(Ok(8)));
+        let mut effect = Observation {
+            status: CallStatus {
+                operation: "collect".into(),
+                returned: -1,
+                errno: Some(libc::EIO),
+            },
+            raw: ffi::AcceptedEffect {
+                command: ffi::CommandResult {
+                    command: 11,
+                    operation: 4,
+                    returned: 8,
+                    phase: 1,
+                    ..Default::default()
+                },
+                installation: ffi::FdAccept {
+                    command: 11,
+                    accept_lease: lease.0,
+                    owner_mm: who.mm.generation(),
+                    ..Default::default()
+                },
+            }
+            .into(),
+        };
+        assert!(
+            custody
+                .retain_physical_effect(who, lease, effect.clone())
+                .is_err()
+        );
+        assert_eq!(
+            custody.operations[&lease].physical_effect,
+            Some(effect.clone())
+        );
+        assert!(custody.pin(who, lease).is_err());
+        effect.status.returned = 0;
+        effect.status.errno = None;
+        assert!(custody.retain_physical_effect(who, lease, effect).is_err());
+        assert_eq!(
+            custody.operations[&lease]
+                .physical_effect
+                .as_ref()
+                .unwrap()
+                .status
+                .errno,
+            Some(libc::EIO)
+        );
     }
 }

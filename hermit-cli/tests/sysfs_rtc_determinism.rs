@@ -6,9 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/run_epoch.rs"]
+mod run_epoch;
+#[path = "common/strict_run_report.rs"]
+mod strict_run_report;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 
 const RTC_ROOT: &str = "/sys/class/rtc/rtc0";
 const RTC_DATE: &str = "/sys/class/rtc/rtc0/date";
@@ -20,6 +26,7 @@ struct ProgramCase {
     name: &'static str,
     candidates: &'static [&'static str],
     args: &'static [&'static str],
+    rtc: Option<&'static str>,
 }
 
 fn required_program(name: &str, candidates: &[&str]) -> PathBuf {
@@ -32,6 +39,7 @@ fn required_program(name: &str, candidates: &[&str]) -> PathBuf {
 
 fn hermit_command(epoch: Option<&str>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.env_remove("HERMIT_EPOCH");
     command.args([
         "--log",
         "DEBUG",
@@ -74,8 +82,10 @@ fn assert_normalized_attribute(path: &str, expected: &[u8]) {
     );
 }
 
-fn assert_l2(case: &ProgramCase) {
+fn assert_l2(case: &ProgramCase, epoch: Option<&str>) -> Output {
     let program = required_program(case.name, case.candidates);
+    let reports = tempfile::tempdir().expect("RTC verification report directory");
+    let report = reports.path().join("verify.json");
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "90s"])
@@ -86,13 +96,24 @@ fn assert_l2(case: &ProgramCase) {
             "run",
             "--strict",
             "--verify",
+            "--verify-strict",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--epoch=2026-01-01T00:00:00Z",
-            "--",
         ])
-        .arg(program)
-        .args(case.args);
+        .env_remove("HERMIT_EPOCH")
+        .arg(format!("--verify-json={}", report.display()));
+    if let Some(epoch) = epoch {
+        command.arg(format!("--epoch={epoch}"));
+    }
+    command.arg("--");
+    if epoch.is_none() && case.rtc.is_some() {
+        let python = required_program("Python RTC consumer brackets", &["/usr/bin/python3"]);
+        command.arg(python).args([
+            "-c",
+            "import json, subprocess, sys, time; before=time.clock_gettime_ns(time.CLOCK_REALTIME); child=subprocess.run(sys.argv[1:], stdout=subprocess.PIPE, check=True); after=time.clock_gettime_ns(time.CLOCK_REALTIME); print(json.dumps([before, child.stdout.decode(), after]))",
+        ]);
+    }
+    command.arg(program).args(case.args);
 
     let rendered = format!("{command:?}");
     let output = command
@@ -112,10 +133,21 @@ fn assert_l2(case: &ProgramCase) {
         "{} omitted Hermit's verification marker ({rendered})\nstdout:\n{stdout}\nstderr:\n{stderr}",
         case.name,
     );
+    strict_run_report::assert_canonical_success(&report, &output);
+    if epoch.is_none() {
+        let epoch = run_epoch::captured_epoch(&output.stderr);
+        if let Some(attribute) = case.rtc {
+            let bracket: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .expect("RTC consumer CLOCK_REALTIME bracket");
+            run_epoch::assert_start(epoch, bracket[0].as_i64().unwrap());
+            run_epoch::assert_rtc_bracket(attribute, &bracket);
+        }
+    }
+    output
 }
 
 #[test]
-fn sysfs_rtc_consumers_verify() {
+fn sysfs_rtc_consumers_verify_fixed_epoch() {
     if ![RTC_DATE, RTC_TIME, RTC_EPOCH]
         .iter()
         .all(|path| Path::new(path).is_file())
@@ -129,7 +161,7 @@ fn sysfs_rtc_consumers_verify() {
         .expect("RTC time should be UTF-8");
     assert!(
         rtc_time.starts_with("00:00:"),
-        "unexpected default RTC time: {rtc_time:?}"
+        "unexpected fixed RTC time: {rtc_time:?}"
     );
     let rtc_epoch = String::from_utf8(read_normalized_attribute(RTC_EPOCH, Some(FIXED_EPOCH)))
         .expect("RTC epoch should be UTF-8")
@@ -138,38 +170,11 @@ fn sysfs_rtc_consumers_verify() {
         .expect("RTC epoch should be an integer");
     assert!(
         (1_767_225_600..1_767_225_660).contains(&rtc_epoch),
-        "unexpected default RTC epoch: {rtc_epoch}"
+        "unexpected fixed RTC epoch: {rtc_epoch}"
     );
 
-    let cases = [
-        ProgramCase {
-            name: "bash sysfs RTC epoch",
-            candidates: &["/usr/bin/bash", "/bin/bash"],
-            args: &[
-                "-c",
-                "for i in {1..100000}; do :; done; cat /sys/class/rtc/rtc0/since_epoch",
-            ],
-        },
-        ProgramCase {
-            name: "zsh sysfs RTC time",
-            candidates: &["/usr/bin/zsh", "/bin/zsh"],
-            args: &[
-                "-c",
-                "i=0; while [ \"$i\" -lt 5000 ]; do i=$((i+1)); done; cat /sys/class/rtc/rtc0/time",
-            ],
-        },
-        ProgramCase {
-            name: "perl sysfs RTC epoch",
-            candidates: &["/usr/bin/perl", "/bin/perl"],
-            args: &[
-                "-e",
-                "$x += $_ for 1..5000000; open my $fh, \"<\", \"/sys/class/rtc/rtc0/since_epoch\" or die $!; print while <$fh>",
-            ],
-        },
-    ];
-
-    for case in &cases {
-        assert_l2(case);
+    for case in &rtc_consumers() {
+        assert_l2(case, Some(FIXED_EPOCH));
     }
 }
 
@@ -236,4 +241,61 @@ fn sysfs_rtc_tracks_custom_epoch_and_virtual_time() {
         "RTC did not advance by the two-second virtual sleep: {output}"
     );
     assert_eq!(lines.next(), None, "unexpected RTC output: {output}");
+}
+
+fn rtc_consumers() -> [ProgramCase; 3] {
+    [
+        ProgramCase {
+            name: "bash sysfs RTC epoch",
+            rtc: Some("since_epoch"),
+            candidates: &["/usr/bin/bash", "/bin/bash"],
+            args: &[
+                "-c",
+                "for i in {1..100000}; do :; done; cat /sys/class/rtc/rtc0/since_epoch",
+            ],
+        },
+        ProgramCase {
+            name: "zsh sysfs RTC time",
+            rtc: Some("time"),
+            candidates: &["/usr/bin/zsh", "/bin/zsh"],
+            args: &[
+                "-c",
+                "i=0; while [ \"$i\" -lt 5000 ]; do i=$((i+1)); done; cat /sys/class/rtc/rtc0/time",
+            ],
+        },
+        ProgramCase {
+            name: "perl sysfs RTC epoch",
+            rtc: Some("since_epoch"),
+            candidates: &["/usr/bin/perl", "/bin/perl"],
+            args: &[
+                "-e",
+                "$x += $_ for 1..5000000; open my $fh, \"<\", \"/sys/class/rtc/rtc0/since_epoch\" or die $!; print while <$fh>",
+            ],
+        },
+    ]
+}
+
+#[test]
+fn sysfs_rtc_consumers_verify_omitted_epoch_and_clock_continuity() {
+    if ![RTC_DATE, RTC_TIME, RTC_EPOCH]
+        .iter()
+        .all(|path| Path::new(path).is_file())
+    {
+        eprintln!("skipping: {RTC_ROOT} does not expose the expected RTC attributes");
+        return;
+    }
+    for case in &rtc_consumers() {
+        assert_l2(case, None);
+    }
+    let output = assert_l2(
+        &ProgramCase {
+            name: "omitted-epoch RTC sleep/exec clock probe",
+            candidates: &["/usr/bin/python3"],
+            args: &["-c", run_epoch::CLOCK_PROBE, run_epoch::CLOCK_PROBE, "rtc"],
+            rtc: None,
+        },
+        None,
+    );
+    let epoch = run_epoch::captured_epoch(&output.stderr);
+    run_epoch::assert_clock_progress(&output.stdout, epoch, true);
 }

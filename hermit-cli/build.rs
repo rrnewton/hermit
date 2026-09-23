@@ -21,11 +21,14 @@
 #[path = "build_support.rs"]
 mod build_support;
 
+mod guard_client_build;
+
 use build_support::build_date;
 use build_support::git_short_sha;
 use build_support::git_watch_paths;
 
 fn main() {
+    guard_client_build::build();
     let sha = git_short_sha();
     let date = build_date();
 

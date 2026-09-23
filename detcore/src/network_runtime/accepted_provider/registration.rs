@@ -34,6 +34,18 @@ struct Setter {
     option: i32,
 }
 
+struct AcceptPreparation {
+    identity: Identity,
+    lease: u64,
+    mm: u64,
+    fd: i32,
+    flags: i32,
+}
+enum Preparation {
+    Setter(Setter),
+    Accept(AcceptPreparation),
+}
+
 trait Backend {
     type Pin;
     fn identity(&self, pidfd: &Self::Pin) -> io::Result<PidfdIdentity>;
@@ -41,6 +53,24 @@ trait Backend {
     fn prepare(&mut self, pidfd: &Self::Pin, setter: Setter) -> io::Result<Observation<u64>>;
     fn finish(&mut self, pidfd: &Self::Pin, command: u64)
     -> io::Result<Observation<CommandResult>>;
+    fn prepare_accept(
+        &mut self,
+        _pidfd: &Self::Pin,
+        _accept: AcceptPreparation,
+    ) -> io::Result<Observation<u64>> {
+        Err(io::Error::other(
+            "backend does not produce accepted installation receipts",
+        ))
+    }
+    fn collect_accept(
+        &mut self,
+        _pidfd: &Self::Pin,
+        _command: u64,
+    ) -> io::Result<Observation<super::AcceptedEffect>> {
+        Err(io::Error::other(
+            "backend does not collect accepted installation receipts",
+        ))
+    }
 }
 
 struct Physical<'a>(&'a mut ffi::Session);
@@ -88,9 +118,34 @@ impl Backend for Physical<'_> {
     fn finish(&mut self, pidfd: &OwnedFd, command: u64) -> io::Result<Observation<CommandResult>> {
         Ok(self.0.finish_setter(pidfd.as_fd(), command).into())
     }
+    fn prepare_accept(
+        &mut self,
+        pidfd: &OwnedFd,
+        accept: AcceptPreparation,
+    ) -> io::Result<Observation<u64>> {
+        Ok(self
+            .0
+            .prepare_accept(
+                pidfd.as_fd(),
+                accept.identity.into(),
+                accept.lease,
+                accept.mm,
+                accept.fd,
+                accept.flags,
+            )
+            .into())
+    }
+    fn collect_accept(
+        &mut self,
+        pidfd: &OwnedFd,
+        command: u64,
+    ) -> io::Result<Observation<super::AcceptedEffect>> {
+        Ok(self.0.collect_accept(pidfd.as_fd(), command).into())
+    }
 }
 
 struct Active {
+    operation: Operation,
     request: u64,
     command: Option<u64>,
     finish_submitted: bool,
@@ -137,16 +192,52 @@ impl Registrations {
             .ok_or_else(|| io::Error::other("setter lacks task owner"))?;
         let request: Request = serde_json::from_slice(&envelope.body)?;
         let reply = match (envelope.operation, request) {
-            (
-                Operation::PrepareSetter,
-                Request::PrepareSetter {
-                    identity,
-                    before,
-                    after,
-                    level,
-                    option,
-                },
-            ) if rights.len() == 2 => {
+            (operation @ (Operation::PrepareSetter | Operation::PrepareAccept), request)
+                if rights.len() == 2 =>
+            {
+                let preparation = match (operation, request) {
+                    (
+                        Operation::PrepareSetter,
+                        Request::PrepareSetter {
+                            identity,
+                            before,
+                            after,
+                            level,
+                            option,
+                        },
+                    ) => Preparation::Setter(Setter {
+                        identity,
+                        before,
+                        after,
+                        level,
+                        option,
+                    }),
+                    (
+                        Operation::PrepareAccept,
+                        Request::PrepareAccept {
+                            identity,
+                            lease,
+                            mm,
+                            fd,
+                            flags,
+                        },
+                    ) if envelope.accept.map(|lease| lease.0) == Some(lease)
+                        && owner.mm.generation() == mm =>
+                    {
+                        Preparation::Accept(AcceptPreparation {
+                            identity,
+                            lease,
+                            mm,
+                            fd,
+                            flags,
+                        })
+                    }
+                    _ => {
+                        return Err(io::Error::other(
+                            "provider preparation kind/owner/lease mismatch",
+                        ));
+                    }
+                };
                 let pidfd = &rights[1];
                 let observed = backend.identity(pidfd)?;
                 if self
@@ -204,33 +295,41 @@ impl Registrations {
                         ));
                     }
                     receipt.active = Some(Active {
+                        operation,
                         request: envelope.sequence,
                         command: None,
                         finish_submitted: false,
                     });
-                    let outcome = backend.prepare(
-                        pidfd,
-                        Setter {
-                            identity,
-                            before,
-                            after,
-                            level,
-                            option,
-                        },
-                    )?;
+                    let outcome = match preparation {
+                        Preparation::Setter(setter) => backend.prepare(pidfd, setter)?,
+                        Preparation::Accept(accept) => backend.prepare_accept(pidfd, accept)?,
+                    };
                     if outcome.status.returned == 0 && outcome.raw != 0 {
                         receipt.active.as_mut().unwrap().command = Some(outcome.raw);
                     }
                     Reply::Prepared(outcome)
                 }
             }
-            (
-                Operation::FinishSetter,
-                Request::FinishSetter {
-                    command,
-                    prepared_request,
-                },
-            ) if rights.is_empty() => {
+            (operation @ (Operation::FinishSetter | Operation::CollectAccept), request)
+                if rights.is_empty() =>
+            {
+                let (command, prepared_request, preparation) = match (operation, request) {
+                    (
+                        Operation::FinishSetter,
+                        Request::FinishSetter {
+                            command,
+                            prepared_request,
+                        },
+                    ) => (command, prepared_request, Operation::PrepareSetter),
+                    (
+                        Operation::CollectAccept,
+                        Request::CollectAccept {
+                            command,
+                            prepared_request,
+                        },
+                    ) => (command, prepared_request, Operation::PrepareAccept),
+                    _ => return Err(io::Error::other("provider completion kind mismatch")),
+                };
                 let pins = prepared_rights
                     .filter(|pins| pins.len() == 2)
                     .ok_or_else(|| io::Error::other("setter finish lacks retained preparation"))?;
@@ -244,7 +343,9 @@ impl Registrations {
                     .active
                     .as_mut()
                     .filter(|active| {
-                        active.request == prepared_request && active.command == Some(command)
+                        active.request == prepared_request
+                            && active.command == Some(command)
+                            && active.operation == preparation
                     })
                     .ok_or_else(|| io::Error::other("setter finish changed active command"))?;
                 if active.finish_submitted {
@@ -253,14 +354,27 @@ impl Registrations {
                     ));
                 }
                 active.finish_submitted = true;
-                let outcome = backend.finish(&pins[1], command)?;
-                if outcome.status.returned == 0 {
-                    if outcome.raw.command != command {
+                let reply = match operation {
+                    Operation::FinishSetter => Reply::Command(backend.finish(&pins[1], command)?),
+                    Operation::CollectAccept => {
+                        Reply::AcceptedEffect(backend.collect_accept(&pins[1], command)?)
+                    }
+                    _ => unreachable!(),
+                };
+                let (status, returned_command) = match &reply {
+                    Reply::Command(outcome) => (&outcome.status, outcome.raw.command),
+                    Reply::AcceptedEffect(outcome) => {
+                        (&outcome.status, outcome.raw.command.command)
+                    }
+                    _ => unreachable!(),
+                };
+                if status.returned == 0 {
+                    if returned_command != command {
                         return Err(io::Error::other("provider finish returned another command"));
                     }
                     receipt.active = None;
                 }
-                Reply::Command(outcome)
+                reply
             }
             _ => {
                 return Err(io::Error::other(
@@ -608,5 +722,179 @@ mod tests {
                 .is_err()
         );
         assert_eq!((backend.registrations, backend.preparations), (1, 1));
+    }
+
+    #[derive(Default)]
+    struct AcceptBackend {
+        shared: Fake,
+        unknown_collection: bool,
+    }
+    impl Backend for AcceptBackend {
+        type Pin = PidfdIdentity;
+        fn identity(&self, pin: &Self::Pin) -> io::Result<PidfdIdentity> {
+            self.shared.identity(pin)
+        }
+        fn register(&mut self, pin: &Self::Pin) -> io::Result<CallStatus> {
+            self.shared.register(pin)
+        }
+        fn prepare(&mut self, pin: &Self::Pin, setter: Setter) -> io::Result<Observation<u64>> {
+            self.shared.prepare(pin, setter)
+        }
+        fn finish(
+            &mut self,
+            pin: &Self::Pin,
+            command: u64,
+        ) -> io::Result<Observation<CommandResult>> {
+            self.shared.finish(pin, command)
+        }
+        fn prepare_accept(
+            &mut self,
+            _: &Self::Pin,
+            accept: AcceptPreparation,
+        ) -> io::Result<Observation<u64>> {
+            assert_eq!(accept.lease, 17);
+            assert_eq!(accept.mm, owner().mm.generation());
+            assert_eq!((accept.fd, accept.flags), (6, libc::SOCK_CLOEXEC));
+            self.shared.preparations += 1;
+            Ok(Observation {
+                status: status("prepare_accept"),
+                raw: self.shared.preparations as u64,
+            })
+        }
+        fn collect_accept(
+            &mut self,
+            _: &Self::Pin,
+            command: u64,
+        ) -> io::Result<Observation<super::super::AcceptedEffect>> {
+            self.shared.completions += 1;
+            if self.unknown_collection {
+                return Err(io::Error::other("collection mutated before lost result"));
+            }
+            Ok(Observation {
+                status: status("collect_accept"),
+                raw: ffi::AcceptedEffect {
+                    command: ffi::CommandResult {
+                        command,
+                        operation: 4,
+                        returned: 8,
+                        phase: 1,
+                        ..Default::default()
+                    },
+                    installation: ffi::FdAccept {
+                        command,
+                        accept_lease: 17,
+                        owner_mm: owner().mm.generation(),
+                        returned_fd: 8,
+                        phases: 127,
+                        ..Default::default()
+                    },
+                }
+                .into(),
+            })
+        }
+    }
+    fn prepare_accept(sequence: u64) -> Envelope {
+        let mut e = prepare(sequence, owner());
+        e.accept = Some(crate::network_replay::NetworkAcceptLeaseId(17));
+        e.operation = Operation::PrepareAccept;
+        e.body = serde_json::to_vec(&Request::PrepareAccept {
+            identity: Identity {
+                provider: 1,
+                object: 9,
+                namespace: 2,
+            },
+            lease: 17,
+            mm: owner().mm.generation(),
+            fd: 6,
+            flags: libc::SOCK_CLOEXEC,
+        })
+        .unwrap();
+        e
+    }
+    fn collect_accept(sequence: u64) -> Envelope {
+        let mut e = finish(sequence, 1, 1, owner());
+        e.operation = Operation::CollectAccept;
+        e.accept = Some(crate::network_replay::NetworkAcceptLeaseId(17));
+        e.body = serde_json::to_vec(&Request::CollectAccept {
+            command: 1,
+            prepared_request: 1,
+        })
+        .unwrap();
+        e
+    }
+    #[test]
+    fn accepted_effect_dispatch_uses_one_registration_and_excludes_setter_completion() {
+        let mut registrations = Registrations::default();
+        let mut backend = AcceptBackend::default();
+        let ready = prepared(
+            registrations
+                .dispatch(&mut backend, &prepare_accept(1), &pins(), None)
+                .unwrap(),
+        );
+        assert_eq!(ready.raw, 1);
+        assert!(
+            registrations
+                .dispatch(&mut backend, &finish(2, 1, 1, owner()), &[], Some(&pins()))
+                .is_err()
+        );
+        assert_eq!(backend.shared.completions, 0);
+        let collected = registrations
+            .dispatch(&mut backend, &collect_accept(3), &[], Some(&pins()))
+            .unwrap();
+        let Reply::AcceptedEffect(effect) = serde_json::from_slice(&collected).unwrap() else {
+            panic!("wrong physical response")
+        };
+        assert_eq!(effect.raw.command.returned, 8);
+        assert_eq!(effect.raw.installation.returned_fd, 8);
+        let next = prepared(
+            registrations
+                .dispatch(&mut backend, &prepare(4, owner()), &pins(), None)
+                .unwrap(),
+        );
+        assert_eq!(next.raw, 2);
+        assert_eq!(
+            (
+                backend.shared.registrations,
+                backend.shared.preparations,
+                backend.shared.completions
+            ),
+            (1, 2, 1)
+        );
+    }
+    #[test]
+    fn accepted_effect_dispatch_unknown_collection_retains_the_original_command() {
+        let mut registrations = Registrations::default();
+        let mut backend = AcceptBackend {
+            unknown_collection: true,
+            ..Default::default()
+        };
+        registrations
+            .dispatch(&mut backend, &prepare_accept(1), &pins(), None)
+            .unwrap();
+        assert!(
+            registrations
+                .dispatch(&mut backend, &collect_accept(2), &[], Some(&pins()))
+                .is_err()
+        );
+        backend.unknown_collection = false;
+        assert!(
+            registrations
+                .dispatch(&mut backend, &collect_accept(3), &[], Some(&pins()))
+                .is_err()
+        );
+        assert!(
+            registrations
+                .dispatch(&mut backend, &prepare_accept(4), &pins(), None)
+                .is_err()
+        );
+        assert_eq!(
+            (
+                backend.shared.registrations,
+                backend.shared.preparations,
+                backend.shared.completions
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(registrations.active_count(), 1);
     }
 }

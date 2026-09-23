@@ -692,6 +692,98 @@ impl GlobalState {
         GlobalResponse::Network(outcome.map(|()| NetworkReply::Unit))
     }
 
+    async fn recv_prepare_accepted_effect(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+        fd: i32,
+        flags: i32,
+    ) -> GlobalResponse {
+        let Some(runtime) = &self.network_runtime else {
+            return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                "accepted effect runtime absent",
+            )));
+        };
+        let (listener, physical, backend_failed) = {
+            let sched = self.sched.lock().unwrap();
+            if sched.backend_failed()
+                || sched.thread_is_logically_killed(owner.thread)
+                || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+            {
+                return GlobalResponse::ThreadExited;
+            }
+            let target = self
+                .network_engine
+                .as_ref()
+                .ok_or_else(|| NetworkRpcError::internal("accepted effect engine absent"))
+                .and_then(|engine| {
+                    engine
+                        .lock()
+                        .unwrap()
+                        .accepted_provider_effect_target(owner, lease)
+                        .map_err(|error| NetworkRpcError::internal(error.to_string()))
+                });
+            let (listener, physical) = match target {
+                Ok(value) => value,
+                Err(error) => return GlobalResponse::Network(Err(error)),
+            };
+            (listener, physical, sched.backend_failure_waiter())
+        };
+        let result = tokio::select! {
+            result=runtime.prepare_accepted_effect(owner,lease,listener,physical,fd,flags)=>result,
+            _=backend_failed=>return GlobalResponse::ThreadExited,
+        };
+        let sched = self.sched.lock().unwrap();
+        if sched.backend_failed()
+            || sched.thread_is_logically_killed(owner.thread)
+            || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+            || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+        {
+            return GlobalResponse::ThreadExited;
+        }
+        GlobalResponse::Network(
+            result
+                .map(|()| NetworkReply::Unit)
+                .map_err(|error| NetworkRpcError::internal(error.to_string())),
+        )
+    }
+
+    async fn recv_collect_accepted_effect(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+    ) -> GlobalResponse {
+        let Some(runtime) = &self.network_runtime else {
+            return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                "accepted recovery runtime absent",
+            )));
+        };
+        // Authenticate the original submitted lease, even when scheduler/task
+        // publication permission was revoked. This only retains effect evidence.
+        let admission = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| NetworkRpcError::internal("accepted recovery engine absent"))
+            .and_then(|engine| {
+                engine
+                    .lock()
+                    .unwrap()
+                    .accepted_capture_recovery_call(owner, lease)
+                    .map_err(|error| NetworkRpcError::internal(error.to_string()))
+            });
+        if let Err(error) = admission {
+            return GlobalResponse::Network(Err(error));
+        }
+        GlobalResponse::Network(
+            runtime
+                .collect_accepted_effect(owner, lease)
+                .await
+                .map(|()| NetworkReply::Unit)
+                .map_err(|error| NetworkRpcError::internal(error.to_string())),
+        )
+    }
+
     async fn recv_resolve_accepted_provider(
         &self,
         owner: NetworkStreamOwner,
@@ -817,7 +909,7 @@ impl GlobalState {
         result: Result<i32, i32>,
     ) -> GlobalResponse {
         let sched = self.sched.lock().unwrap();
-        let may_publish = !sched.backend_failed()
+        let mut may_publish = !sched.backend_failed()
             && !sched.thread_is_logically_killed(owner.thread)
             && sched.rpc_incarnation_matches(owner.thread, owner.mm)
             && self.registered_exec_mms.lock().unwrap().get(&owner.thread) == Some(&owner.mm);
@@ -834,6 +926,9 @@ impl GlobalState {
             // later scheduler transition has revoked semantic publication.
             engine
                 .accepted_capture_recovery_call(owner, lease)
+                .map_err(|error| NetworkRpcError::internal(error.to_string()))?;
+            may_publish &= !engine
+                .accepted_capture_owner_retired(owner, lease)
                 .map_err(|error| NetworkRpcError::internal(error.to_string()))?;
             let may_acquire = may_publish && engine.accepted_capture_call(owner, lease).is_ok();
             runtime
@@ -1222,6 +1317,12 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
+        if let Some(runtime) = &self.network_runtime {
+            // Backend wait and scheduler join precede this cleanup. Collection
+            // and final read retirement must finish before trace publication;
+            // a lost final guest RPC cannot turn an unapplied receipt into success.
+            runtime.finish_accepted_after_backend().await?;
+        }
         self.finalize_network_trace()?;
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
@@ -1499,6 +1600,19 @@ impl GlobalTool for GlobalState {
                     *lease,
                     *kernel_result,
                 ),
+            );
+        }
+        if let GlobalRequest::Network(NetworkRequest::CollectAcceptedEffect { lease }) = &request {
+            return (
+                None,
+                self.recv_collect_accepted_effect(
+                    NetworkStreamOwner {
+                        thread: dtid,
+                        mm: request_mm,
+                    },
+                    *lease,
+                )
+                .await,
             );
         }
         if matches!(request, GlobalRequest::NetworkOwnerGone) {
@@ -2089,6 +2203,21 @@ impl GlobalTool for GlobalState {
                 R::GlobalTimeLowerBound(ns)
             }
             GlobalRequest::Network(request) => match request {
+                NetworkRequest::PrepareAcceptedEffect { lease, fd, flags } => {
+                    self.recv_prepare_accepted_effect(
+                        NetworkStreamOwner {
+                            thread: dtid,
+                            mm: request_mm,
+                        },
+                        lease,
+                        fd,
+                        flags,
+                    )
+                    .await
+                }
+                NetworkRequest::CollectAcceptedEffect { .. } => {
+                    unreachable!("effect recovery uses early dispatch")
+                }
                 NetworkRequest::ResolveAcceptedProvider { lease } => {
                     self.recv_resolve_accepted_provider(
                         NetworkStreamOwner {
@@ -2168,32 +2297,22 @@ impl GlobalTool for GlobalState {
                 unreachable!("consuming path handled before admission")
             }
             GlobalRequest::RegisterNetworkPhysicalTask { process, thread } => {
-                // This is independent of StartNewThread's cfgseq path. The
-                // runtime capability is issued only at an actual ptrace spawn;
-                // untrusted numeric IDs or a Config bool cannot create it.
-                let sched = self.lock_rpc_scheduler(false).await;
-                let owner = NetworkStreamOwner {
-                    thread: dtid,
-                    mm: request_mm,
-                };
-                let authenticated = thread == dtid.as_raw()
-                    && sched.rpc_incarnation_matches(dtid, request_mm)
-                    && !sched.thread_is_logically_killed(dtid)
-                    && sched
-                        .registered_process(dtid)
-                        .is_some_and(|pid| pid.as_raw() as i32 == process)
-                    && self.registered_exec_mms.lock().unwrap().get(&dtid) == Some(&request_mm);
-                if !authenticated {
-                    R::ThreadExited
-                } else {
-                    R::RegisterNetworkPhysicalTask(match &self.network_runtime {
-                        None => Ok(false),
-                        Some(runtime) => runtime
-                            .register_ptrace_task(owner, process, thread)
-                            .map(|()| true)
-                            .map_err(|error| error.to_string()),
-                    })
+                let response = self
+                    .recv_register_network_physical_task(
+                        NetworkStreamOwner {
+                            thread: dtid,
+                            mm: request_mm,
+                        },
+                        process,
+                        thread,
+                    )
+                    .await;
+                // Terminal birth recovery must not enter the ordinary epilogue,
+                // whose admission lock intentionally parks after backend failure.
+                if response == R::ThreadExited {
+                    return (None, response);
                 }
+                response
             }
             GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap) => {
                 match self
@@ -2702,6 +2821,7 @@ impl GlobalState {
                         child_dettid, physical_pid, physical_tid, open_error,
                     );
                     sched.logically_kill_thread(&child_dettid, &child_detpid, child_mm);
+                    self.exec_preparation_changed.notify_waiters();
                     return SchedulerRpcResult::ThreadExited;
                 }
             }
@@ -2819,6 +2939,8 @@ impl GlobalState {
             );
             sched.started_up.try_put(());
         }
+        // Publish complete birth before ParentContinue can await child progress.
+        self.exec_preparation_changed.notify_waiters();
         // The child queue position above determines which equal-priority side
         // gets the first turn when the parent requests ParentContinue.
         // A vfork parent is already blocked by the kernel and is not in the run
@@ -2848,6 +2970,71 @@ impl GlobalState {
             }
         }
         SchedulerRpcResult::Continue(())
+    }
+
+    // A backend may deliver the child's startup callback before the parent's
+    // CreateChildThread RPC. Missing birth is a wait, not terminal cancellation.
+    // This also covers NoSeq without creating a scheduler turn or retrying the
+    // RPC's clock accounting. Historical tree membership with no active MM is
+    // retired identity, so it must never wait for (or accept) raw TID reuse.
+    async fn recv_register_network_physical_task(
+        &self,
+        owner: NetworkStreamOwner,
+        process: i32,
+        thread: i32,
+    ) -> GlobalResponse {
+        if thread != owner.thread.as_raw() {
+            return GlobalResponse::ThreadExited;
+        }
+        loop {
+            let changed = self.exec_preparation_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                // Unlike lock_rpc_scheduler(false), this lock permits an
+                // already pending birth waiter to observe backend failure.
+                let sched = self.sched.lock().unwrap();
+                if sched.backend_failed()
+                    || sched.thread_is_logically_killed(owner.thread)
+                    || !sched.rpc_incarnation_matches(owner.thread, owner.mm)
+                {
+                    return GlobalResponse::ThreadExited;
+                }
+                let registered_mm = self
+                    .registered_exec_mms
+                    .lock()
+                    .unwrap()
+                    .get(&owner.thread)
+                    .copied();
+                match (sched.registered_process(owner.thread), registered_mm) {
+                    (None, None) => {}
+                    (Some(pid), Some(mm)) if pid.as_raw() == process && mm == owner.mm => {
+                        let initial = sched.thread_tree.is_root(owner.thread);
+                        // Kernel registration may perform a bounded native
+                        // request. Never hold scheduler/MM locks across it.
+                        drop(sched);
+                        return GlobalResponse::RegisterNetworkPhysicalTask(
+                            match &self.network_runtime {
+                                None => Ok(false),
+                                Some(runtime) => runtime
+                                    .register_ptrace_task(owner, process, thread)
+                                    .and_then(|()| {
+                                        if initial {
+                                            runtime.register_guard_initial(owner)
+                                        } else {
+                                            Ok(())
+                                        }
+                                    })
+                                    .map(|()| true)
+                                    .map_err(|error| error.to_string()),
+                            },
+                        );
+                    }
+                    _ => return GlobalResponse::ThreadExited,
+                }
+            }
+            changed.await;
+        }
     }
 
     /// Called by the child thread upon startup.
@@ -3684,6 +3871,8 @@ impl GlobalState {
                         })
                         .map(|()| NetworkReply::Unit),
                     NetworkRequest::ResolveAcceptedProvider { .. }
+                    | NetworkRequest::PrepareAcceptedEffect { .. }
+                    | NetworkRequest::CollectAcceptedEffect { .. }
                     | NetworkRequest::EnrollAcceptedListener { .. } => {
                         unreachable!("listener enrollment uses authenticated asynchronous dispatch")
                     }
@@ -3938,6 +4127,8 @@ impl GlobalState {
             | NetworkRequest::BeginAcceptedSocket { .. }
             | NetworkRequest::SubmitAcceptedSocket { .. }
             | NetworkRequest::ResolveAcceptedProvider { .. }
+            | NetworkRequest::PrepareAcceptedEffect { .. }
+            | NetworkRequest::CollectAcceptedEffect { .. }
             | NetworkRequest::EnrollAcceptedListener { .. }
             | NetworkRequest::CaptureAcceptedReturn { .. }
             | NetworkRequest::CancelAcceptedSocket { .. }
@@ -4547,6 +4738,20 @@ pub enum NetworkRequest {
     /// Latch possible physical descriptor allocation before kernel injection.
     SubmitAcceptedSocket {
         /// Exact owned accept receipt.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+    },
+    /// Arm the provider's exact original physical accept before kernel entry.
+    PrepareAcceptedEffect {
+        /// Existing submitted accept receipt authenticated by owner and MM.
+        lease: crate::network_replay::NetworkAcceptLeaseId,
+        /// Original numeric listener argument, checked at the kernel boundary.
+        fd: i32,
+        /// Original accept4 flags; never inferred from a typed bit mask.
+        flags: i32,
+    },
+    /// Retain the original completed/partial kernel effect, including owner exit.
+    CollectAcceptedEffect {
+        /// Original submitted receipt, retained even after owner abandonment.
         lease: crate::network_replay::NetworkAcceptLeaseId,
     },
     /// Synchronously latch the actual return and acquire controller custody before continuation.
@@ -6236,7 +6441,7 @@ where
 /// Shared terminal boundary for existing unrecoverable shutdown and an
 /// explicitly owned controller's typed network refusal. No cleanup success is
 /// claimed: exiting the PID namespace init kills its remaining guest tasks.
-fn exit_owned_controller(status: i32) -> ! {
+pub(crate) fn exit_owned_controller(status: i32) -> ! {
     // In this scenario a backtrace doesn't really help us.
     //
     // ⚠️ THE STATUS IS THE ONLY THING THAT CROSSES THIS BOUNDARY, SO IT HAS TO
@@ -6936,6 +7141,294 @@ mod tests {
         }
         (config, state, owner, files)
     }
+    fn custody_birth_fixture(sequentialize: bool) -> (Config, GlobalState, DetTid, MmId) {
+        let config = Config {
+            sequentialize_threads: sequentialize,
+            runs_post_fork: RunsPostFork::Parent,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(61);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, parent, true);
+        install_test_registration(&state, parent, Ivar::new());
+        (config, state, parent, MmId::initial(parent))
+    }
+
+    struct CustodyWakeCount(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for CustodyWakeCount {
+        fn wake_by_ref(this: &std::sync::Arc<Self>) {
+            this.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn custody_test_waker() -> (std::sync::Arc<CustodyWakeCount>, std::task::Waker) {
+        let count = std::sync::Arc::new(CustodyWakeCount(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = futures::task::waker(std::sync::Arc::clone(&count));
+        (count, waker)
+    }
+
+    #[tokio::test]
+    async fn custody_birth_rpc_waits_for_actual_parent_publication_in_both_modes() {
+        use std::future::Future;
+        for sequentialize in [false, true] {
+            for same_process in [false, true] {
+                let (config, state, parent, parent_mm) = custody_birth_fixture(sequentialize);
+                let child = DetTid::from_raw(62);
+                let flags = if same_process {
+                    CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM
+                } else {
+                    CloneFlags::empty()
+                };
+                let mm = MmId::for_clone(parent_mm, child, same_process);
+                let process = if same_process { parent } else { child };
+                let mut waiting = Box::pin(state.receive_rpc(
+                    Tid::from_raw(child.as_raw()),
+                    (
+                        DetTime::new(&config),
+                        mm,
+                        GlobalRequest::RegisterNetworkPhysicalTask {
+                            process: process.as_raw(),
+                            thread: child.as_raw(),
+                        },
+                    ),
+                ));
+                let (wakes, waker) = custody_test_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                let committed = state.sched.lock().unwrap().committed_time;
+                assert!(waiting.as_mut().poll(&mut cx).is_pending());
+                let child_time = state.global_time.lock().unwrap().threads_time(child);
+                assert!(waiting.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(
+                    state.global_time.lock().unwrap().threads_time(child),
+                    child_time
+                );
+                assert_eq!(state.sched.lock().unwrap().committed_time, committed);
+                assert!(!state.sched.lock().unwrap().next_turns.contains_key(&child));
+                assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let mut publication = Box::pin(state.receive_rpc(
+                    Tid::from_raw(parent.as_raw()),
+                    (
+                        DetTime::new(&config),
+                        parent_mm,
+                        GlobalRequest::CreateChildThread(
+                            child,
+                            parent,
+                            0,
+                            Some(flags),
+                            if same_process { 0 } else { libc::SIGCHLD },
+                            None,
+                            Some(DEFAULT_PRIORITY),
+                        ),
+                    ),
+                ));
+                let parent_result = futures::poll!(&mut publication);
+                assert_eq!(parent_result.is_pending(), sequentialize);
+                assert!(
+                    wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    "actual birth must wake the registered waiter"
+                );
+                assert_eq!(
+                    waiting.await.1,
+                    GlobalResponse::RegisterNetworkPhysicalTask(Ok(false))
+                );
+                // Birth admission neither schedules this child nor opens a pidfd
+                // when the run has no physical-runtime capability.
+                assert!(
+                    state.sched.lock().unwrap().next_turns[&child]
+                        .req
+                        .try_read()
+                        .is_none()
+                );
+                assert_eq!(state.sched.lock().unwrap().committed_time, committed);
+                assert!(
+                    state
+                        .sched
+                        .lock()
+                        .unwrap()
+                        .physical_thread_identity(child)
+                        .is_none()
+                );
+                if sequentialize {
+                    let turn = crate::scheduler::do_a_turn_blocking(
+                        state.sched.clone(),
+                        state.global_time.clone(),
+                        &Err(crate::scheduler::SkipTurn),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(turn.tid, parent);
+                    assert_eq!(publication.await.1, GlobalResponse::CreateChildThread(None));
+                } else {
+                    assert!(matches!(
+                        parent_result,
+                        Poll::Ready((_, GlobalResponse::CreateChildThread(None)))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_birth_rpc_wakes_on_actual_physical_registration_failure() {
+        use std::future::Future;
+        for sequentialize in [false, true] {
+            let (config, state, parent, mm) = custody_birth_fixture(sequentialize);
+            let child = DetTid::from_raw(62);
+            let mut waiting = Box::pin(state.receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::RegisterNetworkPhysicalTask {
+                        process: parent.as_raw(),
+                        thread: child.as_raw(),
+                    },
+                ),
+            ));
+            let (wakes, waker) = custody_test_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                state
+                    .receive_rpc(
+                        Tid::from_raw(parent.as_raw()),
+                        (
+                            DetTime::new(&config),
+                            mm,
+                            GlobalRequest::CreateChildThread(
+                                child,
+                                parent,
+                                0,
+                                Some(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM),
+                                0,
+                                Some((i32::MAX, i32::MAX)),
+                                Some(DEFAULT_PRIORITY)
+                            ),
+                        )
+                    )
+                    .await
+                    .1,
+                GlobalResponse::ThreadExited
+            );
+            assert!(
+                wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "actual terminal publication must wake the sleeping future"
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                assert_eq!(waiting.await.1, GlobalResponse::ThreadExited);
+            })
+            .await
+            .expect("failed physical birth must wake its waiter");
+            assert!(state.sched.lock().unwrap().thread_was_registered(child));
+            assert!(
+                !state
+                    .registered_exec_mms
+                    .lock()
+                    .unwrap()
+                    .contains_key(&child)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_birth_rpc_wakes_on_backend_failure_without_admitting_child() {
+        use std::future::Future;
+        for sequentialize in [false, true] {
+            let (config, state, parent, mm) = custody_birth_fixture(sequentialize);
+            let child = DetTid::from_raw(62);
+            let mut waiting = Box::pin(state.receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::RegisterNetworkPhysicalTask {
+                        process: parent.as_raw(),
+                        thread: child.as_raw(),
+                    },
+                ),
+            ));
+            let (wakes, waker) = custody_test_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            state.report_backend_failure(reverie::BackendFailure {
+                pid: Tid::from_raw(parent.as_raw()),
+                tid: Tid::from_raw(child.as_raw()),
+                phase: "pending custody birth",
+            });
+            assert!(
+                wakes.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "actual terminal publication must wake the sleeping future"
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                assert_eq!(waiting.await.1, GlobalResponse::ThreadExited);
+            })
+            .await
+            .expect("terminal backend publication must wake its waiter");
+            assert!(!state.sched.lock().unwrap().thread_was_registered(child));
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_birth_rpc_rejects_retired_ptrace_owner_without_waiting_for_tid_reuse() {
+        let (config, state, parent, mm) = custody_birth_fixture(true);
+        assert!(!config.cancel_killed_thread_rpcs);
+        state
+            .receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    DetTime::new(&config),
+                    mm,
+                    GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        dettid: parent,
+                        detpid: parent,
+                        mm,
+                        thread_start_entered: true,
+                        timeslice_stats: TimesliceStats::default(),
+                        syscall_count: 0,
+                        chaos_epochs: Vec::new(),
+                    }),
+                ),
+            )
+            .await;
+        assert!(state.sched.lock().unwrap().thread_was_registered(parent));
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_is_logically_killed(parent)
+        );
+        assert!(
+            !state
+                .registered_exec_mms
+                .lock()
+                .unwrap()
+                .contains_key(&parent)
+        );
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                DetTime::new(&config),
+                mm,
+                GlobalRequest::RegisterNetworkPhysicalTask {
+                    process: parent.as_raw(),
+                    thread: parent.as_raw(),
+                },
+            ),
+        ));
+        assert!(matches!(
+            futures::poll!(&mut registration),
+            Poll::Ready((_, GlobalResponse::ThreadExited))
+        ));
+    }
+
     #[tokio::test]
     async fn custody_task_registration_checks_sender_process_mm_without_cfgseq() {
         let (config, state, owner, _) = fd_lifecycle_exec_fixture();
@@ -11405,6 +11898,117 @@ mod tests {
                     .is_err(),
                 "terminal receipt fabricated completion: {cause}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_terminal_capture_drives_collection_without_following_guest_rpc() {
+        for backend_failed in [false, true] {
+            let (config, mut state, owner, lease) = accepted_capture_rpc_fixture().await;
+            let (mut retained, mut peer) = state
+                .network_runtime
+                .as_mut()
+                .unwrap()
+                .accepted_collection_transport_fixture(owner, lease);
+            if backend_failed {
+                state.report_backend_failure(reverie::BackendFailure {
+                    pid: Tid::from_raw(owner.thread.as_raw()),
+                    tid: Tid::from_raw(owner.thread.as_raw()),
+                    phase: "accepted final caller collection control",
+                });
+            } else {
+                assert_eq!(
+                    state
+                        .receive_rpc(
+                            Tid::from_raw(owner.thread.as_raw()),
+                            (
+                                DetTime::new(&config),
+                                owner.mm,
+                                GlobalRequest::NetworkOwnerGone
+                            )
+                        )
+                        .await,
+                    (None, GlobalResponse::NetworkOwnerGone)
+                );
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            // A wrong lease cannot enqueue any command or overwrite the real
+            // operation, even when the terminal reply hides its diagnostic.
+            let wrong = crate::network_replay::NetworkAcceptLeaseId(lease.0 + 1);
+            let _ = state
+                .receive_rpc(
+                    Tid::from_raw(owner.thread.as_raw()),
+                    (
+                        DetTime::new(&config),
+                        owner.mm,
+                        GlobalRequest::Network(NetworkRequest::CaptureAcceptedReturn {
+                            lease: wrong,
+                            kernel_result: Ok(8),
+                        }),
+                    ),
+                )
+                .await;
+            assert!(peer.no_other_request());
+            assert_eq!(
+                state
+                    .network_runtime
+                    .as_ref()
+                    .unwrap()
+                    .accepted_recovery_result(owner, lease)
+                    .unwrap(),
+                None
+            );
+
+            let mut capture = Box::pin(state.receive_rpc(
+                Tid::from_raw(owner.thread.as_raw()),
+                (
+                    DetTime::new(&config),
+                    owner.mm,
+                    GlobalRequest::Network(NetworkRequest::CaptureAcceptedReturn {
+                        lease,
+                        kernel_result: Ok(8),
+                    }),
+                ),
+            ));
+            assert!(matches!(
+                futures::poll!(capture.as_mut()),
+                Poll::Ready((None, GlobalResponse::ThreadExited))
+            ));
+            drop(capture);
+            // No CollectAcceptedEffect RPC and no sibling task follows that
+            // terminal response. Actual native transport must still advance.
+            peer.reply_to_collection(owner, lease, deadline);
+            loop {
+                if state
+                    .network_runtime
+                    .as_ref()
+                    .unwrap()
+                    .accepted_collection_effect_status(owner, lease)
+                    .unwrap()
+                    == Some((-1, 8))
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(peer.no_other_request());
+            assert!(
+                state
+                    .network_engine
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .finish()
+                    .is_err()
+            );
+            let error = state.clean_up(false, &None).await.unwrap_err();
+            assert!(
+                error.to_string().contains("partial receipt retained"),
+                "actual cleanup must refuse the retained provider failure before trace publication: {error}"
+            );
+            retained.stop_collection_fixture(deadline);
         }
     }
 

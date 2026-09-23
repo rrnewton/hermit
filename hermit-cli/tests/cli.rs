@@ -6757,6 +6757,81 @@ fn run_timeout_leaves_a_guest_that_finishes_in_time_alone() {
     );
 }
 
+/// Analyze uses the public captured-output runner (`RunOpts::run(..., true)`).
+/// Its timeout must keep the same error classification and process drain as the
+/// ordinary runner, including after moving the executor future onto the heap.
+#[test]
+fn captured_output_timeout_fires_and_unwinds_the_container() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let scratch = tempfile::tempdir().expect("create captured-output timeout evidence");
+    let timeout = format!("--run-arg=--timeout={RUN_TIMEOUT_SECS}");
+    let mut command = hermit_command(&[
+        "analyze",
+        "--run1-seed=0",
+        "--guest-log=warn",
+        &timeout,
+        "--run-arg=--",
+        "--",
+        RUN_TIMEOUT_SPINNER[0],
+        RUN_TIMEOUT_SPINNER[1],
+        RUN_TIMEOUT_SPINNER[2],
+    ]);
+    command
+        .env("TMPDIR", scratch.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid is async-signal-safe and executes before the child exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().expect("spawn captured-output timeout");
+    let session = child.id() as i32;
+    let started = Instant::now();
+    let output = child
+        .wait_with_output()
+        .expect("wait for captured-output timeout");
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(124), "{stderr}");
+    assert!(stderr.contains("class=run-timeout"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("bound of {RUN_TIMEOUT_SECS} seconds")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Studying target execution"), "{stderr}");
+    let drained = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if run_timeout_pids_in_session(session).is_empty() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let survivors = run_timeout_pids_in_session(session);
+    for pid in &survivors {
+        // SAFETY: only the still-owned test session is being cleaned up.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
+    }
+    assert!(
+        drained,
+        "captured-output timeout left the session alive: {survivors:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "captured-output timeout took {elapsed:?}"
+    );
+}
+
 /// The SIGALRM fallback fires, is named, and reports the deadline code.
 ///
 /// ⚠️ THIS CELL EXISTS BECAUSE THE FALLBACK COULD NOT BE MADE TO FIRE ANY OTHER

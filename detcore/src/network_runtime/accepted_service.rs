@@ -258,10 +258,19 @@ impl AcceptedProviderService {
         let preparation = if let Request::FinishSetter {
             command,
             prepared_request,
+        }
+        | Request::CollectAccept {
+            command,
+            prepared_request,
         } = request
         {
             let (prior, pins, outcome) = session.retained_request(prepared_request)?;
-            if prior.operation != Operation::PrepareSetter
+            let expected = if envelope.operation == Operation::CollectAccept {
+                Operation::PrepareAccept
+            } else {
+                Operation::PrepareSetter
+            };
+            if prior.operation != expected
                 || prior.owner != envelope.owner
                 || prior.accept != envelope.accept
                 || pins.len() != 2
@@ -300,7 +309,10 @@ impl AcceptedProviderService {
         let (stored, _, _) = session.retained_request(sequence)?;
         if matches!(
             stored.operation,
-            Operation::EnrollListener | Operation::MatchAccepted | Operation::FinishSetter
+            Operation::EnrollListener
+                | Operation::MatchAccepted
+                | Operation::FinishSetter
+                | Operation::CollectAccept
         ) {
             let acknowledgement = session
                 .acknowledge_command_completion(sequence, |envelope, body| {

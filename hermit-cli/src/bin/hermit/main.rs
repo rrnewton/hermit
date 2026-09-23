@@ -824,7 +824,13 @@ mod tests {
     #[test]
     fn strace_only_run_epoch_is_neither_captured_nor_reported() {
         let matches = command_without_epoch_env()
-            .try_get_matches_from(["hermit", "run", "--strace-only", "/bin/true"])
+            .try_get_matches_from([
+                "hermit",
+                "run",
+                "--strace-only",
+                "--unsafe-live-network",
+                "/bin/true",
+            ])
             .unwrap();
         let args = args_from_matches_with_clock(&matches, || {
             panic!("strace-only disables virtual time and must not sample the host clock")
@@ -1112,6 +1118,52 @@ mod tests {
             oci.run_epoch_capture_for_test(),
             ("2026-01-01T00:00:00+00:00".to_owned(), false, true)
         );
+    }
+
+    #[test]
+    fn effective_epoch_report_names_the_trace_without_changing_explicit_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("epoch.trace");
+        detcore_model::network_trace::NetworkTraceV2 {
+            epoch: "2000-01-02T03:04:05Z".parse().unwrap(),
+            channels: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+        .write_framed(std::fs::File::create(&path).unwrap())
+        .unwrap();
+        for replay in [false, true] {
+            let mut argv = vec!["hermit".to_owned(), "run".to_owned()];
+            if replay {
+                argv.push(format!("--replay-networking={}", path.display()));
+            }
+            argv.push("/bin/true".into());
+            let matches = command_without_epoch_env()
+                .try_get_matches_from(argv)
+                .unwrap();
+            let args = args_from_matches_with_clock(&matches, || {
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_933_135_628)
+            })
+            .unwrap();
+            let Subcommand::Run(mut run) = args.command else {
+                panic!("expected run")
+            };
+            assert!(!run.epoch_source_explicit());
+            run.validate_args().unwrap();
+            assert_eq!(
+                run.epoch_source_label(),
+                if replay { "network-trace" } else { "host-now" }
+            );
+            assert!(!run.epoch_source_explicit());
+            assert_eq!(
+                run.epoch_capture_for_test().0,
+                if replay {
+                    "2000-01-02T03:04:05+00:00"
+                } else {
+                    "2031-04-05T06:07:08+00:00"
+                }
+            );
+        }
     }
 
     #[test]

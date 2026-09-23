@@ -35,6 +35,20 @@ pub enum CapabilityServiceKind {
     UnixGuard,
 }
 
+/// Service lifetime policy, separate from finite startup and cleanup deadlines.
+/// This value configures a launcher; it never authenticates a controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityServiceLifetime {
+    /// A bounded qualification or explicitly bounded enclosing run. Zero is
+    /// rejected, and the exact existing bound is passed to systemd unchanged.
+    Bounded(u32),
+    /// The service monitors its authenticated held parent/controller pidfds.
+    /// Callers must also provide a finite pre-authentication bootstrap deadline
+    /// and explicit terminal cleanup. Channel closure alone is not that proof.
+    /// This variant does not impose a new wall deadline on an untimed guest.
+    ControllerOwned,
+}
+
 /// Immutable launch inputs. Construction alone grants no guest capability.
 #[derive(Debug)]
 pub struct CapabilityUnitLaunch<'a> {
@@ -46,8 +60,8 @@ pub struct CapabilityUnitLaunch<'a> {
     pub executable: &'a Path,
     /// Data arguments after `--`; never shell-evaluated.
     pub arguments: &'a [OsString],
-    /// Existing runner's wall bound, never a new independent guest deadline.
-    pub maximum_seconds: u32,
+    /// Explicit lifetime policy; startup and shutdown remain separately bounded.
+    pub lifetime: CapabilityServiceLifetime,
     /// Unix keeper only: exact owned bpffs and recovery directories. These are
     /// mount-policy exceptions, not evidence that a pathname still owns an FD.
     pub writable_directories: &'a [PathBuf],
@@ -72,7 +86,7 @@ impl CapabilityUnitLaunch<'_> {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || !self.executable.is_absolute()
-            || self.maximum_seconds == 0
+            || self.lifetime == CapabilityServiceLifetime::Bounded(0)
         {
             return Err(io::Error::other(
                 "invalid capability unit identity, executable, or bound",
@@ -105,7 +119,7 @@ impl CapabilityUnitLaunch<'_> {
         args.push(format!("--unit={}", self.unit).into());
         for property in [
             "Type=exec".to_owned(), "RemainAfterExit=yes".into(),
-            format!("RuntimeMaxSec={}s", self.maximum_seconds), "TimeoutStopSec=1s".into(),
+            "TimeoutStopSec=1s".into(),
             "KillMode=control-group".into(), "KillSignal=SIGKILL".into(), "SendSIGKILL=yes".into(), "MemoryMax=268435456".into(), "MemorySwapMax=0".into(),
             "TasksMax=8".into(), "CPUQuota=100%".into(), "CPUQuotaPeriodSec=100ms".into(),
             "LimitNOFILE=128".into(), "LimitFSIZE=1048576".into(), "LimitCORE=0".into(),
@@ -115,6 +129,9 @@ impl CapabilityUnitLaunch<'_> {
             "CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE".into(),
             "NoNewPrivileges=yes".into(),
         ] { args.push(format!("--property={property}").into()); }
+        if let CapabilityServiceLifetime::Bounded(seconds) = self.lifetime {
+            args.push(format!("--property=RuntimeMaxSec={seconds}s").into());
+        }
         let mut writable = Vec::new();
         for directory in self.writable_directories {
             // systemd string-list parsing interprets whitespace and escapes;
@@ -184,7 +201,7 @@ mod tests {
             unit: "hermit-accepted-01000000000000000000000000000000.service",
             executable: Path::new("/product/hermit"),
             arguments: &args,
-            maximum_seconds: 30,
+            lifetime: CapabilityServiceLifetime::Bounded(30),
             writable_directories: &[],
         };
         let argv = spec.arguments().unwrap();
@@ -224,7 +241,7 @@ mod tests {
                 unit,
                 executable: Path::new("/product/hermit"),
                 arguments: &[],
-                maximum_seconds: 30,
+                lifetime: CapabilityServiceLifetime::Bounded(30),
                 writable_directories: &[],
             };
             assert!(spec.arguments().is_err());
@@ -238,7 +255,7 @@ mod tests {
             unit: "hermit-accepted-01000000000000000000000000000000.service",
             executable: Path::new("/product/hermit"),
             arguments: &[],
-            maximum_seconds: 30,
+            lifetime: CapabilityServiceLifetime::Bounded(30),
             writable_directories: &writes,
         };
         assert!(spec.arguments().is_err());
@@ -258,10 +275,41 @@ mod tests {
                 unit: "hermit-unix-01000000000000000000000000000000.service",
                 executable: Path::new("/product/keeper"),
                 arguments: &[],
-                maximum_seconds: 30,
+                lifetime: CapabilityServiceLifetime::Bounded(30),
                 writable_directories: &paths,
             };
             assert!(spec.arguments().is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn controller_owned_lifetime_changes_only_the_wall_property() {
+        let paths = [
+            PathBuf::from("/owned/bpf"),
+            PathBuf::from("/owned/recovery"),
+        ];
+        let mut spec = CapabilityUnitLaunch {
+            kind: CapabilityServiceKind::UnixGuard,
+            unit: "hermit-unix-01000000000000000000000000000000.service",
+            executable: Path::new("/product/keeper"),
+            arguments: &[],
+            lifetime: CapabilityServiceLifetime::Bounded(30),
+            writable_directories: &paths,
+        };
+        let bounded = spec.arguments().unwrap();
+        spec.lifetime = CapabilityServiceLifetime::ControllerOwned;
+        let owned = spec.arguments().unwrap();
+        let expected: Vec<_> = bounded
+            .into_iter()
+            .filter(|arg| arg != "--property=RuntimeMaxSec=30s")
+            .collect();
+        assert_eq!(owned, expected);
+        assert!(
+            !owned
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("RuntimeMaxSec="))
+        );
+        spec.lifetime = CapabilityServiceLifetime::Bounded(0);
+        assert!(spec.arguments().is_err());
     }
 }

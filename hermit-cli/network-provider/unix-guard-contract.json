@@ -1,0 +1,265 @@
+{
+  "schema": 1,
+  "abi_version": "3",
+  "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
+  "maps": 10,
+  "programs": 31,
+  "links": 31,
+  "source_files": [
+    "unix/keeper-channel.c",
+    "unix/keeper-channel.h",
+    "unix/keeper-executable.c",
+    "unix/keeper-main.c",
+    "unix/keeper-monitor.c",
+    "unix/keeper-monitor.h",
+    "unix/keeper-session.c",
+    "unix/keeper-session.h",
+    "unix/unix-guard.bpf.c",
+    "unix/unix-guard.h"
+  ],
+  "hooks": {
+    "__put_net": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "__sk_free": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "bpf_lsm_file_fcntl": [
+      [
+        8,
+        4,
+        8
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_file_ioctl": [
+      [
+        8,
+        4,
+        8
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_file_ioctl_compat": [
+      [
+        8,
+        4,
+        8
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_file_permission": [
+      [
+        8,
+        4
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_file_receive": [
+      [
+        8
+      ],
+      1,
+      4
+    ],
+    "bpf_lsm_socket_accept": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_socket_bind": [
+      [
+        8,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_socket_connect": [
+      [
+        8,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_socket_getpeername": [
+      [
+        8
+      ],
+      1,
+      4
+    ],
+    "bpf_lsm_socket_getsockname": [
+      [
+        8
+      ],
+      1,
+      4
+    ],
+    "bpf_lsm_socket_getsockopt": [
+      [
+        8,
+        4,
+        4
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_socket_listen": [
+      [
+        8,
+        4
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_socket_post_create": [
+      [
+        8,
+        4,
+        4,
+        4,
+        4
+      ],
+      5,
+      4
+    ],
+    "bpf_lsm_socket_recvmsg": [
+      [
+        8,
+        8,
+        4,
+        4
+      ],
+      4,
+      4
+    ],
+    "bpf_lsm_socket_sendmsg": [
+      [
+        8,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_socket_setsockopt": [
+      [
+        8,
+        4,
+        4
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_socket_shutdown": [
+      [
+        8,
+        4
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_socket_socketpair": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_task_alloc": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_task_free": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "bpf_lsm_unix_find": [
+      [
+        8,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "bpf_lsm_unix_may_send": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "bpf_lsm_unix_stream_connect": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ],
+    "copy_net_ns": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      8
+    ],
+    "setup_net": [
+      [
+        8
+      ],
+      1,
+      4
+    ],
+    "unix_dgram_poll": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ],
+    "unix_poll": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ]
+  }
+}

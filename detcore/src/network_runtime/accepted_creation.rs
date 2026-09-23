@@ -42,6 +42,7 @@ pub(super) struct Creations {
     retired: Option<ObservationReceipt>,
     final_ack: Option<(NetworkStreamOwner, u64)>,
     finished: bool,
+    last_origin: Option<NetworkStreamOwner>,
 }
 impl Default for Creations {
     fn default() -> Self {
@@ -56,6 +57,7 @@ impl Default for Creations {
             retired: None,
             final_ack: None,
             finished: false,
+            last_origin: None,
         }
     }
 }
@@ -141,6 +143,7 @@ impl Creations {
             })?;
         // No await separates retained result from clearing its in-flight token.
         self.ready_request = Some((pending.id, sequence, bytes));
+        self.last_origin = Some(pending.owner);
         self.pending = None;
         self.ready = Some(observed.clone());
         Ok(Some(observed))
@@ -188,6 +191,28 @@ impl Creations {
             }
             _ => Err(io::Error::other(
                 "terminal observation acknowledgement changed response",
+            )),
+        }
+    }
+
+    /// Backend completion has no live caller. Reuse the authenticated origin
+    /// of the retained observation instead of constructing a replacement MM.
+    pub(super) async fn finish_after_backend(&mut self, controller: &Controller) -> io::Result<()> {
+        match self.last_origin {
+            Some(owner) => self.finish(controller, owner).await,
+            None if self.pending.is_none()
+                && self.ready.is_none()
+                && self.failure.is_none()
+                && self.ready_request.is_none()
+                && self.consumed_request.is_none()
+                && self.retired.is_none()
+                && self.final_ack.is_none() =>
+            {
+                self.finished = true;
+                Ok(())
+            }
+            None => Err(io::Error::other(
+                "terminal observation has no authenticated origin",
             )),
         }
     }

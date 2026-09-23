@@ -8,6 +8,10 @@
 
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
+#[path = "common/run_epoch.rs"]
+mod run_epoch;
+#[path = "common/strict_run_report.rs"]
+mod strict_run_report;
 
 use std::fs;
 use std::io::Read;
@@ -168,12 +172,12 @@ fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
 
 fn liteinst_command(log_level: &str) -> Command {
     let mut command = Command::new(liteinst_runtime::hermit_binary());
+    command.env_remove("HERMIT_EPOCH");
     command.arg(format!("--log={log_level}")).args([
         "run",
         "--backend",
         "liteinst",
         "--strict",
-        "--epoch=2026-01-01T00:00:00Z",
         "--base-env=minimal",
         "--mount=type=tmpfs,target=/test",
         "--workdir=/test",
@@ -196,7 +200,6 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
             "--backend",
             "liteinst",
             "--strict",
-            "--epoch=2026-01-01T00:00:00Z",
             "--base-env=minimal",
             "--mount=type=tmpfs,target=/test",
             "--workdir=/test",
@@ -210,13 +213,29 @@ fn run_liteinst_with_input(
     verify: bool,
     input: Option<&[u8]>,
 ) -> Output {
+    run_liteinst_with_input_and_epoch(program, args, verify, input, None)
+}
+
+fn run_liteinst_with_input_and_epoch(
+    program: &Path,
+    args: &[&str],
+    verify: bool,
+    input: Option<&[u8]>,
+    epoch: Option<&str>,
+) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
     let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
     let xdg_config_home = home.path().join(".config");
     fs::create_dir_all(&xdg_config_home).expect("failed to create isolated XDG config directory");
+    let report = home.path().join("verify.json");
     let mut command = liteinst_command("info");
     if verify {
-        command.arg("--verify");
+        command
+            .args(["--verify", "--verify-strict"])
+            .arg(format!("--verify-json={}", report.display()));
+    }
+    if let Some(epoch) = epoch {
+        command.arg(format!("--epoch={epoch}"));
     }
     command
         .arg(format!("--env=HOME={}", home.path().display()))
@@ -228,25 +247,29 @@ fn run_liteinst_with_input(
         .env("HOME", home.path())
         .env("PYTHONDONTWRITEBYTECODE", "1");
     command.arg("--").arg(program).args(args);
-    let Some(input) = input else {
-        return command.output().expect("failed to run Hermit LiteInst");
+    let output = if let Some(input) = input {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run Hermit LiteInst with stdin");
+        child
+            .stdin
+            .take()
+            .expect("LiteInst stdin pipe should exist")
+            .write_all(input)
+            .expect("failed to write LiteInst stdin");
+        child
+            .wait_with_output()
+            .expect("failed to collect Hermit LiteInst output")
+    } else {
+        command.output().expect("failed to run Hermit LiteInst")
     };
-
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to run Hermit LiteInst with stdin");
-    child
-        .stdin
-        .take()
-        .expect("LiteInst stdin pipe should exist")
-        .write_all(input)
-        .expect("failed to write LiteInst stdin");
-    child
-        .wait_with_output()
-        .expect("failed to collect Hermit LiteInst output")
+    if verify {
+        strict_run_report::assert_canonical_success(&report, &output);
+    }
+    output
 }
 
 fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout: &[u8]) {
@@ -254,14 +277,20 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
     assert_eq!(output.stdout, expected_stdout);
 }
 
-fn assert_liteinst_virtual_time_is_continuous() {
+fn assert_liteinst_fixed_epoch_virtual_time_is_continuous() {
     const EPOCH_SECONDS: u64 = 1_767_225_600;
     const MAX_STARTUP_SECONDS: u64 = 60;
 
     // Whole seconds remain stable across verified LiteInst runs. Do not assert
     // the old exact epoch: that encoded #1095's reset-on-exec behavior and
     // rejects legitimate deterministic startup progress.
-    let output = run_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"]);
+    let output = assert_liteinst_strict_verify_output(run_liteinst_with_input_and_epoch(
+        Path::new("/usr/bin/date"),
+        &["-u", "+%s"],
+        true,
+        None,
+        Some("2026-01-01T00:00:00Z"),
+    ));
     let timestamp = String::from_utf8(output.stdout).expect("date output should be UTF-8");
     let seconds = timestamp
         .trim()
@@ -277,11 +306,14 @@ fn assert_liteinst_virtual_time_is_continuous() {
         "guest startup consumed an implausible amount of virtual time: {timestamp}"
     );
     // Verify continuous progression independently of the startup offset.
-    assert_liteinst_strict_verify(
+    let output = assert_liteinst_strict_verify_output(run_liteinst_with_input_and_epoch(
         advanced_guest(),
         &["clock-progress"],
-        b"clock-progress-ok\n",
-    );
+        true,
+        None,
+        Some("2026-01-01T00:00:00Z"),
+    ));
+    assert_eq!(output.stdout, b"clock-progress-ok\n");
 }
 
 #[test]
@@ -361,8 +393,7 @@ fn liteinst_strict_verify_identity_utilities() {
 }
 
 #[test]
-fn liteinst_strict_verify_virtual_identity_and_time() {
-    assert_liteinst_virtual_time_is_continuous();
+fn liteinst_strict_verify_virtual_identity() {
     assert_liteinst_strict_verify(
         Path::new("/usr/bin/hostname"),
         &[],
@@ -993,5 +1024,30 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
     assert!(
         diagnostics.contains("[scheduler] guest in queue"),
         "stderr={diagnostics}",
+    );
+}
+
+#[test]
+fn liteinst_strict_verify_fixed_epoch_clock_continuity() {
+    assert_liteinst_fixed_epoch_virtual_time_is_continuous();
+}
+
+#[test]
+fn liteinst_strict_verify_omitted_epoch_clock_continuity() {
+    let output = run_liteinst_strict_verify(
+        Path::new("/usr/bin/python3"),
+        &[
+            "-c",
+            run_epoch::CLOCK_PROBE,
+            run_epoch::CLOCK_PROBE,
+            "clock",
+        ],
+    );
+    let epoch = run_epoch::captured_epoch(&output.stderr);
+    run_epoch::assert_clock_progress(&output.stdout, epoch, false);
+    assert_liteinst_strict_verify(
+        advanced_guest(),
+        &["clock-progress"],
+        b"clock-progress-ok\n",
     );
 }

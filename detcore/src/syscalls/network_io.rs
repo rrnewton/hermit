@@ -1504,7 +1504,7 @@ impl NetworkPhysicalCompletion {
             Err(Error::Errno(errno)) => Err(errno.into_raw()),
             Err(_) => return Ok(()), // Submitted receipt retains an unknown effect.
         };
-        match network_request(
+        let captured = match network_request(
             guest,
             NetworkRequest::CaptureAcceptedReturn {
                 lease,
@@ -1512,13 +1512,26 @@ impl NetworkPhysicalCompletion {
             },
         )
         .await
-        .map_err(engine_rpc_error)?
+        .map_err(engine_rpc_error)
         {
-            NetworkReply::Unit => Ok(()),
+            Ok(NetworkReply::Unit) => Ok(()),
+            Err(error) => Err(error),
             reply => Err(engine_error(format!(
                 "unexpected accepted capture reply {reply:?}"
             ))),
-        }
+        };
+        let collected =
+            match network_request(guest, NetworkRequest::CollectAcceptedEffect { lease })
+                .await
+                .map_err(engine_rpc_error)
+            {
+                Ok(NetworkReply::Unit) => Ok(()),
+                Ok(reply) => Err(engine_error(format!(
+                    "unexpected accepted effect collection {reply:?}"
+                ))),
+                Err(error) => Err(error),
+            };
+        finish_shadow_operation(captured, collected)
     }
 }
 
@@ -2740,6 +2753,12 @@ fn checked_accept4_socket_type(flags: i32) -> Result<i32, Errno> {
 // syscall caller, not a post-hoc RegisterAccepted/default-copy shortcut.
 impl<T: RecordOrReplay> Detcore<T> {
     async fn accepted_model_mode<G: Guest<Self>>(&self, guest: &mut G) -> Result<bool, Error> {
+        if !matches!(
+            guest.config().network_trace.policy,
+            NetworkPolicy::Record | NetworkPolicy::Replay
+        ) {
+            return Ok(false);
+        }
         match network_request(guest, NetworkRequest::AcceptedMode)
             .await
             .map_err(engine_rpc_error)?
@@ -2814,6 +2833,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
             let result: Result<i64, Error> = if policy == NetworkPolicy::Record {
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::PrepareAcceptedEffect {
+                        lease: reservation.lease,
+                        fd: call.sockfd(),
+                        flags: call.flags().bits(),
+                    },
+                )
+                .await?;
                 // Original guest address/length preserve Linux allocation and
                 // copyout priority. No preliminary scratch accept or validation.
                 self.live_network_syscall_with_completion(
