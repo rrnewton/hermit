@@ -555,7 +555,18 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "158");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "160");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--test", "clock_determinism"])
+            );
+            assert!(
+                step.integration_test_binaries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|binary| binary == "clock_determinism")
+            );
 
             let mut omitted_execution = step.clone();
             omitted_execution.cmd = omitted_execution.cmd.replace("--test child_time_rpc ", "");

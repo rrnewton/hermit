@@ -26,6 +26,9 @@ const NON_RACY_EXAMPLES: [&str; 2] = ["date.sh", "devrand.sh"];
 const SABRE_BACKEND_FACT_PREFIX: &str = ":: Backend: sabre static rewriting + ptrace runtime;";
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+// Independent comparison runs must receive the same clock input. Keep its
+// fractional precision; virtual time still progresses throughout each guest.
+const COMPARISON_EPOCH: &str = "--epoch=2026-01-01T00:00:00.123456789Z";
 
 fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
     match requested {
@@ -71,6 +74,13 @@ fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
     )
     .unwrap();
     let args: Vec<_> = command.get_args().collect();
+    assert_eq!(
+        args.iter()
+            .filter(|arg| arg.to_string_lossy().starts_with("--epoch="))
+            .copied()
+            .collect::<Vec<_>>(),
+        [OsStr::new(COMPARISON_EPOCH)]
+    );
     assert!(args.contains(&OsStr::new("--base-env=minimal")));
     assert!(args.windows(2).any(|args| {
         args == [
@@ -291,6 +301,7 @@ fn example_command_with_execution_root(
         "--strict",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
+        COMPARISON_EPOCH,
     ]);
     if verify {
         command.arg("--verify");

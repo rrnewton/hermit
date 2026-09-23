@@ -3150,9 +3150,9 @@ impl RunOpts {
             } else {
                 "explicit"
             };
-            eprintln!(
+            global.write_controller_diagnostic(format_args!(
                 "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
-            );
+            ))?;
         }
         if self.allow_unsupported_syscalls {
             eprintln!(

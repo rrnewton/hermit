@@ -4760,14 +4760,19 @@ fn log_file_under_tmp_lands_on_the_host() {
         .tempdir_in("/tmp")
         .unwrap();
     let log = directory.path().join("guest.log");
+    let epoch = "2026-01-01T00:00:00.123456789+00:00";
+    let epoch_arg = format!("--epoch={epoch}");
 
     let output = hermit(&[
         "--log=info",
         "--log-file",
         log.to_str().unwrap(),
         "run",
+        &epoch_arg,
         "--",
-        "/bin/true",
+        "/bin/sh",
+        "-c",
+        "printf 'guest-stderr-control\n' >&2",
     ]);
 
     assert_eq!(
@@ -4785,6 +4790,11 @@ fn log_file_under_tmp_lands_on_the_host() {
         size > 0,
         "--log-file under /tmp produced an empty host file"
     );
+    let diagnostics = std::fs::read_to_string(&log).unwrap();
+    assert!(diagnostics.contains(&format!(
+        "hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}\n"
+    )));
+    assert_eq!(output.stderr, b"guest-stderr-control\n");
 }
 
 /// A log destination that cannot be opened must say so and fail, never exit 0
@@ -6479,11 +6489,17 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     // A long, fully deterministic diagnostic whose length the caller controls:
     // hermit echoes the (absent) program path back in the error chain.
     let program = format!("/nonexistent-{}", "A".repeat(2000));
+    // The control and pressured invocation compare complete diagnostics, so
+    // their explicit clock input must match too.
+    let args = [
+        "run",
+        "--epoch=2026-01-01T00:00:00.123456789Z",
+        "--",
+        &program,
+    ];
 
     // The truth to compare against, captured with an ordinary pipe.
-    let control = hermit_command(&["run", "--", &program])
-        .output()
-        .expect("control run");
+    let control = hermit_command(&args).output().expect("control run");
     let expected = control.stderr;
     // EXIT-CLASS: hermit
     assert_eq!(
@@ -6529,7 +6545,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     }
 
     let stderr_for_child = unsafe { std::process::Stdio::from_raw_fd(libc::dup(write_fd)) };
-    let mut child = hermit_command(&["run", "--", &program])
+    let mut child = hermit_command(&args)
         .stdout(std::process::Stdio::null())
         .stderr(stderr_for_child)
         .spawn()

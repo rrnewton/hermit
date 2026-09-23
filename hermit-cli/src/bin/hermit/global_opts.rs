@@ -8,6 +8,7 @@
 
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,6 +117,23 @@ impl GlobalOpts {
                     format!("cannot open --log-file {} for writing", path.display())
                 })?;
             self.log_file_handle = Some(Arc::new(file));
+        }
+        Ok(())
+    }
+
+    /// Report controller context before tracing starts, using the selected host
+    /// destination without reopening its path or creating a tracing thread.
+    pub(crate) fn write_controller_diagnostic(
+        &self,
+        message: std::fmt::Arguments<'_>,
+    ) -> Result<(), Error> {
+        if let Some(handle) = &self.log_file_handle {
+            writeln!(&**handle, "{message}").context("cannot write to the host log file")?;
+        } else {
+            // A stopped stderr reader must not replace the command's primary
+            // exit status. This shares the existing invocation-wide deadline
+            // with later error reports and preserves the inherited fd flags.
+            let _ = writeln!(detcore::util::RetryingStderr, "{message}");
         }
         Ok(())
     }
@@ -266,6 +284,9 @@ mod tests {
         drop(options);
         std::fs::rename(&path, &opened_path).unwrap();
         std::fs::write(&path, b"replacement must not change").unwrap();
+        cloned_options
+            .write_controller_diagnostic(format_args!("controller context"))
+            .unwrap();
         let mut held = cloned_options
             .log_file_handle
             .as_ref()
@@ -278,7 +299,24 @@ mod tests {
 
         assert_eq!(
             std::fs::read(opened_path).unwrap(),
-            b"written through the held descriptor"
+            b"controller context\nwritten through the held descriptor"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"replacement must not change"
+        );
+
+        // An explicit log destination that cannot accept the report must refuse,
+        // rather than silently falling back to the compared guest stderr.
+        let mut read_only_options = log_options(path.clone());
+        read_only_options.log_file_handle = Some(Arc::new(File::open(&path).unwrap()));
+        let error = read_only_options
+            .write_controller_diagnostic(format_args!("must not disappear"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot write to the host log file")
         );
         assert_eq!(std::fs::read(path).unwrap(), b"replacement must not change");
     }
