@@ -2363,6 +2363,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         guest.config(),
                         call.number(),
                     ) {
+                        // AUTONOMOUS-BOT-IMPLEMENTED
                         self.record_or_replay_preserving_tool_errors(guest, call)
                             .await
                     } else {
@@ -2382,6 +2383,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         guest.config(),
                         call.number(),
                     ) {
+                        // AUTONOMOUS-BOT-IMPLEMENTED
                         self.record_or_replay_preserving_tool_errors(guest, call)
                             .await
                     } else {
@@ -2401,6 +2403,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         guest.config(),
                         call.number(),
                     ) {
+                        // AUTONOMOUS-BOT-IMPLEMENTED
                         self.record_or_replay_preserving_tool_errors(guest, call)
                             .await
                     } else {
