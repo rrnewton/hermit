@@ -29,40 +29,51 @@ const HERMETIC_TEST_WORKDIR: &str = "/test";
 const COMPARISON_EPOCH: &str = "2026-09-23T02:39:52.970859833+00:00";
 const NEXT_NANOSECOND_EPOCH: &str = "2026-09-23T02:39:52.970859834+00:00";
 
+fn unique_sabre_backend_fact_field<'a>(fact: &'a str, name: &str) -> Option<&'a str> {
+    let mut values = fact.split(';').filter_map(|field| {
+        let (field_name, value) = field.trim().split_once('=')?;
+        (field_name == name).then_some(value)
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn unique_sabre_backend_fact_line(diagnostics: &str) -> Result<&str, String> {
+    let mut facts = diagnostics
+        .lines()
+        .filter(|line| line.contains(SABRE_BACKEND_FACT_PREFIX));
+    let Some(fact) = facts.next() else {
+        return Err("expected exactly one SaBRe backend fact, found 0".to_owned());
+    };
+    let additional = facts.count();
+    if additional != 0 {
+        return Err(format!(
+            "expected exactly one SaBRe backend fact, found {}",
+            additional + 1
+        ));
+    }
+    Ok(fact)
+}
+
 fn sabre_backend_fact_is_exercised(fact: &str) -> bool {
-    let has_field = |required: &str| fact.split(';').any(|field| field.trim() == required);
-    [
-        "evidence_schema=1",
-        "ptrace_fallback_sites=0",
-        "trusted_shared_object_sites=0",
-        "guest_rpc_observed=true",
-        "reach_state=sabre-exercised",
-    ]
-    .into_iter()
-    .all(has_field)
+    unique_sabre_backend_fact_field(fact, "evidence_schema") == Some("1")
+        && unique_sabre_backend_fact_field(fact, "ptrace_fallback_sites") == Some("0")
+        && unique_sabre_backend_fact_field(fact, "trusted_shared_object_sites") == Some("0")
+        && unique_sabre_backend_fact_field(fact, "guest_rpc_observed") == Some("true")
+        && unique_sabre_backend_fact_field(fact, "reach_state") == Some("sabre-exercised")
 }
 
 fn sabre_backend_fact_reached_detcore(fact: &str) -> bool {
-    let has_field = |required: &str| fact.split(';').any(|field| field.trim() == required);
-    [
-        "evidence_schema=1",
-        "ptrace_fallback_sites=0",
-        "guest_rpc_observed=true",
-        "reach_state=sabre-exercised",
-    ]
-    .into_iter()
-    .all(has_field)
+    unique_sabre_backend_fact_field(fact, "evidence_schema") == Some("1")
+        && unique_sabre_backend_fact_field(fact, "ptrace_fallback_sites") == Some("0")
+        && unique_sabre_backend_fact_field(fact, "guest_rpc_observed") == Some("true")
+        && unique_sabre_backend_fact_field(fact, "reach_state") == Some("sabre-exercised")
 }
 
 fn assert_sabre_backend_fact(diagnostics: &str, label: &str) {
-    let fact = diagnostics
-        .lines()
-        .find(|line| line.contains(SABRE_BACKEND_FACT_PREFIX))
-        .unwrap_or_else(|| {
-            panic!(
-                "SaBRe controller diagnostics omitted the backend fact for {label}:\n{diagnostics}"
-            )
-        });
+    let fact = unique_sabre_backend_fact_line(diagnostics).unwrap_or_else(|error| {
+        panic!("SaBRe controller diagnostics did not contain exactly one backend fact for {label}: {error}\n{diagnostics}")
+    });
     assert!(
         sabre_backend_fact_is_exercised(fact),
         "SaBRe backend fact did not prove schema-1 RPC reach with zero ptrace fallback for {label}:\n{fact}",
@@ -71,6 +82,11 @@ fn assert_sabre_backend_fact(diagnostics: &str, label: &str) {
 
 #[test]
 fn sabre_backend_fact_refuses_unreached_or_fallback_execution() {
+    let complete = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; trusted_shared_object_sites=0; \
+         guest_rpc_observed=true; reach_state=sabre-exercised"
+    );
     let false_reach = format!(
         "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
          ptrace_fallback_sites=0; guest_rpc_observed=false; \
@@ -86,16 +102,56 @@ fn sabre_backend_fact_refuses_unreached_or_fallback_execution() {
          ptrace_fallback_sites=0; trusted_shared_object_sites=1; \
          guest_rpc_observed=true; reach_state=sabre-exercised"
     );
+    let contradictory_reach = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; guest_rpc_observed=true; \
+         guest_rpc_observed=false; reach_state=sabre-exercised"
+    );
+    let contradictory_fallback = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; ptrace_fallback_sites=1; \
+         guest_rpc_observed=true; reach_state=sabre-exercised"
+    );
+    assert_eq!(unique_sabre_backend_fact_line(&complete).unwrap(), complete);
+    let missing = unique_sabre_backend_fact_line("controller diagnostics without a backend fact")
+        .unwrap_err();
+    assert!(missing.contains("found 0"), "{missing}");
+    for (label, diagnostics) in [
+        ("valid plus unreached", format!("{complete}\n{false_reach}")),
+        ("valid plus fallback", format!("{complete}\n{fallback}")),
+        ("duplicate valid", format!("{complete}\n{complete}")),
+    ] {
+        let error = unique_sabre_backend_fact_line(&diagnostics).unwrap_err();
+        assert!(
+            error.contains("found 2"),
+            "{label} did not fail as ambiguous: {error}"
+        );
+    }
+    assert!(sabre_backend_fact_reached_detcore(&complete));
+    assert!(sabre_backend_fact_is_exercised(&complete));
     for (label, fact) in [
         ("unreached", false_reach),
         ("fallback", fallback),
-        ("trusted shared-object escape", trusted_escape),
+        ("contradictory reach", contradictory_reach),
+        ("contradictory fallback", contradictory_fallback),
     ] {
+        assert!(
+            !sabre_backend_fact_reached_detcore(&fact),
+            "{label} backend fact falsely proved RPC reach with zero fallback: {fact}",
+        );
         assert!(
             !sabre_backend_fact_is_exercised(&fact),
             "{label} backend fact carried the complete exercised contract: {fact}",
         );
     }
+    assert!(
+        sabre_backend_fact_reached_detcore(&trusted_escape),
+        "trusted shared-object execution still reached Detcore"
+    );
+    assert!(
+        !sabre_backend_fact_is_exercised(&trusted_escape),
+        "trusted shared-object escape falsely carried the complete exercised contract"
+    );
 }
 
 fn assert_clock_progress_trajectory(output: &Output, backend_label: &str) {
@@ -597,12 +653,9 @@ fn parity_run_with_path_contract(
         if require_no_escape_sites {
             assert_sabre_backend_fact(&diagnostics, label);
         } else {
-            let fact = diagnostics
-                .lines()
-                .find(|line| line.contains(SABRE_BACKEND_FACT_PREFIX))
-                .unwrap_or_else(|| {
-                    panic!("SaBRe controller diagnostics omitted the backend fact for {label}:\n{diagnostics}")
-                });
+            let fact = unique_sabre_backend_fact_line(&diagnostics).unwrap_or_else(|error| {
+                panic!("SaBRe controller diagnostics did not contain exactly one backend fact for {label}: {error}\n{diagnostics}")
+            });
             assert!(
                 sabre_backend_fact_reached_detcore(fact),
                 "SaBRe backend fact did not prove RPC reach for {label}:\n{fact}",
