@@ -59,6 +59,32 @@ fn logical_clock_ticks(
     clock_t_from_ticks(ticks)
 }
 
+fn logical_uptime_seconds(
+    now: crate::types::LogicalTime,
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> u64 {
+    // Subtract in the full nanosecond domain before projecting the elapsed
+    // duration to whole seconds. Flooring `now` and `boot` independently makes
+    // uptime jump a second early whenever the absolute timestamps straddle a
+    // second boundary but less than one full second has elapsed.
+    uptime_offset_seconds + (now - boot).as_secs()
+}
+
+pub(super) fn logical_boot_time_seconds(
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> i64 {
+    // Linux btime is signed whole seconds. Floor the nonnegative exact origin
+    // first, then subtract the integral configured uptime in a wider signed
+    // domain so early valid epochs remain representable (epoch zero => -offset).
+    // An extreme programmatic offset is configuration, not a reason for an
+    // unrelated procfs read to fail, so clamp only at the time_t boundary.
+    let boot_seconds = i128::from(boot.as_nanos() / NANOS_PER_SECOND);
+    let signed = boot_seconds - i128::from(uptime_offset_seconds);
+    signed.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
 fn prlimit_targets_current_process(
     target_pid: i32,
     deterministic_pid: Option<i32>,
@@ -354,8 +380,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
     ) -> Result<u64, Error> {
         let global_time = thread_observe_time(guest).await;
-        Ok(self.cfg.sysinfo_uptime_offset + global_time.as_secs()
-            - crate::types::DetTime::new(&self.cfg).as_nanos().as_secs())
+        Ok(logical_uptime_seconds(
+            global_time,
+            crate::types::DetTime::new(&self.cfg).as_nanos(),
+            self.cfg.sysinfo_uptime_offset,
+        ))
     }
 
     async fn collect_sysinfo<G: Guest<Self>>(
@@ -428,6 +457,32 @@ mod tests {
         let now = boot + LogicalTime::from_millis(25);
 
         assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+    }
+
+    #[test]
+    fn logical_uptime_floors_elapsed_time_not_absolute_endpoints() {
+        let boot = LogicalTime::from_nanos(1_790_000_000_970_859_833);
+
+        // This crosses an absolute whole-second boundary after only 29ms. The
+        // old floor(now)-floor(boot) expression incorrectly reported +1s.
+        let crossed_boundary = boot + LogicalTime::from_nanos(29_140_167);
+        assert_eq!(logical_uptime_seconds(crossed_boundary, boot, 120), 120);
+        assert_eq!(logical_uptime_seconds(boot, boot, 120), 120);
+        assert_eq!(logical_boot_time_seconds(boot, 120), 1_789_999_880);
+        assert_eq!(logical_boot_time_seconds(LogicalTime::ZERO, 120), -120);
+        assert_eq!(
+            logical_boot_time_seconds(LogicalTime::ZERO, u64::MAX),
+            i64::MIN,
+        );
+    }
+
+    #[test]
+    fn logical_uptime_advances_after_one_exact_elapsed_second() {
+        let boot = LogicalTime::from_nanos(1_790_000_000_970_859_833);
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
+            121,
+        );
     }
 
     #[test]

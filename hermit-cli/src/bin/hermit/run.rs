@@ -2915,6 +2915,27 @@ impl RunOpts {
         self.det_opts.det_config.epoch.to_rfc3339()
     }
 
+    fn virtual_epoch_provenance(&self) -> Option<String> {
+        self.uses_virtual_time_determinization().then(|| {
+            let epoch = self.epoch_rfc3339();
+            let source = if self.epoch_captured_from_host {
+                "host-now"
+            } else {
+                "explicit"
+            };
+            format!(
+                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
+            )
+        })
+    }
+
+    /// Record the selected epoch in the controller log, never in guest stderr.
+    fn emit_virtual_epoch_provenance(&self) {
+        if let Some(provenance) = self.virtual_epoch_provenance() {
+            tracing::warn!(target: "hermit::virtual_time", "{provenance}");
+        }
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -3143,17 +3164,6 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
-        if self.uses_virtual_time_determinization() {
-            let epoch = self.epoch_rfc3339();
-            let source = if self.epoch_captured_from_host {
-                "host-now"
-            } else {
-                "explicit"
-            };
-            global.write_controller_diagnostic(format_args!(
-                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
-            ))?;
-        }
         if self.allow_unsupported_syscalls {
             eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \
@@ -3237,6 +3247,14 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbt => {
+                // DBT owns a separate launcher and typed guest Output. Its
+                // ordinary adapter has no controller log-file sink, so retain
+                // the top-level provenance on controller stderr without ever
+                // adding it to the guest Output that verification compares.
+                let epoch_provenance = self.virtual_epoch_provenance();
+                if let Some(provenance) = &epoch_provenance {
+                    eprintln!("WARN hermit::virtual_time: {provenance}");
+                }
                 let environment = self.guest_command()?.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
@@ -3256,6 +3274,7 @@ impl RunOpts {
                     self.backend_engagement_json.as_deref(),
                     global.log,
                     global.log_file.as_deref(),
+                    epoch_provenance.as_deref(),
                     &config,
                     environment,
                     self.workdir.as_deref().map(Path::new),
@@ -3450,6 +3469,9 @@ impl RunOpts {
                 "--clock-multiplier must be finite and positive (received {})",
                 multiplier
             );
+        }
+        if detcore_model::config::epoch_nanos(&config.epoch).is_none() {
+            anyhow::bail!("--{}", detcore_model::config::EPOCH_RANGE_ERROR);
         }
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
         if let Some(max_timeslice) = config.max_timeslice
@@ -5029,6 +5051,7 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
+        self.emit_virtual_epoch_provenance();
 
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
@@ -5141,6 +5164,7 @@ impl RunOpts {
             BoundedWriter::new(log_file, limit),
             self.runtime_backend(),
         );
+        self.emit_virtual_epoch_provenance();
 
         let command = self.guest_command()?;
 

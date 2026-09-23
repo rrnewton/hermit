@@ -33,9 +33,7 @@ use hermit::run_evidence::inspect_run_evidence;
 mod hermit_test;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
-// Baseline and evidence runs compare the same explicit input, including the
-// fractional epoch, while preserving all stdout/stderr and identity checks.
-const COMPARISON_EPOCH: &str = "--epoch=2026-01-01T00:00:00.123456789Z";
+const COMPARISON_EPOCH: &str = "2026-09-23T02:39:52.970859833+00:00";
 
 fn hermit_run_guard() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
@@ -93,6 +91,7 @@ fn prepare_command_for(command: &mut Command, requested: Option<&OsStr>) -> Resu
 // staging before output configures its standard descriptors.
 fn command_output(command: &mut Command) -> std::io::Result<Output> {
     let requested = std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR");
+    command.env("HERMIT_EPOCH", COMPARISON_EPOCH);
     prepare_command_for(command, requested.as_deref())
         .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
     command.output()
@@ -101,6 +100,34 @@ fn command_output(command: &mut Command) -> std::io::Result<Output> {
 fn run(args: &[&str]) -> Output {
     command_output(hermit_command().args(args))
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
+}
+
+fn without_controller_epoch_provenance(bytes: &[u8], label: &str) -> Vec<u8> {
+    let marker = b"WARN hermit::virtual_time: hermit: virtual-time epoch=";
+    let mut provenance_events = 0;
+    let mut remaining = Vec::new();
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.windows(marker.len()).any(|window| window == marker) {
+            provenance_events += 1;
+        } else {
+            remaining.extend_from_slice(line);
+        }
+    }
+    assert_eq!(
+        provenance_events,
+        1,
+        "{label} must contain exactly one controller epoch provenance event: {}",
+        String::from_utf8_lossy(bytes),
+    );
+    remaining
+}
+
+fn assert_same_guest_stderr(baseline: &Output, with_evidence: &Output, label: &str) {
+    assert_eq!(
+        without_controller_epoch_provenance(&with_evidence.stderr, "evidence stderr"),
+        without_controller_epoch_provenance(&baseline.stderr, "baseline stderr"),
+        "{label}",
+    );
 }
 
 #[test]
@@ -335,22 +362,16 @@ fn sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info() {
         "printf ordinary-out; printf ordinary-err >&2; exit 23",
     ];
 
-    let mut baseline_args = vec!["run", COMPARISON_EPOCH, "--"];
+    let mut baseline_args = vec!["run", "--"];
     baseline_args.extend(guest);
     let baseline = run(&baseline_args);
-    let mut evidence_args = vec![
-        "run",
-        COMPARISON_EPOCH,
-        "--run-evidence-dir",
-        &destination_arg,
-        "--",
-    ];
+    let mut evidence_args = vec!["run", "--run-evidence-dir", &destination_arg, "--"];
     evidence_args.extend(guest);
     let with_evidence = run(&evidence_args);
 
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
+    assert_same_guest_stderr(&baseline, &with_evidence, "sidecar changed guest stderr");
     let RunEvidenceInspection::Complete(report) = inspect_run_evidence(&destination) else {
         panic!("ordinary ptrace evidence did not validate")
     };
@@ -379,10 +400,9 @@ fn sidecar_preserves_session_and_process_group_identity() {
 
     // The test binary can itself live below /tmp when this suite is built in a
     // disposable mirror. Expose that host path identically in both controls.
-    let baseline = run(&["run", COMPARISON_EPOCH, "--tmp=/tmp", "--", guest]);
+    let baseline = run(&["run", "--tmp=/tmp", "--", guest]);
     let with_evidence = run(&[
         "run",
-        COMPARISON_EPOCH,
         "--tmp=/tmp",
         "--run-evidence-dir",
         &destination_arg,
@@ -397,7 +417,7 @@ fn sidecar_preserves_session_and_process_group_identity() {
     );
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
+    assert_same_guest_stderr(&baseline, &with_evidence, "sidecar changed guest stderr");
     let stdout = String::from_utf8(with_evidence.stdout).unwrap();
     assert!(stdout.contains("setpgid rc=0 errno=0"));
     assert!(stdout.contains("setsid rc=-1 errno=1"));
@@ -421,14 +441,14 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
         hermit_command()
             .args(["--log-file"])
             .arg(&baseline_log)
-            .args(["run", COMPARISON_EPOCH, "--tmp=/tmp", "--", guest]),
+            .args(["run", "--tmp=/tmp", "--", guest]),
     )
     .unwrap();
     let with_evidence = command_output(
         hermit_command()
             .args(["--log-file"])
             .arg(&public_log)
-            .args(["run", COMPARISON_EPOCH, "--tmp=/tmp", "--run-evidence-dir"])
+            .args(["run", "--tmp=/tmp", "--run-evidence-dir"])
             .arg(&evidence)
             .args(["--", guest]),
     )
@@ -441,10 +461,13 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
     );
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
     assert_eq!(
-        fs::read(&public_log).unwrap(),
-        fs::read(&baseline_log).unwrap(),
+        with_evidence.stderr, baseline.stderr,
+        "--log-file must keep controller provenance out of process stderr",
+    );
+    assert_eq!(
+        without_controller_epoch_provenance(&fs::read(&public_log).unwrap(), "public log"),
+        without_controller_epoch_provenance(&fs::read(&baseline_log).unwrap(), "baseline log"),
         "the private INFO layer changed the default-WARN public log"
     );
 
@@ -476,7 +499,6 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
 
     let baseline = run(&[
         "run",
-        COMPARISON_EPOCH,
         "--tmp=/tmp",
         "--",
         guest,
@@ -485,7 +507,6 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
     ]);
     let with_evidence = run(&[
         "run",
-        COMPARISON_EPOCH,
         "--tmp=/tmp",
         "--run-evidence-dir",
         evidence.to_str().unwrap(),
@@ -502,7 +523,7 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
     );
     assert_eq!(with_evidence.status, baseline.status);
     assert_eq!(with_evidence.stdout, baseline.stdout);
-    assert_eq!(with_evidence.stderr, baseline.stderr);
+    assert_same_guest_stderr(&baseline, &with_evidence, "sidecar changed guest stderr");
     assert_eq!(
         fs::read(&evidence_report).unwrap(),
         fs::read(&baseline_report).unwrap()

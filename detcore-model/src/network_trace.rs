@@ -9,7 +9,7 @@
 //! Versioned data model for schedule-independent external network input.
 //!
 //! This module deliberately contains no recorder, replayer, or scheduler hook.
-//! It defines the fail-closed v1 envelope and its framing so a future runtime
+//! It defines the fail-closed v1 data envelope and v2 framing so a future runtime
 //! integration cannot accidentally reuse the schedule-coupled syscall event
 //! stream. Merely constructing a [`NetworkTraceConfig`] does not enable any
 //! behavior today.
@@ -28,13 +28,18 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::config::epoch_nanos;
 use crate::fd::OpenFileId;
 use crate::time::LogicalTime;
 
 /// The on-disk format magic. The version is stored in the following four bytes.
 pub const NETWORK_TRACE_MAGIC: [u8; 16] = *b"HERMIT-NET-TRACE";
-/// The only network trace format this build accepts.
-pub const NETWORK_TRACE_VERSION_V1: u32 = 1;
+/// The only network trace framing this build accepts.
+///
+/// Framing v1 projected the epoch to microseconds. V2 preserves the complete
+/// nanosecond epoch. We refuse v1 rather than silently reinterpret its payload
+/// in the new clock domain; no runtime recorder or replayer has shipped yet.
+pub const NETWORK_TRACE_VERSION_V2: u32 = 2;
 /// Refuse hostile or corrupt length headers before allocating memory.
 pub const MAX_NETWORK_TRACE_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -278,19 +283,9 @@ pub struct NetworkTraceV1 {
 impl NetworkTraceV1 {
     /// Convert the recorded epoch to the absolute starting time used by
     /// `GlobalTime`, rejecting Chrono values outside its `u64` nanosecond
-    /// domain. `GlobalTime` truncates the epoch to microseconds, so this does
-    /// the same conversion without an unchecked signed cast or multiplication.
+    /// domain, without truncating its fractional nanoseconds.
     pub fn epoch_global_time(&self) -> Result<LogicalTime, NetworkTraceValidationError> {
-        let seconds = u64::try_from(self.epoch.timestamp())
-            .map_err(|_| NetworkTraceValidationError::EpochOutOfRange)?;
-        let whole_seconds = seconds
-            .checked_mul(1_000_000_000)
-            .ok_or(NetworkTraceValidationError::EpochOutOfRange)?;
-        let fractional_micros = u64::from(self.epoch.timestamp_subsec_micros())
-            .checked_mul(1_000)
-            .ok_or(NetworkTraceValidationError::EpochOutOfRange)?;
-        whole_seconds
-            .checked_add(fractional_micros)
+        epoch_nanos(&self.epoch)
             .map(LogicalTime::from_nanos)
             .ok_or(NetworkTraceValidationError::EpochOutOfRange)
     }
@@ -391,7 +386,7 @@ impl NetworkTraceV1 {
         Ok(())
     }
 
-    /// Write one complete, length-delimited v1 trace.
+    /// Write one complete, length-delimited v2 frame containing the v1 data envelope.
     pub fn write_framed<W: Write>(&self, mut writer: W) -> Result<(), NetworkTraceCodecError> {
         self.validate()?;
         let payload = bincode::serde::encode_to_vec(self, bincode::config::standard())
@@ -402,7 +397,7 @@ impl NetworkTraceV1 {
             return Err(NetworkTraceCodecError::TooLarge);
         }
         writer.write_all(&NETWORK_TRACE_MAGIC)?;
-        writer.write_all(&NETWORK_TRACE_VERSION_V1.to_le_bytes())?;
+        writer.write_all(&NETWORK_TRACE_VERSION_V2.to_le_bytes())?;
         writer.write_all(&payload_len.to_le_bytes())?;
         writer.write_all(&payload)?;
         Ok(())
@@ -422,7 +417,7 @@ impl NetworkTraceV1 {
                 .try_into()
                 .expect("fixed-size version field"),
         );
-        if version != NETWORK_TRACE_VERSION_V1 {
+        if version != NETWORK_TRACE_VERSION_V2 {
             return Err(NetworkTraceCodecError::UnsupportedVersion(version));
         }
         let len_start = version_start + 4;
@@ -519,7 +514,7 @@ impl fmt::Display for NetworkTraceValidationError {
 
 impl Error for NetworkTraceValidationError {}
 
-/// Failure to decode or encode the framed v1 representation.
+/// Failure to decode or encode the v2 frame carrying the v1 data envelope.
 #[derive(Debug)]
 pub enum NetworkTraceCodecError {
     Io(io::Error),
@@ -642,14 +637,14 @@ mod tests {
         let payload = bincode::serde::encode_to_vec(trace, bincode::config::standard()).unwrap();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&NETWORK_TRACE_MAGIC);
-        bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V2.to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
     }
 
     #[test]
-    fn network_trace_v1_round_trips_exactly() {
+    fn network_trace_v2_frame_round_trips_exactly() {
         let trace = valid_trace();
         let decoded = NetworkTraceV1::read_framed(Cursor::new(framed(&trace))).unwrap();
         assert_eq!(decoded, trace);
@@ -765,10 +760,21 @@ mod tests {
     fn unknown_versions_are_rejected_before_payload_decode() {
         let mut bytes = framed(&valid_trace());
         let start = NETWORK_TRACE_MAGIC.len();
-        bytes[start..start + 4].copy_from_slice(&2u32.to_le_bytes());
+        bytes[start..start + 4].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             NetworkTraceV1::read_framed(Cursor::new(bytes)),
-            Err(NetworkTraceCodecError::UnsupportedVersion(2))
+            Err(NetworkTraceCodecError::UnsupportedVersion(3))
+        ));
+    }
+
+    #[test]
+    fn legacy_microsecond_frame_is_refused_not_reinterpreted() {
+        let mut bytes = framed(&valid_trace());
+        let start = NETWORK_TRACE_MAGIC.len();
+        bytes[start..start + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            NetworkTraceV1::read_framed(Cursor::new(bytes)),
+            Err(NetworkTraceCodecError::UnsupportedVersion(1))
         ));
     }
 
@@ -776,7 +782,7 @@ mod tests {
     fn oversized_length_is_rejected_before_allocation() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&NETWORK_TRACE_MAGIC);
-        bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V2.to_le_bytes());
         bytes.extend_from_slice(&(MAX_NETWORK_TRACE_PAYLOAD_BYTES + 1).to_le_bytes());
         assert!(matches!(
             NetworkTraceV1::read_framed(Cursor::new(bytes)),
@@ -915,6 +921,33 @@ mod tests {
         assert_eq!(global_time.as_nanos(), release.not_before_global_time);
         assert!(!release.is_eligible(global_time.as_nanos(), 2));
         assert!(release.is_eligible(global_time.as_nanos(), 3));
+    }
+
+    #[test]
+    fn trace_epochs_one_nanosecond_apart_remain_distinct() {
+        let mut first = valid_trace();
+        let mut second = valid_trace();
+        first.epoch = Utc.timestamp_opt(1_790_000_000, 833).unwrap();
+        second.epoch = Utc.timestamp_opt(1_790_000_000, 834).unwrap();
+
+        assert_eq!(
+            second.epoch_global_time().unwrap() - first.epoch_global_time().unwrap(),
+            LogicalTime::from_nanos(1),
+        );
+    }
+
+    #[test]
+    fn framed_trace_preserves_fractional_nanoseconds() {
+        let mut trace = valid_trace();
+        trace.epoch = Utc.timestamp_opt(1_790_000_000, 833).unwrap();
+        for input in &mut trace.inputs {
+            input.release.not_before_global_time =
+                input.release.not_before_global_time + LogicalTime::from_nanos(833);
+        }
+
+        let decoded = NetworkTraceV1::read_framed(Cursor::new(framed(&trace))).unwrap();
+        assert_eq!(decoded.epoch.timestamp_subsec_nanos(), 833);
+        assert_eq!(decoded.epoch_global_time(), trace.epoch_global_time());
     }
 
     #[test]

@@ -202,6 +202,8 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 2),
     ("test.isolated_detcore_workdir", 1),
+    // Four exact nanosecond origin, domain, overflow, and trace regressions plus
+    // three SaBRe wire-fingerprint decisions retain all 610 prior identities.
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
@@ -214,23 +216,28 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eleven record-workload preparation controls retain all 566 prior IDs.
     // Seven census/finalized-run/scope controls retain all 577 current-main IDs.
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
-    ("test.regular_crates", 610),
+    // Environment-neutral defaults and two v2 framing guards retain all 617 prior IDs.
+    ("test.regular_crates", 620),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
-    ("test.hermit_unit", 723),
+    // One DBT controller-provenance materialization regression retains all 723 prior IDs.
+    ("test.hermit_unit", 724),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
-    ("test.detcore_unit", 748),
+    // One fractional zero-work summary regression retains all 748 prior IDs.
+    // Two exact elapsed-before-floor uptime regressions retain all 749 prior IDs.
+    ("test.detcore_unit", 751),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
-    // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
-    // default_virtual_epoch_tracks_invocation_start_and_is_reported and
-    // explicit_virtual_epoch_reproduces_identical_observed_time.
-    ("test.hermit_integration", 160),
+    // Current exact selection enumerates 164 integration identities after the
+    // epoch provenance and range-refusal controls; no selector or skip changed.
+    ("test.hermit_integration", 164),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
-    ("test.sabre_examples", 6),
+    // Same-epoch reuse and distinct-nanosecond controls retain all six prior IDs.
+    // Structured reach refusal and public HERMIT_EPOCH pairing retain all eight prior IDs.
+    ("test.sabre_examples", 10),
     ("test.hermit_modes", 19),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -249,16 +256,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 748),
-    // The host variant selects the same two additional clock_determinism tests.
-    ("test.hermit_integration_on_host", 160),
-    ("test.hermit_unit_on_host", 723),
+    ("test.detcore_unit_on_host", 751),
+    ("test.hermit_integration_on_host", 164),
+    ("test.hermit_unit_on_host", 724),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 610),
+    ("test.regular_crates_on_host", 620),
     ("test.rr_suite_contract_on_host", 1),
-    ("test.sabre_examples_on_host", 6),
+    ("test.sabre_examples_on_host", 10),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
