@@ -1397,6 +1397,7 @@ const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3780;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
 const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
 const PORTABLE_CHECKS_OVERHEAD_SECONDS: u64 = 600;
+const PORTABLE_DEBUG_BUILD_OVERHEAD_SECONDS: u64 = 300;
 const PRIVILEGED_WORKFLOW_OVERHEAD_SECONDS: u64 = 300;
 
 fn audit_portable_preflight_budget(
@@ -1467,6 +1468,44 @@ fn audit_portable_checks_budget(
     if job_bound < required {
         return Err(format!(
             "portable checks job {job_bound}s must cover its {critical_path}s constructed DAG critical path plus at least {PORTABLE_CHECKS_OVERHEAD_SECONDS}s for checkout, package installation, artifact transfer, and teardown"
+        ));
+    }
+    Ok(())
+}
+
+fn audit_portable_debug_build_budget(
+    workflow: &YamlValue,
+    portable: &dagrun::DagConfig,
+    shards: &JsonValue,
+) -> Result<(), String> {
+    let steps = portable
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect();
+    let tags = shards["build_debug_nodes"]
+        .as_array()
+        .ok_or_else(|| "portable shard map has no build_debug_nodes array".to_string())?
+        .iter()
+        .map(|node| {
+            let node = node.as_str().ok_or_else(|| {
+                "portable build_debug_nodes contains a non-string node".to_string()
+            })?;
+            Ok(portable_shard_step(&steps, node)?.tag())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // Resolve the real hosted aliases, then retain exactly the job's nodes.
+    // Preflight supplies external dependencies; internal ordering still counts.
+    let selected = dagrun::select_steps_by_tags(portable, &tags, true)
+        .map_err(|error| format!("cannot select portable debug build: {error}"))?;
+    let critical_path = dag_critical_path(&selected)?;
+    let job_bound = workflow_job_timeout(workflow, "build-debug")? * 60;
+    let required = critical_path
+        .checked_add(PORTABLE_DEBUG_BUILD_OVERHEAD_SECONDS)
+        .ok_or_else(|| "portable debug build required budget overflowed".to_string())?;
+    if job_bound < required {
+        return Err(format!(
+            "portable build-debug job {job_bound}s must cover its {critical_path}s constructed DAG critical path plus at least {PORTABLE_DEBUG_BUILD_OVERHEAD_SECONDS}s for setup and artifacts"
         ));
     }
     Ok(())
@@ -1564,6 +1603,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
     audit_portable_preflight_budget(&portable_workflow, &portable, &shards)?;
     audit_portable_checks_budget(&portable_workflow, &portable, &shards)?;
+    audit_portable_debug_build_budget(&portable_workflow, &portable, &shards)?;
     audit_portable_reducer_prepared_tools(&portable_workflow)?;
     let portable_steps = portable
         .steps
@@ -3003,6 +3043,36 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .expect("portable workflow");
         super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards).unwrap();
         super::audit_portable_checks_budget(&portable_workflow, &portable, &shards).unwrap();
+        super::audit_portable_debug_build_budget(&portable_workflow, &portable, &shards).unwrap();
+        let mut short_debug = portable_workflow.clone();
+        short_debug["jobs"]["build-debug"]["timeout-minutes"] =
+            serde_yaml::to_value(52_u64).unwrap();
+        let error =
+            super::audit_portable_debug_build_budget(&short_debug, &portable, &shards).unwrap_err();
+        assert!(
+            error.contains(
+                "portable build-debug job 3120s must cover its 3000s constructed DAG critical path plus at least 300s"
+            ),
+            "{error}"
+        );
+        // Increasing an actual selected node changes the computed critical path;
+        // the guard must not merely recognize a literal 55-minute workflow value.
+        let mut longer_debug = portable.clone();
+        longer_debug
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.recorded_clocks_on_host")
+            .unwrap()
+            .timeout += 1;
+        let error =
+            super::audit_portable_debug_build_budget(&portable_workflow, &longer_debug, &shards)
+                .unwrap_err();
+        assert!(
+            error.contains(
+                "portable build-debug job 3300s must cover its 3001s constructed DAG critical path plus at least 300s"
+            ),
+            "{error}"
+        );
         super::audit_portable_reducer_prepared_tools(&portable_workflow).unwrap();
         portable_workflow["jobs"]["preflight"]["timeout-minutes"] =
             serde_yaml::to_value(10_u64).unwrap();
@@ -3076,6 +3146,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             "test.detcore_parallel",
             "test.regular_crates",
             "test.hermit_integration",
+            "test.recorded_clocks",
             "test.arbitrary_binaries",
             "test.applications_e2e",
             "test.app_strict_verify",
@@ -3121,8 +3192,8 @@ report.write_bytes((root/'verification.json').read_bytes())
         // They remain assigned exactly once, but share the integration shard so
         // the hosted validator cannot mistake a standalone zero-test run for a
         // pass.
-        assert_eq!(physical_rows, 25);
-        assert_eq!(resolved.len(), 25);
+        assert_eq!(physical_rows, 26);
+        assert_eq!(resolved.len(), 26);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
