@@ -1074,8 +1074,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
-    /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own
-    /// subscriptions specified in recorder/mod.rs.
+    /// Detcore subscriptions apply to run, record, and replay. The default intercepts
+    /// every syscall; explicit passthrough optimization unions Detcore's audited
+    /// subscriptions with those required by the nested record-or-replay tool.
     fn subscriptions(config: &Config) -> Subscription {
         let do_sched =
             config.sched_heuristic != SchedHeuristic::None || config.sequentialize_threads;

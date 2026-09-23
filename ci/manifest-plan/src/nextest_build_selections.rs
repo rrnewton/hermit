@@ -697,7 +697,7 @@ mod tests {
                 .find(|step| step.tag() == consumer)
                 .unwrap();
             assert_command_selection(step).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "4");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6");
             assert!(step.deps.iter().any(|dependency| dependency == producer));
             let args: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
             assert_eq!(args, clock_args);
