@@ -728,16 +728,6 @@ struct DecodedDbtEvidence {
     initialization_records: usize,
 }
 
-/// Prefix for controller-generated annotations in a materialized DBT log.
-///
-/// These lines are not records from Reverie's authenticated evidence stream.
-/// The canonical comparator ignores their WARN level, while the explicit label
-/// prevents a retained log's epoch-zero presentation timestamp from making the
-/// annotation look like authenticated guest evidence.
-#[cfg(feature = "dbt")]
-const DBT_UNAUTHENTICATED_CONTROLLER_PREFIX: &str =
-    "UNAUTHENTICATED CONTROLLER PROVENANCE (not guest evidence):";
-
 #[cfg(feature = "dbt")]
 fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DecodedDbtEvidence, Error> {
     file.seek(SeekFrom::Start(0))?;
@@ -763,7 +753,6 @@ fn materialize_dbt_comparison_log(
     records: &[Vec<u8>],
     mut log: std::fs::File,
     path: &Path,
-    epoch_provenance: Option<&str>,
 ) -> Result<usize, Error> {
     if records.is_empty() {
         return Err(Error::msg("DBT canonical evidence contained no records"));
@@ -783,13 +772,6 @@ fn materialize_dbt_comparison_log(
         }
         log.write_all(record)?;
     }
-    if let Some(provenance) = epoch_provenance {
-        writeln!(
-            log,
-            "1970-01-01T00:00:00.000000Z WARN hermit::virtual_time: \
-             {DBT_UNAUTHENTICATED_CONTROLLER_PREFIX} {provenance}"
-        )?;
-    }
     log.flush()?;
 
     // The verdict publishes `dbt_evidence_transport_v1`: Reverie's authenticated
@@ -804,14 +786,13 @@ fn materialize_dbt_comparison_log(
         .iter()
         .filter(|byte| **byte == b'\n')
         .count();
-    let expected_materialized = records.len() + usize::from(epoch_provenance.is_some());
+    let expected_materialized = records.len();
     if materialized != expected_materialized {
         return Err(Error::msg(format!(
             "DBT canonical evidence log holds {materialized} newline-delimited entries but \
              {expected_materialized} \
-             were required from {} decoded records plus the non-authenticated controller \
-             provenance annotation; the comparison publishes the dbt_evidence_transport_v1 \
-             envelope and must not drop any authenticated record",
+             were required from {} decoded records; the comparison publishes the \
+             dbt_evidence_transport_v1 envelope and must not drop any authenticated record",
             records.len(),
         )));
     }
@@ -893,7 +874,6 @@ pub(super) fn run_dbt(
     backend_engagement_json: Option<&Path>,
     log: Option<LevelFilter>,
     log_file: Option<&Path>,
-    epoch_provenance: Option<&str>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
     workdir: Option<&Path>,
@@ -1102,12 +1082,9 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
-    if let Err(error) = materialize_dbt_comparison_log(
-        &first_evidence.records,
-        log1_file,
-        &log1_path,
-        epoch_provenance,
-    ) {
+    if let Err(error) =
+        materialize_dbt_comparison_log(&first_evidence.records, log1_file, &log1_path)
+    {
         if keep_logs {
             retain_verification_logs([("run 1", log1_path)])?;
         }
@@ -1182,12 +1159,9 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
-    if let Err(error) = materialize_dbt_comparison_log(
-        &second_evidence.records,
-        log2_file,
-        &log2_path,
-        epoch_provenance,
-    ) {
+    if let Err(error) =
+        materialize_dbt_comparison_log(&second_evidence.records, log2_file, &log2_path)
+    {
         if keep_logs {
             retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
         }
@@ -1298,7 +1272,6 @@ pub(super) fn run_dbt(
     _backend_engagement_json: Option<&Path>,
     _log: Option<LevelFilter>,
     _log_file: Option<&Path>,
-    _epoch_provenance: Option<&str>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
     _workdir: Option<&Path>,
@@ -1724,7 +1697,7 @@ mod tests {
             b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG second\n".to_vec(),
         ];
 
-        super::materialize_dbt_comparison_log(&records, file, &path, None)
+        super::materialize_dbt_comparison_log(&records, file, &path)
             .expect("materialization must accept comparable records");
 
         assert_eq!(std::fs::read(&path).expect("read back"), records.concat());
@@ -2170,7 +2143,7 @@ mod tests {
             b"1970-01-01T00:00:00.000000Z INFO detcore::scheduler: second\n".to_vec(),
         ];
 
-        let compared = materialize_dbt_comparison_log(&records, file, &path, None).unwrap();
+        let compared = materialize_dbt_comparison_log(&records, file, &path).unwrap();
 
         assert_eq!(compared, 2);
         assert_eq!(fs::read(&path).unwrap(), records.concat());
@@ -2181,7 +2154,7 @@ mod tests {
     fn dbt_canonical_evidence_fails_closed_on_empty_or_unframed_records() {
         let empty = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = empty.into_parts();
-        assert!(materialize_dbt_comparison_log(&[], file, &path, None).is_err());
+        assert!(materialize_dbt_comparison_log(&[], file, &path).is_err());
 
         let unframed = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = unframed.into_parts();
@@ -2190,7 +2163,6 @@ mod tests {
                 &[b"1970-01-01T00:00:00.000000Z INFO detcore: missing newline".to_vec()],
                 file,
                 &path,
-                None,
             )
             .is_err()
         );
@@ -2198,26 +2170,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_verify_log_labels_controller_epoch_provenance_as_unauthenticated() {
+    fn dbt_verify_log_contains_only_authenticated_records() {
         let log = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = log.into_parts();
         let records = vec![b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG first\n".to_vec()];
-        let provenance = "hermit: virtual-time epoch=2026-09-23T02:39:52.970859833+00:00 source=explicit; reproduce with --epoch=2026-09-23T02:39:52.970859833+00:00";
-
-        let compared =
-            materialize_dbt_comparison_log(&records, file, &path, Some(provenance)).unwrap();
+        let compared = materialize_dbt_comparison_log(&records, file, &path).unwrap();
         let materialized = fs::read_to_string(&path).unwrap();
 
-        assert_eq!(
-            compared, 1,
-            "controller WARN is not an INFO comparison record"
-        );
-        assert!(materialized.as_bytes().starts_with(&records.concat()));
-        assert_eq!(materialized.matches(provenance).count(), 1);
-        assert!(materialized.contains(&format!(
-            "WARN hermit::virtual_time: {DBT_UNAUTHENTICATED_CONTROLLER_PREFIX} {provenance}"
-        )));
-        assert!(!materialized.contains(&format!("WARN hermit::virtual_time: {provenance}")));
+        assert_eq!(compared, 1);
+        assert_eq!(materialized.as_bytes(), records.concat());
+        assert!(!materialized.contains("virtual-time epoch="));
     }
 
     #[test]

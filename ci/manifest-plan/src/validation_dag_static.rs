@@ -226,7 +226,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven census/finalized-run/scope controls retain all 577 current-main IDs.
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
     // Environment-neutral defaults and two v2 framing guards retain all 617 prior IDs.
-    ("test.regular_crates", 620),
+    // Three current inventory controls retain all 620 prior identities.
+    ("test.regular_crates", 623),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // One DBT controller-provenance materialization regression retains all 723 prior IDs.
@@ -235,12 +236,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five resource-limit controls retain all 743 prior identities.
     // One fractional zero-work summary regression retains all 748 prior IDs.
     // Two exact elapsed-before-floor uptime regressions retain all 749 prior IDs.
-    ("test.detcore_unit", 751),
+    // One current inventory control retains all 751 prior identities.
+    ("test.detcore_unit", 752),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
-    // Current exact selection enumerates 164 integration identities after the
+    // Current exact selection enumerates 165 integration identities after the
     // epoch provenance and range-refusal controls; no selector or skip changed.
-    ("test.hermit_integration", 164),
+    ("test.hermit_integration", 165),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
@@ -265,13 +267,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 751),
-    ("test.hermit_integration_on_host", 164),
+    ("test.detcore_unit_on_host", 752),
+    ("test.hermit_integration_on_host", 165),
     ("test.hermit_unit_on_host", 724),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 620),
+    ("test.regular_crates_on_host", 623),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 10),
 ];

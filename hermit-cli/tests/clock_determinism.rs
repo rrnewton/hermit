@@ -175,6 +175,73 @@ fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
 }
 
 #[test]
+fn default_verify_reports_one_stable_replay_epoch_without_retained_logs() {
+    let _guard = hermit_clock_lock();
+    let mut command = Command::new(hermit_binary::hermit_binary());
+    command.env_remove("HERMIT_EPOCH").args([
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        // This checkout itself is under /tmp. Keep Hermit's private summary
+        // sidecar visible to both verification containers during this test.
+        "--tmp=/tmp",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/true",
+    ]);
+    let output = command_output(command, "default-epoch verification without retained logs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("hermit: virtual-time epoch="))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "verification must expose exactly one top-level epoch reproducer: {stderr}"
+    );
+    let line = lines[0];
+    let epoch = line
+        .split_once("epoch=")
+        .and_then(|(_, tail)| tail.split_once(" source=host-now"))
+        .map(|(epoch, _)| epoch)
+        .unwrap_or_else(|| panic!("missing host-now epoch provenance: {line}"));
+    assert_eq!(
+        line.matches(&format!("--epoch={epoch}")).count(),
+        1,
+        "the reproducer must reuse the exact captured epoch: {line}"
+    );
+
+    let failed = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args([
+            "--log=info",
+            "--log-file=/dev/full",
+            "run",
+            "--verify",
+            "--base-env=minimal",
+            "--tmp=/tmp",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to start the unwritable epoch-provenance probe");
+    assert!(
+        !failed.status.success(),
+        "verification succeeded after losing its only durable epoch reproducer"
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr)
+            .contains("cannot write epoch provenance to --log-file"),
+        "verification did not identify the lost epoch provenance: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}
+
+#[test]
 fn explicit_virtual_epoch_reproduces_identical_observed_time() {
     let _guard = hermit_clock_lock();
     let (first, first_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));
