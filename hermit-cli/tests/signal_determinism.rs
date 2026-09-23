@@ -322,6 +322,9 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
         command.args([
             "--log=off",
             "run",
+            // Compare complete diagnostics from the same clock input, including
+            // committed virtual time; do not strip or quantize their contents.
+            "--epoch=2026-01-01T00:00:00.123456789Z",
             "--strict",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",

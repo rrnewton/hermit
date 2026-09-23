@@ -33,6 +33,9 @@ use hermit::run_evidence::inspect_run_evidence;
 mod hermit_test;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
+// Baseline and evidence runs compare the same explicit input, including the
+// fractional epoch, while preserving all stdout/stderr and identity checks.
+const COMPARISON_EPOCH: &str = "--epoch=2026-01-01T00:00:00.123456789Z";
 
 fn hermit_run_guard() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
@@ -332,10 +335,16 @@ fn sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info() {
         "printf ordinary-out; printf ordinary-err >&2; exit 23",
     ];
 
-    let mut baseline_args = vec!["run", "--"];
+    let mut baseline_args = vec!["run", COMPARISON_EPOCH, "--"];
     baseline_args.extend(guest);
     let baseline = run(&baseline_args);
-    let mut evidence_args = vec!["run", "--run-evidence-dir", &destination_arg, "--"];
+    let mut evidence_args = vec![
+        "run",
+        COMPARISON_EPOCH,
+        "--run-evidence-dir",
+        &destination_arg,
+        "--",
+    ];
     evidence_args.extend(guest);
     let with_evidence = run(&evidence_args);
 
@@ -370,9 +379,10 @@ fn sidecar_preserves_session_and_process_group_identity() {
 
     // The test binary can itself live below /tmp when this suite is built in a
     // disposable mirror. Expose that host path identically in both controls.
-    let baseline = run(&["run", "--tmp=/tmp", "--", guest]);
+    let baseline = run(&["run", COMPARISON_EPOCH, "--tmp=/tmp", "--", guest]);
     let with_evidence = run(&[
         "run",
+        COMPARISON_EPOCH,
         "--tmp=/tmp",
         "--run-evidence-dir",
         &destination_arg,
@@ -411,14 +421,14 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
         hermit_command()
             .args(["--log-file"])
             .arg(&baseline_log)
-            .args(["run", "--tmp=/tmp", "--", guest]),
+            .args(["run", COMPARISON_EPOCH, "--tmp=/tmp", "--", guest]),
     )
     .unwrap();
     let with_evidence = command_output(
         hermit_command()
             .args(["--log-file"])
             .arg(&public_log)
-            .args(["run", "--tmp=/tmp", "--run-evidence-dir"])
+            .args(["run", COMPARISON_EPOCH, "--tmp=/tmp", "--run-evidence-dir"])
             .arg(&evidence)
             .args(["--", guest]),
     )
@@ -466,6 +476,7 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
 
     let baseline = run(&[
         "run",
+        COMPARISON_EPOCH,
         "--tmp=/tmp",
         "--",
         guest,
@@ -474,6 +485,7 @@ fn sidecar_does_not_replace_or_reopen_guest_standard_descriptors() {
     ]);
     let with_evidence = run(&[
         "run",
+        COMPARISON_EPOCH,
         "--tmp=/tmp",
         "--run-evidence-dir",
         evidence.to_str().unwrap(),
