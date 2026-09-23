@@ -569,10 +569,14 @@ impl Tool for Recorder {
             // on replay. Without this arm it fell through to live injection and
             // the fd side effect was neither recorded nor replayed.
             Syscall::PidfdOpen(_) => self.handle_simple(guest, syscall).await,
-            Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
-            Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
+            Syscall::ClockGettime(syscall) => {
+                return self.handle_clock_gettime(guest, syscall).await;
+            }
+            Syscall::Gettimeofday(syscall) => {
+                return self.handle_gettimeofday(guest, syscall).await;
+            }
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
+            Syscall::Time(syscall) => return self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
             // FIXME: Not all fcntl cases are simple.
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
