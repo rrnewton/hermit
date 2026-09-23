@@ -1320,12 +1320,13 @@ impl GlobalTool for GlobalState {
                             .unwrap()
                             .reassign_thread(pending.caller, dettid)
                     {
+                        let failure = reverie::BackendFailure {
+                            pid: reverie::Pid::from_raw(from.as_raw()),
+                            tid: from,
+                            phase: "global virtual-time accounting",
+                        };
                         let (wake, deferred) = (
-                            sched.report_backend_failure(reverie::BackendFailure {
-                                pid: reverie::Pid::from_raw(from.as_raw()),
-                                tid: from,
-                                phase: "global virtual-time accounting",
-                            }),
+                            sched.report_backend_failure_with_cause(failure, error.to_string()),
                             sched.take_signal_failure_wakes(),
                         );
                         error!(
@@ -1695,14 +1696,24 @@ impl GlobalState {
             "terminal virtual-time failure for backend task {}: {}",
             task, error
         );
-        <Self as GlobalTool>::report_backend_failure(
-            self,
-            reverie::BackendFailure {
-                pid: reverie::Pid::from_raw(task.as_raw()),
-                tid: task,
-                phase: "global virtual-time accounting",
-            },
-        );
+        let failure = reverie::BackendFailure {
+            pid: reverie::Pid::from_raw(task.as_raw()),
+            tid: task,
+            phase: "global virtual-time accounting",
+        };
+        let (wake, deferred) = {
+            let mut sched = self.sched.lock().unwrap();
+            (
+                sched.report_backend_failure_with_cause(failure, error.to_string()),
+                sched.take_signal_failure_wakes(),
+            )
+        };
+        for wake in deferred {
+            let _ = wake.send(());
+        }
+        if let Some(wake) = wake {
+            let _ = wake.send(());
+        }
     }
 
     async fn recv_resources_with_origin(
@@ -3401,6 +3412,7 @@ pub(crate) async fn deregister_thread<R>(
         // We can't update the thread time here.  But it's dead anyway!
         match resp.1 {
             GlobalResponse::DeregisterThread(x) => x,
+            GlobalResponse::ThreadExited => (),
             _ => unreachable!(),
         }
     }

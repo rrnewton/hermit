@@ -612,6 +612,7 @@ pub struct Scheduler {
     // The event and run-queue transition share the grant/commit mutex. Every
     // callback and daemon wait clones its own subscriber, unlike an Ivar.
     backend_failure: Option<BackendFailureLocation>,
+    backend_failure_cause: Option<String>,
     backend_failure_sender: Option<oneshot::Sender<()>>,
     backend_failure_wake: Shared<oneshot::Receiver<()>>,
 
@@ -1681,6 +1682,7 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             backend_failure: None,
+            backend_failure_cause: None,
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
@@ -2319,10 +2321,13 @@ impl Scheduler {
 
     pub(crate) fn backend_failure_description(&self) -> Option<String> {
         self.backend_failure.as_ref().map(|failure| {
-            format!(
+            let location = format!(
                 "backend failure for process {}, task {:?}, phase {}",
                 failure.pid, failure.tid, failure.phase
-            )
+            );
+            self.backend_failure_cause
+                .as_ref()
+                .map_or(location.clone(), |cause| format!("{location}: {cause}"))
         })
     }
 
@@ -2343,6 +2348,18 @@ impl Scheduler {
             tid: Some(event.tid),
             phase: event.phase,
         })
+    }
+
+    pub(crate) fn report_backend_failure_with_cause(
+        &mut self,
+        event: reverie::BackendFailure,
+        cause: String,
+    ) -> Option<oneshot::Sender<()>> {
+        if self.backend_failed() {
+            return None;
+        }
+        self.backend_failure_cause = Some(cause);
+        self.report_backend_failure(event)
     }
 
     fn report_backend_failure_location(

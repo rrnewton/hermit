@@ -964,7 +964,11 @@ impl GlobalTime {
     /// This is effectively used to account for "time" consumed by the scheduler, and to
     /// ensure monotonic increase of global time while scheduling.
     pub fn add_scheduler_time(&mut self) -> anyhow::Result<LogicalTime> {
-        let delta = Duration::from_nanos((NANOS_PER_SCHED * self.multiplier) as u64);
+        let projected = NANOS_PER_SCHED * self.multiplier;
+        if !projected.is_finite() || projected < 0.0 || projected >= u64::MAX as f64 {
+            anyhow::bail!("scheduler virtual-time delta overflowed its unsigned nanosecond domain");
+        }
+        let delta = Duration::from_nanos(projected as u64);
         self.add_extra_time(delta)
     }
 
@@ -1150,6 +1154,27 @@ mod global_time_tests {
         assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::from_nanos(1));
         time.add_extra_time(Duration::from_nanos(1)).unwrap();
         assert_eq!(time.elapsed_nanos().unwrap(), LogicalTime::from_nanos(2));
+    }
+
+    #[test]
+    fn scheduler_delta_overflow_is_rejected_before_conversion() {
+        let config = Config {
+            epoch: chrono::Utc.timestamp_opt(0, 0).unwrap(),
+            clock_multiplier: Some(1e14),
+            ..Config::default()
+        };
+        let mut time = GlobalTime::new(&config);
+        let before = time.as_nanos();
+        let error = time
+            .add_scheduler_time()
+            .expect_err("an unrepresentable scheduler delta must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "scheduler virtual-time delta overflowed its unsigned nanosecond domain"
+        );
+        assert_eq!(time.as_nanos(), before, "rejection must not mutate time");
+        assert_eq!(time.extra_time, LogicalTime::ZERO);
     }
 
     #[test]

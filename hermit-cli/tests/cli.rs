@@ -2970,6 +2970,52 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
     assert!(stderr(&output).contains(":: Success: deterministic. Determinism verified."));
 }
 
+#[test]
+fn virtual_time_overflow_fails_cleanly_and_preserves_its_cause_with_logging_off() {
+    let _guard = hermit_run_guard();
+    for (mode, multiplier, expected_cause) in [
+        (
+            None,
+            "1e14",
+            "scheduler virtual-time delta overflowed its unsigned nanosecond domain",
+        ),
+        (
+            Some("--no-sequentialize-threads"),
+            "1e20",
+            "local virtual-time syscall projection overflowed its unsigned nanosecond domain",
+        ),
+    ] {
+        let mut args = vec!["--log=off", "run"];
+        if let Some(mode) = mode {
+            args.push(mode);
+        }
+        args.extend([
+            "--epoch=1970-01-01T00:00:00Z",
+            "--max-timeslice=disabled",
+            "--clock-multiplier",
+            multiplier,
+            "--",
+            "/bin/true",
+        ]);
+        let output = hermit(&args);
+        let diagnostics = stderr(&output);
+
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            "unrepresentable virtual time must be a bounded Hermit failure: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(expected_cause),
+            "terminal failure lost its originating cause with --log=off: {diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("panicked at") && !diagnostics.contains("unreachable code"),
+            "terminal cleanup panicked instead of completing: {diagnostics}"
+        );
+    }
+}
+
 /// The two sanitizer variables Hermit forces into *every* guest, on *every*
 /// backend.
 ///

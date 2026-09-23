@@ -372,9 +372,9 @@ async fn backend_failure_completes_registered_daemon_without_another_request() {
         }
         let error = state.clean_up(false, &None).await.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("Hermit terminal backend failure"),
+            error.to_string().contains(
+                "local virtual-time syscall projection overflowed its unsigned nanosecond domain"
+            ),
             "{error}"
         );
     }
