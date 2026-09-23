@@ -222,10 +222,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.regular_crates", 618),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
-    ("test.hermit_unit", 723),
+    // Seven captured-clock output/codec controls retain all 723 prior IDs.
+    ("test.hermit_unit", 730),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
-    ("test.detcore_unit", 749),
+    // The virtual-uptime flooring control retains all 748 prior identities.
+    // Three captured-clock routing controls retain all 749 prior identities.
+    ("test.detcore_unit", 752),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -254,10 +257,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 749),
+    ("test.detcore_unit_on_host", 752),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 160),
-    ("test.hermit_unit_on_host", 723),
+    ("test.hermit_unit_on_host", 730),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
