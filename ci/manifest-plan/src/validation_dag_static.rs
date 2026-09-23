@@ -298,7 +298,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_bridge_is_not_installed_by_a_process_that_is_pid_1) retain all 754
     // prior identities (`cargo nextest list --profile ci` measured 758;
     // https://github.com/rrnewton/hermit/issues/3354).
-    ("test.hermit_unit", 758),
+    // Seven captured-clock output/codec controls; 758 prior identities
+    // retained: 758 + 7 = 765 (`cargo nextest list --profile ci` measured 765).
+    ("test.hermit_unit", 765),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -320,7 +322,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands)
     // retain all 843 prior identities (`cargo nextest list --profile ci`
     // measured 845; https://github.com/rrnewton/hermit/issues/3360).
-    ("test.detcore_unit", 845),
+    // Three captured-clock routing controls; 845 prior identities retained:
+    // 845 + 3 = 848 (`cargo nextest list --profile ci` measured 848).
+    ("test.detcore_unit", 848),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -370,10 +374,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 845),
+    ("test.detcore_unit_on_host", 848),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
-    ("test.hermit_unit_on_host", 758),
+    ("test.hermit_unit_on_host", 765),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
