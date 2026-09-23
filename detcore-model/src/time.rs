@@ -984,7 +984,12 @@ impl GlobalTime {
 
     /// Project aggregate progress since this clock's own immutable origin.
     pub fn elapsed_nanos(&self) -> LogicalDuration {
-        self.total - self.starting_nanos
+        LogicalTime::from_nanos(
+            self.total
+                .as_nanos()
+                .checked_sub(self.starting_nanos.as_nanos())
+                .expect("global virtual time regressed before its immutable origin"),
+        )
     }
 }
 
@@ -1037,6 +1042,19 @@ mod global_time_tests {
         assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(1));
         time.add_extra_time(Duration::from_nanos(1));
         assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "global virtual time regressed before its immutable origin")]
+    fn elapsed_nanos_rejects_time_before_immutable_origin() {
+        let config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let mut time = GlobalTime::new(&config);
+        time.total = LogicalTime::ZERO;
+
+        let _ = time.elapsed_nanos();
     }
 
     #[test]

@@ -728,6 +728,16 @@ struct DecodedDbtEvidence {
     initialization_records: usize,
 }
 
+/// Prefix for controller-generated annotations in a materialized DBT log.
+///
+/// These lines are not records from Reverie's authenticated evidence stream.
+/// The canonical comparator ignores their WARN level, while the explicit label
+/// prevents a retained log's epoch-zero presentation timestamp from making the
+/// annotation look like authenticated guest evidence.
+#[cfg(feature = "dbt")]
+const DBT_UNAUTHENTICATED_CONTROLLER_PREFIX: &str =
+    "UNAUTHENTICATED CONTROLLER PROVENANCE (not guest evidence):";
+
 #[cfg(feature = "dbt")]
 fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DecodedDbtEvidence, Error> {
     file.seek(SeekFrom::Start(0))?;
@@ -776,7 +786,8 @@ fn materialize_dbt_comparison_log(
     if let Some(provenance) = epoch_provenance {
         writeln!(
             log,
-            "1970-01-01T00:00:00.000000Z WARN hermit::virtual_time: {provenance}"
+            "1970-01-01T00:00:00.000000Z WARN hermit::virtual_time: \
+             {DBT_UNAUTHENTICATED_CONTROLLER_PREFIX} {provenance}"
         )?;
     }
     log.flush()?;
@@ -796,9 +807,11 @@ fn materialize_dbt_comparison_log(
     let expected_materialized = records.len() + usize::from(epoch_provenance.is_some());
     if materialized != expected_materialized {
         return Err(Error::msg(format!(
-            "DBT canonical evidence log holds {materialized} records but {expected_materialized} \
-             were required from {} decoded records plus the controller provenance event; the \
-             comparison publishes the dbt_evidence_transport_v1 envelope and must not drop any",
+            "DBT canonical evidence log holds {materialized} newline-delimited entries but \
+             {expected_materialized} \
+             were required from {} decoded records plus the non-authenticated controller \
+             provenance annotation; the comparison publishes the dbt_evidence_transport_v1 \
+             envelope and must not drop any authenticated record",
             records.len(),
         )));
     }
@@ -2185,7 +2198,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_verify_log_keeps_one_controller_epoch_provenance_event() {
+    fn dbt_verify_log_labels_controller_epoch_provenance_as_unauthenticated() {
         let log = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = log.into_parts();
         let records = vec![b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG first\n".to_vec()];
@@ -2199,8 +2212,12 @@ mod tests {
             compared, 1,
             "controller WARN is not an INFO comparison record"
         );
+        assert!(materialized.as_bytes().starts_with(&records.concat()));
         assert_eq!(materialized.matches(provenance).count(), 1);
-        assert!(materialized.contains("WARN hermit::virtual_time:"));
+        assert!(materialized.contains(&format!(
+            "WARN hermit::virtual_time: {DBT_UNAUTHENTICATED_CONTROLLER_PREFIX} {provenance}"
+        )));
+        assert!(!materialized.contains(&format!("WARN hermit::virtual_time: {provenance}")));
     }
 
     #[test]

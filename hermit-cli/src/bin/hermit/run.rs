@@ -2929,10 +2929,19 @@ impl RunOpts {
         })
     }
 
-    /// Record the selected epoch in the controller log, never in guest stderr.
-    fn emit_virtual_epoch_provenance(&self) {
+    /// Record the selected epoch in the active controller diagnostic sink.
+    ///
+    /// The default controller-stderr form deliberately has no host timestamp:
+    /// it is stable invocation provenance, not guest output. When a log-file
+    /// sink is active, use its tracing subscriber so the event follows that
+    /// sink's normal framing and remains out of process stderr.
+    fn emit_virtual_epoch_provenance(&self, log_file_sink: bool) {
         if let Some(provenance) = self.virtual_epoch_provenance() {
-            tracing::warn!(target: "hermit::virtual_time", "{provenance}");
+            if log_file_sink {
+                tracing::warn!(target: "hermit::virtual_time", "{provenance}");
+            } else {
+                eprintln!("WARN hermit::virtual_time: {provenance}");
+            }
         }
     }
 
@@ -5051,7 +5060,9 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
-        self.emit_virtual_epoch_provenance();
+        self.emit_virtual_epoch_provenance(
+            global.log_file.is_some() || global.log_file_handle.is_some(),
+        );
 
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
@@ -5164,7 +5175,7 @@ impl RunOpts {
             BoundedWriter::new(log_file, limit),
             self.runtime_backend(),
         );
-        self.emit_virtual_epoch_provenance();
+        self.emit_virtual_epoch_provenance(true);
 
         let command = self.guest_command()?;
 
