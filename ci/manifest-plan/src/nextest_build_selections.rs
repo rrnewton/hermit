@@ -555,7 +555,7 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "158");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "164");
 
             let mut omitted_execution = step.clone();
             omitted_execution.cmd = omitted_execution.cmd.replace("--test child_time_rpc ", "");

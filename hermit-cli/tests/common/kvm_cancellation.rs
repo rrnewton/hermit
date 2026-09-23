@@ -436,7 +436,7 @@ fn assert_mechanism(log: &str, loops: usize, timestamp_rip: u64) {
         inbound + 1,
         &format!("[tid {worker}] ticked its global time component to "),
     );
-    let post_time = number(lines[inbound], "starting_micros: ") * 1000
+    let post_time = number(lines[inbound], "starting_nanos: ")
         + number(lines[tick], "global time component to ");
     assert!(post_time > pre_time && post_time >= deadline);
     let reached = line_after(&lines, tick + 1, &format!("[dtid {worker}] logical time "));

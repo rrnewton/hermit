@@ -70,6 +70,7 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+const COMPARISON_EPOCH_ARG: &str = "--epoch=2026-09-23T02:39:52.970859833+00:00";
 
 const DBT_IO_BUFFER_MUTATOR_SOURCE: &str = r#"
 #define _XOPEN_SOURCE 700
@@ -3480,6 +3481,7 @@ fn run_kvm_preserves_closed_standard_input() {
         "kvm",
         "--strict",
         "--base-env=minimal",
+        COMPARISON_EPOCH_ARG,
         "--",
         "/bin/cat",
     ];
@@ -3534,12 +3536,21 @@ fn run_kvm_preserves_closed_standard_input() {
     assert_eq!(stdout(&native), expected);
     assert_eq!(stderr(&native), "");
     for backend in ["ptrace", "kvm"] {
+        let diagnostic_log = tempfile::Builder::new()
+            .prefix("stdio-inode-epoch-provenance-")
+            .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create stdio-inode controller log");
+        let diagnostic_path = diagnostic_log.path().to_str().unwrap();
         let args = [
+            "--log=warn",
+            "--log-file",
+            diagnostic_path,
             "run",
             "--backend",
             backend,
             "--strict",
             "--base-env=minimal",
+            COMPARISON_EPOCH_ARG,
             "--",
         ];
         let output = hermit_command(&args)
@@ -3552,6 +3563,14 @@ fn run_kvm_preserves_closed_standard_input() {
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");
         assert_eq!(stderr(&output), "", "{backend} {mode}");
+        let diagnostics = std::fs::read_to_string(diagnostic_log.path())
+            .expect("failed to read stdio-inode controller log");
+        assert_eq!(
+            diagnostics.matches("hermit: virtual-time epoch=").count(),
+            1,
+            "{backend} {mode} controller provenance: {diagnostics}",
+        );
+        assert!(diagnostics.contains("source=explicit"), "{diagnostics}");
     }
 }
 
@@ -6481,7 +6500,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     let program = format!("/nonexistent-{}", "A".repeat(2000));
 
     // The truth to compare against, captured with an ordinary pipe.
-    let control = hermit_command(&["run", "--", &program])
+    let control = hermit_command(&["run", COMPARISON_EPOCH_ARG, "--", &program])
         .output()
         .expect("control run");
     let expected = control.stderr;
@@ -6529,7 +6548,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     }
 
     let stderr_for_child = unsafe { std::process::Stdio::from_raw_fd(libc::dup(write_fd)) };
-    let mut child = hermit_command(&["run", "--", &program])
+    let mut child = hermit_command(&["run", COMPARISON_EPOCH_ARG, "--", &program])
         .stdout(std::process::Stdio::null())
         .stderr(stderr_for_child)
         .spawn()
@@ -6974,7 +6993,7 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
     unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
 
     let started = Instant::now();
-    let mut child = hermit_command(&["run", "--", &program])
+    let mut child = hermit_command(&["run", COMPARISON_EPOCH_ARG, "--", &program])
         .stdout(Stdio::null())
         .stderr(unsafe { Stdio::from_raw_fd(write_fd) })
         .spawn()

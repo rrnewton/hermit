@@ -269,21 +269,35 @@ static uint64_t timespec_nanos(const struct timespec *time) {
 }
 
 static void run_clock_progress(void) {
-  struct timespec before;
-  struct timespec after;
-  if (clock_gettime(CLOCK_MONOTONIC, &before) != 0) {
-    fail("clock_gettime before");
+  struct timespec samples[8];
+  if (clock_gettime(CLOCK_MONOTONIC, &samples[0]) != 0) {
+    fail("clock_gettime sample 0");
   }
-  for (unsigned int index = 0; index < 4; ++index) {
-    (void)syscall(SYS_gettid);
+  for (unsigned int sample = 1; sample < 8; ++sample) {
+    for (unsigned int index = 0; index < sample; ++index) {
+      (void)syscall(SYS_gettid);
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &samples[sample]) != 0) {
+      fail("clock_gettime sample");
+    }
+    uint64_t before = timespec_nanos(&samples[sample - 1]);
+    uint64_t after = timespec_nanos(&samples[sample]);
+    if (after <= before) {
+      fprintf(stderr, "CLOCK_MONOTONIC did not advance at sample %u\n", sample);
+      exit(1);
+    }
+    // Backend startup and scheduler work have no portable maximum delta. Exact
+    // nanosecond resolution is covered in the clock-model tests; this guest
+    // guards the runtime trajectory against freezes and rewinds.
   }
-  if (clock_gettime(CLOCK_MONOTONIC, &after) != 0) {
-    fail("clock_gettime after");
+
+  uint64_t origin = timespec_nanos(&samples[0]);
+  fputs("clock-progress-deltas", stdout);
+  for (unsigned int sample = 0; sample < 8; ++sample) {
+    printf(" %llu",
+           (unsigned long long)(timespec_nanos(&samples[sample]) - origin));
   }
-  if (timespec_nanos(&after) <= timespec_nanos(&before)) {
-    fprintf(stderr, "CLOCK_MONOTONIC did not advance\n");
-    exit(1);
-  }
+  putchar('\n');
 }
 
 static uint64_t parse_seed(const char *value) {
@@ -300,7 +314,6 @@ static uint64_t parse_seed(const char *value) {
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "clock-progress") == 0) {
     run_clock_progress();
-    puts("clock-progress-ok");
     return 0;
   }
   if (argc == 2 && strcmp(argv[1], "threads") == 0) {

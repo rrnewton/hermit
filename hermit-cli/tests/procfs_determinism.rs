@@ -28,6 +28,7 @@ use reverie::process::Namespace;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const RUNS: usize = 5;
+const COMPARISON_EPOCH: &str = "2026-09-23T02:39:52.970859833+00:00";
 
 fn compile_c(source: &Path, output: &Path) {
     let rendered = format!("cc -O0 -g {} -o {}", source.display(), output.display());
@@ -84,7 +85,7 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
 }
 
 fn read_procfs(path: &str) -> Vec<u8> {
-    read_procfs_at_epoch(path, None)
+    read_procfs_at_epoch(path, Some(COMPARISON_EPOCH))
 }
 
 fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
@@ -326,7 +327,10 @@ fn proc_system_cpu_accounting_is_deterministic() {
                 }
             );
         }
-        assert!(text.contains("btime 1767225480\n"));
+        // The configured explicit epoch is 1790131192.970859833 seconds
+        // since Unix time. Linux's whole-second btime is the exact epoch minus
+        // the 120-second synthetic uptime, floored only after subtraction.
+        assert!(text.contains("btime 1790131072\n"));
     });
 }
 
@@ -428,6 +432,22 @@ fn proc_uptime_uses_virtual_time() {
     assert_deterministic("/proc/uptime", |contents| {
         assert_eq!(contents, b"120.00 0.00\n");
     });
+
+    // Snapshot construction computes every shared procfs context field even
+    // when the selected file does not render btime. A valid early epoch must
+    // therefore neither fail this unrelated read nor lose signed boot time.
+    let epoch_zero = "1970-01-01T00:00:00Z";
+    assert_eq!(
+        read_procfs_at_epoch("/proc/uptime", Some(epoch_zero)),
+        b"120.00 0.00\n",
+    );
+    let stat = read_procfs_at_epoch("/proc/stat", Some(epoch_zero));
+    assert!(
+        stat.windows(b"btime -120\n".len())
+            .any(|window| window == b"btime -120\n"),
+        "epoch-zero proc stat omitted signed btime: {}",
+        String::from_utf8_lossy(&stat),
+    );
 }
 
 #[test]
