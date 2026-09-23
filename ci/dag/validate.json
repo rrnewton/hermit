@@ -8151,13 +8151,13 @@
       "group": "test",
       "job": "recorded_clocks",
       "desc": "Ptrace captured clocks and recording-version refusals",
-      "description": "Four exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, and current/pre-flock version admission. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The 1-GiB scheduling baseline and 2-GiB hard memory cap are provisional conservative bounds for these four ptrace cases, not a measured peak; the node has a 300-second wall and 120-second aggregate CPU bound. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions.",
+      "description": "Six exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, current/pre-flock version admission, exec continuity, and thread clock ordering. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The aggregate 180-second CPU bound covers six 22-second attempts plus 48 seconds of provisional cleanup and orchestration headroom; failed historical attempts reached 24.011 CPU seconds during teardown. The 420-second wall bound covers six 57-second attempts, six 2-second grace periods, six 5-second hard-reap allowances, and 36 seconds of provisional orchestration headroom. These aggregate bounds and the unchanged 1-GiB scheduling baseline/2-GiB hard memory cap remain provisional, not measured six-case peaks. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions.",
       "labels": [
         "full",
         "portable",
         "recorder-clock-focused"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E '\\''test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate)'\\'''",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E '\\''test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate) | test(=record_c_clock_exec_continuity) | test(=record_rs_clock_total_order)'\\'''",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -8181,13 +8181,13 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "4",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--test\",\"record_replay\",\"--test\",\"flock_exclusion\"]"
       },
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
-      "cpu_timeout": 120,
+      "timeout": 420,
+      "cpu_timeout": 180,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -62581,11 +62581,11 @@
       "group": "test",
       "job": "recorded_clocks_on_host",
       "desc": "Ptrace captured clocks and recording-version refusals",
-      "description": "Four exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, and current/pre-flock version admission. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The 1-GiB scheduling baseline and 2-GiB hard memory cap are provisional conservative bounds for these four ptrace cases, not a measured peak; the node has a 300-second wall and 120-second aggregate CPU bound. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions.",
+      "description": "Six exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, current/pre-flock version admission, exec continuity, and thread clock ordering. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The aggregate 180-second CPU bound covers six 22-second attempts plus 48 seconds of provisional cleanup and orchestration headroom; failed historical attempts reached 24.011 CPU seconds during teardown. The 420-second wall bound covers six 57-second attempts, six 2-second grace periods, six 5-second hard-reap allowances, and 36 seconds of provisional orchestration headroom. These aggregate bounds and the unchanged 1-GiB scheduling baseline/2-GiB hard memory cap remain provisional, not measured six-case peaks. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions.",
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E 'test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate)'",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E 'test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate) | test(=record_c_clock_exec_continuity) | test(=record_rs_clock_total_order)'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -62607,13 +62607,13 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "4",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--test\",\"record_replay\",\"--test\",\"flock_exclusion\"]"
       },
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
-      "cpu_timeout": 120,
+      "timeout": 420,
+      "cpu_timeout": 180,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
