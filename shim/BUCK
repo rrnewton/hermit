@@ -17,6 +17,45 @@ load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 
 oncall("open_source")
 
+# Cargo's release profile applies these settings to the target dependency
+# closure while leaving host build scripts/proc macros in their execution
+# configuration. The dedicated configured platform below gives Buck the same
+# split without changing the default Hermit target or its dependency graph.
+HERMIT_RELEASE_RUSTC_FLAGS = [
+    "-Ccodegen-units=16",
+    "-Cdebuginfo=0",
+    "-Cdebug-assertions=no",
+    "-Cembed-bitcode=no",
+    "-Clto=off",
+    "-Copt-level=3",
+    "-Coverflow-checks=no",
+    "-Cpanic=unwind",
+    "-Cstrip=none",
+]
+
+constraint_setting(
+    name = "hermit_rust_profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "hermit_rust_release",
+    constraint_setting = ":hermit_rust_profile",
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "hermit_rust_release_enabled",
+    constraint_values = [":hermit_rust_release"],
+)
+
+platform(
+    name = "hermit_rust_release_platform",
+    constraint_values = [":hermit_rust_release"],
+    deps = ["prelude//platforms:default"],
+    visibility = ["PUBLIC"],
+)
+
 system_cxx_toolchain(
     name = "cxx",
     compiler = "gcc",
@@ -77,6 +116,10 @@ system_python_bootstrap_toolchain(
 system_rust_toolchain(
     name = "rust",
     default_edition = "2024",
+    rustc_flags = select({
+        ":hermit_rust_release_enabled": HERMIT_RELEASE_RUSTC_FLAGS,
+        "DEFAULT": [],
+    }),
     visibility = ["PUBLIC"],
 )
 

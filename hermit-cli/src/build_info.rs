@@ -16,6 +16,104 @@
 pub use detcore_model::build_info::BuildFeatures;
 pub use detcore_model::build_info::BuildInfo;
 
+#[cfg(feature = "buck-release-provenance")]
+const fn is_ascii_hex(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
+}
+
+#[cfg(feature = "buck-release-provenance")]
+const fn valid_release_sha(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let valid_length = bytes.len() == 12
+        || (bytes.len() == 18
+            && bytes[12] == b'-'
+            && bytes[13] == b'd'
+            && bytes[14] == b'i'
+            && bytes[15] == b'r'
+            && bytes[16] == b't'
+            && bytes[17] == b'y');
+    if !valid_length {
+        return false;
+    }
+    let mut index = 0;
+    while index < 12 {
+        if !is_ascii_hex(bytes[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+#[cfg(feature = "buck-release-provenance")]
+const fn valid_release_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if index != 4 && index != 7 && !bytes[index].is_ascii_digit() {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+#[cfg(feature = "buck-release-provenance")]
+const fn valid_release_version(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || (bytes.len() == 7
+            && bytes[0] == b'u'
+            && bytes[1] == b'n'
+            && bytes[2] == b'k'
+            && bytes[3] == b'n'
+            && bytes[4] == b'o'
+            && bytes[5] == b'w'
+            && bytes[6] == b'n')
+    {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if !(byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'+') {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+#[cfg(feature = "buck-release-provenance")]
+const fn valid_reverie_pin(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 40 {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_ascii_hex(bytes[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+// A release target is unsafe when invoked without the provenance wrapper. Keep
+// this assertion in the Rust compilation itself so a direct Buck invocation
+// cannot silently emit an empty/unknown release identity.
+#[cfg(feature = "buck-release-provenance")]
+const _: () = {
+    assert!(valid_release_version(env!("CARGO_PKG_VERSION")));
+    assert!(valid_release_date(env!("HERMIT_BUILD_DATE")));
+    assert!(valid_release_sha(env!("HERMIT_BUILD_GIT_SHA")));
+    assert!(valid_reverie_pin(env!("HERMIT_REVERIE_PIN")));
+};
+
 /// Construct the record from values embedded in this binary.
 ///
 /// `hermit --version` remains presentation text and must not be parsed for

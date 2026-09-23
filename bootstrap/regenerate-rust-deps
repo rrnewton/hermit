@@ -54,6 +54,15 @@ cmp --silent "$first_output" "$third_party_dir/BUCK" || {
   exit 1
 }
 
+# Prelude normally assembles a Cargo manifest directory from symlinks. The
+# pinned reverie-dbt build installs native headers and preserves those links,
+# which would leave dangling paths after installation. Patch both independently
+# generated graphs with the same declared copied-directory target, then keep
+# comparing them through every deterministic postprocessing step below.
+materialize_reverie_dbt=$repo_root/scripts/patch-reverie-dbt-buck.rs
+"$materialize_reverie_dbt" "$first_output"
+"$materialize_reverie_dbt" "$third_party_dir/BUCK"
+
 git diff --exit-code -- Cargo.lock
 
 # One third-party cell serves both Hermit and Reverie: .buckconfig maps the
@@ -64,8 +73,8 @@ git diff --exit-code -- Cargo.lock
 # needs are appended here. Each is resolved against the BUCK just generated, so
 # a version bump cannot silently strand one.
 append_shared_cell_aliases() {
+  local buck=$1
   local list=$third_party_dir/shared-cell-aliases.txt
-  local buck=$third_party_dir/BUCK
   [[ -f $list ]] || { echo "missing $list" >&2; exit 1; }
   {
     echo
@@ -103,7 +112,13 @@ third_party_rust_alias(
 EOT
   done <"$list"
 }
-append_shared_cell_aliases
+append_shared_cell_aliases "$first_output"
+append_shared_cell_aliases "$third_party_dir/BUCK"
+
+cmp --silent "$first_output" "$third_party_dir/BUCK" || {
+  echo "complete Buck generation was not byte-identical across consecutive invocations" >&2
+  exit 1
+}
 
 sha256sum \
   Cargo.lock \

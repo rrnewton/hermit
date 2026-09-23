@@ -27,6 +27,7 @@ use std::path::PathBuf;
 const WORKFLOW_DIR: &str = ".github/workflows";
 const PORTABLE: &str = "ci-portable.yml";
 const VALIDATION_LEVELS: &str = "validation-levels.yml";
+const BUCK2_OSS_NIGHTLY: &str = "buck2-oss-nightly.yml";
 const RUST_SCRIPT_VERSION: &str = "0.36.0";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -385,6 +386,502 @@ fn validate_validation_levels_bootstrap(source: &str) -> Vec<String> {
     errors
 }
 
+fn buck2_nightly_required_markers() -> Vec<(&'static str, &'static str)> {
+    let path_export = r#"echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH""#;
+    let install = r#"cargo install rust-script --version 0.36.0 --locked --root "$CARGO_HOME""#;
+    let path_binding = r#"test "$(realpath "$resolved_rust_script")" = "$(realpath "$CARGO_HOME/bin/rust-script")""#;
+    let version_binding = r#"test "$("$resolved_rust_script" --version)" = "rust-script 0.36.0""#;
+    vec![
+        (
+            "180-minute supplemental release-evidence job",
+            "  buck-release-evidence:\n    name: Supplemental feature-complete Buck release evidence\n    runs-on: ubuntu-24.04\n    timeout-minutes: 180",
+        ),
+        (
+            "restored 120-minute legacy OSS Buck job",
+            "  oss-buck2:\n    name: Regenerate and build the OSS Buck2 graph\n    runs-on: ubuntu-24.04\n    timeout-minutes: 120",
+        ),
+        (
+            "read-only workflow permissions",
+            "permissions:\n  contents: read",
+        ),
+        ("checkout credential refusal", "persist-credentials: false"),
+        ("isolated rust-script PATH export", path_export),
+        ("isolated rust-script install root", install),
+        (
+            "isolated rust-script executable check",
+            r#"test -x "$CARGO_HOME/bin/rust-script""#,
+        ),
+        (
+            "resolved rust-script path lookup",
+            r#"resolved_rust_script="$(command -v rust-script)""#,
+        ),
+        ("resolved rust-script path binding", path_binding),
+        ("pinned rust-script version binding", version_binding),
+        (
+            "Buck release driver refusal tests",
+            "rust-script --test scripts/build-buck-release.rs",
+        ),
+        (
+            "release capture step",
+            "      - name: Capture the feature-complete Hermit release build\n        id: release-build",
+        ),
+        (
+            "inner process-tree build deadline",
+            "          timeout --foreground --kill-after=30s 40m \\\n            \"$PUBLIC_DOTSLASH\" ./bootstrap/buck2 build --show-output --no-remote-cache \\",
+        ),
+        (
+            "capture EXIT receipt trap",
+            "          trap retain_shell_exit EXIT",
+        ),
+        (
+            "recognized release event-log filename",
+            "          event_log=\"$evidence/hermit-release.json-lines.gz\"",
+        ),
+        (
+            "Cargo package version derivation",
+            "          version=\"$(sed -n '/^\\[package\\]/,/^\\[/s/^version = \"\\([^\"]*\\)\"/\\1/p' hermit-cli/Cargo.toml | head -n 1)\"",
+        ),
+        (
+            "UTC build-date derivation",
+            "          build_date=\"$(date -u +%F)\"",
+        ),
+        (
+            "12-character Hermit SHA derivation",
+            "          hermit_sha=\"$(git rev-parse --short=12 HEAD)\"",
+        ),
+        (
+            "40-character Reverie gitlink derivation",
+            "          reverie_sha=\"$(git rev-parse HEAD:reverie)\"",
+        ),
+        (
+            "Hermit SHA length assertion",
+            "          test \"${#hermit_sha}\" -eq 12",
+        ),
+        (
+            "Reverie SHA length assertion",
+            "          test \"${#reverie_sha}\" -eq 40",
+        ),
+        (
+            "explicit public DotSlash release build",
+            "            \"$PUBLIC_DOTSLASH\" ./bootstrap/buck2 build --show-output --no-remote-cache \\",
+        ),
+        (
+            "recognized release event-log argument",
+            "            --event-log \"$event_log\" \\",
+        ),
+        (
+            "release version metadata argument",
+            "            -c \"hermit_release.version=$version\" \\",
+        ),
+        (
+            "release date metadata argument",
+            "            -c \"hermit_release.build_date=$build_date\" \\",
+        ),
+        (
+            "release Hermit SHA metadata argument",
+            "            -c \"hermit_release.hermit_sha=$hermit_sha\" \\",
+        ),
+        (
+            "release Reverie SHA metadata argument",
+            "            -c \"hermit_release.reverie_sha=$reverie_sha\" \\",
+        ),
+        (
+            "feature-complete release target argument",
+            "            //hermit-cli:hermit-release \\",
+        ),
+        (
+            "captured shell exit",
+            "printf 'shell_exit\\t%s\\n' \"$capture_rc\" >\"$evidence/shell-exit.tsv\"",
+        ),
+        ("capture status propagation", "          exit \"$shell_rc\""),
+        (
+            "always-run reconciliation step",
+            "      - name: Reconcile and scan release evidence\n        id: release-evidence\n        if: always()",
+        ),
+        (
+            "explicit public DotSlash event summary",
+            "          \"$PUBLIC_DOTSLASH\" ./bootstrap/buck2 log summary \\",
+        ),
+        (
+            "typed release evidence reconciler",
+            "          ./scripts/build-buck-release.rs --reconcile-release-evidence \\",
+        ),
+        (
+            "reconciler show-output binding",
+            "            --show-output \"$evidence/build.stdout\" \\",
+        ),
+        (
+            "reconciler shell-exit binding",
+            "            --shell-exit \"$shell_rc\" \\",
+        ),
+        (
+            "combined captured-byte evidence packager",
+            "          ./scripts/build-buck-release.rs --scan-and-package-public-evidence \\",
+        ),
+        (
+            "combined scanner receipt output",
+            "            --receipt-output \"$scan_receipt\" \\",
+        ),
+        (
+            "scanner failure refusal",
+            "          ./scripts/build-buck-release.rs --release-evidence-verdict \\",
+        ),
+        (
+            "zero-marker assertion",
+            "          test \"$marker_count\" = 0",
+        ),
+        (
+            "reconciliation failure refusal",
+            "            --reconciliation-exit \"$reconciliation_rc\"",
+        ),
+        (
+            "external immutable archive binding",
+            "            --archive \"$archive\"",
+        ),
+        (
+            "archive canonical-path equality",
+            "          test \"$artifact_path\" = \"$archive\"",
+        ),
+        (
+            "canonical immutable archive path",
+            "          artifact_path=\"$(realpath -e \"$archive\")\"",
+        ),
+        (
+            "canonical artifact output",
+            "          echo \"artifact-path=$artifact_path\" >>\"$GITHUB_OUTPUT\"",
+        ),
+        (
+            "conditional safe upload output",
+            "          echo \"safe-to-upload=true\" >>\"$GITHUB_OUTPUT\"",
+        ),
+        (
+            "safe public upload condition",
+            "if: always() && steps.release-evidence.outputs.safe-to-upload == 'true'",
+        ),
+        (
+            "release evidence artifact path",
+            "path: ${{ steps.release-evidence.outputs.artifact-path }}",
+        ),
+        (
+            "upload missing-file refusal",
+            "          if-no-files-found: error",
+        ),
+        (
+            "diagnostic after evidence upload",
+            "      - name: Run the full third-party diagnostic",
+        ),
+        (
+            "diagnostic non-upload disclosure",
+            "      - name: Scan and package the full third-party diagnostic",
+        ),
+        (
+            "guarded legacy diagnostic upload",
+            "if: always() && steps.third-party-evidence.outputs.safe-to-upload == 'true'",
+        ),
+        (
+            "preserved legacy diagnostic artifact name",
+            "name: buck2-third-party-diagnostic-${{ github.run_id }}",
+        ),
+        (
+            "immutable legacy diagnostic staging path",
+            "path: ${{ steps.third-party-evidence.outputs.artifact-path }}",
+        ),
+        (
+            "combined captured-byte legacy staging",
+            "          ./scripts/build-buck-release.rs --scan-and-stage-public-evidence \\",
+        ),
+        ("legacy Hermit target", "//hermit-cli:hermit'"),
+    ]
+}
+
+// These non-cryptographic hashes are drift tripwires for reviewed workflow
+// blocks. Semantic validators and mutation tests remain the security boundary.
+const RELEASE_CAPTURE_BLOCK_FNV1A64: u64 = 0xd47269f7822be906;
+const RELEASE_FINALIZE_BLOCK_FNV1A64: u64 = 0x2391b53a25c3213a;
+const RELEASE_UPLOAD_BLOCK_FNV1A64: u64 = 0x729e01b3370e7f6f;
+const LEGACY_REVERIE_BLOCK_FNV1A64: u64 = 0x560c7d2fcc02b62f;
+const LEGACY_DIAGNOSTIC_CAPTURE_BLOCK_FNV1A64: u64 = 0x0ce72a075541cfdf;
+const LEGACY_DIAGNOSTIC_FINALIZE_BLOCK_FNV1A64: u64 = 0x6c037b9cd4dabcaf;
+const LEGACY_DIAGNOSTIC_UPLOAD_BLOCK_FNV1A64: u64 = 0x48723ec958bff433;
+const LEGACY_FINAL_TARGET_BLOCK_FNV1A64: u64 = 0x2a320ec4e59c3edc;
+
+fn named_step_block<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("      - name: {name}\n");
+    let start = source.find(&marker)?;
+    let rest = &source[start + marker.len()..];
+    let end = rest
+        .find("\n      - name: ")
+        .map(|offset| start + marker.len() + offset + 1)
+        .or_else(|| {
+            rest.find("\n  oss-buck2:")
+                .map(|offset| start + marker.len() + offset + 1)
+        })
+        .unwrap_or(source.len());
+    source.get(start..end)
+}
+
+fn fnv1a64(text: &str) -> u64 {
+    text.replace("\r\n", "\n")
+        .trim_end()
+        .bytes()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn validate_bound_release_blocks(source: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (name, expected) in [
+        (
+            "Capture the feature-complete Hermit release build",
+            RELEASE_CAPTURE_BLOCK_FNV1A64,
+        ),
+        (
+            "Reconcile and scan release evidence",
+            RELEASE_FINALIZE_BLOCK_FNV1A64,
+        ),
+        (
+            "Upload feature-complete release evidence",
+            RELEASE_UPLOAD_BLOCK_FNV1A64,
+        ),
+        (
+            "Build the four Reverie targets",
+            LEGACY_REVERIE_BLOCK_FNV1A64,
+        ),
+        (
+            "Run the full third-party diagnostic",
+            LEGACY_DIAGNOSTIC_CAPTURE_BLOCK_FNV1A64,
+        ),
+        (
+            "Scan and package the full third-party diagnostic",
+            LEGACY_DIAGNOSTIC_FINALIZE_BLOCK_FNV1A64,
+        ),
+        (
+            "Upload the full third-party diagnostic log",
+            LEGACY_DIAGNOSTIC_UPLOAD_BLOCK_FNV1A64,
+        ),
+        (
+            "Build the Hermit green gate",
+            LEGACY_FINAL_TARGET_BLOCK_FNV1A64,
+        ),
+    ] {
+        match named_step_block(source, name) {
+            Some(block) if fnv1a64(block) == expected => {}
+            Some(block) => errors.push(format!(
+                "buck2-oss-nightly.yml bound step {name:?} changed: expected fnv1a64={expected:016x}, got {:016x}",
+                fnv1a64(block)
+            )),
+            None => errors.push(format!(
+                "buck2-oss-nightly.yml lacks bound step {name:?}"
+            )),
+        }
+    }
+    errors
+}
+
+fn validate_buck2_nightly_contract(source: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    errors.extend(validate_bound_release_blocks(source));
+    for (description, marker) in buck2_nightly_required_markers() {
+        let expected = match description {
+            "checkout credential refusal"
+            | "isolated rust-script PATH export"
+            | "isolated rust-script install root"
+            | "isolated rust-script executable check"
+            | "resolved rust-script path lookup"
+            | "resolved rust-script path binding"
+            | "pinned rust-script version binding"
+            | "reconciler show-output binding"
+            | "canonical artifact output"
+            | "conditional safe upload output"
+            | "upload missing-file refusal" => 2,
+            _ => 1,
+        };
+        if source.matches(marker).count() != expected {
+            errors.push(format!(
+                "buck2-oss-nightly.yml must contain exactly {expected} occurrence(s) of {description}"
+            ));
+        }
+    }
+
+    let path_export = r#"echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH""#;
+    let install = r#"cargo install rust-script --version 0.36.0 --locked --root "$CARGO_HOME""#;
+    let path_binding = r#"test "$(realpath "$resolved_rust_script")" = "$(realpath "$CARGO_HOME/bin/rust-script")""#;
+    let version_binding = r#"test "$("$resolved_rust_script" --version)" = "rust-script 0.36.0""#;
+    let path_offset = source.find(path_export);
+    let install_offset = source.find(install);
+    let binding_offset = source.find(path_binding);
+    let version_offset = source.find(version_binding);
+    let regeneration_offset = source.find("./bootstrap/regenerate-rust-deps");
+    let capture_offset =
+        source.find("      - name: Capture the feature-complete Hermit release build");
+    let reconcile_offset = source.find("      - name: Reconcile and scan release evidence");
+    let scan_offset =
+        source.find("./scripts/build-buck-release.rs --scan-and-package-public-evidence");
+    let zero_marker_offset = source.find("test \"$marker_count\" = 0");
+    let artifact_output_offset =
+        source.find("echo \"artifact-path=$artifact_path\" >>\"$GITHUB_OUTPUT\"");
+    let safe_output_offset = source.find("echo \"safe-to-upload=true\" >>\"$GITHUB_OUTPUT\"");
+    let verdict_offset = source.find("./scripts/build-buck-release.rs --release-evidence-verdict");
+    let upload_offset = source.find("      - name: Upload feature-complete release evidence");
+    let diagnostic_offset = source.find("      - name: Run the full third-party diagnostic");
+    let legacy_offset = source.find("      - name: Build the Hermit green gate");
+    if !matches!(
+        (
+            path_offset,
+            install_offset,
+            binding_offset,
+            version_offset,
+            regeneration_offset,
+            capture_offset,
+            reconcile_offset,
+            scan_offset,
+            zero_marker_offset,
+            artifact_output_offset,
+            safe_output_offset,
+            verdict_offset,
+            upload_offset,
+            diagnostic_offset,
+            legacy_offset,
+        ),
+        (
+            Some(path),
+            Some(install),
+            Some(binding),
+            Some(version),
+            Some(regeneration),
+            Some(capture),
+            Some(reconcile),
+            Some(scan),
+            Some(zero_marker),
+            Some(artifact_output),
+            Some(safe_output),
+            Some(verdict),
+            Some(upload),
+            Some(diagnostic),
+            Some(legacy),
+        )
+            if path < install
+                && install < binding
+                && binding < version
+                && version < regeneration
+                && regeneration < capture
+                && capture < reconcile
+                && reconcile < scan
+                && scan < zero_marker
+                && zero_marker < artifact_output
+                && artifact_output < safe_output
+                && safe_output < verdict
+                && verdict < upload
+                && upload < diagnostic
+                && diagnostic < legacy
+    ) {
+        errors.push(
+            "buck2-oss-nightly.yml load-bearing tool/build/reconcile/scan/upload/diagnostic ordering drifted"
+                .to_string(),
+        );
+    }
+    let global = source
+        .split_once("\njobs:")
+        .map(|(global, _)| global)
+        .unwrap_or_default();
+    let carriers = [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "ACTIONS_RUNTIME_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ];
+    for carrier in carriers {
+        if global.contains(&format!("  {carrier}:")) {
+            errors.push(format!(
+                "buck2-oss-nightly.yml must not globally blank token carrier {carrier}; upload actions need their runtime credentials"
+            ));
+        }
+    }
+    let mut starts = source
+        .match_indices("      - name: ")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    starts.push(source.len());
+    for pair in starts.windows(2) {
+        let block = &source[pair[0]..pair[1]];
+        let name = block.lines().next().unwrap_or("unnamed step");
+        if block.contains("        shell: bash\n") {
+            for carrier in carriers {
+                let marker = format!("          {carrier}: \"\"");
+                if block.matches(&marker).count() != 1 {
+                    errors.push(format!(
+                        "buck2-oss-nightly.yml shell step {name:?} must explicitly clear {carrier} exactly once"
+                    ));
+                }
+            }
+        }
+        if block.contains("uses: actions/upload-artifact@")
+            && ["ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+                .into_iter()
+                .any(|carrier| block.contains(&format!("{carrier}: \"\"")))
+        {
+            errors.push(format!(
+                "buck2-oss-nightly.yml upload step {name:?} must inherit Actions runtime/id tokens"
+            ));
+        }
+    }
+    if upload_offset.is_some()
+        && reconcile_offset.is_some()
+        && source[..upload_offset.unwrap()]
+            .rfind("\n      - name:")
+            .is_some_and(|offset| offset + 1 != reconcile_offset.unwrap())
+    {
+        errors.push(
+            "buck2-oss-nightly.yml must upload the immutable archive immediately after reconciliation"
+                .to_owned(),
+        );
+    }
+    let diagnostic_finalize =
+        source.find("      - name: Scan and package the full third-party diagnostic");
+    let diagnostic_upload = source.find("      - name: Upload the full third-party diagnostic log");
+    if diagnostic_upload.is_none()
+        || diagnostic_finalize.is_none()
+        || source[..diagnostic_upload.unwrap()]
+            .rfind("\n      - name:")
+            .is_none_or(|offset| offset + 1 != diagnostic_finalize.unwrap())
+    {
+        errors.push(
+            "buck2-oss-nightly.yml must immediately upload the guarded legacy diagnostic staging directory"
+                .to_owned(),
+        );
+    }
+    for forbidden in [
+        "command_success == true",
+        "release_output_count",
+        "reconciliation=pass",
+        "marker_count=0",
+        "scan_rc=0",
+        "shell_rc=0",
+        "summary_rc=0",
+        "reconciliation_rc=0",
+        "|| true",
+        "path: ${{ runner.temp }}/buck2-phase1-release",
+        "continue-on-error:",
+        "    needs:",
+        "${{ github.token }}",
+        " --scan-public-evidence ",
+        " --package-public-evidence ",
+        " --stage-public-evidence ",
+        " --verify-staged-public-evidence ",
+    ] {
+        if source.contains(forbidden) {
+            errors.push(format!(
+                "buck2-oss-nightly.yml contains forbidden evidence shortcut {forbidden:?}"
+            ));
+        }
+    }
+    errors
+}
+
 fn workflow_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries =
         fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
@@ -437,6 +934,13 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
         if name == VALIDATION_LEVELS {
             errors.extend(
                 validate_validation_levels_bootstrap(&source)
+                    .into_iter()
+                    .map(|error| format!("{}: {error}", path.display())),
+            );
+        }
+        if name == BUCK2_OSS_NIGHTLY {
+            errors.extend(
+                validate_buck2_nightly_contract(&source)
                     .into_iter()
                     .map(|error| format!("{}: {error}", path.display())),
             );
@@ -643,6 +1147,185 @@ mod tests {
                 !validate_validation_levels_bootstrap(&broken).is_empty(),
                 "broken bootstrap unexpectedly passed"
             );
+        }
+    }
+
+    #[test]
+    fn buck2_nightly_binds_tools_release_event_and_public_artifact_evidence() {
+        let source = include_str!("../.github/workflows/buck2-oss-nightly.yml");
+        assert!(
+            validate_buck2_nightly_contract(source).is_empty(),
+            "checked-in Buck2 nightly lost its fail-closed release contract"
+        );
+    }
+
+    #[test]
+    fn buck2_nightly_contract_refuses_path_and_evidence_gate_regressions() {
+        let source = include_str!("../.github/workflows/buck2-oss-nightly.yml");
+        for (description, marker) in buck2_nightly_required_markers() {
+            let broken = source.replacen(marker, "removed-load-bearing-contract", 1);
+            assert!(
+                !validate_buck2_nightly_contract(&broken).is_empty(),
+                "removing {description} unexpectedly passed"
+            );
+        }
+        let path_export = r#"echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH""#;
+        let install = r#"cargo install rust-script --version 0.36.0 --locked --root "$CARGO_HOME""#;
+        let late_path = source.replacen(path_export, "", 1).replacen(
+            install,
+            &format!("{install}\n          {path_export}"),
+            1,
+        );
+        let late_upload = source
+            .replacen(
+                "      - name: Upload feature-complete release evidence",
+                "      - name: Misplaced release evidence upload",
+                1,
+            )
+            .replacen(
+                "      - name: Build the Hermit green gate",
+                "      - name: Upload feature-complete release evidence\n        run: true\n      - name: Build the Hermit green gate",
+                1,
+            );
+        for broken in [
+            source.replacen(
+                path_export,
+                r#"echo "$HOME/.cargo/bin" >>"$GITHUB_PATH""#,
+                1,
+            ),
+            late_path,
+            late_upload,
+            source.replacen(
+                "          GH_TOKEN: \"\"",
+                "          GH_TOKEN: inherited",
+                1,
+            ),
+            source.replacen(
+                "          test \"$marker_count\" = 0",
+                "          marker_count=0\n          test \"$marker_count\" = 0",
+                1,
+            ),
+            source.replacen(
+                "          [[ $shell_rc =~ ^[0-9]+$ ]]",
+                "          shell_rc=0\n          [[ $shell_rc =~ ^[0-9]+$ ]]",
+                1,
+            ),
+            source.replacen(
+                "          summary_rc=$?",
+                "          summary_rc=$?\n          summary_rc=0",
+                1,
+            ),
+            source.replacen(
+                "          reconciliation_rc=$?",
+                "          reconciliation_rc=$?\n          reconciliation_rc=0",
+                1,
+            ),
+            source.replacen(
+                "          summary_rc=$?",
+                "          summary_rc=$?\n          summary_rc=$((summary_rc * 0))",
+                1,
+            ),
+            source.replacen(
+                "          ./scripts/build-buck-release.rs --release-evidence-verdict \\",
+                "          if false; then\n            ./scripts/build-buck-release.rs --release-evidence-verdict \\",
+                1,
+            ),
+            source.replacen(
+                "          exit \"$shell_rc\"",
+                "          : \"$shell_rc\"",
+                1,
+            ),
+            source.replacen("          set +e\n", "", 1),
+            source.replacen(
+                "          candidate_rc=$?\n          set -e",
+                "          set -e\n          candidate_rc=$?",
+                1,
+            ),
+            source.replacen(
+                "          ./scripts/build-buck-release.rs --scan-and-package-public-evidence \\",
+                "          ./scripts/build-buck-release.rs --scan-and-package-public-evidence \\ || true",
+                1,
+            ),
+            source.replacen(
+                "        if: always() && steps.release-evidence.outputs.safe-to-upload == 'true'",
+                "        if: always()",
+                1,
+            ),
+            source.replacen(
+                "          echo \"safe-to-upload=true\" >>\"$GITHUB_OUTPUT\"",
+                "          echo \"safe-to-upload=true\" >>\"$GITHUB_OUTPUT\"\n          echo \"safe-to-upload=true\" >>\"$GITHUB_OUTPUT\"",
+                1,
+            ),
+            source.replacen(
+                "path: ${{ steps.release-evidence.outputs.artifact-path }}",
+                "path: ${{ runner.temp }}/buck2-phase1-release",
+                1,
+            ),
+            source.replacen(
+                "      - name: Upload feature-complete release evidence",
+                "      - name: Interposed mutable diagnostic\n        run: true\n\n      - name: Upload feature-complete release evidence",
+                1,
+            ),
+        ] {
+            assert!(
+                !validate_buck2_nightly_contract(&broken).is_empty(),
+                "broken Buck2 nightly contract unexpectedly passed"
+            );
+        }
+        for carrier in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "ACTIONS_RUNTIME_TOKEN",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ] {
+            let cleared = format!("          {carrier}: \"\"");
+            let broken = source.replacen(&cleared, &format!("          {carrier}: inherited"), 1);
+            assert_ne!(source, broken, "missing token fixture for {carrier}");
+            assert!(
+                !validate_buck2_nightly_contract(&broken).is_empty(),
+                "inheriting {carrier} in a load-bearing step unexpectedly passed"
+            );
+        }
+        let github_token_reintroduced = source.replacen(
+            "          GITHUB_TOKEN: \"\"",
+            "          GITHUB_TOKEN: ${{ github.token }}",
+            1,
+        );
+        assert!(
+            !validate_buck2_nightly_contract(&github_token_reintroduced).is_empty(),
+            "reintroducing github.token into a shell step unexpectedly passed"
+        );
+    }
+
+    #[test]
+    fn every_single_byte_mutation_of_bound_release_blocks_is_refused() {
+        let source = include_str!("../.github/workflows/buck2-oss-nightly.yml");
+        for name in [
+            "Capture the feature-complete Hermit release build",
+            "Reconcile and scan release evidence",
+            "Upload feature-complete release evidence",
+            "Build the four Reverie targets",
+            "Run the full third-party diagnostic",
+            "Scan and package the full third-party diagnostic",
+            "Upload the full third-party diagnostic log",
+            "Build the Hermit green gate",
+        ] {
+            let block = named_step_block(source, name).unwrap();
+            let start = block.as_ptr() as usize - source.as_ptr() as usize;
+            for index in 0..block.len() {
+                let mut bytes = block.as_bytes().to_vec();
+                bytes[index] = if bytes[index] == b'x' { b'y' } else { b'x' };
+                let changed = String::from_utf8(bytes).unwrap();
+                let mut mutated = source.to_owned();
+                mutated.replace_range(start..start + block.len(), &changed);
+                assert!(
+                    !validate_bound_release_blocks(&mutated).is_empty(),
+                    "single-byte mutation {index} of {name} escaped the bound-block contract"
+                );
+            }
         }
     }
 
