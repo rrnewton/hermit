@@ -262,7 +262,10 @@ async fn backend_failure_completes_unstarted_daemon_without_aborting_it() {
     .expect("terminal startup must complete")
     .expect("daemon must not panic or be aborted");
     assert!(state.sched.lock().unwrap().started_up.try_read().is_none());
-    state.clean_up(false, &None).await;
+    state
+        .clean_up(false, &None)
+        .await
+        .expect("failed-run cleanup must complete without a network engine");
 }
 
 #[tokio::test]
@@ -294,7 +297,10 @@ async fn backend_failure_completes_registered_daemon_without_another_request() {
     .expect("daemon must not panic or be aborted");
     assert!(request.try_read().is_none());
     assert_eq!(state.sched.lock().unwrap().turn, 0);
-    state.clean_up(false, &None).await;
+    state
+        .clean_up(false, &None)
+        .await
+        .expect("failed-run cleanup must complete without a network engine");
 }
 
 #[tokio::test]

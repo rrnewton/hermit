@@ -51,6 +51,11 @@ mod ivar;
 pub mod logdiff;
 mod memory;
 pub mod netlink_route;
+pub mod network_failure;
+/// Schedule-independent external-network capture and replay state machine.
+pub mod network_replay;
+/// Owned runtime resources supplied through an authenticated launch boundary.
+pub mod network_runtime;
 mod procfs;
 mod procmaps;
 pub mod random;
@@ -120,12 +125,32 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
+#[doc(hidden)]
+pub use tool_global::NetworkCapturedStreamInput;
+#[doc(hidden)]
+pub use tool_global::NetworkCapturedStreamOutput;
+#[doc(hidden)]
+pub use tool_global::NetworkConnection;
+#[doc(hidden)]
+pub use tool_global::NetworkDatagramDelivery;
+#[doc(hidden)]
+pub use tool_global::NetworkDatagramReceive;
+#[doc(hidden)]
+pub use tool_global::NetworkReply;
+#[doc(hidden)]
+pub use tool_global::NetworkRequest;
+#[doc(hidden)]
+pub use tool_global::NetworkStreamReceive;
+#[doc(hidden)]
+pub use tool_global::NetworkStreamTransmit;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+#[doc(hidden)]
+pub use tool_global::network_request;
 pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 use tool_global::robust_list_wakes_after_exit;
@@ -1486,6 +1511,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .expect("clone_flags must be set by parent");
                 let dettid = DetPid::from_raw(tid.into());
 
+                if pts
+                    .1
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .network_lifetime_tracking()
+                {
+                    let permit = pts
+                        .1
+                        .pending_fd_clone
+                        .expect("active table clone requires pre-physical admission");
+                    assert_eq!(permit.owner.thread, pts.1.dettid);
+                    assert_eq!(permit.owner.mm, pts.1.mm_id);
+                    assert_eq!(permit.files, pts.1.file_metadata.lock().unwrap().files_id);
+                }
+
                 // If we had mutable access to the parent state, we could update it here, but
                 // instead we leave that to the clone/fork handling.
                 let (_next_parent_pedigree, child_pedigree) = pts.1.pedigree.fork();
@@ -1536,6 +1577,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             ))
                         }
                     },
+                    pending_exec_files: None,
                     discover_live_file_metadata: pts.1.discover_live_file_metadata,
                     // Linux copies the creating thread's current timer slack
                     // into both fields of every new task (thread or process).
@@ -1583,6 +1625,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
+                    pending_fd_clone: pts.1.pending_fd_clone,
 
                     // Child RNG identity follows the deterministic creation
                     // pedigree, never the backend/host Tid. Guest-visible IDs
@@ -1685,15 +1728,42 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             } else {
                 None
             };
-            if let Some(post_exec_mm) =
+            if let Some((post_exec_mm, files)) =
                 create_child_thread(guest, new_dettid, 0, None, libc::SIGCHLD, physical_ids).await
             {
-                guest.thread_state_mut().mm_id = post_exec_mm;
+                let state = guest.thread_state_mut();
+                state.mm_id = post_exec_mm;
+                state.finish_exec_files(files);
+            }
+        }
+
+        // One owned ptrace startup resource authenticates custody for accepted
+        // sockets and descriptor publication, independently of signal identity
+        // and cfgseq. Do not register the same task twice when both are active.
+        let needs_fd_runtime = self.cfg.network_trace.uses_trace()
+            && crate::network_replay::backend_fd_table_capability(&self.cfg).is_some();
+        let needs_accepted_runtime = guest.config().backend_supports_host_socket_pin
+            && matches!(
+                guest.config().network_trace.policy,
+                detcore_model::network_trace::NetworkPolicy::Record
+                    | detcore_model::network_trace::NetworkPolicy::Replay
+            );
+        if needs_fd_runtime || needs_accepted_runtime {
+            let registered = tool_global::register_network_physical_task(guest).await?;
+            if needs_fd_runtime && !registered {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "active network lifetime lacks owned ptrace runtime"
+                )));
             }
         }
 
         // Except for the root task, let's block until it's our turn to go:
         let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
+
+        // Descriptor ownership is granted by actual global registration, not
+        // by a deserialized local tracking bit or the network trace flag.
+        self.initialize_network_fd_tracking(guest).await?;
+        guest.thread_state_mut().pending_fd_clone = None;
 
         // Finish the delayed initialization of the full threadstate:
         {
@@ -2255,6 +2325,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
                 self.handle_epoll_pwait2(guest, call).await
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3174): Review explicit Record/Replay socket dispatch.
+            // https://github.com/rrnewton/hermit/pull/3174
+            SyscallClassification::Determinized if self.network_io_owns(guest, call) => {
+                self.handle_network_io(guest, call).await
+            }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2443,9 +2519,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
 
-                Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
-                Syscall::Dup2(w) => self.handle_dup2(guest, w).await.map_err(Into::into),
-                Syscall::Dup3(w) => self.handle_dup3(guest, w).await.map_err(Into::into),
+                Syscall::Dup(w) => self.handle_dup(guest, w).await,
+                Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
+                Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
                 Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
                 Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
                 Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
@@ -2890,6 +2966,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
+        tool_global::network_owner_gone(
+            &self.cfg,
+            thread_state.thread_logical_time.clone(),
+            mm_id,
+            global_state,
+        )
+        .await;
         let exit_signal = match &exit_status {
             ExitStatus::Signaled(signal, _) => Some(*signal as i32),
             ExitStatus::Exited(_) => None,

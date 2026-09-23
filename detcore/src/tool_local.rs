@@ -18,6 +18,8 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
 
+use detcore_model::network_trace::NetworkAncillaryObjectV2;
+use detcore_model::network_trace::NetworkObjectId;
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
 use nix::fcntl::OFlag;
@@ -44,6 +46,13 @@ use crate::config::Config;
 use crate::detlog;
 use crate::fd::*;
 use crate::memory::MemoryMetadata;
+use crate::network_replay::NetworkFdEffectAssociation;
+use crate::network_replay::NetworkFdLocalPublication;
+use crate::network_replay::NetworkFdPublicationAdmission;
+use crate::network_replay::NetworkFdPublicationBatch;
+use crate::network_replay::NetworkFdPublicationEntry;
+use crate::network_replay::NetworkFdPublicationReply;
+use crate::network_replay::NetworkFdPublicationRequest;
 use crate::preemptions::ThreadHistoryIterator;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
@@ -76,7 +85,7 @@ pub struct Detcore<T = NoopTool> {
 }
 
 /// The metadata associated with the file system view of a particular *process*.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FileMetadata {
     /// Identity of the Linux descriptor table represented by `file_handles`.
     pub(crate) files_id: FilesId,
@@ -85,9 +94,466 @@ pub struct FileMetadata {
     /// Socket-only sequence used for backend-independent socket cookies.
     #[serde(default)]
     next_socket_open_file_sequence: u64,
+    /// Every successful modeled installation, including reuse of the same OFD,
+    /// consumes one generation. It is independent of object-open sequences.
+    next_slot_generation: u64,
+    /// Slot incarnation corresponding exactly to each entry in file_handles.
+    slot_generations: HashMap<RawFd, u64>,
+    /// Trace modes publish descriptor ownership; ordinary run retains no journal.
+    track_network_lifetime: bool,
+    /// Preserve exact overwritten network installations until ledger publication.
+    pending_network_installations: Vec<NetworkFdSlotReplacement>,
+    network_publication: NetworkFdLocalPublication,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
+}
+
+// FileMetadata is same-image ThreadState transport, not a versioned recording
+// format. Old/malformed snapshots must fail decoding; guessing generations for
+// existing handles could authenticate a stale descriptor after numeric reuse.
+impl<'de> Deserialize<'de> for FileMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            files_id: FilesId,
+            next_open_file_sequence: u64,
+            #[serde(default)]
+            next_socket_open_file_sequence: u64,
+            next_slot_generation: u64,
+            slot_generations: HashMap<RawFd, u64>,
+            track_network_lifetime: bool,
+            pending_network_installations: Vec<NetworkFdSlotReplacement>,
+            network_publication: NetworkFdLocalPublication,
+            file_handles: HashMap<RawFd, DetFd>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut used = std::collections::HashSet::new();
+        if wire.slot_generations.len() != wire.file_handles.len()
+            || wire.file_handles.iter().any(|(&fd, detfd)| {
+                fd < 0
+                    || detfd.fd != fd
+                    || !wire.slot_generations.get(&fd).is_some_and(|&generation| {
+                        generation != 0
+                            && generation <= wire.next_slot_generation
+                            && used.insert(generation)
+                    })
+            })
+        {
+            return Err(serde::de::Error::custom(
+                "incoherent descriptor slot generations",
+            ));
+        }
+        let mut prior_generation = 0;
+        for receipt in &wire.pending_network_installations {
+            let binding_valid = |slot: NetworkFdSlot| {
+                slot.binding.slot.files == wire.files_id
+                    && slot.binding.slot.fd >= 0
+                    && slot.binding.generation != 0
+                    && slot.binding.generation <= wire.next_slot_generation
+            };
+            if receipt.files != wire.files_id
+                || receipt.installation_generation <= prior_generation
+                || receipt.installation_generation > wire.next_slot_generation
+                || receipt.before.is_none() && receipt.after.is_none()
+                || !wire.track_network_lifetime
+                || receipt.before.is_some_and(|slot| {
+                    !binding_valid(slot)
+                        || slot.binding.generation >= receipt.installation_generation
+                })
+                || receipt.after.is_some_and(|slot| {
+                    !binding_valid(slot)
+                        || slot.binding.generation != receipt.installation_generation
+                })
+                || matches!((receipt.before, receipt.after), (Some(before), Some(after))
+                    if before.binding.slot.fd != after.binding.slot.fd
+                        || before.binding.generation >= after.binding.generation)
+            {
+                return Err(serde::de::Error::custom(
+                    "incoherent pending descriptor installation",
+                ));
+            }
+            prior_generation = receipt.installation_generation;
+        }
+        let metadata = Self {
+            files_id: wire.files_id,
+            next_open_file_sequence: wire.next_open_file_sequence,
+            next_socket_open_file_sequence: wire.next_socket_open_file_sequence,
+            next_slot_generation: wire.next_slot_generation,
+            slot_generations: wire.slot_generations,
+            track_network_lifetime: wire.track_network_lifetime,
+            pending_network_installations: wire.pending_network_installations,
+            network_publication: wire.network_publication,
+            file_handles: wire.file_handles,
+        };
+        metadata
+            .validate_publication_state()
+            .map_err(serde::de::Error::custom)?;
+        Ok(metadata)
+    }
+}
+
+fn fd_publication_error(message: &str) -> Error {
+    Error::Tool(anyhow::anyhow!(
+        "network FD publication protocol: {message}"
+    ))
+}
+
+impl FileMetadata {
+    /// Associate only the engine-confirmed physical installation with its exact
+    /// local journal entry. The global Publish handler revalidates the durable
+    /// submitted/confirmed owner, lease, kind, result index and returned FD.
+    pub(crate) fn associate_network_installation(
+        &mut self,
+        generation: u64,
+        effect: NetworkFdEffectAssociation,
+    ) -> Result<(), Error> {
+        let replacement = self
+            .pending_network_installations
+            .iter()
+            .find(|entry| entry.installation_generation == generation)
+            .ok_or_else(|| fd_publication_error("installation receipt is not pending"))?;
+        let fd = replacement
+            .after
+            .or(replacement.before)
+            .ok_or_else(|| fd_publication_error("installation has no network endpoint"))?
+            .binding
+            .slot
+            .fd;
+        if effect.returned_fd != fd {
+            return Err(fd_publication_error(
+                "physical result names another descriptor",
+            ));
+        }
+        if let Some(old) = self.network_publication.effects.get(&generation) {
+            return if old == &effect {
+                Ok(())
+            } else {
+                Err(fd_publication_error("installation effect was rebound"))
+            };
+        }
+        self.network_publication.effects.insert(generation, effect);
+        Ok(())
+    }
+
+    fn publication_snapshot(
+        &mut self,
+        admission: &NetworkFdPublicationAdmission,
+    ) -> Result<NetworkFdPublicationBatch, Error> {
+        if self.files_id != admission.permit.files {
+            return Err(fd_publication_error("admitted table changed"));
+        }
+        if let Some(recovery) = &admission.recovery {
+            // Recovery is the server's durable exact prefix, not a newly-created
+            // local mutex or an inferred sequence after deserialization.
+            if let Some(local) = &self.network_publication.in_flight {
+                if local != recovery {
+                    return Err(fd_publication_error("local/server pending prefix mismatch"));
+                }
+            }
+            if self.network_publication.last_acknowledged.as_ref() != Some(recovery) {
+                self.validate_publication_prefix(recovery)?;
+                self.network_publication.in_flight = Some(recovery.clone());
+            }
+            return Ok(recovery.clone());
+        }
+        if let Some(local) = &self.network_publication.in_flight {
+            // Cancellation can occur before Publish reached the server. Reuse
+            // the exact serialized prefix while its predecessor cursor matches.
+            if local.previous_generation != admission.acknowledged_generation
+                || local.sequence
+                    != admission
+                        .acknowledged_sequence
+                        .checked_add(1)
+                        .ok_or_else(|| fd_publication_error("publication sequence exhausted"))?
+            {
+                return Err(fd_publication_error("unsubmitted prefix cursor changed"));
+            }
+            self.validate_publication_prefix(local)?;
+            return Ok(local.clone());
+        }
+        if self.network_publication.acknowledged_sequence != admission.acknowledged_sequence
+            || self.network_publication.acknowledged_generation != admission.acknowledged_generation
+        {
+            return Err(fd_publication_error(
+                "local publication cursor is not the run-global cursor",
+            ));
+        }
+        let entries = self
+            .pending_network_installations
+            .iter()
+            .map(|replacement| {
+                let effect = self
+                    .network_publication
+                    .effects
+                    .get(&replacement.installation_generation)
+                    .copied()
+                    .ok_or_else(|| {
+                        fd_publication_error("installation has no confirmed physical association")
+                    })?;
+                Ok(NetworkFdPublicationEntry {
+                    replacement: *replacement,
+                    effect,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let batch = NetworkFdPublicationBatch {
+            files: self.files_id,
+            sequence: admission
+                .acknowledged_sequence
+                .checked_add(1)
+                .ok_or_else(|| fd_publication_error("publication sequence exhausted"))?,
+            previous_generation: admission.acknowledged_generation,
+            through_generation: self.next_slot_generation,
+            entries,
+        };
+        self.validate_publication_prefix(&batch)?;
+        self.network_publication.in_flight = Some(batch.clone());
+        Ok(batch)
+    }
+
+    fn validate_publication_prefix(&self, batch: &NetworkFdPublicationBatch) -> Result<(), Error> {
+        let prefix: Vec<_> = batch
+            .entries
+            .iter()
+            .map(|entry| entry.replacement)
+            .collect();
+        if batch.files != self.files_id
+            || batch.sequence
+                != self
+                    .network_publication
+                    .acknowledged_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| fd_publication_error("publication sequence exhausted"))?
+            || batch.previous_generation != self.network_publication.acknowledged_generation
+            || batch.through_generation <= batch.previous_generation
+            || batch.through_generation > self.next_slot_generation
+            || !self.pending_network_installations.starts_with(&prefix)
+            || self
+                .pending_network_installations
+                .get(prefix.len())
+                .is_some_and(|entry| entry.installation_generation <= batch.through_generation)
+            || batch.entries.iter().any(|entry| {
+                self.network_publication
+                    .effects
+                    .get(&entry.replacement.installation_generation)
+                    != Some(&entry.effect)
+            })
+        {
+            return Err(fd_publication_error(
+                "publication is not the exact captured prefix",
+            ));
+        }
+        Ok(())
+    }
+
+    fn publication_acknowledge(&mut self, batch: &NetworkFdPublicationBatch) -> Result<(), Error> {
+        if self.network_publication.last_acknowledged.as_ref() == Some(batch) {
+            return Ok(());
+        }
+        if self.network_publication.in_flight.as_ref() != Some(batch) {
+            return Err(fd_publication_error("ACK does not match pending prefix"));
+        }
+        self.validate_publication_prefix(batch)?;
+        self.pending_network_installations
+            .drain(..batch.entries.len());
+        for entry in &batch.entries {
+            self.network_publication
+                .effects
+                .remove(&entry.replacement.installation_generation);
+        }
+        self.network_publication.acknowledged_sequence = batch.sequence;
+        self.network_publication.acknowledged_generation = batch.through_generation;
+        self.network_publication.last_acknowledged = Some(batch.clone());
+        self.network_publication.awaiting_global_ack = Some(batch.clone());
+        self.network_publication.in_flight = None;
+        Ok(())
+    }
+}
+
+/// The RPC implementation waits in the existing global Notify admission path
+/// for NoSeq contention; it never sleeps against the host capture clock. It
+/// revalidates the sender and FilesId after every wake. All ordinary metadata
+/// locks below are dropped before every await.
+pub(crate) trait NetworkFdPublicationRpc {
+    fn request(
+        &mut self,
+        request: NetworkFdPublicationRequest,
+    ) -> impl std::future::Future<Output = Result<NetworkFdPublicationReply, Error>> + Send;
+}
+
+pub(crate) async fn publish_network_installations_through<R: NetworkFdPublicationRpc>(
+    table: &Arc<Mutex<FileMetadata>>,
+    files: FilesId,
+    through: u64,
+    rpc: &mut R,
+) -> Result<(), Error> {
+    loop {
+        let admission = match rpc
+            .request(NetworkFdPublicationRequest::Acquire { files })
+            .await?
+        {
+            NetworkFdPublicationReply::Admitted(value) if value.permit.files == files => value,
+            _ => return Err(fd_publication_error("unexpected admission response")),
+        };
+        let satisfied = {
+            let mut table = table.lock().unwrap();
+            table.reconcile_publication_admission(&admission)?;
+            if table.files_id != files {
+                return Err(fd_publication_error(
+                    "table changed while awaiting admission",
+                ));
+            }
+            table.network_publication.acknowledged_generation >= through
+                && admission.recovery.is_none()
+                && table.network_publication.acknowledged_sequence
+                    == admission.acknowledged_sequence
+                && table.network_publication.acknowledged_generation
+                    == admission.acknowledged_generation
+        };
+        if satisfied {
+            if rpc
+                .request(NetworkFdPublicationRequest::ReleaseEmpty {
+                    permit: admission.permit,
+                })
+                .await?
+                != NetworkFdPublicationReply::Released
+            {
+                return Err(fd_publication_error(
+                    "empty permit release not acknowledged",
+                ));
+            }
+            return Ok(());
+        }
+        let batch = { table.lock().unwrap().publication_snapshot(&admission)? };
+        let already_acknowledged = {
+            table
+                .lock()
+                .unwrap()
+                .network_publication
+                .last_acknowledged
+                .as_ref()
+                == Some(&batch)
+        };
+        if !already_acknowledged {
+            let published = rpc
+                .request(NetworkFdPublicationRequest::Publish {
+                    permit: admission.permit,
+                    batch: batch.clone(),
+                })
+                .await?;
+            if published != NetworkFdPublicationReply::Published(batch.clone()) {
+                return Err(fd_publication_error("global publication receipt changed"));
+            }
+            table.lock().unwrap().publication_acknowledge(&batch)?;
+        }
+        // An interrupted ACK leaves last_acknowledged in actual table state;
+        // the next global admission returns this exact durable recovery batch.
+        if rpc
+            .request(NetworkFdPublicationRequest::Acknowledge {
+                permit: admission.permit,
+                batch: batch.clone(),
+            })
+            .await?
+            != NetworkFdPublicationReply::Released
+        {
+            return Err(fd_publication_error(
+                "publication permit release not acknowledged",
+            ));
+        }
+        table
+            .lock()
+            .unwrap()
+            .publication_server_acknowledge(&batch)?;
+    }
+}
+
+impl FileMetadata {
+    fn validate_publication_state(&self) -> Result<(), Error> {
+        let state = &self.network_publication;
+        if state.acknowledged_generation > self.next_slot_generation
+            || state.effects.keys().any(|generation| {
+                !self
+                    .pending_network_installations
+                    .iter()
+                    .any(|entry| entry.installation_generation == *generation)
+            })
+            || self
+                .pending_network_installations
+                .iter()
+                .any(|entry| entry.installation_generation <= state.acknowledged_generation)
+            || state.last_acknowledged.as_ref().is_some_and(|batch| {
+                batch.files != self.files_id
+                    || batch.sequence != state.acknowledged_sequence
+                    || batch.through_generation != state.acknowledged_generation
+            })
+            || (state.acknowledged_sequence != 0 && state.last_acknowledged.is_none())
+            || state
+                .awaiting_global_ack
+                .as_ref()
+                .is_some_and(|batch| state.last_acknowledged.as_ref() != Some(batch))
+            || (state.in_flight.is_some() && state.awaiting_global_ack.is_some())
+        {
+            return Err(fd_publication_error(
+                "incoherent serialized publication state",
+            ));
+        }
+        if let Some(batch) = &state.in_flight {
+            self.validate_publication_prefix(batch)?;
+        }
+        Ok(())
+    }
+    fn publication_server_acknowledge(
+        &mut self,
+        batch: &NetworkFdPublicationBatch,
+    ) -> Result<(), Error> {
+        if self.network_publication.last_acknowledged.as_ref() != Some(batch)
+            || self
+                .network_publication
+                .awaiting_global_ack
+                .as_ref()
+                .is_some_and(|pending| pending != batch)
+        {
+            return Err(fd_publication_error(
+                "server ACK differs from local completed prefix",
+            ));
+        }
+        self.network_publication.awaiting_global_ack = None;
+        Ok(())
+    }
+    fn reconcile_publication_admission(
+        &mut self,
+        admission: &NetworkFdPublicationAdmission,
+    ) -> Result<(), Error> {
+        if admission.permit.files != self.files_id {
+            return Err(fd_publication_error("admission names another table"));
+        }
+        if let Some(pending) = &self.network_publication.awaiting_global_ack {
+            if admission.recovery.is_none()
+                && admission.acknowledged_sequence == pending.sequence
+                && admission.acknowledged_generation == pending.through_generation
+            {
+                // The previous ACK was applied but its response was lost. This
+                // is an authenticated global receipt, never a local assumption.
+                self.network_publication.awaiting_global_ack = None;
+            }
+        }
+        Ok(())
+    }
+    fn assert_network_publication_snapshot_ready(&self) {
+        assert!(
+            !self.track_network_lifetime
+                || (self.pending_network_installations.is_empty()
+                    && self.network_publication.in_flight.is_none()
+                    && self.network_publication.awaiting_global_ack.is_none()
+                    && self.network_publication.acknowledged_generation
+                        == self.next_slot_generation),
+            "fork/exec table snapshot preceded complete network prefix publication"
+        );
+    }
 }
 
 /// A descriptor identity held across an awaited syscall.
@@ -119,6 +585,45 @@ pub(crate) struct CapturedDetFdInstallCleanup {
     pub(crate) close_fd: RawFd,
     /// A scheduler resource whose final modeled OFD reference was the capture.
     pub(crate) release_open_file: Option<OpenFileId>,
+}
+
+/// One SCM_RIGHTS object bound to a trace-stable identity and a retained OFD.
+#[derive(Debug, Clone)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct ScmRightsObjectSnapshot {
+    pub(crate) object: NetworkObjectId,
+    pub(crate) open_file: OpenFileId,
+    description: OpenFileDescriptionRef,
+}
+
+/// One descriptor slot installed from an SCM_RIGHTS object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct InstalledScmRight {
+    pub(crate) object: NetworkObjectId,
+    pub(crate) fd: RawFd,
+    pub(crate) open_file: OpenFileId,
+}
+
+/// Installation result plus exact physical fds which the adapter must close
+/// because the guest control buffer truncated them.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct ScmRightsInstallResult {
+    pub(crate) installed: Vec<InstalledScmRight>,
+    pub(crate) close_excess_fds: Vec<RawFd>,
+}
+
+/// Fail-closed SCM_RIGHTS metadata error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) enum ScmRightsError {
+    BadDescriptor(Errno),
+    UnsupportedObjectKind,
+    ObjectIdentityMismatch(NetworkObjectId),
+    OpenFileIdentityMismatch(OpenFileId),
+    ResultCountMismatch,
+    DestinationOccupied(RawFd),
 }
 
 impl CapturedDetFdInstallError {
@@ -465,6 +970,11 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
+            next_slot_generation: 0,
+            slot_generations: HashMap::new(),
+            track_network_lifetime: false,
+            pending_network_installations: Vec::new(),
+            network_publication: NetworkFdLocalPublication::default(),
             file_handles: HashMap::new(),
         }
     }
@@ -525,6 +1035,11 @@ impl FileMetadata {
         }
     }
 
+    /// Whether this table has complete backend mutation authority.
+    pub(crate) fn network_lifetime_tracking(&self) -> bool {
+        self.track_network_lifetime
+    }
+
     // TODO-HUMAN-REVIEW(#2373)
     /// Fork the file table for `child`.
     ///
@@ -552,20 +1067,44 @@ impl FileMetadata {
     /// held. So any guest that forked and later vforked was refused even when
     /// it had never called `flock` at all.
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
+        self.assert_network_publication_snapshot_ready();
         self.forget_flock_modes();
         Self {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_slot_generation: self.next_slot_generation,
+            slot_generations: self.slot_generations.clone(),
+            track_network_lifetime: self.track_network_lifetime,
+            pending_network_installations: Vec::new(),
+            network_publication: NetworkFdLocalPublication {
+                acknowledged_generation: self.next_slot_generation,
+                ..NetworkFdLocalPublication::default()
+            },
             file_handles: self.file_handles.clone(),
         }
     }
 
-    pub(crate) fn for_exec(&self, task: DetTid) -> Self {
+    pub(crate) fn for_exec(&self, files_id: FilesId) -> Self {
+        self.assert_network_publication_snapshot_ready();
         Self {
-            files_id: self.files_id.for_exec(task),
+            files_id,
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_slot_generation: self.next_slot_generation,
+            slot_generations: self
+                .slot_generations
+                .iter()
+                .filter_map(|(&fd, &generation)| {
+                    (!self.file_handles[&fd].is_cloexec()).then_some((fd, generation))
+                })
+                .collect(),
+            track_network_lifetime: self.track_network_lifetime,
+            pending_network_installations: Vec::new(),
+            network_publication: NetworkFdLocalPublication {
+                acknowledged_generation: self.next_slot_generation,
+                ..NetworkFdLocalPublication::default()
+            },
             file_handles: self
                 .file_handles
                 .iter()
@@ -733,10 +1272,117 @@ impl FileMetadata {
         Ok(f(detfd))
     }
 
+    /// Publish a new installation. Replacing a stale modeled entry is permitted:
+    /// Linux can reuse its numeric slot before an older close returns from linger.
+    fn replace_detfd(&mut self, detfd: DetFd) -> Option<DetFd> {
+        let generation = self
+            .next_slot_generation
+            .checked_add(1)
+            .expect("descriptor slot generation exhausted");
+        let before = self.network_descriptor_slot(detfd.fd);
+        let after = detfd.socket_open_file_id().map(|open_file| NetworkFdSlot {
+            binding: FdSlotBinding {
+                slot: FdSlot {
+                    files: self.files_id,
+                    fd: detfd.fd,
+                },
+                generation,
+                open_file,
+            },
+            cloexec: detfd.is_cloexec(),
+        });
+        self.next_slot_generation = generation;
+        self.slot_generations.insert(detfd.fd, generation);
+        let replaced = self.file_handles.insert(detfd.fd, detfd);
+        if self.track_network_lifetime && (before.is_some() || after.is_some()) {
+            self.pending_network_installations
+                .push(NetworkFdSlotReplacement {
+                    files: self.files_id,
+                    installation_generation: generation,
+                    before,
+                    after,
+                });
+        }
+        replaced
+    }
+
     /// add a detfd
     fn add_detfd(&mut self, detfd: DetFd) {
-        let fd = detfd.fd;
-        self.file_handles.insert(fd, detfd);
+        self.replace_detfd(detfd);
+    }
+
+    /// Capture identity without manufacturing an OFD alias via Arc::clone.
+    pub(crate) fn descriptor_binding(&self, fd: RawFd) -> Result<FdSlotBinding, Errno> {
+        let detfd = self.file_handles.get(&fd).ok_or(Errno::EBADF)?;
+        let generation = *self
+            .slot_generations
+            .get(&fd)
+            .expect("every descriptor installation has a slot generation");
+        Ok(FdSlotBinding {
+            slot: FdSlot {
+                files: self.files_id,
+                fd,
+            },
+            generation,
+            open_file: detfd.open_file_id(),
+        })
+    }
+
+    fn network_descriptor_slot(&self, fd: RawFd) -> Option<NetworkFdSlot> {
+        let detfd = self.file_handles.get(&fd)?;
+        detfd.socket_open_file_id()?;
+        Some(NetworkFdSlot {
+            binding: self.descriptor_binding(fd).expect("registered descriptor"),
+            cloexec: detfd.is_cloexec(),
+        })
+    }
+
+    pub(crate) fn pending_network_installations(&self) -> &[NetworkFdSlotReplacement] {
+        &self.pending_network_installations
+    }
+
+    /// Only acknowledge the exact prefix accepted by the global ledger. A
+    /// concurrently appended installation remains pending. False changes nothing.
+    #[cfg(test)]
+    pub(crate) fn acknowledge_network_installations(
+        &mut self,
+        accepted: &[NetworkFdSlotReplacement],
+    ) -> bool {
+        if !self.pending_network_installations.starts_with(accepted) {
+            return false;
+        }
+        self.pending_network_installations.drain(..accepted.len());
+        true
+    }
+
+    pub(crate) fn network_descriptor_slots(&self) -> Vec<NetworkFdSlot> {
+        let mut slots: Vec<_> = self
+            .file_handles
+            .iter()
+            .filter_map(|(&fd, detfd)| {
+                detfd.socket_open_file_id().map(|_| NetworkFdSlot {
+                    binding: self.descriptor_binding(fd).expect("registered descriptor"),
+                    cloexec: detfd.is_cloexec(),
+                })
+            })
+            .collect();
+        slots.sort_by_key(|entry| entry.binding.slot.fd);
+        slots
+    }
+
+    /// Reconcile only the installation whose kernel removal was authenticated.
+    /// A delayed result must never remove a new installation at the same number,
+    /// even when it points to the same OFD. The returned identity says nothing
+    /// about final ownership; NetworkLifetime is the authority for retirement.
+    pub(crate) fn remove_descriptor_binding(&mut self, binding: FdSlotBinding) -> bool {
+        if self.descriptor_binding(binding.slot.fd).ok() != Some(binding) {
+            return false;
+        }
+        self.slot_generations.remove(&binding.slot.fd);
+        self.file_handles
+            .remove(&binding.slot.fd)
+            .expect("validated descriptor");
+        true
     }
 
     /// add a raw fd
@@ -757,6 +1403,9 @@ impl FileMetadata {
     /// remove a rawfd
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
         let detfd = self.file_handles.remove(&fd)?;
+        self.slot_generations
+            .remove(&fd)
+            .expect("registered slot generation");
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
@@ -790,7 +1439,7 @@ impl FileMetadata {
         let detfd = self.with_detfd(oldfd, |old_detfd| {
             old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
-        let replaced = self.file_handles.insert(newfd, detfd);
+        let replaced = self.replace_detfd(detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
     }
@@ -801,6 +1450,92 @@ impl FileMetadata {
         Ok(CapturedDetFd {
             files_id: self.files_id,
             detfd,
+        })
+    }
+
+    /// Snapshot SCM_RIGHTS source slots while binding each OFD to the trace
+    /// object identity selected by the shared network engine.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    fn snapshot_scm_rights(
+        &mut self,
+        rights: &[(RawFd, NetworkAncillaryObjectV2)],
+    ) -> Result<Vec<ScmRightsObjectSnapshot>, ScmRightsError> {
+        let mut objects = BTreeMap::new();
+        let mut open_files = BTreeMap::new();
+        let mut snapshots = Vec::with_capacity(rights.len());
+        for (fd, object) in rights {
+            let NetworkAncillaryObjectV2::FileDescriptor { object } = object else {
+                return Err(ScmRightsError::UnsupportedObjectKind);
+            };
+            let detfd = self
+                .file_handles
+                .get(fd)
+                .ok_or(ScmRightsError::BadDescriptor(Errno::EBADF))?;
+            let open_file = detfd.open_file_id();
+            if objects
+                .insert(*object, open_file)
+                .is_some_and(|known| known != open_file)
+            {
+                return Err(ScmRightsError::ObjectIdentityMismatch(*object));
+            }
+            if open_files
+                .insert(open_file, *object)
+                .is_some_and(|known| known != *object)
+            {
+                return Err(ScmRightsError::OpenFileIdentityMismatch(open_file));
+            }
+            let description = detfd.open_file_description_ref();
+            snapshots.push(ScmRightsObjectSnapshot {
+                object: *object,
+                open_file,
+                description,
+            });
+        }
+        Ok(snapshots)
+    }
+
+    /// Install the prefix visible through the guest control buffer. Physical
+    /// descriptors in the suffix must be closed by the adapter, exactly as
+    /// Linux closes excess SCM_RIGHTS descriptors when setting `MSG_CTRUNC`.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    fn install_scm_rights(
+        &mut self,
+        snapshots: &[ScmRightsObjectSnapshot],
+        returned_fds: &[RawFd],
+        visible_count: usize,
+        cmsg_cloexec: bool,
+    ) -> Result<ScmRightsInstallResult, ScmRightsError> {
+        if snapshots.len() != returned_fds.len() || visible_count > snapshots.len() {
+            return Err(ScmRightsError::ResultCountMismatch);
+        }
+        for fd in returned_fds.iter().take(visible_count) {
+            if self.file_handles.contains_key(fd) {
+                return Err(ScmRightsError::DestinationOccupied(*fd));
+            }
+        }
+        let flags = if cmsg_cloexec {
+            OFlag::O_CLOEXEC
+        } else {
+            OFlag::empty()
+        };
+        let close_excess_fds = returned_fds[visible_count..].to_vec();
+        let mut installed = Vec::with_capacity(visible_count);
+        for (snapshot, &fd) in snapshots.iter().zip(returned_fds).take(visible_count) {
+            debug_assert_eq!(snapshot.open_file, snapshot.description.open_file_id());
+            self.add_detfd(DetFd::from_open_file_description(
+                fd,
+                flags,
+                snapshot.description.clone(),
+            ));
+            installed.push(InstalledScmRight {
+                object: snapshot.object,
+                fd,
+                open_file: snapshot.open_file,
+            });
+        }
+        Ok(ScmRightsInstallResult {
+            installed,
+            close_excess_fds,
         })
     }
 
@@ -825,7 +1560,7 @@ impl FileMetadata {
         }
 
         let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
-        let replaced = self.file_handles.insert(newfd, detfd);
+        let replaced = self.replace_detfd(detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
     }
@@ -994,6 +1729,199 @@ mod file_metadata_tests {
     use super::*;
 
     #[test]
+    fn descriptor_binding_roundtrip_preserves_generation_and_rejects_malformed_state() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        table.dup_fd(7, 8, OFlag::empty()).unwrap();
+        let encoded = serde_json::to_value(&table).unwrap();
+        let decoded: FileMetadata = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            decoded.network_descriptor_slots(),
+            table.network_descriptor_slots()
+        );
+        assert_eq!(decoded.next_slot_generation, table.next_slot_generation);
+        let mut missing_map = encoded.clone();
+        missing_map
+            .as_object_mut()
+            .unwrap()
+            .remove("slot_generations");
+        assert!(serde_json::from_value::<FileMetadata>(missing_map).is_err());
+        let mut missing_entry = encoded.clone();
+        missing_entry["slot_generations"]
+            .as_object_mut()
+            .unwrap()
+            .remove("7");
+        assert!(serde_json::from_value::<FileMetadata>(missing_entry).is_err());
+        for bad in [0, table.next_slot_generation + 1] {
+            let mut malformed = encoded.clone();
+            malformed["slot_generations"]["7"] = serde_json::json!(bad);
+            assert!(serde_json::from_value::<FileMetadata>(malformed).is_err());
+        }
+        let mut duplicate = encoded.clone();
+        duplicate["slot_generations"]["8"] = encoded["slot_generations"]["7"].clone();
+        assert!(serde_json::from_value::<FileMetadata>(duplicate).is_err());
+    }
+
+    #[test]
+    fn replacing_network_slot_retains_exact_superseded_receipt_until_acknowledged() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table.track_network_lifetime = true;
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let first = table.network_descriptor_slots()[0];
+        let first_batch = table.pending_network_installations().to_vec();
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(first_batch[0].before, None);
+        assert_eq!(first_batch[0].after, Some(first));
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let replacement = table.pending_network_installations()[1];
+        assert_eq!(replacement.before, Some(first));
+        assert_eq!(replacement.after, None);
+        assert!(!table.acknowledge_network_installations(&[replacement]));
+        assert_eq!(table.pending_network_installations().len(), 2);
+        assert!(table.acknowledge_network_installations(&first_batch));
+        assert_eq!(table.pending_network_installations(), &[replacement]);
+        let encoded = serde_json::to_vec(&table).unwrap();
+        let mut decoded: FileMetadata = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.pending_network_installations(), &[replacement]);
+        assert!(decoded.acknowledge_network_installations(&[replacement]));
+        assert!(decoded.pending_network_installations().is_empty());
+    }
+
+    #[test]
+    fn delayed_close_does_not_remove_reused_same_ofd_slot() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        table.dup_fd(7, 8, OFlag::empty()).unwrap();
+        let old = table.descriptor_binding(7).unwrap();
+        // Kernel close has removed fd7, but its release result is still pending.
+        // A later successful dup2(8,7) publishes a new installation first.
+        table.dup_fd(8, 7, OFlag::empty()).unwrap();
+        let replacement = table.descriptor_binding(7).unwrap();
+        assert_eq!(old.open_file, replacement.open_file);
+        assert_ne!(old.generation, replacement.generation);
+        assert!(!table.remove_descriptor_binding(old));
+        assert_eq!(table.descriptor_binding(7).unwrap(), replacement);
+        assert!(table.remove_descriptor_binding(replacement));
+        assert_eq!(table.descriptor_binding(7), Err(Errno::EBADF));
+        assert!(table.descriptor_binding(8).is_ok());
+    }
+
+    #[test]
+    fn slot_binding_changes_on_new_open_and_captured_install() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let original = table.descriptor_binding(7).unwrap();
+        let captured = table.capture_fd(7).unwrap();
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let newer = table.descriptor_binding(7).unwrap();
+        assert_ne!(original.open_file, newer.open_file);
+        assert_ne!(original.generation, newer.generation);
+        table
+            .install_captured_fd(captured, 7, OFlag::O_CLOEXEC)
+            .unwrap();
+        let restored_object = table.descriptor_binding(7).unwrap();
+        assert_eq!(original.open_file, restored_object.open_file);
+        assert!(original.generation < newer.generation);
+        assert!(newer.generation < restored_object.generation);
+        assert!(!table.remove_descriptor_binding(original));
+        assert!(!table.remove_descriptor_binding(newer));
+        assert_eq!(
+            table.network_descriptor_slots(),
+            vec![NetworkFdSlot {
+                binding: restored_object,
+                cloexec: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn fork_and_exec_bindings_keep_aliases_but_change_table_identity() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 7, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        table.dup_fd(7, 8, OFlag::O_CLOEXEC).unwrap();
+        let original = table.descriptor_binding(7).unwrap();
+        let mut fork = table.fork_for(DetTid::from_raw(20));
+        let copied = fork.descriptor_binding(7).unwrap();
+        assert_eq!(original.open_file, copied.open_file);
+        assert_eq!(original.generation, copied.generation);
+        assert_ne!(original.slot.files, copied.slot.files);
+        assert!(!fork.remove_descriptor_binding(original));
+        let replacement = table.for_exec(FilesIdAllocator::default().allocate_exec(owner));
+        let survived = replacement.descriptor_binding(7).unwrap();
+        assert_eq!(original.open_file, survived.open_file);
+        assert_ne!(original.slot.files, survived.slot.files);
+        assert_eq!(replacement.descriptor_binding(8), Err(Errno::EBADF));
+        assert!(replacement.slot_generations.get(&8).is_none());
+        assert!(table.descriptor_binding(8).is_ok());
+    }
+
+    #[test]
+    fn exec_receipt_preserves_retained_cross_table_ofd_aliases() {
+        let owner = DetTid::from_raw(10);
+        let mut state = ThreadState::new(owner, &Config::default(), ());
+        {
+            let mut table = state.file_metadata.lock().unwrap();
+            table
+                .add_fd(owner, 7, OFlag::empty(), FdType::Regular, None)
+                .unwrap();
+            table.dup_fd(7, 8, OFlag::O_CLOEXEC).unwrap();
+        }
+        let external = state
+            .file_metadata
+            .lock()
+            .unwrap()
+            .fork_for(DetTid::from_raw(20));
+        let old_table = state.file_metadata.clone();
+        let receipt = ExecFilesReceipt {
+            caller: owner,
+            process: owner,
+            mm: state.mm_id,
+            old_files: old_table.lock().unwrap().files_id,
+            new_files: FilesIdAllocator::default().allocate_exec(owner),
+        };
+        let candidate = old_table.lock().unwrap().for_exec(receipt.new_files);
+        state.pending_exec_files = Some(receipt);
+        state.file_metadata = Arc::new(Mutex::new(candidate));
+        let actual_candidate = state.file_metadata.clone();
+        state.finish_exec_files(receipt);
+        assert!(Arc::ptr_eq(&state.file_metadata, &actual_candidate));
+        assert!(state.pending_exec_files.is_none());
+        let mut new_table = state.file_metadata.lock().unwrap();
+        assert_eq!(new_table.files_id, receipt.new_files);
+        assert_eq!(new_table.with_detfd(8, |_| ()), Err(Errno::EBADF));
+        external.file_handles[&7].set_status_flags(OFlag::O_NONBLOCK.bits());
+        assert!(
+            new_table.with_detfd(7, |fd| fd.is_nonblocking()).unwrap(),
+            "a surviving external alias must update the same OFD object"
+        );
+        assert_eq!(
+            new_table.with_detfd(7, |fd| fd.open_file_id()).unwrap(),
+            external.file_handles[&7].open_file_id()
+        );
+        assert!(external.file_handles[&8].is_cloexec());
+        assert_eq!(old_table.lock().unwrap().files_id, receipt.old_files);
+    }
+
+    #[test]
     fn on_demand_discovery_finds_a_live_descriptor() {
         let owner = DetTid::from_raw(9);
         let file = std::fs::File::open("/dev/null").expect("open test descriptor");
@@ -1059,7 +1987,8 @@ mod file_metadata_tests {
             .with_detfd(3, |detfd| detfd.set_flock_mode(Some(libc::LOCK_SH)))
             .expect("registered descriptor");
 
-        let mut after_exec = metadata.for_exec(DetTid::from_raw(10));
+        let mut after_exec =
+            metadata.for_exec(FilesIdAllocator::default().allocate_exec(DetTid::from_raw(10)));
         assert_eq!(
             after_exec
                 .with_detfd(3, |detfd| detfd.known_flock_mode())
@@ -1145,7 +2074,8 @@ mod file_metadata_tests {
         }
         metadata.dup_fd(7, 9, OFlag::O_CLOEXEC).unwrap();
         let child = metadata.fork_for(DetTid::from_raw(10));
-        let after_exec = child.for_exec(DetTid::from_raw(10));
+        let after_exec =
+            child.for_exec(FilesIdAllocator::default().allocate_exec(DetTid::from_raw(10)));
         assert!(!after_exec.file_handles.contains_key(&9));
         assert!(after_exec.file_handles.contains_key(&7));
     }
@@ -1333,6 +2263,116 @@ mod file_metadata_tests {
                 .expect("captured alias should be installed"),
             (source_id, true)
         );
+    }
+
+    #[test]
+    fn scm_rights_repeated_object_preserves_ofd_across_install_dup_and_fork() {
+        let owner = DetTid::from_raw(60);
+        let mut source = FileMetadata::new(owner);
+        source
+            .add_fd(owner, 3, OFlag::O_NONBLOCK, FdType::Regular, None)
+            .unwrap();
+        let object = NetworkObjectId(9);
+        let rights = [(3, NetworkAncillaryObjectV2::FileDescriptor { object })];
+        let snapshot = source.snapshot_scm_rights(&rights).unwrap().remove(0);
+        let open_file = snapshot.open_file;
+        let repeated = vec![snapshot.clone(), snapshot];
+
+        let mut receiver = FileMetadata::new(DetTid::from_raw(61));
+        let result = receiver
+            .install_scm_rights(&repeated, &[10, 11], 2, true)
+            .unwrap();
+        assert_eq!(
+            result.installed,
+            vec![
+                InstalledScmRight {
+                    object,
+                    fd: 10,
+                    open_file,
+                },
+                InstalledScmRight {
+                    object,
+                    fd: 11,
+                    open_file,
+                },
+            ]
+        );
+        assert!(result.close_excess_fds.is_empty());
+        for fd in [10, 11] {
+            assert_eq!(
+                receiver
+                    .with_detfd(fd, |detfd| (detfd.open_file_id(), detfd.is_cloexec()))
+                    .unwrap(),
+                (open_file, true),
+                "MSG_CMSG_CLOEXEC is per installed descriptor slot"
+            );
+        }
+
+        drop(repeated);
+        assert_eq!(source.remove_fd(3), None);
+        assert_eq!(receiver.remove_fd(10), None);
+        let mut child = receiver.fork_for(DetTid::from_raw(62));
+        assert_eq!(receiver.remove_fd(11), None);
+        assert_eq!(
+            child.remove_fd(11),
+            Some(open_file),
+            "only the final fork/dup/SCM_RIGHTS alias retires the OFD"
+        );
+    }
+
+    #[test]
+    fn scm_rights_truncation_returns_exact_close_obligations() {
+        let owner = DetTid::from_raw(63);
+        let mut source = FileMetadata::new(owner);
+        source
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let object = NetworkObjectId(10);
+        let snapshot = source
+            .snapshot_scm_rights(&[(3, NetworkAncillaryObjectV2::FileDescriptor { object })])
+            .unwrap()
+            .remove(0);
+        let snapshots = vec![snapshot.clone(), snapshot.clone(), snapshot];
+        let mut receiver = FileMetadata::new(DetTid::from_raw(64));
+        let result = receiver
+            .install_scm_rights(&snapshots, &[20, 21, 22], 1, false)
+            .unwrap();
+        assert_eq!(result.installed.len(), 1);
+        assert_eq!(result.close_excess_fds, vec![21, 22]);
+        assert!(!receiver.with_detfd(20, |fd| fd.is_cloexec()).unwrap());
+        assert_eq!(receiver.with_detfd(21, |_| ()), Err(Errno::EBADF));
+        assert_eq!(receiver.with_detfd(22, |_| ()), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn scm_rights_refuses_unsupported_or_inconsistent_object_metadata() {
+        let owner = DetTid::from_raw(65);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        metadata
+            .add_fd(owner, 4, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            metadata.snapshot_scm_rights(&[(
+                3,
+                NetworkAncillaryObjectV2::Credentials {
+                    pid: 1,
+                    uid: 2,
+                    gid: 3,
+                },
+            )]),
+            Err(ScmRightsError::UnsupportedObjectKind)
+        ));
+        let object = NetworkObjectId(11);
+        assert!(matches!(
+            metadata.snapshot_scm_rights(&[
+                (3, NetworkAncillaryObjectV2::FileDescriptor { object }),
+                (4, NetworkAncillaryObjectV2::FileDescriptor { object }),
+            ]),
+            Err(ScmRightsError::ObjectIdentityMismatch(id)) if id == object
+        ));
     }
 
     #[test]
@@ -1767,9 +2807,17 @@ pub struct ThreadState<T> {
     /// `handle_thread_start`; the parent clears its copy when injection returns.
     pub pending_vfork: Option<PendingVfork>,
 
+    /// Pre-physical table reservation inherited only by the actual clone child.
+    pub pending_fd_clone: Option<crate::network_replay::NetworkFdPublicationPermit>,
+
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
+
+    /// The coordinator's exact reservation for the current exec attempt.
+    /// Recreated backend state starts empty; fd numbers do not prove continuity.
+    #[serde(default)]
+    pub(crate) pending_exec_files: Option<ExecFilesReceipt>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-gated live descriptor discovery state.
@@ -2154,7 +3202,7 @@ impl<T> ThreadState<T> {
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
-        let file_metadata = if cfg.discover_live_file_metadata {
+        let mut file_metadata = if cfg.discover_live_file_metadata {
             let mut metadata = FileMetadata::new(pid);
             for fd in 0..=2 {
                 metadata
@@ -2165,6 +3213,9 @@ impl<T> ThreadState<T> {
         } else {
             FileMetadata::new(pid).setup_stdio(pid.into(), pid)
         };
+        // Actual tracking is enabled only by authenticated global table admission.
+        // A trace configuration alone does not prove complete physical coverage.
+        file_metadata.track_network_lifetime = false;
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
@@ -2177,6 +3228,7 @@ impl<T> ThreadState<T> {
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(file_metadata)),
+            pending_exec_files: None,
             discover_live_file_metadata: cfg.discover_live_file_metadata,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
@@ -2191,6 +3243,7 @@ impl<T> ThreadState<T> {
             thread_cpu_start_system_time: last_accounted_system_time,
             clone_flags: None,
             pending_vfork: None,
+            pending_fd_clone: None,
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),
             initialized_random_auxv: None,
@@ -2345,6 +3398,39 @@ impl<T> ThreadState<T> {
             ready.extend(pending.wakes.into_iter().map(|wake| (owner, wake)));
         }
         Some((request_time, ready))
+    }
+
+    /// Apply the same global table allocation at authenticated exec success.
+    /// Ptrace retains this state and its actual OFD Arcs, including aliases in
+    /// other tables. Recreating backends receive the table ID only: rebuilding
+    /// their surviving OFD metadata is a separate existing lifecycle gap.
+    pub(crate) fn finish_exec_files(&mut self, receipt: ExecFilesReceipt) {
+        if let Some(prepared) = self.pending_exec_files.take() {
+            assert_eq!(
+                prepared, receipt,
+                "post-exec receipt differs from local preparation"
+            );
+            let replacement = {
+                let metadata = self.file_metadata.lock().unwrap();
+                if metadata.files_id == receipt.new_files {
+                    // The shared syscall handler already built the candidate.
+                    None
+                } else {
+                    // An external syscall executor can prepare without using
+                    // the shared handler. Filter its retained state only now.
+                    assert_eq!(
+                        metadata.files_id, receipt.old_files,
+                        "post-exec table is not the prepared table"
+                    );
+                    Some(metadata.for_exec(receipt.new_files))
+                }
+            };
+            if let Some(replacement) = replacement {
+                self.file_metadata = Arc::new(Mutex::new(replacement));
+            }
+        } else {
+            self.file_metadata.lock().unwrap().files_id = receipt.new_files;
+        }
     }
 
     /// Clear the robust-list head for a candidate `execve` image, returning the
@@ -2502,6 +3588,30 @@ impl<T> ThreadState<T> {
         metadata.with_detfd(fd, f)
     }
 
+    /// Capture the exact modeled installation before an admitted mutation.
+    pub(crate) fn descriptor_binding(&self, fd: RawFd) -> Result<FdSlotBinding, Errno> {
+        self.metadata().descriptor_binding(fd)
+    }
+
+    pub(crate) fn network_descriptor_slots(&self) -> Vec<NetworkFdSlot> {
+        self.metadata().network_descriptor_slots()
+    }
+
+    pub(crate) fn remove_descriptor_binding(&self, binding: FdSlotBinding) -> bool {
+        self.metadata().remove_descriptor_binding(binding)
+    }
+
+    /// Resolve a raw socket descriptor to its stable open-file identity.
+    ///
+    /// Network capture/replay calls this once at the syscall boundary and
+    /// retains the returned identity across blocking retries. Resolving the fd
+    /// again after a close and numeric reuse could otherwise retarget an
+    /// operation to a different socket.
+    pub fn socket_open_file_id(&self, fd: RawFd) -> Result<OpenFileId, Errno> {
+        self.with_detfd(fd, |detfd| detfd.socket_open_file_id())?
+            .ok_or(Errno::ENOTSOCK)
+    }
+
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
     }
@@ -2592,6 +3702,37 @@ impl<T> ThreadState<T> {
     /// Abandon an uninstalled capture and identify a deferred final-OFD release.
     pub(crate) fn abandon_captured_fd(&self, captured: CapturedDetFd) -> Option<OpenFileId> {
         self.metadata().abandon_captured_fd(captured)
+    }
+
+    /// Snapshot SCM_RIGHTS source descriptors under one descriptor-table lock.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn snapshot_scm_rights(
+        &self,
+        rights: &[(RawFd, NetworkAncillaryObjectV2)],
+    ) -> Result<Vec<ScmRightsObjectSnapshot>, ScmRightsError> {
+        let mut metadata = self.metadata();
+        if self.discover_live_file_metadata {
+            for (fd, _) in rights {
+                metadata
+                    .discover_fd_from_current_process(self.dettid, *fd)
+                    .map_err(ScmRightsError::BadDescriptor)?;
+            }
+        }
+        metadata.snapshot_scm_rights(rights)
+    }
+
+    /// Install the visible SCM_RIGHTS prefix into deterministic fd slots.
+    /// `close_excess_fds` in the result is a mandatory guest-close obligation.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn install_scm_rights(
+        &self,
+        snapshots: &[ScmRightsObjectSnapshot],
+        returned_fds: &[RawFd],
+        visible_count: usize,
+        cmsg_cloexec: bool,
+    ) -> Result<ScmRightsInstallResult, ScmRightsError> {
+        self.metadata()
+            .install_scm_rights(snapshots, returned_fds, visible_count, cmsg_cloexec)
     }
 
     /// get thread prng, note this rng is deterministic and should not be used
@@ -3889,4 +5030,745 @@ fn thread_rng_from_parent_entropy_labeled(
     rng.next_u64();
     rng.next_u64();
     rng
+}
+
+#[cfg(test)]
+mod fd_publication_tests {
+    use std::task::Poll;
+
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::network_replay::NetworkReplayEngine;
+    use crate::network_replay::NetworkStreamOwner;
+
+    // The actual engine and FileMetadata methods are exercised. Only physical
+    // confirmation and transport loss are fixture inputs; no guest is run.
+    struct EngineRpcFixture {
+        engine: Arc<Mutex<NetworkReplayEngine>>,
+        owner: NetworkStreamOwner,
+        lose_after_publish: bool,
+        lose_after_ack: bool,
+    }
+    impl NetworkFdPublicationRpc for EngineRpcFixture {
+        async fn request(
+            &mut self,
+            request: NetworkFdPublicationRequest,
+        ) -> Result<NetworkFdPublicationReply, Error> {
+            use NetworkFdPublicationReply as P;
+            use NetworkFdPublicationRequest as Q;
+            let publish = matches!(request, Q::Publish { .. });
+            let ack = matches!(request, Q::Acknowledge { .. });
+            let result = {
+                let mut engine = self.engine.lock().unwrap();
+                match request {
+                    Q::Acquire { files } => engine
+                        .acquire_fd_publication(self.owner, files)
+                        .map(P::Admitted),
+                    Q::Publish { permit, batch } => engine
+                        .publish_fd_publication(self.owner, permit, &batch)
+                        .map(P::Published),
+                    Q::Acknowledge { permit, batch } => engine
+                        .acknowledge_fd_publication(self.owner, permit, &batch)
+                        .map(|()| P::Released),
+                    Q::ReleaseEmpty { permit } => engine
+                        .release_empty_fd_publication(self.owner, permit)
+                        .map(|()| P::Released),
+                }
+            }
+            .map_err(|error| Error::Tool(anyhow::anyhow!(error)))?;
+            if (publish && self.lose_after_publish) || (ack && self.lose_after_ack) {
+                std::future::pending::<()>().await;
+            }
+            Ok(result)
+        }
+    }
+    fn owner(tid: i32) -> NetworkStreamOwner {
+        NetworkStreamOwner {
+            thread: DetTid::from_raw(tid),
+            mm: MmId::initial(DetTid::from_raw(10)),
+        }
+    }
+    fn fixture() -> (
+        Arc<Mutex<FileMetadata>>,
+        Arc<Mutex<NetworkReplayEngine>>,
+        NetworkStreamOwner,
+        NetworkStreamOwner,
+    ) {
+        let first = owner(10);
+        let sibling = owner(11);
+        let mut engine =
+            NetworkReplayEngine::record(chrono::Utc.timestamp_opt(1_790_000_000, 0).unwrap());
+        engine.fd_publication_fixture_register(first, None);
+        engine.fd_publication_fixture_register(sibling, Some(first));
+        let mut metadata = FileMetadata::new(first.thread);
+        metadata.track_network_lifetime = true;
+        (
+            Arc::new(Mutex::new(metadata)),
+            Arc::new(Mutex::new(engine)),
+            first,
+            sibling,
+        )
+    }
+    fn install(
+        table: &Arc<Mutex<FileMetadata>>,
+        engine: &Arc<Mutex<NetworkReplayEngine>>,
+        owner: NetworkStreamOwner,
+        fd: i32,
+        ty: FdType,
+    ) -> u64 {
+        let mut table = table.lock().unwrap();
+        table
+            .add_fd(owner.thread, fd, OFlag::empty(), ty, None)
+            .unwrap();
+        let replacement = *table.pending_network_installations.last().unwrap();
+        let association = engine
+            .lock()
+            .unwrap()
+            .fd_publication_fixture_effect(owner, replacement);
+        table
+            .associate_network_installation(replacement.installation_generation, association)
+            .unwrap();
+        replacement.installation_generation
+    }
+    #[tokio::test]
+    async fn sibling_recovers_applied_prefix_after_publisher_cancellation_and_preserves_later_installation()
+     {
+        let (table, engine, first, sibling) = fixture();
+        let files = table.lock().unwrap().files_id;
+        let first_generation = install(&table, &engine, first, 7, FdType::Socket);
+        let ofd = table
+            .lock()
+            .unwrap()
+            .descriptor_binding(7)
+            .unwrap()
+            .open_file;
+        let mut lost = EngineRpcFixture {
+            engine: engine.clone(),
+            owner: first,
+            lose_after_publish: true,
+            lose_after_ack: false,
+        };
+        {
+            let future =
+                publish_network_installations_through(&table, files, first_generation, &mut lost);
+            let mut future = std::pin::pin!(future);
+            assert!(matches!(futures::poll!(future.as_mut()), Poll::Pending));
+            assert_eq!(
+                engine
+                    .lock()
+                    .unwrap()
+                    .fd_publication_fixture_cursor(sibling),
+                (1, first_generation)
+            );
+            assert_eq!(table.lock().unwrap().pending_network_installations.len(), 1);
+            // A real independently confirmed later installation is appended
+            // while the first reply is absent. It must not be drained by ACK1.
+            install(&table, &engine, sibling, 7, FdType::Regular);
+        }
+        engine.lock().unwrap().stream_owner_gone(first);
+        let through = table.lock().unwrap().next_slot_generation;
+        let mut rpc = EngineRpcFixture {
+            engine: engine.clone(),
+            owner: sibling,
+            lose_after_publish: false,
+            lose_after_ack: false,
+        };
+        publish_network_installations_through(&table, files, through, &mut rpc)
+            .await
+            .unwrap();
+        let table = table.lock().unwrap();
+        assert!(table.pending_network_installations.is_empty());
+        assert!(table.network_publication.in_flight.is_none());
+        assert!(table.network_publication.awaiting_global_ack.is_none());
+        assert_eq!(table.network_publication.acknowledged_sequence, 2);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .fd_publication_fixture_cursor(sibling),
+            (2, through)
+        );
+        assert!(
+            engine
+                .lock()
+                .unwrap()
+                .fd_publication_fixture_is_retired(ofd)
+        );
+        assert_eq!(table.file_handles[&7].ty(), FdType::Regular);
+    }
+    #[tokio::test]
+    async fn serialized_pending_prefix_rehydrates_against_global_permit_after_lost_publish_response()
+     {
+        let (table, engine, first, sibling) = fixture();
+        let files = table.lock().unwrap().files_id;
+        let through = install(&table, &engine, first, 7, FdType::Socket);
+        let mut lost = EngineRpcFixture {
+            engine: engine.clone(),
+            owner: first,
+            lose_after_publish: true,
+            lose_after_ack: false,
+        };
+        {
+            let mut future = std::pin::pin!(publish_network_installations_through(
+                &table, files, through, &mut lost
+            ));
+            assert!(matches!(futures::poll!(future.as_mut()), Poll::Pending));
+        }
+        let encoded = serde_json::to_value(&*table.lock().unwrap()).unwrap();
+        let decoded: FileMetadata = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            decoded.network_publication,
+            table.lock().unwrap().network_publication
+        );
+        let mut missing = encoded;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("network_publication");
+        assert!(serde_json::from_value::<FileMetadata>(missing).is_err());
+        engine.lock().unwrap().stream_owner_gone(first);
+        let restored = Arc::new(Mutex::new(decoded));
+        let mut rpc = EngineRpcFixture {
+            engine: engine.clone(),
+            owner: sibling,
+            lose_after_publish: false,
+            lose_after_ack: false,
+        };
+        publish_network_installations_through(&restored, files, through, &mut rpc)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .lock()
+                .unwrap()
+                .network_publication
+                .acknowledged_sequence,
+            1
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .fd_publication_fixture_cursor(sibling),
+            (1, through)
+        );
+        // A stale independent copy has not acquired publication authority merely
+        // because serde decoded it. The committed global cursor rejects it.
+        let admission = engine
+            .lock()
+            .unwrap()
+            .acquire_fd_publication(sibling, files)
+            .unwrap();
+        assert!(
+            table
+                .lock()
+                .unwrap()
+                .publication_snapshot(&admission)
+                .is_err()
+        );
+        engine
+            .lock()
+            .unwrap()
+            .release_empty_fd_publication(sibling, admission.permit)
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn lost_ack_response_is_reconciled_only_by_matching_global_cursor() {
+        let (table, engine, first, sibling) = fixture();
+        let files = table.lock().unwrap().files_id;
+        let through = install(&table, &engine, first, 7, FdType::Socket);
+        let mut lost = EngineRpcFixture {
+            engine: engine.clone(),
+            owner: first,
+            lose_after_publish: false,
+            lose_after_ack: true,
+        };
+        {
+            let mut future = std::pin::pin!(publish_network_installations_through(
+                &table, files, through, &mut lost
+            ));
+            assert!(matches!(futures::poll!(future.as_mut()), Poll::Pending));
+        }
+        assert!(
+            table
+                .lock()
+                .unwrap()
+                .network_publication
+                .awaiting_global_ack
+                .is_some()
+        );
+        engine.lock().unwrap().stream_owner_gone(first);
+        let mut rpc = EngineRpcFixture {
+            engine: engine.clone(),
+            owner: sibling,
+            lose_after_publish: false,
+            lose_after_ack: false,
+        };
+        publish_network_installations_through(&table, files, through, &mut rpc)
+            .await
+            .unwrap();
+        assert!(
+            table
+                .lock()
+                .unwrap()
+                .network_publication
+                .awaiting_global_ack
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .fd_publication_fixture_cursor(sibling),
+            (1, through)
+        );
+    }
+    #[test]
+    fn changed_effect_and_unknown_installation_are_rejected_before_publication() {
+        let (table, engine, first, _) = fixture();
+        install(&table, &engine, first, 7, FdType::Socket);
+        let mut table = table.lock().unwrap();
+        let exact = table.network_publication.effects[&1];
+        let mut wrong = exact;
+        wrong.returned_fd = 8;
+        assert!(table.associate_network_installation(1, wrong).is_err());
+        assert!(table.associate_network_installation(999, exact).is_err());
+        assert_eq!(table.network_publication.effects[&1], exact);
+    }
+    #[test]
+    fn fork_snapshot_rejects_pending_prefix_without_changing_it() {
+        let (table, engine, first, _) = fixture();
+        install(&table, &engine, first, 7, FdType::Socket);
+        let table = table.lock().unwrap();
+        let before = serde_json::to_vec(&*table).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.fork_for(DetTid::from_raw(12))
+        }));
+        assert!(result.is_err());
+        assert_eq!(serde_json::to_vec(&*table).unwrap(), before);
+    }
+}
+
+struct GuestFdPublicationRpc<'a, G, T> {
+    guest: &'a mut G,
+    tool: std::marker::PhantomData<fn() -> T>,
+}
+impl<G, T> NetworkFdPublicationRpc for GuestFdPublicationRpc<'_, G, T>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    async fn request(
+        &mut self,
+        request: NetworkFdPublicationRequest,
+    ) -> Result<NetworkFdPublicationReply, Error> {
+        use crate::tool_global::NetworkReply;
+        use crate::tool_global::NetworkRequest;
+        match crate::tool_global::network_request::<G, T>(
+            self.guest,
+            NetworkRequest::FdPublication(request),
+        )
+        .await
+        .map_err(|error| Error::Tool(error.into_error()))?
+        {
+            NetworkReply::FdPublication(reply) => Ok(reply),
+            _ => Err(fd_publication_error("unexpected publication RPC response")),
+        }
+    }
+}
+impl<T: RecordOrReplay> Detcore<T> {
+    /// Publish the prefix captured from this actual shared FileMetadata. The
+    /// caller must hold the separately admitted kernel table mutation/snapshot
+    /// boundary when it needs to prevent new installations after this prefix.
+    pub(crate) async fn publish_network_fd_installations<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), Error> {
+        let table = guest.thread_state().file_metadata.clone();
+        let (files, through) = {
+            let metadata = table.lock().unwrap();
+            if !metadata.track_network_lifetime {
+                return Ok(());
+            }
+            (metadata.files_id, metadata.next_slot_generation)
+        };
+        let mut rpc = GuestFdPublicationRpc::<G, T> {
+            guest,
+            tool: std::marker::PhantomData,
+        };
+        publish_network_installations_through(&table, files, through, &mut rpc).await
+    }
+}
+
+fn finish_fd_mutation_step<V>(
+    primary: Result<V, Error>,
+    cleanup: Result<(), Error>,
+) -> Result<V, Error> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(Error::Tool(primary)), Err(secondary)) => Err(Error::Tool(primary.context(format!(
+            "secondary descriptor mutation failure: {secondary:#}"
+        )))),
+        (Err(primary), Err(secondary)) => Err(Error::Tool(anyhow::Error::new(primary).context(
+            format!("secondary descriptor mutation failure: {secondary:#}"),
+        ))),
+    }
+}
+
+impl<T: RecordOrReplay> Detcore<T> {
+    async fn fd_mutation_request<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        request: crate::network_replay::NetworkFdMutationRequest,
+    ) -> Result<crate::network_replay::NetworkFdMutationReply, Error> {
+        match crate::tool_global::network_request(
+            guest,
+            crate::tool_global::NetworkRequest::FdMutation(request),
+        )
+        .await
+        .map_err(|error| Error::Tool(error.into_error()))?
+        {
+            crate::tool_global::NetworkReply::FdMutation(reply) => Ok(reply),
+            _ => Err(fd_publication_error("unexpected descriptor mutation reply")),
+        }
+    }
+
+    /// Bind local tracking only to the capability of its registered global table.
+    pub(crate) async fn initialize_network_fd_tracking<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), Error> {
+        if !self.cfg.network_trace.uses_trace()
+            || crate::network_replay::backend_fd_table_capability(&self.cfg).is_none()
+        {
+            return Ok(());
+        }
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let table = guest.thread_state().file_metadata.clone();
+        let files = table.lock().unwrap().files_id;
+        let P::Tracking(active) = self
+            .fd_mutation_request(guest, Q::Tracking { files })
+            .await?
+        else {
+            return Err(fd_publication_error("tracking response mismatch"));
+        };
+        let mut table = table.lock().unwrap();
+        if table.files_id != files {
+            return Err(fd_publication_error("tracking table changed"));
+        }
+        // No serde-default mutex/token can grant this authority. Normal backend
+        // construction returns false until the entire physical closure is ready.
+        table.track_network_lifetime = active;
+        Ok(())
+    }
+
+    /// Complete prior publication, then latch this physical operation before inject.
+    pub(crate) async fn begin_network_fd_mutation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        kind: crate::network_replay::NetworkFdMutationKind,
+    ) -> Result<Option<crate::network_replay::NetworkFdMutationAdmission>, Error> {
+        use crate::network_replay::NetworkFdMutationBegin as B;
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let table = guest.thread_state().file_metadata.clone();
+        let files = {
+            let table = table.lock().unwrap();
+            if !table.track_network_lifetime {
+                return Ok(None);
+            }
+            table.files_id
+        };
+        loop {
+            self.publish_network_fd_installations(guest).await?;
+            let kind = {
+                let table = table.lock().unwrap();
+                match &kind {
+                    crate::network_replay::NetworkFdMutationKind::Socket
+                    | crate::network_replay::NetworkFdMutationKind::Clone { .. }
+                    | crate::network_replay::NetworkFdMutationKind::Exec { .. } => kind.clone(),
+                    crate::network_replay::NetworkFdMutationKind::Alias {
+                        source_fd,
+                        kind,
+                        cloexec,
+                        destination,
+                        ..
+                    } => {
+                        let source = table.descriptor_binding(*source_fd).ok();
+                        if source.is_some_and(|binding| !binding.open_file.is_socket()) {
+                            return Err(fd_publication_error(
+                                "active backend admitted an unjoined regular-source alias route",
+                            ));
+                        }
+                        crate::network_replay::NetworkFdMutationKind::Alias {
+                            source_fd: *source_fd,
+                            source,
+                            kind: *kind,
+                            cloexec: *cloexec,
+                            destination: *destination,
+                            replaced: destination.and_then(|fd| table.network_descriptor_slot(fd)),
+                        }
+                    }
+                }
+            };
+            let P::Begin(reply) = self
+                .fd_mutation_request(
+                    guest,
+                    Q::Begin {
+                        files,
+                        kind: kind.clone(),
+                    },
+                )
+                .await?
+            else {
+                return Err(fd_publication_error("mutation admission response mismatch"));
+            };
+            let admission = match reply {
+                B::Recover | B::Refresh => continue,
+                B::Dormant => {
+                    return Err(fd_publication_error("enrolled table lost global authority"));
+                }
+                B::Admitted(value) => value,
+            };
+            {
+                let table = table.lock().unwrap();
+                if table.files_id != files || admission.kind != kind {
+                    return Err(fd_publication_error(
+                        "mutation admission changed table or syscall",
+                    ));
+                }
+            }
+            if self
+                .fd_mutation_request(
+                    guest,
+                    Q::Submit {
+                        permit: admission.publication.permit,
+                    },
+                )
+                .await?
+                != P::Unit
+            {
+                return Err(fd_publication_error(
+                    "physical submission was not acknowledged",
+                ));
+            }
+            return Ok(Some(admission));
+        }
+    }
+
+    /// Record actual kernel completion before any metadata/profile await. A
+    /// known failed allocation releases admission without creating an alias.
+    pub(crate) async fn observe_network_fd_result<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: Option<&crate::network_replay::NetworkFdMutationAdmission>,
+        result: Result<i64, Errno>,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let Some(admission) = admission else {
+            return result.map_err(Error::from);
+        };
+        let permit = admission.publication.permit;
+        let observation = self
+            .fd_mutation_request(
+                guest,
+                Q::KernelResult {
+                    permit,
+                    result: result.map_err(|errno| errno.into_raw()),
+                },
+            )
+            .await
+            .and_then(|reply| {
+                if reply == P::Unit {
+                    Ok(())
+                } else {
+                    Err(fd_publication_error(
+                        "physical completion was not acknowledged",
+                    ))
+                }
+            });
+        let value = finish_fd_mutation_step(result.map_err(Error::from), observation);
+        if result.is_err() && value.is_err() {
+            let cleanup = self
+                .fd_mutation_request(guest, Q::Unchanged { permit })
+                .await
+                .and_then(|reply| {
+                    if reply == P::Unit {
+                        Ok(())
+                    } else {
+                        Err(fd_publication_error(
+                            "failed allocation release was not acknowledged",
+                        ))
+                    }
+                });
+            return finish_fd_mutation_step(value, cleanup);
+        }
+        value
+    }
+
+    /// Publish a protected local installation using the permit acquired before
+    /// the physical syscall. Never reacquire a different permit after creation.
+    pub(crate) async fn complete_network_fd_installation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: Option<&crate::network_replay::NetworkFdMutationAdmission>,
+        returned_fd: RawFd,
+    ) -> Result<(), Error> {
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let Some(admission) = admission else {
+            return Ok(());
+        };
+        let table = guest.thread_state().file_metadata.clone();
+        let change = {
+            let table = table.lock().unwrap();
+            *table
+                .pending_network_installations
+                .last()
+                .filter(|change| {
+                    change.files == admission.publication.permit.files
+                        && change
+                            .after
+                            .is_some_and(|s| s.binding.slot.fd == returned_fd)
+                })
+                .ok_or_else(|| fd_publication_error("missing exact completed installation"))?
+        };
+        let P::Installation(effect) = self
+            .fd_mutation_request(
+                guest,
+                Q::Installation {
+                    permit: admission.publication.permit,
+                    change,
+                },
+            )
+            .await?
+        else {
+            return Err(fd_publication_error("installation receipt mismatch"));
+        };
+        let batch = {
+            let mut table = table.lock().unwrap();
+            table.associate_network_installation(change.installation_generation, effect)?;
+            table.publication_snapshot(&admission.publication)?
+        };
+        let mut rpc = GuestFdPublicationRpc::<G, T> {
+            guest,
+            tool: std::marker::PhantomData,
+        };
+        if rpc
+            .request(NetworkFdPublicationRequest::Publish {
+                permit: admission.publication.permit,
+                batch: batch.clone(),
+            })
+            .await?
+            != NetworkFdPublicationReply::Published(batch.clone())
+        {
+            return Err(fd_publication_error(
+                "completed installation publication changed",
+            ));
+        }
+        table.lock().unwrap().publication_acknowledge(&batch)?;
+        if rpc
+            .request(NetworkFdPublicationRequest::Acknowledge {
+                permit: admission.publication.permit,
+                batch: batch.clone(),
+            })
+            .await?
+            != NetworkFdPublicationReply::Released
+        {
+            return Err(fd_publication_error("completed installation ACK changed"));
+        }
+        table
+            .lock()
+            .unwrap()
+            .publication_server_acknowledge(&batch)?;
+        Ok(())
+    }
+}
+
+impl<T: RecordOrReplay> Detcore<T> {
+    /// One real alias syscall, with the physical result separated from metadata
+    /// publication. The source is captured only after table/OFD admission.
+    pub(crate) async fn network_fd_alias_syscall<G, C>(
+        &self,
+        guest: &mut G,
+        call: C,
+        source_fd: RawFd,
+        destination: Option<RawFd>,
+        flags: OFlag,
+        kind: crate::network_replay::NetworkFdInstallKind,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        C: Into<reverie::syscalls::Syscall>,
+    {
+        use crate::network_replay::NetworkFdMutationKind;
+        use crate::network_replay::NetworkFdMutationReply as P;
+        use crate::network_replay::NetworkFdMutationRequest as Q;
+        let admission = self
+            .begin_network_fd_mutation(
+                guest,
+                NetworkFdMutationKind::Alias {
+                    source_fd,
+                    source: None,
+                    kind,
+                    cloexec: flags.contains(OFlag::O_CLOEXEC),
+                    destination,
+                    replaced: None,
+                },
+            )
+            .await?;
+        let table = guest.thread_state().file_metadata.clone();
+        let captured = if admission.is_some() {
+            table.lock().unwrap().capture_fd(source_fd).ok()
+        } else {
+            None
+        };
+        let physical = self.record_or_replay(guest, call.into()).await;
+        let returned = self
+            .observe_network_fd_result(guest, admission.as_ref(), physical)
+            .await?;
+        let newfd = RawFd::try_from(returned)
+            .map_err(|_| fd_publication_error("kernel returned out-of-range descriptor"))?;
+        let Some(admission) = admission else {
+            let replaced = guest.thread_state_mut().dup_fd(source_fd, newfd, flags)?;
+            if let Some(open_file) = replaced {
+                self.release_port_for_open_file(guest, open_file).await;
+            }
+            return Ok(returned);
+        };
+        if kind == crate::network_replay::NetworkFdInstallKind::Dup2 && source_fd == newfd {
+            if self
+                .fd_mutation_request(
+                    guest,
+                    Q::Unchanged {
+                        permit: admission.publication.permit,
+                    },
+                )
+                .await?
+                != P::Unit
+            {
+                return Err(fd_publication_error("same-FD dup2 completion mismatch"));
+            }
+            return Ok(returned);
+        }
+        let captured = captured.ok_or_else(|| {
+            fd_publication_error(
+                "successful duplicate has no admitted source metadata; result remains unresolved",
+            )
+        })?;
+        table
+            .lock()
+            .unwrap()
+            .install_captured_fd(captured, newfd, flags)
+            .map_err(|_| fd_publication_error("admitted duplicate changed descriptor table"))?;
+        // Retirement is derived and committed inside the engine; the captured
+        // metadata Arc is not an alias counter or permission to call Retire.
+        self.complete_network_fd_installation(guest, Some(&admission), newfd)
+            .await?;
+        Ok(returned)
+    }
 }

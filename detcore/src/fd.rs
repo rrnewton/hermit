@@ -178,6 +178,24 @@ struct OpenFileDescription {
     flock_mode_ever_known: bool,
 }
 
+/// Opaque retained reference to one Linux open file description.
+///
+/// SCM_RIGHTS snapshots carry this handle rather than a raw fd so installation
+/// in another descriptor slot preserves the same status flags, offsets,
+/// identity, and lifetime as `dup`/`fork`.
+#[derive(Debug, Clone)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct OpenFileDescriptionRef {
+    open_file: Arc<Mutex<OpenFileDescription>>,
+}
+
+impl OpenFileDescriptionRef {
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn open_file_id(&self) -> OpenFileId {
+        self.open_file.lock().expect("open file mutex poisoned").id
+    }
+}
+
 impl PartialEq for DetFd {
     fn eq(&self, other: &Self) -> bool {
         self.fd == other.fd
@@ -327,6 +345,38 @@ impl DetFd {
     /// Stable identity shared by dup and fork aliases.
     pub fn open_file_id(&self) -> OpenFileId {
         self.description().id
+    }
+
+    /// Retain this descriptor's open file description for SCM_RIGHTS transfer.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn open_file_description_ref(&self) -> OpenFileDescriptionRef {
+        OpenFileDescriptionRef {
+            open_file: Arc::clone(&self.open_file),
+        }
+    }
+
+    /// Create a descriptor slot referring to a retained open file description.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn from_open_file_description(
+        fd: RawFd,
+        flags: OFlag,
+        description: OpenFileDescriptionRef,
+    ) -> Self {
+        Self {
+            fd,
+            fd_flags: flags.bits() & OFlag::O_CLOEXEC.bits(),
+            open_file: description.open_file,
+        }
+    }
+
+    /// Stable network identity for this open-file description.
+    ///
+    /// Every dup/fork alias returns the same value. A later socket reusing the
+    /// same numeric fd receives a distinct value, so network replay must use
+    /// this identity rather than the raw descriptor number.
+    pub fn socket_open_file_id(&self) -> Option<OpenFileId> {
+        let description = self.description();
+        (description.ty == FdType::Socket).then_some(description.id)
     }
 
     /// Number of modeled descriptor slots that retain this open file description.
@@ -665,6 +715,11 @@ mod tests {
         let duplicate = original.clone().with_fd(4).with_fd_flags(OFlag::O_CLOEXEC);
 
         assert_eq!(original.open_file_id(), duplicate.open_file_id());
+        assert_eq!(
+            original.socket_open_file_id(),
+            duplicate.socket_open_file_id(),
+            "network identity belongs to the shared OFD, not either fd slot"
+        );
         assert!(
             !original.is_cloexec(),
             "dup must not alter the source fd flags"

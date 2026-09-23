@@ -30,8 +30,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 use std::vec::IntoIter;
 
+use detcore_model::fd::OpenFileId;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
@@ -74,9 +76,12 @@ use crate::config::Config;
 use crate::config::RunsPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
+use crate::network_replay::NetworkEngineMode;
+use crate::network_replay::NetworkReplayEngine;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::read_trace;
 use crate::resources::ExternalOpId;
+use crate::resources::NetworkWaitKind;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -305,6 +310,22 @@ pub struct BlockedPool {
     /// re-admitted to the run queue. Their `InboundSignal` turn must now be
     /// granted rather than deferred again on the turn the scheduler selects them.
     pub sigchld_ready: BTreeSet<DetTid>,
+
+    /// Replay waiters keyed by stable open-file description.  Multiple dup/fork
+    /// aliases may wait on the same socket; readiness wakes all eligible
+    /// threads and the normal scheduler order decides which one consumes it.
+    pub network_waiters: BTreeMap<DetTid, Vec<(OpenFileId, NetworkWaitKind)>>,
+    /// A blocked syscall owns the actual call reference, not a recycled fd/OFD lookup.
+    network_call_waiters: BTreeMap<
+        DetTid,
+        (
+            crate::network_replay::NetworkStreamOwner,
+            Vec<(crate::network_replay::NetworkStreamCallId, NetworkWaitKind)>,
+        ),
+    >,
+    /// Exact recv(0) receipts, a subset of active-call waiters. Arrival rather
+    /// than readable level decides their wake, including positive peek offsets.
+    zero_stream_waiters: BTreeMap<DetTid, crate::network_replay::NetworkZeroStreamWaitId>,
 }
 
 impl BlockedPool {
@@ -318,13 +339,18 @@ impl BlockedPool {
             && self.external_io_blockers.is_empty()
             && self.rt_sigsuspend_blockers.is_empty()
             && self.sigchld_deferred.is_empty()
+            && self.network_waiters.is_empty()
+            && self.network_call_waiters.is_empty()
+            && self.zero_stream_waiters.is_empty()
     }
 
     /// True if there are no runnable threads, and the only blocked ones are externally-blocked.
     fn only_external_blocked(&self) -> bool {
         let has_external_wait = !self.external_io_blockers.is_empty()
             || !self.child_waiters.is_empty()
-            || !self.physical_child_waiters.is_empty();
+            || !self.physical_child_waiters.is_empty()
+            || !self.network_waiters.is_empty()
+            || !self.network_call_waiters.is_empty();
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
             && self.physical_child_ready.is_empty()
@@ -552,6 +578,19 @@ pub struct Scheduler {
 
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
+
+    /// The same run-global engine used by syscall RPCs.  The scheduler only
+    /// releases virtual-time-gated input and observes readiness; it never
+    /// consumes bytes on behalf of a thread.
+    network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
+
+    /// Typed subset of `blocked.external_io_blockers`. Only live network
+    /// capture introduces host elapsed time; replay and ordinary IO do not.
+    network_capture_blockers: BTreeMap<DetTid, ExternalOpId>,
+
+    /// Last monotonic sample while no guest was runnable and network capture
+    /// remained in the kernel. Closed before admitting runnable guest work.
+    network_capture_idle_since: Option<Instant>,
 
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
@@ -1674,6 +1713,9 @@ impl Scheduler {
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             blocked: Default::default(),
+            network_engine: None,
+            network_capture_blockers: BTreeMap::new(),
+            network_capture_idle_since: None,
             vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
@@ -1715,6 +1757,21 @@ impl Scheduler {
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
         }
+    }
+
+    /// Install the run-global capture/replay engine before the scheduler task
+    /// starts.  Every clone points at the same mutex-protected state machine.
+    pub(crate) fn set_network_engine(&mut self, engine: Option<Arc<Mutex<NetworkReplayEngine>>>) {
+        assert!(
+            self.network_engine.is_none(),
+            "network engine installed twice"
+        );
+        self.network_engine = engine;
+    }
+
+    /// Detach the scheduler's engine reference during terminal finalization.
+    pub(crate) fn take_network_engine(&mut self) -> Option<Arc<Mutex<NetworkReplayEngine>>> {
+        self.network_engine.take()
     }
 
     /// Record a newly created thread for happens-before `spawn_ordinal`
@@ -2414,13 +2471,19 @@ impl Scheduler {
     /// Remove entries from everywhere that non-runnable threads lurk.
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.blocked.timed_waiters.remove(*dtid);
-        let _ = self.blocked.external_io_blockers.remove(dtid);
+        let external = self.blocked.external_io_blockers.remove(dtid);
+        if let Some(capture) = self.network_capture_blockers.remove(dtid) {
+            assert_eq!(external, Some(capture));
+        }
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
+        self.blocked.network_waiters.remove(dtid);
+        self.blocked.network_call_waiters.remove(dtid);
+        self.blocked.zero_stream_waiters.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
             waiters.remove(dtid);
             !waiters.is_empty()
@@ -2669,12 +2732,145 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         self.step2_drain_prefix()?;
         self.step2b_process_timed();
+        self.step2_network_replay_ready()?;
         if self.backend_failed() || self.control_barrier() {
             return Err(SkipTurn);
         }
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    fn network_wait_is_ready(
+        engine: &NetworkReplayEngine,
+        open_file: OpenFileId,
+        kind: NetworkWaitKind,
+    ) -> Result<bool, crate::network_replay::NetworkReplayError> {
+        if let NetworkWaitKind::ReadableAtLeast(minimum) = kind {
+            return engine.stream_ready_at_least(open_file, minimum);
+        }
+        if let NetworkWaitKind::PollReadableAtLeast(minimum) = kind {
+            return engine.poll_readable_at_least(open_file, minimum);
+        }
+        if kind == NetworkWaitKind::PollReadable {
+            return engine.poll_readable(open_file);
+        }
+        if kind == NetworkWaitKind::Terminal {
+            return engine.terminal_readiness(open_file);
+        }
+        if kind == NetworkWaitKind::ReceiveHalfClosed {
+            return engine.receive_half_closed(open_file);
+        }
+        let readiness = engine.readiness(open_file)?;
+        Ok(match kind {
+            NetworkWaitKind::Readable => readiness.readable || readiness.error || readiness.hangup,
+            NetworkWaitKind::Writable => readiness.writable || readiness.error || readiness.hangup,
+            NetworkWaitKind::Any => !readiness.is_empty(),
+            NetworkWaitKind::ReadableAtLeast(_)
+            | NetworkWaitKind::PollReadableAtLeast(_)
+            | NetworkWaitKind::PollReadable
+            | NetworkWaitKind::Terminal
+            | NetworkWaitKind::ReceiveHalfClosed => unreachable!(),
+        })
+    }
+
+    /// Release trace events whose exact virtual-time and outbound-progress
+    /// gates are satisfied, then wake every eligible waiter.  No bytes are
+    /// consumed here: after ordinary scheduling, the winning syscall consumes
+    /// them and any losing reader re-parks if availability is exhausted.
+    fn step2_network_replay_ready(&mut self) -> Result<(), SkipTurn> {
+        assert!(
+            self.blocked
+                .zero_stream_waiters
+                .keys()
+                .all(|tid| self.blocked.network_call_waiters.contains_key(tid))
+        );
+        if self.blocked.network_waiters.is_empty() && self.blocked.network_call_waiters.is_empty() {
+            return Ok(());
+        }
+        let Some(engine) = &self.network_engine else {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                "network waiter registered without a capture/replay engine".to_owned()
+            });
+            return Err(SkipTurn);
+        };
+        let ready = {
+            let mut engine = engine.lock().unwrap();
+            if engine.mode() == NetworkEngineMode::Replay
+                && let Err(error) = engine.release_eligible(self.committed_time)
+            {
+                self.terminal_deadlock
+                    .get_or_insert_with(|| format!("network replay release failed: {error}"));
+                return Err(SkipTurn);
+            }
+            let mut ready = Vec::new();
+            for (&dettid, interests) in &self.blocked.network_waiters {
+                let mut any_ready = false;
+                for &(open_file, kind) in interests {
+                    match Self::network_wait_is_ready(&engine, open_file, kind) {
+                        Ok(true) => {
+                            any_ready = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.terminal_deadlock.get_or_insert_with(|| {
+                                format!(
+                                    "network replay readiness failed for {open_file:?}: {error}"
+                                )
+                            });
+                            return Err(SkipTurn);
+                        }
+                    }
+                }
+                if any_ready {
+                    ready.push(dettid);
+                }
+            }
+            for (&dettid, (owner, interests)) in &self.blocked.network_call_waiters {
+                if !self.rpc_incarnation_matches(dettid, owner.mm)
+                    || self.thread_is_logically_killed(dettid)
+                {
+                    self.terminal_deadlock
+                        .get_or_insert_with(|| "stale network call wait owner".to_owned());
+                    return Err(SkipTurn);
+                }
+                let readiness = if let Some(id) = self.blocked.zero_stream_waiters.get(&dettid) {
+                    engine
+                        .zero_stream_wait_ready(*owner, *id)
+                        .map(|ready| vec![ready])
+                } else {
+                    interests
+                        .iter()
+                        .map(|&(call, kind)| {
+                            engine
+                                .stream_call_open_file(*owner, call)
+                                .and_then(|ofd| Self::network_wait_is_ready(&engine, ofd, kind))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                match readiness {
+                    Ok(values) if values.iter().any(|value| *value) => ready.push(dettid),
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network active-call readiness failed: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                }
+            }
+            ready
+        };
+        for dettid in ready {
+            let legacy = self.blocked.network_waiters.remove(&dettid).is_some();
+            let active = self.blocked.network_call_waiters.remove(&dettid).is_some();
+            self.blocked.zero_stream_waiters.remove(&dettid);
+            assert!(legacy ^ active);
+            self.blocked.timed_waiters.remove(dettid);
+            self.runqueue_push_back(dettid);
+        }
+        Ok(())
     }
 
     /// Re-admit parents whose host-async `SIGCHLD` was parked in
@@ -2989,6 +3185,9 @@ impl Scheduler {
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
+        self.blocked.network_waiters.remove(&dettid);
+        self.blocked.network_call_waiters.remove(&dettid);
+        self.blocked.zero_stream_waiters.remove(&dettid);
         let futex_timed_out = {
             let next_turn = self
                 .next_turns
@@ -3017,9 +3216,9 @@ impl Scheduler {
         self.runqueue_push_front(dettid);
     }
 
-    /// Send a signal to the guest. A scheduler-parked thread is made runnable immediately. SaBRe
-    /// external syscalls remain blocked until the signal interrupts them and their real
-    /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
+    /// Send a signal to the guest. A scheduler-parked thread is made runnable immediately.
+    /// On every backend, physical external syscalls retain their operation until
+    /// an actual inbound-signal or continuation request becomes visible.
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
@@ -3102,8 +3301,11 @@ impl Scheduler {
         // scheduler and must await its own continuation.
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
-        let await_external_continuation =
-            self.backend_reports_physical_process_exits && has_external_blocker;
+        // Physical IO owns its next request on every backend. Sending a signal
+        // does not prove the kernel operation has stopped: wait for the real
+        // InboundSignal or matching continuation rather than counterfeiting a
+        // scheduler request while its syscall future is still running.
+        let await_external_continuation = has_external_blocker;
         if cfg!(debug_assertions) && !await_external_continuation {
             let nxtturn = self
                 .next_turns
@@ -3315,6 +3517,9 @@ impl Scheduler {
                         ready_dtid
                     );
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
+                    if let Some(capture) = scheduler.network_capture_blockers.remove(ready_dtid) {
+                        assert_eq!(external, Some(capture));
+                    }
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
                     assert!(
                         external.is_some() ^ sigsuspend.is_some(),
@@ -3709,10 +3914,27 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        if self.network_capture_idle_since.is_some() && !self.network_capture_is_idle() {
+            // Harvesting a real continuation (or admitting another guest) ends
+            // the idle interval. Pay its final elapsed portion before that
+            // guest can run, then revisit due timers with the updated clock.
+            let mut time = global_time.lock().unwrap();
+            self.sample_network_capture_clock(&mut time, Instant::now());
+            return Err(SkipTurn);
+        }
+        if self.network_capture_is_idle() {
+            // `bump_global_time` samples elapsed time even when IO maintenance
+            // returns early. Never jump to a future alarm while a real capture
+            // can still complete first; elapsed alarms remain eligible in 2b.
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
         let timed_empty = self.blocked.timed_waiters.is_empty();
         let external_waits_empty = self.blocked.external_io_blockers.is_empty()
             && self.blocked.child_waiters.is_empty()
-            && self.blocked.physical_child_waiters.is_empty();
+            && self.blocked.physical_child_waiters.is_empty()
+            && self.blocked.network_waiters.is_empty()
+            && self.blocked.network_call_waiters.is_empty();
         let rt_sigsuspend_empty = self.blocked.rt_sigsuspend_blockers.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
 
@@ -3727,6 +3949,59 @@ impl Scheduler {
                 );
                 std::thread::yield_now();
                 return Err(SkipTurn);
+            }
+            if !self.blocked.network_waiters.is_empty()
+                || !self.blocked.network_call_waiters.is_empty()
+            {
+                let next_network = self
+                    .network_engine
+                    .as_ref()
+                    .and_then(|engine| {
+                        let engine = engine.lock().unwrap();
+                        (engine.mode() == NetworkEngineMode::Replay)
+                            .then(|| engine.next_release_time())
+                    })
+                    .transpose();
+                let next_network = match next_network {
+                    Ok(next) => next.flatten(),
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network replay release-time lookup failed: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                };
+                let next_timer = self.blocked.timed_waiters.next_deadline();
+                if let Some(deadline) = next_network
+                    && !deadline.is_indefinite()
+                    && next_timer.is_none_or(|timer| deadline <= timer)
+                {
+                    let mut gt = global_time.lock().unwrap();
+                    let now = gt.as_nanos();
+                    if deadline > now {
+                        let delta = deadline.duration_since(now);
+                        info!(
+                            "[scheduler] advancing continuous virtual time exactly to network release {}",
+                            deadline
+                        );
+                        gt.add_extra_time(delta);
+                        return Err(SkipTurn);
+                    }
+                    drop(gt);
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        format!(
+                            "network replay waiter remained blocked at eligible release time {deadline}"
+                        )
+                    });
+                    return Err(SkipTurn);
+                }
+                if next_network.is_none() && timed_empty {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network replay wait cannot be satisfied by time or outbound progress"
+                            .to_owned()
+                    });
+                    return Err(SkipTurn);
+                }
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && external_waits_empty && rt_sigsuspend_empty {
@@ -4075,6 +4350,7 @@ impl Scheduler {
 
             // Thread BEGINS a blocking syscall outside the runnable set.
             ResourceID::BlockingExternalIO(op_id)
+            | ResourceID::BlockingNetworkCapture(op_id)
             | ResourceID::BlockingVfork(op_id)
             | ResourceID::BlockingRtSigsuspend(op_id) => {
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
@@ -4119,6 +4395,13 @@ impl Scheduler {
                     self.blocked.external_io_blockers.insert(dettid, *op_id)
                 };
                 assert!(old.is_none(), "thread started a second external operation");
+                if matches!(rid, ResourceID::BlockingNetworkCapture(_)) {
+                    assert!(
+                        self.network_capture_blockers
+                            .insert(dettid, *op_id)
+                            .is_none()
+                    );
+                }
                 Err(SkipTurn)
             }
 
@@ -4171,6 +4454,183 @@ impl Scheduler {
                         self.wake_physical_child_waiters(*child);
                     }
                     skipped
+                }
+            }
+
+            ResourceID::NetworkWait { open_file, kind } => {
+                let Some(engine) = self.network_engine.as_ref() else {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network wait requested without a capture/replay engine".to_owned()
+                    });
+                    return Err(SkipTurn);
+                };
+                let readiness =
+                    match Self::network_wait_is_ready(&engine.lock().unwrap(), *open_file, *kind) {
+                        Ok(readiness) => readiness,
+                        Err(error) => {
+                            self.terminal_deadlock.get_or_insert_with(|| {
+                                format!(
+                                    "network replay readiness failed for {open_file:?}: {error}"
+                                )
+                            });
+                            return Err(SkipTurn);
+                        }
+                    };
+                if readiness {
+                    Ok(())
+                } else {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, parking dettid {} for network OFD {:?} {:?}",
+                        self.turn, dettid, open_file, kind
+                    );
+                    assert!(
+                        self.blocked
+                            .network_waiters
+                            .insert(dettid, vec![(*open_file, *kind)])
+                            .is_none()
+                    );
+                    self.skip_turn_blocked(dettid)
+                }
+            }
+
+            ResourceID::NetworkWaitSet {
+                interests,
+                deadline,
+            } => {
+                let Some(engine) = self.network_engine.as_ref() else {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network wait set requested without a capture/replay engine".to_owned()
+                    });
+                    return Err(SkipTurn);
+                };
+                let readiness = {
+                    let engine = engine.lock().unwrap();
+                    interests
+                        .iter()
+                        .map(|&(open_file, kind)| {
+                            Self::network_wait_is_ready(&engine, open_file, kind)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let ready = match readiness {
+                    Ok(readiness) => readiness.into_iter().any(|ready| ready),
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network replay wait-set readiness failed: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                };
+                if ready || deadline.is_some_and(|deadline| deadline <= self.committed_time) {
+                    Ok(())
+                } else {
+                    assert!(!interests.is_empty());
+                    assert!(
+                        self.blocked
+                            .network_waiters
+                            .insert(dettid, interests.clone())
+                            .is_none()
+                    );
+                    if let Some(deadline) = deadline {
+                        self.blocked.timed_waiters.insert(*deadline, dettid);
+                    }
+                    self.skip_turn_blocked(dettid)
+                }
+            }
+
+            ResourceID::NetworkCallWaitSet {
+                interests,
+                deadline,
+                zero_wait,
+            } => {
+                let Some(origin) = self
+                    .next_turns
+                    .get(&dettid)
+                    .and_then(|turn| turn.protocol.origin.as_ref())
+                else {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network call wait lacks authenticated MM".to_owned()
+                    });
+                    return Err(SkipTurn);
+                };
+                let owner = crate::network_replay::NetworkStreamOwner {
+                    thread: dettid,
+                    mm: origin.mm,
+                };
+                let Some(engine) = self.network_engine.clone() else {
+                    self.terminal_deadlock
+                        .get_or_insert_with(|| "network call wait lacks engine".to_owned());
+                    return Err(SkipTurn);
+                };
+                let ready = {
+                    let engine = engine.lock().unwrap();
+                    if let Some(id) = zero_wait {
+                        engine.zero_stream_wait_call(owner, *id).and_then(|call| {
+                            if interests.len() != 1 || interests[0].0 != call {
+                                return Err(crate::network_replay::NetworkReplayError::ZeroStreamWaitCallMismatch(*id));
+                            }
+                            engine.zero_stream_wait_ready(owner, *id).map(|ready| vec![ready])
+                        })
+                    } else {
+                        interests
+                            .iter()
+                            .map(|&(call, kind)| {
+                                engine
+                                    .stream_call_open_file(owner, call)
+                                    .and_then(|ofd| Self::network_wait_is_ready(&engine, ofd, kind))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    }
+                };
+                let ready = match ready {
+                    Ok(values) => values.into_iter().any(|value| value),
+                    Err(error) => {
+                        self.terminal_deadlock
+                            .get_or_insert_with(|| format!("network call wait failed: {error}"));
+                        return Err(SkipTurn);
+                    }
+                };
+                if deadline.is_some_and(|end| end <= self.committed_time)
+                    || !self.inbound_signals(dettid).is_empty()
+                {
+                    return Ok(());
+                }
+                // This is logical sk_wait_data entry after the canonical
+                // signal/deadline check. A tail change since the atomic empty
+                // decision can complete it immediately without parking.
+                if let Some(id) = zero_wait
+                    && let Err(error) = engine.lock().unwrap().enter_zero_stream_wait(owner, *id)
+                {
+                    self.terminal_deadlock
+                        .get_or_insert_with(|| format!("zero wait entry failed: {error}"));
+                    return Err(SkipTurn);
+                }
+                if ready {
+                    Ok(())
+                } else {
+                    assert!(!interests.is_empty());
+                    assert!(
+                        self.blocked
+                            .network_call_waiters
+                            .insert(dettid, (owner, interests.clone()))
+                            .is_none()
+                    );
+                    trace!(
+                        "[network-wait-parked] dtid={} mm={:?} interests={:?}",
+                        owner.thread, owner.mm, interests,
+                    );
+                    if let Some(id) = zero_wait {
+                        assert!(
+                            self.blocked
+                                .zero_stream_waiters
+                                .insert(dettid, *id)
+                                .is_none()
+                        );
+                    }
+                    if let Some(deadline) = deadline {
+                        self.blocked.timed_waiters.insert(*deadline, dettid);
+                    }
+                    self.skip_turn_blocked(dettid)
                 }
             }
 
@@ -4411,6 +4871,29 @@ impl Scheduler {
         }
     }
 
+    fn network_capture_is_idle(&self) -> bool {
+        self.run_queue.is_empty() && !self.network_capture_blockers.is_empty()
+    }
+
+    /// Capture is an external input boundary: only its genuinely idle elapsed
+    /// intervals enter virtual time. Replay uses recorded release times and
+    /// never starts this clock. An explicit sample also makes exact boundary
+    /// tests possible without sleeps or timing tolerances.
+    fn sample_network_capture_clock(&mut self, time: &mut GlobalTime, now: Instant) {
+        for (tid, operation) in &self.network_capture_blockers {
+            assert_eq!(self.blocked.external_io_blockers.get(tid), Some(operation));
+        }
+        if let Some(previous) = self.network_capture_idle_since.take() {
+            time.add_extra_time(
+                now.checked_duration_since(previous)
+                    .expect("monotonic network capture clock went backwards"),
+            );
+        }
+        if self.network_capture_is_idle() {
+            self.network_capture_idle_since = Some(now);
+        }
+    }
+
     /// Tick global logical time due to represent the work of the scheduler itself.
     /// Also, update committed time.
     /// Prerequisite: all threads are parked, with their time contributions frozen.
@@ -4441,6 +4924,10 @@ impl Scheduler {
         // frozen and we can read it without any race.
         let snapshot: LogicalTime = {
             let mut gtime = global_time.lock().unwrap();
+
+            if self.network_capture_idle_since.is_some() || self.network_capture_is_idle() {
+                self.sample_network_capture_clock(&mut gtime, Instant::now());
+            }
 
             if self.run_queue.is_empty() && self.blocked.only_external_blocked() {
                 // TODO(T112017687): rationalize the occurence of
@@ -4583,6 +5070,37 @@ impl Scheduler {
             &resp, &dtid
         );
         let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
+        if signals.is_empty() {
+            let record_wait = self.next_turns.get(&dtid).and_then(|turn| {
+                let origin = turn.protocol.origin.as_ref()?;
+                let request = turn.req.try_read()?;
+                let resources = request.as_ref().ok()?;
+                resources
+                    .resources
+                    .keys()
+                    .find_map(|resource| match resource {
+                        ResourceID::BlockingNetworkCapture(operation) => Some((
+                            crate::network_replay::NetworkStreamOwner {
+                                thread: dtid,
+                                mm: origin.mm,
+                            },
+                            *operation,
+                        )),
+                        _ => None,
+                    })
+            });
+            if let (Some((owner, operation)), Some(engine)) =
+                (record_wait, self.network_engine.as_ref())
+                && let Err(error) = engine
+                    .lock()
+                    .unwrap()
+                    .enter_record_zero_stream_wait(owner, operation)
+            {
+                self.terminal_deadlock
+                    .get_or_insert_with(|| format!("record zero-wait entry failed: {error}"));
+                return Err(SkipTurn);
+            }
+        }
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
@@ -5105,6 +5623,11 @@ impl Scheduler {
             if self.blocked.external_io_blockers.contains_key(&dtid) {
                 return ThreadStatus::NotRunning;
             }
+            if self.blocked.network_waiters.contains_key(&dtid)
+                || self.blocked.network_call_waiters.contains_key(&dtid)
+            {
+                return ThreadStatus::NotRunning;
+            }
             if self.blocked.rt_sigsuspend_blockers.contains_key(&dtid)
                 || self.blocked.child_waiters.contains_key(&dtid)
                 || self
@@ -5576,6 +6099,1927 @@ mod test {
         );
     }
 
+    fn threshold_network_fixture() -> (
+        Scheduler,
+        Arc<Mutex<NetworkReplayEngine>>,
+        DetTid,
+        OpenFileId,
+        LogicalTime,
+    ) {
+        use detcore_model::network_trace::NetworkChannelId;
+        use detcore_model::network_trace::NetworkChannelV2;
+        use detcore_model::network_trace::NetworkEndpointRoleV2;
+        use detcore_model::network_trace::NetworkTransportV2;
+        let config = Config::default();
+        let now = GlobalTime::new(&config).as_nanos();
+        let mut scheduler = Scheduler::new(&config);
+        let mut engine = NetworkReplayEngine::record(config.epoch);
+        let tid = DetTid::from_raw(191);
+        let ofd = OpenFileId::new_socket(tid, 0);
+        engine
+            .record_channel(NetworkChannelV2 {
+                id: NetworkChannelId(1),
+                transport: NetworkTransportV2::Tcp,
+                role: NetworkEndpointRoleV2::OutboundClient,
+                local_address: None,
+                peer_address: None,
+                accepted_from: None,
+            })
+            .unwrap();
+        engine.bind(ofd, NetworkChannelId(1)).unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+        scheduler.set_network_engine(Some(engine.clone()));
+        register_known_thread(&mut scheduler, tid);
+        (scheduler, engine, tid, ofd, now)
+    }
+
+    fn threshold_publish(
+        engine: &Arc<Mutex<NetworkReplayEngine>>,
+        ofd: OpenFileId,
+        now: LogicalTime,
+        offset: u64,
+        bytes: &[u8],
+    ) {
+        use detcore_model::network_trace::NetworkChannelId;
+        use detcore_model::network_trace::NetworkInputEventV2;
+        use detcore_model::network_trace::NetworkInputKindV2;
+        use detcore_model::network_trace::NetworkReleaseV2;
+        engine
+            .lock()
+            .unwrap()
+            .publish_ingress(
+                ofd,
+                NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel: NetworkChannelId(1),
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: now,
+                        after_transmitted_offset: 0,
+                    },
+                    event: NetworkInputKindV2::StreamBytes {
+                        stream_offset: offset,
+                        bytes: bytes.to_vec(),
+                    },
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn network_threshold_parks_below_target_then_reenters_actual_turn_selection() {
+        let (mut scheduler, engine, tid, ofd, now) = threshold_network_fixture();
+        threshold_publish(&engine, ofd, now, 0, b"a");
+        let resource = ResourceID::NetworkWait {
+            open_file: ofd,
+            kind: NetworkWaitKind::ReadableAtLeast(3),
+        };
+        let mut request = Resources::new(tid);
+        request.insert(resource.clone(), Permission::R);
+        let next = scheduler.next_turns.get(&tid).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        scheduler.runqueue_push_back(tid);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tid));
+        assert!(
+            scheduler
+                .block_for_one_resource(tid, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(scheduler.step2_network_replay_ready().is_ok());
+        assert!(scheduler.step3_peek().is_none());
+        assert_eq!(
+            scheduler.blocked.network_waiters.get(&tid),
+            Some(&vec![(ofd, NetworkWaitKind::ReadableAtLeast(3))])
+        );
+        assert!(scheduler.network_capture_blockers.is_empty());
+        threshold_publish(&engine, ofd, now, 1, b"bc");
+        assert!(scheduler.step2_network_replay_ready().is_ok());
+        assert!(scheduler.blocked.network_waiters.is_empty());
+        let (selected, _, response) = scheduler
+            .step3_peek()
+            .expect("threshold wake must enter real scheduler selection");
+        assert_eq!(selected, tid);
+        assert!(
+            scheduler
+                .block_for_one_resource(tid, &resource, &Permission::R, None, &response)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn network_call_threshold_keeps_admitted_ofd_after_final_alias_close() {
+        use crate::network_replay::NetworkSocketControlFinish;
+        use crate::network_replay::NetworkStreamOwner;
+        use crate::network_replay::NetworkStreamPinOutcome;
+        let (mut scheduler, engine, tid, ofd, now) = threshold_network_fixture();
+        let owner = NetworkStreamOwner {
+            thread: tid,
+            mm: MmId::initial(tid),
+        };
+        let call = {
+            let mut e = engine.lock().unwrap();
+            let control = e.begin_socket_controls(owner, vec![ofd]).unwrap()[0].1;
+            let call = e.begin_stream_call(owner, control).unwrap();
+            e.confirm_stream_call_pin(owner, call.id, NetworkStreamPinOutcome::Acquired)
+                .unwrap();
+            e.finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+                .unwrap();
+            call.id
+        };
+        scheduler.next_turns.get_mut(&tid).unwrap().protocol.origin =
+            Some(parked::ResourceOrigin {
+                rpc: parked::RpcOrigin::DirectRequestResources,
+                mm: owner.mm,
+                control: parked::ControlCapability::None,
+            });
+        threshold_publish(&engine, ofd, now, 0, b"a");
+        let resource = ResourceID::NetworkCallWaitSet {
+            interests: vec![(call, NetworkWaitKind::ReadableAtLeast(3))],
+            deadline: None,
+            zero_wait: None,
+        };
+        let mut request = Resources::new(tid);
+        request.insert(resource.clone(), Permission::R);
+        let next = scheduler.next_turns.get(&tid).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        scheduler.runqueue_push_back(tid);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tid));
+        assert!(
+            scheduler
+                .block_for_one_resource(tid, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(scheduler.step2_network_replay_ready().is_ok());
+        assert!(scheduler.step3_peek().is_none());
+        assert!(scheduler.blocked.network_waiters.is_empty());
+        assert_eq!(
+            scheduler.blocked.network_call_waiters.get(&tid),
+            Some(&(owner, vec![(call, NetworkWaitKind::ReadableAtLeast(3))]))
+        );
+        engine.lock().unwrap().retire_open_file(ofd);
+        assert!(
+            engine
+                .lock()
+                .unwrap()
+                .begin_socket_controls(owner, vec![ofd])
+                .is_err()
+        );
+        threshold_publish(&engine, ofd, now, 1, b"bc");
+        assert!(scheduler.step2_network_replay_ready().is_ok());
+        assert!(scheduler.blocked.network_call_waiters.is_empty());
+        let (selected, _, response) = scheduler
+            .step3_peek()
+            .expect("active call must reenter actual turn selection");
+        assert_eq!(selected, tid);
+        assert!(
+            scheduler
+                .block_for_one_resource(tid, &resource, &Permission::R, None, &response)
+                .is_ok()
+        );
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .stream_call_queue_status(owner, call)
+                .unwrap()
+                .queued_bytes,
+            3
+        );
+    }
+
+    #[test]
+    fn abandoned_network_delivery_is_terminal_for_scheduler_waiters() {
+        use crate::network_replay::NetworkStreamOwner;
+        let (mut scheduler, engine, tid, ofd, now) = threshold_network_fixture();
+        threshold_publish(&engine, ofd, now, 0, b"abc");
+        let owner = NetworkStreamOwner {
+            thread: DetTid::from_raw(192),
+            mm: MmId::initial(DetTid::from_raw(192)),
+        };
+        engine
+            .lock()
+            .unwrap()
+            .reserve_stream_chunk(owner, ofd, 3, 0)
+            .unwrap();
+        scheduler
+            .blocked
+            .network_waiters
+            .insert(tid, vec![(ofd, NetworkWaitKind::ReadableAtLeast(1))]);
+        assert!(scheduler.step2_network_replay_ready().is_ok());
+        assert!(!scheduler.run_queue.contains_tid(tid));
+        engine.lock().unwrap().stream_owner_gone(owner);
+        assert!(scheduler.step2_network_replay_ready().is_err());
+        assert!(
+            scheduler
+                .terminal_deadlock
+                .as_ref()
+                .unwrap()
+                .contains("UnresolvedStreamOperation")
+        );
+        assert!(!scheduler.run_queue.contains_tid(tid));
+    }
+
+    struct ZeroNetworkFixture {
+        scheduler: Scheduler,
+        engine: Arc<Mutex<NetworkReplayEngine>>,
+        owner: crate::network_replay::NetworkStreamOwner,
+        ofd: OpenFileId,
+        call: crate::network_replay::NetworkStreamCallId,
+        wait: crate::network_replay::NetworkZeroStreamWaitId,
+        now: LogicalTime,
+        operation: ExternalOpId,
+    }
+
+    fn zero_network_fixture() -> ZeroNetworkFixture {
+        use crate::network_replay::NetworkSocketControlFinish;
+        use crate::network_replay::NetworkStreamOwner;
+        use crate::network_replay::NetworkStreamPinOutcome;
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let (mut scheduler, engine, tid, ofd, now) = threshold_network_fixture();
+        let owner = NetworkStreamOwner {
+            thread: tid,
+            mm: MmId::initial(tid),
+        };
+        threshold_publish(&engine, ofd, now, 0, b"abc");
+        let operation = ExternalOpId::new(tid, 19);
+        let (call, wait) = {
+            let mut e = engine.lock().unwrap();
+            let control = e.begin_socket_controls(owner, vec![ofd]).unwrap()[0].1;
+            let call = e.begin_stream_call(owner, control).unwrap().id;
+            e.confirm_stream_call_pin(owner, call, NetworkStreamPinOutcome::Acquired)
+                .unwrap();
+            e.finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+                .unwrap();
+            let NetworkZeroStreamReceive::Waiting(wait) =
+                e.prepare_zero_stream_receive(owner, call, 8).unwrap()
+            else {
+                panic!("expected empty-at-offset wait")
+            };
+            assert_eq!(
+                e.begin_zero_stream_wait(owner, call, Some(operation))
+                    .unwrap(),
+                wait
+            );
+            (call, wait)
+        };
+        scheduler.next_turns.get_mut(&tid).unwrap().protocol.origin =
+            Some(parked::ResourceOrigin {
+                rpc: parked::RpcOrigin::DirectRequestResources,
+                mm: owner.mm,
+                control: parked::ControlCapability::None,
+            });
+        ZeroNetworkFixture {
+            scheduler,
+            engine,
+            owner,
+            ofd,
+            call,
+            wait,
+            now,
+            operation,
+        }
+    }
+
+    fn zero_network_request(f: &mut ZeroNetworkFixture) -> (ResourceID, Ivar<SchedResponse>) {
+        let resource = ResourceID::NetworkCallWaitSet {
+            interests: vec![(f.call, NetworkWaitKind::ReadableAtLeast(9))],
+            deadline: None,
+            zero_wait: Some(f.wait),
+        };
+        let mut request = Resources::new(f.owner.thread);
+        request.insert(resource.clone(), Permission::R);
+        request.set_signal_interrupt_errno(Errno::EINTR);
+        let next = f.scheduler.next_turns.get(&f.owner.thread).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        f.scheduler.runqueue_push_back(f.owner.thread);
+        (resource, response)
+    }
+
+    #[test]
+    fn zero_receive_tail_wakes_below_peek_offset_through_actual_turn_selection() {
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let mut f = zero_network_fixture();
+        let (resource, response) = zero_network_request(&mut f);
+        let turn_before = f.scheduler.turn;
+        let time_before = f.scheduler.committed_time;
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(
+                    f.owner.thread,
+                    &resource,
+                    &Permission::R,
+                    Some(libc::EINTR),
+                    &response
+                )
+                .is_err()
+        );
+        assert!(
+            f.engine
+                .lock()
+                .unwrap()
+                .zero_stream_wait_entered(f.owner, f.wait)
+                .unwrap()
+        );
+        assert_eq!(
+            f.scheduler.blocked.zero_stream_waiters.get(&f.owner.thread),
+            Some(&f.wait)
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        // skip_turn advances its attempt number but does not commit guest time.
+        assert_eq!(f.scheduler.turn, turn_before + 1);
+        assert!(response.try_read().is_none());
+        assert_eq!(f.scheduler.committed_time, time_before);
+        assert!(f.scheduler.network_capture_blockers.is_empty());
+        threshold_publish(&f.engine, f.ofd, f.now, 3, b"d");
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        let (selected, _, response) = f
+            .scheduler
+            .step3_peek()
+            .expect("tail arrival must enter real selection");
+        assert_eq!(selected, f.owner.thread);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(
+                    selected,
+                    &resource,
+                    &Permission::R,
+                    Some(libc::EINTR),
+                    &response
+                )
+                .is_ok()
+        );
+        let mut e = f.engine.lock().unwrap();
+        assert_eq!(
+            e.prepare_zero_stream_receive(f.owner, f.call, 8).unwrap(),
+            NetworkZeroStreamReceive::Ready
+        );
+        assert_eq!(
+            e.stream_call_queue_status(f.owner, f.call)
+                .unwrap()
+                .queued_bytes,
+            4
+        );
+        assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+    }
+
+    #[test]
+    fn zero_receive_signal_before_publication_before_park_and_after_park_keep_entry_distinct() {
+        for signal_phase in 0..3 {
+            let mut f = zero_network_fixture();
+            let tid = f.owner.thread;
+            let mut signal_request = Resources::new(tid);
+            signal_request.insert(
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                Permission::W,
+            );
+            signal_request.set_signal_interrupt_errno(Errno::EINTR);
+            let response;
+            if signal_phase == 0 {
+                // The backend publishes its pending signal before a wait resource.
+                let next = f.scheduler.next_turns.get(&tid).unwrap();
+                next.req.put(Ok(signal_request));
+                response = next.resp.clone();
+                f.scheduler.runqueue_push_back(tid);
+            } else {
+                let (resource, published_response) = zero_network_request(&mut f);
+                response = published_response;
+                if signal_phase == 2 {
+                    assert_eq!(f.scheduler.run_queue.tentative_pop_next(), Some(tid));
+                    assert!(
+                        f.scheduler
+                            .block_for_one_resource(
+                                tid,
+                                &resource,
+                                &Permission::R,
+                                Some(libc::EINTR),
+                                &response
+                            )
+                            .is_err()
+                    );
+                    // Exercise the actual parked-signal wake and subset cleanup.
+                    f.scheduler.wake_signaled_guest(tid, Signal::SIGUSR1);
+                } else {
+                    // The backend's inbound signal replaces a published request
+                    // before the scheduler selects or parks that request.
+                    f.scheduler.next_turns.get_mut(&tid).unwrap().req =
+                        Ivar::full(Ok(signal_request));
+                }
+            }
+            let (selected, request, _) = f.scheduler.step3_peek().unwrap();
+            assert_eq!(selected, tid);
+            assert_eq!(request.try_read().unwrap().unwrap().resources.len(), 1);
+            assert_eq!(
+                f.scheduler.inbound_signals(tid),
+                vec![SigWrapper::from(Signal::SIGUSR1)]
+            );
+            f.scheduler.unblock_guest(tid, &response).unwrap();
+            assert!(
+                matches!(response.try_read(), Some(SchedResponse::Signaled(Some(signals))) if signals == vec![SigWrapper::from(Signal::SIGUSR1)])
+            );
+            assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+            assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+            let mut e = f.engine.lock().unwrap();
+            assert_eq!(
+                e.zero_stream_wait_entered(f.owner, f.wait).unwrap(),
+                signal_phase == 2
+            );
+            if signal_phase == 2 {
+                assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+            } else {
+                e.cancel_zero_stream_wait(f.owner, f.wait).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn zero_receive_record_grant_enters_before_injection_but_pending_signal_does_not() {
+        for pending_signal in [false, true] {
+            let mut f = zero_network_fixture();
+            let tid = f.owner.thread;
+            let resource = if pending_signal {
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1))
+            } else {
+                ResourceID::BlockingNetworkCapture(f.operation)
+            };
+            let mut request = Resources::new(tid);
+            request.insert(resource.clone(), Permission::RW);
+            request.set_signal_interrupt_errno(Errno::EINTR);
+            let next = f.scheduler.next_turns.get(&tid).unwrap();
+            next.req.put(Ok(request));
+            let response = next.resp.clone();
+            f.scheduler.runqueue_push_back(tid);
+            assert_eq!(f.scheduler.run_queue.tentative_pop_next(), Some(tid));
+            if pending_signal {
+                assert!(
+                    f.scheduler
+                        .block_for_one_resource(
+                            tid,
+                            &resource,
+                            &Permission::RW,
+                            Some(libc::EINTR),
+                            &response
+                        )
+                        .is_ok()
+                );
+                f.scheduler.unblock_guest(tid, &response).unwrap();
+                assert!(matches!(
+                    response.try_read(),
+                    Some(SchedResponse::Signaled(_))
+                ));
+            } else {
+                assert!(
+                    f.scheduler
+                        .block_for_one_resource(
+                            tid,
+                            &resource,
+                            &Permission::RW,
+                            Some(libc::EINTR),
+                            &response
+                        )
+                        .is_err()
+                );
+                assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+                assert_eq!(
+                    f.scheduler.network_capture_blockers.get(&tid),
+                    Some(&f.operation)
+                );
+                // A signal in grant -> timer injection is after the semantic
+                // wait-entry point, even though physical ppoll has not begun.
+                assert!(
+                    f.engine
+                        .lock()
+                        .unwrap()
+                        .zero_stream_wait_entered(f.owner, f.wait)
+                        .unwrap()
+                );
+                let mut signal = Resources::new(tid);
+                signal.insert(
+                    ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                    Permission::W,
+                );
+                let next = f.scheduler.next_turns.get_mut(&tid).unwrap();
+                next.req.put(Ok(signal));
+                let continuation = next.resp.clone();
+                assert!(f.scheduler.step2c_process_io_blockers().is_ok());
+                assert_eq!(f.scheduler.step3_peek().unwrap().0, tid);
+                f.scheduler.unblock_guest(tid, &continuation).unwrap();
+                assert!(matches!(
+                    continuation.try_read(),
+                    Some(SchedResponse::Signaled(_))
+                ));
+            }
+            let mut e = f.engine.lock().unwrap();
+            assert_eq!(
+                e.zero_stream_wait_entered(f.owner, f.wait).unwrap(),
+                !pending_signal
+            );
+            if pending_signal {
+                e.cancel_zero_stream_wait(f.owner, f.wait).unwrap();
+            } else {
+                assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_receive_arrival_before_park_enters_only_after_deadline_check() {
+        use crate::network_replay::NetworkZeroStreamReceive;
+        for expired in [false, true] {
+            let mut f = zero_network_fixture();
+            let (mut resource, response) = zero_network_request(&mut f);
+            if expired {
+                let ResourceID::NetworkCallWaitSet { deadline, .. } = &mut resource else {
+                    unreachable!()
+                };
+                *deadline = Some(f.scheduler.committed_time);
+                let mut request = Resources::new(f.owner.thread);
+                request.insert(resource.clone(), Permission::R);
+                f.scheduler.next_turns.get_mut(&f.owner.thread).unwrap().req =
+                    Ivar::full(Ok(request));
+            }
+            threshold_publish(&f.engine, f.ofd, f.now, 3, b"d");
+            assert_eq!(
+                f.scheduler.run_queue.tentative_pop_next(),
+                Some(f.owner.thread)
+            );
+            assert!(
+                f.scheduler
+                    .block_for_one_resource(
+                        f.owner.thread,
+                        &resource,
+                        &Permission::R,
+                        None,
+                        &response
+                    )
+                    .is_ok()
+            );
+            assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+            let mut e = f.engine.lock().unwrap();
+            assert_eq!(
+                e.zero_stream_wait_entered(f.owner, f.wait).unwrap(),
+                !expired
+            );
+            let outcome = e.prepare_zero_stream_receive(f.owner, f.call, 8).unwrap();
+            if expired {
+                assert_eq!(outcome, NetworkZeroStreamReceive::Waiting(f.wait));
+                e.cancel_zero_stream_wait(f.owner, f.wait).unwrap();
+            } else {
+                assert_eq!(outcome, NetworkZeroStreamReceive::Ready);
+                assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+            }
+            assert_eq!(
+                e.stream_call_queue_status(f.owner, f.call)
+                    .unwrap()
+                    .queued_bytes,
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn zero_receive_owner_exit_is_terminal_and_removal_cleans_both_wait_pools() {
+        let mut f = zero_network_fixture();
+        let (resource, response) = zero_network_request(&mut f);
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        f.engine.lock().unwrap().stream_owner_gone(f.owner);
+        assert!(f.scheduler.step2_network_replay_ready().is_err());
+        assert!(
+            f.scheduler
+                .terminal_deadlock
+                .as_ref()
+                .unwrap()
+                .contains("StreamOwnerGone")
+        );
+        assert!(f.scheduler.step3_peek().is_none());
+        f.scheduler.remove_blocking_entries(&f.owner.thread);
+        assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        assert!(f.engine.lock().unwrap().finish().is_err());
+    }
+
+    // The earlier zero_network_fixture deliberately remains a Record-engine
+    // scheduler transition fixture. These separate cases load an actual V3
+    // frame and use the Replay-only admission protocol, with no physical pin.
+    fn zero_replay_network_fixture() -> ZeroNetworkFixture {
+        zero_replay_network_fixture_with_terminals(false, false)
+    }
+
+    fn zero_replay_network_fixture_with_terminals(
+        local_read_shutdown: bool,
+        peer_fin: bool,
+    ) -> ZeroNetworkFixture {
+        zero_replay_network_fixture_with_readiness(local_read_shutdown, peer_fin, None)
+    }
+
+    fn zero_replay_network_fixture_with_readiness(
+        local_read_shutdown: bool,
+        peer_fin: bool,
+        fault: Option<detcore_model::network_trace::NetworkReadinessV2>,
+    ) -> ZeroNetworkFixture {
+        use detcore_model::network_trace::*;
+
+        use crate::network_replay::NetworkChannelBinding;
+        use crate::network_replay::NetworkSocketControlFinish;
+        use crate::network_replay::NetworkStreamNamespace;
+        use crate::network_replay::NetworkStreamOwner;
+        use crate::network_replay::NetworkStreamPhysicalEffect;
+        use crate::network_replay::NetworkStreamPhysicalResult;
+        use crate::network_replay::NetworkStreamSocketOption;
+        use crate::network_replay::NetworkZeroStreamReceive;
+
+        let mut config = Config::default();
+        config.network_trace.policy = NetworkPolicy::Replay;
+        let now = GlobalTime::new(&config).as_nanos();
+        let tid = DetTid::from_raw(195);
+        let ofd = OpenFileId::new_socket(tid, 0);
+        let owner = NetworkStreamOwner {
+            thread: tid,
+            mm: MmId::initial(tid),
+        };
+        let profile = FreshStreamSocketProfileV3 {
+            key: StreamSocketKeyV3 {
+                transport: NetworkTransportV2::Tcp,
+                domain: libc::AF_INET,
+                socket_type: libc::SOCK_STREAM,
+                protocol: libc::IPPROTO_TCP,
+            },
+            normalization: LinuxReceiveNormalizationV3 {
+                hz: LinuxReceiveHzV3::Hz1000,
+                peek_offset_set_supported: true,
+                system_rmem_max: 20_971_520,
+                namespace_tcp_rmem_max: 6_291_456,
+                minimum_receive_buffer: 2304,
+            },
+            initial: StreamSocketOptionsV3 {
+                peek_offset: Some(-1),
+                receive_low_water: 1,
+                receive_timeout: ReceiveTimeoutV3::Infinite,
+                receive_buffer: ReceiveBufferStateV3 {
+                    bytes: 262_144,
+                    user_locked: false,
+                    tcp_scaling_ratio: 128,
+                },
+            },
+        };
+        let namespace = NetworkStreamNamespace {
+            device: 4,
+            inode: 100,
+        };
+        let binding = NetworkChannelBinding {
+            transport: NetworkTransportV2::Tcp,
+            role: NetworkEndpointRoleV2::OutboundClient,
+            peer_address: Some(NetworkAddressV2::Inet4 {
+                address: [192, 0, 2, 1],
+                port: 443,
+            }),
+            requested_local_constraint: None,
+            observed_local_address: None,
+            accepted_from: None,
+            selected_channel: None,
+        };
+        let mut record = NetworkReplayEngine::record_shadow(config.epoch);
+        record
+            .register_stream_socket(ofd, profile.key, namespace, Some(profile.clone()))
+            .unwrap();
+        let channel = record.ensure_channel(ofd, binding.clone()).unwrap();
+        record
+            .publish_ingress(
+                ofd,
+                NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: now,
+                        after_transmitted_offset: 0,
+                    },
+                    event: NetworkInputKindV2::StreamBytes {
+                        stream_offset: 0,
+                        bytes: b"abc".to_vec(),
+                    },
+                },
+            )
+            .unwrap();
+        if local_read_shutdown {
+            record
+                .record_output(NetworkOutputEventV2 {
+                    channel,
+                    event: NetworkOutputKindV2::Shutdown {
+                        stream_offset: 0,
+                        direction: NetworkShutdownV2::Read,
+                    },
+                })
+                .unwrap();
+        }
+        record
+            .record_output(NetworkOutputEventV2 {
+                channel,
+                event: NetworkOutputKindV2::StreamBytes {
+                    stream_offset: 0,
+                    bytes: b"Z".to_vec(),
+                },
+            })
+            .unwrap();
+        record
+            .publish_ingress(
+                ofd,
+                NetworkInputEventV2 {
+                    ordinal: 1,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: now,
+                        after_transmitted_offset: 1,
+                    },
+                    event: NetworkInputKindV2::StreamBytes {
+                        stream_offset: 3,
+                        bytes: b"d".to_vec(),
+                    },
+                },
+            )
+            .unwrap();
+        if peer_fin {
+            record
+                .publish_ingress(
+                    ofd,
+                    NetworkInputEventV2 {
+                        ordinal: 2,
+                        channel,
+                        release: NetworkReleaseV2 {
+                            not_before_global_time: now,
+                            after_transmitted_offset: 1,
+                        },
+                        event: NetworkInputKindV2::PeerShutdown {
+                            stream_offset: 4,
+                            direction: NetworkShutdownV2::Write,
+                        },
+                    },
+                )
+                .unwrap();
+            // This fixture includes the guest write whose availability the
+            // post-FIN assertion checks; Replay validates it below.
+            record
+                .record_output(NetworkOutputEventV2 {
+                    channel,
+                    event: NetworkOutputKindV2::StreamBytes {
+                        stream_offset: 1,
+                        bytes: b"Y".to_vec(),
+                    },
+                })
+                .unwrap();
+        }
+        if fault.is_some() {
+            assert!(!local_read_shutdown && !peer_fin);
+            record
+                .record_output(NetworkOutputEventV2 {
+                    channel,
+                    event: NetworkOutputKindV2::StreamBytes {
+                        stream_offset: 1,
+                        bytes: b"W".to_vec(),
+                    },
+                })
+                .unwrap();
+        }
+        let mut trace = record.into_recorded_versioned_trace().unwrap();
+        if let Some(readiness) = fault {
+            let NetworkTrace::V3(v3) = &mut trace else {
+                unreachable!()
+            };
+            for (watermark, observed) in [(1, readiness), (2, NetworkReadinessV2::default())] {
+                v3.history.inputs.push(NetworkInputEventV2 {
+                    ordinal: v3.history.inputs.len() as u64,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: now,
+                        after_transmitted_offset: watermark,
+                    },
+                    event: NetworkInputKindV2::Readiness(observed),
+                });
+            }
+        }
+
+        assert!(matches!(trace, NetworkTrace::V3(_)));
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let mut engine =
+            NetworkReplayEngine::replay_from_reader(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(engine.mode(), NetworkEngineMode::Replay);
+        assert!(engine.shadow_mode());
+        engine
+            .register_stream_socket(
+                ofd,
+                profile.key,
+                NetworkStreamNamespace {
+                    device: 88,
+                    inode: 999,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(engine.ensure_channel(ofd, binding).unwrap(), channel);
+        engine.release_eligible(now).unwrap();
+        let control = engine.begin_socket_controls(owner, vec![ofd]).unwrap()[0].1;
+        engine
+            .submit_stream_physical(
+                owner,
+                control,
+                NetworkStreamPhysicalEffect::SetSocketOption {
+                    option: NetworkStreamSocketOption::PeekOffset(8),
+                },
+            )
+            .unwrap();
+        engine
+            .confirm_stream_physical(
+                owner,
+                control,
+                NetworkStreamPhysicalResult::SocketOption { result: Ok(()) },
+            )
+            .unwrap();
+        let admitted = engine.begin_stream_call(owner, control).unwrap();
+        assert!(!admitted.physical_pin_required);
+        let call = admitted.id;
+        engine
+            .finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+        assert_eq!(
+            engine
+                .stream_call_socket_state(owner, call)
+                .unwrap()
+                .options
+                .peek_offset,
+            Some(8)
+        );
+        assert_eq!(
+            engine
+                .stream_call_queue_status(owner, call)
+                .unwrap()
+                .queued_bytes,
+            3
+        );
+        let NetworkZeroStreamReceive::Waiting(wait) =
+            engine.prepare_zero_stream_receive(owner, call, 8).unwrap()
+        else {
+            panic!("V3 replay must wait beyond the preexisting tail");
+        };
+        assert_eq!(
+            engine.begin_zero_stream_wait(owner, call, None).unwrap(),
+            wait
+        );
+        let engine = Arc::new(Mutex::new(engine));
+        let mut scheduler = Scheduler::new(&config);
+        // A real guest admission occurs in the configured absolute epoch.
+        scheduler.committed_time = now;
+        scheduler.set_network_engine(Some(engine.clone()));
+        register_known_thread(&mut scheduler, tid);
+        scheduler.next_turns.get_mut(&tid).unwrap().protocol.origin =
+            Some(parked::ResourceOrigin {
+                rpc: parked::RpcOrigin::DirectRequestResources,
+                mm: owner.mm,
+                control: parked::ControlCapability::None,
+            });
+        ZeroNetworkFixture {
+            scheduler,
+            engine,
+            owner,
+            ofd,
+            call,
+            wait,
+            now,
+            operation: ExternalOpId::new(tid, 19),
+        }
+    }
+
+    fn allow_zero_replay_tail(f: &ZeroNetworkFixture) {
+        assert_eq!(
+            f.engine
+                .lock()
+                .unwrap()
+                .transmit_stream(f.ofd, b"Z")
+                .unwrap(),
+            crate::network_replay::StreamTransmitOutcome::Accepted(1)
+        );
+    }
+
+    #[test]
+    fn v3_replay_zero_receive_tail_wakes_below_peek_offset_through_actual_turn_selection() {
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let mut f = zero_replay_network_fixture();
+        let (resource, response) = zero_network_request(&mut f);
+        let turn_before = f.scheduler.turn;
+        let time_before = f.scheduler.committed_time;
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(
+                    f.owner.thread,
+                    &resource,
+                    &Permission::R,
+                    Some(libc::EINTR),
+                    &response
+                )
+                .is_err()
+        );
+        assert!(
+            f.engine
+                .lock()
+                .unwrap()
+                .zero_stream_wait_entered(f.owner, f.wait)
+                .unwrap()
+        );
+        assert_eq!(
+            f.scheduler.blocked.zero_stream_waiters.get(&f.owner.thread),
+            Some(&f.wait)
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        // skip_turn advances its attempt number but does not commit guest time.
+        assert_eq!(f.scheduler.turn, turn_before + 1);
+        assert!(response.try_read().is_none());
+        assert_eq!(f.scheduler.committed_time, time_before);
+        assert!(f.scheduler.network_capture_blockers.is_empty());
+        allow_zero_replay_tail(&f);
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        let (selected, _, response) = f
+            .scheduler
+            .step3_peek()
+            .expect("tail arrival must enter real selection");
+        assert_eq!(selected, f.owner.thread);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(
+                    selected,
+                    &resource,
+                    &Permission::R,
+                    Some(libc::EINTR),
+                    &response
+                )
+                .is_ok()
+        );
+        let mut e = f.engine.lock().unwrap();
+        assert_eq!(
+            e.prepare_zero_stream_receive(f.owner, f.call, 8).unwrap(),
+            NetworkZeroStreamReceive::Ready
+        );
+        assert_eq!(
+            e.stream_call_queue_status(f.owner, f.call)
+                .unwrap()
+                .queued_bytes,
+            4
+        );
+        assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+    }
+
+    #[test]
+    fn v3_replay_zero_receive_signal_before_publication_before_park_and_after_park_keep_entry_distinct()
+     {
+        for signal_phase in 0..3 {
+            let mut f = zero_replay_network_fixture();
+            let tid = f.owner.thread;
+            let mut signal_request = Resources::new(tid);
+            signal_request.insert(
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                Permission::W,
+            );
+            signal_request.set_signal_interrupt_errno(Errno::EINTR);
+            let response;
+            if signal_phase == 0 {
+                // The backend publishes its pending signal before a wait resource.
+                let next = f.scheduler.next_turns.get(&tid).unwrap();
+                next.req.put(Ok(signal_request));
+                response = next.resp.clone();
+                f.scheduler.runqueue_push_back(tid);
+            } else {
+                let (resource, published_response) = zero_network_request(&mut f);
+                response = published_response;
+                if signal_phase == 2 {
+                    assert_eq!(f.scheduler.run_queue.tentative_pop_next(), Some(tid));
+                    assert!(
+                        f.scheduler
+                            .block_for_one_resource(
+                                tid,
+                                &resource,
+                                &Permission::R,
+                                Some(libc::EINTR),
+                                &response
+                            )
+                            .is_err()
+                    );
+                    // Exercise the actual parked-signal wake and subset cleanup.
+                    f.scheduler.wake_signaled_guest(tid, Signal::SIGUSR1);
+                } else {
+                    // The backend's inbound signal replaces a published request
+                    // before the scheduler selects or parks that request.
+                    f.scheduler.next_turns.get_mut(&tid).unwrap().req =
+                        Ivar::full(Ok(signal_request));
+                }
+            }
+            let (selected, request, _) = f.scheduler.step3_peek().unwrap();
+            assert_eq!(selected, tid);
+            assert_eq!(request.try_read().unwrap().unwrap().resources.len(), 1);
+            assert_eq!(
+                f.scheduler.inbound_signals(tid),
+                vec![SigWrapper::from(Signal::SIGUSR1)]
+            );
+            f.scheduler.unblock_guest(tid, &response).unwrap();
+            assert!(
+                matches!(response.try_read(), Some(SchedResponse::Signaled(Some(signals))) if signals == vec![SigWrapper::from(Signal::SIGUSR1)])
+            );
+            assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+            assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+            let mut e = f.engine.lock().unwrap();
+            assert_eq!(
+                e.zero_stream_wait_entered(f.owner, f.wait).unwrap(),
+                signal_phase == 2
+            );
+            if signal_phase == 2 {
+                assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+            } else {
+                e.cancel_zero_stream_wait(f.owner, f.wait).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn v3_replay_zero_receive_arrival_before_park_enters_only_after_deadline_check() {
+        use crate::network_replay::NetworkZeroStreamReceive;
+        for expired in [false, true] {
+            let mut f = zero_replay_network_fixture();
+            let (mut resource, response) = zero_network_request(&mut f);
+            if expired {
+                let ResourceID::NetworkCallWaitSet { deadline, .. } = &mut resource else {
+                    unreachable!()
+                };
+                *deadline = Some(f.scheduler.committed_time);
+                let mut request = Resources::new(f.owner.thread);
+                request.insert(resource.clone(), Permission::R);
+                f.scheduler.next_turns.get_mut(&f.owner.thread).unwrap().req =
+                    Ivar::full(Ok(request));
+            }
+            allow_zero_replay_tail(&f);
+            // Match the global Replay RPC admission release before turn selection.
+            f.engine.lock().unwrap().release_eligible(f.now).unwrap();
+            assert_eq!(
+                f.scheduler.run_queue.tentative_pop_next(),
+                Some(f.owner.thread)
+            );
+            assert!(
+                f.scheduler
+                    .block_for_one_resource(
+                        f.owner.thread,
+                        &resource,
+                        &Permission::R,
+                        None,
+                        &response
+                    )
+                    .is_ok()
+            );
+            assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+            let mut e = f.engine.lock().unwrap();
+            assert_eq!(
+                e.zero_stream_wait_entered(f.owner, f.wait).unwrap(),
+                !expired
+            );
+            let outcome = e.prepare_zero_stream_receive(f.owner, f.call, 8).unwrap();
+            if expired {
+                assert_eq!(outcome, NetworkZeroStreamReceive::Waiting(f.wait));
+                e.cancel_zero_stream_wait(f.owner, f.wait).unwrap();
+            } else {
+                assert_eq!(outcome, NetworkZeroStreamReceive::Ready);
+                assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+            }
+            assert_eq!(
+                e.stream_call_queue_status(f.owner, f.call)
+                    .unwrap()
+                    .queued_bytes,
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn v3_replay_zero_receive_owner_exit_is_terminal_and_removal_cleans_both_wait_pools() {
+        let mut f = zero_replay_network_fixture();
+        let (resource, response) = zero_network_request(&mut f);
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        f.engine.lock().unwrap().stream_owner_gone(f.owner);
+        assert!(f.scheduler.step2_network_replay_ready().is_err());
+        assert!(
+            f.scheduler
+                .terminal_deadlock
+                .as_ref()
+                .unwrap()
+                .contains("StreamOwnerGone")
+        );
+        assert!(f.scheduler.step3_peek().is_none());
+        f.scheduler.remove_blocking_entries(&f.owner.thread);
+        assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        assert!(f.engine.lock().unwrap().finish().is_err());
+    }
+
+    #[test]
+    fn v3_replay_receive_half_closed_wait_wakes_on_peer_fin_behind_buffered_payload() {
+        let mut f = zero_replay_network_fixture_with_terminals(false, true);
+        f.engine
+            .lock()
+            .unwrap()
+            .cancel_zero_stream_wait(f.owner, f.wait)
+            .unwrap();
+        let resource = ResourceID::NetworkCallWaitSet {
+            interests: vec![(f.call, NetworkWaitKind::ReceiveHalfClosed)],
+            deadline: None,
+            zero_wait: None,
+        };
+        let mut request = Resources::new(f.owner.thread);
+        request.insert(resource.clone(), Permission::R);
+        let next = f.scheduler.next_turns.get(&f.owner.thread).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        f.scheduler.runqueue_push_back(f.owner.thread);
+        let time_before = f.scheduler.committed_time;
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        assert!(response.try_read().is_none());
+        assert_eq!(f.scheduler.committed_time, time_before);
+        // Existing readable bytes alone do not satisfy a bare RDHUP wait.
+        assert_eq!(
+            f.engine
+                .lock()
+                .unwrap()
+                .stream_call_queue_status(f.owner, f.call)
+                .unwrap()
+                .queued_bytes,
+            3
+        );
+        assert!(!f.engine.lock().unwrap().receive_half_closed(f.ofd).unwrap());
+        allow_zero_replay_tail(&f);
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+        let (selected, _, response) = f
+            .scheduler
+            .step3_peek()
+            .expect("peer FIN must reenter ordinary turn selection");
+        assert_eq!(selected, f.owner.thread);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(selected, &resource, &Permission::R, None, &response)
+                .is_ok()
+        );
+        let e = f.engine.lock().unwrap();
+        let status = e.stream_call_queue_status(f.owner, f.call).unwrap();
+        assert_eq!(status.queued_bytes, 4);
+        assert!(status.eof && !status.local_read_shutdown);
+        assert!(status.readiness.writable && !status.readiness.hangup);
+        assert!(e.receive_half_closed(f.ofd).unwrap());
+        assert!(e.stream_ready_at_least(f.ofd, 4096).unwrap());
+        assert!(!e.terminal_readiness(f.ofd).unwrap());
+        drop(e);
+        assert_eq!(
+            f.engine
+                .lock()
+                .unwrap()
+                .transmit_stream(f.ofd, b"Y")
+                .unwrap(),
+            crate::network_replay::StreamTransmitOutcome::Accepted(1)
+        );
+    }
+
+    #[test]
+    fn v3_replay_local_read_shutdown_wakes_entered_zero_wait_without_external_input() {
+        use detcore_model::network_trace::NetworkShutdownV2;
+
+        use crate::network_replay::NetworkSocketControlFinish;
+        use crate::network_replay::NetworkStreamOwner;
+        use crate::network_replay::NetworkStreamPhysicalEffect;
+        use crate::network_replay::NetworkStreamPhysicalResult;
+        use crate::network_replay::NetworkZeroStreamReceive;
+        let mut f = zero_replay_network_fixture_with_terminals(true, false);
+        let (resource, response) = zero_network_request(&mut f);
+        let time_before = f.scheduler.committed_time;
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(
+            f.engine
+                .lock()
+                .unwrap()
+                .zero_stream_wait_entered(f.owner, f.wait)
+                .unwrap()
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        let sibling = NetworkStreamOwner {
+            thread: DetTid::from_raw(196),
+            mm: f.owner.mm,
+        };
+        let control = {
+            let mut e = f.engine.lock().unwrap();
+            let control = e.begin_socket_controls(sibling, vec![f.ofd]).unwrap()[0].1;
+            e.submit_stream_physical(
+                sibling,
+                control,
+                NetworkStreamPhysicalEffect::Shutdown {
+                    direction: NetworkShutdownV2::Read,
+                },
+            )
+            .unwrap();
+            control
+        };
+        // A submitted/unknown effect cannot wake a guest as if shutdown succeeded.
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        assert!(response.try_read().is_none());
+        {
+            let mut e = f.engine.lock().unwrap();
+            e.confirm_stream_physical(
+                sibling,
+                control,
+                NetworkStreamPhysicalResult::Shutdown { result: Ok(()) },
+            )
+            .unwrap();
+            e.finish_socket_control(sibling, control, NetworkSocketControlFinish::Unchanged)
+                .unwrap();
+        }
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        assert!(f.scheduler.blocked.zero_stream_waiters.is_empty());
+        let (selected, _, response) = f
+            .scheduler
+            .step3_peek()
+            .expect("local shutdown must reenter ordinary turn selection");
+        assert_eq!(selected, f.owner.thread);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(selected, &resource, &Permission::R, None, &response)
+                .is_ok()
+        );
+        assert_eq!(f.scheduler.committed_time, time_before);
+        let mut e = f.engine.lock().unwrap();
+        let status = e.stream_call_queue_status(f.owner, f.call).unwrap();
+        assert_eq!(status.queued_bytes, 3);
+        assert!(status.local_read_shutdown && !status.eof && !status.readiness.hangup);
+        assert!(status.readiness.writable);
+        assert_eq!(
+            e.prepare_zero_stream_receive(f.owner, f.call, 8).unwrap(),
+            NetworkZeroStreamReceive::Ready
+        );
+        assert!(e.finish_zero_stream_wait(f.owner, f.wait).unwrap());
+        assert!(e.receive_half_closed(f.ofd).unwrap());
+        assert!(e.stream_ready_at_least(f.ofd, 4096).unwrap());
+        assert!(!e.terminal_readiness(f.ofd).unwrap());
+    }
+
+    fn poll_readiness_review_scheduler_wake(kind: NetworkWaitKind, error: bool) {
+        use detcore_model::network_trace::NetworkReadinessV2;
+        let mut f = zero_replay_network_fixture_with_readiness(
+            false,
+            false,
+            Some(NetworkReadinessV2 {
+                readable: false,
+                writable: false,
+                error,
+                hangup: !error,
+            }),
+        );
+        f.engine
+            .lock()
+            .unwrap()
+            .cancel_zero_stream_wait(f.owner, f.wait)
+            .unwrap();
+        let resource = ResourceID::NetworkCallWaitSet {
+            interests: vec![(f.call, kind)],
+            deadline: None,
+            zero_wait: None,
+        };
+        let mut request = Resources::new(f.owner.thread);
+        request.insert(resource.clone(), Permission::R);
+        let next = f.scheduler.next_turns.get(&f.owner.thread).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        f.scheduler.runqueue_push_back(f.owner.thread);
+        let time_before = f.scheduler.committed_time;
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        assert!(response.try_read().is_none());
+        allow_zero_replay_tail(&f);
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        let (selected, _, response) = f
+            .scheduler
+            .step3_peek()
+            .expect("recorded poll ERR/HUP must wake without a fabricated recv error");
+        assert_eq!(selected, f.owner.thread);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(selected, &resource, &Permission::R, None, &response)
+                .is_ok()
+        );
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        assert_eq!(f.scheduler.committed_time, time_before);
+        let mut e = f.engine.lock().unwrap();
+        let status = e.stream_call_queue_status(f.owner, f.call).unwrap();
+        assert_eq!(status.queued_bytes, 4);
+        assert_eq!(status.error, None);
+        assert!(!status.eof && !status.local_read_shutdown);
+        assert_eq!(status.readiness.error, error);
+        assert_eq!(status.readiness.hangup, !error);
+        assert!(!e.stream_ready_at_least(f.ofd, 8).unwrap());
+        assert_eq!(
+            e.transmit_stream(f.ofd, b"W").unwrap(),
+            crate::network_replay::StreamTransmitOutcome::Accepted(1)
+        );
+        e.release_eligible(f.now).unwrap();
+        assert!(!Scheduler::network_wait_is_ready(&e, f.ofd, kind).unwrap());
+        assert_eq!(
+            e.stream_call_queue_status(f.owner, f.call)
+                .unwrap()
+                .queued_bytes,
+            4
+        );
+    }
+
+    #[test]
+    fn poll_readiness_review_scheduler_rdhup_error() {
+        poll_readiness_review_scheduler_wake(NetworkWaitKind::ReceiveHalfClosed, true);
+    }
+    #[test]
+    fn poll_readiness_review_scheduler_rdhup_hangup() {
+        poll_readiness_review_scheduler_wake(NetworkWaitKind::ReceiveHalfClosed, false);
+    }
+    #[test]
+    fn poll_readiness_review_scheduler_readable_error() {
+        poll_readiness_review_scheduler_wake(NetworkWaitKind::PollReadableAtLeast(8), true);
+    }
+    #[test]
+    fn poll_readiness_review_scheduler_readable_hangup() {
+        poll_readiness_review_scheduler_wake(NetworkWaitKind::PollReadableAtLeast(8), false);
+    }
+    #[test]
+    fn poll_readiness_review_scheduler_terminal_error() {
+        poll_readiness_review_scheduler_wake(NetworkWaitKind::Terminal, true);
+    }
+    #[test]
+    fn poll_readiness_review_scheduler_terminal_hangup() {
+        poll_readiness_review_scheduler_wake(NetworkWaitKind::Terminal, false);
+    }
+
+    fn poll_current_profile_set_lowat(f: &ZeroNetworkFixture, minimum: i32) {
+        use crate::network_replay::NetworkSocketControlFinish;
+        use crate::network_replay::NetworkStreamPhysicalEffect;
+        use crate::network_replay::NetworkStreamPhysicalResult;
+        use crate::network_replay::NetworkStreamSocketOption;
+        let mut e = f.engine.lock().unwrap();
+        let control = e.begin_socket_controls(f.owner, vec![f.ofd]).unwrap()[0].1;
+        for option in [
+            NetworkStreamSocketOption::ReceiveBuffer(131072),
+            NetworkStreamSocketOption::ReceiveLowWater(minimum),
+        ] {
+            e.submit_stream_physical(
+                f.owner,
+                control,
+                NetworkStreamPhysicalEffect::SetSocketOption { option },
+            )
+            .unwrap();
+            e.confirm_stream_physical(
+                f.owner,
+                control,
+                NetworkStreamPhysicalResult::SocketOption { result: Ok(()) },
+            )
+            .unwrap();
+        }
+        e.finish_socket_control(f.owner, control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+    }
+
+    #[test]
+    fn poll_current_profile_parked_waiter_wakes_when_lowat_is_lowered() {
+        let mut f = zero_replay_network_fixture();
+        f.engine
+            .lock()
+            .unwrap()
+            .cancel_zero_stream_wait(f.owner, f.wait)
+            .unwrap();
+        poll_current_profile_set_lowat(&f, 10);
+        let resource = ResourceID::NetworkCallWaitSet {
+            interests: vec![(f.call, NetworkWaitKind::PollReadable)],
+            deadline: None,
+            zero_wait: None,
+        };
+        let mut request = Resources::new(f.owner.thread);
+        request.insert(resource.clone(), Permission::R);
+        let next = f.scheduler.next_turns.get(&f.owner.thread).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        f.scheduler.runqueue_push_back(f.owner.thread);
+        let time_before = f.scheduler.committed_time;
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        assert!(response.try_read().is_none());
+        // Reapplying the same profile cannot wake a blocked poll.
+        poll_current_profile_set_lowat(&f, 10);
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        assert!(response.try_read().is_none());
+        poll_current_profile_set_lowat(&f, 1);
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        let (selected, _, response) = f.scheduler.step3_peek().expect("lower LOWAT wakes poll");
+        assert_eq!(selected, f.owner.thread);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(selected, &resource, &Permission::R, None, &response)
+                .is_ok()
+        );
+        assert!(f.scheduler.blocked.network_call_waiters.is_empty());
+        assert_eq!(f.scheduler.committed_time, time_before);
+        let e = f.engine.lock().unwrap();
+        assert_eq!(e.stream_queue_status(f.ofd).unwrap().queued_bytes, 3);
+        assert!(
+            !Scheduler::network_wait_is_ready(&e, f.ofd, NetworkWaitKind::ReadableAtLeast(10))
+                .unwrap()
+        );
+        assert!(
+            !Scheduler::network_wait_is_ready(&e, f.ofd, NetworkWaitKind::PollReadableAtLeast(10))
+                .unwrap()
+        );
+        assert!(
+            Scheduler::network_wait_is_ready(&e, f.ofd, NetworkWaitKind::ReadableAtLeast(1))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn poll_current_profile_raise_before_resource_check_reparks_waiter() {
+        let mut f = zero_replay_network_fixture();
+        f.engine
+            .lock()
+            .unwrap()
+            .cancel_zero_stream_wait(f.owner, f.wait)
+            .unwrap();
+        poll_current_profile_set_lowat(&f, 1);
+        let resource = ResourceID::NetworkCallWaitSet {
+            interests: vec![(f.call, NetworkWaitKind::PollReadable)],
+            deadline: None,
+            zero_wait: None,
+        };
+        let mut request = Resources::new(f.owner.thread);
+        request.insert(resource.clone(), Permission::R);
+        let next = f.scheduler.next_turns.get(&f.owner.thread).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        f.scheduler.runqueue_push_back(f.owner.thread);
+        let time_before = f.scheduler.committed_time;
+        assert!(
+            Scheduler::network_wait_is_ready(
+                &f.engine.lock().unwrap(),
+                f.ofd,
+                NetworkWaitKind::PollReadable
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            f.scheduler.run_queue.tentative_pop_next(),
+            Some(f.owner.thread)
+        );
+        poll_current_profile_set_lowat(&f, 10);
+        assert!(
+            f.scheduler
+                .block_for_one_resource(f.owner.thread, &resource, &Permission::R, None, &response)
+                .is_err()
+        );
+        assert!(f.scheduler.step2_network_replay_ready().is_ok());
+        assert!(f.scheduler.step3_peek().is_none());
+        assert!(response.try_read().is_none());
+        assert_eq!(f.scheduler.blocked.network_call_waiters.len(), 1);
+        assert_eq!(f.scheduler.committed_time, time_before);
+        assert_eq!(
+            f.engine
+                .lock()
+                .unwrap()
+                .stream_queue_status(f.ofd)
+                .unwrap()
+                .queued_bytes,
+            3
+        );
+    }
+
+    #[test]
+    fn poll_current_profile_terminal_facts_override_lowat_without_consumption() {
+        for (shutdown, fin) in [(true, false), (false, true)] {
+            let f = zero_replay_network_fixture_with_terminals(shutdown, fin);
+            poll_current_profile_set_lowat(&f, 10);
+            if fin {
+                allow_zero_replay_tail(&f);
+            }
+            let mut e = f.engine.lock().unwrap();
+            if shutdown {
+                use detcore_model::network_trace::NetworkShutdownV2;
+
+                use crate::network_replay::NetworkSocketControlFinish;
+                use crate::network_replay::NetworkStreamPhysicalEffect;
+                use crate::network_replay::NetworkStreamPhysicalResult;
+                // The trace records a guest output, so replay must perform
+                // the corresponding local effect before it can be ready.
+                let control = e.begin_socket_controls(f.owner, vec![f.ofd]).unwrap()[0].1;
+                e.submit_stream_physical(
+                    f.owner,
+                    control,
+                    NetworkStreamPhysicalEffect::Shutdown {
+                        direction: NetworkShutdownV2::Read,
+                    },
+                )
+                .unwrap();
+                e.confirm_stream_physical(
+                    f.owner,
+                    control,
+                    NetworkStreamPhysicalResult::Shutdown { result: Ok(()) },
+                )
+                .unwrap();
+                e.finish_socket_control(f.owner, control, NetworkSocketControlFinish::Unchanged)
+                    .unwrap();
+            }
+            e.release_eligible(f.now).unwrap();
+            assert!(
+                Scheduler::network_wait_is_ready(&e, f.ofd, NetworkWaitKind::PollReadable).unwrap()
+            );
+            let status = e.stream_queue_status(f.ofd).unwrap();
+            assert_eq!(status.local_read_shutdown, shutdown);
+            assert_eq!(status.eof, fin);
+            assert_eq!(status.queued_bytes, if fin { 4 } else { 3 });
+        }
+    }
+
+    fn start_test_network_capture(scheduler: &mut Scheduler, tid: DetTid) -> ExternalOpId {
+        register_known_thread(scheduler, tid);
+        let operation = ExternalOpId::new(tid, 7);
+        let resource = ResourceID::BlockingNetworkCapture(operation);
+        let mut request = Resources::new(tid);
+        request.insert(resource.clone(), Permission::RW);
+        let next = scheduler.next_turns.get(&tid).unwrap();
+        next.req.put(Ok(request));
+        let response = next.resp.clone();
+        scheduler.runqueue_push_back(tid);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tid));
+        assert!(
+            scheduler
+                .block_for_one_resource(tid, &resource, &Permission::RW, None, &response)
+                .is_err()
+        );
+        assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
+        assert!(!scheduler.run_queue.contains_tid(tid));
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&tid),
+            Some(&operation)
+        );
+        assert_eq!(
+            scheduler.network_capture_blockers.get(&tid),
+            Some(&operation)
+        );
+        operation
+    }
+
+    #[test]
+    fn network_capture_clock_reaches_alarm_by_elapsed_time_without_fast_forward() {
+        for recordreplay_modes in [false, true] {
+            let config = Config {
+                recordreplay_modes,
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            let global = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            let initial = global.lock().unwrap().as_nanos();
+            let tid = DetTid::from_raw(101);
+            start_test_network_capture(&mut scheduler, tid);
+            scheduler.register_alarm(
+                tid,
+                tid,
+                initial,
+                LogicalTime::from_secs(8),
+                LogicalTime::ZERO,
+                Signal::SIGALRM,
+            );
+
+            // Production empty-queue maintenance must not consume the future
+            // alarm while the real syscall is still in the kernel.
+            assert!(scheduler.step2d_handle_empty_queue(&global).is_err());
+            assert_eq!(global.lock().unwrap().as_nanos(), initial);
+            assert_eq!(
+                scheduler.blocked.timed_waiters.next_deadline(),
+                Some(initial + LogicalTime::from_secs(8))
+            );
+            let start = Instant::now();
+            scheduler.sample_network_capture_clock(&mut global.lock().unwrap(), start);
+            scheduler.sample_network_capture_clock(
+                &mut global.lock().unwrap(),
+                start + Duration::from_nanos(7_999_999_999),
+            );
+            scheduler.committed_time = global.lock().unwrap().as_nanos();
+            assert_eq!(
+                scheduler.committed_time,
+                initial + LogicalTime::from_nanos(7_999_999_999)
+            );
+            assert!(!scheduler.step2b_process_timed());
+            assert_eq!(scheduler.host_signal_attempts, 0);
+
+            scheduler.sample_network_capture_clock(
+                &mut global.lock().unwrap(),
+                start + Duration::from_secs(8),
+            );
+            scheduler.committed_time = global.lock().unwrap().as_nanos();
+            assert_eq!(
+                scheduler.committed_time,
+                initial + LogicalTime::from_secs(8)
+            );
+            assert!(scheduler.step2b_process_timed());
+            assert!(scheduler.blocked.timed_waiters.is_empty());
+            assert_eq!(scheduler.host_signal_attempts, 1);
+            // No process group was registered: the timer path was exercised,
+            // but this unit test never sends a host signal.
+            assert_eq!(scheduler.network_capture_blockers.len(), 1);
+        }
+    }
+
+    #[test]
+    fn network_capture_clock_closes_before_resumed_guest_and_cleans_up() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let mut time = GlobalTime::new(&config);
+        let initial = time.as_nanos();
+        let tid = DetTid::from_raw(101);
+        let operation = start_test_network_capture(&mut scheduler, tid);
+        let start = Instant::now();
+        scheduler.sample_network_capture_clock(&mut time, start);
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_millis(3));
+        let mut continuation = Resources::new(tid);
+        continuation.insert(
+            ResourceID::BlockedExternalContinue(operation),
+            Permission::RW,
+        );
+        scheduler
+            .next_turns
+            .get(&tid)
+            .unwrap()
+            .req
+            .put(Ok(continuation));
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(tid));
+        assert!(scheduler.network_capture_blockers.is_empty());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_millis(7));
+        assert_eq!(
+            time.as_nanos(),
+            initial + LogicalTime::from_nanos(7_000_000)
+        );
+        assert!(scheduler.network_capture_idle_since.is_none());
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_secs(30));
+        assert_eq!(
+            time.as_nanos(),
+            initial + LogicalTime::from_nanos(7_000_000)
+        );
+
+        assert!(scheduler.run_queue.remove_tid(tid));
+        let second = DetTid::from_raw(102);
+        start_test_network_capture(&mut scheduler, second);
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_secs(31));
+        scheduler.remove_blocking_entries(&second);
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_secs(32));
+        assert_eq!(
+            time.as_nanos(),
+            initial + LogicalTime::from_nanos(1_007_000_000)
+        );
+        assert!(scheduler.network_capture_blockers.is_empty());
+        assert!(scheduler.network_capture_idle_since.is_none());
+    }
+
+    #[test]
+    fn ordinary_io_and_replay_waits_do_not_start_capture_clock() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let mut time = GlobalTime::new(&config);
+        let initial = time.as_nanos();
+        let tid = DetTid::from_raw(101);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(tid, ExternalOpId::new(tid, 7));
+        scheduler.blocked.network_waiters.insert(
+            DetTid::from_raw(102),
+            vec![(OpenFileId::new_socket(tid, 0), NetworkWaitKind::Readable)],
+        );
+        let start = Instant::now();
+        scheduler.sample_network_capture_clock(&mut time, start);
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_secs(30));
+        assert_eq!(time.as_nanos(), initial);
+        assert!(scheduler.network_capture_idle_since.is_none());
+    }
+
+    #[test]
+    fn physical_signal_waits_for_real_request_on_every_backend() {
+        for physical_exits in [false, true] {
+            for captured in [false, true] {
+                for signal_request in [false, true] {
+                    let config = Config {
+                        backend_reports_physical_process_exits: physical_exits,
+                        ..Config::default()
+                    };
+                    let mut scheduler = Scheduler::new(&config);
+                    let tid = DetTid::from_raw(101);
+                    register_known_thread(&mut scheduler, tid);
+                    let operation = ExternalOpId::new(tid, 7);
+                    scheduler
+                        .blocked
+                        .external_io_blockers
+                        .insert(tid, operation);
+                    if captured {
+                        scheduler.network_capture_blockers.insert(tid, operation);
+                    }
+                    let original = scheduler.next_turns.get(&tid).unwrap().req.clone();
+                    scheduler.wake_signaled_guest(tid, Signal::SIGALRM);
+                    assert!(original.try_read().is_none());
+                    assert!(
+                        scheduler
+                            .next_turns
+                            .get(&tid)
+                            .unwrap()
+                            .req
+                            .try_read()
+                            .is_none()
+                    );
+                    assert!(!scheduler.run_queue.contains_tid(tid));
+                    assert_eq!(
+                        scheduler.blocked.external_io_blockers.get(&tid),
+                        Some(&operation)
+                    );
+
+                    let mut request = Resources::new(tid);
+                    request.insert(
+                        if signal_request {
+                            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGALRM))
+                        } else {
+                            ResourceID::BlockedExternalContinue(operation)
+                        },
+                        Permission::RW,
+                    );
+                    original.put(Ok(request.clone()));
+                    scheduler.wake_signaled_guest(tid, Signal::SIGALRM);
+                    assert_eq!(
+                        scheduler
+                            .next_turns
+                            .get(&tid)
+                            .unwrap()
+                            .req
+                            .try_read()
+                            .unwrap()
+                            .unwrap(),
+                        request
+                    );
+                    assert!(!scheduler.run_queue.contains_tid(tid));
+                    assert!(scheduler.step2c_process_io_blockers().is_ok());
+                    assert!(scheduler.run_queue.contains_tid(tid));
+                    assert!(scheduler.blocked.external_io_blockers.is_empty());
+                    assert!(scheduler.network_capture_blockers.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_capture_continuation_still_requires_exact_operation_identity() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(101);
+        let operation = start_test_network_capture(&mut scheduler, tid);
+        let mut wrong = Resources::new(tid);
+        wrong.insert(
+            ResourceID::BlockedExternalContinue(ExternalOpId::new(tid, 8)),
+            Permission::RW,
+        );
+        scheduler.next_turns.get(&tid).unwrap().req.put(Ok(wrong));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scheduler.step2c_process_io_blockers()
+        }));
+        assert!(failed.is_err());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&tid),
+            Some(&operation)
+        );
+        assert_eq!(
+            scheduler.network_capture_blockers.get(&tid),
+            Some(&operation)
+        );
+        assert!(!scheduler.run_queue.contains_tid(tid));
+    }
+
+    #[test]
+    fn network_waiter_is_live_and_signal_wakes_it_once() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, tid);
+        let open_file = OpenFileId::new_socket(tid, 0);
+        let mut request = Resources::new(tid);
+        request.insert(
+            ResourceID::NetworkWait {
+                open_file,
+                kind: NetworkWaitKind::Readable,
+            },
+            Permission::R,
+        );
+        scheduler.next_turns.get(&tid).unwrap().req.put(Ok(request));
+        scheduler
+            .blocked
+            .network_waiters
+            .insert(tid, vec![(open_file, NetworkWaitKind::Readable)]);
+        assert!(matches!(
+            scheduler.thread_status(tid),
+            ThreadStatus::NotRunning
+        ));
+        scheduler.wake_signaled_guest(tid, Signal::SIGUSR1);
+        assert!(scheduler.blocked.network_waiters.is_empty());
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![tid]
+        );
+        let resources = scheduler
+            .next_turns
+            .get(&tid)
+            .unwrap()
+            .req
+            .try_read()
+            .unwrap()
+            .unwrap();
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper::from(
+                    Signal::SIGUSR1
+                )))
+        );
+        scheduler.wake_signaled_guest(tid, Signal::SIGUSR1);
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![tid]
+        );
+    }
+
     #[test]
     fn physical_thread_pidfd_is_bound_to_address_space_identity() {
         let mut scheduler = Scheduler::new(&Config::default());
@@ -5606,6 +8050,25 @@ mod test {
 
         scheduler.remove_physical_thread(&dettid, mm);
         assert!(!scheduler.physical_thread_pidfds.contains_key(&dettid));
+    }
+
+    #[test]
+    fn custody_registration_does_not_select_native_child_exit_signal() {
+        let scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(37);
+        assert!(scheduler.should_synthesize_child_exit_signal(parent));
+        let custody = crate::network_runtime::custody_identity_fixture(
+            crate::network_replay::NetworkStreamOwner {
+                thread: parent,
+                mm: MmId::initial(parent),
+            },
+        );
+        assert!(scheduler.should_synthesize_child_exit_signal(parent));
+        assert!(scheduler.physical_thread_pidfds.is_empty());
+        drop(custody);
+        assert!(scheduler.should_synthesize_child_exit_signal(parent));
+        // The existing native-pidfd positive test immediately below remains
+        // unchanged; this pure fixture opens no FD and makes no native claim.
     }
 
     #[test]

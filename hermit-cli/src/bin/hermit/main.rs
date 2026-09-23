@@ -16,6 +16,7 @@
 
 use core::arch::global_asm;
 
+mod accepted_service;
 mod analyze;
 mod backends;
 mod bisect;
@@ -173,7 +174,11 @@ fn startup_stdin() -> io::Result<Option<File>> {
     }
 }
 
+use clap::ArgMatches;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
+use clap::parser::ValueSource;
 use colored::*;
 use hermit::BackendUnavailable;
 use hermit::Error;
@@ -406,8 +411,42 @@ impl Subcommand {
     }
 }
 
+fn epoch_source_is_explicit(source: Option<ValueSource>) -> bool {
+    matches!(
+        source,
+        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+    )
+}
+
+fn apply_argument_provenance(args: &mut Args, matches: &ArgMatches) {
+    let epoch_source = matches
+        .subcommand_matches("run")
+        .and_then(|run| run.value_source("epoch"));
+    if let Subcommand::Run(run) = &mut args.command {
+        run.set_epoch_source_explicit(epoch_source_is_explicit(epoch_source));
+    }
+}
+
+fn try_parse_args_with_provenance<I, T>(arguments: I) -> Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Args::command().try_get_matches_from(arguments)?;
+    let mut args = Args::from_arg_matches(&matches)?;
+    apply_argument_provenance(&mut args, &matches);
+    Ok(args)
+}
+
+fn parse_args_with_provenance() -> Args {
+    try_parse_args_with_provenance(std::env::args_os()).unwrap_or_else(|error| error.exit())
+}
+
 #[fbinit::main]
 fn main() {
+    if accepted_service::requested() {
+        accepted_service::run(startup_stdin());
+    }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
     // shared mapping that children inherit across fork. A mapping made after the
@@ -422,7 +461,7 @@ fn main() {
     let Args {
         mut global,
         mut command,
-    } = Args::parse();
+    } = parse_args_with_provenance();
 
     // Claim the evidence destination before any fallible run preflight. The
     // directory itself is the invocation boundary: it must not exist, so no
@@ -635,6 +674,7 @@ fn display_error(error: Error) {
 mod tests {
     use clap::CommandFactory;
     use clap::Parser;
+    use clap::parser::ValueSource;
     use hermit::Backend;
     use hermit::BackendUnavailable;
     use hermit::Error;
@@ -642,11 +682,57 @@ mod tests {
     use super::Args;
     use super::Subcommand;
     use super::classify_failure;
+    use super::epoch_source_is_explicit;
     use super::failure_exit_code;
+    use super::try_parse_args_with_provenance;
 
     #[test]
     fn clap_configuration_is_valid() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn epoch_provenance_respects_guest_boundary_and_explicit_sources() {
+        let before = detcore_model::config::capture_current_epoch();
+        let mut guest_argument = try_parse_args_with_provenance([
+            "hermit",
+            "run",
+            "--",
+            "/bin/echo",
+            "--epoch=guest-data",
+        ])
+        .unwrap();
+        let Subcommand::Run(run) = &mut guest_argument.command else {
+            panic!("run command was not parsed")
+        };
+        assert!(!run.epoch_source_explicit());
+        run.validate_args().unwrap();
+        let after = detcore_model::config::capture_current_epoch();
+        assert!(before <= run.det_opts.det_config.epoch);
+        assert!(run.det_opts.det_config.epoch <= after);
+
+        let mut explicit = try_parse_args_with_provenance([
+            "hermit",
+            "run",
+            "--epoch=2000-01-02T03:04:05Z",
+            "--",
+            "/bin/echo",
+        ])
+        .unwrap();
+        let Subcommand::Run(run) = &mut explicit.command else {
+            panic!("run command was not parsed")
+        };
+        assert!(run.epoch_source_explicit());
+        run.validate_args().unwrap();
+        assert_eq!(
+            run.det_opts.det_config.epoch,
+            "2000-01-02T03:04:05Z"
+                .parse::<detcore_model::config::Epoch>()
+                .unwrap()
+        );
+
+        assert!(epoch_source_is_explicit(Some(ValueSource::EnvVariable)));
+        assert!(!epoch_source_is_explicit(Some(ValueSource::DefaultValue)));
     }
 
     #[test]

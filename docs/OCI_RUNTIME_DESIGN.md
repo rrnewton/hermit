@@ -291,9 +291,13 @@ The extracted snapshot is never the guest's writable root. For each execution:
 
 `pivot_root` is preferred to a bare `chroot`: the old host root must not remain
 reachable through the process cwd, mount tree, or inherited file descriptors.
-The default remains isolated loopback networking. `--network=host` and writable
-host bind mounts are explicit nondeterministic inputs and are recorded in the
-run summary.
+The default is a fresh network namespace whose kernel-mandatory loopback device
+is left down. `--network=local` explicitly enables isolated loopback for
+guest-internal communication. External traffic is either captured/replayed by
+the shared versioned network engine or admitted through
+`--unsafe-live-network`; the latter and writable host bind mounts are explicit
+nondeterministic inputs and cannot support a determinism claim. Legacy
+`--network=host` means the same unsafe policy.
 
 This directly closes the risks tracked by `fix-1179-oci-isolation-risks`:
 verification runs cannot poison each other, the image path cannot bypass

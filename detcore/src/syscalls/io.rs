@@ -15,6 +15,7 @@ use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
+use detcore_model::network_trace::NetworkPolicy;
 use nix::fcntl::OFlag;
 use reverie::Errno;
 use reverie::Error;
@@ -89,6 +90,23 @@ fn connect_result_allows_peer_classification(result: &Result<i64, Error>) -> boo
         Ok(_) => true,
         Err(Error::Errno(errno)) => *errno == Errno::EINPROGRESS,
         Err(_) => false,
+    }
+}
+
+fn disabled_network_connect_message(
+    policy: NetworkPolicy,
+    result: &Result<i64, Error>,
+) -> Option<&'static str> {
+    if policy == NetworkPolicy::Deny
+        && matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ENETUNREACH)
+    {
+        Some(
+            "External networking is disabled by the selected policy; connect returned ENETUNREACH. \
+             Use --record-networking=TRACE to capture external input, --replay-networking=TRACE \
+             to replay it, or --unsafe-live-network to explicitly allow nondeterministic networking.",
+        )
+    } else {
+        None
     }
 }
 
@@ -1318,6 +1336,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        // Explain the isolated namespace's refusal without replacing the kernel's
+        // errno or rejecting permitted guest-local socket operations.
+        if let Some(message) =
+            disabled_network_connect_message(guest.config().network_trace.policy, &result)
+        {
+            tracing::warn!("{message}");
+        }
         if self.cfg.discover_live_file_metadata
             && connect_result_allows_peer_classification(&result)
         {
@@ -1832,6 +1857,39 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_connect_diagnostic_preserves_errno_and_distinguishes_network_policies() {
+        let unreachable = Err(Error::Errno(Errno::ENETUNREACH));
+        let message = disabled_network_connect_message(NetworkPolicy::Deny, &unreachable)
+            .expect("denied external connect must explain its network policy");
+        assert!(message.contains("networking is disabled"));
+        assert!(message.contains("ENETUNREACH"));
+        assert!(message.contains("--record-networking=TRACE"));
+        assert!(message.contains("--replay-networking=TRACE"));
+        assert!(matches!(unreachable, Err(Error::Errno(Errno::ENETUNREACH))));
+
+        for policy in [
+            NetworkPolicy::Record,
+            NetworkPolicy::Replay,
+            NetworkPolicy::UnsafeLive,
+        ] {
+            assert_eq!(disabled_network_connect_message(policy, &unreachable), None);
+        }
+        for result in [
+            Ok(0),
+            Err(Error::Errno(Errno::EINPROGRESS)),
+            Err(Error::Errno(Errno::ECONNREFUSED)),
+            Err(Error::Errno(Errno::EBADF)),
+            Err(Error::Errno(Errno::EFAULT)),
+            Err(Error::Tool(anyhow::anyhow!("unsupported replay operation"))),
+        ] {
+            assert_eq!(
+                disabled_network_connect_message(NetworkPolicy::Deny, &result),
+                None
+            );
+        }
+    }
 
     #[test]
     fn zero_timeout_socket_poll_requests_a_strong_one_turn_yield() {
