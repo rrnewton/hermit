@@ -549,14 +549,35 @@ fn record_replay_command_with_policy(
 }
 
 fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
-    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
-    let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
-    let verdict_path = verdict_dir.path().join("verify.json");
+    // Maintained tests always exercise the binary produced by this build.
+    // Comparisons with older binaries belong to separate diagnostic runs.
+    let hermit = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    // Verification creates its own recording directory and two controller logs,
+    // overriding --data-dir and --log-file. Keep their tempfile root observable
+    // even if the CPU watchdog terminates this test before Command::output returns.
+    let diagnostics = tempfile::Builder::new()
+        .prefix("hermit-canonical-record-")
+        .tempdir()
+        .expect("failed to create recording diagnostics directory")
+        .keep();
+    let data_dir = diagnostics.join("data");
+    fs::create_dir(&data_dir).expect("failed to create Hermit recording directory");
+    let verdict_path = diagnostics.join("verify.json");
+    println!(
+        "canonical record/replay diagnostics for {name}: {} (record_log_*, replay_log_*, recording data, verify.json); binary: {}; guest: {}",
+        diagnostics.display(),
+        hermit.display(),
+        program.display()
+    );
+    std::io::stdout()
+        .flush()
+        .expect("failed to announce recording diagnostics");
     let mut command = Command::new("timeout");
     command
+        .env("TMPDIR", &diagnostics)
         .env("HERMIT_MODE", "record")
         .args(["--kill-after=5s", "45s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit)
         .args([
             "--log=info",
             "--backend=ptrace",
@@ -568,7 +589,7 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
             "--record-timeout=30",
         ])
         .arg(format!("--verify-json={}", verdict_path.display()))
-        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--data-dir={}", data_dir.display()))
         .arg("--")
         .arg(program)
         .args(args);
@@ -587,6 +608,7 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
         &fs::read(&verdict_path).expect("canonical record/replay omitted verify JSON"),
     )
     .expect("canonical record/replay verify JSON was invalid");
+    println!("canonical record/replay report for {name}: {report}");
     assert_eq!(report["verdict"], serde_json::json!("matched"));
     assert_eq!(report["bitwise_parity"], serde_json::json!(true));
     assert!(
@@ -599,6 +621,7 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
             .as_u64()
             .is_some_and(|count| count > 0)
     );
+    fs::remove_dir_all(&diagnostics).expect("failed to remove successful recording diagnostics");
 }
 
 fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
@@ -2113,6 +2136,80 @@ fn record_poll_invalid_nfds_preserves_einval() {
     );
 }
 
+// Recording captures passthrough clock values; it does not select the virtual
+// run-mode epoch. These checks require the current build to replay the complete
+// captured trajectories, including INFO events, across exec and thread RPCs.
+#[test]
+fn record_c_clock_exec_continuity() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "clock trajectory across exec",
+        &workload("c_clock_exec_continuity").path,
+        &[],
+    );
+}
+
+fn canonical_fractional_clock_run(name: &str) {
+    let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
+    let verdict = verdict_dir.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "run")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00.123456789Z",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg("--")
+        .arg(&workload(name).path);
+    command_output(command, &format!("fractional-origin strict run for {name}"));
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(verdict).expect("strict run omitted verify JSON"))
+            .unwrap();
+    println!("fractional-origin strict run report for {name}: {report}");
+    assert_eq!(report["verdict"], serde_json::json!("matched"));
+    assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+    }
+}
+
+// Keep run-mode virtual time separate from the captured passthrough clocks in
+// the recording tests above and below. The guests assert advancing trajectories
+// within and across exec generations, and causal clock order across threads.
+#[test]
+fn fractional_clock_exec_trajectory_matches_strict_info() {
+    let _guard = hermit_record_lock();
+    canonical_fractional_clock_run("c_clock_exec_continuity");
+}
+
+#[test]
+fn fractional_clock_thread_trajectory_matches_strict_info() {
+    let _guard = hermit_record_lock();
+    canonical_fractional_clock_run("rustbin_clock_total_order");
+}
+
+#[test]
+fn record_rs_clock_total_order() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "clock trajectory across threads",
+        &workload("rustbin_clock_total_order").path,
+        &[],
+    );
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
@@ -2146,8 +2243,6 @@ record_replay_tests! {
     record_c_fd_reuse_after_close => "c_record_replay_fd_close",
     record_c_execveat_paths => "c_record_replay_execveat_paths",
     record_c_sigpipe_siginfo => "c_sigpipe_siginfo",
-    record_c_clock_exec_continuity => "c_clock_exec_continuity",
-    record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",
     record_rs_futex_timeout => "rustbin_futex_timeout",

@@ -171,6 +171,17 @@ fn explicit_virtual_epoch_reproduces_identical_observed_time() {
         (epoch..epoch + 1_000_000_000).contains(&observed),
         "explicit epoch did not seed the expected virtual-time trajectory: {observed}"
     );
+    // Adjacent nanosecond origins must translate the same deterministic work
+    // exactly, including the carry from 999ns to the next microsecond.
+    for delta in [1_u32, 13, 999, 1_000] {
+        let shifted_epoch = format!("2000-12-31T23:59:59.{:09}Z", 123_456_789 + delta);
+        let shifted = run_date_at_epoch(Some(&shifted_epoch));
+        let rendered = String::from_utf8_lossy(&shifted.stdout);
+        let (seconds, nanos) = rendered.trim().split_once('.').unwrap();
+        let shifted_observed =
+            seconds.parse::<u64>().unwrap() * 1_000_000_000 + nanos.parse::<u64>().unwrap();
+        assert_eq!(shifted_observed, observed + u64::from(delta));
+    }
     for output in [first, second] {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("source=explicit"), "{stderr}");

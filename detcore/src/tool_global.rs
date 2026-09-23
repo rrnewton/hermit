@@ -6549,9 +6549,25 @@ mod tests {
         assert_eq!(format_unsupported_syscall_warning(&BTreeSet::new()), None);
     }
 
+    #[test]
+    fn fractional_epoch_zero_progress_summary_preserves_exact_origin() {
+        for nanos in [1, 13, 999, 1_000, 123_456_789] {
+            let config = Config {
+                epoch: chrono::DateTime::from_timestamp(1_767_225_600, nanos).unwrap(),
+                ..Config::default()
+            };
+            let expected = config.epoch.timestamp_nanos_opt().unwrap() as u64;
+            let state = GlobalState::initialize(&config, false);
+            let summary = state.into_run_summary().unwrap();
+            assert_eq!(summary.virttime_final, expected);
+            assert_eq!(summary.virttime_elapsed, 0);
+        }
+    }
+
     #[tokio::test]
     async fn abnormal_cleanup_cancels_an_unstarted_scheduler() {
         let config = Config {
+            epoch: chrono::DateTime::from_timestamp(1_767_225_600, 999).unwrap(),
             sequentialize_threads: true,
             ..Config::default()
         };
@@ -6571,6 +6587,7 @@ mod tests {
     #[tokio::test]
     async fn abnormal_cleanup_cancels_a_registered_scheduler() {
         let config = Config {
+            epoch: chrono::DateTime::from_timestamp(1_767_225_600, 13).unwrap(),
             sequentialize_threads: true,
             ..Config::default()
         };

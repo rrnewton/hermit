@@ -7972,6 +7972,85 @@ mod test {
     }
 
     #[test]
+    fn fractional_origin_sleep_wakes_at_the_exact_absolute_deadline() {
+        for nanos in [1, 13, 999] {
+            let config = Config {
+                epoch: chrono::DateTime::from_timestamp(1_767_225_600, nanos).unwrap(),
+                ..Config::default()
+            };
+            let origin =
+                LogicalTime::from_nanos(config.epoch.timestamp_nanos_opt().unwrap() as u64);
+            let global_time = Mutex::new(GlobalTime::new(&config));
+            let mut scheduler = Scheduler::new(&config);
+            let sleeper = DetTid::from_raw(100);
+            register_known_thread(&mut scheduler, sleeper);
+            let deadline = origin + LogicalTime::from_nanos(1_001);
+            let resource = ResourceID::SleepUntil(deadline);
+            let mut request = Resources::new(sleeper);
+            request.insert(resource.clone(), Permission::W);
+            scheduler.next_turns.get_mut(&sleeper).unwrap().req = Ivar::full(Ok(request));
+            scheduler.runqueue_push_back(sleeper);
+            scheduler.bump_global_time(&global_time, &Err(SkipTurn));
+            assert_eq!(scheduler.committed_time, origin);
+
+            // Follow the real tentative-selection and blocking path. A skipped
+            // turn does not charge work or make the guest's response available.
+            let (selected, _, response) = scheduler.step3_peek().unwrap();
+            assert_eq!(selected, sleeper);
+            assert!(
+                scheduler
+                    .block_for_one_resource(sleeper, &resource, &Permission::W, None, &response,)
+                    .is_err()
+            );
+            assert!(response.try_read().is_none());
+            assert!(!scheduler.run_queue.contains_tid(sleeper));
+            assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
+
+            global_time
+                .lock()
+                .unwrap()
+                .add_extra_time(Duration::from_nanos(1_000));
+            scheduler.bump_global_time(&global_time, &Err(SkipTurn));
+            assert_eq!(
+                scheduler.committed_time,
+                deadline - LogicalTime::from_nanos(1)
+            );
+            assert!(!scheduler.step2b_process_timed());
+            assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
+            assert!(!scheduler.run_queue.contains_tid(sleeper));
+            assert!(response.try_read().is_none());
+
+            global_time
+                .lock()
+                .unwrap()
+                .add_extra_time(Duration::from_nanos(1));
+            scheduler.bump_global_time(&global_time, &Err(SkipTurn));
+            assert_eq!(scheduler.committed_time, deadline);
+            assert!(scheduler.step2b_process_timed());
+            assert!(scheduler.blocked.timed_waiters.is_empty());
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![sleeper]
+            );
+            assert!(!scheduler.step2b_process_timed());
+            assert!(response.try_read().is_none());
+            assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+            // At equality the reselected original request is ready immediately;
+            // it must not register a second wait or shift the clock again.
+            assert_eq!(scheduler.step3_peek().unwrap().0, sleeper);
+            assert!(
+                scheduler
+                    .block_for_one_resource(sleeper, &resource, &Permission::W, None, &response,)
+                    .is_ok()
+            );
+            scheduler.run_queue.undo_tentative_pop();
+            assert!(scheduler.blocked.timed_waiters.is_empty());
+            assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        }
+    }
+
+    #[test]
     fn finite_deadline_runs_before_rt_sigsuspend_deadlock_verdict() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);

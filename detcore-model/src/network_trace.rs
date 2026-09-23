@@ -276,10 +276,10 @@ pub struct NetworkTraceV1 {
 }
 
 impl NetworkTraceV1 {
-    /// Convert the recorded epoch to the absolute starting time used by
-    /// `GlobalTime`, rejecting Chrono values outside its `u64` nanosecond
-    /// domain. `GlobalTime` truncates the epoch to microseconds, so this does
-    /// the same conversion without an unchecked signed cast or multiplication.
+    /// Convert the recorded epoch to the historical V1 microsecond origin,
+    /// rejecting Chrono values outside its `u64` nanosecond domain. V1 keeps
+    /// that origin even though current `GlobalTime` preserves nanoseconds;
+    /// this conversion must not reinterpret existing V1 traces.
     pub fn epoch_global_time(&self) -> Result<LogicalTime, NetworkTraceValidationError> {
         let seconds = u64::try_from(self.epoch.timestamp())
             .map_err(|_| NetworkTraceValidationError::EpochOutOfRange)?;

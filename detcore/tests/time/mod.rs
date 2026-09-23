@@ -504,3 +504,65 @@ fn nanosleep_rejects_malformed_timespec_but_not_a_past_deadline() {
         true,
     );
 }
+
+#[test]
+fn fractional_epoch_absolute_sleep_preserves_deadline_and_clock_progress() {
+    let config = detcore::Config {
+        epoch: DateTime::from_timestamp(1_767_225_600, 999).unwrap(),
+        sequentialize_threads: true,
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch = config.epoch.timestamp_nanos_opt().unwrap();
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let now = || {
+                let mut value = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut value) },
+                    0
+                );
+                value.tv_sec * 1_000_000_000 + value.tv_nsec
+            };
+            let sleep_until = |deadline: i64| {
+                let value = libc::timespec {
+                    tv_sec: deadline / 1_000_000_000,
+                    tv_nsec: deadline % 1_000_000_000,
+                };
+                assert_eq!(
+                    unsafe {
+                        libc::clock_nanosleep(
+                            libc::CLOCK_REALTIME,
+                            libc::TIMER_ABSTIME,
+                            &value,
+                            ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+            };
+            let first = now();
+            assert!(first >= epoch);
+            // Linux permits an already-passed absolute deadline to return
+            // immediately; it must neither rewind nor freeze virtual time.
+            sleep_until(epoch - 1);
+            let second = now();
+            assert!(second > first);
+            // Leave room for syscall work before blocking. The scheduler-level
+            // companion checks the exact D-1/D boundary without guest overhead.
+            let deadline = second + 1_000_000_001;
+            sleep_until(deadline);
+            let after = now();
+            assert!(
+                after >= deadline,
+                "absolute sleep returned before its deadline"
+            );
+            assert!(now() > after, "clock froze after an absolute wake");
+        },
+        config,
+        true,
+    );
+}

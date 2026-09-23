@@ -471,6 +471,27 @@ pub struct DetTime {
     /// Like the other clock fields, this must always be present in bincode RPCs.
     #[serde(default)]
     inherited_nanos: LogicalDuration,
+
+    /// Submicrosecond part of the configured origin, never elapsed guest work.
+    /// Missing legacy JSON fields mean the old microsecond origin. This field
+    /// is always serialized, including zero, in positional bincode RPCs;
+    /// mixed RPC layouts require matching config wire fingerprints, not serde
+    /// defaults. Keep the representation canonical in the range 0..1000.
+    #[serde(default, deserialize_with = "deserialize_origin_remainder")]
+    starting_submicro_nanos: u16,
+}
+
+fn deserialize_origin_remainder<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let remainder = u16::deserialize(deserializer)?;
+    if remainder >= 1_000 {
+        return Err(serde::de::Error::custom(
+            "clock origin remainder must be less than 1000 nanoseconds",
+        ));
+    }
+    Ok(remainder)
 }
 
 // Don't derive Default because it would give us a 0.0 multiplier:
@@ -486,6 +507,7 @@ impl Default for DetTime {
             starting_micros: 0,
             multiplier: 1.0,
             inherited_nanos: LogicalTime::ZERO,
+            starting_submicro_nanos: 0,
         }
     }
 }
@@ -526,6 +548,7 @@ impl From<&DateTime<Utc>> for DetTime {
             starting_micros: micros_from_utc(dt),
             multiplier: 1.0,
             inherited_nanos: LogicalTime::ZERO,
+            starting_submicro_nanos: (dt.timestamp_subsec_nanos() % 1_000) as u16,
         }
     }
 }
@@ -574,6 +597,7 @@ impl DetTime {
             starting_micros: 0,
             multiplier: 1.0,
             inherited_nanos: LogicalTime::ZERO,
+            starting_submicro_nanos: 0,
         }
     }
 
@@ -666,7 +690,7 @@ impl DetTime {
             |weighted| weighted as f64 * NANOS_PER_RCB / RCB_TIME_MULTIPLIER_SCALE as f64,
         );
         LogicalTime(
-            (self.starting_micros * 1000)
+            self.starting_nanos()
                 + self.extra_nanos
                 + ((syscall_nanos as f64 * self.multiplier) as u64)
                 + ((rcb_nanos * self.multiplier) as u64)
@@ -677,7 +701,11 @@ impl DetTime {
     /// Same as as_nanos but without the starting time.
     pub fn without_starting(&self) -> LogicalDuration {
         let LogicalTime(t1) = self.as_nanos();
-        LogicalTime(t1 - (self.starting_micros * 1000))
+        LogicalTime(t1 - self.starting_nanos())
+    }
+
+    fn starting_nanos(&self) -> u64 {
+        self.starting_micros * 1_000 + u64::from(self.starting_submicro_nanos)
     }
 
     // TODO-HUMAN-REVIEW(#797): Review logical user/system CPU-time projections.
@@ -715,7 +743,7 @@ impl DetTime {
 
     /// Project deterministic time duration from imaginary starting point of deterministic time creation
     pub fn as_duration(&self) -> std::time::Duration {
-        std::time::Duration::from_nanos(self.as_nanos().0 - self.starting_micros * 1000)
+        std::time::Duration::from_nanos(self.without_starting().0)
     }
 }
 
@@ -787,7 +815,7 @@ impl GlobalTime {
     pub fn new(cfg: &Config) -> Self {
         let base = DetTime::new(cfg);
         GlobalTime {
-            starting_nanos: LogicalTime::from_micros(micros_from_utc(&cfg.epoch)),
+            starting_nanos: LogicalTime::from_nanos(base.starting_nanos()),
             time_vector: HashMap::new(),
             inherited_time: HashMap::new(),
             extra_time: LogicalTime::from_nanos(0),
@@ -951,6 +979,119 @@ impl GlobalTime {
 mod global_time_tests {
     use super::*;
 
+    #[test]
+    fn fractional_network_trace_v1_keeps_its_original_bytes_and_time_domain() {
+        use crate::fd::OpenFileId;
+        use crate::network_trace::*;
+
+        let epoch = DateTime::from_timestamp(1_767_225_600, 123_456_789).unwrap();
+        let channel = OpenFileId::new_socket(DetTid::from_raw(1), 0);
+        // V1 predates the nanosecond clock origin. Keep its historical
+        // microsecond origin and absolute release timestamps unchanged.
+        let origin = LogicalTime::from_nanos(1_767_225_600_123_456_000);
+        let mut trace = NetworkTraceV1 {
+            epoch,
+            channels: vec![NetworkChannelV1 {
+                id: channel,
+                transport: NetworkTransportV1::Tcp,
+                role: NetworkEndpointRoleV1::OutboundClient,
+                local_address: NetworkAddressV1::Inet4 {
+                    address: [10, 0, 0, 2],
+                    port: 40_000,
+                },
+                peer_address: NetworkAddressV1::Inet4 {
+                    address: [192, 0, 2, 10],
+                    port: 443,
+                },
+                created_before_competing_threads: true,
+            }],
+            inputs: vec![NetworkInputEventV1 {
+                ordinal: 0,
+                channel,
+                release: NetworkReleaseV1 {
+                    not_before_global_time: origin + LogicalTime::from_nanos(10),
+                    after_transmitted_offset: 0,
+                },
+                event: NetworkInputKindV1::InboundBytes {
+                    stream_offset: 0,
+                    bytes: b"x".to_vec(),
+                },
+            }],
+            outputs: vec![],
+        };
+        let mut frame = Vec::new();
+        trace.write_framed(&mut frame).unwrap();
+        // Captured with the pre-fix producer at 173929ab, before adding the
+        // origin remainder. This is a format fixture, not a fresh round-trip
+        // expectation derived from the implementation under test.
+        const ORIGINAL_FRAME: &[u8] = &[
+            72, 69, 82, 77, 73, 84, 45, 78, 69, 84, 45, 84, 82, 65, 67, 69, 1, 0, 0, 0, 88, 0, 0,
+            0, 0, 0, 0, 0, 30, 50, 48, 50, 54, 45, 48, 49, 45, 48, 49, 84, 48, 48, 58, 48, 48, 58,
+            48, 48, 46, 49, 50, 51, 52, 53, 54, 55, 56, 57, 90, 1, 2, 253, 0, 0, 0, 0, 0, 0, 0,
+            128, 0, 0, 0, 10, 0, 0, 2, 251, 64, 156, 0, 192, 0, 2, 10, 251, 187, 1, 1, 1, 0, 2,
+            253, 0, 0, 0, 0, 0, 0, 0, 128, 253, 10, 202, 85, 245, 81, 114, 134, 24, 0, 0, 0, 1,
+            120, 0,
+        ];
+        assert_eq!(frame, ORIGINAL_FRAME);
+        let decoded = NetworkTraceV1::read_framed(frame.as_slice()).unwrap();
+        assert_eq!(decoded, trace);
+        assert_eq!(decoded.epoch, epoch);
+        assert_eq!(decoded.epoch_global_time(), Ok(origin));
+        let current = GlobalTime::new(&Config {
+            epoch,
+            ..Config::default()
+        });
+        assert_eq!(current.as_nanos(), origin + LogicalTime::from_nanos(789));
+        let release = decoded.inputs[0].release;
+        assert!(!release.is_eligible(origin + LogicalTime::from_nanos(9), 0));
+        assert!(release.is_eligible(origin + LogicalTime::from_nanos(10), 0));
+        trace.inputs[0].release.not_before_global_time = origin - LogicalTime::from_nanos(1);
+        assert_eq!(
+            trace.validate(),
+            Err(NetworkTraceValidationError::ReleaseBeforeEpoch)
+        );
+    }
+
+    #[test]
+    fn fractional_epoch_is_an_exact_origin_not_elapsed_work() {
+        for nanos in [0, 1, 13, 999, 1_000, 123_456_789, 999_999_999] {
+            let epoch = DateTime::from_timestamp(1_767_225_600, nanos).unwrap();
+            let expected = LogicalTime::from_nanos(epoch.timestamp_nanos_opt().unwrap() as u64);
+            let config = Config {
+                epoch,
+                clock_multiplier: Some(2.0),
+                ..Config::default()
+            };
+            let mut clock = DetTime::new(&config);
+            let mut global = GlobalTime::new(&config);
+            assert_eq!(clock.as_nanos(), expected, "epoch fraction {nanos}");
+            assert_eq!(global.as_nanos(), expected);
+            assert_eq!(clock.without_starting(), LogicalTime::ZERO);
+            assert_eq!(clock.as_duration(), Duration::ZERO);
+            assert_eq!(clock.user_cpu_time(), LogicalTime::ZERO);
+            assert_eq!(clock.system_cpu_time(), LogicalTime::ZERO);
+
+            // In particular, 999ns + 1ns crosses a microsecond without rounding
+            // the configured origin or charging it as guest work.
+            clock.advance_to(expected + LogicalTime::from_nanos(1));
+            publish(&mut global, DetTid::from_raw(3), &clock);
+            assert_eq!(clock.as_duration(), Duration::from_nanos(1));
+            assert_eq!(global.as_nanos(), expected + LogicalTime::from_nanos(1));
+            let mut zero_origin = DetTime::zero().with_multiplier(clock.multiplier);
+            zero_origin.advance_to(LogicalTime::from_nanos(1));
+            for time in [&mut clock, &mut zero_origin] {
+                time.add_syscall_with_cost(7);
+                time.add_rcbs(3);
+                time.add_rdtsc();
+            }
+            assert_eq!(clock.without_starting(), zero_origin.as_nanos());
+            assert_eq!(clock.user_cpu_time(), zero_origin.user_cpu_time());
+            assert_eq!(clock.system_cpu_time(), zero_origin.system_cpu_time());
+            publish(&mut global, DetTid::from_raw(3), &clock);
+            assert_eq!(global.as_nanos(), expected + zero_origin.as_nanos());
+        }
+    }
+
     fn publish(time: &mut GlobalTime, tid: DetTid, clock: &DetTime) {
         time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
     }
@@ -958,6 +1099,7 @@ mod global_time_tests {
     #[test]
     fn descendants_preserve_absolute_clocks_and_charge_only_their_own_work() {
         let config = Config {
+            epoch: DateTime::from_timestamp(1_767_225_600, 999).unwrap(),
             clock_multiplier: Some(2.0),
             ..Config::default()
         };
@@ -1021,7 +1163,10 @@ mod global_time_tests {
 
     #[test]
     fn exec_preserves_inherited_baselines_and_each_retired_threads_work() {
-        let config = Config::default();
+        let config = Config {
+            epoch: DateTime::from_timestamp(1_767_225_600, 13).unwrap(),
+            ..Config::default()
+        };
         let ancestor = DetTid::from_raw(3);
         let leader = DetTid::from_raw(4);
         let worker = DetTid::from_raw(5);
@@ -1071,28 +1216,78 @@ mod global_time_tests {
 
     #[test]
     fn inherited_clock_survives_rpc_serialization_and_legacy_json_defaults() {
-        let mut parent = DetTime::zero();
-        parent.add_syscall_with_cost(13);
-        let child = parent.clone_for_child();
-        // The following tuple field detects a skipped positional clock field,
-        // which would otherwise consume bytes from the RPC request.
-        let wire = bincode::serde::encode_to_vec(
-            (child.clone(), 0x1234_5678_u64),
-            bincode::config::legacy(),
-        )
-        .unwrap();
-        let ((restored, following), consumed): ((DetTime, u64), usize) =
-            bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
-        assert_eq!(consumed, wire.len());
-        assert_eq!(following, 0x1234_5678);
-        assert_eq!(restored.as_nanos(), child.as_nanos());
-        assert_eq!(restored.inherited_nanos(), LogicalTime::from_nanos(13));
+        let mut wire_lengths = Vec::new();
+        for nanos in [0, 1, 13, 999, 1_000] {
+            let epoch = DateTime::from_timestamp(1_767_225_600, nanos).unwrap();
+            let origin = LogicalTime::from_nanos(epoch.timestamp_nanos_opt().unwrap() as u64);
+            let mut parent = DetTime::from(&epoch);
+            parent.add_syscall_with_cost(13);
+            let child = parent.clone_for_child();
+            // The following tuple field and full-consumption check detect a
+            // skipped clock field consuming bytes from the next RPC argument.
+            let wire = bincode::serde::encode_to_vec(
+                (child.clone(), 0x1234_5678_u64),
+                bincode::config::legacy(),
+            )
+            .unwrap();
+            wire_lengths.push(wire.len());
+            let ((restored, following), consumed): ((DetTime, u64), usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(consumed, wire.len());
+            assert_eq!(following, 0x1234_5678);
+            assert_eq!(restored.as_nanos(), origin + LogicalTime::from_nanos(13));
+            assert_eq!(restored.inherited_nanos(), LogicalTime::from_nanos(13));
 
-        let mut legacy = serde_json::to_value(parent.clone()).unwrap();
-        legacy.as_object_mut().unwrap().remove("inherited_nanos");
-        let restored: DetTime = serde_json::from_value(legacy).unwrap();
-        assert_eq!(restored.as_nanos(), parent.as_nanos());
-        assert_eq!(restored.inherited_nanos(), LogicalTime::ZERO);
+            let mut legacy = serde_json::to_value(parent.clone()).unwrap();
+            legacy.as_object_mut().unwrap().remove("inherited_nanos");
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("starting_submicro_nanos");
+            let restored: DetTime = serde_json::from_value(legacy).unwrap();
+            assert_eq!(
+                restored.as_nanos(),
+                parent.as_nanos() - LogicalTime::from_nanos(u64::from(nanos % 1_000))
+            );
+            assert_eq!(restored.inherited_nanos(), LogicalTime::ZERO);
+            assert_eq!(restored.as_duration(), Duration::from_nanos(13));
+        }
+        assert!(wire_lengths.iter().all(|length| *length == wire_lengths[0]));
+
+        // Actual old positional bytes (including a following u64), captured
+        // before the layout change. JSON defaults are not binary compatibility:
+        // old/new coordinator and plugin pairs must refuse by wire fingerprint.
+        const OLD_RPC: &[u8] = &[
+            1, 0, 0, 0, 0, 0, 0, 0, 1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240,
+            63, 13, 0, 0, 0, 0, 0, 0, 0, 120, 86, 52, 18, 0, 0, 0, 0,
+        ];
+        assert!(
+            bincode::serde::decode_from_slice::<(DetTime, u64), _>(
+                OLD_RPC,
+                bincode::config::legacy(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn serialized_origin_remainder_must_be_canonical() {
+        for invalid in [1_000, u16::MAX] {
+            let mut json = serde_json::to_value(DetTime::zero()).unwrap();
+            json["starting_submicro_nanos"] = invalid.into();
+            assert!(serde_json::from_value::<DetTime>(json).is_err());
+            let invalid_clock = DetTime {
+                starting_submicro_nanos: invalid,
+                ..DetTime::zero()
+            };
+            let wire =
+                bincode::serde::encode_to_vec(invalid_clock, bincode::config::legacy()).unwrap();
+            assert!(
+                bincode::serde::decode_from_slice::<DetTime, _>(&wire, bincode::config::legacy())
+                    .is_err()
+            );
+        }
     }
 
     #[test]
