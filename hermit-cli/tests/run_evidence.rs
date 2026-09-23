@@ -102,31 +102,56 @@ fn run(args: &[&str]) -> Output {
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
 }
 
-fn without_public_log_epoch_provenance(bytes: &[u8], label: &str) -> Vec<u8> {
+fn expected_epoch_provenance() -> String {
+    format!(
+        "WARN hermit::virtual_time: hermit: virtual-time epoch={COMPARISON_EPOCH} \
+         source=explicit; reproduce with --epoch={COMPARISON_EPOCH}"
+    )
+}
+
+fn validate_and_remove_public_log_epoch_provenance(
+    bytes: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, String> {
     let marker = b"WARN hermit::virtual_time: hermit: virtual-time epoch=";
+    let expected = expected_epoch_provenance();
     let mut provenance_events = 0;
     let mut remaining = Vec::new();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if line.windows(marker.len()).any(|window| window == marker) {
+        if let Some(start) = line
+            .windows(marker.len())
+            .position(|window| window == marker)
+        {
             provenance_events += 1;
+            let payload = line[start..].strip_suffix(b"\n").unwrap_or(&line[start..]);
+            if payload != expected.as_bytes() {
+                return Err(format!(
+                    "{label} contained a malformed controller epoch provenance event; \
+                     expected {expected:?}, got {:?}",
+                    String::from_utf8_lossy(payload),
+                ));
+            }
         } else {
             remaining.extend_from_slice(line);
         }
     }
-    assert_eq!(
-        provenance_events,
-        1,
-        "{label} must contain exactly one controller epoch provenance event: {}",
-        String::from_utf8_lossy(bytes),
-    );
-    remaining
+    if provenance_events != 1 {
+        return Err(format!(
+            "{label} must contain exactly one controller epoch provenance event, found \
+             {provenance_events}: {}",
+            String::from_utf8_lossy(bytes),
+        ));
+    }
+    Ok(remaining)
+}
+
+fn without_public_log_epoch_provenance(bytes: &[u8], label: &str) -> Vec<u8> {
+    validate_and_remove_public_log_epoch_provenance(bytes, label)
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn assert_untimestamped_default_epoch_provenance(stderr: &[u8]) {
-    let expected = format!(
-        "WARN hermit::virtual_time: hermit: virtual-time epoch={COMPARISON_EPOCH} \
-         source=explicit; reproduce with --epoch={COMPARISON_EPOCH}"
-    );
+    let expected = expected_epoch_provenance();
     assert_eq!(
         stderr
             .split(|byte| *byte == b'\n')
@@ -136,6 +161,41 @@ fn assert_untimestamped_default_epoch_provenance(stderr: &[u8]) {
         "default stderr must contain exactly one untimestamped epoch provenance line: {}",
         String::from_utf8_lossy(stderr),
     );
+}
+
+#[test]
+fn public_log_epoch_provenance_requires_the_exact_reproducer_payload() {
+    let expected = expected_epoch_provenance();
+    let valid = format!("2026-09-23T00:00:00Z  {expected}\nkept\n");
+    assert_eq!(
+        validate_and_remove_public_log_epoch_provenance(valid.as_bytes(), "valid log").unwrap(),
+        b"kept\n",
+    );
+
+    let wrong_epoch = expected.replacen(
+        &format!("epoch={COMPARISON_EPOCH} source="),
+        "epoch=2026-09-23T02:39:52.970859834+00:00 source=",
+        1,
+    );
+    let wrong_source = expected.replace("source=explicit", "source=host-now");
+    let wrong_reproducer = expected.replacen(
+        &format!("reproduce with --epoch={COMPARISON_EPOCH}"),
+        "reproduce with --epoch=2026-09-23T02:39:52.970859834+00:00",
+        1,
+    );
+    for (label, payload) in [
+        ("wrong epoch", wrong_epoch),
+        ("wrong source", wrong_source),
+        ("wrong reproducer", wrong_reproducer),
+    ] {
+        let log = format!("timestamp {payload}\nkept\n");
+        let error = validate_and_remove_public_log_epoch_provenance(log.as_bytes(), label)
+            .expect_err("malformed provenance unexpectedly passed");
+        assert!(
+            error.contains("malformed controller epoch provenance event"),
+            "{label} produced the wrong refusal: {error}",
+        );
+    }
 }
 
 #[test]
