@@ -37,6 +37,7 @@
   "build_debug_nodes": [
     "e2e.audit_compile_backend_parity_c",
     "setup.nextest",
+    "build.recorded_clocks",
     "build.workspace",
     "build.manifest_guests"
   ],
@@ -87,6 +88,7 @@
       "nodes": [
         "check.backend_parity_suites",
         "test.hermit_integration",
+        "test.recorded_clocks",
         "test.cli_on_host",
         "test.arbitrary_binaries",
         "test.applications_e2e",
