@@ -242,6 +242,35 @@ fn default_verify_reports_one_stable_replay_epoch_without_retained_logs() {
 }
 
 #[test]
+fn ordinary_run_refuses_to_lose_epoch_provenance_to_an_unwritable_log() {
+    let _guard = hermit_clock_lock();
+    let failed = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args([
+            "--log=info",
+            "--log-file=/dev/full",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to start the ordinary unwritable epoch-provenance probe");
+    assert!(
+        !failed.status.success(),
+        "ordinary run succeeded after losing its only durable epoch reproducer"
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr)
+            .contains("cannot write epoch provenance to --log-file"),
+        "ordinary run did not identify the lost epoch provenance: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}
+
+#[test]
 fn explicit_virtual_epoch_reproduces_identical_observed_time() {
     let _guard = hermit_clock_lock();
     let (first, first_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));

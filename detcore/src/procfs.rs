@@ -617,7 +617,7 @@ impl MountInfoSnapshot {
 pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_uptime_seconds: u64,
     pub(crate) virtual_realtime_seconds: i64,
-    pub(crate) virtual_boot_time_seconds: i64,
+    pub(crate) virtual_boot_time_seconds: u64,
     pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
@@ -1805,7 +1805,7 @@ fn sanitize_uptime(contents: &[u8], virtual_uptime_seconds: u64) -> Vec<u8> {
 fn sanitize_system_stat(
     contents: &[u8],
     virtual_uptime_seconds: u64,
-    virtual_boot_time_seconds: i64,
+    virtual_boot_time_seconds: u64,
 ) -> Vec<u8> {
     const VOLATILE_FIELDS: &[&[u8]] = &[
         b"intr",
