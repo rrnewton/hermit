@@ -102,15 +102,40 @@ fn run(args: &[&str]) -> Output {
         .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"))
 }
 
-fn without_public_log_epoch_provenance(bytes: &[u8], label: &str) -> Vec<u8> {
+fn normalize_public_log_epoch_provenance_timestamp(bytes: &[u8], label: &str) -> Vec<u8> {
     let marker = b"WARN hermit::virtual_time: hermit: virtual-time epoch=";
     let mut provenance_events = 0;
-    let mut remaining = Vec::new();
+    let mut normalized = Vec::new();
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if line.windows(marker.len()).any(|window| window == marker) {
+        if let Some(marker_offset) = line
+            .windows(marker.len())
+            .position(|window| window == marker)
+        {
             provenance_events += 1;
+            let framing = &line[..marker_offset];
+            let timestamp = framing.strip_suffix(b"  ").unwrap_or_else(|| {
+                panic!(
+                    "{label} epoch provenance lacked the expected tracing timestamp framing: {}",
+                    String::from_utf8_lossy(line),
+                )
+            });
+            assert!(
+                timestamp.len() >= 20
+                    && timestamp[4] == b'-'
+                    && timestamp[7] == b'-'
+                    && timestamp[10] == b'T'
+                    && timestamp[13] == b':'
+                    && timestamp[16] == b':'
+                    && timestamp.last() == Some(&b'Z')
+                    && timestamp.iter().all(|byte| {
+                        byte.is_ascii_digit() || matches!(*byte, b'-' | b'T' | b':' | b'.' | b'Z')
+                    }),
+                "{label} epoch provenance had malformed tracing timestamp framing: {}",
+                String::from_utf8_lossy(line),
+            );
+            normalized.extend_from_slice(&line[marker_offset..]);
         } else {
-            remaining.extend_from_slice(line);
+            normalized.extend_from_slice(line);
         }
     }
     assert_eq!(
@@ -119,7 +144,48 @@ fn without_public_log_epoch_provenance(bytes: &[u8], label: &str) -> Vec<u8> {
         "{label} must contain exactly one controller epoch provenance event: {}",
         String::from_utf8_lossy(bytes),
     );
-    remaining
+    normalized
+}
+
+#[test]
+fn public_log_epoch_normalization_preserves_provenance_content_and_order() {
+    let provenance = format!(
+        "WARN hermit::virtual_time: hermit: virtual-time epoch={COMPARISON_EPOCH} \
+         source=explicit; reproduce with --epoch={COMPARISON_EPOCH}"
+    );
+    let first = format!("2026-09-23T05:04:17.818362Z  {provenance}\nstable-after\n");
+    let later = format!("2026-09-23T05:04:19.123456Z  {provenance}\nstable-after\n");
+    let expected = format!("{provenance}\nstable-after\n").into_bytes();
+
+    assert_eq!(
+        normalize_public_log_epoch_provenance_timestamp(first.as_bytes(), "first fixture"),
+        expected,
+    );
+    assert_eq!(
+        normalize_public_log_epoch_provenance_timestamp(first.as_bytes(), "first fixture"),
+        normalize_public_log_epoch_provenance_timestamp(later.as_bytes(), "later fixture"),
+    );
+
+    for (label, mutated) in [
+        (
+            "changed epoch",
+            later.replace("52.970859833", "52.970859834"),
+        ),
+        (
+            "changed provenance source",
+            later.replace("source=explicit", "source=host-now"),
+        ),
+        (
+            "changed order",
+            format!("stable-after\n2026-09-23T05:04:19.123456Z  {provenance}\n"),
+        ),
+    ] {
+        assert_ne!(
+            normalize_public_log_epoch_provenance_timestamp(first.as_bytes(), "control fixture"),
+            normalize_public_log_epoch_provenance_timestamp(mutated.as_bytes(), label),
+            "{label} was erased by timestamp normalization",
+        );
+    }
 }
 
 fn assert_untimestamped_default_epoch_provenance(stderr: &[u8]) {
@@ -481,8 +547,14 @@ fn private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker() {
         "--log-file must keep controller provenance out of process stderr",
     );
     assert_eq!(
-        without_public_log_epoch_provenance(&fs::read(&public_log).unwrap(), "public log"),
-        without_public_log_epoch_provenance(&fs::read(&baseline_log).unwrap(), "baseline log"),
+        normalize_public_log_epoch_provenance_timestamp(
+            &fs::read(&public_log).unwrap(),
+            "public log",
+        ),
+        normalize_public_log_epoch_provenance_timestamp(
+            &fs::read(&baseline_log).unwrap(),
+            "baseline log",
+        ),
         "the private INFO layer changed the default-WARN public log"
     );
 

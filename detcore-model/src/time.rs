@@ -252,6 +252,11 @@ impl LogicalTime {
         }
         Duration::from_nanos(self.0 - from.0)
     }
+
+    /// Measure a logical duration without panicking when `from` is in the future.
+    pub fn checked_sub(self, from: LogicalTime) -> Option<LogicalDuration> {
+        self.0.checked_sub(from.0).map(LogicalTime)
+    }
 }
 
 impl std::fmt::Display for LogicalTime {
@@ -673,11 +678,10 @@ impl DetTime {
             (rcb_nanos * self.multiplier) as u64,
             (self.nondet_instrs as f64 * NANOS_PER_NONDET_INSTR * self.multiplier) as u64,
         ];
-        let projected = components
-            .into_iter()
-            .try_fold(self.starting_nanos, u64::checked_add)
-            .expect("virtual time overflowed its unsigned nanosecond domain");
-        LogicalTime(projected)
+        components.into_iter().fold(
+            LogicalTime::from_nanos(self.starting_nanos),
+            |projected, component| projected + LogicalTime::from_nanos(component),
+        )
     }
 
     /// Same as as_nanos but without the starting time.
@@ -858,14 +862,7 @@ impl GlobalTime {
     }
 
     fn bump_total(&mut self, delta: Duration) {
-        let delta = u64::try_from(delta.as_nanos())
-            .expect("virtual-time progress exceeds the unsigned nanosecond domain");
-        self.total = LogicalTime::from_nanos(
-            self.total
-                .as_nanos()
-                .checked_add(delta)
-                .expect("global virtual time overflowed its unsigned nanosecond domain"),
-        );
+        self.total = self.total + delta;
         self.sanity();
     }
 
@@ -873,17 +870,9 @@ impl GlobalTime {
     fn sum_up(&self) -> LogicalTime {
         let mut sum = self.starting_nanos;
         for (tid, tm) in &self.time_vector {
-            sum = LogicalTime::from_nanos(
-                sum.as_nanos()
-                    .checked_add((*tm - self.inherited_duration(*tid)).as_nanos())
-                    .expect("global virtual time overflowed while summing thread progress"),
-            );
+            sum = sum + (*tm - self.inherited_duration(*tid));
         }
-        LogicalTime::from_nanos(
-            sum.as_nanos()
-                .checked_add(self.extra_time.as_nanos())
-                .expect("global virtual time overflowed while summing scheduler progress"),
-        )
+        sum + self.extra_time
     }
 
     /// Add time that passage is not driven by the internal events within guest threads.
@@ -901,14 +890,7 @@ impl GlobalTime {
     /// The argument is in nanosecods and should have had any clock multiplier
     /// applied alreday.
     pub fn add_extra_time(&mut self, delta: Duration) -> LogicalTime {
-        let delta_nanos = u64::try_from(delta.as_nanos())
-            .expect("scheduler progress exceeds the unsigned nanosecond domain");
-        self.extra_time = LogicalTime::from_nanos(
-            self.extra_time
-                .as_nanos()
-                .checked_add(delta_nanos)
-                .expect("scheduler virtual time overflowed its unsigned nanosecond domain"),
-        );
+        self.extra_time = self.extra_time + delta;
         // Update the cached total for efficiency:
         self.bump_total(delta);
         self.as_nanos()
@@ -917,12 +899,7 @@ impl GlobalTime {
     /// Project a thread's absolute local clock, including its inherited history
     /// and the epoch. Exec recovery and scheduler replay use this projection.
     pub fn threads_time(&self, dtid: DetTid) -> LogicalTime {
-        LogicalTime::from_nanos(
-            self.starting_nanos
-                .as_nanos()
-                .checked_add(self.threads_duration(dtid).as_nanos())
-                .expect("thread virtual time overflowed its unsigned nanosecond domain"),
-        )
+        self.starting_nanos + self.threads_duration(dtid)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -983,13 +960,8 @@ impl GlobalTime {
     }
 
     /// Project aggregate progress since this clock's own immutable origin.
-    pub fn elapsed_nanos(&self) -> LogicalDuration {
-        LogicalTime::from_nanos(
-            self.total
-                .as_nanos()
-                .checked_sub(self.starting_nanos.as_nanos())
-                .expect("global virtual time regressed before its immutable origin"),
-        )
+    pub fn elapsed_nanos(&self) -> Option<LogicalDuration> {
+        self.total.checked_sub(self.starting_nanos)
     }
 }
 
@@ -1037,16 +1009,15 @@ mod global_time_tests {
             second_time.as_nanos() - time.as_nanos(),
             LogicalTime::from_nanos(1),
         );
-        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO);
+        assert_eq!(time.elapsed_nanos(), Some(LogicalTime::ZERO));
         time.add_extra_time(Duration::from_nanos(1));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(1));
+        assert_eq!(time.elapsed_nanos(), Some(LogicalTime::from_nanos(1)));
         time.add_extra_time(Duration::from_nanos(1));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(2));
+        assert_eq!(time.elapsed_nanos(), Some(LogicalTime::from_nanos(2)));
     }
 
     #[test]
-    #[should_panic(expected = "global virtual time regressed before its immutable origin")]
-    fn elapsed_nanos_rejects_time_before_immutable_origin() {
+    fn elapsed_nanos_reports_time_before_immutable_origin() {
         let config = Config {
             epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
             ..Config::default()
@@ -1054,7 +1025,7 @@ mod global_time_tests {
         let mut time = GlobalTime::new(&config);
         time.total = LogicalTime::ZERO;
 
-        let _ = time.elapsed_nanos();
+        assert_eq!(time.elapsed_nanos(), None);
     }
 
     #[test]
@@ -1084,8 +1055,33 @@ mod global_time_tests {
         time.add_extra_time(hundred_years);
 
         assert_eq!(origin, LogicalTime::from_nanos(max_epoch_nanos));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO + hundred_years);
+        assert_eq!(
+            time.elapsed_nanos(),
+            Some(LogicalTime::ZERO + hundred_years)
+        );
         assert_eq!(time.as_nanos(), origin + hundred_years);
+    }
+
+    #[test]
+    fn unrepresentable_progress_saturates_without_stopping_the_scheduler() {
+        let config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let mut local = DetTime::new(&config);
+        local.extra_nanos = u64::MAX;
+        assert_eq!(local.as_nanos(), LogicalTime::MAX);
+
+        let mut global = GlobalTime::new(&config);
+        let origin = global.as_nanos();
+        global.add_extra_time(Duration::from_secs(u64::MAX));
+        assert_eq!(global.as_nanos(), LogicalTime::MAX);
+        assert_eq!(
+            global.elapsed_nanos(),
+            Some(LogicalTime::from_nanos(u64::MAX - origin.as_nanos()))
+        );
+        global.add_scheduler_time();
+        assert_eq!(global.as_nanos(), LogicalTime::MAX);
     }
 
     #[test]

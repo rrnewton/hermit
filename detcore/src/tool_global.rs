@@ -31,6 +31,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
 use std::time::SystemTime;
 
+use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
@@ -761,21 +762,34 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+    pub async fn clean_up(self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+        if let Err(error) = self
+            .try_clean_up(to_stderr, print_summary_to_json_file)
+            .await
+        {
+            error!("detcore cleanup failed: {error:#}");
+        }
+    }
+
+    async fn try_clean_up(
+        mut self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
-            handle.await.expect("Global scheduler clean shutdown");
+            handle.await?;
             debug!("Global state cleanup, continuing...");
         }
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
-        let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
+        let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log()?;
 
         // Print machine-readable summary:
         if let Some(path) = print_summary_to_json_file {
-            let json = serde_json::to_string_pretty(&summary).unwrap();
-            fs::write(path, json + "\n").unwrap();
+            let json = serde_json::to_string_pretty(&summary)?;
+            fs::write(path, json + "\n")?;
         }
 
         // Print human-readable summary:
@@ -804,6 +818,7 @@ impl GlobalState {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
             }
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -828,7 +843,12 @@ impl GlobalState {
             let final_time = self.global_time.lock().unwrap();
             let final_time_ns = final_time.as_nanos();
             summary.virttime_final = final_time_ns.as_nanos();
-            summary.virttime_elapsed = final_time.elapsed_nanos().as_nanos();
+            let Some(elapsed) = final_time.elapsed_nanos() else {
+                bail!(
+                    "internal invariant violated: global virtual time regressed before its immutable origin"
+                );
+            };
+            summary.virttime_elapsed = elapsed.as_nanos();
         }
 
         Ok((summary, info_reprio_descrip))
@@ -4021,6 +4041,46 @@ mod tests {
 
         assert_eq!(summary.virttime_final, expected_final);
         assert_eq!(summary.virttime_elapsed, 0);
+    }
+
+    #[test]
+    fn regressed_global_time_is_a_recoverable_summary_error() {
+        let config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        {
+            let mut global_time = state.global_time.lock().unwrap();
+            let mut malformed = serde_json::to_value(&*global_time).unwrap();
+            malformed["total"] = serde_json::json!(0);
+            *global_time = serde_json::from_value(malformed).unwrap();
+        }
+
+        let error = state.into_run_summary().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "internal invariant violated: global virtual time regressed before its immutable origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_cleanup_handles_regressed_global_time_without_unwinding() {
+        let config = Config {
+            epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        {
+            let mut global_time = state.global_time.lock().unwrap();
+            let mut malformed = serde_json::to_value(&*global_time).unwrap();
+            malformed["total"] = serde_json::json!(0);
+            *global_time = serde_json::from_value(malformed).unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_millis(100), state.clean_up(false, &None))
+            .await
+            .expect("production cleanup must return after a recoverable summary error");
     }
 
     #[test]

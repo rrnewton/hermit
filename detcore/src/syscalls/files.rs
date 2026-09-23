@@ -1236,7 +1236,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_boot_time_seconds = super::sysinfo::logical_boot_time_seconds(
             crate::types::DetTime::new(&self.cfg).as_nanos(),
             self.cfg.sysinfo_uptime_offset,
-        );
+        )
+        .ok_or(Errno::EOVERFLOW)?;
         // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
         let virtual_memory_kb = guest.config().memory / 1024;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.

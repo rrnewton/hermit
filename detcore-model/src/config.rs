@@ -692,7 +692,12 @@ pub struct Config {
 
     /// Configure a time offset (in seconds) between a container OS considered booted and a guest is executed
     /// This primarily affects 'sysinfo' syscall's 'uptime' field reporting
-    #[clap(long, default_value = "120", value_name = "uint64")]
+    #[clap(
+        long,
+        default_value = "120",
+        value_parser = try_parse_sysinfo_uptime_offset,
+        value_name = "uint64"
+    )]
     pub sysinfo_uptime_offset: u64,
 
     /// Configure memory available for the container.  Takes a number of bytes, or shorthand (e.g.
@@ -742,6 +747,16 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
         .map_err(anyhow::Error::msg)
 }
 
+fn try_parse_sysinfo_uptime_offset(from_str: &str) -> anyhow::Result<u64> {
+    let offset = from_str.parse::<u64>()?;
+    if offset > MAX_SYSINFO_UPTIME_OFFSET_SECONDS {
+        anyhow::bail!(
+            "sysinfo uptime offset must be at most {MAX_SYSINFO_UPTIME_OFFSET_SECONDS} seconds"
+        );
+    }
+    Ok(offset)
+}
+
 impl Config {
     /// Whether the epoch is the stable library default omitted by `Display`.
     pub fn has_default_epoch(&self) -> bool {
@@ -770,6 +785,11 @@ impl Config {
     /// Check invariants that must hold at every execution boundary without mutating the config.
     pub fn validate_invariants(&self) {
         assert!(epoch_nanos(&self.epoch).is_some(), "{EPOCH_RANGE_ERROR}");
+        assert!(
+            self.sysinfo_uptime_offset <= MAX_SYSINFO_UPTIME_OFFSET_SECONDS,
+            "sysinfo uptime offset must be at most {} seconds",
+            MAX_SYSINFO_UPTIME_OFFSET_SECONDS
+        );
         assert!(self.sched_sticky_random_param >= 0.0);
         assert!(self.sched_sticky_random_param <= 1.0);
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1298,6 +1318,14 @@ pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 /// deterministic progress in the surrounding unsigned clock domain.
 pub const MAX_EPOCH_NANOS: u64 = i64::MAX as u64;
 
+/// Largest boot-to-run offset whose uptime remains representable for the full
+/// unsigned nanosecond clock domain.
+///
+/// Linux exposes `sysinfo.uptime` as a signed `long`. Reserving the largest
+/// possible whole-second virtual-time advance here also keeps `/proc/stat`
+/// `btime + uptime` exact instead of forcing either side to clamp independently.
+pub const MAX_SYSINFO_UPTIME_OFFSET_SECONDS: u64 = i64::MAX as u64 - u64::MAX / 1_000_000_000;
+
 /// User-facing invariant shared by CLI and internal validation boundaries.
 pub const EPOCH_RANGE_ERROR: &str = "epoch must be between 1970-01-01T00:00:00Z and \
 2262-04-11T23:47:16.854775807Z inclusive, leaving at least 2^63 nanoseconds of \
@@ -1560,6 +1588,43 @@ mod tests {
         assert_eq!(epoch_nanos(&last_accepted), Some(MAX_EPOCH_NANOS));
         assert_eq!(epoch_nanos(&first_refused), None);
         assert_eq!(u64::MAX - MAX_EPOCH_NANOS, 1_u64 << 63);
+    }
+
+    #[test]
+    fn sysinfo_uptime_offset_accepts_only_the_full_clock_safe_range() {
+        let maximum = Config::try_parse_from([
+            "detcore".to_owned(),
+            format!("--sysinfo-uptime-offset={MAX_SYSINFO_UPTIME_OFFSET_SECONDS}"),
+        ])
+        .unwrap();
+        assert_eq!(
+            maximum.sysinfo_uptime_offset,
+            MAX_SYSINFO_UPTIME_OFFSET_SECONDS
+        );
+
+        let error = Config::try_parse_from([
+            "detcore".to_owned(),
+            format!(
+                "--sysinfo-uptime-offset={}",
+                MAX_SYSINFO_UPTIME_OFFSET_SECONDS + 1
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("sysinfo uptime offset must be at most")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "sysinfo uptime offset must be at most")]
+    fn invariant_rejects_programmatic_unrepresentable_sysinfo_offset() {
+        let config = Config {
+            sysinfo_uptime_offset: MAX_SYSINFO_UPTIME_OFFSET_SECONDS + 1,
+            ..Config::default()
+        };
+        config.validate_invariants();
     }
 
     #[test]
