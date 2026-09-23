@@ -271,6 +271,44 @@ fn ordinary_run_refuses_to_lose_epoch_provenance_to_an_unwritable_log() {
 }
 
 #[test]
+fn ordinary_run_refuses_to_lose_host_now_epoch_provenance_to_unwritable_stderr() {
+    let _guard = hermit_clock_lock();
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/true",
+    ];
+    let control = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args(args)
+        .output()
+        .expect("failed to start the writable-stderr control");
+    assert!(
+        control.status.success(),
+        "writable-stderr control failed: {}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("failed to open /dev/full");
+    let status = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args(args)
+        .stderr(full)
+        .status()
+        .expect("failed to start the unwritable-stderr epoch-provenance probe");
+    assert!(
+        !status.success(),
+        "host-now run succeeded after losing its only epoch reproducer to /dev/full",
+    );
+}
+
+#[test]
 fn explicit_virtual_epoch_reproduces_identical_observed_time() {
     let _guard = hermit_clock_lock();
     let (first, first_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));

@@ -2939,9 +2939,17 @@ impl RunOpts {
         let Some(provenance) = self.virtual_epoch_provenance() else {
             return Ok(());
         };
+        let sink = if global.log_file_handle.is_some() {
+            "--log-file"
+        } else {
+            "controller stderr"
+        };
         global
-            .write_controller_diagnostic(format_args!("WARN hermit::virtual_time: {provenance}"))
-            .context("cannot write epoch provenance to --log-file")
+            .write_controller_diagnostic(
+                format_args!("WARN hermit::virtual_time: {provenance}"),
+                true,
+            )
+            .with_context(|| format!("cannot write epoch provenance to {sink}"))
     }
 
     /// Point this run at an OCI image rootfs, as `--image` does.
