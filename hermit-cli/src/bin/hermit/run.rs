@@ -2939,18 +2939,9 @@ impl RunOpts {
         let Some(provenance) = self.virtual_epoch_provenance() else {
             return Ok(());
         };
-        if let Some(handle) = &global.log_file_handle {
-            let mut file = handle
-                .try_clone()
-                .context("cannot duplicate the host log file descriptor for epoch provenance")?;
-            writeln!(file, "WARN hermit::virtual_time: {provenance}")
-                .context("cannot write epoch provenance to --log-file")?;
-            file.flush()
-                .context("cannot flush epoch provenance to --log-file")?;
-        } else {
-            eprintln!("WARN hermit::virtual_time: {provenance}");
-        }
-        Ok(())
+        global
+            .write_controller_diagnostic(format_args!("WARN hermit::virtual_time: {provenance}"))
+            .context("cannot write epoch provenance to --log-file")
     }
 
     /// Point this run at an OCI image rootfs, as `--image` does.

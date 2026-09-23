@@ -4779,14 +4779,19 @@ fn log_file_under_tmp_lands_on_the_host() {
         .tempdir_in("/tmp")
         .unwrap();
     let log = directory.path().join("guest.log");
+    let epoch = "2026-01-01T00:00:00.123456789+00:00";
+    let epoch_arg = format!("--epoch={epoch}");
 
     let output = hermit(&[
         "--log=info",
         "--log-file",
         log.to_str().unwrap(),
         "run",
+        &epoch_arg,
         "--",
-        "/bin/true",
+        "/bin/sh",
+        "-c",
+        "printf 'guest-stderr-control\n' >&2",
     ]);
 
     assert_eq!(
@@ -4804,6 +4809,11 @@ fn log_file_under_tmp_lands_on_the_host() {
         size > 0,
         "--log-file under /tmp produced an empty host file"
     );
+    let diagnostics = std::fs::read_to_string(&log).unwrap();
+    assert!(diagnostics.contains(&format!(
+        "hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}\n"
+    )));
+    assert_eq!(output.stderr, b"guest-stderr-control\n");
 }
 
 /// A log destination that cannot be opened must say so and fail, never exit 0

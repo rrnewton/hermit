@@ -219,6 +219,10 @@ fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
     )
     .unwrap();
     let args: Vec<_> = command.get_args().collect();
+    assert_eq!(
+        command_epoch_arguments(&command),
+        [format!("--epoch={COMPARISON_EPOCH}")],
+    );
     assert!(args.contains(&OsStr::new("--base-env=minimal")));
     assert!(args.windows(2).any(|args| {
         args == [
