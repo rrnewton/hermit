@@ -30,6 +30,14 @@ pub(super) const RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 
 pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
+pub(super) const SABRE_MANIFEST_C_GATE_COMMAND: &str = concat!(
+    "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
+    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run ",
+    "--lane portable --category c-programs --test c-programs/add-key-enosys ",
+    "--mode verify --backend sabre --prebuilt --jobs 1 --require-sabre-packaged-gate ",
+    "--results \"$E2E_RESULT_ROOT/portable/sabre_manifest_c_gate/results.jsonl\" ",
+    "--junit \"$E2E_RESULT_ROOT/portable/sabre_manifest_c_gate/junit.xml\""
+);
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -179,6 +187,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "privileged-only-e2e.manifest_backend_parity_c",
     "privileged-only-e2e.manifest_backend_parity_c_on_host",
     "quick.e2e_verify",
+    "test.sabre_manifest_c_gate",
 ];
 
 pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] =
@@ -511,6 +520,38 @@ pub(super) fn config() -> DagConfig {
             .materialize(),
         );
     }
+    steps.push(
+        StaticStepSpec {
+            group: "test",
+            job: "sabre_manifest_c_gate",
+            desc: "Packaged SaBRe dynamic-PIE C execution-path gate",
+            description: "Run one stable dynamic-PIE C guest through the published Hermit/install bundle and require both strict-verification executions to reach Detcore without ptrace fallback or trusted native sites.",
+            labels: &["full", "portable"],
+            cmd: SABRE_MANIFEST_C_GATE_COMMAND,
+            cmdtype: CmdType::Unknown,
+            manifest: None,
+            integration_test_binaries: None,
+            deps: &["build.e2e_artifact", "build.manifest_guests"],
+            env: &[],
+            hint: HintSpec {
+                resources: &[("manifest_guest", 1)],
+                est_duration_s: 5.0,
+                rss_baseline_bytes: Some(1073741824),
+                hard_mem_max_bytes: Some(3221225472),
+                classification: StepClass::LatencyBound,
+                preferred_inner_jobs: Some(1),
+                measured_effective_cores: None,
+                measured_cpu_utilization: None,
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: 60,
+            cpu_timeout: 60,
+            jobs_flag: None,
+            jobs_env: None,
+        }
+        .materialize(),
+    );
     DagConfig {
         description: "Hermit validation superset; select quick, portable, hosted-portable, full, super, privileged, or hosted-privileged by step label".into(),
         default_step_timeout: 600,

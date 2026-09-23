@@ -102,6 +102,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.isolated_detcore_workdir",
     "test.liteinst_strict",
     "test.sabre_examples",
+    "test.sabre_manifest_c_gate",
     "test.hermit_modes",
     "test.app_strict_verify",
     "test.command_strict_verify",
@@ -160,13 +161,13 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 269,
-        selected_steps: 270,
+        direct_steps: 270,
+        selected_steps: 271,
     },
     Profile {
         label: "portable",
-        direct_steps: 260,
-        selected_steps: 261,
+        direct_steps: 261,
+        selected_steps: 262,
     },
     Profile {
         label: "quick",
@@ -1220,9 +1221,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 106 {
+    if expected.len() != 107 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 106",
+            "structured result producer registry has {} entries, expected 107",
             expected.len()
         ));
     }
@@ -1357,9 +1358,79 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [67, 33, 2, 2, 2] {
+    if actual_group_counts != [67, 34, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn assert_sabre_manifest_c_gate_contract(cfg: &DagConfig) -> Result<(), String> {
+    let matches = cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "test.sabre_manifest_c_gate")
+        .collect::<Vec<_>>();
+    let [step] = matches.as_slice() else {
+        return Err(format!(
+            "validation DAG requires exactly one test.sabre_manifest_c_gate, got {}",
+            matches.len()
+        ));
+    };
+    if cfg
+        .steps
+        .iter()
+        .any(|candidate| candidate.tag() == "test.sabre_manifest_c_gate_on_host")
+    {
+        return Err("packaged SaBRe C gate must not duplicate unrelated hosted work".into());
+    }
+    if step.labels != ["full".to_string(), "portable".to_string()]
+        || step.timeout != 60
+        || step.cpu_timeout != 60
+        || step.hint.resources.get("manifest_guest") != Some(&1)
+        || step.hint.resources.len() != 1
+        || step.hint.preferred_inner_jobs != Some(1)
+        || step.manifest.is_some()
+        || step.jobs_flag.is_some()
+        || step.jobs_env.is_some()
+    {
+        return Err(format!(
+            "packaged SaBRe C gate changed labels/bounds/resource/ownership: labels={:?} wall={} cpu={} hint={:?} manifest={:?} jobs_flag={:?} jobs_env={:?}",
+            step.labels,
+            step.timeout,
+            step.cpu_timeout,
+            step.hint,
+            step.manifest,
+            step.jobs_flag,
+            step.jobs_env
+        ));
+    }
+    let command = crate::nextest_build_selections::execution_command(step)?;
+    if command != crate::validation_dag_static::SABRE_MANIFEST_C_GATE_COMMAND {
+        return Err(format!(
+            "packaged SaBRe C gate changed its exact artifact/cell assertion command: {command:?}"
+        ));
+    }
+    for dependency in [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+    ] {
+        if !step.deps.iter().any(|actual| actual == dependency) {
+            return Err(format!(
+                "packaged SaBRe C gate lost causal dependency {dependency}"
+            ));
+        }
+    }
+    let manifests = step.effective_result_manifests();
+    let structured = step
+        .structured_test_results_manifest()
+        .map_err(|error| format!("test.sabre_manifest_c_gate: {error}"))?;
+    if !manifests.is_empty()
+        || !matches!(structured, Some(result) if result.owner == "test.sabre_manifest_c_gate")
+    {
+        return Err(format!(
+            "packaged SaBRe C gate must own only its structured one-cell count: manifests={manifests:?} structured={structured:?}"
         ));
     }
     Ok(())
@@ -1611,12 +1682,13 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
+    assert_sabre_manifest_c_gate_contract(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1605 {
+    if cfg.steps.len() != 1606 {
         return Err(format!(
-            "superset has {} steps, expected 1605",
+            "superset has {} steps, expected 1606",
             cfg.steps.len()
         ));
     }
@@ -2185,6 +2257,91 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_sabre_c_gate_contract_rejects_command_dependency_and_budget_mutations() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_sabre_manifest_c_gate_contract(&committed).unwrap();
+
+        let mut mutations = Vec::new();
+        for (label, from, to) in [
+            ("install requirement", "--require-install ", ""),
+            (
+                "exact guest",
+                "c-programs/add-key-enosys",
+                "c-programs/rcx-canonicalization",
+            ),
+            ("path assertion", " --require-sabre-packaged-gate", ""),
+        ] {
+            let mut changed = committed.clone();
+            let step = changed
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+                .unwrap();
+            step.cmd = step.cmd.replacen(from, to, 1);
+            mutations.push((label, changed));
+        }
+        let mut missing_artifact = committed.clone();
+        missing_artifact
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .deps
+            .retain(|dependency| dependency != "build.e2e_artifact_in_pinned_root");
+        mutations.push(("artifact dependency", missing_artifact));
+        let mut missing_guest = committed.clone();
+        missing_guest
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .deps
+            .retain(|dependency| dependency != "build.manifest_guests_in_pinned_root");
+        mutations.push(("guest dependency", missing_guest));
+        let mut wall = committed.clone();
+        wall.steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .timeout = 61;
+        mutations.push(("wall bound", wall));
+        let mut cpu = committed.clone();
+        cpu.steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .cpu_timeout = 61;
+        mutations.push(("CPU bound", cpu));
+        let mut resource = committed.clone();
+        resource
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .hint
+            .resources
+            .insert("manifest_guest".into(), 2);
+        mutations.push(("resource demand", resource));
+        let mut hosted = committed.clone();
+        let mut hosted_step = hosted
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.sabre_manifest_c_gate")
+            .unwrap()
+            .clone();
+        hosted_step.job.push_str("_on_host");
+        hosted.steps.push(hosted_step);
+        mutations.push(("hosted duplicate", hosted));
+
+        for (label, mutation) in mutations {
+            assert!(
+                assert_sabre_manifest_c_gate_contract(&mutation).is_err(),
+                "{label} mutation was accepted"
+            );
+        }
+    }
 
     #[test]
     fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
