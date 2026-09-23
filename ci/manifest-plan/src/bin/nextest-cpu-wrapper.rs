@@ -47,7 +47,12 @@ use hermit_manifest_plan::nextest_cpu::write_attempt_atomic;
 use hermit_manifest_plan::nextest_cpu::write_binary_map_atomic;
 use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 
-const ATTEMPT_ENV: &str = "__NEXTEST_ATTEMPT";
+const ATTEMPT_ENV: &str = "NEXTEST_ATTEMPT";
+// cargo-nextest 0.9.116 replaced this private variable with the public one
+// above. The pinned validation image deliberately retains the declared 0.9.100
+// minimum, so accept the legacy spelling only when the public contract is
+// absent. A process carrying both must agree byte-for-byte.
+const LEGACY_ATTEMPT_ENV: &str = "__NEXTEST_ATTEMPT";
 const RUN_ID_ENV: &str = "NEXTEST_RUN_ID";
 const PACKAGE_ENV: &str = "CARGO_PKG_NAME";
 const CONTROL_ARM_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL";
@@ -118,6 +123,44 @@ fn required_env(name: &str) -> Result<String, String> {
     env::var(name).map_err(|error| format!("{name} must be present and valid UTF-8: {error}"))
 }
 
+fn attempt_from_values(public: Option<&str>, legacy: Option<&str>) -> Result<u64, String> {
+    let (name, value) = match (public, legacy) {
+        (Some(public), Some(legacy)) if public != legacy => {
+            return Err(format!(
+                "{ATTEMPT_ENV} and {LEGACY_ATTEMPT_ENV} disagree: {public:?} != {legacy:?}"
+            ));
+        }
+        (Some(public), _) => (ATTEMPT_ENV, public),
+        (None, Some(legacy)) => (LEGACY_ATTEMPT_ENV, legacy),
+        (None, None) => {
+            return Err(format!(
+                "{ATTEMPT_ENV} (cargo-nextest 0.9.116+) or {LEGACY_ATTEMPT_ENV} (0.9.100-0.9.115) must be present"
+            ));
+        }
+    };
+    let attempt = value
+        .parse::<u64>()
+        .map_err(|error| format!("{name} is not a positive integer: {error}"))?;
+    if attempt == 0 {
+        return Err(format!("{name} is not a positive integer: zero"));
+    }
+    Ok(attempt)
+}
+
+fn optional_env(name: &str) -> Result<Option<String>, String> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("{name} must be valid UTF-8 when present: {error}")),
+    }
+}
+
+fn attempt_from_environment() -> Result<u64, String> {
+    let public = optional_env(ATTEMPT_ENV)?;
+    let legacy = optional_env(LEGACY_ATTEMPT_ENV)?;
+    attempt_from_values(public.as_deref(), legacy.as_deref())
+}
+
 fn identity_from_command(program: &OsStr, args: &[OsString]) -> Result<AttemptIdentity, String> {
     let mut command = Vec::with_capacity(args.len() + 1);
     command.push(program);
@@ -140,9 +183,7 @@ fn identity_from_command(program: &OsStr, args: &[OsString]) -> Result<AttemptId
             "nextest command package {command_package:?} disagrees with typed inventory package {package:?}"
         ));
     }
-    let attempt = required_env(ATTEMPT_ENV)?
-        .parse::<u64>()
-        .map_err(|error| format!("{ATTEMPT_ENV} is not a positive integer: {error}"))?;
+    let attempt = attempt_from_environment()?;
     let identity = AttemptIdentity {
         package: package.to_string(),
         binary: binary.to_string(),
@@ -2660,6 +2701,20 @@ fn budget_map_self_test(
 }
 
 fn self_test() -> Result<(), String> {
+    for (label, public, legacy, expected) in [
+        ("public-only", Some("1"), None, Ok(1)),
+        ("legacy-only", None, Some("2"), Ok(2)),
+        ("both-equal", Some("3"), Some("3"), Ok(3)),
+        ("both-conflicting", Some("4"), Some("5"), Err(())),
+        ("neither", None, None, Err(())),
+    ] {
+        let actual = attempt_from_values(public, legacy).map_err(|_| ());
+        if actual != expected {
+            return Err(format!(
+                "attempt environment contract {label} produced {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
     let scratch = Scratch::new()?;
     let executable = env::current_exe().map_err(|error| error.to_string())?;
     let test_binary = scratch.0.join("fixture_name-0123456789abcdef");

@@ -1590,6 +1590,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/manifest-plan/src/runner.rs",
         "ci/manifest-plan/src/service_result.rs",
         "ci/manifest-plan/src/timeouts.rs",
+        "ci/manifest-plan/src/validation_dag.rs",
+        "ci/manifest-plan/src/validation_dag_static.rs",
         "ci/manifest-plan/validation-service-result-schema.json",
         "ci/nextest-timeout-config.rs",
         "ci/run-nextest-counted.sh",
@@ -1625,6 +1627,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/manifest-plan/src/runner.rs",
                 "ci/manifest-plan/src/service_result.rs",
                 "ci/manifest-plan/src/timeouts.rs",
+                "ci/manifest-plan/src/validation_dag.rs",
+                "ci/manifest-plan/src/validation_dag_static.rs",
                 "ci/manifest-plan/validation-service-result-schema.json",
                 "ci/nextest-timeout-config.rs",
                 "ci/run-nextest-counted.sh",
@@ -5832,20 +5836,32 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
             .strip_prefix(PREFIX)
             .and_then(|rest| rest.split_once(&separator))
             .ok_or_else(|| format!("{tag} has an unsupported pinned-root transport"))?;
-        let words = forwarded.split_whitespace().collect::<Vec<_>>();
+        let mut words = forwarded.split_whitespace();
         let mut names = BTreeSet::new();
-        for pair in words.chunks(2) {
-            if pair.len() != 2
-                || pair[0] != "--env"
-                || !pair[1]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-                || !names.insert(pair[1])
-            {
-                return Err(format!("{tag} has an ambiguous pinned-root environment"));
+        let expected_proc_locks_runtime =
+            matches!(tag.as_str(), "e2e.manifest_c_programs" | "quick.e2e_verify");
+        let mut proc_locks_runtime = false;
+        while let Some(option) = words.next() {
+            match option {
+                "--env" => {
+                    let Some(name) = words.next() else {
+                        return Err(format!("{tag} has an ambiguous pinned-root environment"));
+                    };
+                    if !name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    }) || !names.insert(name)
+                    {
+                        return Err(format!("{tag} has an ambiguous pinned-root environment"));
+                    }
+                }
+                "--proc-locks-runtime" if expected_proc_locks_runtime && !proc_locks_runtime => {
+                    proc_locks_runtime = true;
+                }
+                _ => return Err(format!("{tag} has an ambiguous pinned-root environment")),
             }
         }
-        if payload != validate_plan::shell_quote(&guarded)
+        if proc_locks_runtime != expected_proc_locks_runtime
+            || payload != validate_plan::shell_quote(&guarded)
             || ["DAGRUN_TEST_COUNTS_PATH", "E2E_RESULT_ROOT", "E2E_RUN_ID"]
                 .iter()
                 .any(|name| !names.contains(name))
@@ -6118,11 +6134,11 @@ fn verify_raw_publisher_completion(
             ));
         };
         if start.0 >= end.0
-            || !start.1["pid"]
+            || start.1["pid"]
                 .as_str()
                 .and_then(|pid| pid.parse::<u32>().ok())
-                .is_some_and(|pid| pid > 0)
-            || !start.1["cmd"].as_str().is_some_and(|cmd| !cmd.is_empty())
+                .is_none_or(|pid| pid == 0)
+            || start.1["cmd"].as_str().is_none_or(|cmd| cmd.is_empty())
             || end.1["ok"].as_bool() != Some(outcome.ok)
             || ["aborted", "timed_out", "cpu_timed_out"]
                 .iter()
@@ -6132,7 +6148,7 @@ fn verify_raw_publisher_completion(
             || outcome.aborted
             || outcome.timed_out
             || outcome.cpu_timed_out
-            || !outcome.returncode.is_some_and(|code| code >= 0)
+            || outcome.returncode.is_none_or(|code| code < 0)
             || outcome.test_results.is_none()
             || outcome.test_results_error.is_some()
             || outcome.test_results_error_kind.is_some()
@@ -8153,6 +8169,10 @@ const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
 const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; \
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
+const DAGRUN_PREPARE_BODY: &str =
+    "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
+const RUST_SCRIPT_PRODUCER_BODY: &str =
+    "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ./ci/prepare-rust-scripts.sh";
 
 fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
     let cfg = validate_plan::validation_config(root)?;
@@ -8168,6 +8188,32 @@ fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
         ));
     }
     Ok(producers[0].clone())
+}
+
+fn committed_dagrun_prepare_boundary(root: &Path) -> Result<(String, i64), String> {
+    let producer = committed_rust_script_producer(root)?;
+    let body = producer
+        .cmd
+        .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+        .ok_or_else(|| {
+            format!(
+                "committed {RUST_SCRIPT_PRODUCER_TAG} lost its rust-script command prefix: {}",
+                producer.cmd
+            )
+        })?;
+    let suffix = " && ./ci/prepare-rust-scripts.sh";
+    let prepare = body.strip_suffix(suffix).ok_or_else(|| {
+        format!(
+            "committed {RUST_SCRIPT_PRODUCER_TAG} lost its dagrun-before-Cargo boundary: {}",
+            producer.cmd
+        )
+    })?;
+    if prepare != DAGRUN_PREPARE_BODY || producer.timeout != 900 {
+        return Err(format!(
+            "committed {RUST_SCRIPT_PRODUCER_TAG} changed its exact dagrun preparation or 900-second wall bound: {producer:?}"
+        ));
+    }
+    Ok((prepare.to_string(), producer.timeout))
 }
 
 fn serialized_step(step: &Step) -> String {
@@ -8194,7 +8240,7 @@ fn rust_script_producer_step() -> Step {
         "build",
         "rust_scripts",
         "Build every tracked rust-script before graph consumers run",
-        "./ci/prepare-rust-scripts.sh".into(),
+        RUST_SCRIPT_PRODUCER_BODY.into(),
         Vec::new(),
         900,  // wall-clock seconds
         7200, // CPU seconds: eight workers may consume this in 900 wall seconds
@@ -8373,7 +8419,7 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         .iter()
         .find(|step| step.tag() == "fixture.child")
         .ok_or("rust-script producer bracket lost the child fixture")?;
-    if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh")
+    if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}{RUST_SCRIPT_PRODUCER_BODY}")
         || root_step.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
         || child.deps != ["fixture.root".to_string()]
         || !root_step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
@@ -8392,6 +8438,23 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     };
     if configure_prebuilt_rust_scripts(root, &mut duplicated, false).is_ok() {
         return Err("rust-script producer bracket accepted duplicate writers".into());
+    }
+    let mut late_prepare = committed_rust_script_producer(root)?;
+    late_prepare.cmd = format!(
+        "{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh && {DAGRUN_PREPARE_BODY}"
+    );
+    let mut late = Plan {
+        cfg: validate_plan::config_from(
+            vec![late_prepare],
+            "late dagrun preparation bracket",
+        ),
+        ..Default::default()
+    };
+    if configure_prebuilt_rust_scripts(root, &mut late, false).is_ok() {
+        return Err(
+            "rust-script producer bracket accepted dagrun preparation after Cargo compilation"
+                .into(),
+        );
     }
     let mut transported = Plan {
         cfg: validate_plan::config_from(
@@ -10667,6 +10730,41 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         .filter(|value| *value > 0)
         .unwrap_or(1)
         .to_string();
+    // In the production graph build.rust_scripts performs this preparation
+    // before opening its Cargo build directory. A standalone --self-test has
+    // no enclosing producer node, so exercise the exact committed prefix here
+    // before starting the independently bounded raw-launcher fixture.
+    let (prepare_command, prepare_timeout_s) = committed_dagrun_prepare_boundary(root)?;
+    let prepare_timeout = format!("{prepare_timeout_s}s");
+    let prepared = Command::new("timeout")
+        .args([
+            "--foreground",
+            "--kill-after=10s",
+            &prepare_timeout,
+            "bash",
+            "-c",
+            &prepare_command,
+        ])
+        .current_dir(root)
+        .env("CARGO_BUILD_JOBS", &scheduled_build_jobs)
+        .output()
+        .map_err(|error| format!("raw run-dag engine: cannot prepare committed dagrun: {error}"))?;
+    let prepared_stdout = String::from_utf8_lossy(&prepared.stdout);
+    let prepared_target = Path::new(prepared_stdout.trim());
+    let prepared_executable = prepared_target
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    if !prepared.status.success()
+        || prepared_stdout.lines().count() != 1
+        || !prepared_target.is_absolute()
+        || !prepared_executable
+    {
+        return Err(format!(
+            "raw run-dag engine: committed dagrun preparation failed or published no executable: status={} stdout={prepared_stdout:?} stderr={:?}",
+            prepared.status,
+            String::from_utf8_lossy(&prepared.stderr),
+        ));
+    }
     let launch = |engine: Option<&str>| -> Result<std::process::Output, String> {
         let mut command = Command::new("timeout");
         command
@@ -26180,6 +26278,33 @@ mod raw_census_publication_tests {
         assert_eq!(publishers.len(), 33);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
+            let expects_proc_locks_runtime = matches!(
+                step.tag().as_str(),
+                "e2e.manifest_c_programs" | "quick.e2e_verify"
+            );
+            assert_eq!(
+                step.cmd.matches(" --proc-locks-runtime ").count(),
+                usize::from(expects_proc_locks_runtime),
+                "{}",
+                step.tag()
+            );
+            if expects_proc_locks_runtime {
+                for command in [
+                    step.cmd.replace(" --proc-locks-runtime", ""),
+                    step.cmd.replace(
+                        " --proc-locks-runtime",
+                        " --proc-locks-runtime --proc-locks-runtime",
+                    ),
+                ] {
+                    let mut changed = step.clone();
+                    changed.cmd = command;
+                    assert!(
+                        normal_raw_result_path(&changed, "fixture-run").is_err(),
+                        "{} accepted a missing or duplicate proc-locks runtime",
+                        step.tag()
+                    );
+                }
+            }
             let expected_flag = match step
                 .manifest
                 .as_ref()
@@ -26258,6 +26383,19 @@ mod raw_census_publication_tests {
                 );
             }
         }
+        let mut wrong_tag = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_bin_c")
+            .unwrap()
+            .clone();
+        wrong_tag.cmd = wrong_tag
+            .cmd
+            .replacen(" -- bash -c ", " --proc-locks-runtime -- bash -c ", 1);
+        assert!(
+            normal_raw_result_path(&wrong_tag, "fixture-run").is_err(),
+            "an unrelated publisher accepted the proc-locks runtime option"
+        );
     }
 
     fn failed_publisher() -> (DagConfig, LaneResult, Vec<serde_json::Value>) {

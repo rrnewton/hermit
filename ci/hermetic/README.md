@@ -25,6 +25,7 @@ an independent container resource policy.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest
+ci/hermetic/check-image-provenance.rs           # check tracked pin/receipt consistency
 ci/hermetic/run-in-pinned-root.sh --check-image # read-only exact local image check
 ci/hermetic/run-in-pinned-root.sh --src DIR --out DIR -- CMD...
 ci/hermetic/run-split-validate.sh --fetch-only # canonical driver's locked fetch node
@@ -41,6 +42,41 @@ as `COULD_NOT_RUN`, with zero executed nodes/tests and no passing receipt. The
 raw probe status and stderr remain visible; store errors are distinct from
 Podman's absent-image status 1. Inspection has a 10-second bound and a 2-second
 forced-stop grace. Admission neither builds nor loads an image.
+
+## Image provenance and repins
+
+`image.digest` is accepted only with the checked-in
+`image.provenance.json`. Run `check-image-provenance.rs` after checkout changes
+and before proposing a pin change. The checker validates the tracked receipt's
+strict schema and internal agreement, exact recorded build/store identities and
+results, the four enumerated live image-input files, and live pin. The recorded
+build-source commit, tree, and archive are historical evidence: review binds
+those identities and the external bytes and logs to the receipt. Rebases can
+rewrite commit ancestry, so live equivalence is deliberately limited to those
+four image inputs rather than the complete historical tree or archive. The
+checker is read-only and does not build, load, inspect, or silently repair an
+image. Both `-h` and `--help` describe this interface; its unit tests run with
+`rust-script --test ci/hermetic/check-image-provenance.rs`.
+
+The current d809 pin supersedes c607 because c607 was produced from a reused,
+mixed Nix store. Three same-path inputs in that store had NAR contents different
+from fresh realizations. A separately reviewed eight-combination fresh/shared
+matrix reported that its all-fresh cell produced the same 717144 archive as two
+new builds from commit
+`c549ee2642cd2bb670247453d8f69b7502346bf4`. Those builds used
+independent source snapshots, physical Nix stores, and Podman stores and loaded
+the same d809 image. The matrix did not match the recorded c607 archive SHA-256
+`e3655bf4a4e82753e39a74c838e03fbdb2e22dae7fc7568c2c4664d7639374db`;
+the original archive bytes were not retained and are unavailable, so the
+comparison is against PR #3172's recorded SHA-256 rather than present bytes.
+
+This proves same-host reproducibility for the recorded method only; it makes no
+cross-host reproducibility claim. The evidence also states what the experiment
+did not preserve: its exact launch command/environment, elapsed wall time,
+build-time Nix version, and a pre-build empty-store listing. `build-image.sh`
+remains useful for a local one-off build, but one such build is not sufficient
+evidence for another reviewed repin. A future repin must replace the digest and
+provenance together with two new agreeing isolated builds.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each

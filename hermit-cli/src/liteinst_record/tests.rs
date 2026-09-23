@@ -3221,7 +3221,19 @@ fn teardown_child() {
     };
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) }, 0);
     let path = std::env::var_os(TEARDOWN_OUTPUT).expect("child output path");
-    let file = std::fs::File::create(path).unwrap();
+    let mut file = std::fs::File::create(path).unwrap();
+    if case == "stderr-pressure" {
+        let pipe_capacity = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETPIPE_SZ) };
+        assert!(pipe_capacity > 0, "stderr should be a pipe");
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "pressure-start capacity={pipe_capacity}").unwrap();
+        stderr
+            .write_all(&vec![b'x'; pipe_capacity as usize + 1])
+            .unwrap();
+        writeln!(stderr, "\npressure-end").unwrap();
+        file.write_all(TEARDOWN_RECORD).unwrap();
+        return;
+    }
     let dynamic = case == "dynamic-filter";
     let filter = EnvFilter::new(if dynamic {
         "off,[watched]=info"
@@ -3293,7 +3305,9 @@ fn teardown_child() {
 }
 
 fn teardown_subprocess(case: &str) -> (std::process::Output, Vec<u8>) {
+    use std::io::Read;
     use std::process::Command;
+    use std::process::Output;
     use std::process::Stdio;
     use std::time::Duration;
     use std::time::Instant;
@@ -3314,23 +3328,59 @@ fn teardown_subprocess(case: &str) -> (std::process::Output, Vec<u8>) {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    let mut stderr = child.stderr.take().expect("piped child stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            let result = child.wait_with_output().unwrap();
+            child.wait().unwrap();
+            let stderr = stderr_reader.join().expect("stderr reader should complete");
             panic!(
                 "teardown subprocess {case} exceeded 10 seconds: {}",
-                String::from_utf8_lossy(&result.stderr)
+                String::from_utf8_lossy(&stderr)
             );
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
-    let result = child.wait_with_output().unwrap();
+    };
+    let stderr = stderr_reader.join().expect("stderr reader should complete");
+    let result = Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    };
     let bytes = std::fs::read(output).unwrap();
     (result, bytes)
+}
+
+#[test]
+fn teardown_subprocess_drains_stderr_beyond_pipe_capacity() {
+    let (result, bytes) = teardown_subprocess("stderr-pressure");
+    assert!(
+        result.status.success(),
+        "pressure child failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    let (header, body) = stderr
+        .split_once('\n')
+        .expect("pressure child should separate its header");
+    let capacity = header
+        .strip_prefix("pressure-start capacity=")
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("pressure child should report the pipe capacity");
+    let pressure = body
+        .strip_suffix("\npressure-end\n")
+        .expect("pressure child should retain its stderr trailer");
+    assert_eq!(pressure.len(), capacity + 1);
+    assert!(pressure.bytes().all(|byte| byte == b'x'));
+    assert_eq!(bytes, TEARDOWN_RECORD);
 }
 
 #[test]

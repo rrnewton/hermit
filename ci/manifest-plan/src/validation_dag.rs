@@ -819,15 +819,14 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         if producer.job == "manifest_guests" && producer_tags.contains("setup.manifest_plan") {
             twin.deps.push("setup.manifest_plan_in_pinned_root".into());
         }
-        // The host manifest producer already prepares the tracked Rust dagrun
-        // before gate.manifest. The pinned-root twin builds only the manifest
-        // binaries it publishes. Re-running the host launcher here can hold the
-        // shared agent-utils cache lock longer than the gate's bounded raw
-        // launcher fixture while contributing no pinned-root output.
-        if producer.tag() == "setup.manifest_plan" {
+        // The host rust-script producer prepares the tracked Rust dagrun before
+        // opening its Cargo build directory. The pinned-root twin has private
+        // agent-utils state and publishes only rust-script artifacts, so it
+        // must not repeat that host-cache preparation.
+        if producer.tag() == "build.rust_scripts" {
             if twin.cmd.matches(DAGRUN_PREPARE_COMMAND).count() != 1 {
                 return Err(
-                    "manifest-plan producer lost its exact dagrun preparation boundary".into(),
+                    "rust-script producer lost its exact dagrun preparation boundary".into(),
                 );
             }
             twin.cmd = twin.cmd.replacen(DAGRUN_PREPARE_COMMAND, "", 1);
@@ -1469,6 +1468,18 @@ fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
             .find(|step| step.tag() == *tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))?;
         let execution_command = crate::nextest_build_selections::execution_command(step)?;
+        let expected_command = if matches!(
+            *tag,
+            "build.rust_scripts_in_pinned_root" | "quick-super-build.rust_scripts_in_pinned_root"
+        ) {
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND.replacen(
+                DAGRUN_PREPARE_COMMAND,
+                "",
+                1,
+            )
+        } else {
+            crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND.to_string()
+        };
         let expected_labels = labels
             .iter()
             .map(|label| (*label).to_string())
@@ -1479,7 +1490,7 @@ fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
             .collect::<Vec<_>>();
         let has_no_result_ownership =
             step.manifest.is_none() && matches!(step.result_manifests.as_deref(), Some([]));
-        if execution_command != crate::validation_dag_static::RUST_SCRIPT_PRODUCER_COMMAND
+        if execution_command != expected_command
             || step.labels != expected_labels
             || step.deps != expected_deps
             || !has_no_result_ownership
@@ -1499,6 +1510,49 @@ fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
         {
             return Err(format!(
                 "{tag} changed its exact rust-script producer identity or resource contract: {step:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_dagrun_preparation_placement(cfg: &DagConfig) -> Result<(), String> {
+    let step = |tag: &str| {
+        cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG lost {tag}"))
+    };
+    for tag in [
+        "build.rust_scripts",
+        "quick-super-build.rust_scripts",
+        "build.rust_scripts_on_host",
+    ] {
+        let command = &step(tag)?.cmd;
+        let prepare = command.find(DAGRUN_PREPARE_COMMAND);
+        let build = command.find("./ci/prepare-rust-scripts.sh");
+        if command.matches(DAGRUN_PREPARE_COMMAND).count() != 1
+            || command.matches("./ci/prepare-rust-scripts.sh").count() != 1
+            || !matches!((prepare, build), (Some(prepare), Some(build)) if prepare < build)
+        {
+            return Err(format!(
+                "{tag} must prepare dagrun exactly once before opening the rust-script Cargo build: {command}"
+            ));
+        }
+    }
+    for tag in [
+        "build.rust_scripts_in_pinned_root",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "setup.manifest_plan",
+        "quick-super-setup.manifest_plan",
+        "setup.manifest_plan_on_host",
+        "setup.manifest_plan_in_pinned_root",
+        "quick-super-setup.manifest_plan_in_pinned_root",
+    ] {
+        let command = &step(tag)?.cmd;
+        if command.contains(DAGRUN_PREPARE_COMMAND) {
+            return Err(format!(
+                "{tag} must not replant host dagrun preparation after the rust-script Cargo build begins: {command}"
             ));
         }
     }
@@ -1558,6 +1612,7 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
+    assert_dagrun_preparation_placement(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
     if cfg.steps.len() != 1605 {
         return Err(format!(
@@ -2198,12 +2253,74 @@ mod tests {
     }
 
     #[test]
-    fn manifest_setup_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
+    fn rust_script_producer_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
         use std::os::unix::fs::PermissionsExt;
 
         use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
 
+        for tag in ["build.rust_scripts", "build.rust_scripts_on_host"] {
+            let step = crate::validation_dag_static::config()
+                .steps
+                .into_iter()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            for width in [1, 3] {
+                for (prepare_status, producer_status) in [(0, 0), (23, 0), (0, 29)] {
+                    let scratch = Scratch::create().unwrap();
+                    let root = &scratch.0;
+                    fs::create_dir_all(root.join("agent-utils/rs/bin")).unwrap();
+                    fs::create_dir_all(root.join("ci")).unwrap();
+                    let launcher = root.join("agent-utils/rs/bin/dagrun");
+                    fs::write(
+                        &launcher,
+                        "#!/bin/bash\nprintf 'runner:%s:%s:%s\\n' \"${AGENT_UTILS_RS_ENSURE_ONLY:-}\" \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PREPARE_STATUS\"\n",
+                    )
+                    .unwrap();
+                    let producer = root.join("ci/prepare-rust-scripts.sh");
+                    fs::write(
+                        &producer,
+                        "#!/bin/bash\nprintf 'producer:%s:%s\\n' \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PRODUCER_STATUS\"\n",
+                    )
+                    .unwrap();
+                    for path in [&launcher, &producer] {
+                        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+                    }
+                    let capture = root.join("capture");
+                    let mut command = Command::new("timeout");
+                    command
+                        .args(["--kill-after=1s", "5s", "bash", "-c"])
+                        .arg(command_with_inner_jobs(&step, "-j", Some(width)))
+                        .current_dir(root)
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("CAPTURE", &capture)
+                        .env("CARGO_BUILD_JOBS", "99")
+                        .env("PREPARE_STATUS", prepare_status.to_string())
+                        .env("PRODUCER_STATUS", producer_status.to_string());
+                    if let Some((key, value)) = env_with_inner_jobs(&step, "", Some(width)) {
+                        command.env(key, value);
+                    }
+                    let output = command.output().unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(if prepare_status == 0 {
+                            producer_status
+                        } else {
+                            prepare_status
+                        }),
+                        "{tag}: {output:?}",
+                    );
+                    let mut expected = format!("runner:1:{width}:0\n");
+                    if prepare_status == 0 {
+                        expected.push_str(&format!("producer:{width}:0\n"));
+                    }
+                    assert_eq!(fs::read_to_string(&capture).unwrap(), expected, "{tag}");
+                }
+            }
+        }
+
+        // The later manifest build must not reacquire or clean the dagrun
+        // cache. It retains the same admitted width and Cargo failure status.
         for tag in ["setup.manifest_plan", "setup.manifest_plan_on_host"] {
             let step = crate::validation_dag_static::config()
                 .steps
@@ -2211,26 +2328,17 @@ mod tests {
                 .find(|step| step.tag() == tag)
                 .unwrap();
             for width in [1, 3] {
-                for (prepare_status, cargo_status) in [(0, 0), (23, 0), (0, 29)] {
+                for cargo_status in [0, 29] {
                     let scratch = Scratch::create().unwrap();
                     let root = &scratch.0;
-                    fs::create_dir_all(root.join("agent-utils/rs/bin")).unwrap();
                     fs::create_dir_all(root.join("tools")).unwrap();
-                    let launcher = root.join("agent-utils/rs/bin/dagrun");
-                    fs::write(
-                        &launcher,
-                        "#!/bin/bash\nprintf 'runner:%s:%s:%s\\n' \"${AGENT_UTILS_RS_ENSURE_ONLY:-}\" \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PREPARE_STATUS\"\n",
-                    )
-                    .unwrap();
                     let cargo = root.join("tools/cargo");
                     fs::write(
                         &cargo,
                         "#!/bin/bash\nprintf 'cargo:%s\\n' \"${CARGO_BUILD_JOBS:-}\" >> \"$CAPTURE\"\nprintf '<%s>\\n' \"$@\" >> \"$CAPTURE\"\nexit \"$CARGO_STATUS\"\n",
                     )
                     .unwrap();
-                    for path in [&launcher, &cargo] {
-                        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-                    }
+                    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
                     let capture = root.join("capture");
                     let mut command = Command::new("timeout");
                     command
@@ -2243,7 +2351,6 @@ mod tests {
                         )
                         .env("CAPTURE", &capture)
                         .env("CARGO_BUILD_JOBS", "99")
-                        .env("PREPARE_STATUS", prepare_status.to_string())
                         .env("CARGO_STATUS", cargo_status.to_string());
                     if let Some((key, value)) = env_with_inner_jobs(&step, "", Some(width)) {
                         command.env(key, value);
@@ -2251,20 +2358,16 @@ mod tests {
                     let output = command.output().unwrap();
                     assert_eq!(
                         output.status.code(),
-                        Some(if prepare_status == 0 {
-                            cargo_status
-                        } else {
-                            prepare_status
-                        }),
-                        "{tag}: {output:?}",
+                        Some(cargo_status),
+                        "{tag}: {output:?}"
                     );
-                    let mut expected = format!("runner:1:{width}:0\n");
-                    if prepare_status == 0 {
-                        expected.push_str(&format!(
+                    assert_eq!(
+                        fs::read_to_string(&capture).unwrap(),
+                        format!(
                             "cargo:{width}\n<build>\n<-p>\n<hermit-manifest-plan>\n<--bins>\n<-j>\n<{width}>\n"
-                        ));
-                    }
-                    assert_eq!(fs::read_to_string(&capture).unwrap(), expected, "{tag}");
+                        ),
+                        "{tag}"
+                    );
                 }
             }
         }
@@ -3151,6 +3254,44 @@ sys.exit(37)
             assert_rust_script_producer_contract(&changed_population)
                 .unwrap_err()
                 .contains("identity population")
+        );
+    }
+
+    #[test]
+    fn dagrun_preparation_stays_before_host_rust_script_build_only() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_dagrun_preparation_placement(&committed).unwrap();
+
+        for tag in ["setup.manifest_plan", "build.rust_scripts_in_pinned_root"] {
+            let mut replanted = committed.clone();
+            replanted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .cmd
+                .push_str(&format!("; {DAGRUN_PREPARE_COMMAND} true"));
+            let error = assert_dagrun_preparation_placement(&replanted).unwrap_err();
+            assert!(
+                error.contains(tag) && error.contains("must not replant"),
+                "{tag}: {error}"
+            );
+        }
+
+        let mut reordered = committed;
+        let producer = reordered
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "build.rust_scripts")
+            .unwrap();
+        producer.cmd = producer.cmd.replacen(DAGRUN_PREPARE_COMMAND, "", 1);
+        producer
+            .cmd
+            .push_str(&format!(" && {DAGRUN_PREPARE_COMMAND} true"));
+        let error = assert_dagrun_preparation_placement(&reordered).unwrap_err();
+        assert!(
+            error.contains("build.rust_scripts") && error.contains("before opening"),
+            "{error}"
         );
     }
 
