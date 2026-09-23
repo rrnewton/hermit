@@ -1264,9 +1264,23 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         };
         let command = crate::nextest_build_selections::execution_command(step)?;
-        if command.contains("NEXTEST_EXPECTED_EXECUTED=") {
+        const EXPECTED_COUNT_NAME: &str = "NEXTEST_EXPECTED_EXECUTED";
+        let invalid_expected_count_use =
+            command
+                .match_indices(EXPECTED_COUNT_NAME)
+                .any(|(offset, _)| {
+                    let before_name = &command.as_bytes()[..offset];
+                    let after_name = &command.as_bytes()[offset + EXPECTED_COUNT_NAME.len()..];
+                    before_name.last() != Some(&b'$')
+                        || (before_name.len() >= 2
+                            && matches!(before_name[before_name.len() - 2], b'\\' | b'$' | b'{'))
+                        || after_name
+                            .first()
+                            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                });
+        if invalid_expected_count_use {
             return Err(format!(
-                "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
+                "{tag} uses NEXTEST_EXPECTED_EXECUTED in command text other than as the exact plain $NEXTEST_EXPECTED_EXECUTED reference; declarations and shell default expressions belong in typed step environment"
             ));
         }
         if command_kind == Some(StructuredResultProducerKind::Nextest)
@@ -3660,6 +3674,25 @@ sys.exit(37)
         let error = assert_structured_result_producers(&inline_count).unwrap_err();
         assert!(
             error.contains("test.cli") && error.contains("command text"),
+            "{error}"
+        );
+
+        let mut defaulted_count = committed.clone();
+        let defaulted_step = defaulted_count
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.hermit_integration_on_host")
+            .unwrap();
+        assert!(defaulted_step.cmd.contains("$NEXTEST_EXPECTED_EXECUTED"));
+        defaulted_step.cmd = defaulted_step.cmd.replacen(
+            "$NEXTEST_EXPECTED_EXECUTED",
+            "${NEXTEST_EXPECTED_EXECUTED:-71}",
+            1,
+        );
+        let error = assert_structured_result_producers(&defaulted_count).unwrap_err();
+        assert!(
+            error.contains("test.hermit_integration_on_host")
+                && error.contains("shell default expressions"),
             "{error}"
         );
 
