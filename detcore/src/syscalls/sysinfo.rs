@@ -68,7 +68,13 @@ fn logical_uptime_seconds(
     // duration to whole seconds. Flooring `now` and `boot` independently makes
     // uptime jump a second early whenever the absolute timestamps straddle a
     // second boundary but less than one full second has elapsed.
-    uptime_offset_seconds + (now - boot).as_secs()
+    // Linux exposes uptime through a signed `c_long`. An extreme programmatic
+    // offset must not overflow in this unsigned intermediate and then become a
+    // negative guest-visible uptime when the syscall ABI is populated. As with
+    // `logical_boot_time_seconds`, clamp only at the ABI boundary.
+    uptime_offset_seconds
+        .saturating_add((now - boot).as_secs())
+        .min(libc::c_long::MAX as u64)
 }
 
 pub(super) fn logical_boot_time_seconds(
@@ -482,6 +488,21 @@ mod tests {
         assert_eq!(
             logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
             121,
+        );
+    }
+
+    #[test]
+    fn logical_uptime_saturates_at_linux_long_boundary() {
+        let boot = LogicalTime::from_nanos(1_790_000_000_970_859_833);
+        let max_linux_uptime = libc::c_long::MAX as u64;
+
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(2), boot, max_linux_uptime - 1,),
+            max_linux_uptime,
+        );
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, u64::MAX),
+            max_linux_uptime,
         );
     }
 
