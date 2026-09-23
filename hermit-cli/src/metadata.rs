@@ -137,7 +137,14 @@ impl RecordVersion {
 // the event stream and replace its recorded random bytes.
 // Early rejection of invalid negative offsets also stops emitting ReadvV2
 // error events for non-random descriptors.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11a);
+// 0x11a -> 0x11b: captured clock events retain output bytes even on EFAULT.
+// Older event variants remain structurally decodable, but their errno-only
+// clock failures cannot establish replay fidelity and are refused at admission.
+// Unlanded development heads of https://github.com/rrnewton/hermit/pull/3212
+// stamped 0x11a (and, earlier, 0x117) on their clock-event schema. A recording
+// from one of those heads is not main's random-preadv 0x11a format; do not
+// reinterpret that identity.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -162,7 +169,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

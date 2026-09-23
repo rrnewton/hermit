@@ -488,10 +488,14 @@ impl Tool for Replayer {
                 self.handle_replayed_side_effect(guest, syscall, "pidfd_open")
                     .await
             }
-            Syscall::ClockGettime(syscall) => self.handle_clock_gettime(guest, syscall).await,
-            Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
+            Syscall::ClockGettime(syscall) => {
+                return self.handle_clock_gettime(guest, syscall).await;
+            }
+            Syscall::Gettimeofday(syscall) => {
+                return self.handle_gettimeofday(guest, syscall).await;
+            }
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
+            Syscall::Time(syscall) => return self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => {
                 self.handle_replayed_side_effect(guest, syscall, "setsockopt")
                     .await
