@@ -762,13 +762,13 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
-    pub async fn clean_up(self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
-        if let Err(error) = self
-            .try_clean_up(to_stderr, print_summary_to_json_file)
+    pub async fn clean_up(
+        self,
+        to_stderr: bool,
+        print_summary_to_json_file: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        self.try_clean_up(to_stderr, print_summary_to_json_file)
             .await
-        {
-            error!("detcore cleanup failed: {error:#}");
-        }
     }
 
     async fn try_clean_up(
@@ -4065,7 +4065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_cleanup_handles_regressed_global_time_without_unwinding() {
+    async fn production_cleanup_reports_regressed_global_time_without_unwinding() {
         let config = Config {
             epoch: "2026-09-23T02:39:52.970859833Z".parse().unwrap(),
             ..Config::default()
@@ -4078,9 +4078,60 @@ mod tests {
             *global_time = serde_json::from_value(malformed).unwrap();
         }
 
-        tokio::time::timeout(Duration::from_millis(100), state.clean_up(false, &None))
+        let error = tokio::time::timeout(Duration::from_millis(100), state.clean_up(false, &None))
             .await
-            .expect("production cleanup must return after a recoverable summary error");
+            .expect("production cleanup must return after a recoverable summary error")
+            .expect_err("a regressed global time must not report successful cleanup");
+        assert_eq!(
+            error.to_string(),
+            "internal invariant violated: global virtual time regressed before its immutable origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_cleanup_reports_scheduler_join_error_without_unwinding() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, true);
+        state
+            .sched_handle
+            .as_ref()
+            .expect("internal scheduler must exist")
+            .abort();
+
+        let error = tokio::time::timeout(Duration::from_millis(100), state.clean_up(false, &None))
+            .await
+            .expect("production cleanup must return after a scheduler join error")
+            .expect_err("a scheduler join error must not report successful cleanup");
+        assert!(
+            error
+                .downcast_ref::<tokio::task::JoinError>()
+                .is_some_and(tokio::task::JoinError::is_cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn production_cleanup_reports_summary_write_error_without_unwinding() {
+        let state = GlobalState::initialize(&Config::default(), false);
+        let directory = tempfile::tempdir().unwrap();
+        let summary_path = Some(directory.path().to_owned());
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            state.clean_up(false, &summary_path),
+        )
+        .await
+        .expect("production cleanup must return after a summary write error")
+        .expect_err("a summary write error must not report successful cleanup");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("summary write failure must retain its io::Error")
+                .kind(),
+            std::io::ErrorKind::IsADirectory
+        );
     }
 
     #[test]
@@ -6611,12 +6662,10 @@ mod tests {
         let summary_path = None;
         let cleanup = state.clean_up(false, &summary_path);
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), cleanup)
-                .await
-                .is_ok(),
-            "cleanup waited for a scheduler whose guest never registered"
-        );
+        tokio::time::timeout(Duration::from_millis(100), cleanup)
+            .await
+            .expect("cleanup waited for a scheduler whose guest never registered")
+            .expect("cleanup failed after cancelling an unstarted scheduler");
     }
 
     #[tokio::test]
@@ -6647,15 +6696,13 @@ mod tests {
 
         state.cancel_internal_scheduler().await;
         let summary_path = None;
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                state.clean_up(false, &summary_path),
-            )
-            .await
-            .is_ok(),
-            "cleanup waited after cancelling a registered scheduler"
-        );
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            state.clean_up(false, &summary_path),
+        )
+        .await
+        .expect("cleanup waited after cancelling a registered scheduler")
+        .expect("cleanup failed after cancelling a registered scheduler");
     }
 
     /// A deterministic inode must be minted from the monotonic counter, never

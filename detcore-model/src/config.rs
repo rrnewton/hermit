@@ -1342,8 +1342,9 @@ pub fn epoch_from_host_time(now: SystemTime) -> DateTime<Utc> {
 ///
 /// The signed-nanosecond upper bound preserves every fractional nanosecond while
 /// reserving half of the surrounding unsigned domain for future progress.
-/// Actual clock additions are checked separately and fail rather than wrapping
-/// or silently saturating at the end of that larger domain.
+/// Clock additions remain exact until the larger domain's representable ceiling,
+/// where they saturate at `LogicalTime::MAX` without wrapping; ordinary progress
+/// is neither clamped nor rounded.
 pub fn epoch_nanos(epoch: &DateTime<Utc>) -> Option<u64> {
     let seconds = u64::try_from(epoch.timestamp()).ok()?;
     let nanos = seconds

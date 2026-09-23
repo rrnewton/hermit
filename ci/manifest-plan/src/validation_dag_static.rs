@@ -238,9 +238,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit", 755),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
-    // Current exact selection enumerates 164 integration identities after the
-    // epoch provenance and range-refusal controls; no selector or skip changed.
-    ("test.hermit_integration", 164),
+    // Current exact selection executes 162 runnable integration identities;
+    // three additional identities remain #[ignore] and are not execution counts.
+    ("test.hermit_integration", 162),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
@@ -266,7 +266,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 755),
-    ("test.hermit_integration_on_host", 164),
+    ("test.hermit_integration_on_host", 162),
     ("test.hermit_unit_on_host", 724),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),

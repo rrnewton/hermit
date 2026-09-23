@@ -555,7 +555,9 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "164");
+            // The shipped selection also retains three #[ignore] identities;
+            // the wrapper contract counts only the 162 runnable executions.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "162");
 
             let mut omitted_execution = step.clone();
             omitted_execution.cmd = omitted_execution.cmd.replace("--test child_time_rpc ", "");

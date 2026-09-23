@@ -114,8 +114,9 @@ impl Record {
         let (exit_status, global_state) = tracer.wait().await?;
         let persist =
             Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, &global_state);
-        global_state.clean_up(false, &None).await;
+        let cleanup = global_state.clean_up(false, &None).await;
         persist?;
+        cleanup?;
         Ok(exit_status)
     }
 
@@ -129,8 +130,9 @@ impl Record {
         let (output, global_state) = tracer.wait_with_output().await?;
         let persist =
             Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, &global_state);
-        global_state.clean_up(false, &None).await;
+        let cleanup = global_state.clean_up(false, &None).await;
         persist?;
+        cleanup?;
         Ok(output)
     }
 }
