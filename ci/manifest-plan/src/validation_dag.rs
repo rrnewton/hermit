@@ -142,6 +142,8 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
     crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+    "HERMIT_VALIDATE_RELEASE_BUILD_MODE",
+    "HERMIT_VALIDATE_BUCK_DOTSLASH",
     "L4_REPS",
     "NEXTEST_TEST_THREADS",
     "PR_NUMBER",
@@ -160,13 +162,13 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 269,
-        selected_steps: 270,
+        direct_steps: 270,
+        selected_steps: 271,
     },
     Profile {
         label: "portable",
-        direct_steps: 260,
-        selected_steps: 261,
+        direct_steps: 261,
+        selected_steps: 262,
     },
     Profile {
         label: "quick",
@@ -185,8 +187,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 251,
-        selected_steps: 251,
+        direct_steps: 252,
+        selected_steps: 252,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -813,6 +815,12 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             .filter(|dependency| producer_tags.contains(*dependency))
             .map(|dependency| pinned_root_twin_tag(dependency))
             .collect();
+        if producer.tag() == "build.runtime_release" {
+            // This host-only node is a no-op in the default Cargo mode. In the
+            // explicit Buck mode it prepares one content-addressed binary
+            // before the network-disabled pinned root installs those bytes.
+            twin.deps.push("build.buck_release_artifact".into());
+        }
         if producer.tag() != "build.rust_scripts" && has_rust_scripts {
             twin.deps.push("build.rust_scripts_in_pinned_root".into());
         }
@@ -1653,9 +1661,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1605 {
+    if cfg.steps.len() != 1606 {
         return Err(format!(
-            "superset has {} steps, expected 1605",
+            "superset has {} steps, expected 1606",
             cfg.steps.len()
         ));
     }
@@ -2912,7 +2920,7 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        assert_eq!(selected.steps.len(), 251);
+        assert_eq!(selected.steps.len(), 252);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3066,7 +3074,7 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            error.contains("hosted-portable label has 250 direct steps"),
+            error.contains("hosted-portable label has 251 direct steps"),
             "{error}"
         );
     }

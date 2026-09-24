@@ -64,7 +64,12 @@ The wrapper always regenerates dependencies, refuses missing release metadata
 inside Rust compilation, resolves Buck through the supplied public DotSlash
 launcher, and records hashes for DotSlash, the Buck descriptor, resolved Buck
 executable, generated graph, binaries, resources, and the
-`-llzma` link input. Before DotSlash's first probe it snapshots the launcher
+`liblzma.so.5` link input. On minimal CI hosts the driver resolves and validates
+the runtime SONAME without requiring the unversioned development-package
+symlink. It copies the canonical ELF bytes into a content-addressed package
+under `ignored/buck2-link-inputs/`, supplies that package as an explicit Buck
+dependency, and retains the source path, hash, and target label. Before
+DotSlash's first probe it snapshots the launcher
 into the exclusive evidence tree with stable before/copy/after hashes, uses
 only that snapshot, and re-verifies it before the final receipt. Deleting or
 changing the caller path cannot change the run. The wrapper likewise snapshots
@@ -101,11 +106,10 @@ case/role multiset and their normalized argv multisets must match. The final
 typed receipt binds the expected-ledger name/hash/count plus the actual
 manifest hash and both per-candidate counts, then recomputes all of it.
 Post-behavior evidence mutation, deletion, or addition therefore refuses.
-The generated Buck graph and linker-resolved `liblzma.so` cannot be redirected
-to snapshots without changing Buck's project/link semantics. They instead have
-stable hashes immediately before/after the build and at receipt time. This is a
-fail-closed invariant for ordinary non-malicious concurrent workspace/package
-changes, not an immutable-consumption claim. The final receipt has a closed
+The generated Buck graph has stable hashes immediately before/after the build
+and at receipt time. The canonical host liblzma input remains guarded the same
+way, while the link action consumes the separately verified content-addressed
+copy as a declared source input. The final receipt has a closed
 typed schema: unknown, duplicate, missing, mutated, or non-recomputable semantic
 facts refuse. It publishes separate Cargo and Buck bundles only under
 `ignored/buck2-phase1/`; it never writes the authoritative
@@ -210,6 +214,33 @@ delegation, and passwordless bounded-run-space cleanup all work. Its last step
 must run the same single-process captured-byte scan-and-package operation before
 upload. Absence of a
 runner or public bundle is `blocked`, never parity-green.
+
+## Validate DAG opt-in
+
+Ordinary validation keeps Cargo as its default release builder. Phase two adds
+one explicit opt-in for the complete `full`, `portable-only`, and
+`hosted-portable` plans:
+
+```sh
+./scripts/validate.rs portable-only \
+  --buck-release /absolute/path/to/public/dotslash
+```
+
+The normal dev-hermit admission boundary still applies; this example documents
+driver arguments rather than bypassing `ci-hub`. Buck mode is never inferred
+from ambient environment and cannot reuse the older tree/profile result cache.
+A missing launcher, malformed provenance, failed regeneration or build,
+unreadable event log, unexpected target/output, non-x86_64 executable, or hash
+mismatch refuses the run. None falls back to Cargo.
+
+The network-capable host producer builds `//hermit-cli:hermit-release`, retains
+its event/stdout/stderr and typed reconciliation under
+`ignored/buck2-phase2/`, and publishes one content-addressed binary there. Both
+the host and network-disabled pinned-root release nodes install that exact
+verified binary at `target/ci/hermit-strict`. Direct release consumers use that
+path; E2E consumers receive the same bytes through the existing verified
+binary-plus-resource publisher. Cargo still supplies the complete backend
+resource bundle in both modes.
 
 ## On a Meta host
 

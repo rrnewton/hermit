@@ -28,6 +28,11 @@ release_build_env = {
     "HERMIT_BUILD_GIT_SHA": read_root_config("hermit_release", "hermit_sha", ""),
     "HERMIT_REVERIE_PIN": read_root_config("hermit_release", "reverie_sha", ""),
 }
+release_lzma_target = read_root_config(
+    "hermit_release",
+    "lzma_target",
+    "gh_facebook_buck2_shims_meta//third-party/xz:lzma",
+)
 
 rust_library(
     name = "libhermit",
@@ -181,8 +186,9 @@ rust_binary(
         "sabre",
     ],
     link_style = "static_pic",
-    rustc_flags = ["-Clink-arg=-llzma"],
-    deps = [
+    # The guarded local producer overrides this with its content-bound prebuilt
+    # target. CI resolves the default declared pkg-config dependency.
+    deps = [release_lzma_target] + [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:colored",
