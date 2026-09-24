@@ -945,6 +945,14 @@ impl GlobalTime {
     pub fn as_nanos(&self) -> LogicalTime {
         self.total
     }
+
+    /// Elapsed virtual time in the same precision domain as this clock's
+    /// baseline. `DetTime` stores the epoch at microsecond precision, so
+    /// subtracting the original nanosecond `DateTime` can underflow for an
+    /// otherwise empty run whose epoch has a sub-microsecond component.
+    pub fn elapsed_nanos(&self) -> LogicalDuration {
+        self.total - self.starting_nanos
+    }
 }
 
 #[cfg(test)]
@@ -953,6 +961,16 @@ mod global_time_tests {
 
     fn publish(time: &mut GlobalTime, tid: DetTid, clock: &DetTime) {
         time.update_global_time(tid, clock.as_nanos(), clock.inherited_nanos());
+    }
+
+    #[test]
+    fn submicrosecond_epoch_starts_with_zero_elapsed_time() {
+        let mut config = Config::default();
+        config.epoch = "2026-09-24T23:52:07.760605385Z".parse().unwrap();
+        let mut time = GlobalTime::new(&config);
+        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO);
+        time.add_extra_time(Duration::from_nanos(1));
+        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(1));
     }
 
     #[test]

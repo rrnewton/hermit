@@ -1933,7 +1933,11 @@ fn run_liteinst_verifies_detcore_backend() {
         "/bin/echo",
         "liteinst-cli-ok",
     ];
-    let output = hermit(&args);
+    let mut command = Command::new(liteinst_runtime::hermit_binary());
+    append_hermit_args(&mut command, &args);
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run selected LiteInst Hermit: {error}"));
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "liteinst-cli-ok\n");
     let stderr = stderr(&output);

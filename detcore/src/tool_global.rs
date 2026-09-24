@@ -31,7 +31,6 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
 use std::time::SystemTime;
 
-use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
@@ -826,23 +825,8 @@ impl GlobalState {
 
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
-            let final_time_ns = final_time.as_nanos();
-            let nanos = self
-                .cfg
-                .epoch
-                .timestamp_nanos_opt()
-                .expect("epoch cannot be represented in a timestamp with nanosecond precision")
-                as u64;
-            let epoch_ns = LogicalTime::from_nanos(nanos);
-            summary.virttime_final = final_time_ns.as_nanos();
-            summary.virttime_elapsed = if final_time_ns.as_nanos() >= epoch_ns.as_nanos() {
-                (final_time_ns - epoch_ns).as_nanos()
-            } else {
-                bail!(
-                    "Internal invariant violated! Global time is before epoch start {}",
-                    epoch_ns
-                );
-            }
+            summary.virttime_final = final_time.as_nanos().as_nanos();
+            summary.virttime_elapsed = final_time.elapsed_nanos().as_nanos();
         }
 
         Ok((summary, info_reprio_descrip))

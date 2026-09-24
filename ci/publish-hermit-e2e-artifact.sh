@@ -24,8 +24,46 @@ function tree_manifest {
     done < <(cd "$root" && find -L . -type f -printf '%P\0' | LC_ALL=C sort -z)
 }
 
+function binary_declares_runtime_resources {
+    local binary=$1 dynamic magic rpath runpath needed
+    # Historical Cargo/default fixtures may be executable scripts. They do not
+    # declare an ELF runtime closure; the exact resource inventory below still
+    # rejects any undeclared hermit-runtime directory beside them.
+    magic=$(od -An -t x1 -N4 "$binary" | tr -d ' \n') ||
+        fail "cannot inspect selected Hermit file type: $binary"
+    if [[ $magic != 7f454c46 ]]; then
+        return 1
+    fi
+    dynamic=$(readelf -d "$binary") || fail "cannot read selected Hermit dynamic contract: $binary"
+    rpath=$(sed -n 's/.*(RPATH).*Library rpath: \[\(.*\)\].*/\1/p' <<<"$dynamic")
+    runpath=$(sed -n 's/.*(RUNPATH).*Library runpath: \[\(.*\)\].*/\1/p' <<<"$dynamic")
+    needed=$(sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p' <<<"$dynamic")
+    if [[ $rpath == '$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime' ]]; then
+        [[ -z $runpath && $(grep -Fxc 'libunwind-x86_64.so.8' <<<"$needed") == 1 ]] ||
+            fail "selected Hermit has an incomplete unwind runtime contract: $binary"
+        return 0
+    fi
+    if [[ $rpath == *hermit-runtime* || $runpath == *hermit-runtime* ]]; then
+        fail "selected Hermit has an unsupported partial unwind runtime contract: $binary"
+    fi
+    return 1
+}
+
+function require_runtime_closure {
+    local runtime=$1 path actual
+    [[ -d $runtime && ! -L $runtime ]] ||
+        fail "runtime bundle has no real hermit-runtime directory: $runtime"
+    for path in libunwind-x86_64.so.8 libunwind.so.8; do
+        [[ -f $runtime/$path && ! -L $runtime/$path && -s $runtime/$path ]] ||
+            fail "runtime bundle is missing, empty, or linked: $runtime/$path"
+    done
+    actual=$(cd "$runtime" && find . -type f -o -type l | LC_ALL=C sort)
+    [[ $actual == $'./libunwind-x86_64.so.8\n./libunwind.so.8' ]] ||
+        fail "runtime bundle contains files outside the exact unwind closure: $runtime"
+}
+
 function require_complete_resources {
-    local install=$1 path
+    local install=$1 require_runtime=$2 path
     [[ -d $install/rsrcs ]] || fail "resource bundle has no rsrcs directory: $install"
     for path in libdetcore_dbt.so libdetcore_sabre.so libreverie_dbt_client.so libreverie_liteinst.so; do
         [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||
@@ -35,16 +73,42 @@ function require_complete_resources {
         [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path && -x $install/rsrcs/$path ]] ||
             fail "resource bundle executable is missing, empty, or non-executable: $install/rsrcs/$path"
     done
+    if [[ $require_runtime == true ]]; then
+        require_runtime_closure "$install/rsrcs/hermit-runtime"
+    elif [[ -e $install/rsrcs/hermit-runtime ]]; then
+        fail "resource bundle carries an undeclared Hermit runtime closure: $install/rsrcs/hermit-runtime"
+    fi
 }
 
-[[ $# == 3 || $# == 4 ]] ||
-    fail "usage: $0 SOURCE-BINARY BUNDLE-ROOT POINTER [SOURCE-INSTALL-DIR]"
+function require_runtime_resources {
+    local install=$1 actual
+    require_runtime_closure "$install/rsrcs/hermit-runtime"
+    actual=$(cd "$install" && find . -type f -o -type l | LC_ALL=C sort)
+    [[ $actual == $'./rsrcs/hermit-runtime/libunwind-x86_64.so.8\n./rsrcs/hermit-runtime/libunwind.so.8' ]] ||
+        fail "runtime bundle contains files outside the exact unwind closure: $install"
+}
+
+[[ $# == 3 || $# == 4 || $# == 5 || $# == 6 ]] ||
+    fail "usage: $0 SOURCE-BINARY BUNDLE-ROOT POINTER [SOURCE-INSTALL-DIR | --runtime-only SOURCE-INSTALL-DIR | SOURCE-INSTALL-DIR --runtime-overlay RUNTIME-INSTALL-DIR]"
 source_binary=$1
 bundle_root=$2
 pointer=$3
-source_install=${4:-}
+source_install=""
+runtime_overlay=""
 kind=binary-only
-[[ -z $source_install ]] || kind=complete
+if [[ $# == 4 ]]; then
+    source_install=$4
+    kind=complete
+elif [[ $# == 5 ]]; then
+    [[ $4 == --runtime-only ]] || fail "five-argument form requires --runtime-only"
+    source_install=$5
+    kind=runtime
+elif [[ $# == 6 ]]; then
+    [[ $5 == --runtime-overlay ]] || fail "six-argument form requires --runtime-overlay"
+    source_install=$4
+    runtime_overlay=$6
+    kind=complete
+fi
 
 [[ -f $source_binary && ! -L $source_binary && -s $source_binary && -x $source_binary ]] ||
     fail "source Hermit is missing, empty, or non-executable: $source_binary"
@@ -76,23 +140,61 @@ printf '%s\n' "$published_binary_hash" >"$stage/hermit.sha256"
 printf '%s\n' "$kind" >"$stage/kind"
 
 resource_hash=none
+runtime_contract=none
 if [[ $kind == complete ]]; then
-    require_complete_resources "$source_install"
+    runtime_required=false
+    source_runtime_required=false
+    if [[ -n $runtime_overlay ]]; then
+        # The six-argument form is an explicit publisher contract used by the
+        # Cargo/Buck shadow parity comparison. Its signed marker requires the
+        # same copied closure without claiming the Cargo ELF itself needs it.
+        runtime_required=true
+        runtime_contract=explicit-runtime-overlay-v1
+    elif binary_declares_runtime_resources "$source_binary"; then
+        runtime_required=true
+        source_runtime_required=true
+        runtime_contract=elf-rpath-v1
+    fi
+    require_complete_resources "$source_install" "$source_runtime_required"
     tree_manifest "$source_install" >"$before_manifest"
     [[ -s $before_manifest ]] || fail "source install bundle contains no regular files: $source_install"
     mkdir -p "$stage/install"
     cp -aL "$source_install/." "$stage/install/"
     tree_manifest "$source_install" >"$after_manifest"
     cmp -s "$before_manifest" "$after_manifest" || fail "source install bundle changed during publication: $source_install"
+    if [[ -n $runtime_overlay ]]; then
+        require_runtime_resources "$runtime_overlay"
+        mkdir -p "$stage/install/rsrcs"
+        cp -aL "$runtime_overlay/rsrcs/hermit-runtime" "$stage/install/rsrcs/"
+    fi
     tree_manifest "$stage/install" >"$stage/resources.sha256"
-    cmp -s "$before_manifest" "$stage/resources.sha256" || fail "published resource bytes do not match source bundle: $source_install"
-    require_complete_resources "$stage/install"
+    if [[ -z $runtime_overlay ]]; then
+        cmp -s "$before_manifest" "$stage/resources.sha256" || fail "published resource bytes do not match source bundle: $source_install"
+    fi
+    require_complete_resources "$stage/install" "$runtime_required"
     [[ -z $(find "$stage/install" -type l -print -quit) ]] ||
         fail "published resource bundle retained a symlink instead of an immutable copy: $stage/install"
     resource_hash=$(sha256sum "$stage/resources.sha256" | cut -d' ' -f1)
+elif [[ $kind == runtime ]]; then
+    runtime_contract=runtime-only-v1
+    require_runtime_resources "$source_install"
+    tree_manifest "$source_install" >"$before_manifest"
+    mkdir -p "$stage/install"
+    cp -aL "$source_install/." "$stage/install/"
+    tree_manifest "$source_install" >"$after_manifest"
+    cmp -s "$before_manifest" "$after_manifest" || fail "source runtime bundle changed during publication: $source_install"
+    tree_manifest "$stage/install" >"$stage/resources.sha256"
+    cmp -s "$before_manifest" "$stage/resources.sha256" || fail "published runtime bytes do not match source bundle: $source_install"
+    require_runtime_resources "$stage/install"
+    [[ -z $(find "$stage/install" -type l -print -quit) ]] ||
+        fail "published runtime bundle retained a symlink instead of an immutable copy: $stage/install"
+    resource_hash=$(sha256sum "$stage/resources.sha256" | cut -d' ' -f1)
 fi
 
-identity=$(printf '%s\n%s\n%s\n' "$kind" "$published_binary_hash" "$resource_hash" | sha256sum | cut -d' ' -f1)
+if [[ $runtime_contract != none ]]; then
+    printf '%s\n' "$runtime_contract" >"$stage/runtime-contract"
+fi
+identity=$(printf '%s\n%s\n%s\n%s\n' "$kind" "$published_binary_hash" "$resource_hash" "$runtime_contract" | sha256sum | cut -d' ' -f1)
 published="$bundle_root/$identity"
 if [[ -e $published ]]; then
     "$VERIFY" "$published" >/dev/null

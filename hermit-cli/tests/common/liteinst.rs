@@ -7,9 +7,11 @@
  */
 
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -36,23 +38,66 @@ pub(super) fn staged_runtime_matches_current_pin(runtime: &Path) -> bool {
     fs::read_to_string(revision).is_ok_and(|staged| staged.trim() == env!("HERMIT_REVERIE_PIN"))
 }
 
+fn cargo_build_profile_and_target(compiled_hermit: &Path) -> (OsString, PathBuf) {
+    let profile_dir = compiled_hermit
+        .parent()
+        .expect("compiled Hermit should have a Cargo profile directory");
+    let profile = profile_dir
+        .file_name()
+        .expect("compiled Hermit profile directory should have a name");
+    let cargo_profile = if profile == OsStr::new("debug") {
+        OsString::from("dev")
+    } else {
+        profile.to_owned()
+    };
+    let target_dir = profile_dir
+        .parent()
+        .expect("compiled Hermit profile should be inside a target directory")
+        .to_owned();
+    (cargo_profile, target_dir)
+}
+
+fn stage_existing_runtime(source: &Path, destination: &Path) -> bool {
+    if !staged_runtime_matches_current_pin(source) {
+        return false;
+    }
+    let source_revision = PathBuf::from(format!("{}.revision", source.display()));
+    let destination_revision = PathBuf::from(format!("{}.revision", destination.display()));
+    let Some(parent) = destination.parent() else {
+        return false;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let temporary = parent.join(format!(".libreverie_liteinst.so.copy.{}", process::id()));
+    let temporary_revision = PathBuf::from(format!("{}.revision", temporary.display()));
+    let result = (|| {
+        let before = fs::read(source).ok()?;
+        fs::copy(source, &temporary).ok()?;
+        let after = fs::read(source).ok()?;
+        let copied = fs::read(&temporary).ok()?;
+        if before != after || before != copied {
+            return None;
+        }
+        fs::copy(source_revision, &temporary_revision).ok()?;
+        fs::rename(&temporary, destination).ok()?;
+        fs::rename(&temporary_revision, destination_revision).ok()?;
+        staged_runtime_matches_current_pin(destination).then_some(())
+    })()
+    .is_some();
+    let _ = fs::remove_file(temporary);
+    let _ = fs::remove_file(temporary_revision);
+    result
+}
+
 pub(super) fn ensure_liteinst_runtime() {
     LITEINST_RUNTIME.get_or_init(|| {
-        let hermit = hermit_binary();
-        let profile_dir = hermit
-            .parent()
-            .expect("Hermit test binary should have a profile directory");
-        let profile = profile_dir
-            .file_name()
-            .expect("Hermit profile directory should have a name");
-        let cargo_profile = if profile == OsStr::new("debug") {
-            OsStr::new("dev")
-        } else {
-            profile
-        };
-        let target_dir = profile_dir
-            .parent()
-            .expect("Hermit profile should be inside a target directory");
+        // The selected Hermit may be the validated staged artifact under
+        // target/ci. That directory is not a Cargo profile. Derive build
+        // settings only from the binary Cargo compiled for this test, while
+        // continuing to stage the runtime beside the selected Hermit.
+        let compiled_hermit = PathBuf::from(env!("CARGO_BIN_EXE_hermit"));
+        let (cargo_profile, target_dir) = cargo_build_profile_and_target(&compiled_hermit);
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
@@ -61,6 +106,10 @@ pub(super) fn ensure_liteinst_runtime() {
         let runtime_target = target_dir.join("liteinst-runtime-build");
         let runtime = liteinst_runtime_library();
         if staged_runtime_matches_current_pin(&runtime) {
+            return;
+        }
+        let release_runtime = target_dir.join("release/libreverie_liteinst.so");
+        if stage_existing_runtime(&release_runtime, &runtime) {
             return;
         }
         let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
@@ -82,4 +131,49 @@ pub(super) fn ensure_liteinst_runtime() {
             runtime.display(),
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_ci_artifact_never_becomes_a_cargo_profile() {
+        let selected = Path::new("/checkout/target/ci/hermit-strict");
+        let (profile, target) =
+            cargo_build_profile_and_target(Path::new("/checkout/target/debug/hermit"));
+        assert_eq!(profile, OsStr::new("dev"));
+        assert_eq!(target, Path::new("/checkout/target"));
+        assert_eq!(
+            selected.parent().unwrap().join("libreverie_liteinst.so"),
+            Path::new("/checkout/target/ci/libreverie_liteinst.so")
+        );
+
+        let (profile, target) =
+            cargo_build_profile_and_target(Path::new("/checkout/target/release/hermit"));
+        assert_eq!(profile, OsStr::new("release"));
+        assert_eq!(target, Path::new("/checkout/target"));
+
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("target/release/libreverie_liteinst.so");
+        let destination = fixture.path().join("target/ci/libreverie_liteinst.so");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"runtime-bytes\n").unwrap();
+        fs::write(
+            format!("{}.revision", source.display()),
+            format!("{}\n", env!("HERMIT_REVERIE_PIN")),
+        )
+        .unwrap();
+        assert!(stage_existing_runtime(&source, &destination));
+        assert_eq!(fs::read(&destination).unwrap(), b"runtime-bytes\n");
+        assert!(staged_runtime_matches_current_pin(&destination));
+        fs::write(
+            format!("{}.revision", source.display()),
+            format!("{}\n", "0".repeat(40)),
+        )
+        .unwrap();
+        fs::remove_file(&destination).unwrap();
+        fs::remove_file(format!("{}.revision", destination.display())).unwrap();
+        assert!(!stage_existing_runtime(&source, &destination));
+    }
 }
