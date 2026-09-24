@@ -381,6 +381,86 @@ async fn backend_failure_completes_registered_daemon_without_another_request() {
 }
 
 #[tokio::test]
+async fn signal_dequeue_aggregate_time_overflow_survives_log_only_cleanup() {
+    let config = Config {
+        kvm_shared_dequeue_timers: true,
+        ..Config::default()
+    };
+    let state = GlobalState::initialize(&config, false);
+    let tid = DetTid::from_raw(17);
+    let process = DetPid::from_raw(17);
+    let mm = MmId::initial(process);
+    let identity = reverie::SignalTaskIdentity {
+        process: reverie::SignalProcessId {
+            tgid: Tid::from_raw(process.as_raw()),
+            generation: 1,
+        },
+        tid: Tid::from_raw(tid.as_raw()),
+        task_generation: 1,
+    };
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .real_timers
+        .bind(process, tid, mm, identity)
+        .unwrap();
+
+    let headroom = u64::MAX - state.global_time.lock().unwrap().as_nanos().as_nanos();
+    state
+        .global_time
+        .lock()
+        .unwrap()
+        .add_extra_time(Duration::from_nanos(headroom))
+        .unwrap();
+    let mut guest_time = DetTime::new(&config);
+    guest_time.add_syscall_with_cost(1);
+    assert!(guest_time.try_as_nanos().is_ok());
+
+    let mut siginfo = [0; 128];
+    siginfo[..4].copy_from_slice(&libc::SIGUSR1.to_ne_bytes());
+    let dequeue = reverie::SignalDequeue {
+        process: identity.process,
+        sequence: 1,
+        consumer: reverie::SignalConsumer::SignalFd,
+        domain: reverie::PendingDomain::Process,
+        event: reverie::SignalEvent::new(
+            libc::SIGUSR1,
+            siginfo,
+            reverie::SignalTarget::Process {
+                pid: identity.process.tgid,
+            },
+        )
+        .unwrap(),
+    };
+    let response = state
+        .receive_rpc(
+            Tid::from_raw(tid.as_raw()),
+            (
+                guest_time,
+                mm,
+                GlobalRequest::SignalDequeued {
+                    detpid: process,
+                    identity,
+                    dequeue,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(response, (None, GlobalResponse::ThreadExited));
+
+    // `to_stderr = false` is the cleanup path used when CLI logging is off;
+    // the returned terminal error must carry the checked arithmetic cause.
+    let error = state.clean_up(false, &None).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("global virtual time overflowed its unsigned nanosecond domain"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn backend_failure_precedes_ready_request_without_grant_or_timer_processing() {
     let (_, state, tid, process) = cancellation_test_state();
     let request = Ivar::full(Ok(Resources::new(tid)));

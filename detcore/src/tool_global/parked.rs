@@ -116,11 +116,14 @@ impl GlobalState {
                     )
                 {
                     let (wake, deferred) = (
-                        sched.report_backend_failure(reverie::BackendFailure {
-                            pid: identity.process.tgid,
-                            tid: identity.tid,
-                            phase: "global virtual-time accounting",
-                        }),
+                        sched.report_backend_failure_with_cause(
+                            reverie::BackendFailure {
+                                pid: identity.process.tgid,
+                                tid: identity.tid,
+                                phase: "global virtual-time accounting",
+                            },
+                            error.to_string(),
+                        ),
                         sched.take_signal_failure_wakes(),
                     );
                     tracing::error!(
