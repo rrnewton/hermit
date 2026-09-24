@@ -757,6 +757,65 @@ mod tests {
             assert!(step.deps.iter().any(|dependency| dependency == producer));
             let args: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
             assert_eq!(args, clock_args);
+            assert!(!dagrun::model::step_width_is_resizable(
+                step,
+                &graph.default_jobs_flag,
+                &graph.default_jobs_env,
+            ));
+            for width in [1, 4] {
+                let mut rendered = step.clone();
+                rendered.cmd = dagrun::model::command_with_inner_jobs(
+                    step,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(rendered.cmd, step.cmd, "{consumer}, width {width}");
+                assert_eq!(
+                    dagrun::model::env_with_inner_jobs(step, &graph.default_jobs_env, Some(width)),
+                    None,
+                );
+                let arguments = command_arguments(
+                    &execution_command(&rendered).unwrap(),
+                    "./ci/run-nextest-counted.sh ",
+                )
+                .unwrap();
+                let parsed = crate::nextest_binaries::split_arguments(&arguments).unwrap();
+                assert_eq!(parsed.build, clock_args);
+                let jobs = parsed
+                    .runtime
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-j")
+                    .map(|pair| pair[1].as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(jobs, ["1"], "{consumer} must remain serial");
+
+                // The command already supplies -j 1. Restoring inheritance
+                // adds a second flag, which Nextest refuses even at width 1.
+                rendered.jobs_flag = None;
+                rendered.cmd = dagrun::model::command_with_inner_jobs(
+                    &rendered,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(rendered.cmd, format!("{} -j {width}", step.cmd));
+                if consumer == "test.recorded_clocks" {
+                    assert_eq!(
+                        execution_command(&rendered).unwrap_err(),
+                        format!("{consumer} has an unrecognized pinned-root command"),
+                    );
+                } else {
+                    let arguments = command_arguments(
+                        &execution_command(&rendered).unwrap(),
+                        "./ci/run-nextest-counted.sh ",
+                    )
+                    .unwrap();
+                    let mutated = crate::nextest_binaries::split_arguments(&arguments).unwrap();
+                    assert_eq!(mutated.build, parsed.build);
+                    let mut duplicate = parsed.runtime;
+                    duplicate.extend(["-j".into(), width.to_string()]);
+                    assert_eq!(mutated.runtime, duplicate);
+                }
+            }
         }
         // A consumer with only the focused producer must be covered. Removing
         // that edge refuses even while broad producers exist elsewhere.

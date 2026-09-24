@@ -2449,7 +2449,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 420,
         cpu_timeout: 180,
-        jobs_flag: None,
+        jobs_flag: Some(""),
         jobs_env: None,
     },
     StaticStepSpec {
