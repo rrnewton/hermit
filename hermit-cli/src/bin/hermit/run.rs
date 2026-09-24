@@ -2915,6 +2915,43 @@ impl RunOpts {
         self.det_opts.det_config.epoch.to_rfc3339()
     }
 
+    fn virtual_epoch_provenance(&self) -> Option<String> {
+        self.uses_virtual_time_determinization().then(|| {
+            let epoch = self.epoch_rfc3339();
+            let source = if self.epoch_captured_from_host {
+                "host-now"
+            } else {
+                "explicit"
+            };
+            format!(
+                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
+            )
+        })
+    }
+
+    /// Emit invocation-wide provenance before any per-run subscriber exists.
+    ///
+    /// `tracing` installs a process-global subscriber that cannot be replaced
+    /// by the synchronous per-run subscribers. For `--log-file`, write through
+    /// the already-opened host descriptor instead; otherwise use controller
+    /// stderr. Both forms stay outside guest output and the compared logs.
+    fn emit_top_level_epoch_provenance(&self, global: &GlobalOpts) -> Result<(), Error> {
+        let Some(provenance) = self.virtual_epoch_provenance() else {
+            return Ok(());
+        };
+        let sink = if global.log_file_handle.is_some() {
+            "--log-file"
+        } else {
+            "controller stderr"
+        };
+        global
+            .write_controller_diagnostic(
+                format_args!("{provenance}"),
+                self.epoch_captured_from_host,
+            )
+            .with_context(|| format!("cannot write epoch provenance to {sink}"))
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -3143,17 +3180,6 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
-        if self.uses_virtual_time_determinization() {
-            let epoch = self.epoch_rfc3339();
-            let source = if self.epoch_captured_from_host {
-                "host-now"
-            } else {
-                "explicit"
-            };
-            global.write_controller_diagnostic(format_args!(
-                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
-            ))?;
-        }
         if self.allow_unsupported_syscalls {
             eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \
@@ -3226,6 +3252,11 @@ impl RunOpts {
         } else {
             None
         };
+        // Emit exactly once for both ordinary and verified runs. In particular,
+        // do this outside `run_in_container`: tracing subscribers deliberately
+        // swallow writer failures, but losing the only replayable epoch must
+        // fail the invocation closed.
+        self.emit_top_level_epoch_provenance(global)?;
         // });
 
         // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
@@ -3237,6 +3268,9 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbt => {
+                // DBT owns a separate launcher and typed guest Output, but its
+                // invocation provenance has the same public controller sink as
+                // every other backend and never enters either compared log.
                 let environment = self.guest_command()?.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
@@ -3450,6 +3484,9 @@ impl RunOpts {
                 "--clock-multiplier must be finite and positive (received {})",
                 multiplier
             );
+        }
+        if detcore_model::config::epoch_nanos(&config.epoch).is_none() {
+            anyhow::bail!("--{}", detcore_model::config::EPOCH_RANGE_ERROR);
         }
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
         if let Some(max_timeslice) = config.max_timeslice
@@ -4300,6 +4337,12 @@ impl RunOpts {
 
     // Execution mode corresponding to `run --verify`:
     fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Verification redirects each physical run's diagnostics into private
+        // comparison logs. The caller emits invocation provenance once through
+        // the normal controller sink before entering verify(), so a successful
+        // verification that discards those logs still leaves the exact replay
+        // epoch visible. That event is deliberately outside both compared
+        // streams and therefore cannot affect their equality.
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
         // below (a run that fails to start, a rejected first-run status, a SaBRe
         // capture with zero DETLOG) return early without ever reaching
@@ -5029,7 +5072,6 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
-
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
         }
@@ -5141,7 +5183,6 @@ impl RunOpts {
             BoundedWriter::new(log_file, limit),
             self.runtime_backend(),
         );
-
         let command = self.guest_command()?;
 
         let mut config = self.effective_det_config();

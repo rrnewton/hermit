@@ -46,6 +46,7 @@ use tracing::warn;
 
 use super::deterministic_stdio_inode_for_resource;
 use crate::config::SchedHeuristic;
+use crate::config::epoch_nanos;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::procfs::MountInfoSnapshot;
@@ -1232,6 +1233,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
+        let virtual_boot_time_seconds = super::sysinfo::logical_boot_time_seconds(
+            crate::types::DetTime::new(&self.cfg).as_nanos(),
+            self.cfg.sysinfo_uptime_offset,
+        );
         // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
         let virtual_memory_kb = guest.config().memory / 1024;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
@@ -1483,6 +1488,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     mountinfo: mountinfo.clone(),
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
+                    virtual_boot_time_seconds,
                     virtual_memory_kb,
                     virtual_pid,
                     virtual_ppid,
@@ -2618,11 +2624,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stat: DetStat = stat.into();
         let (d_ino, global_mtime) = match inode_override {
             Some(inode) => {
-                let nanos = cfg
-                    .epoch
-                    .timestamp_nanos_opt()
-                    .expect("epoch cannot be represented in nanoseconds")
-                    as u64;
+                let nanos = epoch_nanos(&cfg.epoch).expect(crate::config::EPOCH_RANGE_ERROR);
                 (inode, LogicalTime::from_nanos(nanos))
             }
             None => determinize_inode(guest, stat.inode).await,

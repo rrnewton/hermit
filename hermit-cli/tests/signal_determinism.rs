@@ -32,6 +32,7 @@ const DEADLOCK_RUNS: usize = 3;
 const DEADLOCK_BOUND: Duration = Duration::from_secs(5);
 const DEADLOCK_CLEANUP_BOUND: Duration = Duration::from_secs(1);
 const DEADLOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const COMPARISON_EPOCH_ARG: &str = "--epoch=2026-09-23T02:39:52.970859833+00:00";
 
 static HERMIT_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
 static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -322,13 +323,11 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
         command.args([
             "--log=off",
             "run",
-            // Compare complete diagnostics from the same clock input, including
-            // committed virtual time; do not strip or quantize their contents.
-            "--epoch=2026-01-01T00:00:00.123456789Z",
             "--strict",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
             "--base-env=minimal",
+            COMPARISON_EPOCH_ARG,
             "--",
         ]);
         command

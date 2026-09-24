@@ -52,11 +52,57 @@ fn logical_clock_ticks(
     now: crate::types::LogicalTime,
     boot: crate::types::LogicalTime,
     uptime_offset_seconds: u64,
-) -> libc::clock_t {
+) -> anyhow::Result<libc::clock_t> {
+    // The programmatic uptime offset can exceed every Linux ABI domain. Keep
+    // one explicit extreme-input policy across the three projections below:
+    // preserve their native ABI behavior (clock_t wraps, signed uptime clamps
+    // high, unsigned btime clamps low) rather than letting Rust arithmetic
+    // panic. These boundary values need not preserve btime + uptime == now;
+    // normal in-domain offsets retain that Linux relationship exactly.
+    let elapsed_nanos = now
+        .as_nanos()
+        .checked_sub(boot.as_nanos())
+        .ok_or_else(|| anyhow::anyhow!("logical clock regressed before its boot origin"))?;
     let ticks = uptime_offset_seconds
         .wrapping_mul(CLOCK_TICKS_PER_SECOND)
-        .wrapping_add(clock_ticks(now - boot));
-    clock_t_from_ticks(ticks)
+        .wrapping_add(clock_ticks(crate::types::LogicalTime::from_nanos(
+            elapsed_nanos,
+        )));
+    Ok(clock_t_from_ticks(ticks))
+}
+
+fn logical_uptime_seconds(
+    now: crate::types::LogicalTime,
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> anyhow::Result<u64> {
+    // Subtract in the full nanosecond domain before projecting the elapsed
+    // duration to whole seconds. Flooring `now` and `boot` independently makes
+    // uptime jump a second early whenever the absolute timestamps straddle a
+    // second boundary but less than one full second has elapsed.
+    // Linux exposes uptime through a signed `c_long`. An extreme programmatic
+    // offset must not overflow in this unsigned intermediate and then become a
+    // negative guest-visible uptime when the syscall ABI is populated. As with
+    // `logical_boot_time_seconds`, clamp only at the ABI boundary.
+    let elapsed_nanos = now
+        .as_nanos()
+        .checked_sub(boot.as_nanos())
+        .ok_or_else(|| anyhow::anyhow!("logical uptime regressed before its boot origin"))?;
+    Ok(uptime_offset_seconds
+        .saturating_add(crate::types::LogicalTime::from_nanos(elapsed_nanos).as_secs())
+        .min(libc::c_long::MAX as u64))
+}
+
+pub(super) fn logical_boot_time_seconds(
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> u64 {
+    // Linux renders /proc/stat's btime with `%llu`. Hermit's epoch domain is
+    // nonnegative, so an uptime offset that predates that domain is represented
+    // by the earliest faithful value, zero, rather than a Linux-impossible
+    // negative token. Saturation also keeps an unrelated procfs snapshot
+    // readable for extreme programmatic offsets.
+    boot.as_secs().saturating_sub(uptime_offset_seconds)
 }
 
 fn prlimit_targets_current_process(
@@ -306,7 +352,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let now = thread_observe_time(guest).await;
         let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
-        let ticks = logical_clock_ticks(now, boot, self.cfg.sysinfo_uptime_offset);
+        let ticks = logical_clock_ticks(now, boot, self.cfg.sysinfo_uptime_offset)?;
         let cpu = guest.thread_state_mut().process_cpu_time();
 
         if let Some(address) = call.buf() {
@@ -354,8 +400,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
     ) -> Result<u64, Error> {
         let global_time = thread_observe_time(guest).await;
-        Ok(self.cfg.sysinfo_uptime_offset + global_time.as_secs()
-            - crate::types::DetTime::new(&self.cfg).as_nanos().as_secs())
+        Ok(logical_uptime_seconds(
+            global_time,
+            crate::types::DetTime::new(&self.cfg).as_nanos(),
+            self.cfg.sysinfo_uptime_offset,
+        )?)
     }
 
     async fn collect_sysinfo<G: Guest<Self>>(
@@ -427,7 +476,53 @@ mod tests {
         let boot = LogicalTime::from_secs(1_000);
         let now = boot + LogicalTime::from_millis(25);
 
-        assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+        assert_eq!(logical_clock_ticks(now, boot, 120).unwrap(), 12_002);
+    }
+
+    #[test]
+    fn logical_uptime_floors_elapsed_time_not_absolute_endpoints() {
+        let boot = LogicalTime::from_nanos(1_790_000_000_970_859_833);
+
+        // This crosses an absolute whole-second boundary after only 29ms. The
+        // old floor(now)-floor(boot) expression incorrectly reported +1s.
+        let crossed_boundary = boot + LogicalTime::from_nanos(29_140_167);
+        assert_eq!(
+            logical_uptime_seconds(crossed_boundary, boot, 120).unwrap(),
+            120
+        );
+        assert_eq!(logical_uptime_seconds(boot, boot, 120).unwrap(), 120);
+        assert_eq!(logical_boot_time_seconds(boot, 120), 1_789_999_880);
+        assert_eq!(logical_boot_time_seconds(LogicalTime::ZERO, 120), 0);
+        assert_eq!(logical_boot_time_seconds(LogicalTime::ZERO, u64::MAX), 0,);
+    }
+
+    #[test]
+    fn logical_uptime_advances_after_one_exact_elapsed_second() {
+        let boot = LogicalTime::from_nanos(1_790_000_000_970_859_833);
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120).unwrap(),
+            121,
+        );
+    }
+
+    #[test]
+    fn logical_uptime_saturates_at_linux_long_boundary() {
+        let boot = LogicalTime::from_nanos(1_790_000_000_970_859_833);
+        let max_linux_uptime = libc::c_long::MAX as u64;
+
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(2), boot, max_linux_uptime - 1,)
+                .unwrap(),
+            max_linux_uptime,
+        );
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, u64::MAX).unwrap(),
+            max_linux_uptime,
+        );
+
+        let regressed = boot - LogicalTime::from_nanos(1);
+        assert!(logical_uptime_seconds(regressed, boot, 120).is_err());
+        assert!(logical_clock_ticks(regressed, boot, 120).is_err());
     }
 
     #[test]
@@ -610,8 +705,9 @@ mod tests {
     #[test]
     fn logical_clock_ticks_wrap_configured_offset_like_linux_clock_t() {
         let boot = LogicalTime::from_secs(1_000);
-        let before = logical_clock_ticks(boot, boot, u64::MAX);
-        let after = logical_clock_ticks(boot + LogicalTime::from_millis(10), boot, u64::MAX);
+        let before = logical_clock_ticks(boot, boot, u64::MAX).unwrap();
+        let after =
+            logical_clock_ticks(boot + LogicalTime::from_millis(10), boot, u64::MAX).unwrap();
 
         assert_eq!(before, -100);
         assert_eq!(after, -99);

@@ -70,6 +70,7 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+const COMPARISON_EPOCH_ARG: &str = "--epoch=2026-09-23T02:39:52.970859833+00:00";
 
 const DBT_IO_BUFFER_MUTATOR_SOURCE: &str = r#"
 #define _XOPEN_SOURCE 700
@@ -2969,6 +2970,52 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
     assert!(stderr(&output).contains(":: Success: deterministic. Determinism verified."));
 }
 
+#[test]
+fn virtual_time_overflow_fails_cleanly_and_preserves_its_cause_with_logging_off() {
+    let _guard = hermit_run_guard();
+    for (mode, multiplier, expected_cause) in [
+        (
+            None,
+            "1e14",
+            "scheduler virtual-time delta overflowed its unsigned nanosecond domain",
+        ),
+        (
+            Some("--no-sequentialize-threads"),
+            "1e20",
+            "local virtual-time syscall projection overflowed its unsigned nanosecond domain",
+        ),
+    ] {
+        let mut args = vec!["--log=off", "run"];
+        if let Some(mode) = mode {
+            args.push(mode);
+        }
+        args.extend([
+            "--epoch=1970-01-01T00:00:00Z",
+            "--max-timeslice=disabled",
+            "--clock-multiplier",
+            multiplier,
+            "--",
+            "/bin/true",
+        ]);
+        let output = hermit(&args);
+        let diagnostics = stderr(&output);
+
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            "unrepresentable virtual time must be a bounded Hermit failure: {diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(expected_cause),
+            "terminal failure lost its originating cause with --log=off: {diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("panicked at") && !diagnostics.contains("unreachable code"),
+            "terminal cleanup panicked instead of completing: {diagnostics}"
+        );
+    }
+}
+
 /// The two sanitizer variables Hermit forces into *every* guest, on *every*
 /// backend.
 ///
@@ -3480,6 +3527,7 @@ fn run_kvm_preserves_closed_standard_input() {
         "kvm",
         "--strict",
         "--base-env=minimal",
+        COMPARISON_EPOCH_ARG,
         "--",
         "/bin/cat",
     ];
@@ -3534,12 +3582,21 @@ fn run_kvm_preserves_closed_standard_input() {
     assert_eq!(stdout(&native), expected);
     assert_eq!(stderr(&native), "");
     for backend in ["ptrace", "kvm"] {
+        let diagnostic_log = tempfile::Builder::new()
+            .prefix("stdio-inode-epoch-provenance-")
+            .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create stdio-inode controller log");
+        let diagnostic_path = diagnostic_log.path().to_str().unwrap();
         let args = [
+            "--log=warn",
+            "--log-file",
+            diagnostic_path,
             "run",
             "--backend",
             backend,
             "--strict",
             "--base-env=minimal",
+            COMPARISON_EPOCH_ARG,
             "--",
         ];
         let output = hermit_command(&args)
@@ -3552,6 +3609,14 @@ fn run_kvm_preserves_closed_standard_input() {
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");
         assert_eq!(stderr(&output), "", "{backend} {mode}");
+        let diagnostics = std::fs::read_to_string(diagnostic_log.path())
+            .expect("failed to read stdio-inode controller log");
+        assert_eq!(
+            diagnostics.matches("hermit: virtual-time epoch=").count(),
+            1,
+            "{backend} {mode} controller provenance: {diagnostics}",
+        );
+        assert!(diagnostics.contains("source=explicit"), "{diagnostics}");
     }
 }
 
@@ -6489,17 +6554,11 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     // A long, fully deterministic diagnostic whose length the caller controls:
     // hermit echoes the (absent) program path back in the error chain.
     let program = format!("/nonexistent-{}", "A".repeat(2000));
-    // The control and pressured invocation compare complete diagnostics, so
-    // their explicit clock input must match too.
-    let args = [
-        "run",
-        "--epoch=2026-01-01T00:00:00.123456789Z",
-        "--",
-        &program,
-    ];
 
     // The truth to compare against, captured with an ordinary pipe.
-    let control = hermit_command(&args).output().expect("control run");
+    let control = hermit_command(&["run", COMPARISON_EPOCH_ARG, "--", &program])
+        .output()
+        .expect("control run");
     let expected = control.stderr;
     // EXIT-CLASS: hermit
     assert_eq!(
@@ -6545,7 +6604,7 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
     }
 
     let stderr_for_child = unsafe { std::process::Stdio::from_raw_fd(libc::dup(write_fd)) };
-    let mut child = hermit_command(&args)
+    let mut child = hermit_command(&["run", COMPARISON_EPOCH_ARG, "--", &program])
         .stdout(std::process::Stdio::null())
         .stderr(stderr_for_child)
         .spawn()
@@ -6990,7 +7049,7 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
     unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
 
     let started = Instant::now();
-    let mut child = hermit_command(&["run", "--", &program])
+    let mut child = hermit_command(&["run", COMPARISON_EPOCH_ARG, "--", &program])
         .stdout(Stdio::null())
         .stderr(unsafe { Stdio::from_raw_fd(write_fd) })
         .spawn()

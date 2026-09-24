@@ -97,6 +97,17 @@ pub struct GlobalOpts {
 }
 
 impl GlobalOpts {
+    fn write_controller_diagnostic_to_selected_sink(
+        &self,
+        message: std::fmt::Arguments<'_>,
+    ) -> std::io::Result<()> {
+        if let Some(handle) = &self.log_file_handle {
+            writeln!(&**handle, "{message}")
+        } else {
+            writeln!(detcore::util::RetryingStderr, "{message}")
+        }
+    }
+
     /// Open `--log-file` in the HOST's filename namespace.
     ///
     /// Call this from `main`, before any container exists. That placement is the
@@ -123,17 +134,28 @@ impl GlobalOpts {
 
     /// Report controller context before tracing starts, using the selected host
     /// destination without reopening its path or creating a tracing thread.
+    /// `require_stderr_delivery` is reserved for replay inputs whose loss would
+    /// make an otherwise successful invocation impossible to reproduce. An
+    /// explicitly requested log file remains fail-closed for either policy.
     pub(crate) fn write_controller_diagnostic(
         &self,
         message: std::fmt::Arguments<'_>,
+        require_stderr_delivery: bool,
     ) -> Result<(), Error> {
-        if let Some(handle) = &self.log_file_handle {
-            writeln!(&**handle, "{message}").context("cannot write to the host log file")?;
+        if self.log_file_handle.is_some() {
+            self.write_controller_diagnostic_to_selected_sink(message)
+                .context("cannot write to the host log file")?;
+        } else if require_stderr_delivery {
+            self.write_controller_diagnostic_to_selected_sink(message)
+                .context("cannot write to controller stderr")?;
         } else {
-            // A stopped stderr reader must not replace the command's primary
-            // exit status. This shares the existing invocation-wide deadline
-            // with later error reports and preserves the inherited fd flags.
-            let _ = writeln!(detcore::util::RetryingStderr, "{message}");
+            // Best-effort diagnostics must not let a stopped stderr reader
+            // replace the command's primary exit status. Host-captured epoch
+            // provenance deliberately takes the fail-closed branch above: if
+            // that value cannot be delivered, the run cannot be reproduced.
+            // This shares the existing invocation-wide deadline with later
+            // error reports and preserves the inherited fd flags.
+            let _ = self.write_controller_diagnostic_to_selected_sink(message);
         }
         Ok(())
     }
@@ -240,6 +262,8 @@ impl GlobalOpts {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::process::Command;
+    use std::process::Stdio;
 
     use super::*;
 
@@ -252,6 +276,47 @@ mod tests {
             run_evidence_write_error: None,
             backend: None,
         }
+    }
+
+    #[test]
+    fn required_controller_diagnostic_propagates_default_stderr_failure() {
+        const CHILD: &str = "HERMIT_TEST_REQUIRED_DIAGNOSTIC_FULL_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            let options = GlobalOpts {
+                log: None,
+                log_file: None,
+                log_file_handle: None,
+                run_evidence_log_handle: None,
+                run_evidence_write_error: None,
+                backend: None,
+            };
+            let result =
+                options.write_controller_diagnostic(format_args!("required replay input"), true);
+            let valid = result.is_err_and(|error| {
+                error
+                    .to_string()
+                    .contains("cannot write to controller stderr")
+            });
+            std::process::exit(if valid { 0 } else { 1 });
+        }
+
+        let full = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("failed to open /dev/full");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("global_opts::tests::required_controller_diagnostic_propagates_default_stderr_failure")
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(full)
+            .status()
+            .expect("failed to start isolated unwritable-stderr unit probe");
+        assert!(
+            status.success(),
+            "required controller diagnostic swallowed its /dev/full stderr failure: {status}",
+        );
     }
 
     #[test]
@@ -285,7 +350,7 @@ mod tests {
         std::fs::rename(&path, &opened_path).unwrap();
         std::fs::write(&path, b"replacement must not change").unwrap();
         cloned_options
-            .write_controller_diagnostic(format_args!("controller context"))
+            .write_controller_diagnostic(format_args!("controller context"), false)
             .unwrap();
         let mut held = cloned_options
             .log_file_handle
@@ -311,7 +376,7 @@ mod tests {
         let mut read_only_options = log_options(path.clone());
         read_only_options.log_file_handle = Some(Arc::new(File::open(&path).unwrap()));
         let error = read_only_options
-            .write_controller_diagnostic(format_args!("must not disappear"))
+            .write_controller_diagnostic(format_args!("must not disappear"), false)
             .unwrap_err();
         assert!(
             error

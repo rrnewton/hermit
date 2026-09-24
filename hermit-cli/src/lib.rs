@@ -1748,7 +1748,7 @@ async fn run_sabre(
     }
     global
         .clean_up(print_summary, print_summary_to_json_file)
-        .await;
+        .await?;
     tracing::info!(
         target: "hermit::sabre::fallback",
         ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
@@ -2158,7 +2158,7 @@ async fn finish_kvm_tool_completion(
             completion
                 .global_state
                 .clean_up(print_summary, print_summary_to_json_file)
-                .await;
+                .await?;
             Ok(output)
         }
         Err(error) => {
@@ -2268,7 +2268,7 @@ async fn run_dbt(
             );
             global.force_shutdown_with_error();
             global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await;
+            global.clean_up(false, &None).await?;
             (output, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
             })?;
@@ -2292,7 +2292,7 @@ async fn run_dbt(
             );
             global.force_shutdown_with_error();
             global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await;
+            global.clean_up(false, &None).await?;
             (status, global) = launch().await.map_err(|error| {
                 anyhow!("failed to launch drrun ({}): {error}", drrun.display())
             })?;
@@ -2304,7 +2304,7 @@ async fn run_dbt(
         global.force_shutdown_with_error();
         global.cancel_internal_scheduler().await;
     }
-    global.clean_up(print_summary, &None).await;
+    global.clean_up(print_summary, &None).await?;
     Ok(Output {
         status: status.into(),
         stdout,
@@ -2766,7 +2766,7 @@ async fn dispatch_backend(
         }
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
-            .await;
+            .await?;
         return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
@@ -2789,7 +2789,7 @@ async fn dispatch_backend(
     let (exit_status, global_state) = builder.spawn().await?.wait().await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await; // Before it's dropped by this function.
+        .await?; // Before it's dropped by this function.
     backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(exit_status)
 }
@@ -2981,7 +2981,7 @@ async fn dispatch_output_backend(
         }
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
-            .await;
+            .await?;
         return Ok(Output {
             status,
             stdout: output.stdout,
@@ -3011,7 +3011,7 @@ async fn dispatch_output_backend(
     let (output, global_state) = builder.spawn().await?.wait_with_output().await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
-        .await;
+        .await?;
     backend_stats::report(backend, stats_request, &backend_stats::PtraceStatsSource);
     Ok(output)
 }

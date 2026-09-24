@@ -612,6 +612,7 @@ pub struct Scheduler {
     // The event and run-queue transition share the grant/commit mutex. Every
     // callback and daemon wait clones its own subscriber, unlike an Ivar.
     backend_failure: Option<BackendFailureLocation>,
+    backend_failure_cause: Option<String>,
     backend_failure_sender: Option<oneshot::Sender<()>>,
     backend_failure_wake: Shared<oneshot::Receiver<()>>,
 
@@ -1307,7 +1308,7 @@ async fn do_ordinary_turn_blocking(
             }
             let arc = global_time.clone();
 
-            let next_outstanding = mg.step1_check_quiescence(&arc, last_turn);
+            let next_outstanding = mg.step1_check_quiescence(&arc, last_turn)?;
             match next_outstanding {
                 None => {
                     trace!("Scheduler observed full quiescense, proceeding...");
@@ -1377,14 +1378,14 @@ pub async fn do_a_turn_blocking(
                 let request = state.are_all_quiesced();
                 if !barrier && request.is_none() {
                     if !charged {
-                        state.bump_global_time(&global_time, last_turn);
+                        state.bump_global_time(&global_time, last_turn)?;
                         charged = true;
                     } else if refresh {
                         // A hook can advance real observed logical time. Refresh
                         // eligibility without charging again. An earlier empty
                         // due check leaves the one-event budget available; an
                         // actual pop consumes it until this turn returns.
-                        state.bump_global_time(&global_time, &Err(SkipTurn));
+                        state.bump_global_time(&global_time, &Err(SkipTurn))?;
                         if !timed_event_processed {
                             timed_event_processed = state.step2b_process_timed();
                         }
@@ -1681,6 +1682,7 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             backend_failure: None,
+            backend_failure_cause: None,
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
@@ -2317,6 +2319,18 @@ impl Scheduler {
         self.backend_failure.is_some()
     }
 
+    pub(crate) fn backend_failure_description(&self) -> Option<String> {
+        self.backend_failure.as_ref().map(|failure| {
+            let location = format!(
+                "backend failure for process {}, task {:?}, phase {}",
+                failure.pid, failure.tid, failure.phase
+            );
+            self.backend_failure_cause
+                .as_ref()
+                .map_or(location.clone(), |cause| format!("{location}: {cause}"))
+        })
+    }
+
     pub(crate) fn backend_failure_waiter(&self) -> Shared<oneshot::Receiver<()>> {
         self.backend_failure_wake.clone()
     }
@@ -2334,6 +2348,18 @@ impl Scheduler {
             tid: Some(event.tid),
             phase: event.phase,
         })
+    }
+
+    pub(crate) fn report_backend_failure_with_cause(
+        &mut self,
+        event: reverie::BackendFailure,
+        cause: String,
+    ) -> Option<oneshot::Sender<()>> {
+        if self.backend_failed() {
+            return None;
+        }
+        self.backend_failure_cause = Some(cause);
+        self.report_backend_failure(event)
     }
 
     fn report_backend_failure_location(
@@ -3700,6 +3726,15 @@ impl Scheduler {
         SkipTurn
     }
 
+    /// Turn a checked virtual-time overflow into the same deterministic,
+    /// process-terminating delivery used for terminal deadlocks. Panicking in
+    /// the spawned scheduler task would strand every parked guest RPC.
+    fn report_terminal_clock_failure(&mut self, error: anyhow::Error) -> SkipTurn {
+        self.terminal_deadlock
+            .get_or_insert_with(|| format!("Hermit terminal virtual-time failure: {error}"));
+        SkipTurn
+    }
+
     /// Take the pending terminal-deadlock report, if the scheduler produced one.
     fn take_terminal_deadlock(&mut self) -> Option<String> {
         self.terminal_deadlock.take()
@@ -3829,7 +3864,9 @@ impl Scheduler {
                             delta,
                             gt_now_ns,
                         );
-                        gt.add_extra_time(delta);
+                        if let Err(error) = gt.add_extra_time(delta) {
+                            return Err(self.report_terminal_clock_failure(error));
+                        }
                     } else {
                         // A control hook may have crossed this deadline after
                         // maintenance consumed its one event. Keep the separate
@@ -4361,13 +4398,13 @@ impl Scheduler {
         &mut self,
         global_time: &Mutex<GlobalTime>,
         last_turn: &Result<Resources, SkipTurn>,
-    ) -> Option<Ivar<SchedRequest>> {
+    ) -> Result<Option<Ivar<SchedRequest>>, SkipTurn> {
         // TODO: actually check resource availability to enable asynchronous background activities!
         let outstanding = self.are_all_quiesced();
         if outstanding.is_none() {
-            self.bump_global_time(global_time, last_turn);
+            self.bump_global_time(global_time, last_turn)?;
         }
-        outstanding
+        Ok(outstanding)
     }
 
     fn is_internal_turn(rsrcs: &Resources) -> bool {
@@ -4418,7 +4455,7 @@ impl Scheduler {
         &mut self,
         global_time: &Mutex<GlobalTime>,
         last_turn: &Result<Resources, SkipTurn>,
-    ) {
+    ) -> Result<(), SkipTurn> {
         // An internal IO-polling retry (see `is_polling_turn`) must still advance logical
         // time -- finite poll/epoll/select/futex timeouts are enforced by comparing observed
         // logical time against the deadline in `retry_nonblocking_syscall_helper`, so freezing
@@ -4465,7 +4502,9 @@ impl Scheduler {
                     "[scheduler] skipping scheduler time advance because just-finished turn was an internal book-keeping one"
                 );
             } else {
-                let newtime = gtime.add_scheduler_time();
+                let newtime = gtime
+                    .add_scheduler_time()
+                    .map_err(|error| self.report_terminal_clock_failure(error))?;
                 if last_turn_was_polling {
                     // Advance time (needed for timeout enforcement) but keep it off the DETLOG.
                     trace!(
@@ -4505,6 +4544,7 @@ impl Scheduler {
                 self.committed_time = snapshot;
             }
         }
+        Ok(())
     }
 
     /// Step 4: unblock enabled actions to actually, physically run.
@@ -6530,7 +6570,9 @@ mod test {
         advancing.runqueue_push_back(runnable);
         let advancing_time = Mutex::new(GlobalTime::new(&config));
         let before_commit = advancing_time.lock().unwrap().as_nanos();
-        advancing.bump_global_time(&advancing_time, &Ok(Resources::new(runnable)));
+        advancing
+            .bump_global_time(&advancing_time, &Ok(Resources::new(runnable)))
+            .unwrap();
         let after_commit = advancing_time.lock().unwrap().as_nanos();
         assert!(
             after_commit > before_commit,
@@ -6542,12 +6584,42 @@ mod test {
         skipping.runqueue_push_back(runnable);
         let skipping_time = Mutex::new(GlobalTime::new(&config));
         let before_skip = skipping_time.lock().unwrap().as_nanos();
-        skipping.bump_global_time(&skipping_time, &Err(SkipTurn));
+        skipping
+            .bump_global_time(&skipping_time, &Err(SkipTurn))
+            .unwrap();
         let after_skip = skipping_time.lock().unwrap().as_nanos();
         assert_eq!(
             after_skip, before_skip,
             "a skipped turn must not advance virtual time"
         );
+
+        // A checked overflow returns through the scheduler's terminal verdict
+        // instead of panicking its spawned task and stranding parked guests.
+        let config = Config::default();
+        let runnable = DetTid::from_raw(13);
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.priorities.insert(runnable, DEFAULT_PRIORITY);
+        scheduler.runqueue_push_back(runnable);
+
+        let mut clock = GlobalTime::new(&config);
+        let headroom = u64::MAX - clock.as_nanos().as_nanos();
+        clock
+            .add_extra_time(Duration::from_nanos(headroom))
+            .unwrap();
+        let global_time = Mutex::new(clock);
+
+        assert!(
+            scheduler
+                .bump_global_time(&global_time, &Ok(Resources::new(runnable)))
+                .is_err(),
+            "overflow must skip the turn through terminal delivery"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), LogicalTime::MAX);
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("scheduler loop must observe a terminal verdict");
+        assert!(report.starts_with("Hermit terminal virtual-time failure:"));
+        assert!(report.contains("overflowed its unsigned nanosecond domain"));
     }
 
     /// Liveness (negative control) for the F6 fix above: proves the guard the

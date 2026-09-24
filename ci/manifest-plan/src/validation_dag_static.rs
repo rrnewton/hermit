@@ -30,6 +30,23 @@ pub(super) const RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 
 pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
+/// Smallest whole-second outer bound strictly above the harness's two complete
+/// prebuilt-mode wall windows (ceil(57s * 1.5) = 86s) plus two 10-second
+/// termination graces (192s).
+pub(super) const SABRE_MANIFEST_C_GATE_WALL_SECONDS: i64 = 193;
+/// Smallest current project bucket strictly above two complete CPU windows at
+/// the portable validation multiplier (2 * ceil(22s * 1.25) = 56s). The
+/// validator derives this envelope from the selected manifest cell and refuses
+/// any future edit that leaves no CPU headroom.
+pub(super) const SABRE_MANIFEST_C_GATE_CPU_SECONDS: i64 = 60;
+pub(super) const SABRE_MANIFEST_C_GATE_COMMAND: &str = concat!(
+    "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
+    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run ",
+    "--lane portable --category c-programs --ci-only --test c-programs/add-key-enosys ",
+    "--mode verify --backend sabre --prebuilt --jobs 1 --require-sabre-packaged-gate ",
+    "--results \"$E2E_RESULT_ROOT/portable/sabre_manifest_c_gate/results.jsonl\" ",
+    "--junit \"$E2E_RESULT_ROOT/portable/sabre_manifest_c_gate/junit.xml\""
+);
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -179,6 +196,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "privileged-only-e2e.manifest_backend_parity_c",
     "privileged-only-e2e.manifest_backend_parity_c_on_host",
     "quick.e2e_verify",
+    "test.sabre_manifest_c_gate",
 ];
 
 pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] =
@@ -202,6 +220,8 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 2),
     ("test.isolated_detcore_workdir", 1),
+    // Four exact nanosecond origin, domain, overflow, and trace regressions plus
+    // three SaBRe wire-fingerprint decisions retain all 610 prior identities.
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
@@ -214,23 +234,32 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eleven record-workload preparation controls retain all 566 prior IDs.
     // Seven census/finalized-run/scope controls retain all 577 current-main IDs.
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
-    ("test.regular_crates", 610),
+    // Environment-neutral defaults and two v2 framing guards retain all 617 prior IDs.
+    // Three current inventory controls retain all 620 prior identities.
+    ("test.regular_crates", 623),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
-    ("test.hermit_unit", 723),
+    // One DBT controller-provenance materialization regression retains all 723 prior IDs.
+    // One required-delivery stderr regression retains all 724 prior IDs.
+    ("test.hermit_unit", 725),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
-    ("test.detcore_unit", 748),
+    // One fractional zero-work summary regression retains all 748 prior IDs.
+    // Two exact elapsed-before-floor uptime regressions retain all 749 prior IDs.
+    // One current inventory control retains all 751 prior identities.
+    ("test.detcore_unit", 752),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
-    // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
-    // default_virtual_epoch_tracks_invocation_start_and_is_reported and
-    // explicit_virtual_epoch_reproduces_identical_observed_time.
-    ("test.hermit_integration", 160),
+    // Current exact selection enumerates 168 integration identities after the
+    // epoch provenance and range-refusal controls. Three are explicitly ignored,
+    // so the ordinary Nextest invocation executes 165 without changing selectors.
+    ("test.hermit_integration", 165),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
-    ("test.sabre_examples", 6),
+    // Same-epoch reuse and distinct-nanosecond controls retain all six prior IDs.
+    // Structured reach refusal and public HERMIT_EPOCH pairing retain all eight prior IDs.
+    ("test.sabre_examples", 10),
     ("test.hermit_modes", 19),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -249,16 +278,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 748),
-    // The host variant selects the same two additional clock_determinism tests.
-    ("test.hermit_integration_on_host", 160),
-    ("test.hermit_unit_on_host", 723),
+    ("test.detcore_unit_on_host", 752),
+    ("test.hermit_integration_on_host", 165),
+    // The host node carries the same required-delivery stderr regression.
+    ("test.hermit_unit_on_host", 725),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 610),
+    ("test.regular_crates_on_host", 623),
     ("test.rr_suite_contract_on_host", 1),
-    ("test.sabre_examples_on_host", 6),
+    ("test.sabre_examples_on_host", 10),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -505,6 +534,41 @@ pub(super) fn config() -> DagConfig {
             .materialize(),
         );
     }
+    steps.push(
+        StaticStepSpec {
+            group: "test",
+            job: "sabre_manifest_c_gate",
+            desc: "Packaged SaBRe dynamic-PIE C execution-path gate",
+            description: "Run one stable dynamic-PIE C guest through the published Hermit/install bundle and require both strict-verification executions to reach Detcore without ptrace fallback or trusted native sites.",
+            labels: &["full", "portable"],
+            cmd: SABRE_MANIFEST_C_GATE_COMMAND,
+            cmdtype: CmdType::Unknown,
+            manifest: None,
+            integration_test_binaries: None,
+            deps: &["build.e2e_artifact", "build.manifest_guests"],
+            env: &[],
+            hint: HintSpec {
+                resources: &[("manifest_guest", 1)],
+                est_duration_s: 5.0,
+                rss_baseline_bytes: Some(1073741824),
+                hard_mem_max_bytes: Some(3221225472),
+                classification: StepClass::LatencyBound,
+                preferred_inner_jobs: Some(1),
+                measured_effective_cores: None,
+                measured_cpu_utilization: None,
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: SABRE_MANIFEST_C_GATE_WALL_SECONDS,
+            cpu_timeout: SABRE_MANIFEST_C_GATE_CPU_SECONDS,
+            // The harness already receives its owned `--jobs 1`. An explicit
+            // empty scheduler flag prevents dagrun's default `-j 1` suffix,
+            // which is not part of the test-harness CLI.
+            jobs_flag: Some(""),
+            jobs_env: None,
+        }
+        .materialize(),
+    );
     DagConfig {
         description: "Hermit validation superset; select quick, portable, hosted-portable, full, super, privileged, or hosted-privileged by step label".into(),
         default_step_timeout: 600,
@@ -2285,7 +2349,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install bash -c "inventory=\$(mktemp); executed_inventory=\$(mktemp); trap 'rm -f \"\$inventory\" \"\$executed_inventory\"' EXIT; if ! ./ci/nextest-binaries.rs list \${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback --message-format json >\"\$inventory\"; then exit 1; fi; if ! jq -e --argjson expected \"\$NEXTEST_EXPECTED_EXECUTED\" '[.\"rust-suites\" | to_entries[] | .key as \$suite | .value.testcases | to_entries[] | {id: (\$suite + \"::\" + .key), value: .value}] as \$all | [\$all[] | select(.value.\"filter-match\".status == \"matches\")] as \$executed | [\$all[] | select(.value.ignored == true)] as \$ignored | (\$all | length == 168) and (\$executed | length == \$expected) and ((\$ignored | map(.id) | sort) == [\"hermit::epoll_determinism::notification_control_syscalls_reach_strict_verify_l2\",\"hermit::epoll_determinism::pinned_root_arguments_are_exact_and_fail_closed\",\"hermit::python_stdlib::strict_python_stdlib_is_deterministic\"]) and (\$ignored | all(.value.\"filter-match\".status == \"mismatch\"))' \"\$inventory\" >/dev/null; then printf 'test.hermit_integration: expected 168 selected identities, 3 ignored mismatches, and %s executable identities; the inventory changed. Update the selection and executed count together.\\n' \"\$NEXTEST_EXPECTED_EXECUTED\" >&2; exit 1; fi; if ! jq -r '[.\"rust-suites\" | to_entries[] | .key as \$suite | .value.testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\") | (\$suite + \"::\" + .key)] | sort[]' \"\$inventory\" >\"\$executed_inventory\"; then exit 1; fi; if ! cmp -s ci/manifest-plan/hermit-integration-executed-tests.txt \"\$executed_inventory\"; then printf 'test.hermit_integration: the exact 165-test executable identity set changed. Update the committed inventory deliberately.\\n' >&2; exit 1; fi; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh \${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[

@@ -1819,7 +1819,7 @@ fn timed_maintenance_preserves_reference_selection_and_clock() {
         let mut last = Ok(Resources::new(r));
         let mut observations = Vec::new();
         for selected in [a, b] {
-            let expected_clock = expected_time.add_scheduler_time();
+            let expected_clock = expected_time.add_scheduler_time().unwrap();
             let result = do_a_turn_blocking(scheduler.clone(), global.clone(), &last)
                 .now_or_never()
                 .expect("all three requests were quiescent")
@@ -1881,7 +1881,8 @@ fn timed_maintenance_budget_survives_alarm_refresh_and_empty_queue() {
         global
             .lock()
             .unwrap()
-            .add_extra_time(std::time::Duration::from_nanos(1));
+            .add_extra_time(std::time::Duration::from_nanos(1))
+            .unwrap();
         if !empty_queue {
             // A prior maintenance pass committed this pending alarm. The turn
             // under test therefore starts with either one or zero due sleeps.
@@ -1951,7 +1952,8 @@ fn timed_maintenance_budget_survives_alarm_refresh_and_empty_queue() {
         global
             .lock()
             .unwrap()
-            .add_extra_time(std::time::Duration::from_nanos(299));
+            .add_extra_time(std::time::Duration::from_nanos(299))
+            .unwrap();
         backend.recipients.lock().unwrap().clear();
         let resumed = Ivar::new();
         scheduler

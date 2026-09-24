@@ -26,9 +26,154 @@ const NON_RACY_EXAMPLES: [&str; 2] = ["date.sh", "devrand.sh"];
 const SABRE_BACKEND_FACT_PREFIX: &str = ":: Backend: sabre static rewriting + ptrace runtime;";
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
-// Independent comparison runs must receive the same clock input. Keep its
-// fractional precision; virtual time still progresses throughout each guest.
-const COMPARISON_EPOCH: &str = "--epoch=2026-01-01T00:00:00.123456789Z";
+const COMPARISON_EPOCH: &str = "2026-09-23T02:39:52.970859833+00:00";
+const NEXT_NANOSECOND_EPOCH: &str = "2026-09-23T02:39:52.970859834+00:00";
+
+fn unique_sabre_backend_fact_field<'a>(fact: &'a str, name: &str) -> Option<&'a str> {
+    let mut values = fact.split(';').filter_map(|field| {
+        let (field_name, value) = field.trim().split_once('=')?;
+        (field_name == name).then_some(value)
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn unique_sabre_backend_fact_line(diagnostics: &str) -> Result<&str, String> {
+    let mut facts = diagnostics
+        .lines()
+        .filter(|line| line.contains(SABRE_BACKEND_FACT_PREFIX));
+    let Some(fact) = facts.next() else {
+        return Err("expected exactly one SaBRe backend fact, found 0".to_owned());
+    };
+    let additional = facts.count();
+    if additional != 0 {
+        return Err(format!(
+            "expected exactly one SaBRe backend fact, found {}",
+            additional + 1
+        ));
+    }
+    Ok(fact)
+}
+
+fn sabre_backend_fact_is_exercised(fact: &str) -> bool {
+    unique_sabre_backend_fact_field(fact, "evidence_schema") == Some("1")
+        && unique_sabre_backend_fact_field(fact, "ptrace_fallback_sites") == Some("0")
+        && unique_sabre_backend_fact_field(fact, "trusted_shared_object_sites") == Some("0")
+        && unique_sabre_backend_fact_field(fact, "guest_rpc_observed") == Some("true")
+        && unique_sabre_backend_fact_field(fact, "reach_state") == Some("sabre-exercised")
+}
+
+fn sabre_backend_fact_reached_detcore(fact: &str) -> bool {
+    unique_sabre_backend_fact_field(fact, "evidence_schema") == Some("1")
+        && unique_sabre_backend_fact_field(fact, "ptrace_fallback_sites") == Some("0")
+        && unique_sabre_backend_fact_field(fact, "guest_rpc_observed") == Some("true")
+        && unique_sabre_backend_fact_field(fact, "reach_state") == Some("sabre-exercised")
+}
+
+fn assert_sabre_backend_fact(diagnostics: &str, label: &str) {
+    let fact = unique_sabre_backend_fact_line(diagnostics).unwrap_or_else(|error| {
+        panic!("SaBRe controller diagnostics did not contain exactly one backend fact for {label}: {error}\n{diagnostics}")
+    });
+    assert!(
+        sabre_backend_fact_is_exercised(fact),
+        "SaBRe backend fact did not prove schema-1 RPC reach with zero ptrace fallback for {label}:\n{fact}",
+    );
+}
+
+#[test]
+fn sabre_backend_fact_refuses_unreached_or_fallback_execution() {
+    let complete = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; trusted_shared_object_sites=0; \
+         guest_rpc_observed=true; reach_state=sabre-exercised"
+    );
+    let false_reach = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; guest_rpc_observed=false; \
+         reach_state=no-detcore-reached"
+    );
+    let fallback = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=1; guest_rpc_observed=true; \
+         reach_state=degraded-ptrace-fallback"
+    );
+    let trusted_escape = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; trusted_shared_object_sites=1; \
+         guest_rpc_observed=true; reach_state=sabre-exercised"
+    );
+    let contradictory_reach = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; guest_rpc_observed=true; \
+         guest_rpc_observed=false; reach_state=sabre-exercised"
+    );
+    let contradictory_fallback = format!(
+        "{SABRE_BACKEND_FACT_PREFIX} evidence_schema=1; \
+         ptrace_fallback_sites=0; ptrace_fallback_sites=1; \
+         guest_rpc_observed=true; reach_state=sabre-exercised"
+    );
+    assert_eq!(unique_sabre_backend_fact_line(&complete).unwrap(), complete);
+    let missing = unique_sabre_backend_fact_line("controller diagnostics without a backend fact")
+        .unwrap_err();
+    assert!(missing.contains("found 0"), "{missing}");
+    for (label, diagnostics) in [
+        ("valid plus unreached", format!("{complete}\n{false_reach}")),
+        ("valid plus fallback", format!("{complete}\n{fallback}")),
+        ("duplicate valid", format!("{complete}\n{complete}")),
+    ] {
+        let error = unique_sabre_backend_fact_line(&diagnostics).unwrap_err();
+        assert!(
+            error.contains("found 2"),
+            "{label} did not fail as ambiguous: {error}"
+        );
+    }
+    assert!(sabre_backend_fact_reached_detcore(&complete));
+    assert!(sabre_backend_fact_is_exercised(&complete));
+    for (label, fact) in [
+        ("unreached", false_reach),
+        ("fallback", fallback),
+        ("contradictory reach", contradictory_reach),
+        ("contradictory fallback", contradictory_fallback),
+    ] {
+        assert!(
+            !sabre_backend_fact_reached_detcore(&fact),
+            "{label} backend fact falsely proved RPC reach with zero fallback: {fact}",
+        );
+        assert!(
+            !sabre_backend_fact_is_exercised(&fact),
+            "{label} backend fact carried the complete exercised contract: {fact}",
+        );
+    }
+    assert!(
+        sabre_backend_fact_reached_detcore(&trusted_escape),
+        "trusted shared-object execution still reached Detcore"
+    );
+    assert!(
+        !sabre_backend_fact_is_exercised(&trusted_escape),
+        "trusted shared-object escape falsely carried the complete exercised contract"
+    );
+}
+
+fn assert_clock_progress_trajectory(output: &Output, backend_label: &str) {
+    let rendered = std::str::from_utf8(&output.stdout)
+        .unwrap_or_else(|error| panic!("{backend_label} trajectory was not UTF-8: {error}"))
+        .trim();
+    let mut fields = rendered.split_whitespace();
+    assert_eq!(fields.next(), Some("clock-progress-deltas"));
+    let samples: Vec<u64> = fields
+        .map(|field| {
+            field.parse().unwrap_or_else(|error| {
+                panic!("{backend_label} emitted invalid clock delta {field:?}: {error}")
+            })
+        })
+        .collect();
+    assert_eq!(samples.len(), 8, "{backend_label} omitted clock samples");
+    assert_eq!(samples[0], 0, "{backend_label} trajectory origin moved");
+    assert!(
+        samples.windows(2).all(|pair| pair[0] < pair[1]),
+        "{backend_label} clock trajectory froze or rewound: {samples:?}",
+    );
+}
 
 fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
     match requested {
@@ -66,20 +211,17 @@ fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
     let command = example_command_with_execution_root(
         Path::new("/bin/true"),
         &[],
+        COMPARISON_EPOCH,
         None,
         false,
-        None,
-        None,
+        (None, None),
         Some(OsStr::new("/test")),
     )
     .unwrap();
     let args: Vec<_> = command.get_args().collect();
     assert_eq!(
-        args.iter()
-            .filter(|arg| arg.to_string_lossy().starts_with("--epoch="))
-            .copied()
-            .collect::<Vec<_>>(),
-        [OsStr::new(COMPARISON_EPOCH)]
+        command_epoch_arguments(&command),
+        [format!("--epoch={COMPARISON_EPOCH}")],
     );
     assert!(args.contains(&OsStr::new("--base-env=minimal")));
     assert!(args.windows(2).any(|args| {
@@ -92,14 +234,100 @@ fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
     let error = example_command_with_execution_root(
         Path::new("/bin/true"),
         &[],
+        COMPARISON_EPOCH,
         None,
         false,
-        None,
-        None,
+        (None, None),
         Some(OsStr::new("/tmp")),
     )
     .unwrap_err();
     assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+}
+
+fn command_epoch_arguments(command: &Command) -> Vec<String> {
+    command
+        .get_args()
+        .filter_map(|argument| {
+            argument
+                .to_str()
+                .filter(|argument| argument.starts_with("--epoch="))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[test]
+fn sabre_comparison_reuses_one_explicit_epoch_for_parity_and_repeatability() {
+    let commands = [
+        example_command(
+            Path::new("/bin/true"),
+            &[],
+            COMPARISON_EPOCH,
+            None,
+            false,
+            None,
+            None,
+        ),
+        example_command(
+            Path::new("/bin/true"),
+            &[],
+            COMPARISON_EPOCH,
+            Some(Path::new("/sabre")),
+            false,
+            None,
+            None,
+        ),
+        example_command(
+            Path::new("/bin/true"),
+            &[],
+            COMPARISON_EPOCH,
+            None,
+            false,
+            None,
+            None,
+        ),
+    ];
+    for command in &commands {
+        assert_eq!(
+            command_epoch_arguments(command),
+            [format!("--epoch={COMPARISON_EPOCH}")],
+        );
+    }
+}
+
+#[test]
+fn sabre_distinct_explicit_epochs_remain_distinct() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    for (backend, label) in [(None, "ptrace"), (Some(loader.as_path()), "SaBRe")] {
+        let first = parity_run(
+            Path::new("/bin/date"),
+            &["+%s.%N"],
+            COMPARISON_EPOCH,
+            backend,
+            &format!("{label} first explicit epoch"),
+        );
+        let second = parity_run(
+            Path::new("/bin/date"),
+            &["+%s.%N"],
+            NEXT_NANOSECOND_EPOCH,
+            backend,
+            &format!("{label} next-nanosecond explicit epoch"),
+        );
+        let observed = |output: &Output| {
+            let text = std::str::from_utf8(&output.stdout).unwrap().trim();
+            let (seconds, nanos) = text
+                .split_once('.')
+                .unwrap_or_else(|| panic!("{label} date output lacked nanoseconds: {text}"));
+            seconds.parse::<u128>().unwrap() * 1_000_000_000 + nanos.parse::<u128>().unwrap()
+        };
+        assert_eq!(
+            observed(&second) - observed(&first),
+            1,
+            "{label} guest observation collapsed two explicit epochs one nanosecond apart",
+        );
+    }
 }
 
 fn hermit_binary() -> PathBuf {
@@ -259,6 +487,7 @@ fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>)
 fn example_command(
     example: &Path,
     args: &[&str],
+    epoch: &str,
     backend: Option<&Path>,
     verify: bool,
     diagnostic_log: Option<&Path>,
@@ -268,10 +497,10 @@ fn example_command(
     example_command_with_execution_root(
         example,
         args,
+        epoch,
         backend,
         verify,
-        diagnostic_log,
-        retained_verify_log_dir,
+        (diagnostic_log, retained_verify_log_dir),
         requested.as_deref(),
     )
     .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"))
@@ -280,12 +509,39 @@ fn example_command(
 fn example_command_with_execution_root(
     example: &Path,
     args: &[&str],
+    epoch: &str,
     backend: Option<&Path>,
     verify: bool,
-    diagnostic_log: Option<&Path>,
-    retained_verify_log_dir: Option<&Path>,
+    output_paths: (Option<&Path>, Option<&Path>),
     requested_workdir: Option<&OsStr>,
 ) -> Result<Command, String> {
+    example_command_with_epoch_source(
+        example,
+        args,
+        EpochSource::ExplicitCli(epoch),
+        backend,
+        verify,
+        output_paths,
+        requested_workdir,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum EpochSource<'a> {
+    ExplicitCli(&'a str),
+    Environment(&'a str),
+}
+
+fn example_command_with_epoch_source(
+    example: &Path,
+    args: &[&str],
+    epoch_source: EpochSource<'_>,
+    backend: Option<&Path>,
+    verify: bool,
+    output_paths: (Option<&Path>, Option<&Path>),
+    requested_workdir: Option<&OsStr>,
+) -> Result<Command, String> {
+    let (diagnostic_log, retained_verify_log_dir) = output_paths;
     let mut command = Command::new(hermit_binary());
     command.arg(if verify { "--log=info" } else { "--log=warn" });
     if let Some(path) = diagnostic_log {
@@ -301,8 +557,15 @@ fn example_command_with_execution_root(
         "--strict",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
-        COMPARISON_EPOCH,
     ]);
+    match epoch_source {
+        EpochSource::ExplicitCli(epoch) => {
+            command.arg(format!("--epoch={epoch}"));
+        }
+        EpochSource::Environment(epoch) => {
+            command.env("HERMIT_EPOCH", epoch);
+        }
+    }
     if verify {
         command.arg("--verify");
         if let Some(directory) = retained_verify_log_dir {
@@ -318,7 +581,42 @@ fn example_command_with_execution_root(
     Ok(command)
 }
 
-fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str) -> Output {
+fn epoch_diagnostic(epoch: &str) -> String {
+    format!("hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}")
+}
+
+fn assert_epoch_diagnostic(output: &Output, diagnostics: &str, epoch: &str, label: &str) {
+    let expected = epoch_diagnostic(epoch);
+    assert_eq!(
+        diagnostics.matches(&expected).count(),
+        1,
+        "{label} must record exactly one explicit-epoch provenance event:\n{diagnostics}",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("virtual-time epoch="),
+        "{label} leaked controller epoch provenance into guest stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn parity_run(
+    example: &Path,
+    args: &[&str],
+    epoch: &str,
+    backend: Option<&Path>,
+    label: &str,
+) -> Output {
+    parity_run_with_path_contract(example, args, epoch, backend, label, false)
+}
+
+fn parity_run_with_path_contract(
+    example: &Path,
+    args: &[&str],
+    epoch: &str,
+    backend: Option<&Path>,
+    label: &str,
+    require_no_escape_sites: bool,
+) -> Output {
     // Hermit gives the guest a private /tmp, so keep the controller sidecar in the host-visible
     // Cargo target directory. The freshly created unique file prevents stale or cross-run logs.
     let diagnostic_log = tempfile::Builder::new()
@@ -335,22 +633,38 @@ fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str
         diagnostic_log.display()
     );
     let output = run_bounded(
-        example_command(example, args, backend, false, Some(&diagnostic_log), None),
+        example_command(
+            example,
+            args,
+            epoch,
+            backend,
+            false,
+            Some(&diagnostic_log),
+            None,
+        ),
         label,
         Some(&diagnostic_log),
     );
     let diagnostics = controller_diagnostics(Some(&diagnostic_log));
     let guest_stderr = String::from_utf8_lossy(&output.stderr);
+    assert_epoch_diagnostic(&output, &diagnostics, epoch, label);
 
     // Positive control: every SaBRe run emits the structured backend fact into
     // the controller sidecar. Negative controls: ptrace emits no SaBRe fact,
     // and neither backend lets that controller fact leak into captured guest
     // stderr. Guest stderr itself is still compared byte-for-byte below.
     if backend.is_some() {
-        assert!(
-            diagnostics.contains(SABRE_BACKEND_FACT_PREFIX),
-            "SaBRe controller diagnostics omitted the backend fact for {label}:\n{diagnostics}",
-        );
+        if require_no_escape_sites {
+            assert_sabre_backend_fact(&diagnostics, label);
+        } else {
+            let fact = unique_sabre_backend_fact_line(&diagnostics).unwrap_or_else(|error| {
+                panic!("SaBRe controller diagnostics did not contain exactly one backend fact for {label}: {error}\n{diagnostics}")
+            });
+            assert!(
+                sabre_backend_fact_reached_detcore(fact),
+                "SaBRe backend fact did not prove RPC reach for {label}:\n{fact}",
+            );
+        }
     } else {
         assert!(
             !diagnostics.contains(SABRE_BACKEND_FACT_PREFIX),
@@ -364,24 +678,61 @@ fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str
     output
 }
 
-fn assert_controller_diagnostics_do_not_hide_guest_stderr(loader: &Path) {
-    const MARKER: &[u8] = b"guest-stderr-control\n";
+#[test]
+fn sabre_public_epoch_environment_reaches_matching_plugin() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let diagnostic = tempfile::Builder::new()
+        .prefix("sabre-epoch-env-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let (_file, path) = diagnostic.keep().unwrap();
+    let command = example_command_with_epoch_source(
+        Path::new("/bin/true"),
+        &[],
+        EpochSource::Environment(COMPARISON_EPOCH),
+        Some(&loader),
+        false,
+        (Some(&path), None),
+        None,
+    )
+    .unwrap();
+    assert!(command_epoch_arguments(&command).is_empty());
+    let output = run_bounded(command, "SaBRe HERMIT_EPOCH public-input run", Some(&path));
+    let diagnostics = controller_diagnostics(Some(&path));
+    assert_epoch_diagnostic(&output, &diagnostics, COMPARISON_EPOCH, "HERMIT_EPOCH run");
+    assert_sabre_backend_fact(&diagnostics, "HERMIT_EPOCH run");
+}
+
+fn assert_controller_diagnostics_do_not_hide_guest_stderr(loader: &Path, epoch: &str) {
     let args = ["-c", "printf 'guest-stderr-control\\n' >&2"];
     let ptrace = parity_run(
         Path::new("/bin/sh"),
         &args,
+        epoch,
         None,
         "ptrace controller/guest stderr separation control",
     );
     let sabre = parity_run(
         Path::new("/bin/sh"),
         &args,
+        epoch,
         Some(loader),
         "SaBRe controller/guest stderr separation control",
     );
 
-    assert_eq!(ptrace.stderr, MARKER, "ptrace hid or rewrote guest stderr");
-    assert_eq!(sabre.stderr, MARKER, "SaBRe hid or rewrote guest stderr");
+    let expected = "guest-stderr-control\n";
+    assert_eq!(
+        ptrace.stderr,
+        expected.as_bytes(),
+        "ptrace hid or rewrote its diagnostic or guest stderr",
+    );
+    assert_eq!(
+        sabre.stderr,
+        expected.as_bytes(),
+        "SaBRe hid or rewrote its diagnostic or guest stderr",
+    );
     assert_eq!(
         sabre.stderr, ptrace.stderr,
         "controller-diagnostic routing must not weaken guest stderr parity",
@@ -391,18 +742,21 @@ fn assert_controller_diagnostics_do_not_hide_guest_stderr(loader: &Path) {
 fn assert_backend_parity_and_sabre_verify(
     program: &Path,
     args: &[&str],
+    epoch: &str,
     loader: &Path,
     label: &str,
 ) {
     let ptrace = parity_run(
         program,
         args,
+        epoch,
         None,
         &format!("ptrace strict portable reference for {label}"),
     );
     let sabre = parity_run(
         program,
         args,
+        epoch,
         Some(loader),
         &format!("SaBRe strict portable parity run for {label}"),
     );
@@ -414,10 +768,10 @@ fn assert_backend_parity_and_sabre_verify(
     assert_eq!(sabre.stdout, ptrace.stdout, "stdout parity: {label}");
     assert_eq!(sabre.stderr, ptrace.stderr, "stderr parity: {label}");
 
-    assert_sabre_verify(program, args, loader, label);
+    assert_sabre_verify(program, args, epoch, loader, label);
 }
 
-fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str) {
+fn assert_sabre_verify(program: &Path, args: &[&str], epoch: &str, loader: &Path, label: &str) {
     let retained_logs = tempfile::Builder::new()
         .prefix("sabre-canonical-verify-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -433,6 +787,7 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
         example_command(
             program,
             args,
+            epoch,
             Some(loader),
             true,
             None,
@@ -440,6 +795,39 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
         ),
         &format!("SaBRe strict portable verification for {label}"),
         None,
+    );
+    let expected_provenance = epoch_diagnostic(epoch);
+    let verify_stderr = String::from_utf8_lossy(&verify.stderr);
+    assert_eq!(
+        verify_stderr.matches(&expected_provenance).count(),
+        1,
+        "SaBRe verify must expose exactly one top-level epoch reproducer for {label}:\n{verify_stderr}",
+    );
+    let mut comparison_logs = 0;
+    for entry in std::fs::read_dir(&retained_logs)
+        .unwrap_or_else(|error| panic!("failed to read retained logs for {label}: {error}"))
+    {
+        let path = entry.unwrap().path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("run1_log_") || name.starts_with("run2_log_") {
+            let diagnostics = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read retained verify log {}: {error}",
+                    path.display()
+                )
+            });
+            assert!(
+                !diagnostics.contains("virtual-time epoch="),
+                "SaBRe comparison log must exclude controller epoch provenance for {label}:\n{diagnostics}",
+            );
+            comparison_logs += 1;
+        }
+    }
+    assert_eq!(
+        comparison_logs, 2,
+        "SaBRe verify must retain one comparison log per physical run for {label}",
     );
     let diagnostics = format!(
         "{}{}",
@@ -475,6 +863,7 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
 fn assert_three_run_determinism(
     program: &Path,
     args: &[&str],
+    epoch: &str,
     backend: Option<&Path>,
     backend_label: &str,
     label: &str,
@@ -482,6 +871,7 @@ fn assert_three_run_determinism(
     let baseline = parity_run(
         program,
         args,
+        epoch,
         backend,
         &format!("{backend_label} strict portable run 1 for {label}"),
     );
@@ -489,6 +879,7 @@ fn assert_three_run_determinism(
         let repeated = parity_run(
             program,
             args,
+            epoch,
             backend,
             &format!("{backend_label} strict portable run {run} for {label}"),
         );
@@ -528,13 +919,14 @@ fn sabre_root_pid_matches_ptrace() {
         return;
     };
 
-    assert_controller_diagnostics_do_not_hide_guest_stderr(&loader);
+    assert_controller_diagnostics_do_not_hide_guest_stderr(&loader, COMPARISON_EPOCH);
 
     // The SaBRe ptrace safety net must not consume the root guest's namespace PID before launch.
     // `printf` is a shell builtin, so this observes the root shell rather than a forked utility.
     assert_backend_parity_and_sabre_verify(
         Path::new("/bin/sh"),
         &["-c", "printf 'pid=%s\\n' \"$$\""],
+        COMPARISON_EPOCH,
         &loader,
         "root-pid",
     );
@@ -558,6 +950,7 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
         example_command(
             Path::new("/bin/sh"),
             &["-c", "printf 'ok\\n'"],
+            COMPARISON_EPOCH,
             Some(&loader),
             true,
             None,
@@ -669,13 +1062,21 @@ fn sabre_non_racy_examples_verify_current_envelope() {
             // continuous clock trajectories. Do not restore fake all-zero parity.
             // Cross-backend trajectory alignment is tracked by task
             // `cross-backend-continuous-clock-trajectory-parity`.
-            let ptrace = assert_three_run_determinism(&program, &[], None, "ptrace", name);
-            let sabre = assert_three_run_determinism(&program, &[], Some(&loader), "SaBRe", name);
+            let ptrace =
+                assert_three_run_determinism(&program, &[], COMPARISON_EPOCH, None, "ptrace", name);
+            let sabre = assert_three_run_determinism(
+                &program,
+                &[],
+                COMPARISON_EPOCH,
+                Some(&loader),
+                "SaBRe",
+                name,
+            );
             assert_date_output_is_sane(&ptrace, "ptrace");
             assert_date_output_is_sane(&sabre, "SaBRe");
-            assert_sabre_verify(&program, &[], &loader, name);
+            assert_sabre_verify(&program, &[], COMPARISON_EPOCH, &loader, name);
         } else {
-            assert_backend_parity_and_sabre_verify(&program, &[], &loader, name);
+            assert_backend_parity_and_sabre_verify(&program, &[], COMPARISON_EPOCH, &loader, name);
         }
     }
 
@@ -698,23 +1099,37 @@ fn sabre_non_racy_examples_verify_current_envelope() {
         "clock-progress guest compilation failed:\n{}",
         String::from_utf8_lossy(&build.stderr),
     );
-    assert_three_run_determinism(
+    let ptrace_trajectory = assert_three_run_determinism(
         &clock_progress,
         &["clock-progress"],
+        COMPARISON_EPOCH,
         None,
         "ptrace",
         "clock-progress",
     );
-    assert_three_run_determinism(
+    let sabre_trajectory = assert_three_run_determinism(
         &clock_progress,
         &["clock-progress"],
+        COMPARISON_EPOCH,
         Some(&loader),
         "SaBRe",
         "clock-progress",
     );
+    assert_clock_progress_trajectory(&ptrace_trajectory, "ptrace");
+    assert_clock_progress_trajectory(&sabre_trajectory, "SaBRe");
+    let complete_path = parity_run_with_path_contract(
+        &clock_progress,
+        &["clock-progress"],
+        COMPARISON_EPOCH,
+        Some(&loader),
+        "SaBRe clock-progress complete path evidence",
+        true,
+    );
+    assert_clock_progress_trajectory(&complete_path, "SaBRe complete-path");
     assert_sabre_verify(
         &clock_progress,
         &["clock-progress"],
+        COMPARISON_EPOCH,
         &loader,
         "clock-progress",
     );
@@ -769,5 +1184,11 @@ int main(void) {
         String::from_utf8_lossy(&build.stderr),
     );
 
-    assert_backend_parity_and_sabre_verify(&program, &[], &loader, "public libc getrandom");
+    assert_backend_parity_and_sabre_verify(
+        &program,
+        &[],
+        COMPARISON_EPOCH,
+        &loader,
+        "public libc getrandom",
+    );
 }

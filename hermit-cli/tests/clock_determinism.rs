@@ -113,12 +113,19 @@ fn run_clock_matrix(iteration: usize) -> Vec<u8> {
     output.stdout
 }
 
-fn run_date_at_epoch(epoch: Option<&str>) -> Output {
+fn run_date_at_epoch(epoch: Option<&str>) -> (Output, String) {
+    let diagnostic_log = tempfile::Builder::new()
+        .prefix("clock-epoch-provenance-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create epoch provenance log");
     let mut command = Command::new(hermit_binary::hermit_binary());
     // Keep the omitted-input case independent of the caller's valid override.
     // Environment precedence is covered separately in isolated parser children.
     command.env_remove("HERMIT_EPOCH");
     command.args([
+        "--log=warn",
+        "--log-file",
+        diagnostic_log.path().to_str().unwrap(),
         "run",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
@@ -128,7 +135,15 @@ fn run_date_at_epoch(epoch: Option<&str>) -> Output {
         command.arg(format!("--epoch={epoch}"));
     }
     command.args(["--", "/bin/date", "+%s.%N"]);
-    command_output(command, "virtual epoch date probe")
+    let output = command_output(command, "virtual epoch date probe");
+    let diagnostics =
+        fs::read_to_string(diagnostic_log.path()).expect("failed to read epoch provenance log");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("virtual-time epoch="),
+        "controller epoch provenance leaked into guest stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (output, diagnostics)
 }
 
 #[test]
@@ -138,7 +153,7 @@ fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
-    let output = run_date_at_epoch(None);
+    let (output, diagnostics) = run_date_at_epoch(None);
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -151,17 +166,176 @@ fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
         observed >= before && observed <= after + 1.0,
         "default virtual epoch {observed} was not captured near host now [{before}, {after}]"
     );
+    assert!(diagnostics.contains("virtual-time epoch="), "{diagnostics}");
+    assert!(diagnostics.contains("source=host-now"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("reproduce with --epoch="),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn default_verify_reports_one_stable_replay_epoch_without_retained_logs() {
+    let _guard = hermit_clock_lock();
+    let mut command = Command::new(hermit_binary::hermit_binary());
+    command.env_remove("HERMIT_EPOCH").args([
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        // This checkout itself is under /tmp. Keep Hermit's private summary
+        // sidecar visible to both verification containers during this test.
+        "--tmp=/tmp",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/true",
+    ]);
+    let output = command_output(command, "default-epoch verification without retained logs");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("virtual-time epoch="), "{stderr}");
-    assert!(stderr.contains("source=host-now"), "{stderr}");
-    assert!(stderr.contains("reproduce with --epoch="), "{stderr}");
+    let lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("hermit: virtual-time epoch="))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "verification must expose exactly one top-level epoch reproducer: {stderr}"
+    );
+    let line = lines[0];
+    let epoch = line
+        .split_once("epoch=")
+        .and_then(|(_, tail)| tail.split_once(" source=host-now"))
+        .map(|(epoch, _)| epoch)
+        .unwrap_or_else(|| panic!("missing host-now epoch provenance: {line}"));
+    assert_eq!(
+        line.matches(&format!("--epoch={epoch}")).count(),
+        1,
+        "the reproducer must reuse the exact captured epoch: {line}"
+    );
+
+    let failed = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args([
+            "--log=info",
+            "--log-file=/dev/full",
+            "run",
+            "--verify",
+            "--base-env=minimal",
+            "--tmp=/tmp",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to start the unwritable epoch-provenance probe");
+    assert!(
+        !failed.status.success(),
+        "verification succeeded after losing its only durable epoch reproducer"
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr)
+            .contains("cannot write epoch provenance to --log-file"),
+        "verification did not identify the lost epoch provenance: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}
+
+#[test]
+fn ordinary_run_refuses_to_lose_epoch_provenance_to_an_unwritable_log() {
+    let _guard = hermit_clock_lock();
+    let failed = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args([
+            "--log=info",
+            "--log-file=/dev/full",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("failed to start the ordinary unwritable epoch-provenance probe");
+    assert!(
+        !failed.status.success(),
+        "ordinary run succeeded after losing its only durable epoch reproducer"
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr)
+            .contains("cannot write epoch provenance to --log-file"),
+        "ordinary run did not identify the lost epoch provenance: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}
+
+#[test]
+fn ordinary_run_requires_host_now_but_not_explicit_epoch_provenance_delivery() {
+    let _guard = hermit_clock_lock();
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/true",
+    ];
+    let control = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args(args)
+        .output()
+        .expect("failed to start the writable-stderr control");
+    assert!(
+        control.status.success(),
+        "writable-stderr control failed: {}",
+        String::from_utf8_lossy(&control.stderr),
+    );
+
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("failed to open /dev/full");
+    let status = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args(args)
+        .stderr(full)
+        .status()
+        .expect("failed to start the unwritable-stderr epoch-provenance probe");
+    assert!(
+        !status.success(),
+        "host-now run succeeded after losing its only epoch reproducer to /dev/full",
+    );
+
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("failed to reopen /dev/full");
+    let explicit_status = Command::new(hermit_binary::hermit_binary())
+        .env_remove("HERMIT_EPOCH")
+        .args([
+            "run",
+            &format!("--epoch={REPEATABLE_EPOCH}"),
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/true",
+        ])
+        .stderr(full)
+        .status()
+        .expect("failed to start the explicit-epoch unwritable-stderr probe");
+    assert!(
+        explicit_status.success(),
+        "an explicit epoch is already reproducible and must retain best-effort stderr semantics",
+    );
 }
 
 #[test]
 fn explicit_virtual_epoch_reproduces_identical_observed_time() {
     let _guard = hermit_clock_lock();
-    let first = run_date_at_epoch(Some(REPEATABLE_EPOCH));
-    let second = run_date_at_epoch(Some(REPEATABLE_EPOCH));
+    let (first, first_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));
+    let (second, second_diagnostics) = run_date_at_epoch(Some(REPEATABLE_EPOCH));
     assert_eq!(first.stdout, second.stdout);
     let rendered = String::from_utf8_lossy(&first.stdout);
     let (seconds, nanos) = rendered.trim().split_once('.').unwrap();
@@ -171,11 +345,43 @@ fn explicit_virtual_epoch_reproduces_identical_observed_time() {
         (epoch..epoch + 1_000_000_000).contains(&observed),
         "explicit epoch did not seed the expected virtual-time trajectory: {observed}"
     );
-    for output in [first, second] {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("source=explicit"), "{stderr}");
+    for diagnostics in [first_diagnostics, second_diagnostics] {
+        assert!(diagnostics.contains("source=explicit"), "{diagnostics}");
         assert!(
-            stderr.contains("2000-12-31T23:59:59.123456789+00:00"),
+            diagnostics.contains("2000-12-31T23:59:59.123456789+00:00"),
+            "{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn epochs_outside_the_signed_nanosecond_origin_cap_are_refused() {
+    for epoch in [
+        "1969-12-31T23:59:59.999999999Z",
+        "2262-04-11T23:47:16.854775808Z",
+    ] {
+        let output = Command::new(hermit_binary::hermit_binary())
+            .args([
+                "run",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                &format!("--epoch={epoch}"),
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start invalid epoch probe: {error}"));
+        assert!(
+            !output.status.success(),
+            "invalid epoch {epoch} was accepted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--epoch must be between 1970-01-01T00:00:00Z"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("leaving at least 2^63 nanoseconds"),
             "{stderr}"
         );
     }

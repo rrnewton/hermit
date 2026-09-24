@@ -786,11 +786,12 @@ fn materialize_dbt_comparison_log(
         .iter()
         .filter(|byte| **byte == b'\n')
         .count();
-    if materialized != records.len() {
+    let expected_materialized = records.len();
+    if materialized != expected_materialized {
         return Err(Error::msg(format!(
-            "DBT canonical evidence log holds {materialized} records but {} were decoded; the \
-             comparison publishes the dbt_evidence_transport_v1 envelope and must not drop any",
-            records.len()
+            "DBT canonical evidence log holds {materialized} newline-delimited entries but \
+             {expected_materialized} decoded records were required; the comparison publishes the \
+             dbt_evidence_transport_v1 envelope and must not drop any authenticated record",
         )));
     }
 
@@ -1342,7 +1343,7 @@ fn run_once<R: Read + Send + 'static>(
                 ),
             )
             .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&output.status, global));
+        runtime.block_on(clean_up_dbt_global(&output.status, global))?;
         Ok(output)
     })
 }
@@ -1365,7 +1366,7 @@ fn run_once_with_terminal_input(
                 ),
             )
             .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&output.status, global));
+        runtime.block_on(clean_up_dbt_global(&output.status, global))?;
         Ok(output)
     })
 }
@@ -1383,20 +1384,24 @@ fn run_status(
         let (status, global) = runtime
             .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
             .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&status, global));
+        runtime.block_on(clean_up_dbt_global(&status, global))?;
         Ok(status)
     })
 }
 
 #[cfg(feature = "dbt")]
-async fn clean_up_dbt_global(status: &std::process::ExitStatus, mut global: detcore::GlobalState) {
+async fn clean_up_dbt_global(
+    status: &std::process::ExitStatus,
+    mut global: detcore::GlobalState,
+) -> Result<(), Error> {
     if !status.success() {
         global.force_shutdown_with_error();
         // The physical supervisor and RPC owner drain have finished. A client
         // that failed before registration cannot start the owned scheduler.
         global.cancel_internal_scheduler().await;
     }
-    global.clean_up(false, &None).await;
+    global.clean_up(false, &None).await?;
+    Ok(())
 }
 
 /// Name the stage that actually failed.
@@ -2163,6 +2168,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_verify_log_contains_only_authenticated_records() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = log.into_parts();
+        let records = vec![b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG first\n".to_vec()];
+        let compared = materialize_dbt_comparison_log(&records, file, &path).unwrap();
+        let materialized = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(compared, 1);
+        assert_eq!(materialized.as_bytes(), records.concat());
+        assert!(!materialized.contains("virtual-time epoch="));
     }
 
     #[test]
