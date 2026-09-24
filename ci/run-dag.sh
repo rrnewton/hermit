@@ -33,6 +33,12 @@
 
 set -uo pipefail
 
+# Buck release selection is private transport owned by scripts/validate.rs after
+# it parses an explicit --buck-release argument. The public raw-DAG launcher is
+# Cargo-only and must not let an inherited environment select another producer.
+unset HERMIT_VALIDATE_RELEASE_BUILD_MODE
+unset HERMIT_VALIDATE_BUCK_DOTSLASH
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
