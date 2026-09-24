@@ -381,6 +381,88 @@ fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
     Ok(())
 }
 
+fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
+    let step = |tag: &str| {
+        cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("release-artifact bracket: missing {tag}"))
+    };
+    let buck = step("build.buck_release_artifact")?;
+    if !buck.cmd.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
+        || !buck
+            .cmd
+            .contains("build-buck-release.rs --validate-dag-build --dotslash")
+        || buck.cmd.contains("target/release/hermit")
+    {
+        return Err("release-artifact bracket: host Buck producer lost its closed mode branch".into());
+    }
+    for tag in ["build.runtime_release", "build.runtime_release_in_pinned_root"] {
+        let runtime = step(tag)?;
+        let source = guarded_command_source(&runtime.tag(), &runtime.cmd)?;
+        if !runtime.deps.iter().any(|dep| dep == "build.buck_release_artifact")
+            || !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
+            || !source.contains("build-buck-release.rs --validate-dag-install")
+            || !source.contains("target/ci/hermit-strict")
+        {
+            return Err(format!("release-artifact bracket: {tag} can bypass the selected artifact"));
+        }
+        if tag.ends_with("_in_pinned_root")
+            && [RELEASE_BUILD_MODE_ENV, BUCK_DOTSLASH_ENV]
+                .iter()
+                .any(|name| runtime.cmd.matches(&format!("--env {name}")).count() != 1)
+        {
+            return Err("release-artifact bracket: pinned mode transport drifted".into());
+        }
+    }
+    for tag in [
+        "build.e2e_artifact",
+        "build.e2e_artifact_on_host",
+        "build.e2e_artifact_in_pinned_root",
+    ] {
+        let Some(publisher) = cfg.steps.iter().find(|step| step.tag() == tag) else {
+            if tag == "build.e2e_artifact_on_host" { continue; }
+            return Err(format!("release-artifact bracket: missing {tag}"));
+        };
+        let source = guarded_command_source(&publisher.tag(), &publisher.cmd)?;
+        if !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
+            || !source.contains("cargo) hermit_payload=target/debug/hermit ;;")
+            || !source.contains("buck) hermit_payload=target/ci/hermit-strict ;;")
+            || !source.contains("*) echo \"unknown Hermit release build mode:")
+            || !source.contains("publish-hermit-e2e-artifact.sh \"$hermit_payload\" target/ci/hermit-e2e-artifacts")
+            || source.contains("target/release/hermit")
+        {
+            return Err(format!("release-artifact bracket: {tag} publishes the wrong binary"));
+        }
+    }
+    let mut direct_consumers = 0;
+    for tag in [
+        "test.cli", "test.cli_on_host", "test.liteinst_strict",
+        "test.liteinst_strict_on_host", "test.sabre_examples",
+        "test.sabre_examples_on_host", "test.dbt_parity", "test.dbt_parity_on_host",
+    ] {
+        let Some(consumer) = cfg.steps.iter().find(|step| step.tag() == tag) else { continue; };
+        direct_consumers += 1;
+        let source = guarded_command_source(&consumer.tag(), &consumer.cmd)?;
+        if !source.contains("target/ci/hermit-strict") || source.contains("target/release/hermit") {
+            return Err(format!("release-artifact bracket: {tag} bypasses the staged artifact"));
+        }
+    }
+    if direct_consumers < 4 {
+        return Err(format!("release-artifact bracket: inspected only {direct_consumers} direct consumers"));
+    }
+    for selected in cfg.steps.iter().filter(|step| step.labels.iter().any(|label| label == "full")) {
+        let source = guarded_command_source(&selected.tag(), &selected.cmd)?;
+        if !matches!(
+            selected.tag().as_str(),
+            "build.runtime_release" | "build.runtime_release_in_pinned_root"
+        ) && source.contains("target/release/hermit") {
+            return Err(format!("release-artifact bracket: full consumer {} names mutable target/release/hermit", selected.tag()));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod artifact_plan_tests {
     use super::*;
@@ -388,6 +470,7 @@ mod artifact_plan_tests {
     #[test]
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
+        release_artifact_plan_bracket(&cfg).unwrap();
         for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
             let step = cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
             integration_artifact_bracket(step).unwrap();
@@ -410,6 +493,22 @@ mod artifact_plan_tests {
             let error = privileged_artifact_barriers(&missing).unwrap_err();
             assert!(error.contains(required), "{error}");
         }
+        for (tag, from, to) in [
+            ("build.e2e_artifact", "cargo) hermit_payload=target/debug/hermit", "cargo) hermit_payload=target/ci/hermit-strict"),
+            ("build.e2e_artifact", "buck) hermit_payload=target/ci/hermit-strict", "buck) hermit_payload=target/debug/hermit"),
+            ("test.dbt_parity", "target/ci/hermit-strict", "target/release/hermit"),
+        ] {
+            let mut changed = cfg.clone();
+            let step = changed.steps.iter_mut().find(|step| step.tag() == tag).unwrap();
+            step.cmd = step.cmd.replacen(from, to, 1);
+            let error = release_artifact_plan_bracket(&changed).unwrap_err();
+            assert!(error.contains(tag), "{error}");
+        }
+        let mut missing_edge = cfg.clone();
+        missing_edge.steps.iter_mut()
+            .find(|step| step.tag() == "build.runtime_release_in_pinned_root").unwrap()
+            .deps.retain(|dep| dep != "build.buck_release_artifact");
+        assert!(release_artifact_plan_bracket(&missing_edge).is_err());
     }
 }
 
@@ -610,6 +709,9 @@ struct Args {
     write_generated_plan: Option<PathBuf>,
     selected: Option<String>,
     ignore_selected_deps: bool,
+    /// Explicit phase-two opt-in. Cargo remains the default; the committed DAG
+    /// carries the closed mode branch and exact-artifact propagation.
+    buck_release_dotslash: Option<PathBuf>,
 }
 
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
@@ -617,6 +719,42 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
+const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
+const BUCK_DOTSLASH_ENV: &str = "HERMIT_VALIDATE_BUCK_DOTSLASH";
+
+fn establish_release_build_environment(args: &Args) -> Result<(), String> {
+    std::env::remove_var(RELEASE_BUILD_MODE_ENV);
+    std::env::remove_var(BUCK_DOTSLASH_ENV);
+    let Some(dotslash) = args.buck_release_dotslash.as_deref() else {
+        std::env::set_var(RELEASE_BUILD_MODE_ENV, "cargo");
+        return Ok(());
+    };
+    if !dotslash.is_absolute() {
+        return Err(format!(
+            "--buck-release requires an absolute DotSlash path, got {}",
+            dotslash.display()
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(dotslash).map_err(|error| {
+        format!(
+            "--buck-release DotSlash launcher {} is unreadable: {error}",
+            dotslash.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(format!(
+            "--buck-release DotSlash launcher {} must be a nonempty executable regular file, not a symlink",
+            dotslash.display()
+        ));
+    }
+    std::env::set_var(RELEASE_BUILD_MODE_ENV, "buck");
+    std::env::set_var(BUCK_DOTSLASH_ENV, dotslash);
+    Ok(())
+}
 
 fn usage() -> &'static str {
     "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
@@ -672,6 +810,10 @@ fn usage() -> &'static str {
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
+     \x20 --buck-release DOTSLASH\n\
+     \x20                  Build release Hermit with Buck2 through the named absolute\n\
+     \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
+     \x20                  mode refuses unsupported plans and never falls back.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
      \x20 --run-timeout SEC  Wall budget for the WHOLE invocation (across lanes and\n\
      \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
@@ -801,6 +943,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         write_generated_plan: None,
         selected: None,
         ignore_selected_deps: false,
+        buck_release_dotslash: None,
     };
     let mut shallow = false;
     let mut selective = false;
@@ -922,6 +1065,22 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 args.skip_inner_dirty_working_tree_and_rebase_freshness_checks = true
             }
             "--ignore-cache" => args.ignore_cache = true,
+            "--buck-release" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() && args.buck_release_dotslash.is_none() => {
+                        args.buck_release_dotslash = Some(PathBuf::from(v));
+                    }
+                    Some(_) if args.buck_release_dotslash.is_some() => {
+                        eprintln!("validate: --buck-release may be supplied only once");
+                        return Err(2);
+                    }
+                    _ => {
+                        eprintln!("validate: --buck-release needs an absolute DOTSLASH path");
+                        return Err(2);
+                    }
+                }
+            }
             "--label-pr" => {
                 args.label_pr = true;
                 args.no_label_pr_explicit = false;
@@ -1020,6 +1179,19 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     args.show_plan = show_plan;
     args.show_plan_json = show_plan_json;
     args.focused = focused.pop();
+    if args.buck_release_dotslash.is_some()
+        && (args.selected.is_some()
+            || !matches!(
+                (&args.focused, args.level),
+                (None, Level::Full | Level::PortableOnly)
+                    | (Some(Focused::HostedPortable), _)
+            ))
+    {
+        eprintln!(
+            "validate: --buck-release currently supports only complete full, portable-only, and hosted-portable plans"
+        );
+        return Err(2);
+    }
     let output_forms = usize::from(args.show_plan_json)
         + usize::from(args.write_constructed_dag.is_some())
         + usize::from(args.write_generated_plan.is_some());
@@ -1595,7 +1767,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/manifest-plan/validation-service-result-schema.json",
         "ci/nextest-timeout-config.rs",
         "ci/run-nextest-counted.sh",
+        "ci/run-dag.sh",
         "ci/verify-submodules.sh",
+        "docs/BUCK2_OSS.md",
+        "hermit-cli/BUCK",
+        "scripts/build-buck-release.rs",
         "scripts/validate.rs",
         "scripts/lib/validate_history.rs",
         "scripts/lib/validate_artifacts.rs",
@@ -1632,7 +1808,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/manifest-plan/validation-service-result-schema.json",
                 "ci/nextest-timeout-config.rs",
                 "ci/run-nextest-counted.sh",
+                "ci/run-dag.sh",
                 "ci/verify-submodules.sh",
+                "docs/BUCK2_OSS.md",
+                "hermit-cli/BUCK",
+                "scripts/build-buck-release.rs",
                 "scripts/validate.rs",
                 "scripts/lib/validate_history.rs",
                 "scripts/lib/validate_artifacts.rs",
@@ -3138,6 +3318,26 @@ fn self_test() -> Result<(), String> {
     {
         return Err("constructed DAG export: malformed or competing output forms were accepted".into());
     }
+    let cargo_default = parse_argv(&["full".into()])
+        .map_err(|code| format!("release mode: Cargo default refused with exit {code}"))?;
+    if cargo_default.buck_release_dotslash.is_some() {
+        return Err("release mode: Cargo is not the default".into());
+    }
+    let buck = parse_argv(&[
+        "full".into(), "--buck-release".into(), "/tmp/public-dotslash".into(),
+    ])
+    .map_err(|code| format!("release mode: explicit Buck opt-in refused with exit {code}"))?;
+    if buck.buck_release_dotslash.as_deref() != Some(Path::new("/tmp/public-dotslash"))
+        || parse_argv(&[
+            "quick".into(), "--buck-release".into(), "/tmp/public-dotslash".into(),
+        ]).is_ok()
+        || parse_argv(&[
+            "full".into(), "--buck-release".into(), "/tmp/one".into(),
+            "--buck-release".into(), "/tmp/two".into(),
+        ]).is_ok()
+    {
+        return Err("release mode: opt-in parsing/refusal drifted".into());
+    }
     // Shell quoting: a corpus argv element must survive round-tripping through
     // `bash -c` byte-for-byte. A silent mangling here would change what the guest
     // runs while every count still looked right.
@@ -3551,6 +3751,7 @@ cleared-caps refusal names {} starved step(s)",
             .find(|s| s.tag() == "build.e2e_artifact")
             .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
         if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
+            || !artifact.cmd.contains("target/ci/hermit-strict")
             || !artifact.cmd.ends_with(" target/install_pkg")
             || !["build.workspace", "build.runtime_release"]
                 .iter()
@@ -3561,6 +3762,7 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
+        release_artifact_plan_bracket(&full.cfg)?;
         let integration = full
             .cfg
             .steps
@@ -10843,7 +11045,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
     let runner = fixture.path().join("capture-runner");
     std::fs::write(
         &runner,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' invoked >>\"$RUN_DAG_INVOKED\"\ntest \"$1\" = run\ntest \"$2\" = --dag\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\ntest \"$4\" = --labels\ntest \"$5\" = \"$RUN_DAG_EXPECTED_LABEL\"\nshift 5\ntest \"$*\" = \"${RUN_DAG_EXPECTED_SUFFIX:-}\"\ntest -n \"$VALIDATE_RUN_STATE\"\ntest -n \"$E2E_RESULT_ROOT\"\ntest -n \"$E2E_BUILD_ROOT\"\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' invoked >>\"$RUN_DAG_INVOKED\"\ntest \"$1\" = run\ntest \"$2\" = --dag\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\ntest \"$4\" = --labels\ntest \"$5\" = \"$RUN_DAG_EXPECTED_LABEL\"\nshift 5\ntest \"$*\" = \"${RUN_DAG_EXPECTED_SUFFIX:-}\"\ntest -n \"$VALIDATE_RUN_STATE\"\ntest -n \"$E2E_RESULT_ROOT\"\ntest -n \"$E2E_BUILD_ROOT\"\ntest -z \"${HERMIT_VALIDATE_RELEASE_BUILD_MODE+x}\"\ntest -z \"${HERMIT_VALIDATE_BUCK_DOTSLASH+x}\"\n",
     )
     .map_err(|error| format!("raw run-dag: cannot write capture runner: {error}"))?;
     std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
@@ -10861,6 +11063,8 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
             .env("RUN_DAG_INVOKED", &invoked)
             .env("RUN_DAG_EXPECTED_LABEL", label)
             .env("RUN_DAG_EXPECTED_SUFFIX", "")
+            .env(RELEASE_BUILD_MODE_ENV, "buck")
+            .env(BUCK_DOTSLASH_ENV, "/caller/ambient/dotslash")
             .env_remove("RUN_DAG_FILE_OVERRIDE")
             .env_remove("VALIDATE_RUN_STATE")
             .env_remove("E2E_RESULT_ROOT")
@@ -21523,6 +21727,10 @@ fn run(
     service_result_path: Option<&Path>,
     scorecard_delegated: bool,
 ) -> RunSummary {
+    // Driver-owned transport only. Re-execs retain the explicit argv and
+    // reconstruct these values, so ambient variables cannot select a mode.
+    std::env::remove_var(RELEASE_BUILD_MODE_ENV);
+    std::env::remove_var(BUCK_DOTSLASH_ENV);
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -21601,6 +21809,15 @@ fn run(
                 RunSummary::new(Verdict::Fail, 2, "self-test", vec![format!("self-test failed: {e}")])
             }
         };
+    }
+
+    if let Err(error) = establish_release_build_environment(&args) {
+        return RunSummary::refused(
+            2,
+            args.level.name(),
+            "release build mode",
+            vec![error],
+        );
     }
 
     let level_name = args.level.name().to_string();
@@ -22139,6 +22356,11 @@ fn run(
             );
         }
     };
+    if args.buck_release_dotslash.is_some() {
+        // Tree/profile cache identity predates the release-builder dimension.
+        // Never answer an explicit Buck request with an earlier Cargo green.
+        plan.cacheable = false;
+    }
 
     if plan.committed_selection.is_none() {
         if let Err(error) =
@@ -24133,13 +24355,14 @@ mod committed_selection_preservation_tests {
             } else {
                 assert!(
                     stdout.contains(
-                        "251 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "252 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
             }
             for (case, marker) in [
                 ("missing", "test.hermit_unit_on_host"),
+                ("missing-buck", "build.buck_release_artifact"),
                 ("duplicate-public", "test.hermit_unit_on_host"),
                 ("duplicate-resolved", "test.hermit_unit_on_host"),
                 ("duplicate-fixture", "compatprep.fixtures_on_host"),
@@ -24151,6 +24374,14 @@ mod committed_selection_preservation_tests {
                 match case {
                     "missing" => {
                         assert_eq!(nodes.remove(0), "test.hermit_unit");
+                    }
+                    "missing-buck" => {
+                        let release = broken["build_dbt_nodes"].as_array_mut().unwrap();
+                        let index = release
+                            .iter()
+                            .position(|node| node == "build.buck_release_artifact")
+                            .unwrap();
+                        assert_eq!(release.remove(index), "build.buck_release_artifact");
                     }
                     "duplicate-public" => nodes.push("test.hermit_unit".into()),
                     "duplicate-resolved" => nodes.push("test.hermit_unit_on_host".into()),
@@ -24214,6 +24445,26 @@ mod committed_selection_preservation_tests {
             stderr.contains("test.hermit_integration_on_host"),
             "{stderr}"
         );
+
+        // The exact assigned set is unchanged, but moving the Buck producer to
+        // the later completed-build job would let its release consumer start
+        // first. The dependency-order guard must name the hidden predecessor.
+        let mut late_buck = shards.clone();
+        let release = late_buck["build_dbt_nodes"].as_array_mut().unwrap();
+        let index = release
+            .iter()
+            .position(|node| node == "build.buck_release_artifact")
+            .unwrap();
+        let buck = release.remove(index);
+        late_buck["build_aux_nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(buck);
+        let output = run("ci/check-shard-coverage.sh", &late_buck, &plan);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("release build job drops constructed predecessor"), "{stderr}");
+        assert!(stderr.contains("build.buck_release_artifact"), "{stderr}");
     }
 
     #[test]
