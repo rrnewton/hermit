@@ -93,6 +93,17 @@ const _: () = assert!(MATRIX_STEP_DEADLINE_SECONDS < MATRIX_SUPERVISOR_DEADLINE_
 const MATRIX_CANDIDATE_DEADLINE_SECONDS: u64 = 120;
 const MATRIX_PROXY_ENV: &str = "HERMIT_BUCK_PHASE1_MATRIX_PROXY";
 const MAX_PUBLIC_EVIDENCE_GZIP_DECODED_BYTES: usize = 128 * 1024 * 1024;
+const VALIDATE_ARTIFACT_ROOT: &str = "ignored/buck2-phase2/artifacts";
+const VALIDATE_ARTIFACT_IDENTITY: &str = "ignored/buck2-phase2/current.identity";
+const LZMA_SONAME: &str = "liblzma.so.5";
+const LZMA_BUCK_PACKAGE: &str = "prebuilt_cxx_library(\n    name = \"lzma\",\n    shared_lib = \"liblzma.so.5\",\n    visibility = [\"PUBLIC\"],\n)\n";
+const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
+    "ld-linux-x86-64.so.2",
+    "libc.so.6",
+    "libgcc_s.so.1",
+    "libm.so.6",
+    "libunwind-x86_64.so.8",
+];
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const GENERATED_MARKERS: [&str; 3] = [
     "name = \"reverie-dbt-0.2-materialized-manifest\"",
@@ -155,6 +166,15 @@ struct InputSnapshot {
     hash_manifest: PathBuf,
     sha256: String,
     executable: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LzmaBuckInput {
+    source: PathBuf,
+    source_sha256: String,
+    root: PathBuf,
+    library: PathBuf,
+    target: String,
 }
 
 fn usage() -> &'static str {
@@ -870,17 +890,171 @@ fn reverify_hashed_input(
 }
 
 fn require_lzma_link_input() -> Result<PathBuf, String> {
-    let path = PathBuf::from(output_text(
-        Command::new("gcc").arg("-print-file-name=liblzma.so"),
+    let located = PathBuf::from(output_text(
+        Command::new("gcc").arg(format!("-print-file-name={LZMA_SONAME}")),
         "gcc liblzma link-input lookup",
     )?);
-    if !path.is_absolute() || !path.is_file() {
+    if !located.is_absolute() {
         return Err(
-            "release linkage requires -llzma, but gcc cannot resolve liblzma.so; install liblzma-dev (Debian/Ubuntu) or xz-devel (Fedora/CentOS) and retry"
-                .to_owned(),
+            "release linkage requires liblzma.so.5, but gcc did not resolve an absolute link input; install the liblzma runtime package and retry"
+                .into(),
         );
     }
+    let path = located.canonicalize().map_err(|error| {
+        format!(
+            "gcc-resolved liblzma link input {} cannot be canonicalized: {error}",
+            located.display()
+        )
+    })?;
+    require_nonempty_regular_file(&path, "canonical liblzma link input")?;
+    verify_lzma_elf(&path)?;
     Ok(path)
+}
+
+fn verify_lzma_elf(path: &Path) -> Result<(), String> {
+    if elf_identity(path)? != (2, 1, 3, 62) {
+        return Err(format!(
+            "liblzma link input {} is not an x86_64 ELF shared object",
+            path.display()
+        ));
+    }
+    let dynamic = output_text(
+        Command::new("readelf").args([OsStr::new("-d"), path.as_os_str()]),
+        &format!("readelf -d {}", path.display()),
+    )?;
+    let sonames = dynamic
+        .lines()
+        .filter(|line| line.contains("(SONAME)"))
+        .filter_map(|line| line.split_once('[')?.1.split_once(']').map(|pair| pair.0))
+        .collect::<Vec<_>>();
+    if sonames != [LZMA_SONAME] {
+        return Err(format!(
+            "liblzma link input {} has SONAMEs {sonames:?}, expected exactly {LZMA_SONAME}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_lzma_buck_input(input: &LzmaBuckInput) -> Result<(), String> {
+    let root_metadata = fs::symlink_metadata(&input.root).map_err(|error| {
+        format!(
+            "declared liblzma input {} is unreadable: {error}",
+            input.root.display()
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("declared liblzma input root must be a real directory".into());
+    }
+    let mut entries = fs::read_dir(&input.root)
+        .map_err(|error| {
+            format!(
+                "cannot enumerate declared liblzma input {}: {error}",
+                input.root.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate declared liblzma input: {error}"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let names = entries
+        .iter()
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    if names != [OsStr::new("BUCK"), OsStr::new(LZMA_SONAME)] {
+        return Err(format!(
+            "declared liblzma input {} has unexpected entries {names:?}",
+            input.root.display()
+        ));
+    }
+    let library = require_nonempty_regular_file(&input.library, "declared liblzma snapshot")?;
+    if sha256(&library)? != input.source_sha256 {
+        return Err("declared liblzma snapshot hash differs from its content identity".into());
+    }
+    verify_lzma_elf(&library)?;
+    let buck_path = require_nonempty_regular_file(
+        &input.root.join("BUCK"),
+        "declared liblzma BUCK package",
+    )?;
+    let buck = fs::read_to_string(buck_path)
+        .map_err(|error| format!("declared liblzma BUCK file is unreadable: {error}"))?;
+    if buck != LZMA_BUCK_PACKAGE {
+        return Err("declared liblzma BUCK package changed after publication".into());
+    }
+    reverify_hashed_input(
+        &input.source,
+        &input.source_sha256,
+        "canonical liblzma link input",
+        false,
+    )
+}
+
+fn publish_lzma_buck_input(
+    root: &Path,
+    evidence_dir: &Path,
+    source: &Path,
+) -> Result<LzmaBuckInput, String> {
+    let source = require_nonempty_regular_file(source, "canonical liblzma link input")?;
+    verify_lzma_elf(&source)?;
+    let source_sha256 = sha256(&source)?;
+    let parent = root.join("ignored/buck2-link-inputs/lzma");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let published = parent.join(&source_sha256);
+    let target = format!("root//ignored/buck2-link-inputs/lzma/{source_sha256}:lzma");
+    let make_input = |published: PathBuf| LzmaBuckInput {
+        source: source.clone(),
+        source_sha256: source_sha256.clone(),
+        library: published.join(LZMA_SONAME),
+        root: published,
+        target: target.clone(),
+    };
+    if !published.exists() {
+        let temporary = parent.join(format!(".tmp-{}", unique_identity()?));
+        create_exclusive_directory(&temporary, "temporary declared liblzma input")?;
+        let temporary_input = make_input(temporary.clone());
+        let copy_result = (|| {
+            let before = sha256(&source)?;
+            fs::copy(&source, &temporary_input.library).map_err(|error| {
+                format!(
+                    "failed to copy declared liblzma input {}: {error}",
+                    source.display()
+                )
+            })?;
+            let after = sha256(&source)?;
+            if before != source_sha256 || after != source_sha256 {
+                return Err("canonical liblzma input changed while it was snapshotted".into());
+            }
+            write_new_file(
+                &temporary.join("BUCK"),
+                LZMA_BUCK_PACKAGE.as_bytes(),
+                "declared liblzma BUCK package",
+            )?;
+            verify_lzma_buck_input(&temporary_input)
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &published) {
+            let _ = fs::remove_dir_all(&temporary);
+            if !published.exists() {
+                return Err(format!(
+                    "failed to publish declared liblzma input {}: {error}",
+                    published.display()
+                ));
+            }
+        }
+    }
+    let input = make_input(published);
+    verify_lzma_buck_input(&input)?;
+    atomic_write_new(
+        &evidence_dir.join("lzma-input.tsv"),
+        &format!(
+            "schema\thermit-buck-lzma-input/v1\nsource\t{}\nsha256\t{}\ntarget\t{}\n",
+            input.source.display(), input.source_sha256, input.target
+        ),
+    )?;
+    Ok(input)
 }
 
 fn verify_generated_buck(text: &str) -> Result<(), String> {
@@ -2260,6 +2434,46 @@ fn needed_libraries(path: &Path) -> Result<BTreeSet<String>, String> {
                 .map(|pair| pair.0.to_owned())
         })
         .collect())
+}
+
+fn validate_release_needed_libraries(libraries: &BTreeSet<String>) -> Result<(), String> {
+    for library in libraries {
+        if !library.is_ascii()
+            || library.contains(['/', '\\'])
+            || library.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            return Err(format!(
+                "Buck validate candidate has nonportable DT_NEEDED entry {library:?}"
+            ));
+        }
+        let Some((stem, abi)) = library.split_once(".so.") else {
+            return Err(format!(
+                "Buck validate candidate has unversioned DT_NEEDED entry {library:?}"
+            ));
+        };
+        if stem.is_empty()
+            || abi.is_empty()
+            || abi
+                .split('.')
+                .any(|component| component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(format!(
+                "Buck validate candidate has nonportable DT_NEEDED ABI {library:?}"
+            ));
+        }
+    }
+    let expected = RELEASE_NEEDED_LIBRARIES
+        .iter()
+        .map(|library| (*library).to_owned())
+        .collect::<BTreeSet<_>>();
+    if libraries != &expected {
+        let missing = expected.difference(libraries).cloned().collect::<Vec<_>>();
+        let unexpected = libraries.difference(&expected).cloned().collect::<Vec<_>>();
+        return Err(format!(
+            "Buck validate candidate DT_NEEDED set differs from the reviewed portable contract; missing={missing:?} unexpected={unexpected:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn require_equal(label: &str, cargo: &str, buck: &str) -> Result<(), String> {
@@ -3668,6 +3882,7 @@ struct FinalReceiptContext<'a> {
     buck_version: &'a str,
     lzma_input: &'a Path,
     lzma_input_sha256: &'a str,
+    lzma_buck_input: &'a LzmaBuckInput,
     generated_buck: &'a Path,
     generated_buck_sha256: &'a str,
 }
@@ -4634,6 +4849,7 @@ fn recompute_final_receipt(
         "liblzma link input",
         false,
     )?;
+    verify_lzma_buck_input(context.lzma_buck_input)?;
     reverify_hashed_input(
         context.generated_buck,
         context.generated_buck_sha256,
@@ -4877,6 +5093,372 @@ fn verify_final_receipt(context: &FinalReceiptContext<'_>, receipt: &Path) -> Re
     )
 }
 
+fn validate_dag_provenance(root: &Path) -> Result<(Provenance, BuildInfo), String> {
+    let version = package_version(
+        &fs::read_to_string(root.join("hermit-cli/Cargo.toml"))
+            .map_err(|error| format!("failed to read hermit-cli/Cargo.toml: {error}"))?,
+    )?;
+    let hermit_sha = git(root, &["rev-parse", "--short=12", "HEAD"])?;
+    let build_date = git(root, &["show", "-s", "--format=%cs", "HEAD"])?;
+    if !canonical_build_date(&build_date) {
+        return Err(format!(
+            "Git commit date {build_date:?} is not canonical YYYY-MM-DD provenance"
+        ));
+    }
+    let info = BuildInfo {
+        schema: BuildInfo::SCHEMA,
+        version,
+        build_date: Some(build_date),
+        git_sha: hermit_sha,
+        features: BuildFeatures {
+            dbt: true,
+            e9patch: true,
+            sabre: true,
+        },
+    };
+    let provenance = exact_provenance(root, &info)?;
+    Ok((provenance, info))
+}
+
+fn phase2_evidence_directory(root: &Path, full_sha: &str) -> Result<PathBuf, String> {
+    let parent = root.join("ignored/buck2-phase2/builds");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let path = parent.join(format!("build-{full_sha}-{}", unique_identity()?));
+    create_exclusive_directory(&path, "Buck validate build evidence directory")?;
+    Ok(path)
+}
+
+fn replace_text_file(path: &Path, contents: &[u8], description: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{description} has no parent directory"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let temporary = path.with_extension(format!("tmp.{}", unique_identity()?));
+    write_new_file(&temporary, contents, &format!("temporary {description}"))?;
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!(
+            "failed to publish {description} {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn validate_artifact_identity(root: &Path) -> Result<PathBuf, String> {
+    let identity_path = root.join(VALIDATE_ARTIFACT_IDENTITY);
+    let document = fs::read_to_string(&identity_path).map_err(|error| {
+        format!(
+            "Buck validate artifact identity {} is unreadable: {error}; the host Buck producer did not complete",
+            identity_path.display()
+        )
+    })?;
+    let rows = document.lines().collect::<Vec<_>>();
+    let [schema, head, identity, binary_sha256] = rows.as_slice() else {
+        return Err("Buck validate artifact identity document must contain exactly four rows".into());
+    };
+    let schema = schema.strip_prefix("schema\t").unwrap_or_default();
+    let head = head.strip_prefix("head\t").unwrap_or_default();
+    let identity = identity.strip_prefix("identity\t").unwrap_or_default();
+    let binary_sha256 = binary_sha256
+        .strip_prefix("binary_sha256\t")
+        .unwrap_or_default();
+    let lowercase_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !document.ends_with('\n')
+        || schema != "hermit-buck-validate-selector/v1"
+        || head.len() != 40
+        || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !lowercase_sha256(identity)
+        || !lowercase_sha256(binary_sha256)
+    {
+        return Err("Buck validate artifact identity document has invalid typed fields".into());
+    }
+    let current_head = git(root, &["rev-parse", "HEAD"])?;
+    if current_head != head {
+        return Err(format!(
+            "Buck validate artifact was built for {head}, not current HEAD {current_head}"
+        ));
+    }
+    let bundle = root.join(VALIDATE_ARTIFACT_ROOT).join(identity);
+    let resolved = output_text(
+        Command::new(root.join("ci/verify-hermit-e2e-artifact.sh")).arg(&bundle),
+        "verify content-addressed Buck validate artifact",
+    )?;
+    let resolved = PathBuf::from(resolved);
+    if resolved
+        != bundle.canonicalize().map_err(|error| {
+            format!(
+                "cannot canonicalize Buck validate artifact {}: {error}",
+                bundle.display()
+            )
+        })?
+    {
+        return Err("Buck validate artifact verifier resolved a different bundle".into());
+    }
+    let binary = resolved.join("hermit");
+    if sha256(&binary)? != binary_sha256 {
+        return Err("Buck validate selector binary hash does not match the verified bundle".into());
+    }
+    Ok(binary)
+}
+
+fn replace_validate_output(root: &Path, source: &Path, relative: &str) -> Result<String, String> {
+    let destination = root.join(relative);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("validate output {relative} has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let temporary = destination.with_extension(format!("tmp.{}", unique_identity()?));
+    let source_hash = copy_stable_executable(source, &temporary, "Buck validate artifact")?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)).map_err(|error| {
+        format!(
+            "failed to set executable permissions on {}: {error}",
+            temporary.display()
+        )
+    })?;
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!(
+            "failed to install Buck validate output {}: {error}",
+            destination.display()
+        )
+    })?;
+    if sha256(source)? != source_hash || sha256(&destination)? != source_hash {
+        return Err(format!(
+            "Buck validate output {relative} changed during atomic installation"
+        ));
+    }
+    Ok(source_hash)
+}
+
+fn install_validate_dag_artifact(root: &Path) -> Result<String, String> {
+    let source = validate_artifact_identity(root)?;
+    let release_hash = replace_validate_output(root, &source, "target/release/hermit")?;
+    let strict_hash = replace_validate_output(root, &source, "target/ci/hermit-strict")?;
+    if release_hash != strict_hash {
+        return Err("release and strict Buck validate artifact copies differ".into());
+    }
+    Ok(strict_hash)
+}
+
+fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
+    let root = repository_root()?;
+    let caller_dotslash = require_absolute_file(dotslash, "public DotSlash launcher")?;
+    let rust_script_version = output_text(
+        Command::new("rust-script").arg("--version"),
+        "rust-script --version",
+    )?;
+    if rust_script_version != RUST_SCRIPT_VERSION {
+        return Err(format!(
+            "Buck validate build requires documented {RUST_SCRIPT_VERSION}, got {rust_script_version:?}"
+        ));
+    }
+    let (provenance, expected_info) = validate_dag_provenance(&root)?;
+    let evidence_dir = phase2_evidence_directory(&root, &provenance.hermit_full_sha)?;
+    let dotslash_snapshot = snapshot_dotslash(&caller_dotslash, &evidence_dir)?;
+    let dotslash_version = output_text(
+        Command::new(&dotslash_snapshot.path).arg("--version"),
+        "snapshotted DotSlash --version",
+    )?;
+    if dotslash_version != DOTSLASH_VERSION {
+        return Err(format!(
+            "--dotslash must be the documented public {DOTSLASH_VERSION}, got {dotslash_version:?}"
+        ));
+    }
+    let descriptor = snapshot_input(
+        &root.join("bootstrap/buck2"),
+        &evidence_dir,
+        "buck2-descriptor-snapshot",
+        "buck2.descriptor",
+        "Buck2 DotSlash descriptor",
+        false,
+    )?;
+    let fetched_buck = PathBuf::from(output_text(
+        Command::new(&dotslash_snapshot.path).args([
+            OsStr::new("--"),
+            OsStr::new("fetch"),
+            descriptor.path.as_os_str(),
+        ]),
+        "DotSlash fetch of pinned Buck2",
+    )?);
+    let buck_snapshot = snapshot_input(
+        &fetched_buck,
+        &evidence_dir,
+        "buck2-tool-snapshot",
+        "buck2",
+        "resolved Buck2 executable",
+        true,
+    )?;
+    let lzma_input = require_lzma_link_input()?;
+    let lzma_hash = sha256(&lzma_input)?;
+    let lzma_buck_input = publish_lzma_buck_input(&root, &evidence_dir, &lzma_input)?;
+
+    checked_output(
+        Command::new(root.join("bootstrap/regenerate-rust-deps")).current_dir(&root),
+        "deterministic Rust dependency regeneration",
+    )?;
+    let generated_buck = root.join("shim/third-party/rust/BUCK");
+    verify_generated_buck(
+        &fs::read_to_string(&generated_buck)
+            .map_err(|error| format!("generated BUCK is unreadable: {error}"))?,
+    )?;
+    let generated_hash = sha256(&generated_buck)?;
+
+    let event_log = evidence_dir.join("buck-build.json-lines.gz");
+    let build = Command::new(&buck_snapshot.path)
+        .current_dir(&root)
+        .args(["build", "--show-output", "--event-log"])
+        .arg(&event_log)
+        .args([
+            "-c",
+            &format!("hermit_release.version={}", provenance.version),
+            "-c",
+            &format!("hermit_release.build_date={}", provenance.build_date),
+            "-c",
+            &format!("hermit_release.hermit_sha={}", provenance.hermit_sha),
+            "-c",
+            &format!("hermit_release.reverie_sha={}", provenance.reverie_sha),
+            "-c",
+            &format!("hermit_release.lzma_target={}", lzma_buck_input.target),
+            TARGET,
+        ])
+        .output()
+        .map_err(|error| format!("failed to start snapshotted Buck2 executable: {error}"))?;
+    write_new_file(
+        &evidence_dir.join("buck-build.stdout"),
+        &build.stdout,
+        "Buck build stdout",
+    )?;
+    write_new_file(
+        &evidence_dir.join("buck-build.stderr"),
+        &build.stderr,
+        "Buck build stderr",
+    )?;
+    let shell_exit = build.status.code().unwrap_or(255);
+    atomic_write_new(
+        &evidence_dir.join("buck-build-shell-exit.tsv"),
+        &format!("shell_exit\t{shell_exit}\n"),
+    )?;
+    let stdout = String::from_utf8(build.stdout)
+        .map_err(|error| format!("Buck build output was not UTF-8: {error}"))?;
+    let show_output = evidence_dir.join("buck-build.stdout");
+    let build_evidence =
+        inspect_release_build_evidence(&event_log, &show_output, shell_exit, &root)?;
+    let candidate = resolve_release_show_output(&stdout, &root)?;
+    if candidate != build_evidence.output || sha256(&candidate)? != build_evidence.output_sha256 {
+        return Err(
+            "Buck event/stdout reconciliation did not bind the selected candidate bytes".into(),
+        );
+    }
+    let candidate_needed = needed_libraries(&candidate)?;
+    validate_release_needed_libraries(&candidate_needed)?;
+    atomic_write_new(
+        &evidence_dir.join("buck-needed-libraries.tsv"),
+        &format!(
+            "schema\thermit-buck-needed-libraries/v1\n{}",
+            candidate_needed
+                .iter()
+                .map(|library| format!("needed\t{library}\n"))
+                .collect::<String>()
+        ),
+    )?;
+    let version = checked_output(
+        Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=2s", "10s"])
+            .arg(&candidate)
+            .args(["version", "--json"]),
+        "bounded Buck validate candidate version probe",
+    )?;
+    if !version.stderr.is_empty() {
+        return Err("Buck validate candidate version probe wrote unexpected stderr".into());
+    }
+    let observed = decode_build_info(
+        &String::from_utf8(version.stdout)
+            .map_err(|error| format!("Buck validate version output was not UTF-8: {error}"))?,
+        &provenance.version,
+        &provenance.hermit_sha,
+        "Buck validate version JSON",
+    )?;
+    if observed != expected_info {
+        return Err(
+            "Buck validate candidate provenance/features differ from requested values".into(),
+        );
+    }
+    reverify_input_snapshot(&dotslash_snapshot, "DotSlash launcher")?;
+    reverify_input_snapshot(&descriptor, "Buck2 descriptor")?;
+    reverify_input_snapshot(&buck_snapshot, "Buck2 executable")?;
+    reverify_hashed_input(
+        &generated_buck,
+        &generated_hash,
+        "generated Buck graph",
+        false,
+    )?;
+    reverify_hashed_input(&lzma_input, &lzma_hash, "liblzma link input", false)?;
+    verify_lzma_buck_input(&lzma_buck_input)?;
+    let (final_provenance, final_expected_info) = validate_dag_provenance(&root)?;
+    if final_provenance != provenance || final_expected_info != expected_info {
+        return Err(
+            "Hermit or Reverie provenance changed during the Buck validate build; refusing a mixed-tree artifact"
+                .into(),
+        );
+    }
+
+    let artifact_root = root.join(VALIDATE_ARTIFACT_ROOT);
+    let pointer = evidence_dir.join("published-artifact.path");
+    checked_output(
+        Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
+            candidate.as_os_str(),
+            artifact_root.as_os_str(),
+            pointer.as_os_str(),
+        ]),
+        "publish content-addressed Buck validate artifact",
+    )?;
+    let bundle = PathBuf::from(
+        fs::read_to_string(&pointer)
+            .map_err(|error| format!("published Buck artifact pointer is unreadable: {error}"))?
+            .trim(),
+    );
+    let identity = bundle
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "published Buck artifact path has no UTF-8 content identity".to_owned())?;
+    if identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("published Buck artifact identity is not SHA-256 shaped".into());
+    }
+    replace_text_file(
+        &root.join(VALIDATE_ARTIFACT_IDENTITY),
+        format!(
+            "schema\thermit-buck-validate-selector/v1\nhead\t{}\nidentity\t{}\nbinary_sha256\t{}\n",
+            provenance.hermit_full_sha, identity, build_evidence.output_sha256
+        )
+        .as_bytes(),
+        "current Buck validate artifact identity",
+    )?;
+    let installed_hash = install_validate_dag_artifact(&root)?;
+    if installed_hash != build_evidence.output_sha256 {
+        return Err("installed Buck validate artifact differs from reconciled Buck output".into());
+    }
+    atomic_write_new(
+        &evidence_dir.join("validate-artifact.tsv"),
+        &format!(
+            "schema\thermit-buck-validate-artifact/v1\nhead\t{}\ntarget\t{}\nidentity\t{}\nsha256\t{}\n",
+            provenance.hermit_full_sha, TARGET, identity, installed_hash
+        ),
+    )?;
+    println!(
+        "Buck validate artifact ready: identity={identity} sha256={installed_hash} evidence={}",
+        evidence_dir.display()
+    );
+    Ok(())
+}
+
 fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     if cgroups.is_none() {
         return Err(
@@ -4966,6 +5548,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     verify_install_bundle(&cargo_bundle.install, &provenance.reverie_sha)?;
     let lzma_input = require_lzma_link_input()?;
     let lzma_input_hash = sha256(&lzma_input)?;
+    let lzma_buck_input = publish_lzma_buck_input(&root, &evidence_dir, &lzma_input)?;
     let buck_descriptor_source = root.join("bootstrap/buck2");
     let buck_descriptor_snapshot = snapshot_input(
         &buck_descriptor_source,
@@ -5023,6 +5606,8 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
             &format!("hermit_release.hermit_sha={}", provenance.hermit_sha),
             "-c",
             &format!("hermit_release.reverie_sha={}", provenance.reverie_sha),
+            "-c",
+            &format!("hermit_release.lzma_target={}", lzma_buck_input.target),
             TARGET,
         ])
         .output()
@@ -5054,6 +5639,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         "liblzma link input immediately after build",
         false,
     )?;
+    verify_lzma_buck_input(&lzma_buck_input)?;
     validate_log_header(&event_log)?;
     let summary = output_text(
         Command::new(&buck_executable)
@@ -5273,6 +5859,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         buck_version: &buck_version,
         lzma_input: &lzma_input,
         lzma_input_sha256: &lzma_input_hash,
+        lzma_buck_input: &lzma_buck_input,
         generated_buck: &generated_buck,
         generated_buck_sha256: &generated_buck_hash,
     };
@@ -5284,6 +5871,42 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
 fn main() -> ExitCode {
     rust_script_prelude::init();
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("--validate-dag-build") {
+        let result = match arguments.as_slice() {
+            [_, option, dotslash] if option == "--dotslash" => {
+                build_validate_dag_artifact(Path::new(dotslash))
+            }
+            _ => Err(
+                "usage: build-buck-release.rs --validate-dag-build --dotslash ABSOLUTE-PATH"
+                    .to_owned(),
+            ),
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("build-buck-release.rs validate DAG build: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if arguments.first().map(String::as_str) == Some("--validate-dag-install") {
+        let result = if arguments.len() == 1 {
+            repository_root().and_then(|root| {
+                install_validate_dag_artifact(&root).map(|hash| {
+                    println!("installed verified Buck validate artifact sha256={hash}");
+                })
+            })
+        } else {
+            Err("usage: build-buck-release.rs --validate-dag-install".to_owned())
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("build-buck-release.rs validate DAG install: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     if arguments.first().map(String::as_str) == Some("--reconcile-release-evidence") {
         return match run_release_evidence_reconciler(&arguments[1..]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -6581,6 +7204,165 @@ mod tests {
         .unwrap();
         assert!(verify_install_bundle(&root, &reverie_sha).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_dag_installs_only_the_verified_content_addressed_binary() {
+        let root = fixture_root("validate-artifact-install");
+        fs::create_dir_all(root.join("ci")).unwrap();
+        for name in [
+            "publish-hermit-e2e-artifact.sh",
+            "verify-hermit-e2e-artifact.sh",
+        ] {
+            fs::copy(
+                source_root().join("ci").join(name),
+                root.join("ci").join(name),
+            )
+            .unwrap();
+        }
+        let candidate = root.join("candidate-hermit");
+        write_executable(&candidate, b"#!/bin/sh\nprintf 'buck-phase-two\\n'\n");
+        checked_output(Command::new("git").current_dir(&root).arg("init"), "init fixture Git repository").unwrap();
+        checked_output(Command::new("git").current_dir(&root).args(["add", "ci", "candidate-hermit"]), "stage fixture repository").unwrap();
+        checked_output(
+            Command::new("git").current_dir(&root).args([
+                "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "-m", "fixture",
+            ]),
+            "commit fixture repository",
+        ).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let pointer = root.join("ignored/buck2-phase2/test-publisher.path");
+        fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        checked_output(
+            Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
+                candidate.as_os_str(),
+                root.join(VALIDATE_ARTIFACT_ROOT).as_os_str(),
+                pointer.as_os_str(),
+            ]),
+            "fixture Buck validate artifact publication",
+        )
+        .unwrap();
+        let bundle = PathBuf::from(fs::read_to_string(&pointer).unwrap().trim());
+        let identity = bundle.file_name().unwrap().to_str().unwrap();
+        let expected = sha256(&candidate).unwrap();
+        let selector = format!(
+            "schema\thermit-buck-validate-selector/v1\nhead\t{head}\nidentity\t{identity}\nbinary_sha256\t{expected}\n"
+        );
+        replace_text_file(
+            &root.join(VALIDATE_ARTIFACT_IDENTITY),
+            selector.as_bytes(),
+            "fixture current identity",
+        )
+        .unwrap();
+
+        assert_eq!(install_validate_dag_artifact(&root).unwrap(), expected);
+        assert_eq!(
+            sha256(&root.join("target/release/hermit")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            sha256(&root.join("target/ci/hermit-strict")).unwrap(),
+            expected
+        );
+
+        fs::write(root.join(VALIDATE_ARTIFACT_IDENTITY), b"not-a-digest\n").unwrap();
+        assert!(install_validate_dag_artifact(&root).is_err());
+        fs::write(
+            root.join(VALIDATE_ARTIFACT_IDENTITY),
+            selector.replace(&format!("head\t{head}"), &format!("head\t{}", "0".repeat(40))),
+        )
+        .unwrap();
+        assert!(install_validate_dag_artifact(&root).is_err());
+        fs::write(root.join(VALIDATE_ARTIFACT_IDENTITY), selector).unwrap();
+        fs::write(bundle.join("hermit"), b"mutated after publication\n").unwrap();
+        assert!(install_validate_dag_artifact(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lzma_link_input_is_content_addressed_declared_and_mutation_guarded() {
+        let root = fixture_root("lzma-declared-input");
+        let evidence_a = root.join("ignored/evidence-a");
+        let evidence_b = root.join("ignored/evidence-b");
+        fs::create_dir_all(&evidence_a).unwrap();
+        fs::create_dir_all(&evidence_b).unwrap();
+        let source = root.join("liblzma.so.5.2.5");
+        let fixture_c = root.join("lzma-fixture.c");
+        fs::write(&fixture_c, b"int lzma_fixture(void) { return 0; }\n").unwrap();
+        checked_output(
+            Command::new("gcc")
+                .args(["-shared", "-fPIC", "-Wl,-soname,liblzma.so.5", "-o"])
+                .arg(&source)
+                .arg(&fixture_c),
+            "compile fixture liblzma ELF",
+        )
+        .unwrap();
+
+        let first = publish_lzma_buck_input(&root, &evidence_a, &source).unwrap();
+        assert!(first
+            .target
+            .starts_with("root//ignored/buck2-link-inputs/lzma/"));
+        assert!(first.target.ends_with(":lzma"));
+        assert_eq!(sha256(&first.library).unwrap(), sha256(&source).unwrap());
+        assert_eq!(
+            fs::read_to_string(first.root.join("BUCK")).unwrap(),
+            LZMA_BUCK_PACKAGE
+        );
+        let second = publish_lzma_buck_input(&root, &evidence_b, &source).unwrap();
+        assert_eq!(first.target, second.target);
+        assert_eq!(first.library, second.library);
+
+        fs::write(first.root.join("BUCK"), b"prebuilt_cxx_library(name = \"decoy\")\n").unwrap();
+        assert!(verify_lzma_buck_input(&first).is_err());
+        fs::write(first.root.join("BUCK"), LZMA_BUCK_PACKAGE).unwrap();
+        fs::write(&source, b"changed source\n").unwrap();
+        assert!(verify_lzma_buck_input(&first).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_buck_target_uses_a_declared_lzma_dependency_not_host_link_flags() {
+        let buck = fs::read_to_string(source_root().join("hermit-cli/BUCK")).unwrap();
+        assert!(buck.contains(
+            "\"gh_facebook_buck2_shims_meta//third-party/xz:lzma\""
+        ));
+        assert!(buck.contains("deps = [release_lzma_target] + ["));
+        assert!(!buck.contains("-Clink-arg=-llzma"));
+        assert!(!buck.contains("-Clink-arg=-l:liblzma"));
+    }
+
+    #[test]
+    fn validate_candidate_needed_libraries_are_exact_versioned_and_portable() {
+        let expected = RELEASE_NEEDED_LIBRARIES
+            .iter()
+            .map(|library| (*library).to_owned())
+            .collect::<BTreeSet<_>>();
+        validate_release_needed_libraries(&expected).unwrap();
+
+        let mut unversioned = expected.clone();
+        unversioned.insert("liblzma.so".to_owned());
+        assert!(validate_release_needed_libraries(&unversioned)
+            .unwrap_err()
+            .contains("unversioned"));
+
+        let mut nonportable = expected.clone();
+        nonportable.insert("/opt/vendor/libextra.so.1".to_owned());
+        assert!(validate_release_needed_libraries(&nonportable)
+            .unwrap_err()
+            .contains("nonportable"));
+
+        let mut unexpected = expected.clone();
+        unexpected.insert("libcrypto.so.3".to_owned());
+        assert!(validate_release_needed_libraries(&unexpected)
+            .unwrap_err()
+            .contains("unexpected"));
+
+        let mut missing = expected;
+        missing.remove("libunwind-x86_64.so.8");
+        assert!(validate_release_needed_libraries(&missing)
+            .unwrap_err()
+            .contains("missing"));
     }
 
     #[test]

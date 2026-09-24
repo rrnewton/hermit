@@ -41,6 +41,7 @@
     "build.manifest_guests"
   ],
   "build_dbt_nodes": [
+    "build.buck_release_artifact",
     "build.runtime_release"
   ],
   "build_aux_nodes": [

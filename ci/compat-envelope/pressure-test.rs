@@ -101,7 +101,7 @@ const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 5;
 const RUNNER_STEP_OUTPUT_DIR: &str = "runner-profile";
 const PROMOTION_REPETITIONS: usize = 10;
-const REQUIRED_BUILD_TAGS: [&str; 10] = [
+const REQUIRED_BUILD_TAGS: [&str; 11] = [
     "pre.submodules",
     "pre.reverie_pin",
     "build.rust_scripts",
@@ -109,10 +109,13 @@ const REQUIRED_BUILD_TAGS: [&str; 10] = [
     "setup.nextest",
     "gate.manifest",
     "build.workspace",
+    "build.buck_release_artifact",
     "build.runtime_release",
     "build.e2e_artifact",
     "build.liteinst_runtime_release",
 ];
+const REQUIRED_CANONICAL_BUILD_EDGES: [(&str, &str); 1] =
+    [("build.runtime_release", "build.buck_release_artifact")];
 /// Written before a cell starts. If the cell's cgroup is killed before the
 /// harness can report, this remains a conservative non-pass attempt marker.
 const INCOMPLETE_ATTEMPT_STATUS: i32 = 125;
@@ -3799,7 +3802,11 @@ fn required_build_tags(
             return required;
         }
         if backend != "liteinst" {
-            required.extend(["gate.manifest", "build.runtime_release"]);
+            required.extend([
+                "gate.manifest",
+                "build.buck_release_artifact",
+                "build.runtime_release",
+            ]);
             return required;
         }
     }
@@ -3875,6 +3882,16 @@ fn retain_required_build_dependencies(
         if !required_builds.contains(dependency.as_str()) {
             return Err(format!(
                 "canonical build node {tag} has unexpected prerequisite {dependency}; refusing to omit a prerequisite whose effect on the consumed build artifacts is unknown"
+            ));
+        }
+    }
+    for (consumer, dependency) in REQUIRED_CANONICAL_BUILD_EDGES {
+        if tag == consumer
+            && required_builds.contains(dependency)
+            && !step.deps.iter().any(|actual| actual == dependency)
+        {
+            return Err(format!(
+                "canonical build node {tag} is missing required prerequisite {dependency}"
             ));
         }
     }
@@ -7541,8 +7558,8 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             }
         } else {
             let execution = result?;
-            if execution.outcomes.len() != 10 || execution.outcomes.iter().any(|outcome| !outcome.ok) {
-                return Err("positive prerequisite fixture did not execute all ten nodes".into());
+            if execution.outcomes.len() != 11 || execution.outcomes.iter().any(|outcome| !outcome.ok) {
+                return Err("positive prerequisite fixture did not execute all eleven nodes".into());
             }
             expected.extend(original.keys().cloned());
         }
@@ -8853,6 +8870,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         "gate.manifest",
         "setup.nextest",
         "build.workspace",
+        "build.buck_release_artifact",
         "build.runtime_release",
         "build.e2e_artifact",
         "build.liteinst_runtime_release",
@@ -9298,7 +9316,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         "pre.submodules", "pre.reverie_pin", "build.rust_scripts", "setup.manifest_plan",
     ]);
     let mut lean_exact = native_exact.clone();
-    lean_exact.extend(["gate.manifest", "build.runtime_release"]);
+    lean_exact.extend([
+        "gate.manifest",
+        "build.buck_release_artifact",
+        "build.runtime_release",
+    ]);
     let exact_runtime_backends_ok = ["ptrace", "kvm", "dbt", "sabre"]
         .into_iter()
         .all(|backend| required_build_tags(Some(("verify", backend)), false) == lean_exact);
@@ -9391,6 +9413,25 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err(format!(
             "unexpected canonical prerequisite refusal did not name both sides: {unexpected_error}"
+        ));
+    }
+    let mut missing_dependency = canonical_build_dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.runtime_release")
+        .ok_or("canonical build graph lost build.runtime_release")?
+        .clone();
+    missing_dependency
+        .deps
+        .retain(|dependency| dependency != "build.buck_release_artifact");
+    let missing_error =
+        retain_required_build_dependencies(&mut missing_dependency, &all_required_builds)
+            .expect_err("a missing canonical build prerequisite was silently accepted");
+    if !missing_error.contains("build.runtime_release")
+        || !missing_error.contains("build.buck_release_artifact")
+    {
+        return Err(format!(
+            "missing canonical prerequisite refusal did not name both sides: {missing_error}"
         ));
     }
     let probe = "space ' quote";
@@ -10742,6 +10783,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|step| step.tag() == "build.runtime_release")
         .collect();
+    let buck_build_steps: Vec<_> = repeated_dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "build.buck_release_artifact")
+        .collect();
     let manifest_plan_steps: Vec<_> = repeated_dag
         .steps
         .iter()
@@ -10762,6 +10808,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if repeated_cell_steps.len() != 3
         || repeated_jobs != expected_repeated_jobs
         || preparation_steps.len() != 1
+        || buck_build_steps.len() != 1
         || runtime_build_steps.len() != 1
         || manifest_plan_steps.len() != 1
         || repeated_dag
@@ -10769,6 +10816,12 @@ fn self_test(root: &Path) -> Result<(), String> {
             .iter()
             .any(|step| recursive_metadata_tags.contains(&step.tag().as_str()))
         || runtime_build_steps[0].deps
+            != [
+                "build.buck_release_artifact".to_string(),
+                "gate.manifest".to_string(),
+                "pre.reverie_pin".to_string(),
+            ]
+        || buck_build_steps[0].deps
             != ["gate.manifest".to_string(), "pre.reverie_pin".to_string()]
         || manifest_plan_steps[0].deps != ["build.rust_scripts".to_string()]
         || !runtime_build_steps[0]
@@ -10867,6 +10920,24 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("repeated-plan audit accepted a missing required Hermit build".into());
     }
+    let mut missing_buck_build = repeated_dag.clone();
+    missing_buck_build
+        .steps
+        .retain(|step| step.tag() != "build.buck_release_artifact");
+    let missing_buck_error = audit_dag(
+        &missing_buck_build,
+        3,
+        repeated_metadata.run_timeout_seconds,
+        &repeated_timeouts,
+    )
+    .expect_err("repeated-plan audit accepted a missing Buck artifact producer");
+    if !missing_buck_error.contains("build.runtime_release")
+        || !missing_buck_error.contains("build.buck_release_artifact")
+    {
+        return Err(format!(
+            "missing Buck artifact producer refusal did not name both sides: {missing_buck_error}"
+        ));
+    }
     let mut duplicate_repetition = repeated_dag.clone();
     let cell_indexes: Vec<_> = duplicate_repetition
         .steps
@@ -10959,7 +11030,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::write(&setup_marker, "ok\n")
         .map_err(|e| format!("cannot write repeated runner marker: {e}"))?;
-    for tag in ["pre.submodules", "pre.reverie_pin", "build.rust_scripts", "gate.manifest"] {
+    for tag in [
+        "pre.submodules",
+        "pre.reverie_pin",
+        "build.rust_scripts",
+        "gate.manifest",
+        "build.buck_release_artifact",
+    ] {
         if required_builds_complete(&repeated_build_results, &repeated_metadata) {
             return Err(format!("repeated exact setup accepted missing prerequisite marker {tag}"));
         }
@@ -10969,7 +11046,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
         return Err("repeated exact ptrace setup refused its direct Hermit build".into());
     }
-    for tag in ["pre.submodules", "pre.reverie_pin", "build.rust_scripts", "gate.manifest"] {
+    for tag in [
+        "pre.submodules",
+        "pre.reverie_pin",
+        "build.rust_scripts",
+        "gate.manifest",
+        "build.buck_release_artifact",
+    ] {
         let marker = build_marker(&repeated_build_results, tag);
         fs::remove_file(&marker)
             .map_err(|e| format!("cannot remove prerequisite marker {tag}: {e}"))?;
@@ -11293,7 +11376,10 @@ fn self_test(root: &Path) -> Result<(), String> {
             "gate.manifest" => BTreeSet::from(["setup.manifest_plan"]),
             "setup.nextest" => BTreeSet::from(["build.rust_scripts", "gate.manifest", "pre.reverie_pin"]),
             "build.workspace" => BTreeSet::from(["gate.manifest", "pre.reverie_pin", "setup.nextest"]),
-            "build.runtime_release" => BTreeSet::from(["gate.manifest", "pre.reverie_pin"]),
+            "build.buck_release_artifact" => BTreeSet::from(["gate.manifest", "pre.reverie_pin"]),
+            "build.runtime_release" => BTreeSet::from([
+                "build.buck_release_artifact", "gate.manifest", "pre.reverie_pin",
+            ]),
             "build.e2e_artifact" => BTreeSet::from([
                 "build.workspace", "build.runtime_release", "gate.manifest", "pre.reverie_pin",
             ]),
