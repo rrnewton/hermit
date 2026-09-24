@@ -4718,6 +4718,7 @@ fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Resul
             "compatibility scorecard: retaining {retired} retired cell(s) in ledger commit {}",
             git_head(&ledger)?
         );
+        archive_retiring_catalogue_comparisons(history, &current_ids)?;
     }
     let unchanged = history.cells.len() == catalogue.cells.len()
         && history
@@ -4756,6 +4757,7 @@ fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Resul
             }
         })
         .collect();
+    validate_attempt_bindings(history, None)?;
     Ok(())
 }
 
@@ -8256,11 +8258,13 @@ struct ComparisonAttemptBindings {
     bindings: Vec<ComparisonAttemptBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired_canonical_comparisons: Vec<RetiredCanonicalComparison>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_backend_parity_comparisons: Vec<RetiredBackendParityComparison>,
 }
 
-/// Import can replace an ordinary comparison projection. Retaining its exact
-/// typed receipt keeps the binding verifiable without retaining stale grades
-/// or divergence coordinates in the active observation.
+/// Import can replace an ordinary comparison projection, and catalogue
+/// reconciliation can retire its cell. Retaining the exact typed receipt keeps
+/// the binding verifiable without retaining stale grades or active coordinates.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RetiredCanonicalComparison {
@@ -8269,6 +8273,32 @@ struct RetiredCanonicalComparison {
     detcore_tree: String,
     comparison: CanonicalComparison,
     typed_comparison_sha256: String,
+}
+
+/// Catalogue retirement removes every observation for the old identity,
+/// including cross-backend comparisons. Preserve those receipts separately
+/// from ordinary repeatability evidence and outside the active cell set.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredBackendParityComparison {
+    cell: CellId,
+    provenance: ObservationProvenance,
+    detcore_tree: String,
+    comparison: RecordedBackendParityComparison,
+    typed_comparison_sha256: String,
+}
+
+fn retired_parity_key(retired: &RetiredBackendParityComparison) -> (DirectEvidenceBase, String) {
+    (
+        DirectEvidenceBase {
+            cell: series_cell_key(&retired.cell),
+            identity: SeriesObservationIdentity::DetcoreTree(retired.detcore_tree.clone()),
+            provenance: retired.provenance,
+            hermit_sha: retired.comparison.hermit_sha.clone(),
+            run_id: retired.comparison.run_id.clone(),
+        },
+        retired.comparison.evidence_sha256.clone(),
+    )
 }
 
 fn retired_comparison_key(retired: &RetiredCanonicalComparison) -> (DirectEvidenceBase, String) {
@@ -8284,7 +8314,7 @@ fn retired_comparison_key(retired: &RetiredCanonicalComparison) -> (DirectEviden
     )
 }
 
-fn typed_comparison_digest(comparison: &CanonicalComparison) -> Result<String, String> {
+fn typed_comparison_digest(comparison: &impl Serialize) -> Result<String, String> {
     let value = serde_json::to_value(comparison).map_err(|error| error.to_string())?;
     Ok(format!(
         "{:x}",
@@ -8321,6 +8351,86 @@ fn bound_canonical_comparisons<'a>(
                 && comparison.result == binding.result
         })
         .collect()
+}
+
+fn bound_parity_comparisons<'a>(
+    tracked: &'a TrackedCells,
+    binding: &'a ComparisonAttemptBinding,
+) -> Vec<&'a RecordedBackendParityComparison> {
+    binding_observations(tracked, binding)
+        .flat_map(|observation| &observation.backend_parity_comparisons)
+        .filter(|comparison| {
+            comparison.hermit_sha == binding.hermit_sha
+                && comparison.run_id == binding.run_id
+                && comparison.evidence_sha256 == binding.evidence_sha256
+                && comparison.result == binding.result
+        })
+        .collect()
+}
+
+/// Only catalogue reconciliation calls this, after proving the exact detailed
+/// document is committed. Binding validation first authenticates each live
+/// attachment; moving its unchanged receipt into the immutable archive keeps
+/// that attachment checkable after its entire cell leaves the catalogue.
+fn archive_retiring_catalogue_comparisons(
+    tracked: &mut TrackedCells,
+    current_ids: &BTreeSet<&CellId>,
+) -> Result<(), String> {
+    validate_attempt_bindings(tracked, None)?;
+    let Some(old) = comparison_attempt_bindings(tracked) else {
+        return Ok(());
+    };
+    let mut canonical = Vec::new();
+    let mut parity = Vec::new();
+    for binding in &old.bindings {
+        if current_ids.contains(&binding.cell) {
+            continue;
+        }
+        if !old
+            .retired_canonical_comparisons
+            .iter()
+            .any(|receipt| retired_comparison_key(receipt) == binding_key(binding))
+        {
+            if let [comparison] = bound_canonical_comparisons(tracked, binding).as_slice() {
+                canonical.push(RetiredCanonicalComparison {
+                    cell: binding.cell.clone(),
+                    provenance: binding.provenance,
+                    detcore_tree: binding.detcore_tree.clone(),
+                    comparison: (*comparison).clone(),
+                    typed_comparison_sha256: typed_comparison_digest(comparison)?,
+                });
+            }
+        }
+        if !old
+            .retired_backend_parity_comparisons
+            .iter()
+            .any(|receipt| retired_parity_key(receipt) == binding_key(binding))
+        {
+            if let [comparison] = bound_parity_comparisons(tracked, binding).as_slice() {
+                parity.push(RetiredBackendParityComparison {
+                    cell: binding.cell.clone(),
+                    provenance: binding.provenance,
+                    detcore_tree: binding.detcore_tree.clone(),
+                    comparison: (*comparison).clone(),
+                    typed_comparison_sha256: typed_comparison_digest(comparison)?,
+                });
+            }
+        }
+    }
+    let envelope = tracked
+        .projection
+        .as_mut()
+        .and_then(|projection| projection.comparison_attempt_bindings_v1.as_mut())
+        .ok_or("catalogue reconciliation dropped comparison-attempt binding authority")?;
+    envelope.retired_canonical_comparisons.extend(canonical);
+    envelope
+        .retired_canonical_comparisons
+        .sort_by_key(retired_comparison_key);
+    envelope.retired_backend_parity_comparisons.extend(parity);
+    envelope
+        .retired_backend_parity_comparisons
+        .sort_by_key(retired_parity_key);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -8509,6 +8619,31 @@ fn validate_attempt_bindings(
         }
         retired.insert(key, comparison);
     }
+    if envelope
+        .retired_backend_parity_comparisons
+        .windows(2)
+        .any(|pair| retired_parity_key(&pair[0]) >= retired_parity_key(&pair[1]))
+    {
+        return Err("retired parity comparisons must have unique canonical ordering".into());
+    }
+    let mut retired_parity = BTreeMap::new();
+    for comparison in &envelope.retired_backend_parity_comparisons {
+        let key = retired_parity_key(comparison);
+        if retired.contains_key(&key)
+            || !envelope
+                .bindings
+                .iter()
+                .any(|binding| binding_key(binding) == key && binding.cell == comparison.cell)
+            || comparison.typed_comparison_sha256
+                != typed_comparison_digest(&comparison.comparison)?
+        {
+            return Err(
+                "retired parity comparison lacks its unique exact binding or typed receipt digest"
+                    .into(),
+            );
+        }
+        retired_parity.insert(key, comparison);
+    }
     let mut attempts = ValidatedComparisonAttempts::new();
     let mut unique_attempts = BTreeSet::new();
     for binding in &envelope.bindings {
@@ -8541,11 +8676,12 @@ fn validate_attempt_bindings(
             })
             .collect::<Vec<_>>();
         let archived = retired.get(&binding_key(binding));
+        let archived_parity = retired_parity.get(&binding_key(binding));
         if live.len() > 1
             || live
                 .iter()
                 .any(|(_, _, _, result)| *result != binding.result)
-            || (live.is_empty() && archived.is_none())
+            || (live.is_empty() && archived.is_none() && archived_parity.is_none())
         {
             return Err("comparison-attempt binding has no unique original comparison".into());
         }
@@ -8556,6 +8692,17 @@ fn validate_attempt_bindings(
                         != [&archived.comparison])
             {
                 return Err("retired comparison conflicts with its binding or live receipt".into());
+            }
+        }
+        if let Some(archived) = archived_parity {
+            if archived.comparison.result != binding.result
+                || (!live.is_empty()
+                    && bound_parity_comparisons(tracked, binding).as_slice()
+                        != [&archived.comparison])
+            {
+                return Err(
+                    "retired parity comparison conflicts with its binding or live receipt".into(),
+                );
             }
         }
         // Retired-only attestations retain provenance and event checks, but
@@ -8628,10 +8775,22 @@ fn preserve_attempt_bindings_for_writer(
                 .retired_canonical_comparisons
                 .iter()
                 .any(|receipt| !new.retired_canonical_comparisons.contains(receipt))
+            || old
+                .retired_backend_parity_comparisons
+                .iter()
+                .any(|receipt| !new.retired_backend_parity_comparisons.contains(receipt))
         {
             return Err("writer changed or removed an immutable comparison-attempt binding or retired receipt".into());
         }
         for binding in &old.bindings {
+            if !bound_parity_comparisons(before, binding).is_empty()
+                && bound_parity_comparisons(after, binding).is_empty()
+            {
+                return Err(
+                    "only catalogue reconciliation may retire an active bound parity comparison"
+                        .into(),
+                );
+            }
             if writer != Writer::ImportResults
                 && !bound_canonical_comparisons(before, binding).is_empty()
                 && bound_canonical_comparisons(after, binding).is_empty()
@@ -8641,6 +8800,17 @@ fn preserve_attempt_bindings_for_writer(
         }
     }
     if let Some(new) = new {
+        if new
+            .retired_backend_parity_comparisons
+            .iter()
+            .any(|receipt| {
+                !old.is_some_and(|old| old.retired_backend_parity_comparisons.contains(receipt))
+            })
+        {
+            return Err(
+                "only catalogue reconciliation may archive a bound parity comparison".into(),
+            );
+        }
         for retired in &new.retired_canonical_comparisons {
             if old.is_some_and(|old| old.retired_canonical_comparisons.contains(retired)) {
                 continue;
@@ -9230,6 +9400,7 @@ fn append_attempt_bindings(
             authority: ATTEMPT_BINDING_AUTHORITY.into(),
             bindings: Vec::new(),
             retired_canonical_comparisons: Vec::new(),
+            retired_backend_parity_comparisons: Vec::new(),
         });
     envelope.bindings.extend(additions);
     envelope.bindings.sort_by_key(binding_key);
@@ -25188,6 +25359,247 @@ mod post_verdict_transaction_tests {
     }
 
     #[test]
+    fn projector_retires_bound_catalogue_cell_without_losing_provenance() {
+        catalogue_retirement_fixture(false);
+    }
+
+    #[test]
+    fn projector_retires_failed_and_parity_catalogue_receipts_without_active_credit() {
+        catalogue_retirement_fixture(true);
+    }
+
+    fn catalogue_retirement_fixture(include_parity: bool) {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        if include_parity {
+            let measured = fixture.options.results_head.as_deref().unwrap();
+            fixture.row = historical_retry_row(measured, "partial-current-run", 1);
+            let mut parity = serde_json::to_value(evidence_identity_tests::parity()).unwrap();
+            for field in ["hermit_sha", "run_id", "test", "category", "lane"] {
+                parity[field] = fixture.row[field].clone();
+            }
+            fixture.publish_rows(&[fixture.row.clone(), parity]);
+        }
+        fixture.publish().unwrap();
+        let before = fixture.cells();
+        let bindings = comparison_attempt_bindings(&before)
+            .unwrap()
+            .bindings
+            .clone();
+        let expected_bindings = if include_parity { 2 } else { 1 };
+        assert_eq!(bindings.len(), expected_bindings);
+        assert_eq!(
+            validate_attempt_bindings(&before, Some(&[])).unwrap().len(),
+            expected_bindings
+        );
+        fs::create_dir_all(fixture.ledger.join("series/hermit/fixture")).unwrap();
+        fs::write(
+            fixture.ledger.join("series/hermit/fixture/2026-09.jsonl"),
+            b"",
+        )
+        .unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        let archived_commit = commit(&fixture.ledger, "bound catalogue history");
+        let original = read_history_files(&fixture.root).unwrap();
+
+        // A real manifest rename retires the old identity. Regenerate the
+        // source catalogue through its normal explicit cell-removal gate.
+        let manifest = fixture.root.join("tests/e2e/manifests/system-utils.yaml");
+        let old = fs::read_to_string(&manifest).unwrap();
+        let start = old.find("  - id: system-utils/record-getpid\n").unwrap();
+        let end = start + old[start + 1..].find("  - id:").unwrap() + 1;
+        let renamed = old[start..end]
+            .replace("system-utils/record-getpid\n", "system-utils/record-getpid-renamed\n")
+            .replace("        ci: false\n", "        ci: false\n        ci_disabled_reason: Fixture retains this mode's existing backend restrictions\n");
+        let new = format!("{}{}{}", &old[..start], renamed, &old[end..]);
+        assert_ne!(old, new);
+        fs::write(manifest, new).unwrap();
+        let reason_baseline = fixture.root.join("ci/ci-reason-baseline.json");
+        let mut reasons: JsonValue = read_json(&reason_baseline).unwrap();
+        let entries = reasons["unreasoned_ci_false_cells"].as_array_mut().unwrap();
+        let original_count = entries.len();
+        entries.retain(|entry| {
+            !entry
+                .as_str()
+                .unwrap()
+                .starts_with("system-utils/record-getpid::")
+        });
+        assert_eq!(original_count - entries.len(), 3);
+        fs::write(
+            reason_baseline,
+            serde_json::to_vec_pretty(&reasons).unwrap(),
+        )
+        .unwrap();
+        let plan = fixture.root.join(EXPECTED_PLAN);
+        let old_plan = fs::read_to_string(&plan).unwrap();
+        let new_plan = old_plan.replace(
+            "system-utils/record-getpid",
+            "system-utils/record-getpid-renamed",
+        );
+        assert_ne!(old_plan, new_plan);
+        fs::write(plan, new_plan).unwrap();
+        update_tracked(&fixture.root, Some("fixture manifest rename"), true).unwrap();
+        git(
+            &fixture.root,
+            &[
+                "add",
+                "tests/e2e/manifests/system-utils.yaml",
+                "ci/ci-reason-baseline.json",
+                EXPECTED_PLAN,
+                SCORECARD,
+                CELLS,
+            ],
+        );
+        commit(&fixture.root, "retire fixture catalogue cell");
+
+        // Even with bindings, retirement must refuse to overwrite uncommitted
+        // history and leave both output files byte-identical on refusal.
+        let mut dirty = original.cells.clone();
+        dirty.push(b'\n');
+        fs::write(fixture.ledger.join(LEDGER_CELLS), &dirty).unwrap();
+        let series = fixture.ledger.join("series");
+        let error = project_observations(&fixture.root, &series, "retirement").unwrap_err();
+        assert!(error.contains("uncommitted history"), "{error}");
+        assert_eq!(fs::read(fixture.ledger.join(LEDGER_CELLS)).unwrap(), dirty);
+        assert_eq!(
+            fs::read(fixture.ledger.join(LEDGER_SCORECARD)).unwrap(),
+            original.scorecard
+        );
+        fs::write(fixture.ledger.join(LEDGER_CELLS), &original.cells).unwrap();
+
+        project_observations(&fixture.root, &series, "retirement").unwrap();
+        let after = fixture.cells();
+        assert!(!after.cells.iter().any(|cell| cell.id == fixture.id));
+        let renamed = after
+            .cells
+            .iter()
+            .filter(|cell| cell.id.test == "system-utils/record-getpid-renamed")
+            .collect::<Vec<_>>();
+        assert!(!renamed.is_empty());
+        assert!(
+            renamed
+                .iter()
+                .all(|cell| cell.observations.is_empty() && cell.last_tested.is_none())
+        );
+        assert_eq!(
+            comparison_attempt_bindings(&after).unwrap().bindings,
+            bindings
+        );
+        let envelope = comparison_attempt_bindings(&after).unwrap();
+        assert_eq!(envelope.retired_canonical_comparisons.len(), 1);
+        assert_eq!(
+            envelope.retired_backend_parity_comparisons.len(),
+            usize::from(include_parity)
+        );
+        let ordinary = &envelope.retired_canonical_comparisons[0];
+        let ordinary_binding = bindings
+            .iter()
+            .find(|binding| binding_key(binding) == retired_comparison_key(ordinary))
+            .unwrap();
+        assert_eq!(
+            bound_canonical_comparisons(&before, ordinary_binding),
+            [&ordinary.comparison]
+        );
+        if include_parity {
+            assert_eq!(ordinary.comparison.result, ObservedResult::ReplayFailure);
+            let parity = &envelope.retired_backend_parity_comparisons[0];
+            let parity_binding = bindings
+                .iter()
+                .find(|binding| binding_key(binding) == retired_parity_key(parity))
+                .unwrap();
+            assert_eq!(
+                bound_parity_comparisons(&before, parity_binding),
+                [&parity.comparison]
+            );
+            // Stored digests detect accidental receipt corruption. Even a
+            // recomputed digest cannot authorize a writer to change history.
+            let mut changed = after.clone();
+            let receipt = &mut changed
+                .projection
+                .as_mut()
+                .unwrap()
+                .comparison_attempt_bindings_v1
+                .as_mut()
+                .unwrap()
+                .retired_backend_parity_comparisons[0];
+            receipt.comparison.compared_records += 1;
+            assert!(validate_attempt_bindings(&changed, None).is_err());
+            let receipt = &mut changed
+                .projection
+                .as_mut()
+                .unwrap()
+                .comparison_attempt_bindings_v1
+                .as_mut()
+                .unwrap()
+                .retired_backend_parity_comparisons[0];
+            receipt.typed_comparison_sha256 = typed_comparison_digest(&receipt.comparison).unwrap();
+            for writer in [Writer::Update, Writer::Observations, Writer::ImportResults] {
+                assert!(preserve_attempt_bindings_for_writer(&after, &changed, writer).is_err());
+                assert!(preserve_attempt_bindings_for_writer(&before, &after, writer).is_err());
+            }
+        }
+        assert!(
+            validate_attempt_bindings(&after, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        let retained = Command::new("git")
+            .args(["show", &format!("{archived_commit}:{LEDGER_CELLS}")])
+            .current_dir(&fixture.ledger)
+            .output()
+            .unwrap();
+        assert!(retained.status.success());
+        assert_eq!(retained.stdout, original.cells);
+        let once = read_history_files(&fixture.root).unwrap();
+        project_observations(&fixture.root, &series, "retirement").unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == once);
+
+        // A returning catalogue identity begins unmeasured. Only the actual
+        // original result inputs may reactivate the exact archived receipts.
+        git(&fixture.ledger, &["add", "scorecard"]);
+        commit(&fixture.ledger, "preserved retired bindings");
+        git(
+            &fixture.root,
+            &[
+                "checkout",
+                &fixture.options.expected_head,
+                "--",
+                "tests/e2e/manifests/system-utils.yaml",
+                "ci/ci-reason-baseline.json",
+                EXPECTED_PLAN,
+                SCORECARD,
+                CELLS,
+            ],
+        );
+        fixture.options.expected_head = commit(&fixture.root, "restore catalogue identity");
+        fixture.publish().unwrap();
+        let reactivated = fixture.cells();
+        assert_eq!(comparison_attempt_bindings(&reactivated), Some(envelope));
+        if include_parity {
+            let mut conflicting = reactivated.clone();
+            let observation = conflicting
+                .cells
+                .iter_mut()
+                .flat_map(|cell| &mut cell.observations)
+                .find(|observation| !observation.backend_parity_comparisons.is_empty())
+                .unwrap();
+            let mut comparison = observation.backend_parity_comparisons.pop_first().unwrap();
+            comparison.compared_records += 1;
+            observation.backend_parity_comparisons.insert(comparison);
+            assert!(validate_attempt_bindings(&conflicting, None).is_err());
+        }
+        assert_eq!(
+            validate_attempt_bindings(&reactivated, Some(&[]))
+                .unwrap()
+                .len(),
+            expected_bindings
+        );
+        let active_once = read_history_files(&fixture.root).unwrap();
+        fixture.publish().unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == active_once);
+    }
+
+    #[test]
     fn import_retires_bound_ordinary_comparison_without_losing_provenance() {
         let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
         let fixture = Fixture::new();
@@ -26358,6 +26770,7 @@ mod attempt_binding_tests {
             schema: 1,
             authority: ATTEMPT_BINDING_AUTHORITY.into(),
             retired_canonical_comparisons: Vec::new(),
+            retired_backend_parity_comparisons: Vec::new(),
             bindings: ["c".repeat(64), "d".repeat(64)]
                 .into_iter()
                 .enumerate()
@@ -27028,7 +27441,7 @@ mod evidence_identity_tests {
         serde_json::from_str(r#"{"argv":["hermit","run","--verify","fixture"],"attempt":1,"attempts":[{"argv":["hermit","run","--verify","fixture"],"cwd":"/repo","env":{"LC_ALL":"C"},"error_kind":"incomplete-verification-evidence","guest_argv":["fixture"],"index":"1","outcome":"ERROR","shell_command":"cd /repo && env LC_ALL=C hermit run --verify fixture","signal":null,"status":75,"timed_out":false,"verification_report":"{\"bitwise_parity\":false,\"compared_log_messages\":null,\"comparison\":null,\"first_divergent_left_message\":null,\"first_divergent_record\":null,\"first_divergent_right_message\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_syscall\":null,\"first_divergent_virtual_nanoseconds\":null,\"guest_exit_code\":null,\"guest_signal\":null,\"infrastructure_error\":null,\"no_result_reason\":{\"kind\":\"not_run\"},\"runtime\":null,\"verdict\":\"no_result\",\"verified\":false}","verification_report_sha256":"0cf756d63a02c73f989586d9f6572c428ce52d55a510ffa4659baab4bdcef405"}],"backend":"ptrace","binary_sha256":"0f533a26257a88f0550ddbabdb318a47f029991cfcf743714ce7f6ee3243105b","category":"fixture","classification":"required","cwd":"/repo","effective_args":["run","--verify","fixture"],"env":{"LC_ALL":"C"},"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,"failure_class":"no_result","guest_argv":["fixture"],"hermit_sha":"e6a1657c5cbe966d24f70ae88151471ca3fbd362","lane":"portable","log_level":"info","mode":"verify","outcome":"ERROR","relaxations":[],"result":null,"run_id":"finalized-a","schema":4,"shell_command":"cd /repo && env LC_ALL=C hermit run --verify fixture","source_tree_dirty":false,"test":"fixture/no-result","test_sha256":"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d","timeout_seconds":15}"#).unwrap()
     }
 
-    fn parity() -> ResultRow {
+    pub(super) fn parity() -> ResultRow {
         let mut row: JsonValue = serde_json::from_str(r#"{"argv":["hermit","run","--backend","sabre"],"attempt":1,"attempts":[],"backend":"sabre","binary_sha256":"0f533a26257a88f0550ddbabdb318a47f029991cfcf743714ce7f6ee3243105b","category":"fixture","classification":"required","cwd":"/repo","effective_args":["run","--backend","sabre"],"env":{"LC_ALL":"C"},"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,"failure_class":null,"guest_argv":["fixture"],"hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lane":"portable","log_level":"info","mode":"verify","outcome":"PASS","relaxations":[],"result":"pass","run_id":"typed-parity-identity-fixture","schema":4,"shell_command":"cd /repo && env LC_ALL=C hermit run --backend sabre","source_tree_dirty":false,"test":"fixture/no-result","test_sha256":"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d","timeout_seconds":15}"#).unwrap();
         let verification: JsonValue = serde_json::from_str(r#"{"bitwise_parity":true,"compared_log_messages":{"left":1,"right":1},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stderr_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stdout_bytes":1,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"right":{"exit_code":0,"signal":null,"stderr_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stdout_bytes":1,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"comparison":{"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"canonicalize_addresses":true,"compare_io_buffers":true,"compare_logs":true,"display_name":"BitwiseInfoV1","exact_remainder":true,"full_trace":true,"ignore_lines":false,"log_scope":"info","record_envelope":"all_records_v1","skip_commit":false,"skip_detlog":false,"strictness":"canonical","strip_lines":false,"stripped_prefixes":["real-wall-clock-prefix/v1"],"virtualize_time":true},"first_divergent_left_message":null,"first_divergent_record":null,"first_divergent_right_message":null,"first_divergent_scheduler_turn":null,"first_divergent_syscall":null,"first_divergent_virtual_nanoseconds":null,"guest_exit_code":0,"guest_signal":null,"infrastructure_error":null,"no_result_reason":null,"verdict":"matched","verified":true}"#).unwrap();
         let report = serde_json::to_string(&verification).unwrap();
