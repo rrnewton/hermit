@@ -63,13 +63,22 @@ absolute paths:
 The wrapper always regenerates dependencies, refuses missing release metadata
 inside Rust compilation, resolves Buck through the supplied public DotSlash
 launcher, and records hashes for DotSlash, the Buck descriptor, resolved Buck
-executable, generated graph, binaries, resources, and the
-`liblzma.so.5` link input. On minimal CI hosts the driver resolves and validates
-the runtime SONAME without requiring the unversioned development-package
+executable, generated graph, binaries, resources, the `liblzma.so.5` link
+input, and the exact libunwind closure. On minimal CI hosts the driver resolves
+and validates the runtime SONAME without requiring the unversioned development-package
 symlink. It copies the canonical ELF bytes into a content-addressed package
 under `ignored/buck2-link-inputs/`, supplies that package as an explicit Buck
 dependency, and retains the source path, hash, and target label. Before
-DotSlash's first probe it snapshots the launcher
+building it also snapshots the canonical `libunwind-ptrace.a`,
+`libunwind-x86_64.so.8`, and transitive `libunwind.so.8` as one
+content-addressed declared Buck package. Their archive/ELF type, SONAME,
+DT_NEEDED closure, hashes, copied bytes, package text, and exact no-extra-file
+population are reverified. The release executable carries only the reviewed
+two-component relative DT_RPATH for direct `target/{ci,release}` use and the
+published E2E layout; DT_RUNPATH, absolute, empty, and ambient components
+refuse. Both shared libraries are immutable regular files under
+`rsrcs/hermit-runtime`, are covered by the resource manifest, and are bound in
+the typed receipt. Before DotSlash's first probe it snapshots the launcher
 into the exclusive evidence tree with stable before/copy/after hashes, uses
 only that snapshot, and re-verifies it before the final receipt. Deleting or
 changing the caller path cannot change the run. The wrapper likewise snapshots
@@ -237,10 +246,14 @@ The network-capable host producer builds `//hermit-cli:hermit-release`, retains
 its event/stdout/stderr and typed reconciliation under
 `ignored/buck2-phase2/`, and publishes one content-addressed binary there. Both
 the host and network-disabled pinned-root release nodes install that exact
-verified binary at `target/ci/hermit-strict`. Direct release consumers use that
-path; E2E consumers receive the same bytes through the existing verified
-binary-plus-resource publisher. Cargo still supplies the complete backend
-resource bundle in both modes.
+verified binary at `target/ci/hermit-strict` and `target/release/hermit`, plus
+the verified libunwind runtime closure at
+`target/install_pkg/rsrcs/hermit-runtime`. Direct and published-bundle loader
+probes explicitly remove `LD_LIBRARY_PATH`; the executable must resolve the
+same content-bound libraries through its relative DT_RPATH. Direct release
+consumers use the strict path; E2E consumers receive the same bytes and runtime
+closure through the existing verified binary-plus-resource publisher. Cargo
+still supplies the remaining complete backend resource bundle in both modes.
 
 ## On a Meta host
 
