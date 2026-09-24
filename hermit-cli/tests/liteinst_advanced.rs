@@ -163,13 +163,18 @@ fn compressed_fixtures() -> &'static [PathBuf; 3] {
 }
 
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
-    run_liteinst_with_input(program, args, verify, None)
+    run_liteinst_with_input(program, args, verify, None, None)
 }
 
-fn liteinst_command(log_level: &str) -> Command {
+const VIRTUAL_TIME_EPOCH: &str = "2026-01-01T00:00:00Z";
+
+fn liteinst_command_at_epoch(log_level: &str, epoch: Option<&str>) -> Command {
     let mut command = Command::new(liteinst_runtime::hermit_binary());
-    command.arg(format!("--log={log_level}")).args([
-        "run",
+    command.arg(format!("--log={log_level}")).arg("run");
+    if let Some(epoch) = epoch {
+        command.arg(format!("--epoch={epoch}"));
+    }
+    command.args([
         "--backend",
         "liteinst",
         "--strict",
@@ -178,6 +183,10 @@ fn liteinst_command(log_level: &str) -> Command {
         "--workdir=/test",
     ]);
     command
+}
+
+fn liteinst_command(log_level: &str) -> Command {
+    liteinst_command_at_epoch(log_level, None)
 }
 
 #[test]
@@ -200,6 +209,24 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
             "--workdir=/test",
         ]
     );
+    let epoch_args = liteinst_command_at_epoch("off", Some(VIRTUAL_TIME_EPOCH))
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        epoch_args,
+        [
+            "--log=off",
+            "run",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--backend",
+            "liteinst",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+        ]
+    );
 }
 
 fn run_liteinst_with_input(
@@ -207,12 +234,13 @@ fn run_liteinst_with_input(
     args: &[&str],
     verify: bool,
     input: Option<&[u8]>,
+    epoch: Option<&str>,
 ) -> Output {
     liteinst_runtime::ensure_liteinst_runtime();
     let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
     let xdg_config_home = home.path().join(".config");
     fs::create_dir_all(&xdg_config_home).expect("failed to create isolated XDG config directory");
-    let mut command = liteinst_command("info");
+    let mut command = liteinst_command_at_epoch("info", epoch);
     if verify {
         command.arg("--verify");
     }
@@ -259,7 +287,13 @@ fn assert_liteinst_virtual_time_is_continuous() {
     // Whole seconds remain stable across verified LiteInst runs. Do not assert
     // the old exact epoch: that encoded #1095's reset-on-exec behavior and
     // rejects legitimate deterministic startup progress.
-    let output = run_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"]);
+    let output = assert_liteinst_strict_verify_output(run_liteinst_with_input(
+        Path::new("/usr/bin/date"),
+        &["-u", "+%s"],
+        true,
+        None,
+        Some(VIRTUAL_TIME_EPOCH),
+    ));
     let timestamp = String::from_utf8(output.stdout).expect("date output should be UTF-8");
     let seconds = timestamp
         .trim()
@@ -275,11 +309,14 @@ fn assert_liteinst_virtual_time_is_continuous() {
         "guest startup consumed an implausible amount of virtual time: {timestamp}"
     );
     // Verify continuous progression independently of the startup offset.
-    assert_liteinst_strict_verify(
+    let progress = assert_liteinst_strict_verify_output(run_liteinst_with_input(
         advanced_guest(),
         &["clock-progress"],
-        b"clock-progress-ok\n",
-    );
+        true,
+        None,
+        Some(VIRTUAL_TIME_EPOCH),
+    ));
+    assert_eq!(progress.stdout, b"clock-progress-ok\n");
 }
 
 #[test]
@@ -297,7 +334,13 @@ fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
 }
 
 fn run_liteinst_strict_verify_with_stdin(program: &Path, args: &[&str], input: &[u8]) -> Output {
-    assert_liteinst_strict_verify_output(run_liteinst_with_input(program, args, true, Some(input)))
+    assert_liteinst_strict_verify_output(run_liteinst_with_input(
+        program,
+        args,
+        true,
+        Some(input),
+        None,
+    ))
 }
 
 fn assert_liteinst_strict_verify_output(output: Output) -> Output {

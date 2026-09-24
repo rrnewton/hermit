@@ -404,6 +404,11 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             || !source.contains("${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}")
             || !source.contains("build-buck-release.rs --validate-dag-install")
             || !source.contains("target/ci/hermit-strict")
+            || !source.contains(
+                "install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so",
+            )
+            || !source.contains("sabre_before=$(sha256sum \"$sabre_source\"")
+            || !source.contains("rm -rf target/install_pkg/rsrcs/hermit-runtime")
         {
             return Err(format!("release-artifact bracket: {tag} can bypass the selected artifact"));
         }
@@ -497,6 +502,9 @@ mod artifact_plan_tests {
             ("build.e2e_artifact", "cargo) hermit_payload=target/debug/hermit", "cargo) hermit_payload=target/ci/hermit-strict"),
             ("build.e2e_artifact", "buck) hermit_payload=target/ci/hermit-strict", "buck) hermit_payload=target/debug/hermit"),
             ("test.dbt_parity", "target/ci/hermit-strict", "target/release/hermit"),
+            ("build.runtime_release", "target/ci/libdetcore_sabre.so", "target/ci/libdetcore_sabre-decoy.so"),
+            ("build.runtime_release", "sabre_before", "sabre_decoy"),
+            ("build.runtime_release", "rm -rf target/install_pkg/rsrcs/hermit-runtime", "true"),
         ] {
             let mut changed = cfg.clone();
             let step = changed.steps.iter_mut().find(|step| step.tag() == tag).unwrap();
@@ -1618,6 +1626,48 @@ fn assert_submodule_fixture_source(
     Ok(())
 }
 
+// Keep the development overlay and its staged population identical by using
+// one list for both operations. The source-identity check below refuses any
+// changed tracked file omitted from this explicit service-result fixture.
+const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
+    ".config/nextest.toml",
+    "Makefile",
+    "ci/compat/corpus-strict.json",
+    "ci/dag/validate.json",
+    "ci/manifest-plan/src/runner.rs",
+    "ci/manifest-plan/src/service_result.rs",
+    "ci/manifest-plan/src/timeouts.rs",
+    "ci/manifest-plan/src/validation_dag.rs",
+    "ci/manifest-plan/src/validation_dag_static.rs",
+    "ci/manifest-plan/validation-service-result-schema.json",
+    "ci/nextest-timeout-config.rs",
+    "ci/publish-hermit-e2e-artifact.sh",
+    "ci/run-nextest-counted.sh",
+    "ci/run-dag.sh",
+    "ci/verify-hermit-e2e-artifact.sh",
+    "ci/verify-submodules.sh",
+    "detcore-model/src/time.rs",
+    "detcore/src/tool_global.rs",
+    "docs/BUCK2_OSS.md",
+    "hermit-cli/BUCK",
+    "hermit-cli/tests/liteinst_advanced.rs",
+    "scripts/build-buck-release.rs",
+    "scripts/validate.rs",
+    "scripts/lib/validate_history.rs",
+    "scripts/lib/validate_artifacts.rs",
+    "scripts/lib/validate_test_results.rs",
+    "scripts/lib/validate_evidence.rs",
+    "scripts/lib/fixtures/schema10-matched-cell.json",
+    "scripts/lib/fixtures/schema10-matched-plan.json",
+    "scripts/lib/validate_plan.rs",
+    "scripts/lib/validate_super.rs",
+    "tests/e2e/manifests/applications.yaml",
+    "tests/e2e/manifests/backend-parity-c.yaml",
+    "tests/e2e/manifests/c-programs.yaml",
+    "tests/e2e/manifests/data-handling.yaml",
+    "tests/e2e/manifests/defaults.yaml",
+];
+
 /// Exercise the real bootstrap boundary around the first DAG node.
 ///
 /// With agent-utils populated, the Rust driver can start and a missing rr
@@ -1754,80 +1804,15 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     // A self-test can run from an uncommitted edit while it is being developed.
     // Overlay exactly this test's production files, then commit only when that
     // changed the clone. The real child therefore still runs from a clean SHA.
-    for relative in [
-        ".config/nextest.toml",
-        "Makefile",
-        "ci/compat/corpus-strict.json",
-        "ci/dag/validate.json",
-        "ci/manifest-plan/src/runner.rs",
-        "ci/manifest-plan/src/service_result.rs",
-        "ci/manifest-plan/src/timeouts.rs",
-        "ci/manifest-plan/src/validation_dag.rs",
-        "ci/manifest-plan/src/validation_dag_static.rs",
-        "ci/manifest-plan/validation-service-result-schema.json",
-        "ci/nextest-timeout-config.rs",
-        "ci/run-nextest-counted.sh",
-        "ci/run-dag.sh",
-        "ci/verify-submodules.sh",
-        "docs/BUCK2_OSS.md",
-        "hermit-cli/BUCK",
-        "scripts/build-buck-release.rs",
-        "scripts/validate.rs",
-        "scripts/lib/validate_history.rs",
-        "scripts/lib/validate_artifacts.rs",
-        "scripts/lib/validate_test_results.rs",
-        "scripts/lib/validate_evidence.rs",
-        "scripts/lib/fixtures/schema10-matched-cell.json",
-        "scripts/lib/fixtures/schema10-matched-plan.json",
-        "scripts/lib/validate_plan.rs",
-        "scripts/lib/validate_super.rs",
-        "tests/e2e/manifests/applications.yaml",
-        "tests/e2e/manifests/backend-parity-c.yaml",
-        "tests/e2e/manifests/c-programs.yaml",
-        "tests/e2e/manifests/data-handling.yaml",
-        "tests/e2e/manifests/defaults.yaml",
-    ] {
+    for relative in SUBMODULE_SERVICE_FIXTURE_SOURCES {
         std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
             format!("submodule service result: cannot copy {relative} into fixture: {error}")
         })?;
     }
     checked_command(
         Command::new("git")
-            .args([
-                "add",
-                "--",
-                ".config/nextest.toml",
-                "Makefile",
-                "ci/compat/corpus-strict.json",
-                "ci/dag/validate.json",
-                "ci/manifest-plan/src/runner.rs",
-                "ci/manifest-plan/src/service_result.rs",
-                "ci/manifest-plan/src/timeouts.rs",
-                "ci/manifest-plan/src/validation_dag.rs",
-                "ci/manifest-plan/src/validation_dag_static.rs",
-                "ci/manifest-plan/validation-service-result-schema.json",
-                "ci/nextest-timeout-config.rs",
-                "ci/run-nextest-counted.sh",
-                "ci/run-dag.sh",
-                "ci/verify-submodules.sh",
-                "docs/BUCK2_OSS.md",
-                "hermit-cli/BUCK",
-                "scripts/build-buck-release.rs",
-                "scripts/validate.rs",
-                "scripts/lib/validate_history.rs",
-                "scripts/lib/validate_artifacts.rs",
-                "scripts/lib/validate_test_results.rs",
-                "scripts/lib/validate_evidence.rs",
-                "scripts/lib/fixtures/schema10-matched-cell.json",
-                "scripts/lib/fixtures/schema10-matched-plan.json",
-                "scripts/lib/validate_plan.rs",
-                "scripts/lib/validate_super.rs",
-                "tests/e2e/manifests/applications.yaml",
-                "tests/e2e/manifests/backend-parity-c.yaml",
-                "tests/e2e/manifests/c-programs.yaml",
-                "tests/e2e/manifests/data-handling.yaml",
-                "tests/e2e/manifests/defaults.yaml",
-            ])
+            .args(["add", "--"])
+            .args(SUBMODULE_SERVICE_FIXTURE_SOURCES)
             .current_dir(&checkout),
         "stage the fixture sources",
     )?;
@@ -5853,6 +5838,34 @@ mod ordinary_artifact_pointer_tests {
         let fixed_bundle = std::fs::read_to_string(&fixed_pointer).unwrap();
         let external_bundle = std::fs::read_to_string(&external_pointer).unwrap();
         assert_ne!(fixed_bundle, external_bundle);
+        let fixed_bundle_path = Path::new(fixed_bundle.trim());
+        assert!(!fixed_bundle_path.join("runtime-contract").exists());
+        assert!(!fixed_bundle_path
+            .join("install/rsrcs/hermit-runtime")
+            .exists());
+
+        let undeclared_runtime = measured
+            .path()
+            .join("fixture-install/rsrcs/hermit-runtime");
+        std::fs::create_dir_all(&undeclared_runtime).unwrap();
+        for name in ["libunwind-x86_64.so.8", "libunwind.so.8"] {
+            std::fs::write(undeclared_runtime.join(name), b"undeclared runtime\n").unwrap();
+        }
+        let refused = Command::new(measured.path().join("ci/publish-hermit-e2e-artifact.sh"))
+            .arg(measured.path().join("fixture-hermit"))
+            .arg(measured.path().join("target/ci/refused-artifacts"))
+            .arg(measured.path().join("target/ci/refused-artifact.path"))
+            .arg(measured.path().join("fixture-install"))
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("undeclared Hermit runtime closure"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        std::fs::remove_dir_all(&undeclared_runtime).unwrap();
 
         let standalone = consumer(measured.path(), Some(&external_pointer));
         assert!(standalone.status.success());
@@ -25452,6 +25465,16 @@ mod submodule_service_tests {
     fn source_and_agent_utils_mismatches_refuse_prepared_reuse() {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::fs::symlink;
+
+        for required in [
+            "ci/publish-hermit-e2e-artifact.sh",
+            "ci/verify-hermit-e2e-artifact.sh",
+        ] {
+            assert!(
+                SUBMODULE_SERVICE_FIXTURE_SOURCES.contains(&required),
+                "service-result fixture omitted {required}"
+            );
+        }
 
         fn git(root: &Path, args: &[&str]) -> String {
             let output = Command::new("git")

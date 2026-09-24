@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Cursor;
@@ -97,6 +98,12 @@ const VALIDATE_ARTIFACT_ROOT: &str = "ignored/buck2-phase2/artifacts";
 const VALIDATE_ARTIFACT_IDENTITY: &str = "ignored/buck2-phase2/current.identity";
 const LZMA_SONAME: &str = "liblzma.so.5";
 const LZMA_BUCK_PACKAGE: &str = "prebuilt_cxx_library(\n    name = \"lzma\",\n    shared_lib = \"liblzma.so.5\",\n    visibility = [\"PUBLIC\"],\n)\n";
+const UNWIND_PTRACE_ARCHIVE: &str = "libunwind-ptrace.a";
+const UNWIND_ARCH_SONAME: &str = "libunwind-x86_64.so.8";
+const UNWIND_CORE_SONAME: &str = "libunwind.so.8";
+const UNWIND_RUNTIME_RELATIVE: &str = "rsrcs/hermit-runtime";
+const RELEASE_RPATH: &str = "$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime";
+const UNWIND_BUCK_PACKAGE: &str = "prebuilt_cxx_library(\n    name = \"_unwind_core\",\n    shared_lib = \"libunwind.so.8\",\n)\n\nprebuilt_cxx_library(\n    name = \"_unwind_arch\",\n    shared_lib = \"libunwind-x86_64.so.8\",\n    exported_deps = [\":_unwind_core\"],\n)\n\nprebuilt_cxx_library(\n    name = \"unwind\",\n    static_lib = \"libunwind-ptrace.a\",\n    exported_deps = [\":_unwind_arch\"],\n    visibility = [\"PUBLIC\"],\n)\n";
 const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
     "ld-linux-x86-64.so.2",
     "libc.so.6",
@@ -110,7 +117,7 @@ const GENERATED_MARKERS: [&str; 3] = [
     "manifest_dir = \":reverie-dbt-0.2-materialized-manifest\"",
     "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")",
 ];
-const REQUIRED_RESOURCES: [(&str, bool); 8] = [
+const REQUIRED_RESOURCES: [(&str, bool); 10] = [
     ("rsrcs/libdetcore_dbt.so", false),
     ("rsrcs/libdetcore_sabre.so", false),
     ("rsrcs/libreverie_dbt_client.so", false),
@@ -119,6 +126,8 @@ const REQUIRED_RESOURCES: [(&str, bool); 8] = [
     ("rsrcs/sabre", true),
     ("rsrcs/e9patch", true),
     ("rsrcs/e9tool", true),
+    ("rsrcs/hermit-runtime/libunwind-x86_64.so.8", false),
+    ("rsrcs/hermit-runtime/libunwind.so.8", false),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,6 +184,33 @@ struct LzmaBuckInput {
     root: PathBuf,
     library: PathBuf,
     target: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UnwindClosure {
+    ptrace_archive: PathBuf,
+    arch_shared: PathBuf,
+    core_shared: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UnwindBuckInput {
+    sources: UnwindClosure,
+    source_sha256: BTreeMap<String, String>,
+    identity: String,
+    root: PathBuf,
+    target: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ValidateArtifact {
+    bundle: PathBuf,
+    binary: PathBuf,
+    install: PathBuf,
+    identity: String,
+    binary_sha256: String,
+    resources_sha256: String,
+    runtime_sha256: BTreeMap<String, String>,
 }
 
 fn usage() -> &'static str {
@@ -1052,6 +1088,307 @@ fn publish_lzma_buck_input(
         &format!(
             "schema\thermit-buck-lzma-input/v1\nsource\t{}\nsha256\t{}\ntarget\t{}\n",
             input.source.display(), input.source_sha256, input.target
+        ),
+    )?;
+    Ok(input)
+}
+
+fn require_gcc_library(name: &str, description: &str) -> Result<PathBuf, String> {
+    let located = PathBuf::from(output_text(
+        Command::new("gcc").arg(format!("-print-file-name={name}")),
+        &format!("gcc {description} lookup"),
+    )?);
+    if !located.is_absolute() {
+        return Err(format!(
+            "{description} requires {name}, but gcc did not resolve an absolute input"
+        ));
+    }
+    let path = located.canonicalize().map_err(|error| {
+        format!(
+            "gcc-resolved {description} {} cannot be canonicalized: {error}",
+            located.display()
+        )
+    })?;
+    require_nonempty_regular_file(&path, description)
+}
+
+fn dynamic_values(path: &Path, tag: &str) -> Result<Vec<String>, String> {
+    let dynamic = output_text(
+        Command::new("readelf").args([OsStr::new("-d"), path.as_os_str()]),
+        &format!("readelf -d {}", path.display()),
+    )?;
+    Ok(dynamic
+        .lines()
+        .filter(|line| line.contains(&format!("({tag})")))
+        .filter_map(|line| {
+            line.split_once('[')?
+                .1
+                .split_once(']')
+                .map(|pair| pair.0.to_owned())
+        })
+        .collect())
+}
+
+fn verify_shared_library(
+    path: &Path,
+    soname: &str,
+    needed: &[&str],
+) -> Result<(), String> {
+    require_nonempty_regular_file(path, &format!("{soname} shared library"))?;
+    if elf_identity(path)? != (2, 1, 3, 62) {
+        return Err(format!(
+            "shared library {} is not an x86_64 ELF shared object",
+            path.display()
+        ));
+    }
+    let sonames = dynamic_values(path, "SONAME")?;
+    if sonames != [soname] {
+        return Err(format!(
+            "shared library {} has SONAMEs {sonames:?}, expected exactly {soname}",
+            path.display()
+        ));
+    }
+    let actual_needed = needed_libraries(path)?;
+    let expected_needed = needed
+        .iter()
+        .map(|library| (*library).to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_needed != expected_needed {
+        return Err(format!(
+            "shared library {soname} has DT_NEEDED {actual_needed:?}, expected exactly {expected_needed:?}"
+        ));
+    }
+    if !dynamic_values(path, "RPATH")?.is_empty()
+        || !dynamic_values(path, "RUNPATH")?.is_empty()
+    {
+        return Err(format!(
+            "shared library {soname} must not carry RPATH or RUNPATH"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_static_archive(path: &Path) -> Result<(), String> {
+    let path = require_nonempty_regular_file(path, "canonical libunwind-ptrace archive")?;
+    let mut magic = [0_u8; 8];
+    fs::File::open(&path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .map_err(|error| format!("cannot read archive {}: {error}", path.display()))?;
+    if &magic != b"!<arch>\n" {
+        return Err(format!(
+            "canonical libunwind-ptrace input {} is not an ar archive",
+            path.display()
+        ));
+    }
+    let members = output_text(
+        Command::new("ar").args([OsStr::new("t"), path.as_os_str()]),
+        &format!("ar t {}", path.display()),
+    )?;
+    if members.lines().next().is_none() {
+        return Err("canonical libunwind-ptrace archive has no members".into());
+    }
+    Ok(())
+}
+
+fn require_unwind_closure() -> Result<UnwindClosure, String> {
+    let closure = UnwindClosure {
+        ptrace_archive: require_gcc_library(
+            UNWIND_PTRACE_ARCHIVE,
+            "canonical libunwind-ptrace link input",
+        )?,
+        arch_shared: require_gcc_library(
+            UNWIND_ARCH_SONAME,
+            "canonical libunwind architecture runtime",
+        )?,
+        core_shared: require_gcc_library(
+            UNWIND_CORE_SONAME,
+            "canonical libunwind core runtime",
+        )?,
+    };
+    verify_static_archive(&closure.ptrace_archive)?;
+    verify_shared_library(
+        &closure.arch_shared,
+        UNWIND_ARCH_SONAME,
+        &[UNWIND_CORE_SONAME, "libc.so.6"],
+    )?;
+    verify_shared_library(
+        &closure.core_shared,
+        UNWIND_CORE_SONAME,
+        &["ld-linux-x86-64.so.2", "libc.so.6"],
+    )?;
+    Ok(closure)
+}
+
+fn unwind_sources(closure: &UnwindClosure) -> [(&'static str, &Path); 3] {
+    [
+        (UNWIND_PTRACE_ARCHIVE, &closure.ptrace_archive),
+        (UNWIND_ARCH_SONAME, &closure.arch_shared),
+        (UNWIND_CORE_SONAME, &closure.core_shared),
+    ]
+}
+
+fn unwind_source_hashes(closure: &UnwindClosure) -> Result<BTreeMap<String, String>, String> {
+    unwind_sources(closure)
+        .into_iter()
+        .map(|(name, path)| Ok((name.to_owned(), sha256(path)?)))
+        .collect()
+}
+
+fn unwind_content_identity(hashes: &BTreeMap<String, String>) -> Result<String, String> {
+    let manifest = hashes
+        .iter()
+        .map(|(name, hash)| format!("{hash}  {name}\n"))
+        .collect::<String>();
+    sha256_bytes(manifest.as_bytes())
+}
+
+fn verify_unwind_buck_input(input: &UnwindBuckInput) -> Result<(), String> {
+    let root_metadata = fs::symlink_metadata(&input.root).map_err(|error| {
+        format!(
+            "declared libunwind input {} is unreadable: {error}",
+            input.root.display()
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("declared libunwind input root must be a real directory".into());
+    }
+    let mut names = fs::read_dir(&input.root)
+        .map_err(|error| format!("cannot enumerate declared libunwind input: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate declared libunwind input: {error}"))?;
+    names.sort();
+    let mut expected_names = vec![
+        OsString::from("BUCK"),
+        OsString::from(UNWIND_ARCH_SONAME),
+        OsString::from(UNWIND_CORE_SONAME),
+        OsString::from(UNWIND_PTRACE_ARCHIVE),
+    ];
+    expected_names.sort();
+    if names != expected_names {
+        return Err(format!(
+            "declared libunwind input {} has unexpected entries {names:?}",
+            input.root.display()
+        ));
+    }
+    for (name, source) in unwind_sources(&input.sources) {
+        let expected = input
+            .source_sha256
+            .get(name)
+            .ok_or_else(|| format!("declared libunwind input lost hash for {name}"))?;
+        reverify_hashed_input(source, expected, &format!("canonical {name} input"), false)?;
+        let copied = require_nonempty_regular_file(
+            &input.root.join(name),
+            &format!("declared {name} snapshot"),
+        )?;
+        if sha256(&copied)? != *expected {
+            return Err(format!(
+                "declared {name} snapshot hash differs from its source identity"
+            ));
+        }
+    }
+    verify_static_archive(&input.root.join(UNWIND_PTRACE_ARCHIVE))?;
+    verify_shared_library(
+        &input.root.join(UNWIND_ARCH_SONAME),
+        UNWIND_ARCH_SONAME,
+        &[UNWIND_CORE_SONAME, "libc.so.6"],
+    )?;
+    verify_shared_library(
+        &input.root.join(UNWIND_CORE_SONAME),
+        UNWIND_CORE_SONAME,
+        &["ld-linux-x86-64.so.2", "libc.so.6"],
+    )?;
+    let buck = fs::read_to_string(require_nonempty_regular_file(
+        &input.root.join("BUCK"),
+        "declared libunwind BUCK package",
+    )?)
+    .map_err(|error| format!("declared libunwind BUCK is unreadable: {error}"))?;
+    if buck != UNWIND_BUCK_PACKAGE {
+        return Err("declared libunwind BUCK package changed after publication".into());
+    }
+    if unwind_content_identity(&input.source_sha256)? != input.identity {
+        return Err("declared libunwind input identity does not match its source hashes".into());
+    }
+    Ok(())
+}
+
+fn publish_unwind_buck_input(
+    root: &Path,
+    evidence_dir: &Path,
+    sources: UnwindClosure,
+) -> Result<UnwindBuckInput, String> {
+    let source_sha256 = unwind_source_hashes(&sources)?;
+    let identity = unwind_content_identity(&source_sha256)?;
+    let parent = root.join("ignored/buck2-link-inputs/unwind");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let published = parent.join(&identity);
+    let target = format!("root//ignored/buck2-link-inputs/unwind/{identity}:unwind");
+    let make_input = |root: PathBuf| UnwindBuckInput {
+        sources: UnwindClosure {
+            ptrace_archive: sources.ptrace_archive.clone(),
+            arch_shared: sources.arch_shared.clone(),
+            core_shared: sources.core_shared.clone(),
+        },
+        source_sha256: source_sha256.clone(),
+        identity: identity.clone(),
+        root,
+        target: target.clone(),
+    };
+    if !published.exists() {
+        let temporary = parent.join(format!(".tmp-{}", unique_identity()?));
+        create_exclusive_directory(&temporary, "temporary declared libunwind input")?;
+        let temporary_input = make_input(temporary.clone());
+        let copy_result = (|| {
+            for (name, source) in unwind_sources(&temporary_input.sources) {
+                let before = sha256(source)?;
+                fs::copy(source, temporary.join(name)).map_err(|error| {
+                    format!("failed to copy declared {name} input: {error}")
+                })?;
+                let after = sha256(source)?;
+                let expected = &temporary_input.source_sha256[name];
+                if before != *expected || after != *expected {
+                    return Err(format!("canonical {name} input changed while snapshotted"));
+                }
+            }
+            write_new_file(
+                &temporary.join("BUCK"),
+                UNWIND_BUCK_PACKAGE.as_bytes(),
+                "declared libunwind BUCK package",
+            )?;
+            verify_unwind_buck_input(&temporary_input)
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &published) {
+            let _ = fs::remove_dir_all(&temporary);
+            if !published.exists() {
+                return Err(format!(
+                    "failed to publish declared libunwind input {}: {error}",
+                    published.display()
+                ));
+            }
+        }
+    }
+    let input = make_input(published);
+    verify_unwind_buck_input(&input)?;
+    let rows = input
+        .source_sha256
+        .iter()
+        .map(|(name, hash)| format!("source\t{name}\t{}\t{hash}\n", match name.as_str() {
+            UNWIND_PTRACE_ARCHIVE => input.sources.ptrace_archive.display().to_string(),
+            UNWIND_ARCH_SONAME => input.sources.arch_shared.display().to_string(),
+            UNWIND_CORE_SONAME => input.sources.core_shared.display().to_string(),
+            _ => unreachable!(),
+        }))
+        .collect::<String>();
+    atomic_write_new(
+        &evidence_dir.join("unwind-input.tsv"),
+        &format!(
+            "schema\thermit-buck-unwind-input/v1\nidentity\t{}\ntarget\t{}\n{}",
+            input.identity, input.target, rows
         ),
     )?;
     Ok(input)
@@ -2374,13 +2711,14 @@ fn verify_install_bundle(
     let mut hashes = Vec::new();
     for (relative, executable) in REQUIRED_RESOURCES {
         let path = bundle.join(relative);
-        let metadata = fs::metadata(&path).map_err(|error| {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
             format!(
                 "Cargo install bundle is incomplete: {} is unavailable ({error}); rebuild hermit-install",
                 path.display()
             )
         })?;
-        if !metadata.is_file()
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
             || metadata.len() == 0
             || (executable && metadata.permissions().mode() & 0o111 == 0)
         {
@@ -2471,6 +2809,196 @@ fn validate_release_needed_libraries(libraries: &BTreeSet<String>) -> Result<(),
         let unexpected = libraries.difference(&expected).cloned().collect::<Vec<_>>();
         return Err(format!(
             "Buck validate candidate DT_NEEDED set differs from the reviewed portable contract; missing={missing:?} unexpected={unexpected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_rpath(path: &Path) -> Result<(), String> {
+    let rpath = dynamic_values(path, "RPATH")?;
+    let runpath = dynamic_values(path, "RUNPATH")?;
+    if rpath != [RELEASE_RPATH] || !runpath.is_empty() {
+        return Err(format!(
+            "Buck release candidate must carry exactly DT_RPATH {RELEASE_RPATH:?} and no DT_RUNPATH; rpath={rpath:?} runpath={runpath:?}"
+        ));
+    }
+    let components = RELEASE_RPATH.split(':').collect::<Vec<_>>();
+    if components
+        != [
+            "$ORIGIN/../install_pkg/rsrcs/hermit-runtime",
+            "$ORIGIN/install/rsrcs/hermit-runtime",
+        ]
+        || components.iter().any(|component| {
+            component.is_empty()
+                || component.starts_with('/')
+                || !component.starts_with("$ORIGIN/")
+        })
+    {
+        return Err("reviewed Buck release RPATH contains an ambient or absolute component".into());
+    }
+    Ok(())
+}
+
+fn runtime_hashes(input: &UnwindBuckInput) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            UNWIND_ARCH_SONAME.to_owned(),
+            input.source_sha256[UNWIND_ARCH_SONAME].clone(),
+        ),
+        (
+            UNWIND_CORE_SONAME.to_owned(),
+            input.source_sha256[UNWIND_CORE_SONAME].clone(),
+        ),
+    ])
+}
+
+fn verify_runtime_directory(
+    runtime: &Path,
+    expected: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let metadata = fs::symlink_metadata(runtime).map_err(|error| {
+        format!(
+            "Hermit runtime directory {} is unavailable: {error}",
+            runtime.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Hermit runtime bundle must be a real directory".into());
+    }
+    let mut names = fs::read_dir(runtime)
+        .map_err(|error| format!("cannot enumerate Hermit runtime bundle: {error}"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate Hermit runtime bundle: {error}"))?;
+    names.sort();
+    let mut expected_names = vec![
+        OsString::from(UNWIND_ARCH_SONAME),
+        OsString::from(UNWIND_CORE_SONAME),
+    ];
+    expected_names.sort();
+    if names != expected_names {
+        return Err(format!(
+            "Hermit runtime bundle has unexpected entries {names:?}"
+        ));
+    }
+    let arch = require_nonempty_regular_file(
+        &runtime.join(UNWIND_ARCH_SONAME),
+        "installed libunwind architecture runtime",
+    )?;
+    let core = require_nonempty_regular_file(
+        &runtime.join(UNWIND_CORE_SONAME),
+        "installed libunwind core runtime",
+    )?;
+    verify_shared_library(
+        &arch,
+        UNWIND_ARCH_SONAME,
+        &[UNWIND_CORE_SONAME, "libc.so.6"],
+    )?;
+    verify_shared_library(
+        &core,
+        UNWIND_CORE_SONAME,
+        &["ld-linux-x86-64.so.2", "libc.so.6"],
+    )?;
+    let actual = BTreeMap::from([
+        (UNWIND_ARCH_SONAME.to_owned(), sha256(&arch)?),
+        (UNWIND_CORE_SONAME.to_owned(), sha256(&core)?),
+    ]);
+    if &actual != expected {
+        return Err(format!(
+            "Hermit runtime hashes differ from the declared unwind closure; expected={expected:?} actual={actual:?}"
+        ));
+    }
+    Ok(actual)
+}
+
+fn verify_runtime_install(
+    install: &Path,
+    expected: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    verify_runtime_directory(&install.join(UNWIND_RUNTIME_RELATIVE), expected)
+}
+
+fn install_runtime_bundle(
+    install: &Path,
+    input: &UnwindBuckInput,
+) -> Result<BTreeMap<String, String>, String> {
+    verify_unwind_buck_input(input)?;
+    let parent = install.join("rsrcs");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let destination = parent.join("hermit-runtime");
+    let temporary = parent.join(format!(".hermit-runtime.tmp-{}", unique_identity()?));
+    create_exclusive_directory(&temporary, "temporary Hermit runtime bundle")?;
+    let result = (|| {
+        for name in [UNWIND_ARCH_SONAME, UNWIND_CORE_SONAME] {
+            let source = input.root.join(name);
+            let expected = &input.source_sha256[name];
+            let before = sha256(&source)?;
+            fs::copy(&source, temporary.join(name))
+                .map_err(|error| format!("failed to copy runtime {name}: {error}"))?;
+            let after = sha256(&source)?;
+            if before != *expected
+                || after != *expected
+                || sha256(&temporary.join(name))? != *expected
+            {
+                return Err(format!("runtime {name} changed while copied"));
+            }
+        }
+        verify_runtime_directory(&temporary, &runtime_hashes(input))
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&destination).map_err(|error| {
+                format!("failed to replace {}: {error}", destination.display())
+            })?;
+        } else {
+            fs::remove_file(&destination).map_err(|error| {
+                format!("failed to replace {}: {error}", destination.display())
+            })?;
+        }
+    }
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_dir_all(&temporary);
+        format!(
+            "failed to publish Hermit runtime bundle {}: {error}",
+            destination.display()
+        )
+    })?;
+    let actual = verify_runtime_install(install, &runtime_hashes(input))?;
+    verify_unwind_buck_input(input)?;
+    Ok(actual)
+}
+
+fn prepare_runtime_install(
+    evidence_dir: &Path,
+    input: &UnwindBuckInput,
+) -> Result<PathBuf, String> {
+    let install = evidence_dir.join("runtime-install");
+    create_exclusive_directory(&install, "runtime-only install bundle")?;
+    install_runtime_bundle(&install, input)?;
+    Ok(install)
+}
+
+fn loader_probe(binary: &Path, description: &str) -> Result<(), String> {
+    validate_release_rpath(binary)?;
+    let output = Command::new("env")
+        .args(["-u", "LD_LIBRARY_PATH"])
+        .arg("timeout")
+        .args(["--signal=TERM", "--kill-after=2s", "10s"])
+        .arg(binary)
+        .args(["version", "--json"])
+        .output()
+        .map_err(|error| format!("failed to start {description}: {error}"))?;
+    if !output.status.success() || !output.stderr.is_empty() || output.stdout.is_empty() {
+        return Err(format!(
+            "{description} failed without LD_LIBRARY_PATH: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         ));
     }
     Ok(())
@@ -2656,6 +3184,7 @@ fn publish_verified_bundle(
     name: &str,
     binary: &Path,
     install_bundle: &Path,
+    runtime_install: &Path,
 ) -> Result<PublishedBundle, String> {
     let artifact_root = evidence_dir.join(format!("{name}-artifacts"));
     let pointer = evidence_dir.join(format!("{name}-artifact.path"));
@@ -2665,6 +3194,8 @@ fn publish_verified_bundle(
             artifact_root.as_os_str(),
             pointer.as_os_str(),
             install_bundle.as_os_str(),
+            OsStr::new("--runtime-overlay"),
+            runtime_install.as_os_str(),
         ]),
         &format!("publish isolated {name} shadow bundle"),
     )?;
@@ -3843,6 +4374,10 @@ struct FinalReceiptFacts {
     buck_executable_sha256: String,
     lzma_input: String,
     lzma_input_sha256: String,
+    unwind_input_identity: String,
+    unwind_ptrace_sha256: String,
+    unwind_arch_sha256: String,
+    unwind_core_sha256: String,
     generated_buck_sha256: String,
     safehermit_sha256: String,
     bounded_run_space_sha256: String,
@@ -3883,6 +4418,7 @@ struct FinalReceiptContext<'a> {
     lzma_input: &'a Path,
     lzma_input_sha256: &'a str,
     lzma_buck_input: &'a LzmaBuckInput,
+    unwind_buck_input: &'a UnwindBuckInput,
     generated_buck: &'a Path,
     generated_buck_sha256: &'a str,
 }
@@ -3909,6 +4445,10 @@ fn validate_receipt_facts(facts: &FinalReceiptFacts) -> Result<(), String> {
         &facts.buck_descriptor_sha256,
         &facts.buck_executable_sha256,
         &facts.lzma_input_sha256,
+        &facts.unwind_input_identity,
+        &facts.unwind_ptrace_sha256,
+        &facts.unwind_arch_sha256,
+        &facts.unwind_core_sha256,
         &facts.generated_buck_sha256,
         &facts.safehermit_sha256,
         &facts.bounded_run_space_sha256,
@@ -4850,6 +5390,7 @@ fn recompute_final_receipt(
         false,
     )?;
     verify_lzma_buck_input(context.lzma_buck_input)?;
+    verify_unwind_buck_input(context.unwind_buck_input)?;
     reverify_hashed_input(
         context.generated_buck,
         context.generated_buck_sha256,
@@ -4951,6 +5492,13 @@ fn recompute_final_receipt(
         buck_executable_sha256: context.buck_executable_snapshot.sha256.clone(),
         lzma_input: context.lzma_input.to_string_lossy().into_owned(),
         lzma_input_sha256: context.lzma_input_sha256.to_owned(),
+        unwind_input_identity: context.unwind_buck_input.identity.clone(),
+        unwind_ptrace_sha256: context.unwind_buck_input.source_sha256[UNWIND_PTRACE_ARCHIVE]
+            .clone(),
+        unwind_arch_sha256: context.unwind_buck_input.source_sha256[UNWIND_ARCH_SONAME]
+            .clone(),
+        unwind_core_sha256: context.unwind_buck_input.source_sha256[UNWIND_CORE_SONAME]
+            .clone(),
         generated_buck_sha256: context.generated_buck_sha256.to_owned(),
         safehermit_sha256: sha256(&context.safehermit_bundle.launcher)?,
         bounded_run_space_sha256: sha256(&context.safehermit_bundle.bounded_run_space)?,
@@ -5006,7 +5554,7 @@ fn validate_bound_hashes(
 
 fn parse_final_receipt(text: &str) -> Result<FinalReceiptDocument, String> {
     let document: FinalReceiptDocument = decode_typed_json(text, "final shadow parity receipt")?;
-    if document.receipt_schema != "hermit-buck-shadow-parity/v1" {
+    if document.receipt_schema != "hermit-buck-shadow-parity/v2" {
         return Err(format!(
             "unknown final receipt schema {:?}",
             document.receipt_schema
@@ -5024,7 +5572,7 @@ fn render_final_receipt(
     artifacts: &BTreeMap<String, String>,
 ) -> Result<String, String> {
     let document = FinalReceiptDocument {
-        receipt_schema: "hermit-buck-shadow-parity/v1".to_owned(),
+        receipt_schema: "hermit-buck-shadow-parity/v2".to_owned(),
         facts: facts.clone(),
         resource_sha256: resources.clone(),
         artifact_sha256: artifacts.clone(),
@@ -5146,7 +5694,7 @@ fn replace_text_file(path: &Path, contents: &[u8], description: &str) -> Result<
     })
 }
 
-fn validate_artifact_identity(root: &Path) -> Result<PathBuf, String> {
+fn validate_artifact_identity(root: &Path) -> Result<ValidateArtifact, String> {
     let identity_path = root.join(VALIDATE_ARTIFACT_IDENTITY);
     let document = fs::read_to_string(&identity_path).map_err(|error| {
         format!(
@@ -5155,8 +5703,10 @@ fn validate_artifact_identity(root: &Path) -> Result<PathBuf, String> {
         )
     })?;
     let rows = document.lines().collect::<Vec<_>>();
-    let [schema, head, identity, binary_sha256] = rows.as_slice() else {
-        return Err("Buck validate artifact identity document must contain exactly four rows".into());
+    let [schema, head, identity, binary_sha256, resources_sha256, arch_sha256, core_sha256] =
+        rows.as_slice()
+    else {
+        return Err("Buck validate artifact identity document must contain exactly seven rows".into());
     };
     let schema = schema.strip_prefix("schema\t").unwrap_or_default();
     let head = head.strip_prefix("head\t").unwrap_or_default();
@@ -5164,6 +5714,16 @@ fn validate_artifact_identity(root: &Path) -> Result<PathBuf, String> {
     let binary_sha256 = binary_sha256
         .strip_prefix("binary_sha256\t")
         .unwrap_or_default();
+    let resources_sha256 = resources_sha256
+        .strip_prefix("resources_sha256\t")
+        .unwrap_or_default();
+    let parse_runtime = |row: &str, name: &str| {
+        row.strip_prefix(&format!("runtime_sha256\t{name}\t"))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let arch_sha256 = parse_runtime(arch_sha256, UNWIND_ARCH_SONAME);
+    let core_sha256 = parse_runtime(core_sha256, UNWIND_CORE_SONAME);
     let lowercase_sha256 = |value: &str| {
         value.len() == 64
             && value
@@ -5171,11 +5731,14 @@ fn validate_artifact_identity(root: &Path) -> Result<PathBuf, String> {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
     if !document.ends_with('\n')
-        || schema != "hermit-buck-validate-selector/v1"
+        || schema != "hermit-buck-validate-selector/v2"
         || head.len() != 40
         || !head.bytes().all(|byte| byte.is_ascii_hexdigit())
         || !lowercase_sha256(identity)
         || !lowercase_sha256(binary_sha256)
+        || !lowercase_sha256(resources_sha256)
+        || !lowercase_sha256(&arch_sha256)
+        || !lowercase_sha256(&core_sha256)
     {
         return Err("Buck validate artifact identity document has invalid typed fields".into());
     }
@@ -5205,7 +5768,41 @@ fn validate_artifact_identity(root: &Path) -> Result<PathBuf, String> {
     if sha256(&binary)? != binary_sha256 {
         return Err("Buck validate selector binary hash does not match the verified bundle".into());
     }
-    Ok(binary)
+    validate_release_needed_libraries(&needed_libraries(&binary)?)?;
+    validate_release_rpath(&binary)?;
+    let resources = resolved.join("resources.sha256");
+    if sha256(&resources)? != resources_sha256 {
+        return Err("Buck validate selector resource manifest hash does not match the verified bundle".into());
+    }
+    let runtime_sha256 = BTreeMap::from([
+        (UNWIND_ARCH_SONAME.to_owned(), arch_sha256.clone()),
+        (UNWIND_CORE_SONAME.to_owned(), core_sha256.clone()),
+    ]);
+    let install = resolved.join("install");
+    verify_runtime_install(&install, &runtime_sha256)?;
+    let inventory = parse_resource_manifest(&resources, "Buck validate runtime resource manifest")?;
+    let expected_inventory = BTreeMap::from([
+        (
+            format!("rsrcs/hermit-runtime/{UNWIND_ARCH_SONAME}"),
+            arch_sha256,
+        ),
+        (
+            format!("rsrcs/hermit-runtime/{UNWIND_CORE_SONAME}"),
+            core_sha256,
+        ),
+    ]);
+    if inventory != expected_inventory {
+        return Err("Buck validate runtime resource manifest has a missing or extra entry".into());
+    }
+    Ok(ValidateArtifact {
+        bundle: resolved,
+        binary,
+        install,
+        identity: identity.to_owned(),
+        binary_sha256: binary_sha256.to_owned(),
+        resources_sha256: resources_sha256.to_owned(),
+        runtime_sha256,
+    })
 }
 
 fn replace_validate_output(root: &Path, source: &Path, relative: &str) -> Result<String, String> {
@@ -5239,12 +5836,60 @@ fn replace_validate_output(root: &Path, source: &Path, relative: &str) -> Result
 }
 
 fn install_validate_dag_artifact(root: &Path) -> Result<String, String> {
-    let source = validate_artifact_identity(root)?;
-    let release_hash = replace_validate_output(root, &source, "target/release/hermit")?;
-    let strict_hash = replace_validate_output(root, &source, "target/ci/hermit-strict")?;
+    let artifact = validate_artifact_identity(root)?;
+    let release_hash = replace_validate_output(root, &artifact.binary, "target/release/hermit")?;
+    let strict_hash = replace_validate_output(root, &artifact.binary, "target/ci/hermit-strict")?;
     if release_hash != strict_hash {
         return Err("release and strict Buck validate artifact copies differ".into());
     }
+    let install = root.join("target/install_pkg");
+    let parent = install.join("rsrcs");
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let temporary = parent.join(format!(".hermit-runtime.tmp-{}", unique_identity()?));
+    create_exclusive_directory(&temporary, "temporary installed Hermit runtime")?;
+    let copy_result = (|| {
+        for name in [UNWIND_ARCH_SONAME, UNWIND_CORE_SONAME] {
+            let source = artifact.install.join(UNWIND_RUNTIME_RELATIVE).join(name);
+            let expected = &artifact.runtime_sha256[name];
+            let before = sha256(&source)?;
+            fs::copy(&source, temporary.join(name))
+                .map_err(|error| format!("failed to install runtime {name}: {error}"))?;
+            let after = sha256(&source)?;
+            if before != *expected
+                || after != *expected
+                || sha256(&temporary.join(name))? != *expected
+            {
+                return Err(format!("runtime {name} changed during atomic installation"));
+            }
+        }
+        verify_runtime_directory(&temporary, &artifact.runtime_sha256)
+    })();
+    if let Err(error) = copy_result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    let destination = parent.join("hermit-runtime");
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&destination).map_err(|error| {
+                format!("failed to replace {}: {error}", destination.display())
+            })?;
+        } else {
+            fs::remove_file(&destination).map_err(|error| {
+                format!("failed to replace {}: {error}", destination.display())
+            })?;
+        }
+    }
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_dir_all(&temporary);
+        format!("failed to publish {}: {error}", destination.display())
+    })?;
+    verify_runtime_install(&install, &artifact.runtime_sha256)?;
+    validate_artifact_identity(root)?;
+    loader_probe(&root.join("target/release/hermit"), "direct release Hermit loader probe")?;
+    loader_probe(&root.join("target/ci/hermit-strict"), "direct strict Hermit loader probe")?;
+    loader_probe(&artifact.binary, "published Buck artifact loader probe")?;
     Ok(strict_hash)
 }
 
@@ -5299,6 +5944,8 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     let lzma_input = require_lzma_link_input()?;
     let lzma_hash = sha256(&lzma_input)?;
     let lzma_buck_input = publish_lzma_buck_input(&root, &evidence_dir, &lzma_input)?;
+    let unwind_buck_input =
+        publish_unwind_buck_input(&root, &evidence_dir, require_unwind_closure()?)?;
 
     checked_output(
         Command::new(root.join("bootstrap/regenerate-rust-deps")).current_dir(&root),
@@ -5327,6 +5974,11 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
             &format!("hermit_release.reverie_sha={}", provenance.reverie_sha),
             "-c",
             &format!("hermit_release.lzma_target={}", lzma_buck_input.target),
+            "-c",
+            &format!(
+                "hermit_release.unwind_target={}",
+                unwind_buck_input.target
+            ),
             TARGET,
         ])
         .output()
@@ -5359,6 +6011,7 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     }
     let candidate_needed = needed_libraries(&candidate)?;
     validate_release_needed_libraries(&candidate_needed)?;
+    validate_release_rpath(&candidate)?;
     atomic_write_new(
         &evidence_dir.join("buck-needed-libraries.tsv"),
         &format!(
@@ -5369,28 +6022,6 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
                 .collect::<String>()
         ),
     )?;
-    let version = checked_output(
-        Command::new("timeout")
-            .args(["--signal=TERM", "--kill-after=2s", "10s"])
-            .arg(&candidate)
-            .args(["version", "--json"]),
-        "bounded Buck validate candidate version probe",
-    )?;
-    if !version.stderr.is_empty() {
-        return Err("Buck validate candidate version probe wrote unexpected stderr".into());
-    }
-    let observed = decode_build_info(
-        &String::from_utf8(version.stdout)
-            .map_err(|error| format!("Buck validate version output was not UTF-8: {error}"))?,
-        &provenance.version,
-        &provenance.hermit_sha,
-        "Buck validate version JSON",
-    )?;
-    if observed != expected_info {
-        return Err(
-            "Buck validate candidate provenance/features differ from requested values".into(),
-        );
-    }
     reverify_input_snapshot(&dotslash_snapshot, "DotSlash launcher")?;
     reverify_input_snapshot(&descriptor, "Buck2 descriptor")?;
     reverify_input_snapshot(&buck_snapshot, "Buck2 executable")?;
@@ -5402,6 +6033,7 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     )?;
     reverify_hashed_input(&lzma_input, &lzma_hash, "liblzma link input", false)?;
     verify_lzma_buck_input(&lzma_buck_input)?;
+    verify_unwind_buck_input(&unwind_buck_input)?;
     let (final_provenance, final_expected_info) = validate_dag_provenance(&root)?;
     if final_provenance != provenance || final_expected_info != expected_info {
         return Err(
@@ -5412,11 +6044,14 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
 
     let artifact_root = root.join(VALIDATE_ARTIFACT_ROOT);
     let pointer = evidence_dir.join("published-artifact.path");
+    let runtime_install = prepare_runtime_install(&evidence_dir, &unwind_buck_input)?;
     checked_output(
         Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
             candidate.as_os_str(),
             artifact_root.as_os_str(),
             pointer.as_os_str(),
+            OsStr::new("--runtime-only"),
+            runtime_install.as_os_str(),
         ]),
         "publish content-addressed Buck validate artifact",
     )?;
@@ -5435,8 +6070,15 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     replace_text_file(
         &root.join(VALIDATE_ARTIFACT_IDENTITY),
         format!(
-            "schema\thermit-buck-validate-selector/v1\nhead\t{}\nidentity\t{}\nbinary_sha256\t{}\n",
-            provenance.hermit_full_sha, identity, build_evidence.output_sha256
+            "schema\thermit-buck-validate-selector/v2\nhead\t{}\nidentity\t{}\nbinary_sha256\t{}\nresources_sha256\t{}\nruntime_sha256\t{}\t{}\nruntime_sha256\t{}\t{}\n",
+            provenance.hermit_full_sha,
+            identity,
+            build_evidence.output_sha256,
+            sha256(&bundle.join("resources.sha256"))?,
+            UNWIND_ARCH_SONAME,
+            unwind_buck_input.source_sha256[UNWIND_ARCH_SONAME],
+            UNWIND_CORE_SONAME,
+            unwind_buck_input.source_sha256[UNWIND_CORE_SONAME],
         )
         .as_bytes(),
         "current Buck validate artifact identity",
@@ -5445,11 +6087,43 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     if installed_hash != build_evidence.output_sha256 {
         return Err("installed Buck validate artifact differs from reconciled Buck output".into());
     }
+    let version = checked_output(
+        Command::new("env")
+            .args(["-u", "LD_LIBRARY_PATH"])
+            .arg("timeout")
+            .args(["--signal=TERM", "--kill-after=2s", "10s"])
+            .arg(root.join("target/ci/hermit-strict"))
+            .args(["version", "--json"]),
+        "bounded installed Buck validate candidate version probe",
+    )?;
+    if !version.stderr.is_empty() {
+        return Err("Buck validate candidate version probe wrote unexpected stderr".into());
+    }
+    let observed = decode_build_info(
+        &String::from_utf8(version.stdout)
+            .map_err(|error| format!("Buck validate version output was not UTF-8: {error}"))?,
+        &provenance.version,
+        &provenance.hermit_sha,
+        "Buck validate version JSON",
+    )?;
+    if observed != expected_info {
+        return Err(
+            "Buck validate candidate provenance/features differ from requested values".into(),
+        );
+    }
     atomic_write_new(
         &evidence_dir.join("validate-artifact.tsv"),
         &format!(
-            "schema\thermit-buck-validate-artifact/v1\nhead\t{}\ntarget\t{}\nidentity\t{}\nsha256\t{}\n",
-            provenance.hermit_full_sha, TARGET, identity, installed_hash
+            "schema\thermit-buck-validate-artifact/v1\nhead\t{}\ntarget\t{}\nidentity\t{}\nsha256\t{}\nresources_sha256\t{}\nruntime_sha256\t{}\t{}\nruntime_sha256\t{}\t{}\n",
+            provenance.hermit_full_sha,
+            TARGET,
+            identity,
+            installed_hash,
+            sha256(&bundle.join("resources.sha256"))?,
+            UNWIND_ARCH_SONAME,
+            unwind_buck_input.source_sha256[UNWIND_ARCH_SONAME],
+            UNWIND_CORE_SONAME,
+            unwind_buck_input.source_sha256[UNWIND_CORE_SONAME],
         ),
     )?;
     println!(
@@ -5503,12 +6177,16 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
             "--dotslash must be the documented public {DOTSLASH_VERSION}, got {dotslash_version:?}; install the pinned launcher from docs/BUCK2_OSS.md"
         ));
     }
+    let unwind_buck_input =
+        publish_unwind_buck_input(&root, &evidence_dir, require_unwind_closure()?)?;
+    let runtime_install = prepare_runtime_install(&evidence_dir, &unwind_buck_input)?;
     let cargo_bundle = publish_verified_bundle(
         &root,
         &evidence_dir,
         "cargo",
         &caller_cargo_binary,
         &caller_install_bundle,
+        &runtime_install,
     )?;
     drop(caller_cargo_binary);
     drop(caller_install_bundle);
@@ -5608,6 +6286,11 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
             &format!("hermit_release.reverie_sha={}", provenance.reverie_sha),
             "-c",
             &format!("hermit_release.lzma_target={}", lzma_buck_input.target),
+            "-c",
+            &format!(
+                "hermit_release.unwind_target={}",
+                unwind_buck_input.target
+            ),
             TARGET,
         ])
         .output()
@@ -5640,6 +6323,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         false,
     )?;
     verify_lzma_buck_input(&lzma_buck_input)?;
+    verify_unwind_buck_input(&unwind_buck_input)?;
     validate_log_header(&event_log)?;
     let summary = output_text(
         Command::new(&buck_executable)
@@ -5662,6 +6346,8 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     let build_stdout = String::from_utf8(build.stdout)
         .map_err(|error| format!("Buck build output was not UTF-8: {error}"))?;
     let buck_binary = resolve_release_show_output(&build_stdout, &root)?;
+    validate_release_needed_libraries(&needed_libraries(&buck_binary)?)?;
+    validate_release_rpath(&buck_binary)?;
 
     let buck_bundle = publish_verified_bundle(
         &root,
@@ -5669,6 +6355,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         "buck",
         &buck_binary,
         &cargo_bundle.install,
+        &runtime_install,
     )?;
     require_equal_resource_manifests(&cargo_bundle, &buck_bundle)?;
 
@@ -5860,6 +6547,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         lzma_input: &lzma_input,
         lzma_input_sha256: &lzma_input_hash,
         lzma_buck_input: &lzma_buck_input,
+        unwind_buck_input: &unwind_buck_input,
         generated_buck: &generated_buck,
         generated_buck_sha256: &generated_buck_hash,
     };
@@ -6151,6 +6839,10 @@ mod tests {
             buck_executable_sha256: hash.clone(),
             lzma_input: "/fixture/liblzma.so".to_owned(),
             lzma_input_sha256: hash.clone(),
+            unwind_input_identity: hash.clone(),
+            unwind_ptrace_sha256: hash.clone(),
+            unwind_arch_sha256: hash.clone(),
+            unwind_core_sha256: hash.clone(),
             generated_buck_sha256: hash.clone(),
             safehermit_sha256: hash.clone(),
             bounded_run_space_sha256: hash.clone(),
@@ -6975,6 +7667,9 @@ mod tests {
         fs::create_dir_all(&fixture).unwrap();
         fs::create_dir(&fake_bin).unwrap();
         write_complete_install(&install, &"1".repeat(40));
+        // This is the ordinary non-ELF publisher fixture. Its resource set must
+        // not carry the Buck-only runtime closure before reaching the copy race.
+        fs::remove_dir_all(install.join(UNWIND_RUNTIME_RELATIVE)).unwrap();
         write_executable(&binary, b"#!/bin/sh\nexit 0\n");
         write_executable(
             &fake_bin.join("cp"),
@@ -7221,9 +7916,30 @@ mod tests {
             .unwrap();
         }
         let candidate = root.join("candidate-hermit");
-        write_executable(&candidate, b"#!/bin/sh\nprintf 'buck-phase-two\\n'\n");
+        let candidate_source = root.join("candidate.c");
+        fs::write(
+            &candidate_source,
+            b"#include <stdio.h>\nint main(void) { puts(\"{}\"); return 0; }\n",
+        )
+        .unwrap();
+        checked_output(
+            Command::new("gcc")
+                .arg(&candidate_source)
+                .args([
+                    "-Wl,--no-as-needed",
+                    "-lgcc_s",
+                    "-lm",
+                    "-Wl,-l:libunwind-x86_64.so.8",
+                    "-Wl,-l:ld-linux-x86-64.so.2",
+                    &format!("-Wl,--disable-new-dtags,-rpath,{RELEASE_RPATH}"),
+                    "-o",
+                ])
+                .arg(&candidate),
+            "compile fixture Buck release ELF",
+        )
+        .unwrap();
         checked_output(Command::new("git").current_dir(&root).arg("init"), "init fixture Git repository").unwrap();
-        checked_output(Command::new("git").current_dir(&root).args(["add", "ci", "candidate-hermit"]), "stage fixture repository").unwrap();
+        checked_output(Command::new("git").current_dir(&root).args(["add", "ci", "candidate-hermit", "candidate.c"]), "stage fixture repository").unwrap();
         checked_output(
             Command::new("git").current_dir(&root).args([
                 "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
@@ -7234,11 +7950,20 @@ mod tests {
         let head = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let pointer = root.join("ignored/buck2-phase2/test-publisher.path");
         fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        let unwind = publish_unwind_buck_input(
+            &root,
+            pointer.parent().unwrap(),
+            require_unwind_closure().unwrap(),
+        )
+        .unwrap();
+        let runtime_install = prepare_runtime_install(pointer.parent().unwrap(), &unwind).unwrap();
         checked_output(
             Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
                 candidate.as_os_str(),
                 root.join(VALIDATE_ARTIFACT_ROOT).as_os_str(),
                 pointer.as_os_str(),
+                OsStr::new("--runtime-only"),
+                runtime_install.as_os_str(),
             ]),
             "fixture Buck validate artifact publication",
         )
@@ -7246,8 +7971,11 @@ mod tests {
         let bundle = PathBuf::from(fs::read_to_string(&pointer).unwrap().trim());
         let identity = bundle.file_name().unwrap().to_str().unwrap();
         let expected = sha256(&candidate).unwrap();
+        let resources_sha256 = sha256(&bundle.join("resources.sha256")).unwrap();
         let selector = format!(
-            "schema\thermit-buck-validate-selector/v1\nhead\t{head}\nidentity\t{identity}\nbinary_sha256\t{expected}\n"
+            "schema\thermit-buck-validate-selector/v2\nhead\t{head}\nidentity\t{identity}\nbinary_sha256\t{expected}\nresources_sha256\t{resources_sha256}\nruntime_sha256\t{UNWIND_ARCH_SONAME}\t{}\nruntime_sha256\t{UNWIND_CORE_SONAME}\t{}\n",
+            unwind.source_sha256[UNWIND_ARCH_SONAME],
+            unwind.source_sha256[UNWIND_CORE_SONAME],
         );
         replace_text_file(
             &root.join(VALIDATE_ARTIFACT_IDENTITY),
@@ -7265,6 +7993,97 @@ mod tests {
             sha256(&root.join("target/ci/hermit-strict")).unwrap(),
             expected
         );
+        assert_eq!(
+            verify_runtime_install(
+                &root.join("target/install_pkg"),
+                &runtime_hashes(&unwind),
+            )
+            .unwrap(),
+            runtime_hashes(&unwind),
+        );
+
+        let complete_install = root.join("complete-install");
+        write_complete_install(&complete_install, &"1".repeat(40));
+        let complete_pointer = root.join("ignored/buck2-phase2/complete-artifact.path");
+        checked_output(
+            Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
+                candidate.as_os_str(),
+                root.join("complete-artifacts").as_os_str(),
+                complete_pointer.as_os_str(),
+                complete_install.as_os_str(),
+            ]),
+            "fixture complete Buck artifact publication",
+        )
+        .unwrap();
+        let complete_bundle = PathBuf::from(fs::read_to_string(&complete_pointer).unwrap().trim());
+        assert_eq!(
+            fs::read_to_string(complete_bundle.join("runtime-contract")).unwrap(),
+            "elf-rpath-v1\n"
+        );
+        let extra_runtime = complete_install.join(UNWIND_RUNTIME_RELATIVE).join("extra.so");
+        fs::write(&extra_runtime, b"extra runtime\n").unwrap();
+        let extra_failure = checked_output(
+            Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
+                candidate.as_os_str(),
+                root.join("extra-runtime-artifacts").as_os_str(),
+                root.join("ignored/buck2-phase2/extra-runtime.path")
+                    .as_os_str(),
+                complete_install.as_os_str(),
+            ]),
+            "refuse an extra Buck runtime resource",
+        )
+        .unwrap_err();
+        assert!(
+            extra_failure.contains("outside the exact unwind closure"),
+            "{extra_failure}"
+        );
+        fs::remove_file(extra_runtime).unwrap();
+        let fake_bin = root.join("fake-readelf-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        write_executable(&fake_bin.join("readelf"), b"#!/bin/sh\nexit 1\n");
+        let readelf_failure = checked_output(
+            Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
+                .args([
+                    candidate.as_os_str(),
+                    root.join("readelf-failure-artifacts").as_os_str(),
+                    root.join("ignored/buck2-phase2/readelf-failure.path")
+                        .as_os_str(),
+                    complete_install.as_os_str(),
+                ])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        fake_bin.display(),
+                        env::var("PATH").unwrap_or_default()
+                    ),
+                ),
+            "refuse an unreadable ELF dynamic contract",
+        )
+        .unwrap_err();
+        assert!(
+            readelf_failure.contains("cannot read selected Hermit dynamic contract"),
+            "{readelf_failure}"
+        );
+        for soname in [UNWIND_ARCH_SONAME, UNWIND_CORE_SONAME] {
+            assert!(complete_bundle
+                .join("install")
+                .join(UNWIND_RUNTIME_RELATIVE)
+                .join(soname)
+                .is_file());
+        }
+        fs::remove_file(
+            complete_bundle
+                .join("install")
+                .join(UNWIND_RUNTIME_RELATIVE)
+                .join(UNWIND_CORE_SONAME),
+        )
+        .unwrap();
+        assert!(checked_output(
+            Command::new(root.join("ci/verify-hermit-e2e-artifact.sh")).arg(&complete_pointer),
+            "refuse incomplete complete Buck artifact",
+        )
+        .is_err());
 
         fs::write(root.join(VALIDATE_ARTIFACT_IDENTITY), b"not-a-digest\n").unwrap();
         assert!(install_validate_dag_artifact(&root).is_err());
@@ -7322,14 +8141,153 @@ mod tests {
     }
 
     #[test]
-    fn release_buck_target_uses_a_declared_lzma_dependency_not_host_link_flags() {
+    fn unwind_closure_is_exact_content_addressed_and_mutation_guarded() {
+        let root = fixture_root("unwind-declared-input");
+        let source_root = root.join("sources");
+        let evidence = root.join("ignored/evidence");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&evidence).unwrap();
+        let host = require_unwind_closure().unwrap();
+        for (name, source) in unwind_sources(&host) {
+            fs::copy(source, source_root.join(name)).unwrap();
+        }
+        let sources = UnwindClosure {
+            ptrace_archive: source_root.join(UNWIND_PTRACE_ARCHIVE),
+            arch_shared: source_root.join(UNWIND_ARCH_SONAME),
+            core_shared: source_root.join(UNWIND_CORE_SONAME),
+        };
+        let input = publish_unwind_buck_input(&root, &evidence, sources).unwrap();
+        assert!(input
+            .target
+            .starts_with("root//ignored/buck2-link-inputs/unwind/"));
+        assert!(input.target.ends_with(":unwind"));
+        assert_eq!(input.root.file_name().unwrap(), input.identity.as_str());
+        verify_unwind_buck_input(&input).unwrap();
+
+        let restore = |name: &str, source: &Path| {
+            let path = input.root.join(name);
+            let _ = fs::remove_file(&path);
+            fs::copy(source, path).unwrap();
+        };
+        fs::write(input.root.join("unexpected"), b"extra\n").unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        fs::remove_file(input.root.join("unexpected")).unwrap();
+
+        fs::remove_file(input.root.join(UNWIND_CORE_SONAME)).unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        restore(UNWIND_CORE_SONAME, &input.sources.core_shared);
+
+        fs::write(input.root.join(UNWIND_ARCH_SONAME), b"tampered\n").unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        restore(UNWIND_ARCH_SONAME, &input.sources.arch_shared);
+
+        fs::copy(
+            &input.sources.core_shared,
+            input.root.join(UNWIND_ARCH_SONAME),
+        )
+        .unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        assert!(verify_shared_library(
+            &input.root.join(UNWIND_ARCH_SONAME),
+            UNWIND_ARCH_SONAME,
+            &[UNWIND_CORE_SONAME, "libc.so.6"],
+        )
+        .unwrap_err()
+        .contains("SONAME"));
+        restore(UNWIND_ARCH_SONAME, &input.sources.arch_shared);
+
+        fs::remove_file(input.root.join(UNWIND_ARCH_SONAME)).unwrap();
+        std::os::unix::fs::symlink(
+            &input.sources.arch_shared,
+            input.root.join(UNWIND_ARCH_SONAME),
+        )
+        .unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        restore(UNWIND_ARCH_SONAME, &input.sources.arch_shared);
+
+        fs::write(input.root.join("BUCK"), b"prebuilt_cxx_library(name = \"decoy\")\n")
+            .unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        fs::write(input.root.join("BUCK"), UNWIND_BUCK_PACKAGE).unwrap();
+
+        let runtime = prepare_runtime_install(&evidence, &input).unwrap();
+        let expected_runtime = runtime_hashes(&input);
+        verify_runtime_install(&runtime, &expected_runtime).unwrap();
+        let runtime_root = runtime.join(UNWIND_RUNTIME_RELATIVE);
+        fs::write(runtime_root.join("extra.so"), b"extra\n").unwrap();
+        assert!(verify_runtime_install(&runtime, &expected_runtime).is_err());
+        fs::remove_file(runtime_root.join("extra.so")).unwrap();
+        fs::remove_file(runtime_root.join(UNWIND_CORE_SONAME)).unwrap();
+        assert!(verify_runtime_install(&runtime, &expected_runtime).is_err());
+        fs::copy(
+            input.root.join(UNWIND_CORE_SONAME),
+            runtime_root.join(UNWIND_CORE_SONAME),
+        )
+        .unwrap();
+        fs::copy(
+            input.root.join(UNWIND_CORE_SONAME),
+            runtime_root.join(UNWIND_ARCH_SONAME),
+        )
+        .unwrap();
+        assert!(verify_runtime_install(&runtime, &expected_runtime)
+            .unwrap_err()
+            .contains("SONAME"));
+
+        fs::write(&input.sources.core_shared, b"changed source\n").unwrap();
+        assert!(verify_unwind_buck_input(&input).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_rpath_is_exact_relative_and_never_runpath_or_ambient() {
+        let root = fixture_root("release-rpath");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.c");
+        fs::write(&source, b"int main(void) { return 0; }\n").unwrap();
+        let compile = |name: &str, flags: &[&str]| {
+            let output = root.join(name);
+            let mut command = Command::new("gcc");
+            command.arg(&source).args(flags).arg("-o").arg(&output);
+            checked_output(&mut command, &format!("compile {name} RPATH fixture")).unwrap();
+            output
+        };
+        let good = compile(
+            "good",
+            &[&format!("-Wl,--disable-new-dtags,-rpath,{RELEASE_RPATH}")],
+        );
+        validate_release_rpath(&good).unwrap();
+        let missing = compile("missing", &[]);
+        assert!(validate_release_rpath(&missing).is_err());
+        let absolute = compile("absolute", &["-Wl,--disable-new-dtags,-rpath,/tmp"]);
+        assert!(validate_release_rpath(&absolute).is_err());
+        let runpath = compile(
+            "runpath",
+            &[&format!("-Wl,--enable-new-dtags,-rpath,{RELEASE_RPATH}")],
+        );
+        assert!(validate_release_rpath(&runpath).is_err());
+        let ambient = compile(
+            "ambient",
+            &[&format!("-Wl,--disable-new-dtags,-rpath,{RELEASE_RPATH}:")],
+        );
+        assert!(validate_release_rpath(&ambient).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_buck_target_uses_declared_library_dependencies_and_exact_rpath() {
         let buck = fs::read_to_string(source_root().join("hermit-cli/BUCK")).unwrap();
         assert!(buck.contains(
             "\"gh_facebook_buck2_shims_meta//third-party/xz:lzma\""
         ));
-        assert!(buck.contains("deps = [release_lzma_target] + ["));
+        assert!(buck.contains(
+            "\"gh_facebook_buck2_shims_meta//third-party/libunwind:unwind-ptrace\""
+        ));
+        assert!(buck.contains("deps = [release_lzma_target, release_unwind_target] + ["));
+        assert!(buck.contains("link-arg=-Wl,--disable-new-dtags"));
+        assert!(buck.contains(&format!("link-arg=-Wl,-rpath,{RELEASE_RPATH}")));
         assert!(!buck.contains("-Clink-arg=-llzma"));
         assert!(!buck.contains("-Clink-arg=-l:liblzma"));
+        assert!(!buck.contains("LD_LIBRARY_PATH"));
     }
 
     #[test]
