@@ -745,7 +745,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 4800,
-      "jobs_flag": null,
+      "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
@@ -61906,7 +61906,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 4800,
-      "jobs_flag": null,
+      "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
@@ -69563,7 +69563,7 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 4800,
-      "jobs_flag": null,
+      "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
