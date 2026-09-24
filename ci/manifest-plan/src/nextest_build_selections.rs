@@ -670,6 +670,62 @@ mod tests {
         assert_eq!(focused.values().next(), Some(&clock_args));
         assert!(!clock_args.iter().any(|arg| arg == "--features"));
         for suffix in ["", "_in_pinned_root", "_on_host"] {
+            let producer_tag = format!("build.recorded_clocks{suffix}");
+            let producer = graph
+                .steps
+                .iter()
+                .find(|step| step.tag() == producer_tag)
+                .unwrap();
+            for width in [1, 4] {
+                let rendered = dagrun::model::command_with_inner_jobs(
+                    producer,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(rendered, producer.cmd, "{producer_tag}, width {width}");
+                assert_eq!(
+                    dagrun::model::env_with_inner_jobs(
+                        producer,
+                        &graph.default_jobs_env,
+                        Some(width),
+                    ),
+                    Some(("CARGO_BUILD_JOBS".into(), width.to_string())),
+                );
+                let mut rendered_producer = producer.clone();
+                rendered_producer.cmd = rendered;
+                assert_eq!(
+                    command_arguments(
+                        &execution_command(&rendered_producer).unwrap(),
+                        "./ci/nextest-binaries.rs ",
+                    )
+                    .unwrap(),
+                    ["prepare", "recorder-clock-focused"],
+                );
+
+                // RUN1900 appended the inherited -j flag to the strict
+                // prepare PROFILE interface. Keep that regression observable
+                // and refused for both host and pinned-root commands.
+                let mut inherited = graph.clone();
+                let changed = inherited
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == producer_tag)
+                    .unwrap();
+                changed.jobs_flag = None;
+                changed.cmd = dagrun::model::command_with_inner_jobs(
+                    changed,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(changed.cmd, format!("{} -j {width}", producer.cmd));
+                let error = assert_preparation_dependencies(&inherited).unwrap_err();
+                let reason = if suffix == "_in_pinned_root" {
+                    "has an unrecognized pinned-root command"
+                } else {
+                    "has an ambiguous prepared profile"
+                };
+                assert_eq!(error, format!("{producer_tag} {reason}"));
+            }
             let workspace = graph
                 .steps
                 .iter()

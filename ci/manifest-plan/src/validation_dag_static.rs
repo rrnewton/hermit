@@ -1236,7 +1236,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 1200,
         cpu_timeout: 4800,
-        jobs_flag: None,
+        jobs_flag: Some(""),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
