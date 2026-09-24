@@ -21,8 +21,8 @@ fn failure(message: &str) -> Error {
     Error::Tool(anyhow::anyhow!("captured clock output: {message}"))
 }
 
-// TODO-HUMAN-REVIEW(PR-pending): Replace the pending identifier when the
-// introducing PR exists; review captured clock copyout and errno fidelity.
+// TODO-HUMAN-REVIEW(PR-3212): Review captured clock copyout and errno fidelity.
+// https://github.com/rrnewton/hermit/pull/3212
 pub(crate) fn capture<M: MemoryAccess, T: Copy>(
     memory: &M,
     address: Option<AddrMut<'_, T>>,
@@ -131,6 +131,7 @@ mod tests {
     struct DenyWrites {
         memory: LocalMemory,
         writes: usize,
+        write_result: Result<usize, Errno>,
     }
 
     impl MemoryAccess for DenyWrites {
@@ -148,7 +149,7 @@ mod tests {
             _to: &mut [io::IoSliceMut],
         ) -> Result<usize, Errno> {
             self.writes += 1;
-            Err(Errno::EFAULT)
+            self.write_result
         }
     }
 
@@ -177,61 +178,81 @@ mod tests {
 
     #[test]
     fn recorded_efault_does_not_hide_failure_to_restore_changed_bytes() {
-        let mut target = 7_u64;
-        let address = AddrMut::<u64>::from_raw(&mut target as *mut u64 as usize).unwrap();
-        let mut memory = DenyWrites {
-            memory: LocalMemory::new(),
-            writes: 0,
-        };
-        let error = replay(
-            &mut memory,
-            Some(address),
-            Err(Errno::EFAULT),
-            ClockOutput {
-                pointer_present: true,
-                bytes: 11_u64.to_ne_bytes().to_vec(),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::Tool(_)));
-        assert_eq!(target, 7);
-        assert_eq!(memory.writes, 1);
+        for write_result in [Err(Errno::EFAULT), Ok(0)] {
+            let mut target = 7_u64;
+            let address = AddrMut::<u64>::from_raw(&mut target as *mut u64 as usize).unwrap();
+            let mut memory = DenyWrites {
+                memory: LocalMemory::new(),
+                writes: 0,
+                write_result,
+            };
+            let error = replay(
+                &mut memory,
+                Some(address),
+                Err(Errno::EFAULT),
+                ClockOutput {
+                    pointer_present: true,
+                    bytes: 11_u64.to_ne_bytes().to_vec(),
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Tool(_)));
+            let Error::Tool(error) = error else {
+                unreachable!();
+            };
+            assert_eq!(
+                error.to_string(),
+                "captured clock output: restored bytes differ from recording"
+            );
+            assert_eq!(target, 7);
+            assert_eq!(memory.writes, 1);
+        }
     }
 
     #[test]
     fn unchanged_protected_error_output_is_not_written() {
-        let mut target = 7_u64;
-        let address = AddrMut::<u64>::from_raw(&mut target as *mut u64 as usize).unwrap();
-        let mut memory = DenyWrites {
-            memory: LocalMemory::new(),
-            writes: 0,
-        };
-        replay(
-            &mut memory,
-            Some(address),
-            Err(Errno::EFAULT),
-            ClockOutput {
-                pointer_present: true,
-                bytes: target.to_ne_bytes().to_vec(),
-            },
-        )
-        .unwrap();
-        assert_eq!(memory.writes, 0);
-        let error = replay(
-            &mut memory,
-            Some(address),
-            Ok(0),
-            ClockOutput {
-                pointer_present: true,
-                bytes: target.to_ne_bytes().to_vec(),
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(error, Error::Tool(_)));
-        assert_eq!(
-            memory.writes, 1,
-            "successful copyout must still require writable memory"
-        );
+        for write_result in [Err(Errno::EFAULT), Ok(0)] {
+            let mut target = 7_u64;
+            let address = AddrMut::<u64>::from_raw(&mut target as *mut u64 as usize).unwrap();
+            let mut memory = DenyWrites {
+                memory: LocalMemory::new(),
+                writes: 0,
+                write_result,
+            };
+            replay(
+                &mut memory,
+                Some(address),
+                Err(Errno::EFAULT),
+                ClockOutput {
+                    pointer_present: true,
+                    bytes: target.to_ne_bytes().to_vec(),
+                },
+            )
+            .unwrap();
+            assert_eq!(memory.writes, 0);
+            let error = replay(
+                &mut memory,
+                Some(address),
+                Ok(0),
+                ClockOutput {
+                    pointer_present: true,
+                    bytes: target.to_ne_bytes().to_vec(),
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::Tool(_)));
+            let Error::Tool(error) = error else {
+                unreachable!();
+            };
+            assert_eq!(
+                error.to_string(),
+                "captured clock output: cannot restore syscall output"
+            );
+            assert_eq!(
+                memory.writes, 1,
+                "successful copyout must still require writable memory"
+            );
+        }
     }
 
     #[test]
