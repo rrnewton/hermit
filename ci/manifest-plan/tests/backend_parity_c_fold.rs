@@ -147,6 +147,13 @@ const PLAN_CELLS_ADDED_AFTER_FOLD: &[(&str, &str, &str, &str)] = &[
         "verify",
         "c-programs/timerfd-semantics",
     ),
+    // https://github.com/rrnewton/hermit/pull/3219 re-selects this test.
+    (
+        "portable",
+        "ptrace",
+        "verify",
+        "system-utils/procfs-sanitized-paths",
+    ),
 ];
 
 /// Tests the committed cell table lists that the pre-fold table did not, as
@@ -183,6 +190,14 @@ const CELL_STATUS_CHANGES_AFTER_FOLD: &[(&str, &str, &str, &str, &str)] = &[
     // https://github.com/rrnewton/hermit/pull/3224
     (
         "c-programs/dbt-pid-virtualization",
+        "ptrace",
+        "verify",
+        "red",
+        "green",
+    ),
+    // https://github.com/rrnewton/hermit/pull/3219
+    (
+        "system-utils/procfs-sanitized-paths",
         "ptrace",
         "verify",
         "red",
@@ -436,7 +451,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let lane = |name: &str| cells.iter().filter(|c| field(c, "lane") == name).count();
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
-        (864, 860, 4)
+        (865, 861, 4)
     );
     for &(added_lane, backend, mode, test) in PLAN_CELLS_ADDED_AFTER_FOLD {
         let selected = cells
