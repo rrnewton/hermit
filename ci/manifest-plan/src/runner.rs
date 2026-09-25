@@ -78,6 +78,8 @@ use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::KVM_2026_09_08_SELECTED_CI_CELL_COUNT;
@@ -6471,6 +6473,7 @@ mod tests {
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
                 + VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT
                 + SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT
+                + EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),

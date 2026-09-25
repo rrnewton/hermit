@@ -3514,6 +3514,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fp-reduction-nondeterminism",
           "mode": "chaos",
           "backend": "ptrace"
@@ -10237,6 +10244,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fp-reduction-nondeterminism",
           "mode": "verify",
           "backend": "ptrace"
@@ -16946,6 +16960,13 @@
           "test": "c-programs/epoll-determinism",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

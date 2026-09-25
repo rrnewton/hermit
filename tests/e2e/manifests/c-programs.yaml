@@ -8174,6 +8174,74 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/external-io-signal-interrupt
+    description: Strict verification for tests/c/external_io_signal_interrupt.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/external_io_signal_interrupt.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -pthread
+    modes:
+      verify:
+        ci:
+          ptrace: true
+        backends_enabled:
+          - ptrace
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify DBT separately
+          kvm: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify KVM separately
+          sabre: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify SaBRe separately
+          liteinst: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify LiteInst separately
+      naked:
+        ci: false
+        ci_disabled_reason: This fixture asserts interrupted external-IO behavior under verification; it has no native nondeterminism oracle.
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts interrupted external-IO semantics under strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: This scheduler-signal fixture is qualified for verify only; record/replay has not been measured.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: This fixture has no schedule-diversity oracle; verify owns its external-IO assertions.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: This fixture takes no arguments and has no additional custom argument case.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: c-programs/sigpipe-siginfo
     description: Strict verification for tests/c/sigpipe_siginfo.c
     lane: portable
