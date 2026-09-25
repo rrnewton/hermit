@@ -1377,12 +1377,31 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 /// strictly requires. A documentation-only edit in one of these files can
 /// require rebuilding the plugin; missing a wire-incompatible hidden variant
 /// can make it decode the handshake or a subsequent request at the wrong offsets.
+fn config_wire_default() -> Config {
+    // `Config::default()` is intentionally environment-aware through Clap.
+    // A coordinator may therefore inherit HERMIT_EPOCH/HERMIT_PRNG or
+    // HERMIT_SCHED_SEED even though the separately loaded plugin receives a
+    // minimal guest environment. Those invocation values are payload data,
+    // not wire shape, and must not make two artifacts from the same source
+    // reject one another. Explicit arguments take precedence over Clap's
+    // environment provider; clear the scheduler override afterward to retain
+    // the real environment-free default of `None` in the encoded shape.
+    let mut config = Config::parse_from([
+        "config-wire-fingerprint",
+        &format!("--epoch={DEFAULT_EPOCH_STR}"),
+        "--seed=0",
+        "--sched-seed=0",
+    ]);
+    config.sched_seed = None;
+    config
+}
+
 pub fn config_wire_fingerprint() -> String {
-    let config = Config::default();
+    let config = config_wire_default();
     let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
-        .expect("Config::default() must encode with the Reverie RPC bincode configuration");
+        .expect("canonical Config wire default must encode with Reverie's bincode configuration");
     let named_shape = serde_json::to_string(&config)
-        .expect("Config::default() must encode as JSON for field-name checking");
+        .expect("canonical Config wire default must encode as JSON for field-name checking");
     fingerprint_of_config_material(&wire, &named_shape, CONFIG_DEFINITION_SOURCES)
 }
 
@@ -1668,7 +1687,7 @@ mod tests {
 
     #[test]
     fn config_fingerprint_includes_clock_rpc_definitions() {
-        let config = Config::default();
+        let config = config_wire_default();
         let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
         let named_shape = serde_json::to_string(&config).unwrap();
         let current = config_wire_fingerprint();
@@ -1718,7 +1737,7 @@ mod tests {
         assert_eq!(config_wire_fingerprint(), config_wire_fingerprint());
         assert_eq!(config_wire_fingerprint().len(), 16);
 
-        let config = Config::default();
+        let config = config_wire_default();
         let base = serde_json::to_string(&config).unwrap();
         let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
         assert_eq!(
@@ -1813,6 +1832,29 @@ mod tests {
             ),
             "a hidden wire-incompatible inner-type change must alter the fingerprint"
         );
+    }
+
+    #[test]
+    fn config_fingerprint_uses_environment_free_wire_defaults() {
+        let environment_derived = Config {
+            epoch: "2042-03-04T05:06:07.890123456Z".parse().unwrap(),
+            seed: 41,
+            sched_seed: Some(42),
+            ..Config::default()
+        };
+
+        let canonical = config_wire_default();
+
+        assert_ne!(
+            serde_json::to_string(&environment_derived).unwrap(),
+            serde_json::to_string(&canonical).unwrap()
+        );
+        assert_eq!(
+            canonical.epoch,
+            DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(canonical.seed, 0);
+        assert_eq!(canonical.sched_seed, None);
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
