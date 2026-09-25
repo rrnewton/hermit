@@ -227,6 +227,7 @@ static bool is_zero_kb_field(const char* name) {
       "Shared_Clean",
       "Shared_Dirty",
       "Private_Clean",
+      "Private_Dirty",
       "Referenced",
       "KSM",
       "SwapPss",
