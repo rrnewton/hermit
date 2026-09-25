@@ -320,6 +320,81 @@ fn sigsuspend_mask_fallback_warns_in_the_compared_log() {
     assert_eq!(warnings, 1, "stderr:\n{stderr}");
 }
 
+/// On ptrace the tool reads the suspend mask and the blocked pending set
+/// without injecting anything, so the kernel runs the guest's own
+/// `rt_sigsuspend` in place. An injected probe ahead of it would move the real
+/// call to Reverie's private page, where an ignored signal that lands before
+/// the syscall instruction is reported as `ERESTARTSYS` with no signal event:
+/// a host-timing race that `--verify` sees only some of the time. This checks
+/// Reverie's injection log instead, which shows the probes on every run.
+#[test]
+fn ptrace_sigsuspend_runs_without_probe_injections() {
+    let _guard = hermit_signal_lock();
+    for (scenario, expected_stdout) in [
+        (
+            "blocking-sigsuspend",
+            "sigsuspend delivered\nsigsuspend restored=1 deliveries=1\n",
+        ),
+        (
+            "pending-sigsuspend",
+            "sigsuspend delivered\npending sigsuspend restored=1 deliveries=1 pending=0\n",
+        ),
+    ] {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command.args([
+            "--log=debug",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ]);
+        command.arg(signal_guest()).arg(scenario);
+        let output = command_output(command, &format!("signal scenario {scenario}"));
+        assert_eq!(output.stdout, expected_stdout.as_bytes());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Each thread's syscall entries (`inbound`) and injections, in log
+        // order, keyed by tid. Detcore's dtid is the tid Reverie logs.
+        let events: Vec<(&str, bool, &str)> = stderr
+            .lines()
+            .filter_map(|line| {
+                if let Some((_, rest)) = line.split_once("[detcore, dtid ") {
+                    let (tid, rest) = rest.split_once("] inbound syscall: ")?;
+                    let (syscall, _) = rest.split_once('(')?;
+                    return Some((tid, true, syscall));
+                }
+                let (_, rest) = line.split_once("[tool] (tid ")?;
+                let (tid, rest) = rest.split_once(") beginning inject of syscall: ")?;
+                let (syscall, _) = rest.split_once(", args ")?;
+                Some((tid, false, syscall))
+            })
+            .collect();
+        let mut suspends = 0;
+        for (index, &(tid, inbound, syscall)) in events.iter().enumerate() {
+            if inbound || syscall != "rt_sigsuspend" {
+                continue;
+            }
+            suspends += 1;
+            // Nothing may be injected for this thread between its
+            // `rt_sigsuspend` entry and the real call.
+            let previous = events[..index]
+                .iter()
+                .rev()
+                .find(|(other, _, _)| *other == tid);
+            assert_eq!(
+                previous.map(|&(_, inbound, syscall)| (inbound, syscall)),
+                Some((true, "rt_sigsuspend")),
+                "{scenario}: tid {tid} injected {previous:?} ahead of its rt_sigsuspend\nstderr:\n{stderr}"
+            );
+        }
+        assert!(
+            suspends > 0,
+            "{scenario}: no rt_sigsuspend injection logged\nstderr:\n{stderr}"
+        );
+    }
+}
+
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_sigsuspend_invalid_pointer_does_not_fault_in_the_tool() {
