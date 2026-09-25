@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 173;
+pub const NON_CI_CELL_COUNT: usize = 171;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -71,6 +71,16 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// `c-programs/socket-timestamp-edge-cases` verify on ptrace and LiteInst,
+/// promoted after Detcore's io-buffer hashing stopped re-reading a vectored
+/// call's `iovec` arrays after the call. The guest lets `recvmsg` write its
+/// control data over its own `msghdr`, which Linux permits; the post-call
+/// re-read followed the overwritten `msg_iov` and returned EFAULT to the guest.
+/// Each cell passed ten consecutive strict verify runs on its backend at the
+/// evidence SHA.
+pub const ENTRY_IOVEC_2026_09_25_EVIDENCE_SHA: &str = "f268c5c95c7d1f7d470a7c7565c51f2b2dd2aa7b";
+pub const ENTRY_IOVEC_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T08:40:54Z";
+pub const ENTRY_IOVEC_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 2;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1877,7 +1887,16 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
-        assert_eq!(NON_CI_CELL_COUNT, 173);
+        assert_eq!(
+            ENTRY_IOVEC_2026_09_25_EVIDENCE_SHA,
+            "f268c5c95c7d1f7d470a7c7565c51f2b2dd2aa7b"
+        );
+        assert_eq!(
+            ENTRY_IOVEC_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T08:40:54Z"
+        );
+        assert_eq!(ENTRY_IOVEC_2026_09_25_SELECTED_CI_CELL_COUNT, 2);
+        assert_eq!(NON_CI_CELL_COUNT, 171);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

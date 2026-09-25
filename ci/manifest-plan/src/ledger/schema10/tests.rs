@@ -716,13 +716,13 @@ fn generated_plan_populations_preserve_command_policy() {
         .map(exact_identity)
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
-    assert_eq!(expected_cells.len(), 856);
+    assert_eq!(expected_cells.len(), 858);
     for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 856),
+        ("full", "e2e.manifest_backend_parity_c", 858),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            852,
+            854,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
