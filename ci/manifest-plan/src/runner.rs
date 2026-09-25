@@ -352,6 +352,14 @@ impl ExpectedGuestExit {
     }
 }
 
+/// The declared guest disposition for a selected cell; only verify cells carry one.
+fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
+    (cell.id.mode == "verify")
+        .then(|| cell.test.modes.get(&cell.id.mode))
+        .flatten()
+        .and_then(|recipe| recipe.expected_guest_exit.clone())
+}
+
 pub fn validate_expected_guest_exit(
     id: &str,
     mode: &str,
@@ -1477,6 +1485,16 @@ pub struct CellResult {
     /// `backend`, and `attempt` becomes a second definition that goes stale
     /// silently, and a path that points at nothing is worse than no path at all.
     pub artifact_dir: String,
+    /// The one nonzero guest disposition this verify cell declares.
+    ///
+    /// A matched verify attempt that ends with a nonzero status or a signal is
+    /// indistinguishable, from the attempt alone, from a cell that crashed
+    /// deterministically without saying it should. Recording the manifest's
+    /// declaration here lets a reader admit exactly the declared disposition
+    /// and keep refusing every other one. Absent for cells that declare none,
+    /// so rows for ordinary cells are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_guest_exit: Option<ExpectedGuestExit>,
 }
 
 impl CellResult {
@@ -2496,9 +2514,7 @@ pub fn build_spec(
         verification_log_dir,
         sabre_path_evidence,
         cell_dir: dir,
-        expected_guest_exit: (cell.id.mode == "verify")
-            .then(|| mode_recipe.expected_guest_exit.clone())
-            .flatten(),
+        expected_guest_exit: cell_expected_guest_exit(cell),
         attempt: attempt.into(),
         fixed_workdir_source,
     })
@@ -4678,6 +4694,7 @@ fn run_cell_inner(
     Ok(CellResult {
         cpu_observations: None,
         artifact_dir: dir.display().to_string(),
+        expected_guest_exit: cell_expected_guest_exit(cell),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -4760,6 +4777,7 @@ pub fn infrastructure_error_result(
     CellResult {
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
+        expected_guest_exit: cell_expected_guest_exit(cell),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -4836,6 +4854,7 @@ pub fn host_inapplicable_result(
     CellResult {
         cpu_observations: Some(empty_cpu_observations(context, cell)),
         artifact_dir: dir.display().to_string(),
+        expected_guest_exit: cell_expected_guest_exit(cell),
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
         machine_shortname: context.machine_shortname.clone(),
@@ -9393,6 +9412,7 @@ backends_disabled:
             first_divergent_right_message: None,
             reason: None,
             artifact_dir: "/repo/artifacts".into(),
+            expected_guest_exit: None,
         }
     }
 
@@ -11166,6 +11186,165 @@ esac
                 "verification did not compare canonical non-vacuous INFO evidence: strictness=stripped compare_logs=true record_envelope=all_records_v1 messages=1/1"
             )
         );
+    }
+
+    /// Run a real verify cell through `run_cell` against a fake Hermit that
+    /// writes `report` and ends with `ending`, returning the serialized row.
+    fn expected_exit_row(
+        expected: Option<ExpectedGuestExit>,
+        report: VerificationReport,
+        ending: &str,
+    ) -> (CellResult, serde_json::Value) {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-expected-exit-row-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("verification.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        let hermit = root.join("hermit");
+        fs::write(
+            &hermit,
+            format!(
+                r#"#!/bin/sh
+set -eu
+verdict=
+logdir=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --verify-json) verdict=$2; shift 2 ;;
+    --verify-log-dir) logdir=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$logdir" ]; then
+  mkdir -p "$logdir"
+  printf 'INFO detcore: shared\n' > "$logdir/run1_log_fixture.log"
+fi
+cp "{}" "$verdict"
+{ending}
+"#,
+                root.join("verification.json").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cell = ptrace_cell("verify");
+        cell.test.id = "fixture/expected-exit-row".into();
+        cell.id.test = cell.test.id.clone();
+        cell.timeout_seconds = 10;
+        cell.cpu_timeout_seconds = 5;
+        cell.test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .expected_guest_exit = expected;
+        let mut context = run_context(&root);
+        context.hermit_bin = hermit;
+        context.run_verify_strict = true;
+
+        let result = run_cell(&context, &cell).unwrap();
+        let row = serde_json::to_value(&result).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        (result, row)
+    }
+
+    /// A verify cell that passes on its declared nonzero disposition must say
+    /// so on its row. Without the declaration a reader of `results.jsonl` sees
+    /// a matched attempt with a nonzero status and no authority for it, and
+    /// must refuse the row -- which is what the series writer did to every
+    /// validate batch that contained one of these cells.
+    #[test]
+    fn a_declared_expected_exit_is_carried_on_the_result_row() {
+        let (code_result, code_row) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_eq!(code_result.outcome, "PASS", "{:?}", code_result.reason);
+        assert_eq!(code_result.attempts[0].status, Some(7));
+        assert!(
+            code_result.attempts[0]
+                .argv
+                .iter()
+                .any(|arg| arg == "--verify-allow=failure")
+        );
+        assert_eq!(
+            code_row["expected_guest_exit"],
+            serde_json::json!({
+                "code": 7,
+                "signal": null,
+                "reason": "the fixture guest fails on purpose",
+            })
+        );
+
+        // The 128 + signo spelling of a signal death carries the declared
+        // signal, not the status Hermit happened to use to report it.
+        let (signal_result, signal_row) = expected_exit_row(
+            Some(expected_exit(None, Some(11))),
+            expected_exit_report(None, Some(11)),
+            "exit 139",
+        );
+        assert_eq!(signal_result.outcome, "PASS", "{:?}", signal_result.reason);
+        assert_eq!(signal_result.attempts[0].status, Some(139));
+        assert_eq!(
+            signal_row["expected_guest_exit"],
+            serde_json::json!({
+                "code": null,
+                "signal": 11,
+                "reason": "the fixture guest fails on purpose",
+            })
+        );
+        let reread: CellResult = serde_json::from_value(signal_row).unwrap();
+        assert_eq!(
+            reread.expected_guest_exit,
+            Some(expected_exit(None, Some(11)))
+        );
+
+        // A cell without a declaration keeps the historical row shape: the key
+        // is absent, not null, and such a row still reads back.
+        let (plain_result, plain_row) =
+            expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert_eq!(plain_result.outcome, "PASS", "{:?}", plain_result.reason);
+        assert!(
+            !plain_row
+                .as_object()
+                .unwrap()
+                .contains_key("expected_guest_exit"),
+            "{plain_row}"
+        );
+        let reread: CellResult = serde_json::from_value(plain_row).unwrap();
+        assert_eq!(reread.expected_guest_exit, None);
+    }
+
+    /// Only a verify cell carries a declaration; the same recipe field on any
+    /// other mode is not authority for a nonzero pass there.
+    #[test]
+    fn only_a_verify_cell_carries_its_declared_expected_exit() {
+        let mut verify = ptrace_cell("verify");
+        verify
+            .test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .expected_guest_exit = Some(expected_exit(Some(3), None));
+        assert_eq!(
+            cell_expected_guest_exit(&verify),
+            Some(expected_exit(Some(3), None))
+        );
+        for mode in ["chaos", "replay", "naked"] {
+            let mut other = ptrace_cell(mode);
+            other.test.modes.get_mut(mode).unwrap().expected_guest_exit =
+                Some(expected_exit(Some(3), None));
+            assert_eq!(cell_expected_guest_exit(&other), None, "{mode}");
+        }
+        assert_eq!(cell_expected_guest_exit(&ptrace_cell("verify")), None);
     }
 
     /// An attempt stopped by the wall backstop is never a pass, even when it
