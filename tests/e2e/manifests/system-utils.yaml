@@ -1727,6 +1727,7 @@ test:
       cflags:
         - -O0
         - -D_GNU_SOURCE
+        - -pthread
     modes:
       naked:
         ci: false
@@ -1755,7 +1756,7 @@ test:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: The guard guest is single-threaded
+          ptrace: The guard joins each sampling thread before starting the next, so there is no interleaving to explore
           dbt: Chaos scheduling is unsupported by DBI
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe

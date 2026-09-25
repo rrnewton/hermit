@@ -3221,6 +3221,8 @@ fn publish_verified_bundle(
 #[derive(Debug)]
 struct CandidateOutput {
     stdout: String,
+    /// The untrimmed stdout bytes, for comparisons that must be exact.
+    exact_stdout: Vec<u8>,
 }
 
 struct CandidateInvocation<'a> {
@@ -3331,11 +3333,14 @@ fn run_safehermit(request: CandidateInvocation<'_>) -> Result<CandidateOutput, S
             invocation.display()
         ));
     }
-    let stdout = String::from_utf8(output.stdout)
+    let stdout = String::from_utf8(output.stdout.clone())
         .map_err(|error| format!("{description} emitted non-UTF-8 stdout: {error}"))?
         .trim()
         .to_owned();
-    Ok(CandidateOutput { stdout })
+    Ok(CandidateOutput {
+        stdout,
+        exact_stdout: output.stdout,
+    })
 }
 
 fn require_object_keys(
@@ -3568,26 +3573,199 @@ fn verify_report(
     Ok(report)
 }
 
-fn equal_cross_candidate_report_semantics(
-    cargo: &VerificationReport,
-    buck: &VerificationReport,
-) -> bool {
-    let mut cargo = cargo.clone();
-    let mut buck = buck.clone();
-    for report in [&mut cargo, &mut buck] {
-        if let Some(runtime) = &mut report.runtime {
-            if let Some(run1) = &mut runtime.run1 {
-                run1.virtual_nanoseconds = 0;
-            }
-            if let Some(run2) = &mut runtime.run2 {
-                run2.virtual_nanoseconds = 0;
-            }
-        }
-    }
-    cargo == buck
+/// The strict parity leg runs the tracked clock fixture under this pinned epoch.
+/// An omitted `--epoch` captures host time per invocation, which is the only
+/// reason two builds' virtual clocks ever differed; pinned, the trajectory and
+/// the whole strict report, virtual time included, must be exactly equal.
+const CLOCK_PARITY_EPOCH: &str = "2026-01-01T00:00:00+00:00";
+const CLOCK_PARITY_EPOCH_NS: u64 = 1_767_225_600_000_000_000;
+/// Startup costs virtual milliseconds; a first read this far past the epoch
+/// means the epoch was not applied.
+const CLOCK_PARITY_STARTUP_BOUND_NS: u64 = 60_000_000_000;
+/// Each scheduler turn adds 500,000 virtual ns, so a turn inside a work segment
+/// breaks the exact work-cost relations below. Pinned to the default, about 50
+/// times the largest segment and longer than the whole run, so no turn lands
+/// inside one; a lower value would redden both builds regardless of parity.
+const CLOCK_PARITY_MAX_TIMESLICE: &str = "--max-timeslice=200000000";
+const CLOCK_FIXTURE_SOURCE: &str = "tests/c/clock_exec_continuity.c";
+const CLOCK_FIXTURE_WORK_ITERATIONS: [u64; 4] = [0, 100_000, 100_000, 200_000];
+
+/// Mirrors the fixture's `do_work`, so a checksum proves the declared work ran.
+fn clock_fixture_work_checksum(iterations: u64) -> u64 {
+    (0..iterations).fold(27, |value: u64, _| {
+        if value & 1 == 1 { value.wrapping_mul(3).wrapping_add(1) } else { value >> 1 }
+    })
 }
 
+fn take_canonical_decimal(text: &str) -> Option<(u64, &str)> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, rest) = text.split_at(digits);
+    if number.is_empty() || (number.len() > 1 && number.starts_with('0')) {
+        return None;
+    }
+    Some((number.parse().ok()?, rest))
+}
+
+fn clock_advance(last: &mut u64, value: u64) -> Result<(), String> {
+    if value <= *last {
+        return Err(format!(
+            "clock read {value} does not advance past {last}: virtual time froze, went \
+             backwards, or was reset"
+        ));
+    }
+    *last = value;
+    Ok(())
+}
+
+/// Validates the fixture's exact stdout as a closed trajectory (3 generations
+/// of 8 main reads, the 4 work segments, and 2 serialized threads of 4 reads,
+/// then a summary; see the fixture header) and returns the last read. Every
+/// read must advance past the one before it in emission order, starting from
+/// the pinned epoch and across exec and thread boundaries; generation 0 must
+/// open within the startup bound; no generation may open on a whole second;
+/// checksums must match; equal work must cost exactly equal virtual time, more
+/// work strictly more, and double work exactly its two halves (cost3 - cost0 ==
+/// (cost1 - cost0) + (cost2 - cost0)); and summaries must match their samples.
+/// The work-cost relations are exact only while no scheduler turn falls inside
+/// a segment, which `CLOCK_PARITY_MAX_TIMESLICE` pins.
+fn parse_clock_trajectory(stdout: &str) -> Result<u64, String> {
+    let body = stdout
+        .strip_suffix('\n')
+        .ok_or("clock trajectory must end with one newline")?;
+    let mut lines = body.split('\n');
+    let mut record = |head: String, keys: &[&str]| -> Result<Vec<u64>, String> {
+        let line = lines.next().ok_or(format!("clock trajectory lacks {head:?}"))?;
+        let mut rest = line
+            .strip_prefix(head.as_str())
+            .ok_or(format!("clock trajectory expected {head:?}, found {line:?}"))?;
+        let mut values = Vec::new();
+        for key in keys {
+            let (value, tail) = rest
+                .strip_prefix(&format!(" {key}="))
+                .and_then(take_canonical_decimal)
+                .ok_or(format!("clock trajectory {line:?} has a malformed {key}"))?;
+            values.push(value);
+            rest = tail;
+        }
+        match rest {
+            "" => Ok(values),
+            _ => Err(format!("clock trajectory {line:?} has trailing text")),
+        }
+    };
+    let mut last = CLOCK_PARITY_EPOCH_NS;
+    for generation in 0..3 {
+        let mut main = Vec::new();
+        for index in 0..8 {
+            let ns = record(format!("sample gen={generation} source=main index={index}"), &["ns"])?[0];
+            clock_advance(&mut last, ns)?;
+            main.push(ns);
+        }
+        let first = main[0];
+        if generation == 0 && first - CLOCK_PARITY_EPOCH_NS >= CLOCK_PARITY_STARTUP_BOUND_NS {
+            return Err(format!("clock trajectory opens {first}, outside the startup bound"));
+        }
+        if first % 1_000_000_000 == 0 {
+            return Err(format!("clock generation {generation} opens on a whole second {first}"));
+        }
+        let mut cost = Vec::new();
+        for (index, iterations) in CLOCK_FIXTURE_WORK_ITERATIONS.iter().enumerate() {
+            let work = record(
+                format!("work gen={generation} index={index} iterations={iterations}"),
+                &["before_ns", "after_ns", "checksum"],
+            )?;
+            clock_advance(&mut last, work[0])?;
+            clock_advance(&mut last, work[1])?;
+            if work[2] != clock_fixture_work_checksum(*iterations) {
+                return Err(format!("clock work {index} checksum {} is wrong", work[2]));
+            }
+            cost.push(work[1] - work[0]);
+        }
+        // cost3 - cost0 == (cost1 - cost0) + (cost2 - cost0), rearranged to avoid
+        // unsigned underflow and widened so huge timestamps cannot overflow.
+        let wide = |a: u64, b: u64| u128::from(a) + u128::from(b);
+        if cost[1] != cost[2] || cost[0] >= cost[1] || wide(cost[3], cost[0]) != wide(cost[1], cost[2]) {
+            return Err(format!(
+                "clock generation {generation} work cost {cost:?} ns: equal work must cost \
+                 equal virtual time, more work strictly more, and double work its two halves"
+            ));
+        }
+        for thread in 0..2 {
+            for index in 0..4 {
+                let head = format!("sample gen={generation} source=thread index={index} thread={thread}");
+                clock_advance(&mut last, record(head, &["ns"])?[0])?;
+            }
+        }
+        let min_delta = main.windows(2).map(|pair| pair[1] - pair[0]).min().unwrap_or(0);
+        if record(format!("gen={generation}"), &["first", "last", "min_delta"])?
+            != [first, last, min_delta]
+        {
+            return Err(format!("clock generation {generation} summary disagrees with its samples"));
+        }
+    }
+    record("clock exec continuity holds across 2 execs".to_owned(), &[])?;
+    match lines.next() {
+        None => Ok(last),
+        Some(extra) => Err(format!("clock trajectory has an extra record {extra:?}")),
+    }
+}
+
+/// Requires both builds' trajectories to be valid and byte-identical, their
+/// strict reports to be exactly equal, and the report to bind the trajectory:
+/// it compared these stdout bytes and its virtual time outlasts the last read.
+fn verify_clock_parity(
+    cargo_stdout: &[u8],
+    buck_stdout: &[u8],
+    cargo_report: &Path,
+    buck_report: &Path,
+) -> Result<VerificationReport, String> {
+    let utf8 = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string());
+    let (cargo_text, buck_text) = (utf8(cargo_stdout)?, utf8(buck_stdout)?);
+    let last = parse_clock_trajectory(&cargo_text).map_err(|error| format!("Cargo {error}"))?;
+    parse_clock_trajectory(&buck_text).map_err(|error| format!("Buck {error}"))?;
+    require_equal("ptrace fixed-epoch clock trajectory", &cargo_text, &buck_text)?;
+    let report = verify_report(cargo_report, true)?;
+    if report != verify_report(buck_report, true)? {
+        return Err("Cargo/Buck ptrace clock strict reports differ; nothing is erased".to_owned());
+    }
+    let compared = report.compared_outputs.as_ref().map(|outputs| &outputs.left);
+    if compared.map(|output| (output.stdout_sha256.clone(), output.stdout_bytes))
+        != Some((sha256_bytes(cargo_stdout)?, cargo_stdout.len() as u64))
+    {
+        return Err("clock strict report compared a different stdout".to_owned());
+    }
+    let virtual_ns = report.runtime.as_ref().and_then(|runtime| runtime.run1.as_ref());
+    match virtual_ns {
+        Some(run) if run.virtual_nanoseconds > last - CLOCK_PARITY_EPOCH_NS => Ok(report),
+        Some(_) => Err("clock strict report virtual time ends before the last read".to_owned()),
+        None => Err("clock strict report lacks a runtime summary".to_owned()),
+    }
+}
+
+/// Compiles the fixture from a copy retained as evidence, so the receipt binds
+/// the exact source compiled.
+fn compile_clock_fixture(root: &Path, evidence_dir: &Path) -> Result<PathBuf, String> {
+    let source = root.join(CLOCK_FIXTURE_SOURCE);
+    let bytes = fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+    let retained = evidence_dir.join("clock-fixture.c");
+    write_new_file(&retained, &bytes, "clock fixture source")?;
+    let binary = evidence_dir.join("clock-fixture");
+    checked_output(
+        Command::new("gcc")
+            .args(["-O0", "-D_GNU_SOURCE", "-pthread"])
+            .arg(&retained)
+            .arg("-o")
+            .arg(&binary),
+        "compile clock trajectory fixture",
+    )?;
+    Ok(binary)
+}
+
+/// The parity verdict is the strict leg's fixed-epoch clock trajectory. The
+/// `/bin/true` record leg is a record/replay smoke case only: record mode reports
+/// no runtime and currently refuses the fixture's clock_gettime, so it cannot
+/// carry clock evidence.
 fn behavioral_parity(
+    root: &Path,
     safehermit: &Path,
     cargo_binary: &Path,
     buck_binary: &Path,
@@ -3597,6 +3775,9 @@ fn behavioral_parity(
 ) -> Result<(), String> {
     {
         let backend = "ptrace";
+        let fixture = compile_clock_fixture(root, evidence_dir)?;
+        let fixture_text = fixture.to_string_lossy();
+        let epoch = format!("--epoch={CLOCK_PARITY_EPOCH}");
         let cargo_report = evidence_dir.join(format!("cargo-{backend}-verify.json"));
         let buck_report = evidence_dir.join(format!("buck-{backend}-verify.json"));
         let cargo_report_text = cargo_report.to_string_lossy();
@@ -3609,13 +3790,15 @@ fn behavioral_parity(
             "--backend",
             backend,
             "--base-env=minimal",
+            &epoch,
+            CLOCK_PARITY_MAX_TIMESLICE,
             "--strict",
             "--verify",
             "--verify-strict",
             "--verify-json",
             &cargo_report_text,
             "--",
-            "/bin/true",
+            &fixture_text,
         ];
         let cargo_description = format!("Cargo {backend} strict verify through safehermit");
         let cargo = run_safehermit(CandidateInvocation {
@@ -3637,13 +3820,15 @@ fn behavioral_parity(
             "--backend",
             backend,
             "--base-env=minimal",
+            &epoch,
+            CLOCK_PARITY_MAX_TIMESLICE,
             "--strict",
             "--verify",
             "--verify-strict",
             "--verify-json",
             &buck_report_text,
             "--",
-            "/bin/true",
+            &fixture_text,
         ];
         let buck_description = format!("Buck {backend} strict verify through safehermit");
         let buck = run_safehermit(CandidateInvocation {
@@ -3657,20 +3842,25 @@ fn behavioral_parity(
             deadline_seconds: VERIFY_DEADLINE_SECONDS,
             description: &buck_description,
         })?;
-        require_equal(
-            &format!("{backend} guest stdout"),
-            &cargo.stdout,
-            &buck.stdout,
+        write_new_file(
+            &evidence_dir.join("cargo-ptrace-clock-trajectory.txt"),
+            &cargo.exact_stdout,
+            "Cargo clock trajectory",
         )?;
-        let cargo_typed = verify_report(&cargo_report, true)?;
-        let buck_typed = verify_report(&buck_report, true)?;
-        if !equal_cross_candidate_report_semantics(&cargo_typed, &buck_typed) {
-            return Err(format!(
-                "Cargo/Buck {backend} typed strict report mismatch; inspect retained reports"
-            ));
-        }
+        write_new_file(
+            &evidence_dir.join("buck-ptrace-clock-trajectory.txt"),
+            &buck.exact_stdout,
+            "Buck clock trajectory",
+        )?;
+        verify_clock_parity(
+            &cargo.exact_stdout,
+            &buck.exact_stdout,
+            &cargo_report,
+            &buck_report,
+        )?;
     }
 
+    // Smoke case only; see the function comment.
     let cargo_record_report = evidence_dir.join("cargo-ptrace-record-verify.json");
     let buck_record_report = evidence_dir.join("buck-ptrace-record-verify.json");
     let cargo_record_data = evidence_dir.join("cargo-record-data");
@@ -3738,7 +3928,7 @@ fn behavioral_parity(
     require_equal("ptrace record/replay stdout", &cargo.stdout, &buck.stdout)?;
     let cargo_typed = verify_report(&cargo_record_report, false)?;
     let buck_typed = verify_report(&buck_record_report, false)?;
-    if !equal_cross_candidate_report_semantics(&cargo_typed, &buck_typed) {
+    if cargo_typed != buck_typed {
         return Err(
             "Cargo/Buck ptrace record/replay typed strict report mismatch; inspect retained reports"
                 .to_owned(),
@@ -5351,14 +5541,15 @@ fn verify_retained_candidate_evidence(
         );
     }
 
-    let cargo_run = verify_report(&evidence_dir.join("cargo-ptrace-verify.json"), true)?;
-    let buck_run = verify_report(&evidence_dir.join("buck-ptrace-verify.json"), true)?;
-    if !equal_cross_candidate_report_semantics(&cargo_run, &buck_run) {
-        return Err("retained Cargo/Buck ptrace strict reports differ".to_owned());
-    }
+    let cargo_run = verify_clock_parity(
+        read_retained_text(evidence_dir, "cargo-ptrace-clock-trajectory.txt")?.as_bytes(),
+        read_retained_text(evidence_dir, "buck-ptrace-clock-trajectory.txt")?.as_bytes(),
+        &evidence_dir.join("cargo-ptrace-verify.json"),
+        &evidence_dir.join("buck-ptrace-verify.json"),
+    )?;
     let cargo_record = verify_report(&evidence_dir.join("cargo-ptrace-record-verify.json"), false)?;
     let buck_record = verify_report(&evidence_dir.join("buck-ptrace-record-verify.json"), false)?;
-    if !equal_cross_candidate_report_semantics(&cargo_record, &buck_record) {
+    if cargo_record != buck_record {
         return Err("retained Cargo/Buck ptrace record reports differ".to_owned());
     }
     Ok(RetainedCandidateEvidence {
@@ -6477,6 +6668,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         return Err("Cargo/Buck ELF NEEDED library sets differ".to_owned());
     }
     behavioral_parity(
+        &root,
         &safehermit,
         &cargo_bundle.binary,
         &buck_bundle.binary,
@@ -6887,10 +7079,16 @@ mod tests {
         ] {
             fs::write(root.join(name), contents).unwrap();
         }
-        let run = canonical_report(true);
+        let run = clock_runtime_report(48_690_715);
         let record = canonical_report(false);
         for name in ["cargo-ptrace-verify.json", "buck-ptrace-verify.json"] {
             write_report(root, name, &run);
+        }
+        for name in [
+            "cargo-ptrace-clock-trajectory.txt",
+            "buck-ptrace-clock-trajectory.txt",
+        ] {
+            fs::write(root.join(name), CAPTURED_CLOCK_TRAJECTORY).unwrap();
         }
         for name in [
             "cargo-ptrace-record-verify.json",
@@ -7808,15 +8006,29 @@ mod tests {
 
         let run_path = fixture.join("buck-ptrace-verify.json");
         let original_run = fs::read(&run_path).unwrap();
-        let mut changed_run = canonical_report(true);
+        // Only the compared INFO counts differ from the retained Cargo report.
+        let mut changed_run = clock_runtime_report(48_690_715);
         changed_run["compared_log_messages"]["left"] = serde_json::json!(13);
         changed_run["compared_log_messages"]["right"] = serde_json::json!(13);
         fs::write(&run_path, serde_json::to_vec(&changed_run).unwrap()).unwrap();
-        assert!(
+        let Err(error) =
             verify_retained_candidate_evidence(&fixture, "0.2.0", "0123456789ab", &cargo_info)
-                .is_err()
-        );
+        else {
+            panic!("retained evidence accepted changed INFO counts");
+        };
+        assert!(error.contains("strict reports differ"), "{error}");
         fs::write(&run_path, original_run).unwrap();
+
+        for build in ["cargo", "buck"] {
+            let trajectory_path = fixture.join(format!("{build}-ptrace-clock-trajectory.txt"));
+            let shifted = shift_clock_trajectory(CAPTURED_CLOCK_TRAJECTORY, 10);
+            fs::write(&trajectory_path, shifted).unwrap();
+            assert!(
+                verify_retained_candidate_evidence(&fixture, "0.2.0", "0123456789ab", &cargo_info)
+                    .is_err()
+            );
+            fs::write(&trajectory_path, CAPTURED_CLOCK_TRAJECTORY).unwrap();
+        }
 
         let record_path = fixture.join("buck-ptrace-record-verify.json");
         let original_record = fs::read(&record_path).unwrap();
@@ -8328,70 +8540,245 @@ mod tests {
         assert!(require_equal("fixture", "cargo", "buck").is_err());
     }
 
+    /// Exact stdout of the clock fixture under the pinned epoch, captured from
+    /// `run --backend ptrace --base-env=minimal --epoch=2026-01-01T00:00:00+00:00
+    /// --strict --verify --verify-strict` with both a Cargo- and a Buck-built
+    /// candidate; the two were byte-identical. That run used the default
+    /// max timeslice, which is the value `CLOCK_PARITY_MAX_TIMESLICE` pins.
+    const CAPTURED_CLOCK_TRAJECTORY: &str = "\
+        sample gen=0 source=main index=0 ns=1767225600002243075\n\
+        sample gen=0 source=main index=1 ns=1767225600002253115\n\
+        sample gen=0 source=main index=2 ns=1767225600002263155\n\
+        sample gen=0 source=main index=3 ns=1767225600002273195\n\
+        sample gen=0 source=main index=4 ns=1767225600002283235\n\
+        sample gen=0 source=main index=5 ns=1767225600002293275\n\
+        sample gen=0 source=main index=6 ns=1767225600002303315\n\
+        sample gen=0 source=main index=7 ns=1767225600002313355\n\
+        work gen=0 index=0 iterations=0 before_ns=1767225600002377795 after_ns=1767225600002387845 checksum=27\n\
+        work gen=0 index=1 iterations=100000 before_ns=1767225600002401805 after_ns=1767225600004411855 checksum=4\n\
+        work gen=0 index=2 iterations=100000 before_ns=1767225600004425895 after_ns=1767225600006435945 checksum=4\n\
+        work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600010460035 checksum=2\n\
+        sample gen=0 source=thread index=0 thread=0 ns=1767225600011247845\n\
+        sample gen=0 source=thread index=1 thread=0 ns=1767225600011257885\n\
+        sample gen=0 source=thread index=2 thread=0 ns=1767225600011267925\n\
+        sample gen=0 source=thread index=3 thread=0 ns=1767225600011277965\n\
+        sample gen=0 source=thread index=0 thread=1 ns=1767225600013817945\n\
+        sample gen=0 source=thread index=1 thread=1 ns=1767225600013827985\n\
+        sample gen=0 source=thread index=2 thread=1 ns=1767225600013838025\n\
+        sample gen=0 source=thread index=3 thread=1 ns=1767225600013848065\n\
+        gen=0 first=1767225600002243075 last=1767225600013848065 min_delta=10040\n\
+        sample gen=1 source=main index=0 ns=1767225600017891900\n\
+        sample gen=1 source=main index=1 ns=1767225600017901940\n\
+        sample gen=1 source=main index=2 ns=1767225600017911980\n\
+        sample gen=1 source=main index=3 ns=1767225600017922020\n\
+        sample gen=1 source=main index=4 ns=1767225600017932060\n\
+        sample gen=1 source=main index=5 ns=1767225600017942100\n\
+        sample gen=1 source=main index=6 ns=1767225600017952140\n\
+        sample gen=1 source=main index=7 ns=1767225600017962180\n\
+        work gen=1 index=0 iterations=0 before_ns=1767225600018026880 after_ns=1767225600018036930 checksum=27\n\
+        work gen=1 index=1 iterations=100000 before_ns=1767225600018050920 after_ns=1767225600020060970 checksum=4\n\
+        work gen=1 index=2 iterations=100000 before_ns=1767225600020075040 after_ns=1767225600022085090 checksum=4\n\
+        work gen=1 index=3 iterations=200000 before_ns=1767225600022099160 after_ns=1767225600026109210 checksum=2\n\
+        sample gen=1 source=thread index=0 thread=0 ns=1767225600026897050\n\
+        sample gen=1 source=thread index=1 thread=0 ns=1767225600026907090\n\
+        sample gen=1 source=thread index=2 thread=0 ns=1767225600026917130\n\
+        sample gen=1 source=thread index=3 thread=0 ns=1767225600026927170\n\
+        sample gen=1 source=thread index=0 thread=1 ns=1767225600029467270\n\
+        sample gen=1 source=thread index=1 thread=1 ns=1767225600029477310\n\
+        sample gen=1 source=thread index=2 thread=1 ns=1767225600029487350\n\
+        sample gen=1 source=thread index=3 thread=1 ns=1767225600029497390\n\
+        gen=1 first=1767225600017891900 last=1767225600029497390 min_delta=10040\n\
+        sample gen=2 source=main index=0 ns=1767225600033541375\n\
+        sample gen=2 source=main index=1 ns=1767225600033551415\n\
+        sample gen=2 source=main index=2 ns=1767225600033561455\n\
+        sample gen=2 source=main index=3 ns=1767225600033571495\n\
+        sample gen=2 source=main index=4 ns=1767225600033581535\n\
+        sample gen=2 source=main index=5 ns=1767225600033591575\n\
+        sample gen=2 source=main index=6 ns=1767225600033601615\n\
+        sample gen=2 source=main index=7 ns=1767225600033611655\n\
+        work gen=2 index=0 iterations=0 before_ns=1767225600033676355 after_ns=1767225600033686405 checksum=27\n\
+        work gen=2 index=1 iterations=100000 before_ns=1767225600033700395 after_ns=1767225600035710445 checksum=4\n\
+        work gen=2 index=2 iterations=100000 before_ns=1767225600035724515 after_ns=1767225600037734565 checksum=4\n\
+        work gen=2 index=3 iterations=200000 before_ns=1767225600037748635 after_ns=1767225600041758685 checksum=2\n\
+        sample gen=2 source=thread index=0 thread=0 ns=1767225600042546525\n\
+        sample gen=2 source=thread index=1 thread=0 ns=1767225600042556565\n\
+        sample gen=2 source=thread index=2 thread=0 ns=1767225600042566605\n\
+        sample gen=2 source=thread index=3 thread=0 ns=1767225600042576645\n\
+        sample gen=2 source=thread index=0 thread=1 ns=1767225600045116745\n\
+        sample gen=2 source=thread index=1 thread=1 ns=1767225600045126785\n\
+        sample gen=2 source=thread index=2 thread=1 ns=1767225600045136825\n\
+        sample gen=2 source=thread index=3 thread=1 ns=1767225600045146865\n\
+        gen=2 first=1767225600033541375 last=1767225600045146865 min_delta=10040\n\
+        clock exec continuity holds across 2 execs\n";
+
+    fn clock_runtime_report(virtual_nanoseconds: u64) -> Value {
+        let mut report = canonical_report(true);
+        for side in ["left", "right"] {
+            let output = &mut report["compared_outputs"][side];
+            output["stdout_sha256"] = sha256_bytes(CAPTURED_CLOCK_TRAJECTORY.as_bytes())
+                .unwrap()
+                .into();
+            output["stdout_bytes"] = CAPTURED_CLOCK_TRAJECTORY.len().into();
+        }
+        let run = serde_json::json!({
+            "scheduler_turns": 36, "virtual_nanoseconds": virtual_nanoseconds, "syscalls": 250
+        });
+        report["runtime"] = serde_json::json!({"run1": run, "run2": run});
+        report
+    }
+
+    /// Adds `offset` to every timestamp, keeping order, costs and summaries.
+    fn shift_clock_trajectory(text: &str, offset: i64) -> String {
+        let shift = |field: &str| match field.split_once('=') {
+            Some((key, value)) if ["ns", "before_ns", "after_ns", "first", "last"].contains(&key) => {
+                format!("{key}={}", value.parse::<i64>().unwrap() + offset)
+            }
+            _ => field.to_owned(),
+        };
+        text.lines()
+            .map(|line| line.split(' ').map(shift).collect::<Vec<_>>().join(" ") + "\n")
+            .collect()
+    }
+
+    /// Replaces the given 0-based lines of the captured trajectory.
+    fn edit_clock_trajectory(edits: &[(usize, &str)]) -> String {
+        let mut lines = CAPTURED_CLOCK_TRAJECTORY.lines().collect::<Vec<_>>();
+        for (index, line) in edits {
+            lines[*index] = line;
+        }
+        lines.join("\n") + "\n"
+    }
+
     #[test]
-    fn cross_candidate_reports_ignore_only_per_invocation_virtual_time() {
-        use hermit_manifest_plan::canonical_verdict::RuntimeStats;
-        use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
+    fn clock_trajectory_accepts_the_capture_and_refuses_each_violation() {
+        let text = CAPTURED_CLOCK_TRAJECTORY;
+        assert_eq!(parse_clock_trajectory(text), Ok(1_767_225_600_045_146_865));
+        // A shift inside the startup bound is valid; only the cross-build
+        // comparison can refuse it.
+        parse_clock_trajectory(&shift_clock_trajectory(text, 10)).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        let without = |index: usize| {
+            let mut kept = lines.clone();
+            kept.remove(index);
+            kept.join("\n") + "\n"
+        };
+        let mut reordered = lines.clone();
+        reordered.swap(12, 16);
+        let advance = "does not advance past";
+        let cost = "equal work must cost equal virtual time";
+        let cases = [
+            ("freeze", edit_clock_trajectory(&[(1, "sample gen=0 source=main index=1 ns=1767225600002243075")]), advance),
+            ("backwards", edit_clock_trajectory(&[(3, "sample gen=0 source=main index=3 ns=1767225600002253000")]), advance),
+            ("exec reset", edit_clock_trajectory(&[(21, "sample gen=1 source=main index=0 ns=1767225600002243075")]), advance),
+            ("thread reset", edit_clock_trajectory(&[(12, "sample gen=0 source=thread index=0 thread=0 ns=1767225600002243075")]), advance),
+            ("epoch too early", shift_clock_trajectory(text, -1_000_000_000), advance),
+            ("epoch too late", shift_clock_trajectory(text, 86_400_000_000_000), "outside the startup bound"),
+            ("round origin", shift_clock_trajectory(text, 1_000_000_000 - 17_891_900), "opens on a whole second"),
+            // Work-cost controls keep every timestamp strictly increasing, so
+            // only the work-cost relation can refuse them.
+            // Double work still costs exactly its two halves here, so only the
+            // equal-cost relation can refuse this one.
+            ("equal work, unequal cost", edit_clock_trajectory(&[
+                (10, "work gen=0 index=2 iterations=100000 before_ns=1767225600004425895 after_ns=1767225600006435946 checksum=4"),
+                (11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600010460036 checksum=2"),
+            ]), cost),
+            ("double work, single cost", edit_clock_trajectory(&[(11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600008460035 checksum=2")]), cost),
+            // Costs more than one unit of work, but not exactly two.
+            ("double work, non-additive cost", edit_clock_trajectory(&[(11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600009460035 checksum=2")]), cost),
+            // A clock that ignores work: every segment costs the empty one's
+            // 10,050 ns, which is equal and additive, so only the grows-with-work
+            // relation can refuse it.
+            ("work costs nothing", edit_clock_trajectory(&[
+                (9, "work gen=0 index=1 iterations=100000 before_ns=1767225600002401805 after_ns=1767225600002411855 checksum=4"),
+                (10, "work gen=0 index=2 iterations=100000 before_ns=1767225600004425895 after_ns=1767225600004435945 checksum=4"),
+                (11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600006460035 checksum=2"),
+            ]), cost),
+            ("wrong checksum", edit_clock_trajectory(&[(9, "work gen=0 index=1 iterations=100000 before_ns=1767225600002401805 after_ns=1767225600004411855 checksum=5")]), "checksum 5 is wrong"),
+            ("changed iterations", edit_clock_trajectory(&[(9, "work gen=0 index=1 iterations=100001 before_ns=1767225600002401805 after_ns=1767225600004411855 checksum=4")]), "expected \"work gen=0 index=1 iterations=100000\""),
+            ("missing sample", without(4), "expected \"sample gen=0 source=main index=4\""),
+            ("extra sample", edit_clock_trajectory(&[(8, "sample gen=0 source=main index=8 ns=1767225600002323395")]), "expected \"work gen=0 index=0"),
+            ("record after verdict", format!("{text}extra\n"), "extra record"),
+            ("threads reordered", reordered.join("\n") + "\n", "expected \"sample gen=0 source=thread index=0 thread=0\""),
+            ("leading zero", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=01767225600002243075")]), "malformed ns"),
+            ("signed", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=+1767225600002243075")]), "malformed ns"),
+            ("empty", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=")]), "malformed ns"),
+            ("overflow", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=99999999999999999999")]), "malformed ns"),
+            ("trailing space", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=1767225600002243075 ")]), "trailing text"),
+            ("carriage returns", text.replace('\n', "\r\n"), "trailing text"),
+            ("summary", edit_clock_trajectory(&[(20, "gen=0 first=1767225600002243075 last=1767225600013848065 min_delta=10041")]), "summary disagrees"),
+            ("no final newline", text[..text.len() - 1].to_owned(), "one newline"),
+            ("no verdict", without(63), "lacks \"clock exec continuity"),
+        ];
+        for (name, mutated, expected) in cases {
+            let error = parse_clock_trajectory(&mutated).expect_err(name);
+            assert!(error.contains(expected), "{name}: expected {expected:?}, got {error:?}");
+        }
+    }
 
-        let mut cargo: VerificationReport = serde_json::from_value(canonical_report(true)).unwrap();
-        cargo.runtime = Some(VerificationRuntime {
-            run1: Some(RuntimeStats {
-                scheduler_turns: 5,
-                virtual_nanoseconds: 3_512_925,
-                syscalls: Some(33),
-            }),
-            run2: Some(RuntimeStats {
-                scheduler_turns: 5,
-                virtual_nanoseconds: 3_512_925,
-                syscalls: Some(33),
-            }),
-        });
-        let mut buck = cargo.clone();
-        let buck_runtime = buck.runtime.as_mut().unwrap();
-        buck_runtime.run1.as_mut().unwrap().virtual_nanoseconds = 3_512_447;
-        buck_runtime.run2.as_mut().unwrap().virtual_nanoseconds = 3_512_447;
-        assert!(equal_cross_candidate_report_semantics(&cargo, &buck));
-
-        let mut different_turns = buck.clone();
-        different_turns
-            .runtime
-            .as_mut()
-            .unwrap()
-            .run1
-            .as_mut()
-            .unwrap()
-            .scheduler_turns += 1;
-        assert!(!equal_cross_candidate_report_semantics(
-            &cargo,
-            &different_turns
-        ));
-
-        let mut different_syscalls = buck.clone();
-        different_syscalls
-            .runtime
-            .as_mut()
-            .unwrap()
-            .run1
-            .as_mut()
-            .unwrap()
-            .syscalls = Some(34);
-        assert!(!equal_cross_candidate_report_semantics(
-            &cargo,
-            &different_syscalls
-        ));
-
-        buck.compared_log_messages.as_mut().unwrap().left += 1;
-        assert!(!equal_cross_candidate_report_semantics(&cargo, &buck));
-
-        let root = fixture_root("unstable-runtime-report");
+    #[test]
+    fn clock_parity_refuses_any_cross_build_difference_including_virtual_time() {
+        let root = fixture_root("clock-parity");
         fs::create_dir(&root).unwrap();
-        let mut unstable = canonical_report(true);
-        unstable["runtime"] = serde_json::json!({
-            "run1": {"scheduler_turns": 5, "virtual_nanoseconds": 10, "syscalls": 33},
-            "run2": {"scheduler_turns": 5, "virtual_nanoseconds": 11, "syscalls": 33}
-        });
-        let path = write_report(&root, "unstable.json", &unstable);
-        assert!(verify_report(&path, true).is_err());
+        let bytes = CAPTURED_CLOCK_TRAJECTORY.as_bytes();
+        let report = |name: &str, value: Value| write_report(&root, name, &value);
+        let cargo = report("cargo.json", clock_runtime_report(48_690_715));
+        verify_clock_parity(bytes, bytes, &cargo, &cargo).unwrap();
+        let shifted = shift_clock_trajectory(CAPTURED_CLOCK_TRAJECTORY, 10);
+        let mut bare = clock_runtime_report(48_690_715);
+        bare.as_object_mut().unwrap().remove("runtime");
+        let mut changed = Vec::new();
+        for (field, value) in [
+            // The value the old comparator zeroed before comparing.
+            ("virtual_nanoseconds", 48_690_237),
+            ("scheduler_turns", 37),
+            ("syscalls", 251),
+        ] {
+            let mut value_report = clock_runtime_report(48_690_715);
+            for run in ["run1", "run2"] {
+                value_report["runtime"][run][field] = value.into();
+            }
+            changed.push(value_report);
+        }
+        let mut counts = clock_runtime_report(48_690_715);
+        counts["compared_log_messages"] = serde_json::json!({"left": 13, "right": 13});
+        changed.push(counts);
+        for buck in changed {
+            let buck = report("buck.json", buck);
+            let error = verify_clock_parity(bytes, bytes, &cargo, &buck).unwrap_err();
+            assert!(error.contains("strict reports differ"), "{error}");
+        }
+        for (cargo_bytes, buck_bytes, cargo, expected) in [
+            (bytes, shifted.as_bytes(), &cargo, "clock trajectory"),
+            (shifted.as_bytes(), shifted.as_bytes(), &cargo, "compared a different stdout"),
+            (bytes, bytes, &report("short.json", clock_runtime_report(45_146_865)), "ends before the last read"),
+            (bytes, bytes, &report("bare.json", bare), "lacks a runtime summary"),
+        ] {
+            let error = verify_clock_parity(cargo_bytes, buck_bytes, cargo, cargo).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_report_with_unequal_run1_run2_is_refused() {
+        let root = fixture_root("unequal-runs");
+        fs::create_dir(&root).unwrap();
+        let bytes = CAPTURED_CLOCK_TRAJECTORY.as_bytes();
+        for (field, value) in [
+            ("virtual_nanoseconds", 48_690_725),
+            ("scheduler_turns", 37),
+            ("syscalls", 251),
+        ] {
+            let mut unequal = clock_runtime_report(48_690_715);
+            unequal["runtime"]["run2"][field] = serde_json::json!(value);
+            let path = write_report(&root, &format!("{field}.json"), &unequal);
+            let error = verify_report(&path, true).unwrap_err();
+            assert!(error.contains("unequal run1/run2"), "{field}: {error}");
+            // Only run1 is read for virtual time, so the parity gate relies on
+            // this refusal to cover run2.
+            let error = verify_clock_parity(bytes, bytes, &path, &path).unwrap_err();
+            assert!(error.contains("unequal run1/run2"), "{field}: {error}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
