@@ -93,6 +93,32 @@ const MATRIX_CPU_TIMEOUT_SECONDS: i64 = 7_200;
 const _: () = assert!(MATRIX_STEP_DEADLINE_SECONDS < MATRIX_SUPERVISOR_DEADLINE_SECONDS);
 const MATRIX_CANDIDATE_DEADLINE_SECONDS: u64 = 120;
 const MATRIX_PROXY_ENV: &str = "HERMIT_BUCK_PHASE1_MATRIX_PROXY";
+const MATRIX_PRIVATE_TMP_HANDOFF: &str = "--matrix-private-tmp";
+/// Runs after the stage's mounts, immediately before the candidate, and records
+/// what the candidate will see so the proxy can measure the isolation rather than
+/// infer it from an exit status the guest also controls.
+const PRIVATE_TMP_READBACK_SCRIPT: &str = "readback=$1
+shift
+printf 'tmp=%s\\ncwd=%s\\ntmpdir=%s\\nuid_map=%s\\n' \"$(stat -c %d:%i /tmp)\" \"$(pwd -P)\" \"$TMPDIR\" \"$(tr -s ' ' ' ' </proc/self/uid_map | sed 's/^ //')\" >\"$readback\"
+exec \"$@\"
+";
+/// Byte-identical to `DBT_PRIVATE_TMP_SCRIPT` in tests/backend-parity/run_matrix.py.
+/// The proxy runs run_matrix's own private-/tmp stage, only one process lower:
+/// inside the safehermit unit, after safehermit has applied its host bounds.
+const DBT_PRIVATE_TMP_SCRIPT: &str = "private_tmp=$1
+mount_count=$2
+shift 2
+mount --make-rprivate /
+while [ \"$mount_count\" -gt 0 ]; do
+    mount --bind \"$1\" \"$2\"
+    shift 2
+    mount_count=$((mount_count - 1))
+done
+mount --rbind \"$private_tmp\" /tmp
+cd /tmp
+export TMPDIR=/tmp
+exec \"$@\"
+";
 const MAX_PUBLIC_EVIDENCE_GZIP_DECODED_BYTES: usize = 128 * 1024 * 1024;
 const VALIDATE_ARTIFACT_ROOT: &str = "ignored/buck2-phase2/artifacts";
 const VALIDATE_ARTIFACT_IDENTITY: &str = "ignored/buck2-phase2/current.identity";
@@ -4176,7 +4202,186 @@ fn classify_matrix_proxy_invocation(arguments: &[String]) -> Result<MatrixProxyI
     })
 }
 
+/// run_matrix's DBT private-/tmp stage, received as data rather than as the
+/// process this proxy runs inside.
+#[derive(Debug, PartialEq, Eq)]
+struct PrivateTmpStage {
+    host_tmp: PathBuf,
+    mounts: Vec<(PathBuf, PathBuf)>,
+    argv: Vec<String>,
+}
+
+fn split_private_tmp_handoff(
+    arguments: Vec<String>,
+) -> Result<(Option<PrivateTmpStage>, Vec<String>), String> {
+    if arguments.first().map(String::as_str) != Some(MATRIX_PRIVATE_TMP_HANDOFF) {
+        return Ok((None, arguments));
+    }
+    let count = arguments
+        .get(1)
+        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|count| count.parse::<usize>().ok())
+        .ok_or_else(|| "matrix private /tmp handoff lacks a decimal stage length".to_owned())?;
+    let end = count
+        .checked_add(2)
+        .filter(|end| *end <= arguments.len())
+        .ok_or_else(|| "matrix private /tmp handoff stage is truncated".to_owned())?;
+    let stage = validate_private_tmp_stage(&arguments[2..end])?;
+    Ok((Some(stage), arguments[end..].to_vec()))
+}
+
+/// Accept exactly the stage `command_in_private_tmp` emits: its fixed unshare
+/// argv and script, a canonical host directory, and binds that land strictly
+/// beneath it.
+fn validate_private_tmp_stage(argv: &[String]) -> Result<PrivateTmpStage, String> {
+    let fixed = [
+        "unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "sh",
+        "-ceu",
+        DBT_PRIVATE_TMP_SCRIPT,
+        "hermit-dbt-private-tmp",
+    ];
+    if argv.len() < fixed.len() + 2 || argv[..fixed.len()] != fixed {
+        return Err(
+            "matrix private /tmp stage is not run_matrix's unshare private-/tmp stage".to_owned(),
+        );
+    }
+    let canonical = |raw: &str, description: &str| -> Result<PathBuf, String> {
+        let path = PathBuf::from(raw);
+        let resolved = fs::canonicalize(&path)
+            .map_err(|error| format!("matrix private /tmp {description} {raw} is unreadable: {error}"))?;
+        if !path.is_absolute() || resolved != path {
+            return Err(format!(
+                "matrix private /tmp {description} {raw} is not an absolute canonical path"
+            ));
+        }
+        Ok(path)
+    };
+    let host_tmp = canonical(&argv[fixed.len()], "host directory")?;
+    if !host_tmp.is_dir() {
+        return Err(format!(
+            "matrix private /tmp host directory {} is not a directory",
+            host_tmp.display()
+        ));
+    }
+    let raw_count = &argv[fixed.len() + 1];
+    let count = Some(raw_count)
+        .filter(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|count| count.parse::<usize>().ok())
+        .ok_or_else(|| format!("matrix private /tmp bind count {raw_count:?} is not decimal"))?;
+    let pairs = &argv[fixed.len() + 2..];
+    if count.checked_mul(2) != Some(pairs.len()) {
+        return Err(format!(
+            "matrix private /tmp stage declares {count} binds but carries {} paths",
+            pairs.len()
+        ));
+    }
+    let mut mounts = Vec::with_capacity(count);
+    let mut destinations = BTreeSet::new();
+    for pair in pairs.chunks(2) {
+        let source = canonical(&pair[0], "bind source")?;
+        let destination = canonical(&pair[1], "bind destination")?;
+        if !destination.starts_with(&host_tmp) || destination == host_tmp {
+            return Err(format!(
+                "matrix private /tmp bind destination {} is not strictly beneath {}",
+                destination.display(),
+                host_tmp.display()
+            ));
+        }
+        if !destinations.insert(destination.clone()) {
+            return Err(format!(
+                "matrix private /tmp stage binds {} twice",
+                destination.display()
+            ));
+        }
+        mounts.push((source, destination));
+    }
+    Ok(PrivateTmpStage {
+        host_tmp,
+        mounts,
+        argv: argv.to_vec(),
+    })
+}
+
+/// safehermit's disk bound needs host sudo, which an unmapped setuid binary
+/// cannot provide; its systemd unit would also escape any outer namespace.
+fn require_initial_user_namespace(uid_map: &str) -> Result<(), String> {
+    let lines = uid_map
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    if lines != [vec!["0", "0", "4294967295"]] {
+        return Err(format!(
+            "matrix candidate proxy must launch safehermit from the initial user namespace, found uid_map {:?}",
+            uid_map.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// The candidate must see the host directory as /tmp, start in it with TMPDIR
+/// pointing at it, and run as root mapped from exactly the proxy's own uid.
+fn require_private_tmp_readback(observed: &str, dev: u64, ino: u64, uid: u32) -> Result<(), String> {
+    let expected = format!("tmp={dev}:{ino}\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 {uid} 1\n");
+    if observed != expected {
+        return Err(format!(
+            "private /tmp readback {observed:?} does not match the host directory and mapping {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn executable_on_path(name: &str) -> Result<PathBuf, String> {
+    let path = env::var_os("PATH").ok_or_else(|| format!("PATH is unset; cannot find {name}"))?;
+    let found = env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("{name} is not an executable on PATH"))?;
+    let resolved = fs::canonicalize(&found)
+        .map_err(|error| format!("cannot resolve {}: {error}", found.display()))?;
+    require_absolute_file(&resolved, name)
+}
+
+/// The report must name the executable safehermit actually launched.
+fn require_safehermit_launched(path: &Path, expected_sha256: &str, description: &str) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "safehermit report for {description} is unreadable at {}: {error}",
+            path.display()
+        )
+    })?;
+    let recorded = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("safehermit: binary_sha256="))
+        .collect::<Vec<_>>();
+    if recorded != [expected_sha256] {
+        return Err(format!(
+            "safehermit report for {description} records launched binary {recorded:?}, expected {expected_sha256}: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn matrix_candidate_proxy(arguments: impl Iterator<Item = String>) -> Result<ExitCode, String> {
+    matrix_candidate_proxy_from(Path::new("/proc/self/uid_map"), arguments)
+}
+
+fn matrix_candidate_proxy_from(
+    uid_map: &Path,
+    arguments: impl Iterator<Item = String>,
+) -> Result<ExitCode, String> {
+    // First, before any binding is read or evidence is written.
+    let uid_map = fs::read_to_string(uid_map)
+        .map_err(|error| format!("cannot read the proxy's user namespace map: {error}"))?;
+    require_initial_user_namespace(&uid_map)?;
     let required = |name: &str| {
         env::var_os(name)
             .filter(|value| !value.is_empty())
@@ -4204,8 +4409,23 @@ fn matrix_candidate_proxy(arguments: impl Iterator<Item = String>) -> Result<Exi
     if !matches!(label.as_str(), "cargo" | "buck") {
         return Err(format!("invalid matrix candidate label {label:?}"));
     }
-    let arguments = arguments.collect::<Vec<_>>();
+    let (private_tmp, arguments) = split_private_tmp_handoff(arguments.collect())?;
     let invocation_metadata = classify_matrix_proxy_invocation(&arguments)?;
+    match (invocation_metadata.role.as_str(), &private_tmp) {
+        ("dbt-run", None) => {
+            return Err(format!(
+                "DBT matrix case {} arrived without run_matrix's private /tmp stage",
+                invocation_metadata.case_identity
+            ));
+        }
+        (role, Some(_)) if role != "dbt-run" => {
+            return Err(format!(
+                "matrix {role} invocation {} must not carry a private /tmp stage",
+                invocation_metadata.case_identity
+            ));
+        }
+        _ => {}
+    }
     let identity = unique_identity()?;
     let invocation = evidence.join(format!("{label}-{identity}"));
     create_exclusive_directory(&invocation, "matrix candidate invocation")?;
@@ -4222,11 +4442,60 @@ fn matrix_candidate_proxy(arguments: impl Iterator<Item = String>) -> Result<Exi
         .as_bytes(),
         "matrix candidate invocation metadata",
     )?;
-    let output = Command::new(&safehermit)
+    let binary_sha256 = sha256(&binary)?;
+    let mut command = Command::new(&safehermit);
+    command
         .arg(format!("--sh-deadline={MATRIX_CANDIDATE_DEADLINE_SECONDS}"))
         .arg("--sh-report")
-        .arg(&report)
-        .arg(&binary)
+        .arg(&report);
+    let launched_sha256 = if let Some(stage) = &private_tmp {
+        // The stage hides host /tmp from the candidate; anything it needs
+        // there must arrive through run_matrix's own binds.
+        for (path, description) in [
+            (&binary, "candidate"),
+            (&install, "install bundle"),
+            (&invocation, "invocation evidence"),
+        ] {
+            if path.starts_with("/tmp") {
+                return Err(format!(
+                    "matrix {description} {} lies beneath the /tmp the private stage replaces",
+                    path.display()
+                ));
+            }
+        }
+        let unshare = executable_on_path(&stage.argv[0])?;
+        let unshare_sha256 = sha256(&unshare)?;
+        write_new_file(
+            &invocation.join("private-tmp.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": "hermit-matrix-private-tmp/v1",
+                    "host_tmp": stage.host_tmp,
+                    "binds": stage.mounts,
+                    "unshare": unshare,
+                    "unshare_sha256": unshare_sha256,
+                    "candidate": binary,
+                    "candidate_sha256": binary_sha256,
+                }))
+                .map_err(|error| format!("failed to encode private /tmp evidence: {error}"))?
+            )
+            .as_bytes(),
+            "matrix private /tmp evidence",
+        )?;
+        command
+            .arg(format!("--sh-bin={}", unshare.display()))
+            .arg("--")
+            .args(&stage.argv[1..])
+            .args(["/bin/sh", "-ceu", PRIVATE_TMP_READBACK_SCRIPT, "hermit-private-tmp-readback"])
+            .arg(invocation.join("private-tmp.readback"))
+            .arg(&binary);
+        unshare_sha256
+    } else {
+        command.arg(&binary);
+        binary_sha256.clone()
+    };
+    let output = command
         .args(&arguments)
         .env("HERMIT_INSTALL_DIR", &install)
         .env("HERMIT_DATA_DIR", &data)
@@ -4242,7 +4511,36 @@ fn matrix_candidate_proxy(arguments: impl Iterator<Item = String>) -> Result<Exi
         &output.stderr,
         "matrix candidate stderr evidence",
     )?;
-    validate_and_surface_safehermit_report(&report, &format!("{label} DBT matrix candidate"))?;
+    let description = format!("{label} DBT matrix candidate");
+    validate_and_surface_safehermit_report(&report, &description)?;
+    require_safehermit_launched(&report, &launched_sha256, &description)?;
+    if sha256(&binary)? != binary_sha256 {
+        return Err(format!(
+            "{description} {} changed bytes while it ran",
+            binary.display()
+        ));
+    }
+    if let Some(stage) = &private_tmp {
+        let readback = invocation.join("private-tmp.readback");
+        let observed = fs::read_to_string(&readback).map_err(|error| {
+            format!(
+                "{description} left no private /tmp readback at {}: {error}",
+                readback.display()
+            )
+        })?;
+        let host = fs::metadata(&stage.host_tmp)
+            .map_err(|error| format!("cannot stat {}: {error}", stage.host_tmp.display()))?;
+        let uid = fs::metadata("/proc/self")
+            .map_err(|error| format!("cannot read the proxy's uid: {error}"))?
+            .uid();
+        require_private_tmp_readback(&observed, host.dev(), host.ino(), uid)
+            .map_err(|error| format!("{description}: {error}: {}", readback.display()))?;
+        eprintln!(
+            "{description}: isolation.private_tmp=APPLIED:{} with {} binds, read back inside the safehermit unit",
+            stage.host_tmp.display(),
+            stage.mounts.len()
+        );
+    }
     std::io::stdout()
         .write_all(&output.stdout)
         .map_err(|error| format!("failed to replay matrix candidate stdout: {error}"))?;
@@ -9718,6 +10016,223 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    fn private_tmp_stage(host_tmp: &Path, binds: &[(&Path, &Path)]) -> Vec<String> {
+        let mut stage = [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-ceu",
+            DBT_PRIVATE_TMP_SCRIPT,
+            "hermit-dbt-private-tmp",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        stage.push(host_tmp.display().to_string());
+        stage.push(binds.len().to_string());
+        for (source, destination) in binds {
+            stage.push(source.display().to_string());
+            stage.push(destination.display().to_string());
+        }
+        stage
+    }
+
+    fn private_tmp_handoff(stage: &[String], hermit: &[&str]) -> Vec<String> {
+        [MATRIX_PRIVATE_TMP_HANDOFF.to_owned(), stage.len().to_string()]
+            .into_iter()
+            .chain(stage.iter().cloned())
+            .chain(hermit.iter().map(|argument| (*argument).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn matrix_private_tmp_stage_is_run_matrix_stage() {
+        let run_matrix = fs::read_to_string(
+            Path::new(file!())
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .join("tests/backend-parity/run_matrix.py"),
+        )
+        .unwrap();
+        let script = run_matrix
+            .split_once("DBT_PRIVATE_TMP_SCRIPT = \"\"\"\\\n")
+            .and_then(|(_, rest)| rest.split_once("\"\"\""))
+            .map(|(script, _)| script)
+            .unwrap();
+        assert_eq!(script, DBT_PRIVATE_TMP_SCRIPT);
+        assert!(run_matrix.contains("MATRIX_PRIVATE_TMP_HANDOFF = \"--matrix-private-tmp\""));
+        assert!(run_matrix.contains("MATRIX_PROXY_ENV = \"HERMIT_BUCK_PHASE1_MATRIX_PROXY\""));
+    }
+
+    #[test]
+    fn matrix_private_tmp_handoff_accepts_only_run_matrix_stage() {
+        let root = fs::canonicalize({
+            let root = fixture_root("matrix-private-tmp");
+            fs::create_dir(&root).unwrap();
+            root
+        })
+        .unwrap();
+        let host_tmp = root.join("host-tmp");
+        let source = root.join("verify-output");
+        let destination = host_tmp.join("verify-output");
+        let other = root.join("other");
+        for directory in [&host_tmp, &source, &destination, &other] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let hermit = ["run", "--backend", "dbt", "--max-timeslice=disabled", "--", "/bin/true"];
+        let stage = private_tmp_stage(&host_tmp, &[(&source, &destination)]);
+        let (parsed, rest) = split_private_tmp_handoff(private_tmp_handoff(&stage, &hermit)).unwrap();
+        assert_eq!(
+            parsed,
+            Some(PrivateTmpStage {
+                host_tmp: host_tmp.clone(),
+                mounts: vec![(source.clone(), destination.clone())],
+                argv: stage.clone(),
+            })
+        );
+        assert_eq!(rest, hermit);
+        let plain = hermit.map(str::to_owned).to_vec();
+        assert_eq!(split_private_tmp_handoff(plain.clone()).unwrap(), (None, plain));
+        let (unbound, _) =
+            split_private_tmp_handoff(private_tmp_handoff(&private_tmp_stage(&host_tmp, &[]), &hermit))
+                .unwrap();
+        assert_eq!(unbound.unwrap().mounts, Vec::new());
+
+        let refused = |stage: Vec<String>, needle: &str| {
+            let error = split_private_tmp_handoff(private_tmp_handoff(&stage, &hermit)).unwrap_err();
+            assert!(error.contains(needle), "{needle:?} not in {error}");
+        };
+        let mut script = stage.clone();
+        script[6] = script[6].replace("--rbind", "--bind");
+        refused(script, "not run_matrix's unshare");
+        let mut mapping = stage.clone();
+        mapping[2] = "--map-current-user".to_owned();
+        refused(mapping, "not run_matrix's unshare");
+        let mut count = stage.clone();
+        count[9] = "2".to_owned();
+        refused(count, "declares 2 binds but carries 2 paths");
+        let mut signed = stage.clone();
+        signed[9] = "+1".to_owned();
+        refused(signed, "is not decimal");
+        refused(private_tmp_stage(&host_tmp, &[(&source, &other)]), "not strictly beneath");
+        refused(private_tmp_stage(&host_tmp, &[(&source, &host_tmp)]), "not strictly beneath");
+        refused(
+            private_tmp_stage(&host_tmp, &[(&source, &destination), (&other, &destination)]),
+            "twice",
+        );
+        refused(
+            private_tmp_stage(&host_tmp, &[(&root.join("missing"), &destination)]),
+            "is unreadable",
+        );
+        let alias = root.join("alias");
+        symlink(&host_tmp, &alias).unwrap();
+        refused(private_tmp_stage(&alias, &[]), "not an absolute canonical path");
+        refused(
+            private_tmp_stage(&host_tmp, &[(&source, &alias.join("verify-output"))]),
+            "not an absolute canonical path",
+        );
+
+        let mut truncated = private_tmp_handoff(&stage, &[]);
+        truncated[1] = (stage.len() + 1).to_string();
+        assert!(split_private_tmp_handoff(truncated).unwrap_err().contains("truncated"));
+        let mut malformed = private_tmp_handoff(&stage, &hermit);
+        malformed[1] = "x".to_owned();
+        assert!(
+            split_private_tmp_handoff(malformed)
+                .unwrap_err()
+                .contains("decimal stage length")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_proxy_refuses_to_launch_safehermit_inside_a_user_namespace() {
+        require_initial_user_namespace("         0          0 4294967295\n").unwrap();
+        for nested in ["         0     212630          1\n", "", "0 0 4294967295\n0 0 1\n"] {
+            assert!(
+                require_initial_user_namespace(nested)
+                    .unwrap_err()
+                    .contains("initial user namespace")
+            );
+        }
+        // The exact shape run_matrix's private-/tmp wrapper would put the proxy in.
+        let nested = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "cat", "/proc/self/uid_map"])
+            .output()
+            .unwrap();
+        assert!(nested.status.success(), "{nested:?}");
+        let nested = String::from_utf8(nested.stdout).unwrap();
+        assert!(require_initial_user_namespace(&nested).is_err(), "{nested:?}");
+
+        // The refusal is the proxy's first act: nothing else is read or written.
+        let root = fixture_root("matrix-proxy-nested-namespace");
+        fs::create_dir(&root).unwrap();
+        let uid_map = root.join("uid_map");
+        fs::write(&uid_map, &nested).unwrap();
+        let error = matrix_candidate_proxy_from(&uid_map, ["run".to_owned()].into_iter()).unwrap_err();
+        assert!(error.contains("initial user namespace"), "{error}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_private_tmp_readback_must_match_host_directory_and_mapping() {
+        let expected = "tmp=48:77\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 1000 1\n";
+        require_private_tmp_readback(expected, 48, 77, 1000).unwrap();
+        for observed in [
+            "tmp=48:78\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 1000 1\n",
+            "tmp=48:77\ncwd=/home\ntmpdir=/tmp\nuid_map=0 1000 1\n",
+            "tmp=48:77\ncwd=/tmp\ntmpdir=/tmp/x\nuid_map=0 1000 1\n",
+            "tmp=48:77\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 0 4294967295\n",
+            "",
+        ] {
+            assert!(require_private_tmp_readback(observed, 48, 77, 1000).is_err(), "{observed:?}");
+        }
+
+        // Execute the stage and readback exactly as the proxy composes them.
+        let root = fs::canonicalize({
+            let root = fixture_root("matrix-private-tmp-readback");
+            fs::create_dir(&root).unwrap();
+            root
+        })
+        .unwrap();
+        let host_tmp = root.join("host-tmp");
+        fs::create_dir(&host_tmp).unwrap();
+        let evidence = root.join("evidence");
+        fs::create_dir(&evidence).unwrap();
+        let readback = evidence.join("private-tmp.readback");
+        // A fixture beneath /tmp is hidden by the stage unless bound through,
+        // exactly as run_matrix preserves its own /tmp paths.
+        let preserved = evidence
+            .strip_prefix("/tmp")
+            .map(|relative| host_tmp.join(relative))
+            .ok();
+        if let Some(destination) = &preserved {
+            fs::create_dir_all(destination).unwrap();
+        }
+        let binds = preserved
+            .iter()
+            .map(|destination| (evidence.as_path(), destination.as_path()))
+            .collect::<Vec<_>>();
+        let stage = private_tmp_stage(&host_tmp, &binds);
+        let output = Command::new(&stage[0])
+            .args(&stage[1..])
+            .args(["/bin/sh", "-ceu", PRIVATE_TMP_READBACK_SCRIPT, "hermit-private-tmp-readback"])
+            .arg(&readback)
+            .args(["/bin/sh", "-c", "printf candidate > /tmp/marker"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let host = fs::metadata(&host_tmp).unwrap();
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        let observed = fs::read_to_string(&readback).unwrap();
+        // uid_map names the parent namespace's uid, which is this test's own.
+        require_private_tmp_readback(&observed, host.dev(), host.ino(), uid).unwrap();
+        assert_eq!(fs::read_to_string(host_tmp.join("marker")).unwrap(), "candidate");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
