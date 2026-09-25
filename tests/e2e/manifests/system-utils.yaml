@@ -1278,8 +1278,7 @@ test:
           ptrace: false
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
-        compare_io_buffers: false
-        compare_io_buffers_disabled_reason: The guest asserts sanitizer-specific invariants for sixteen procfs files that legitimately retain process, virtual-time, topology, or host data; comparing their raw whole-file bytes would manufacture flakes.
+        compare_io_buffers: true
         rcb_time: false
         rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.
         backends_enabled:
