@@ -4447,8 +4447,9 @@ impl NetworkReplayEngine {
         })
     }
 
-    /// Consume a stream message while preserving ancillary object identity and
-    /// its association with the first delivered payload byte.
+    /// Consume a stream message while preserving ancillary object identity.
+    /// Linux Unix-stream recvmsg can consume control data with a zero-length
+    /// payload buffer; MSG_PEEK retains it for a subsequent receive.
     pub fn receive_stream_message(
         &mut self,
         open_file: OpenFileId,
@@ -4717,6 +4718,11 @@ impl NetworkReplayEngine {
                 channel,
                 offset: state.transmitted,
             });
+        }
+        // A zero-length stream send does not emit ancillary data. Keep the
+        // required message intact for the first nonempty transmit.
+        if accepted == 0 {
+            return Ok(StreamTransmitOutcome::Accepted(0));
         }
         *consumed = accepted;
         expected_ancillary.take();
@@ -7375,6 +7381,80 @@ mod tests {
         };
         assert_eq!(second.bytes, b"d");
         assert_eq!(second.ancillary, None);
+    }
+
+    #[test]
+    fn stream_zero_send_preserves_required_ancillary_until_nonempty_output() {
+        let ancillary = NetworkAncillaryDataV2 { bytes: vec![0; 4],
+            objects: vec![detcore_model::network_trace::NetworkAncillaryObjectRefV2 {
+                byte_offset: 0,
+                object: detcore_model::network_trace::NetworkAncillaryObjectV2::FileDescriptor {
+                    object: detcore_model::network_trace::NetworkObjectId(7),
+                },
+            }], truncated: false };
+        let mut history = trace(); history.inputs.clear();
+        history.channels[0].transport = NetworkTransportV2::UnixStream;
+        history.channels[0].local_address = None;
+        history.channels[0].peer_address = Some(NetworkAddressV2::UnixAbstract(b"ancillary".to_vec()));
+        history.outputs = vec![NetworkOutputEventV2 { channel: channel_id(),
+            event: NetworkOutputKindV2::StreamMessage { stream_offset: 0, bytes: b"fd".to_vec(),
+                ancillary: ancillary.clone(), message_flags: 0 } }];
+        let mut engine = NetworkReplayEngine::replay(history).unwrap();
+        let ofd = open_file(0); engine.bind(ofd, channel_id()).unwrap();
+        let pending = format!("{engine:?}");
+        for _ in 0..3 {
+            assert_eq!(engine.transmit_stream_message(ofd, b"", &ancillary, 0).unwrap(),
+                StreamTransmitOutcome::Accepted(0));
+            assert_eq!(format!("{engine:?}"), pending);
+            assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+        }
+        assert!(matches!(engine.transmit_stream(ofd, b"fd"),
+            Err(NetworkReplayError::AncillaryRequiresMessageIo(_))));
+        assert_eq!(format!("{engine:?}"), pending);
+        assert!(matches!(engine.transmit_stream_message(ofd, b"wrong", &ancillary, 0),
+            Err(NetworkReplayError::OutboundMismatch { .. })));
+        assert_eq!(format!("{engine:?}"), pending);
+        assert_eq!(engine.transmit_stream_message(ofd, b"f", &ancillary, 0).unwrap(),
+            StreamTransmitOutcome::Accepted(1));
+        assert_eq!(engine.transmit_stream(ofd, b"d").unwrap(), StreamTransmitOutcome::Accepted(1));
+        engine.finish().unwrap();
+    }
+
+    #[test]
+    fn stream_zero_receive_delivers_control_and_peek_retains_it() {
+        let ancillary = NetworkAncillaryDataV2 { bytes: vec![0; 4],
+            objects: vec![detcore_model::network_trace::NetworkAncillaryObjectRefV2 {
+                byte_offset: 0,
+                object: detcore_model::network_trace::NetworkAncillaryObjectV2::FileDescriptor {
+                    object: detcore_model::network_trace::NetworkObjectId(7),
+                },
+            }], truncated: false };
+        for peek in [false, true] {
+            let mut history = trace(); history.outputs.clear();
+            history.channels[0].transport = NetworkTransportV2::UnixStream;
+            history.channels[0].local_address = None;
+            history.channels[0].peer_address = Some(NetworkAddressV2::UnixAbstract(b"ancillary".to_vec()));
+            history.inputs = vec![NetworkInputEventV2 { ordinal: 0, channel: channel_id(),
+                release: NetworkReleaseV2 { not_before_global_time: time(1), after_transmitted_offset: 0 },
+                event: NetworkInputKindV2::StreamMessage { stream_offset: 0, bytes: b"fd".to_vec(),
+                    ancillary: ancillary.clone(), message_flags: 0 } }];
+            let mut engine = NetworkReplayEngine::replay(history).unwrap();
+            let ofd = open_file(0); engine.bind(ofd, channel_id()).unwrap();
+            engine.release_eligible(time(1)).unwrap();
+            let StreamMessageReceiveOutcome::Message(zero) =
+                engine.receive_stream_message(ofd, 0, true, peek).unwrap()
+            else { panic!("expected zero-payload message"); };
+            assert!(zero.bytes.is_empty());
+            assert_eq!(zero.ancillary, Some(ancillary.clone()));
+            assert_eq!(zero.message_flags, 0);
+            let StreamMessageReceiveOutcome::Message(rest) =
+                engine.receive_stream_message(ofd, 2, true, false).unwrap()
+            else { panic!("expected retained payload"); };
+            assert_eq!(rest.bytes, b"fd");
+            assert_eq!(rest.ancillary, peek.then_some(ancillary.clone()));
+            assert_eq!(rest.message_flags, 0);
+            engine.finish().unwrap();
+        }
     }
 
     #[test]
