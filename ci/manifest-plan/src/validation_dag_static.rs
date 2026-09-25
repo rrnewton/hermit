@@ -31,7 +31,7 @@ pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
 pub(super) const MANIFEST_GATE_INNER_JOBS: i64 = 2;
-const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-worker width on ordinary hosts, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into test-harness so a one-core admission runs the same seven audits serially and is still refused by the preserved 600-second CPU cap if it cannot finish. Two cores are the qualifying admission. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged."########;
+const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their seven top-level audits run serially inside the shared aggregate budget: the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged."########;
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -640,7 +640,10 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"setup.manifest_plan"########],
-        env: &[],
+        env: &[(
+            r########"HERMIT_VALIDATE_AUDIT_JOBS"########,
+            r########"1"########,
+        )],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
@@ -655,7 +658,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 900,
         cpu_timeout: 600,
-        jobs_flag: None,
+        jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
@@ -5883,7 +5886,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         engine_only: false,
         timeout: 180,
         cpu_timeout: 600,
-        jobs_flag: None,
+        jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
