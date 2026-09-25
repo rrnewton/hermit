@@ -46,6 +46,7 @@ mod dirents;
 pub mod edit_distance;
 mod fd;
 mod io_buffers;
+mod iovecs;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
@@ -1926,6 +1927,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             resource_request(guest, request).await;
         }
 
+        // Only an emulated RNG readv supplies authoritative imported geometry.
+        // A generic pre-dispatch snapshot would become stale across pipe waits.
+        let mut rng_readv_output = None;
         let res = match classify_syscall(call.number()) {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
@@ -2282,7 +2286,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Readv(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_readv(guest, s).await
                 }
-                Syscall::Readv(s) => self.handle_readv(guest, s).await,
+                Syscall::Readv(s) => {
+                    self.handle_readv_with_output(guest, s, &mut rng_readv_output)
+                        .await
+                }
                 Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
                 Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
                 Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
@@ -2760,6 +2767,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
         };
 
+        // A copy may already have changed guest memory before reporting a
+        // terminal backend error. Do not perform even the syscall-result
+        // display's memory reads, or later observers/posthooks/timer effects.
+        // Read/readv have completed their existing release RPC before returning;
+        // getrandom acquired no file resource. Physical cleanup belongs to the
+        // backend failure owner, not to this observer fence.
+        if res.as_ref().is_err_and(crate::random::is_copy_failure) {
+            return res;
+        }
+
         detlog!(
             event = crate::detlog::DetLogEvent::SyscallResult {
                 finished_syscall_number: new_count,
@@ -2805,7 +2822,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, rng_readv_output.as_deref())?;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {

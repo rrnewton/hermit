@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cell::RefCell;
 #[cfg(test)]
 use std::ffi::OsStr;
 use std::fs;
@@ -13,6 +14,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -24,7 +26,6 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::Error;
 use hermit::HermitData;
-use hermit::SerializableError;
 use hermit::Shebang;
 use nix::sys::signal::SaFlags;
 use nix::sys::signal::SigAction;
@@ -38,9 +39,7 @@ use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 
-use super::container::Classified;
 use super::container::IdentityGuard;
-use super::container::RunGuarded;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
@@ -179,7 +178,7 @@ fn with_recording_deadline<T>(
     record()
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 pub struct StartOpts {
     /// Program to run.
     #[clap(value_name = "PROGRAM", required = true)]
@@ -446,42 +445,37 @@ impl StartOpts {
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
-            let recording = match record_timeout {
-                Some(timeout) => {
-                    let data = hermit.create_recording_dir()?;
-                    let data_path = data.path().to_path_buf();
-                    let exit_status = container
-                        .run_guarded_at("record.main.deadline", || {
-                            // Namespace init: arm the stop guards before anything else.
-                            crate::container::arm_container_init_guards()?;
-                            let _guard = global.init_tracing();
-                            let command = self.guest_command().map_err(SerializableError::from)?;
-                            let mountinfo = identity_guard
-                                .mountinfo_root_rewrites()
-                                .map_err(SerializableError::from)?;
-                            with_recording_deadline(timeout, || {
-                                hermit::record_to_with_mountinfo(command, &data_path, mountinfo)
-                            })
-                            .map_err(SerializableError::from)
-                        })
-                        .classified()?;
-                    hermit.commit_recording(data, exit_status)?
-                }
-                None => container
-                    .run_guarded_at("record.main", || {
-                        // Namespace init: arm the stop guards before anything else.
-                        crate::container::arm_container_init_guards()?;
-                        let _guard = global.init_tracing();
-                        let command = self.guest_command().map_err(SerializableError::from)?;
-                        let mountinfo = identity_guard
-                            .mountinfo_root_rewrites()
-                            .map_err(SerializableError::from)?;
-                        hermit
-                            .record_with_mountinfo(command, mountinfo)
-                            .map_err(SerializableError::from)
-                    })
-                    .classified()?,
+            // Parent-owned for BOTH deadline and unbounded spellings. No
+            // metadata/last-id commit occurs before real successful completion.
+            let data = hermit.create_recording_dir()?;
+            let resources = format!("recording {} and identity mounts", data.path().display());
+            let options = self.clone();
+            let global = global.clone();
+            let site = if record_timeout.is_some() {
+                "record.main.deadline"
+            } else {
+                "record.main"
             };
+            let (exit_status, (data, _identity)) = super::owned_container::run(
+                &mut container,
+                (data, identity_guard),
+                resources,
+                true,
+                site,
+                None,
+                move |(data, identity)| {
+                    let _guard = global.init_tracing();
+                    let command = options.guest_command()?;
+                    let mountinfo = identity.mountinfo_root_rewrites()?;
+                    match record_timeout {
+                        Some(timeout) => with_recording_deadline(timeout, || {
+                            hermit::record_to_with_mountinfo(command, data.path(), mountinfo)
+                        }),
+                        None => hermit::record_to_with_mountinfo(command, data.path(), mountinfo),
+                    }
+                },
+            )?;
+            let recording = hermit.commit_recording(data, exit_status)?;
 
             eprintln!(
                 "\n{message}:\n\n    {command} {id}\n",
@@ -516,43 +510,57 @@ impl StartOpts {
         eprintln!(":: {}", "Recording...".yellow().bold());
 
         let temp_data_dir = tempfile::tempdir()?;
-        let data_dir = temp_data_dir.path();
+        let resources = format!(
+            "verification recording {}, identity mounts and both logs",
+            temp_data_dir.path().display()
+        );
         let record_timeout = self.record_timeout();
-
-        let recording = recording_container
-            .run_guarded_at("record_verify.record", || {
-                // Namespace init: arm the stop guards before anything else.
-                crate::container::arm_container_init_guards()?;
-                let _guard = global1.init_tracing();
-
-                let command = self.guest_command().map_err(SerializableError::from)?;
-                let mountinfo = record_identity_guard
-                    .mountinfo_root_rewrites()
-                    .map_err(SerializableError::from)?;
-
-                match record_timeout {
-                    Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_with_output_with_mountinfo(command, data_dir, mountinfo)
-                    }),
-                    None => hermit::record_with_output_with_mountinfo(command, data_dir, mountinfo),
-                }
-                .map_err(SerializableError::from)
-            })
-            .classified()?;
-
+        let options = self.clone();
+        let record_global = global1.clone();
+        let (recording, (temp_data_dir, _record_identity, log1, log2)) =
+            super::owned_container::run(
+                &mut recording_container,
+                (temp_data_dir, record_identity_guard, log1, log2),
+                resources.clone(),
+                true,
+                "record_verify.record",
+                None,
+                move |(data, identity, _, _)| {
+                    let _guard = record_global.init_tracing();
+                    let command = options.guest_command()?;
+                    let mountinfo = identity.mountinfo_root_rewrites()?;
+                    match record_timeout {
+                        Some(timeout) => with_recording_deadline(timeout, || {
+                            hermit::record_with_output_with_mountinfo(
+                                command,
+                                data.path(),
+                                mountinfo,
+                            )
+                        }),
+                        None => hermit::record_with_output_with_mountinfo(
+                            command,
+                            data.path(),
+                            mountinfo,
+                        ),
+                    }
+                },
+            )?;
         eprintln!(":: {}", "Replaying...".yellow().bold());
-
-        // Replay the recording.
-        let (mut replay_container, _replay_identity_guard) = self.configured_container()?;
-        let replay = replay_container
-            .run_guarded_at("record_verify.replay", || {
-                // Namespace init: arm the stop guards before anything else.
-                crate::container::arm_container_init_guards()?;
-                let _guard = global2.init_tracing();
-                hermit::replay_with_output_and_mounts(data_dir, &self.mount)
-                    .map_err(SerializableError::from)
-            })
-            .classified()?;
+        let (mut replay_container, replay_identity) = self.configured_container()?;
+        let mounts = self.mount.clone();
+        let replay_global = global2.clone();
+        let (replay, (_data, _identity, log1, log2)) = super::owned_container::run(
+            &mut replay_container,
+            (temp_data_dir, replay_identity, log1, log2),
+            resources,
+            true,
+            "record_verify.replay",
+            None,
+            move |(data, _, _, _)| {
+                let _guard = replay_global.init_tracing();
+                hermit::replay_with_output_and_mounts(data.path(), &mounts)
+            },
+        )?;
 
         let outcome = compare_two_runs(
             ComparedRun {
@@ -609,29 +617,33 @@ impl StartOpts {
         eprintln!(":: {}", "Recording...".yellow().bold());
 
         let temp_data_dir = tempfile::tempdir()?;
-        let data_dir = temp_data_dir.path();
         let record_timeout = self.record_timeout();
-
-        let _result = container
-            .run_guarded_at("record_verify_debug.record", || {
-                // Namespace init: arm the stop guards before anything else.
-                crate::container::arm_container_init_guards()?;
-                let _guard = global.init_tracing();
-
-                let command = self.guest_command().map_err(SerializableError::from)?;
-                let mountinfo = identity_guard
-                    .mountinfo_root_rewrites()
-                    .map_err(SerializableError::from)?;
-
+        let options = self.clone();
+        let record_global = global.clone();
+        let resources = format!(
+            "debug recording {}, identity mounts and GDB watcher",
+            temp_data_dir.path().display()
+        );
+        let (_, (temp_data_dir, _identity)) = super::owned_container::run(
+            &mut container,
+            (temp_data_dir, identity_guard),
+            resources.clone(),
+            true,
+            "record_verify_debug.record",
+            None,
+            move |(data, identity)| {
+                let _guard = record_global.init_tracing();
+                let command = options.guest_command()?;
+                let mountinfo = identity.mountinfo_root_rewrites()?;
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
-                        hermit::record_to_with_mountinfo(command, data_dir, mountinfo)
+                        hermit::record_to_with_mountinfo(command, data.path(), mountinfo)
                     }),
-                    None => hermit::record_to_with_mountinfo(command, data_dir, mountinfo),
+                    None => hermit::record_to_with_mountinfo(command, data.path(), mountinfo),
                 }
-                .map_err(SerializableError::from)
-            })
-            .classified()?;
+            },
+        )?;
+        let data_dir = temp_data_dir.path();
 
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
@@ -663,9 +675,6 @@ impl StartOpts {
         // Make sure gdb always exit.
         gdb_command.arg("-batch");
         gdb_command.arg("--return-child-result");
-        let gdb_client = gdb_command
-            .spawn()
-            .context("Failed to run gdb command. Please make sure it is in your $PATH.")?;
 
         // TODO: For replay, we ought to construct the container from
         // `metadata.json`. That logic belongs in `hermit::replay`, but we have
@@ -678,24 +687,42 @@ impl StartOpts {
         // `gdb_client.wait()` that would have noticed used to sit BELOW the `?`
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
-        let mut gdb_watch = GdbClientWatch::spawn(gdb_client, gdbserver_port);
-        let (mut container, _identity_guard) = self.configured_container()?;
-        let ran = container.run_guarded_at("record_verify_debug.replay", || {
-            // Namespace init: arm the stop guards before anything else.
-            crate::container::arm_container_init_guards()?;
-            let _guard = global.init_tracing();
-            hermit::replay_with_gdbserver_and_mounts(data_dir, gdbserver_port, &self.mount)
-                .map_err(SerializableError::from)
-        });
-        let client_exited_early = gdb_watch.finish();
-        match ran.classified() {
-            Ok(result) => Ok(result),
-            // Name the cause rather than the symptom: without this the failure
-            // reads as an opaque protocol error from a session that never began.
-            Err(error) if client_exited_early => {
-                Err(error.context(CLIENT_EXITED_BEFORE_CONNECTING))
+        let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
+        let (mut container, identity) = self.configured_container()?;
+        let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
+        let replay_global = global.clone();
+        let mounts = self.mount.clone();
+        let result = super::owned_container::run(
+            &mut container,
+            Rc::clone(&guards),
+            resources,
+            true,
+            "record_verify_debug.replay",
+            None,
+            move |guards| {
+                let _guard = replay_global.init_tracing();
+                hermit::replay_with_gdbserver_and_mounts(
+                    guards.borrow().0.path(),
+                    gdbserver_port,
+                    &mounts,
+                )
+            },
+        );
+        if result.as_ref().is_err_and(|e| {
+            e.downcast_ref::<super::owned_container::ParentCleanupUnconfirmed>()
+                .is_some()
+        }) {
+            return result.map(|(status, _)| status);
+        }
+        let finished = guards.borrow_mut().2.finish();
+        match (result, finished) {
+            (Ok((status, _)), Ok(_)) => Ok(status),
+            (Ok(_), Err(watcher)) => Err(watcher),
+            (Err(primary), Err(watcher)) => {
+                Err(primary.context(format!("GDB watcher also failed: {watcher:#}")))
             }
-            Err(error) => Err(error),
+            (Err(primary), Ok(true)) => Err(primary.context(CLIENT_EXITED_BEFORE_CONNECTING)),
+            (Err(primary), Ok(false)) => Err(primary),
         }
     }
 }

@@ -777,6 +777,36 @@ impl HeldObject {
 #[derive(Clone, Copy)]
 struct RemoteMemory(Pid);
 impl MemoryAccess for RemoteMemory {
+    fn write_with_user_access(
+        &mut self,
+        address: AddrMut<u8>,
+        bytes: &[u8],
+    ) -> std::result::Result<usize, Errno> {
+        address
+            .as_raw()
+            .checked_add(bytes.len())
+            .ok_or(Errno::EFAULT)?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        // process_vm_writev obeys the tracee's user page permissions. There is
+        // no ptrace/debugger fallback, including for an eight-byte request.
+        let local = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: address.as_raw() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let n = unsafe { libc::process_vm_writev(self.0.as_raw(), &local, 1, &remote, 1, 0) };
+        if n < 0 {
+            Err(Errno::last())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
     fn read_vectored(
         &self,
         remote: &[IoSlice],
@@ -818,6 +848,16 @@ impl MemoryAccess for RemoteMemory {
         } else {
             Ok(n as usize)
         }
+    }
+}
+
+fn random_response(result: std::result::Result<i64, reverie::Error>) -> Result<i64> {
+    match result {
+        Ok(n) => Ok(n),
+        Err(reverie::Error::Errno(error)) => Ok(-(error.into_raw() as i64)),
+        // The caller must see this error before rewriting registers or
+        // resuming the held bootstrap request. Do not fabricate a guest errno.
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1882,15 +1922,12 @@ impl Bootstrap {
                 let Syscall::Getrandom(call) = call else {
                     unreachable!()
                 };
-                match getrandom(
+                random_response(getrandom(
                     &mut self.prng,
                     RemoteMemory(pid),
                     detcore::types::DetTid::from_raw(pid.as_raw()),
                     call,
-                ) {
-                    Ok(n) => n,
-                    Err(e) => -(e.into_raw() as i64),
-                }
+                ))?
             }
             bootstrap::TAKE_STATE => {
                 ensure!(
@@ -1992,6 +2029,10 @@ impl Bootstrap {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sabre_bootstrap_user_access_tests.rs"]
+mod user_access_tests;
 
 #[cfg(test)]
 mod tests {

@@ -6,7 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use clap::Parser;
 use hermit::Context;
@@ -17,13 +19,12 @@ use hermit::Shebang;
 use reverie::process::ExitStatus;
 
 use super::container::deterministic_container;
-use super::container::with_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
 
 /// Command-line options for the "replay" subcommand.
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 pub struct ReplayOpts {
     /// The ID of the recording to replay. This is obtained by first running
     /// `hermit record`. This is optional. Defaults to the last successful
@@ -65,10 +66,20 @@ impl ReplayOpts {
         };
 
         if self.autopilot || self.serve_only {
-            let (mut container, _identity_guard) = deterministic_container()?;
-            with_container(&mut container, || {
-                self.container_main(global, self.autopilot, &hermit, id)
-            })
+            let (mut container, identity) = deterministic_container()?;
+            let options = self.clone();
+            let global = global.clone();
+            let resources = format!("replay {} and identity mounts", hermit.data_dir().display());
+            super::owned_container::run(
+                &mut container,
+                (identity, hermit),
+                resources,
+                true,
+                "with_container",
+                None,
+                move |(_, hermit)| options.container_main(&global, options.autopilot, hermit, id),
+            )
+            .map(|(value, _guards)| value)
         } else {
             // Find the path to the executable so that GDB can use it to resolve
             // symbols.
@@ -90,9 +101,6 @@ impl ReplayOpts {
             for ex in &self.gdbex {
                 gdb_command.arg("-ex").arg(ex);
             }
-            let gdb_client = gdb_command
-                .spawn()
-                .context("Failed to run gdb command. Please make sure it is in your $PATH.")?;
 
             // TODO: For replay, we ought to construct the container from
             // `metadata.json`. That logic belongs in `hermit::replay`, but we have
@@ -110,18 +118,43 @@ impl ReplayOpts {
             // leaked, and the merged description of hermit#2654 says otherwise.
             // Recorded rather than quietly deleted, because the claim is in a
             // landed commit message where it cannot be edited.
-            let mut gdb_watch = GdbClientWatch::spawn(gdb_client, self.gdbserver_port);
-            let (mut container, _identity_guard) = deterministic_container()?;
-            let result = with_container(&mut container, || {
-                self.container_main(global, self.autopilot, &hermit, id)
-            });
-            let client_exited_early = gdb_watch.finish();
-            match result {
-                Ok(status) => Ok(status),
-                Err(error) if client_exited_early => {
-                    Err(error.context(CLIENT_EXITED_BEFORE_CONNECTING))
+            let gdb_watch = GdbClientWatch::spawn(gdb_command, self.gdbserver_port)?;
+            let (mut container, identity) = deterministic_container()?;
+            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch)));
+            let resources = format!(
+                "replay {}, identity mounts and GDB watcher",
+                guards.borrow().1.data_dir().display()
+            );
+            let options = self.clone();
+            let global = global.clone();
+            let result = super::owned_container::run(
+                &mut container,
+                Rc::clone(&guards),
+                resources,
+                true,
+                "with_container",
+                None,
+                move |guards| {
+                    options.container_main(&global, options.autopilot, &guards.borrow().1, id)
+                },
+            );
+            // On unresolved cleanup the factory retains the SAME guard scope.
+            // Do not signal watcher completion while its container still owns it.
+            if result.as_ref().is_err_and(|e| {
+                e.downcast_ref::<super::owned_container::ParentCleanupUnconfirmed>()
+                    .is_some()
+            }) {
+                return result.map(|(status, _)| status);
+            }
+            let finished = guards.borrow_mut().2.finish();
+            match (result, finished) {
+                (Ok((status, _)), Ok(_)) => Ok(status),
+                (Ok(_), Err(watcher)) => Err(watcher),
+                (Err(primary), Err(watcher)) => {
+                    Err(primary.context(format!("GDB watcher also failed: {watcher:#}")))
                 }
-                Err(error) => Err(error),
+                (Err(primary), Ok(true)) => Err(primary.context(CLIENT_EXITED_BEFORE_CONNECTING)),
+                (Err(primary), Ok(false)) => Err(primary),
             }
         }
     }
