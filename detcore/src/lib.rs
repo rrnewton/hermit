@@ -1926,6 +1926,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             resource_request(guest, request).await;
         }
 
+        // Linux reads a vectored call's `iovec` arrays once, at entry, and the call's own output
+        // may overwrite the guest's copy (a control buffer aliasing its `msghdr`), so the
+        // post-call io-buffer hashing below must use what is captured here.
+        let entry_iovecs = if self.cfg.detlog_io_buffers {
+            io_buffers::capture_entry_iovecs(guest, &call)
+        } else {
+            io_buffers::EntryIovecs::default()
+        };
+
         let res = match classify_syscall(call.number()) {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
@@ -2805,7 +2814,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, &entry_iovecs)?;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {

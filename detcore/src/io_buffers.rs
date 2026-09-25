@@ -113,58 +113,53 @@ fn whole(addr: Option<u64>, len: u64) -> Vec<BufferExtent> {
     }
 }
 
-/// Walk an `iovec` array and return the segments the syscall actually filled,
-/// bounded by `moved`.
+/// The segments a guest `iovec` array declares, before any return-value bound.
 ///
-/// Mirrors the existing traversal in `crate::syscalls::io`: clamp the count to
-/// `UIO_MAXIOV`, skip null/empty segments, and stop once `moved` bytes are
-/// accounted for. Under `MSG_TRUNC` the returned count can exceed the buffers'
-/// capacity, which is why the running remainder rather than `moved` alone
-/// bounds each segment.
-fn iovec_extents<M: MemoryAccess>(
-    memory: &M,
-    iov_addr: usize,
-    iov_count: usize,
-    moved: i64,
-) -> Result<Vec<BufferExtent>, Error> {
-    let remaining = u64::try_from(moved).unwrap_or(0);
-    if iov_addr == 0 || iov_count == 0 || remaining == 0 {
-        return Ok(Vec::new());
-    }
-    let iov_count = iov_count.min(libc::UIO_MAXIOV as usize);
-    let iov_address: AddrMut<'_, libc::iovec> = AddrMut::from_raw(iov_addr).ok_or(Errno::EFAULT)?;
-    // SAFETY: `iovec` is a plain C record; an all-zero value is a valid staging
-    // value that `read_values` immediately overwrites.
-    let mut iovecs: Vec<libc::iovec> = (0..iov_count)
-        .map(|_| unsafe { std::mem::zeroed() })
-        .collect();
-    memory.read_values(iov_address.into(), &mut iovecs)?;
-    Ok(iovec_extents_from_slice(&iovecs, moved))
+/// Mirrors the existing traversal in `crate::syscalls::io`: skip null/empty
+/// segments. Each extent's `len` here is the segment's CAPACITY; see
+/// [`bound_segments`] for the bytes actually moved.
+fn declared_segments(iovecs: &[libc::iovec]) -> Vec<BufferExtent> {
+    iovecs
+        .iter()
+        .filter(|iov| !iov.iov_base.is_null() && iov.iov_len != 0)
+        .map(|iov| BufferExtent {
+            addr: iov.iov_base as u64,
+            len: iov.iov_len as u64,
+        })
+        .collect()
 }
 
-/// Apply the return-value bound after the guest `iovec` array has been read.
+/// Return the declared segments the syscall actually filled, bounded by
+/// `moved`.
 ///
-/// This is separate from the memory access so the short-transfer rule can be
-/// tested directly for every syscall family that shares it.
-fn iovec_extents_from_slice(iovecs: &[libc::iovec], moved: i64) -> Vec<BufferExtent> {
+/// Stop once `moved` bytes are accounted for. Under `MSG_TRUNC` the returned
+/// count can exceed the buffers' capacity, which is why the running remainder
+/// rather than `moved` alone bounds each segment.
+fn bound_segments(segments: &[BufferExtent], moved: i64) -> Vec<BufferExtent> {
     let mut remaining = u64::try_from(moved).unwrap_or(0);
 
     let mut out = Vec::new();
-    for iov in iovecs {
+    for segment in segments {
         if remaining == 0 {
             break;
         }
-        if iov.iov_base.is_null() || iov.iov_len == 0 {
-            continue;
-        }
-        let take = (iov.iov_len as u64).min(remaining);
+        let take = segment.len.min(remaining);
         out.push(BufferExtent {
-            addr: iov.iov_base as u64,
+            addr: segment.addr,
             len: take,
         });
         remaining -= take;
     }
     out
+}
+
+/// Apply the return-value bound to a guest `iovec` array.
+///
+/// This is separate from the memory access so the short-transfer rule can be
+/// tested directly for every syscall family that shares it.
+#[cfg(test)]
+fn iovec_extents_from_slice(iovecs: &[libc::iovec], moved: i64) -> Vec<BufferExtent> {
+    bound_segments(&declared_segments(iovecs), moved)
 }
 
 /// Return the guest `iovec` array described by a vectored I/O syscall.
@@ -190,18 +185,232 @@ fn iovec_extent_arguments(call: &Syscall) -> Option<(usize, usize)> {
     }
 }
 
-/// Read a `msghdr` out of the guest and walk the iovecs it points at.
-fn msghdr_extents<M: MemoryAccess>(
+/// The `iovec` arrays a vectored syscall named, as they stood when it was
+/// issued: one entry per message, in message order, each holding that
+/// message's declared segments.
+///
+/// ⚠️ READ AT ENTRY, NOT AFTER THE CALL. Linux copies an `iovec` array in once,
+/// when the syscall starts (`import_iovec`, reached through
+/// `copy_msghdr_from_user` for the header that points at it), and never looks
+/// at the guest's copy again. The syscall's own output is allowed to land on
+/// top of that copy: `recvmsg` may place its control buffer over the `msghdr`
+/// itself, and `readv` may read into the memory holding its own `iovec` array.
+/// Re-reading after the call then walks timestamp or payload bytes as if they
+/// were pointers. Measured on `tests/c/socket_timestamp_edge_cases.c` under
+/// the ptrace backend: the aliased `recvmsg`'s `msg_iov` had become
+/// `SCM_TIMESTAMPNS`'s `tv_sec`, the hashing read failed with EFAULT, and that
+/// EFAULT was returned to the guest in place of the syscall's successful
+/// result -- for a datagram the kernel had already delivered.
+///
+/// ⚠️ THE BATCH CALLS HAVE A GAP THAT NEITHER READ CLOSES. The kernel reads
+/// each `mmsghdr` only when it reaches that message (`do_recvmmsg` and
+/// `__sys_sendmmsg` call the single-message path once per entry), so header
+/// `i` as the kernel used it is the state AFTER messages `0..i` wrote and
+/// BEFORE message `i` did. The entry snapshot is right unless an earlier
+/// message wrote over header `i`; a post-call read is right unless message `i`
+/// wrote over its own header. Each covers the shape the other misses, and a
+/// batch doing both is covered by neither. The entry snapshot is kept because
+/// its shape is the one real programs produce: a control buffer placed over
+/// the message's own header, as above.
+///
+/// A header or array that could not be read is kept as its errno rather than
+/// dropped. It is consulted only if the kernel then reports that message
+/// complete. For message 0, or a single-message call, the kernel read the same
+/// memory at the same moment, so the errno is reported, which is the
+/// pre-existing behaviour for a genuinely unreadable buffer. For a later batch
+/// message the kernel may have read a header that an earlier message's output
+/// made readable, so [`message_segments`] falls back to the header as it
+/// stands after the call instead of turning a delivered message into EFAULT.
+///
+/// The default value is "not captured", and is distinct from a capture that
+/// found no `iovec` arrays: see [`EntrySegments::Missing`].
+#[derive(Default)]
+pub(crate) struct EntryIovecs(Option<Vec<Result<Vec<BufferExtent>, Errno>>>);
+
+/// What the entry capture recorded for one message.
+#[derive(Debug, PartialEq, Eq)]
+enum EntrySegments<'a> {
+    /// The message's declared segments, as issued.
+    Declared(&'a [BufferExtent]),
+    /// The header or `iovec` array could not be read at entry. A message past
+    /// the end of a capture that stopped at an unreadable header repeats that
+    /// header's errno.
+    Unreadable(Errno),
+    /// Nothing was captured for this message. That is a Detcore bookkeeping
+    /// fault -- the capture guard and the hashing guard disagreed, or an arm
+    /// of [`extents`] consults an `iovec` array that [`entry_iovecs`] does not
+    /// capture -- and never something the guest did, so it must not become a
+    /// guest errno.
+    Missing,
+}
+
+impl EntryIovecs {
+    /// What the capture recorded for message `index`.
+    fn message(&self, index: usize) -> EntrySegments<'_> {
+        let Some(messages) = &self.0 else {
+            return EntrySegments::Missing;
+        };
+        match messages.get(index).or_else(|| messages.last()) {
+            Some(Ok(segments)) if index < messages.len() => EntrySegments::Declared(segments),
+            Some(Err(errno)) => EntrySegments::Unreadable(*errno),
+            _ => EntrySegments::Missing,
+        }
+    }
+}
+
+/// The declared segments to bound for message `index` of `call`.
+///
+/// `post_call_header` is message `index`'s header as it stands after the call,
+/// for the batch calls, which read it anyway for `msg_len`. It is used only
+/// where the entry snapshot cannot answer; see [`EntryIovecs`] for when each
+/// read is right.
+fn message_segments<M: MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+    entry: &EntryIovecs,
+    index: usize,
+    post_call_header: Option<&libc::msghdr>,
+) -> Result<Vec<BufferExtent>, Errno> {
+    let post_call =
+        |header: &libc::msghdr| read_segments(memory, header.msg_iov as usize, header.msg_iovlen);
+    match entry.message(index) {
+        EntrySegments::Declared(segments) => Ok(segments.to_vec()),
+        EntrySegments::Unreadable(errno) => match post_call_header {
+            Some(header) if index > 0 => post_call(header),
+            _ => Err(errno),
+        },
+        EntrySegments::Missing => {
+            // Fall back to reading after the call, which is what this code did
+            // before entry capture existed: correct for every call whose output
+            // does not overwrite its own header, and never a guest errno
+            // invented by Detcore's bookkeeping.
+            if let Some(header) = post_call_header {
+                return post_call(header);
+            }
+            match entry_iovecs(memory, call).message(index) {
+                EntrySegments::Declared(segments) => Ok(segments.to_vec()),
+                EntrySegments::Unreadable(errno) => Err(errno),
+                EntrySegments::Missing => {
+                    debug_assert!(
+                        false,
+                        "io-buffer hashing consults an iovec array for {} that entry_iovecs \
+                         does not capture",
+                        call.name()
+                    );
+                    Ok(Vec::new())
+                }
+            }
+        }
+    }
+}
+
+/// Read a guest `iovec` array's declared segments.
+fn read_segments<M: MemoryAccess>(
+    memory: &M,
+    iov_addr: usize,
+    iov_count: usize,
+) -> Result<Vec<BufferExtent>, Errno> {
+    if iov_addr == 0 || iov_count == 0 {
+        return Ok(Vec::new());
+    }
+    let iov_count = iov_count.min(libc::UIO_MAXIOV as usize);
+    let iov_address: AddrMut<'_, libc::iovec> = AddrMut::from_raw(iov_addr).ok_or(Errno::EFAULT)?;
+    // SAFETY: `iovec` is a plain C record; an all-zero value is a valid staging
+    // value that `read_values` immediately overwrites.
+    let mut iovecs: Vec<libc::iovec> = (0..iov_count)
+        .map(|_| unsafe { std::mem::zeroed() })
+        .collect();
+    memory.read_values(iov_address.into(), &mut iovecs)?;
+    Ok(declared_segments(&iovecs))
+}
+
+/// Read a `msghdr` out of the guest and the segments of the iovecs it points at.
+fn msghdr_segments<M: MemoryAccess>(
     memory: &M,
     msg_addr: usize,
-    moved: i64,
-) -> Result<Vec<BufferExtent>, Error> {
+) -> Result<Vec<BufferExtent>, Errno> {
     if msg_addr == 0 {
         return Ok(Vec::new());
     }
     let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
     let message: libc::msghdr = memory.read_value(address)?;
-    iovec_extents(memory, message.msg_iov as usize, message.msg_iovlen, moved)
+    read_segments(memory, message.msg_iov as usize, message.msg_iovlen)
+}
+
+/// Read each `mmsghdr` in a batch and the segments of the iovecs it points at,
+/// stopping at the first header that cannot be read.
+///
+/// This runs before every batch call whether or not it then delivers
+/// anything, so the header array is read in one access; only an array that
+/// runs into unreadable memory is walked header by header, to find where the
+/// readable prefix ends.
+fn mmsghdr_segments<M: MemoryAccess>(memory: &M, mmsg_addr: usize, vlen: u32) -> EntryIovecs {
+    let count = (vlen as usize).min(libc::UIO_MAXIOV as usize);
+    let mut out = Vec::with_capacity(count);
+    if mmsg_addr == 0 || count == 0 {
+        return EntryIovecs(Some(out));
+    }
+    // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a valid
+    // staging value that `read_values` immediately overwrites.
+    let mut headers: Vec<libc::mmsghdr> =
+        (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let whole = AddrMut::<'_, libc::mmsghdr>::from_raw(mmsg_addr)
+        .ok_or(Errno::EFAULT)
+        .and_then(|address| memory.read_values(address.into(), &mut headers));
+    if whole.is_ok() {
+        for header in &headers {
+            out.push(read_segments(
+                memory,
+                header.msg_hdr.msg_iov as usize,
+                header.msg_hdr.msg_iovlen,
+            ));
+        }
+        return EntryIovecs(Some(out));
+    }
+    for index in 0..count {
+        let header = mmsg_addr
+            .checked_add(index * std::mem::size_of::<libc::mmsghdr>())
+            .and_then(AddrMut::<'_, libc::mmsghdr>::from_raw)
+            .ok_or(Errno::EFAULT)
+            .and_then(|address| memory.read_value(address));
+        match header {
+            Ok(header) => out.push(read_segments(
+                memory,
+                header.msg_hdr.msg_iov as usize,
+                header.msg_hdr.msg_iovlen,
+            )),
+            Err(errno) => {
+                out.push(Err(errno));
+                break;
+            }
+        }
+    }
+    EntryIovecs(Some(out))
+}
+
+/// Capture, before the syscall runs, every `iovec` array [`extents`] will
+/// need afterwards. A capture with no messages for a syscall that names none.
+fn entry_iovecs<M: MemoryAccess>(memory: &M, call: &Syscall) -> EntryIovecs {
+    if let Some((iov_addr, iov_count)) = iovec_extent_arguments(call) {
+        return EntryIovecs(Some(vec![read_segments(memory, iov_addr, iov_count)]));
+    }
+    match call {
+        Syscall::Recvmsg(c) => EntryIovecs(Some(vec![msghdr_segments(
+            memory,
+            c.msg().map_or(0, |p| p.as_raw()),
+        )])),
+        Syscall::Sendmsg(c) => EntryIovecs(Some(vec![msghdr_segments(
+            memory,
+            c.msg().map_or(0, |p| p.as_raw()),
+        )])),
+        Syscall::Recvmmsg(c) => {
+            mmsghdr_segments(memory, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen())
+        }
+        Syscall::Sendmmsg(c) => {
+            mmsghdr_segments(memory, c.msgvec().map_or(0, |p| p.as_raw()), c.vlen())
+        }
+        _ => EntryIovecs(Some(Vec::new())),
+    }
 }
 
 /// Number of completed messages whose per-message lengths are meaningful.
@@ -215,16 +424,21 @@ fn completed_mmsghdr_count(vlen: u32, completed: i64) -> usize {
 /// Walk the `mmsghdr` array a batch send or receive completed.
 ///
 /// `moved` here is a COUNT OF MESSAGES, not a byte count -- which is why
-/// these calls cannot share the `clamp`/`msghdr_extents` path that every other
+/// these calls cannot share the `clamp`/single-message path that every other
 /// send or receive uses. Each completed message carries its own byte count in
 /// `msg_len`, so each is walked separately and bounded by that; treating the
 /// batch as one buffer would let one message's length run into the next
 /// message's memory.
+///
+/// `msg_len` is the kernel's OUTPUT and so is read after the call; the segments
+/// it bounds come from `entry`, read before it (see [`EntryIovecs`]).
 fn mmsghdr_extents<M: MemoryAccess>(
     memory: &M,
+    call: &Syscall,
     mmsg_addr: usize,
     vlen: u32,
     delivered: i64,
+    entry: &EntryIovecs,
 ) -> Result<Vec<BufferExtent>, Error> {
     let count = completed_mmsghdr_count(vlen, delivered);
     if mmsg_addr == 0 || count == 0 {
@@ -238,13 +452,11 @@ fn mmsghdr_extents<M: MemoryAccess>(
     memory.read_values(address.into(), &mut headers)?;
 
     let mut out = Vec::new();
-    for header in &headers {
-        out.extend(iovec_extents(
-            memory,
-            header.msg_hdr.msg_iov as usize,
-            header.msg_hdr.msg_iovlen,
+    for (index, header) in headers.iter().enumerate() {
+        out.extend(bound_segments(
+            &message_segments(memory, call, entry, index, Some(&header.msg_hdr))?,
             i64::from(header.msg_len),
-        )?);
+        ));
     }
     Ok(out)
 }
@@ -313,10 +525,14 @@ fn ret_gates_output(call: &Syscall) -> bool {
 /// Only syscalls whose buffer CONTENT the INFO record does not already show are
 /// listed. `clock_gettime` and `newfstatat`, for instance, are absent because
 /// Reverie's typed display already dereferences and prints their output.
+///
+/// `entry` must be what [`entry_iovecs`] captured for this same call before it
+/// ran; every `iovec` segment comes from there and not from a re-read.
 fn extents<M: MemoryAccess>(
     memory: &M,
     call: &Syscall,
     ret: i64,
+    entry: &EntryIovecs,
 ) -> Result<Vec<BufferExtent>, Error> {
     // Nothing was written on a failed or empty call -- for every syscall whose
     // return value is a byte count. `ret_gates_output` is what keeps the poll
@@ -325,8 +541,11 @@ fn extents<M: MemoryAccess>(
     if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
     }
-    if let Some((iov_addr, iov_count)) = iovec_extent_arguments(call) {
-        return iovec_extents(memory, iov_addr, iov_count, ret);
+    if iovec_extent_arguments(call).is_some() {
+        return Ok(bound_segments(
+            &message_segments(memory, call, entry, 0, None)?,
+            ret,
+        ));
     }
     let raw = |a: Option<AddrMut<'_, u8>>| a.map(|p| p.as_raw() as u64);
     Ok(match call {
@@ -343,15 +562,22 @@ fn extents<M: MemoryAccess>(
         ),
         Syscall::Readlink(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.bufsize(), ret),
         Syscall::Readlinkat(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.buf_len(), ret),
-        Syscall::Recvmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
+        Syscall::Recvmsg(_) => {
+            bound_segments(&message_segments(memory, call, entry, 0, None)?, ret)
+        }
         // `ret` is a MESSAGE count here, not a byte count; see
         // `mmsghdr_extents`. recvmmsg is one of the four receive syscalls
         // that could reach a NETLINK_SOCK_DIAG dump without passing the
         // sock_diag sanitizer, so leaving it unhashed left this check blind
         // to exactly the bypass it would otherwise have reported.
-        Syscall::Recvmmsg(c) => {
-            mmsghdr_extents(memory, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
-        }
+        Syscall::Recvmmsg(c) => mmsghdr_extents(
+            memory,
+            call,
+            c.mmsg().map_or(0, |p| p.as_raw()),
+            c.vlen(),
+            ret,
+            entry,
+        )?,
         // Bytes the guest produced. These never reach stdout/stderr for a QEMU
         // boot -- measured, all 234,872 writes went to fds 7/12/14/11/13/4/8/19/23
         // and none to fd 1 or 2 -- so `--verify`'s stdout/stderr comparison does
@@ -359,12 +585,19 @@ fn extents<M: MemoryAccess>(
         Syscall::Write(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.len(), ret),
         Syscall::Pwrite64(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.len(), ret),
         Syscall::Sendto(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.size(), ret),
-        Syscall::Sendmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
+        Syscall::Sendmsg(_) => {
+            bound_segments(&message_segments(memory, call, entry, 0, None)?, ret)
+        }
         // Like recvmmsg, `ret` counts completed messages and each completed
         // header's `msg_len` bounds the bytes consumed from that message.
-        Syscall::Sendmmsg(c) => {
-            mmsghdr_extents(memory, c.msgvec().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
-        }
+        Syscall::Sendmmsg(c) => mmsghdr_extents(
+            memory,
+            call,
+            c.msgvec().map_or(0, |p| p.as_raw()),
+            c.vlen(),
+            ret,
+            entry,
+        )?,
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
         // the array and not a prefix of it -- and it is reached even when
@@ -472,9 +705,27 @@ fn chunk_digests(buf: &[u8]) -> (usize, Vec<String>) {
     (chunk, chunks)
 }
 
+/// Capture the `iovec` arrays a syscall names BEFORE Detcore runs it, for
+/// [`detlog_io_buffers`] to use afterwards; see [`EntryIovecs`] for why the
+/// arrays cannot be re-read once the call has completed.
+///
+/// Guarded exactly as [`detlog_io_buffers`] is, so the disabled path reads no
+/// guest memory here either.
+pub(crate) fn capture_entry_iovecs<G, T>(guest: &G, call: &Syscall) -> EntryIovecs
+where
+    G: Guest<T>,
+    T: Tool,
+{
+    if !crate::detlog_observed!() {
+        return EntryIovecs::default();
+    }
+    entry_iovecs(&guest.memory(), call)
+}
+
 /// ⚠️ THE GUARD IS FIRST AND THAT IS THE POINT. Everything below it touches
 /// guest memory: for `recvmsg` the extents cannot even be computed without
-/// reading a `msghdr` and an `iovec` array out of the guest. That is
+/// reading a `msghdr` and an `iovec` array out of the guest -- at entry, in
+/// [`capture_entry_iovecs`], which carries the same guard. That is
 /// preparatory work done BEFORE the `detlog!`, which is exactly the shape that
 /// made `--detlog-stack` and `--detlog-heap` cost 4.36x and 4.76x on a boot
 /// with logging off, producing 123 bytes of log. `detlog_observed!()` is
@@ -485,6 +736,7 @@ pub(crate) fn detlog_io_buffers<G, T>(
     call: &Syscall,
     ret: i64,
     dettid: DetTid,
+    entry: &EntryIovecs,
 ) -> Result<(), Error>
 where
     G: Guest<T>,
@@ -516,7 +768,7 @@ where
     };
     let moved_extents = {
         let memory = guest.memory();
-        extents(&memory, call, ret)?
+        extents(&memory, call, ret, entry)?
     };
     for extent in moved_extents {
         let (whole, chunk, chunks) = extent_digests(guest, extent.addr, extent.len)?;
@@ -765,9 +1017,10 @@ mod tests {
                 iovec_extent_arguments(&call),
                 Some((iovecs.as_ptr() as usize, 3))
             );
-            assert_eq!(extents(&memory, &call, 6).unwrap(), expected);
-            assert!(extents(&memory, &call, 0).unwrap().is_empty());
-            assert!(extents(&memory, &call, -1).unwrap().is_empty());
+            let entry = entry_iovecs(&memory, &call);
+            assert_eq!(extents(&memory, &call, 6, &entry).unwrap(), expected);
+            assert!(extents(&memory, &call, 0, &entry).unwrap().is_empty());
+            assert!(extents(&memory, &call, -1, &entry).unwrap().is_empty());
         }
     }
 
@@ -865,7 +1118,8 @@ mod tests {
                 len: 2,
             },
         ];
-        assert_eq!(extents(&memory, &call, 1).unwrap(), first_message);
+        let entry = entry_iovecs(&memory, &call);
+        assert_eq!(extents(&memory, &call, 1, &entry).unwrap(), first_message);
 
         let both_messages = vec![
             BufferExtent {
@@ -885,9 +1139,439 @@ mod tests {
                 len: 4,
             },
         ];
-        assert_eq!(extents(&memory, &call, 2).unwrap(), both_messages);
-        assert!(extents(&memory, &call, 0).unwrap().is_empty());
-        assert!(extents(&memory, &call, -1).unwrap().is_empty());
+        assert_eq!(extents(&memory, &call, 2, &entry).unwrap(), both_messages);
+        assert!(extents(&memory, &call, 0, &entry).unwrap().is_empty());
+        assert!(extents(&memory, &call, -1, &entry).unwrap().is_empty());
         assert_eq!(completed_mmsghdr_count(1, 2), 1);
+    }
+
+    /// A connected `AF_UNIX` datagram pair whose receiving end, `[1]`, stamps
+    /// every message with `SCM_TIMESTAMPNS`, holding `payloads` already queued.
+    fn timestamped_datagrams(payloads: &[u8]) -> [libc::c_int; 2] {
+        let mut sockets = [0; 2];
+        // SAFETY: `sockets` has room for the two descriptors socketpair writes.
+        let paired =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sockets.as_mut_ptr()) };
+        assert_eq!(paired, 0, "socketpair: {}", std::io::Error::last_os_error());
+        let enabled: libc::c_int = 1;
+        // SAFETY: the option value is a live `c_int` of the length passed.
+        let stamped = unsafe {
+            libc::setsockopt(
+                sockets[1],
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPNS,
+                (&raw const enabled).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            stamped,
+            0,
+            "SO_TIMESTAMPNS: {}",
+            std::io::Error::last_os_error()
+        );
+        for payload in payloads {
+            // SAFETY: one readable byte at `payload`.
+            let sent = unsafe { libc::send(sockets[0], (payload as *const u8).cast(), 1, 0) };
+            assert_eq!(sent, 1, "send: {}", std::io::Error::last_os_error());
+        }
+        sockets
+    }
+
+    fn close_all(fds: [libc::c_int; 2]) {
+        for fd in fds {
+            // SAFETY: each descriptor was opened by this test and is closed once.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// The shape `tests/c/socket_timestamp_edge_cases.c` exercises, driven
+    /// through the REAL kernel rather than a hand-built imitation of what it
+    /// writes: a `recvmsg` whose control buffer is its own `msghdr`.
+    ///
+    /// Linux puts the `SCM_TIMESTAMPNS` record over the header's first 32
+    /// bytes, so afterwards `msg_iov` holds the timestamp's `tv_sec` and
+    /// `msg_iovlen` its `tv_nsec`. Reading the header after the call walked
+    /// those as a pointer and a count; under the ptrace backend the read
+    /// failed with EFAULT, which Detcore returned to the guest in place of the
+    /// successful receive. The extent must be the one-byte buffer the kernel
+    /// actually filled.
+    #[test]
+    fn recvmsg_extents_come_from_the_header_as_issued_not_as_overwritten() {
+        let sockets = timestamped_datagrams(b"a");
+        let mut byte = 0_u8;
+        let mut iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        // SAFETY: `msghdr` is a plain C record; every field the kernel reads
+        // is set below.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = (&raw mut message).cast();
+        message.msg_controllen = std::mem::size_of::<libc::msghdr>();
+        let call = Syscall::Recvmsg(
+            syscalls::Recvmsg::new()
+                .with_sockfd(sockets[1])
+                .with_msg(AddrMut::from_raw(&raw mut message as usize)),
+        );
+        let memory = LocalMemory::new();
+
+        let entry = entry_iovecs(&memory, &call);
+        // SAFETY: `message` describes live buffers, including itself as the
+        // control buffer, which Linux permits.
+        let received = unsafe { libc::recvmsg(sockets[1], &raw mut message, 0) };
+        close_all(sockets);
+        assert_eq!(received, 1, "recvmsg: {}", std::io::Error::last_os_error());
+        assert_eq!(byte, b'a');
+        // The premise: if the kernel ever stops overwriting the header, this
+        // test no longer exercises the alias and must say so.
+        assert_ne!(
+            message.msg_iov, &raw mut iov,
+            "the control record no longer lands on msg_iov"
+        );
+
+        assert_eq!(
+            extents(&memory, &call, received as i64, &entry).unwrap(),
+            vec![BufferExtent {
+                addr: &raw const byte as u64,
+                len: 1,
+            }]
+        );
+    }
+
+    /// The same defect through the vectored-read family, with no socket
+    /// involved: a `readv` whose destination is its own `iovec` array. Linux
+    /// copied the array in before reading, so it delivers all 16 bytes to the
+    /// array's storage; a post-call re-read instead finds a segment at
+    /// 0xa5a5a5a5a5a5a5a5.
+    #[test]
+    fn readv_extents_come_from_the_iovec_array_as_issued_not_as_overwritten() {
+        let mut pipe = [0; 2];
+        // SAFETY: `pipe` has room for the two descriptors pipe writes.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let payload = [0xa5_u8; std::mem::size_of::<libc::iovec>()];
+        // SAFETY: `payload` is readable for its full length.
+        let written = unsafe { libc::write(pipe[1], payload.as_ptr().cast(), payload.len()) };
+        assert_eq!(written, payload.len() as isize);
+
+        // SAFETY: `iovec` is a plain C record; both fields are set below.
+        let mut slot: libc::iovec = unsafe { std::mem::zeroed() };
+        slot.iov_base = (&raw mut slot).cast();
+        slot.iov_len = std::mem::size_of::<libc::iovec>();
+        let call = Syscall::Readv(
+            syscalls::Readv::new()
+                .with_fd(pipe[0])
+                .with_iov(Addr::from_ptr(&raw const slot))
+                .with_len(1),
+        );
+        let memory = LocalMemory::new();
+
+        let entry = entry_iovecs(&memory, &call);
+        // SAFETY: the single segment covers `slot`'s own live storage.
+        let read = unsafe { libc::readv(pipe[0], &raw const slot, 1) };
+        close_all(pipe);
+        assert_eq!(read, payload.len() as isize);
+        assert_eq!(
+            slot.iov_base as usize, 0xa5a5_a5a5_a5a5_a5a5,
+            "the premise: the read overwrote the array it was described by"
+        );
+
+        assert_eq!(
+            extents(&memory, &call, read as i64, &entry).unwrap(),
+            vec![BufferExtent {
+                addr: &raw const slot as u64,
+                len: std::mem::size_of::<libc::iovec>() as u64,
+            }]
+        );
+    }
+
+    /// The batch receive, where each message's control buffer is that
+    /// message's own header. `msg_len` must still come from after the call --
+    /// it is the kernel's output -- while each message's segments come from
+    /// before it.
+    #[test]
+    fn recvmmsg_extents_pair_entry_segments_with_completed_lengths() {
+        let sockets = timestamped_datagrams(b"01");
+        let mut bytes = [0_u8; 2];
+        let mut iovecs = [
+            libc::iovec {
+                iov_base: (&raw mut bytes[0]).cast(),
+                iov_len: 1,
+            },
+            libc::iovec {
+                iov_base: (&raw mut bytes[1]).cast(),
+                iov_len: 1,
+            },
+        ];
+        // SAFETY: `mmsghdr` is a plain C record; every field the kernel reads
+        // is set below.
+        let mut headers: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        for (header, iov) in headers.iter_mut().zip(iovecs.iter_mut()) {
+            header.msg_hdr.msg_iov = iov;
+            header.msg_hdr.msg_iovlen = 1;
+            header.msg_hdr.msg_control = (&raw mut header.msg_hdr).cast();
+            header.msg_hdr.msg_controllen = std::mem::size_of::<libc::msghdr>();
+        }
+        let call = Syscall::Recvmmsg(
+            syscalls::Recvmmsg::new()
+                .with_fd(sockets[1])
+                .with_mmsg(AddrMut::from_raw(headers.as_mut_ptr() as usize))
+                .with_vlen(2),
+        );
+        let memory = LocalMemory::new();
+
+        let entry = entry_iovecs(&memory, &call);
+        // SAFETY: both headers describe live buffers, each using itself as
+        // its control buffer.
+        let received = unsafe {
+            libc::recvmmsg(
+                sockets[1],
+                headers.as_mut_ptr(),
+                2,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        close_all(sockets);
+        assert_eq!(received, 2, "recvmmsg: {}", std::io::Error::last_os_error());
+        assert_eq!(&bytes, b"01");
+        for (header, iov) in headers.iter().zip(iovecs.iter()) {
+            assert_eq!(header.msg_len, 1);
+            assert_ne!(
+                header.msg_hdr.msg_iov.cast_const(),
+                iov as *const libc::iovec,
+                "the control record no longer lands on msg_iov"
+            );
+        }
+
+        assert_eq!(
+            extents(&memory, &call, received as i64, &entry).unwrap(),
+            vec![
+                BufferExtent {
+                    addr: &raw const bytes[0] as u64,
+                    len: 1,
+                },
+                BufferExtent {
+                    addr: &raw const bytes[1] as u64,
+                    len: 1,
+                },
+            ]
+        );
+    }
+
+    /// A header the capture could not read is reported only when the kernel
+    /// says that message completed, and it keeps its errno; a message past
+    /// the capture repeats the errno that stopped it.
+    #[test]
+    fn an_unreadable_entry_is_reported_only_for_a_completed_message() {
+        let memory = LocalMemory::new();
+        // Page zero is never mapped for a user process.
+        let call = Syscall::Recvmsg(syscalls::Recvmsg::new().with_msg(AddrMut::from_raw(0x10)));
+        let entry = entry_iovecs(&memory, &call);
+        assert!(extents(&memory, &call, 0, &entry).unwrap().is_empty());
+        assert!(extents(&memory, &call, -1, &entry).unwrap().is_empty());
+        assert!(matches!(
+            extents(&memory, &call, 1, &entry),
+            Err(Error::Errno(Errno::EFAULT))
+        ));
+
+        let stopped = EntryIovecs(Some(vec![Ok(Vec::new()), Err(Errno::EFAULT)]));
+        assert_eq!(stopped.message(0), EntrySegments::Declared(&[]));
+        assert_eq!(stopped.message(1), EntrySegments::Unreadable(Errno::EFAULT));
+        assert_eq!(stopped.message(2), EntrySegments::Unreadable(Errno::EFAULT));
+        // Past the end of a capture that did NOT stop at an error, and no
+        // capture at all, are Detcore's bookkeeping, not the guest's memory.
+        let complete = EntryIovecs(Some(vec![Ok(Vec::new())]));
+        assert_eq!(complete.message(1), EntrySegments::Missing);
+        assert_eq!(
+            EntryIovecs(Some(Vec::new())).message(0),
+            EntrySegments::Missing
+        );
+        assert_eq!(EntryIovecs::default().message(0), EntrySegments::Missing);
+    }
+
+    /// A capture that was never taken must not become a guest errno. Before
+    /// entry capture existed the hashing read after the call; that is the
+    /// fallback, and here, with nothing overwritten, it is also exact.
+    #[test]
+    fn a_missing_capture_falls_back_to_the_post_call_read_not_to_efault() {
+        let mut bytes = [0_u8; 3];
+        let iovecs = [libc::iovec {
+            iov_base: (&raw mut bytes[0]).cast(),
+            iov_len: 3,
+        }];
+        let call = Syscall::Readv(
+            syscalls::Readv::new()
+                .with_iov(Addr::from_raw(iovecs.as_ptr() as usize))
+                .with_len(1),
+        );
+        let memory = LocalMemory::new();
+        assert_eq!(
+            extents(&memory, &call, 2, &EntryIovecs::default()).unwrap(),
+            vec![BufferExtent {
+                addr: &raw const bytes[0] as u64,
+                len: 2,
+            }]
+        );
+    }
+
+    /// Every syscall `extents` hashes must have its `iovec` arrays, if any,
+    /// captured by `entry_iovecs`. An arm added to `extents` that consults an
+    /// array without a matching capture trips the `debug_assert` in
+    /// `message_segments` here, rather than silently falling back to the
+    /// post-call read that this module exists to avoid.
+    #[test]
+    fn every_hashed_syscall_finds_its_entry_capture() {
+        // Zeroed memory: every header and iovec read from it is valid and
+        // declares no segments, so every arm reaches its capture lookup.
+        let zeroed = [0_u64; 512];
+        let pointer = zeroed.as_ptr() as usize;
+        let memory = LocalMemory::new();
+        for &sysno in HASHED_SYSCALLS {
+            // (fd, buffer/iov/msg, count/vlen, ...) fits every hashed syscall.
+            let call = Syscall::from_raw(
+                sysno,
+                reverie::syscalls::SyscallArgs::new(3, pointer, 1, 0, 0, 0),
+            );
+            let entry = entry_iovecs(&memory, &call);
+            assert!(entry.0.is_some(), "{sysno}: no capture");
+            if let Err(error) = extents(&memory, &call, 1, &entry) {
+                panic!("{sysno}: {error:?}");
+            }
+        }
+    }
+
+    /// The cross-message shape the entry snapshot cannot see: the kernel reads
+    /// header 1 only after message 0's payload has rewritten it. At entry
+    /// header 1 names unmapped memory, and a delivered message must not become
+    /// EFAULT; the header as the call left it is the one the kernel used.
+    #[test]
+    fn a_batch_header_made_readable_by_an_earlier_message_is_read_after_the_call() {
+        let mut sockets = [0; 2];
+        // SAFETY: `sockets` has room for the two descriptors socketpair writes.
+        let paired =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sockets.as_mut_ptr()) };
+        assert_eq!(paired, 0, "socketpair: {}", std::io::Error::last_os_error());
+
+        let mut byte = 0_u8;
+        let second_iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        // SAFETY: `mmsghdr` is a plain C record; every field the kernel reads
+        // is set below.
+        let mut headers: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        let second_msg_iov = &raw mut headers[1].msg_hdr.msg_iov;
+        let first_iov = libc::iovec {
+            iov_base: second_msg_iov.cast(),
+            iov_len: std::mem::size_of::<*mut libc::iovec>(),
+        };
+        headers[0].msg_hdr.msg_iov = (&raw const first_iov).cast_mut();
+        headers[0].msg_hdr.msg_iovlen = 1;
+        // Page zero is never mapped for a user process.
+        headers[1].msg_hdr.msg_iov = 0x10 as *mut libc::iovec;
+        headers[1].msg_hdr.msg_iovlen = 1;
+
+        let pointer = ((&raw const second_iov) as usize).to_ne_bytes();
+        for payload in [&pointer[..], b"Z"] {
+            // SAFETY: `payload` is readable for its length.
+            let sent = unsafe { libc::send(sockets[0], payload.as_ptr().cast(), payload.len(), 0) };
+            assert_eq!(sent, payload.len() as isize);
+        }
+        let call = Syscall::Recvmmsg(
+            syscalls::Recvmmsg::new()
+                .with_fd(sockets[1])
+                .with_mmsg(AddrMut::from_raw(headers.as_mut_ptr() as usize))
+                .with_vlen(2),
+        );
+        let memory = LocalMemory::new();
+
+        let entry = entry_iovecs(&memory, &call);
+        assert!(matches!(entry.message(1), EntrySegments::Unreadable(_)));
+        // SAFETY: header 0 describes a live buffer; header 1 becomes live when
+        // message 0 is delivered into its `msg_iov` field.
+        let received = unsafe {
+            libc::recvmmsg(
+                sockets[1],
+                headers.as_mut_ptr(),
+                2,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        close_all(sockets);
+        assert_eq!(received, 2, "recvmmsg: {}", std::io::Error::last_os_error());
+        assert_eq!(byte, b'Z', "the kernel read header 1 after message 0");
+
+        assert_eq!(
+            extents(&memory, &call, received as i64, &entry).unwrap(),
+            vec![
+                BufferExtent {
+                    addr: second_msg_iov as u64,
+                    len: std::mem::size_of::<*mut libc::iovec>() as u64,
+                },
+                BufferExtent {
+                    addr: &raw const byte as u64,
+                    len: 1,
+                },
+            ]
+        );
+    }
+
+    /// The header array is read in one access, and only an array running into
+    /// unmapped memory is walked header by header. The walk must keep the
+    /// readable prefix and stop at the first unreadable header with its errno.
+    #[test]
+    fn a_batch_running_into_unmapped_memory_keeps_its_readable_prefix() {
+        let page = 4096;
+        // SAFETY: an anonymous two-page mapping; the second page is unmapped
+        // below and the first is released at the end.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        // SAFETY: the second page belongs to the mapping above.
+        assert_eq!(
+            unsafe { libc::munmap(base.cast::<u8>().add(page).cast(), page) },
+            0
+        );
+        let mut byte = 0_u8;
+        let iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        let size = std::mem::size_of::<libc::mmsghdr>();
+        let first = base as usize + page - size;
+        // SAFETY: `first` is the last whole `mmsghdr` slot in the mapped page;
+        // the all-zero record is valid and only `msg_iov` is set.
+        unsafe {
+            let header = first as *mut libc::mmsghdr;
+            header.write(std::mem::zeroed());
+            (*header).msg_hdr.msg_iov = (&raw const iov).cast_mut();
+            (*header).msg_hdr.msg_iovlen = 1;
+        }
+
+        let entry = mmsghdr_segments(&LocalMemory::new(), first, 3);
+        assert_eq!(
+            entry.message(0),
+            EntrySegments::Declared(&[BufferExtent {
+                addr: &raw const byte as u64,
+                len: 1,
+            }])
+        );
+        assert_eq!(entry.message(1), EntrySegments::Unreadable(Errno::EFAULT));
+        assert_eq!(entry.message(2), EntrySegments::Unreadable(Errno::EFAULT));
+        assert_eq!(entry.0.as_ref().map(Vec::len), Some(2));
+        // SAFETY: the first page is still mapped and unused from here.
+        assert_eq!(unsafe { libc::munmap(base, page) }, 0);
     }
 }
