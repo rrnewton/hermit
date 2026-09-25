@@ -69,7 +69,7 @@ unit test asserts non-seed squashfuse and non-fuse xarfuse rows survive).
   with pinned evidence (`PROCFS_MOUNTINFO_2026_09_25_*`).
 
 ## Mounts view
-`/proc/<pid>/mounts` now carries the same exclusion (mounts grammar, ProcfsKind::Mounts), so the two guest views agree. KVM reverie-kvm proc_mounts capture is pre-existing and unmeasured. Retained-row-with-seed-parent refuses snapshot (fail-closed, unit-tested).
+`/proc/<pid>/mounts` now carries the same exclusion (mounts grammar, ProcfsKind::Mounts), so the two guest views agree. KVM reverie-kvm proc_mounts capture is pre-existing and unmeasured. A retained row whose parent is an excluded seed still snapshots: the constructor's parent pass covers it and its parent id is rewritten deterministically (unit-tested, `retained_row_with_seed_parent_still_snapshots`).
 
 Residual: a guest program that itself drives host squashfuse seeds would
 not see its own post-launch seed mounts (they were never deterministic —
