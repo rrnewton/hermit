@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 172;
+pub const NON_CI_CELL_COUNT: usize = 171;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -139,6 +139,17 @@ pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "9a60fca92a303ff6198b7e7539d6ed5dd3b7452c";
 pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T03:39:42Z";
 pub const TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// One ptrace verify cell re-selected after the guest mount model excluded
+/// ephemeral per-process host FUSE seed mounts (`fuse.squashfuse_ll` under
+/// `/mnt/xarfuse/`): `system-utils/procfs-sanitized-paths` passed twenty
+/// consecutive strict canonical repetitions at the evidence head under its
+/// manifest comparison profile (`compare_io_buffers: false, rcb_time: false`).
+/// The evidence SHA is the first commit of this change (the tree the
+/// qualification binary was built from).
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
+    "422f3f3a4e05353edd4f2449affc8df9241bdf51";
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:23:58Z";
+pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1990,7 +2001,16 @@ mod tests {
             "2026-09-26T03:39:42Z"
         );
         assert_eq!(TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
-        assert_eq!(NON_CI_CELL_COUNT, 172);
+        assert_eq!(
+            PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
+            "PENDING_FIRST_COMMIT"
+        );
+        assert_eq!(
+            PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T09:23:58Z"
+        );
+        assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(NON_CI_CELL_COUNT, 171);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
