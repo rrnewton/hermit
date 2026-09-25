@@ -28324,6 +28324,105 @@ mod evidence_identity_tests {
         assert!(serde_json::from_value::<ResultRow>(value).is_err());
     }
 
+    /// A declared verify PASS on a parity cell carries two attempts: the
+    /// candidate ("1") and the ptrace reference ("parity-reference"), the only
+    /// multi-attempt verify row the runner writes. Every attempt is checked,
+    /// not only the first: a reference attempt and parity operand coherently
+    /// rehashed to say 4, while the candidate still says 3, is refused. The
+    /// `verify-results` gate reads only the attempt reports, so this check is
+    /// its sole refusal. The evidence reader would also refuse through the
+    /// parity witness, whose Matched verdict then contradicts its operands;
+    /// the exact message pins that the declaration is checked first.
+    #[test]
+    fn declared_exit_is_checked_on_every_attempt_of_a_parity_row() {
+        const DISPOSITION: &str = "matched report does not end as its row declares";
+        fn with_exit(report: &str, code: i32) -> String {
+            let mut report: JsonValue = serde_json::from_str(report).unwrap();
+            report["guest_exit_code"] = code.into();
+            for side in ["left", "right"] {
+                report["compared_outputs"][side]["exit_code"] = code.into();
+            }
+            serde_json::to_string(&report).unwrap()
+        }
+        fn set_report(attempt: &mut JsonValue, report: String) {
+            attempt["verification_report_sha256"] =
+                format!("{:x}", Sha256::digest(report.as_bytes())).into();
+            attempt["verification_report"] = report.into();
+        }
+        let mut row = parity();
+        row.expected_guest_exit = Some(ExpectedGuestExit {
+            code: Some(3),
+            signal: None,
+            reason: "the fixture guest exits 3 on purpose".into(),
+        });
+        let base = row.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for attempt in &mut row.attempts {
+            let backend = attempt["argv"][3].as_str().unwrap().to_owned();
+            let argv = [
+                "hermit",
+                "run",
+                "--backend",
+                &backend,
+                "--verify-allow=failure",
+                "--",
+                "fixture",
+            ];
+            attempt["argv"] = serde_json::json!(argv);
+            attempt["shell_command"] = literal_shell_command(
+                "/repo",
+                &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+                &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+            )
+            .into();
+            attempt["status"] = 3.into();
+            set_report(attempt, with_exit(&base, 3));
+        }
+        // The row names its candidate invocation.
+        let candidate = &row.attempts[0];
+        row.argv = serde_json::from_value(candidate["argv"].clone()).unwrap();
+        row.effective_args = row.argv[1..].to_vec();
+        row.shell_command = candidate["shell_command"].as_str().unwrap().into();
+        fn operand_exit(
+            operand: &mut hermit_manifest_plan::backend_parity::BackendParityOperand,
+            code: i32,
+        ) {
+            let mut value = serde_json::to_value(&*operand).unwrap();
+            value["verification"] = serde_json::from_str(&with_exit(
+                &serde_json::to_string(&value["verification"]).unwrap(),
+                code,
+            ))
+            .unwrap();
+            value["output"]["exit_code"] = code.into();
+            *operand = serde_json::from_value(value).unwrap();
+        }
+        let parity = row.backend_parity.as_mut().unwrap();
+        operand_exit(&mut parity.reference, 3);
+        operand_exit(&mut parity.candidate, 3);
+        row.require_canonical_pass_evidence()
+            .expect("the verify-results gate refused the genuine declared parity row");
+        row.comparison_evidence()
+            .expect("the evidence reader refused the genuine declared parity row");
+
+        let mut tampered = row.clone();
+        let reference = &mut tampered.attempts[1];
+        assert_eq!(reference["index"], "parity-reference");
+        set_report(reference, with_exit(&base, 4));
+        operand_exit(&mut tampered.backend_parity.as_mut().unwrap().reference, 4);
+        let error = tampered.require_canonical_pass_evidence().unwrap_err();
+        assert!(
+            error.contains(&format!("attempt 2 {DISPOSITION}")),
+            "verify-results: {error}"
+        );
+        let error = tampered.comparison_evidence().err().unwrap();
+        assert!(
+            error.contains(&format!("attempt 2 {DISPOSITION}")),
+            "evidence: {error}"
+        );
+    }
+
     #[test]
     fn series_audit_must_carry_exactly_the_declaration_and_its_identity() {
         let reason = "the fixture guest fails on purpose";
