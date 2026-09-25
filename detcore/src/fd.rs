@@ -137,6 +137,19 @@ struct OpenFileDescription {
     /// succeeds on this open file description.
     #[serde(default)]
     directory: Option<DirectoryStream>,
+    /// True once `getdents` on this open file reads the host directory one
+    /// kernel buffer at a time, because no whole-directory snapshot can stand
+    /// in for its position. See `use_host_directory_order`.
+    #[serde(default)]
+    directory_host_order: bool,
+    /// Held across a whole `getdents` or `lseek` on this open file
+    /// description. Reading the host directory takes several injected
+    /// syscalls on the shared kernel position, and the kernel's own per-file
+    /// position lock covers only one of them; without this, two unsequentialized
+    /// threads could interleave their reads and each keep part of the
+    /// directory. Sequentialized threads never contend for it.
+    #[serde(skip)]
+    directory_lock: Arc<tokio::sync::Mutex<()>>,
     /// Logical timestamp of the last packet delivered through this socket.
     socket_receive_timestamp: Option<LogicalTime>,
     /// True when this open file is an `AF_NETLINK`/`NETLINK_SOCK_DIAG` socket,
@@ -225,6 +238,8 @@ impl DetFd {
                 resource: None,
                 procfs: None,
                 directory: None,
+                directory_host_order: false,
+                directory_lock: Default::default(),
                 socket_receive_timestamp: None,
                 sock_diag: false,
                 netlink_route: false,
@@ -502,11 +517,33 @@ impl DetFd {
             .and_then(|procfs| procfs.take_timer_slack_at(value, offset, maximum))
     }
 
+    /// The lock serializing `getdents` and `lseek` on this open file
+    /// description across every alias of it.
+    pub(crate) fn directory_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.description().directory_lock)
+    }
+
     /// Whether a `getdents` call has created a directory stream here. Only a
     /// successful read of the host directory creates one, so this also proves
     /// the open file is a directory.
     pub(crate) fn has_directory_stream(&self) -> bool {
         self.description().directory.is_some()
+    }
+
+    /// Whether `getdents` on this open file reads the host directory one
+    /// kernel buffer at a time instead of from a sorted stream.
+    pub(crate) fn directory_in_host_order(&self) -> bool {
+        self.description().directory_host_order
+    }
+
+    /// Read this open file's directory one kernel buffer at a time from now
+    /// on: its position was moved before the first `getdents`, or the guest's
+    /// buffer cannot hold every entry. Any stream is dropped, so `lseek`
+    /// reaches the kernel again.
+    pub(crate) fn use_host_directory_order(&self) {
+        let mut description = self.description();
+        description.directory_host_order = true;
+        description.directory = None;
     }
 
     /// Whether the next `getdents` must read the host directory.

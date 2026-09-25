@@ -1682,6 +1682,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
         let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
+        // A seek must not move the position under a `getdents` that is
+        // reading or serving this open file's directory.
+        let directory_lock = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.directory_lock())?;
+        let _seeking = directory_lock.lock().await;
         let (fd_type, status_flags, procfs_position, resource, directory_stream) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
@@ -4215,11 +4221,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
         self.serve_directory_stream(
             guest,
-            Syscall::from(call),
-            call.fd() as i32,
-            buf,
-            call.count() as usize,
-            DirentFormat::Legacy,
+            GetdentsCall {
+                call: Syscall::from(call),
+                drain: Syscall::from(call.with_count(call.count().min(DIRECTORY_DRAIN_COUNT))),
+                fd: call.fd() as i32,
+                buf,
+                capacity: call.count() as usize,
+                format: DirentFormat::Legacy,
+            },
         )
         .await
     }
@@ -4236,11 +4245,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
         self.serve_directory_stream(
             guest,
-            Syscall::from(call),
-            call.fd() as i32,
-            buf,
-            call.count() as usize,
-            DirentFormat::Dirent64,
+            GetdentsCall {
+                call: Syscall::from(call),
+                drain: Syscall::from(call.with_count(call.count().min(DIRECTORY_DRAIN_COUNT))),
+                fd: call.fd() as i32,
+                buf,
+                capacity: call.count() as usize,
+                format: DirentFormat::Dirent64,
+            },
         )
         .await
     }
@@ -4256,33 +4268,92 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn serve_directory_stream<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: Syscall,
-        fd: RawFd,
-        buf: AddrMut<'_, u8>,
-        capacity: usize,
-        format: DirentFormat,
+        call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
-        let (known_directory, needs_snapshot) = guest.thread_state().with_detfd(fd, |detfd| {
+        let lock = match guest
+            .thread_state()
+            .with_detfd(call.fd, |detfd| detfd.directory_lock())
+        {
+            Ok(lock) => lock,
+            // Detcore has no open file description for this descriptor (one
+            // received through SCM_RIGHTS, for example), so there is nowhere
+            // to keep a stream. Sort the one kernel buffer instead, as before
+            // directory streams existed; the kernel reports a descriptor that
+            // is not open at all.
+            Err(Errno::EBADF) => return self.sort_one_buffer(guest, call).await,
+            Err(errno) => return Err(errno.into()),
+        };
+        let _serving = lock.lock().await;
+        let (host_order, needs_snapshot) = guest.thread_state().with_detfd(call.fd, |detfd| {
             (
-                detfd.has_directory_stream(),
+                detfd.directory_in_host_order(),
                 detfd.directory_needs_snapshot(),
             )
         })?;
-        let mut drained_len = 0;
-        if needs_snapshot {
-            let (entries, len) = self
-                .snapshot_directory(guest, call, fd, buf, format, known_directory)
-                .await?;
-            drained_len = len;
-            let mut entries = Some(entries);
-            guest.thread_state().with_detfd(fd, |detfd| {
-                detfd.install_directory_snapshot(entries.take().unwrap_or_default())
-            })?;
+        if host_order {
+            return self.sort_one_buffer(guest, call).await;
+        }
+        if !needs_snapshot {
+            return self.serve_next_batch(guest, call).await;
         }
 
-        let (start, batch) = guest.thread_state().with_detfd(fd, |detfd| {
+        // Reading the host directory writes host-ordered records into the
+        // guest's buffer, but Linux leaves every byte after the returned
+        // records as it was. Keep the bytes a read can overwrite to put back.
+        let mut original = vec![0; call.capacity.min(DIRECTORY_DRAIN_COUNT as usize)];
+        let mut saved = 0;
+        while saved < original.len() {
+            match guest
+                .memory()
+                .read(unsafe { call.buf.add(saved) }, &mut original[saved..])
+            {
+                Ok(0) | Err(_) => break,
+                Ok(len) => saved += len,
+            }
+        }
+        original.truncate(saved);
+
+        let mut overwritten = 0;
+        let served = match self.snapshot_directory(guest, call, &mut overwritten).await {
+            Ok(Some(entries)) => {
+                let mut entries = Some(entries);
+                guest.thread_state().with_detfd(call.fd, |detfd| {
+                    detfd.install_directory_snapshot(entries.take().unwrap_or_default())
+                })?;
+                self.serve_next_batch(guest, call).await
+            }
+            Ok(None) => {
+                guest
+                    .thread_state()
+                    .with_detfd(call.fd, |detfd| detfd.use_host_directory_order())?;
+                self.sort_one_buffer(guest, call).await
+            }
+            Err(error) => Err(error),
+        };
+        let returned = served.as_ref().map_or(0, |&len| len as usize);
+        let end = overwritten.min(original.len());
+        if end > returned {
+            guest
+                .memory()
+                .write_exact(unsafe { call.buf.add(returned) }, &original[returned..end])?;
+        }
+        served
+    }
+
+    /// Return the entries at the stream's position that fit in the guest's
+    /// buffer, with determinized inodes and each `d_off` naming the position
+    /// after its entry, counting from 1.
+    async fn serve_next_batch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: GetdentsCall<'_>,
+    ) -> Result<i64, Error> {
+        let (start, batch) = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| {
-                (stream.position(), stream.next_batch(format, capacity))
+                (
+                    stream.position(),
+                    stream.next_batch(call.format, call.capacity),
+                )
             })
         })?;
         let batch = batch?;
@@ -4290,79 +4361,136 @@ impl<T: RecordOrReplay> Detcore<T> {
         for (index, entry) in batch.iter().enumerate() {
             let (d_ino, _) = determinize_inode(guest, entry.ino).await;
             let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
-            format.encode(entry, d_ino.as_raw(), d_off, &mut records);
+            call.format
+                .encode(entry, d_ino.as_raw(), d_off, &mut records);
         }
-        let returned = records.len();
-        // Reading the host directory wrote host-ordered records into the
-        // guest's buffer; zero whatever the sorted records do not overwrite.
-        records.resize(returned.max(drained_len), 0);
         if !records.is_empty() {
-            guest.memory().write_exact(buf, &records)?;
+            guest.memory().write_exact(call.buf, &records)?;
         }
-        guest.thread_state().with_detfd(fd, |detfd| {
+        guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| stream.advance(batch.len()))
         })?;
-        Ok(returned as i64)
+        Ok(records.len() as i64)
     }
 
-    /// Read the whole host directory behind `fd` by reissuing the guest's own
-    /// `getdents` call until it returns 0, and sort the result. Returns the
-    /// entries and the largest number of bytes any read wrote into the guest's
-    /// buffer.
+    /// Answer `getdents` without a directory stream by issuing the guest's own
+    /// call, sorting the entries of that one kernel buffer and determinizing
+    /// their inodes. The host's `d_off` cookies are kept, so the kernel can
+    /// still interpret them. A directory larger than one buffer comes back as
+    /// sorted runs whose boundaries depend on the host.
+    async fn sort_one_buffer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: GetdentsCall<'_>,
+    ) -> Result<i64, Error> {
+        let len = self.record_or_replay(guest, call.call).await? as usize;
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut bytes = vec![0; len];
+        guest.memory().read_exact(call.buf, &mut bytes)?;
+        let mut entries = call.format.parse(&bytes)?;
+        sort_dir_entries(&mut entries);
+        let mut records = Vec::with_capacity(len);
+        for entry in &entries {
+            let (d_ino, _) = determinize_inode(guest, entry.ino).await;
+            call.format
+                .encode(entry, d_ino.as_raw(), entry.off, &mut records);
+        }
+        guest.memory().write_exact(call.buf, &records)?;
+        Ok(records.len() as i64)
+    }
+
+    /// Read the whole host directory by issuing `call.drain` until it returns
+    /// 0, and sort the result. `overwritten` is raised to the largest number
+    /// of bytes any read wrote into the guest's buffer.
     ///
     /// Every step goes through `record_or_replay`, so a replay reads the same
-    /// entries from the log. The first read must start at the beginning of
-    /// the directory, so the kernel position is rewound to 0 unless it already
-    /// is. Before the first snapshot the rewind waits for a `getdents` probe to
-    /// succeed: rewinding a non-directory would move a regular file's offset
-    /// even though `getdents` then fails with `ENOTDIR`.
+    /// entries from the log. The reads must start at the beginning of the
+    /// directory: a known directory is rewound there, and before the first
+    /// snapshot the kernel position must already be 0.
+    ///
+    /// Returns `None` when this open file must be read in host order instead,
+    /// with the kernel position where the guest left it. Either the position
+    /// was moved before the first `getdents`, to a host cookie that no entry
+    /// index stands for, or an entry after the first ones does not fit in the
+    /// guest's buffer, so the directory cannot be read to its end with it. A
+    /// regular file, pipe or `O_PATH` descriptor whose position is not 0 also
+    /// lands here, and reading it in host order reports the kernel's error
+    /// without moving its offset.
     async fn snapshot_directory<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: Syscall,
-        fd: RawFd,
-        buf: AddrMut<'_, u8>,
-        format: DirentFormat,
-        known_directory: bool,
-    ) -> Result<(Vec<DirEntry>, usize), Error> {
+        call: GetdentsCall<'_>,
+        overwritten: &mut usize,
+    ) -> Result<Option<Vec<DirEntry>>, Error> {
+        let known_directory = guest
+            .thread_state()
+            .with_detfd(call.fd, |detfd| detfd.has_directory_stream())?;
         let lseek = |offset, whence| {
             syscalls::Lseek::new()
-                .with_fd(fd)
+                .with_fd(call.fd)
                 .with_offset(offset)
                 .with_whence(whence)
         };
-        let mut drained_len = 0;
-        let rewind = if known_directory {
-            true
+        if known_directory {
+            self.record_or_replay(guest, lseek(0, Whence::SEEK_SET))
+                .await?;
         } else if self
             .record_or_replay(guest, lseek(0, Whence::SEEK_CUR))
             .await
-            == Ok(0)
+            != Ok(0)
         {
-            false
-        } else {
-            drained_len = self.record_or_replay(guest, call).await? as usize;
-            true
-        };
-        if rewind {
-            self.record_or_replay(guest, lseek(0, Whence::SEEK_SET))
-                .await?;
+            return Ok(None);
         }
 
         let mut entries = Vec::new();
+        let mut read_any = false;
         loop {
-            let len = self.record_or_replay(guest, call).await? as usize;
+            let len = match self.record_or_replay(guest, call.drain).await {
+                Ok(len) => len as usize,
+                Err(error) if read_any => {
+                    // The failed call must leave the position where the guest
+                    // left it, but the earlier reads moved it.
+                    self.record_or_replay(guest, lseek(0, Whence::SEEK_SET))
+                        .await?;
+                    if error == Errno::EINVAL {
+                        return Ok(None);
+                    }
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            };
             if len == 0 {
                 break;
             }
-            drained_len = drained_len.max(len);
+            read_any = true;
+            *overwritten = (*overwritten).max(len);
             let mut bytes = vec![0; len];
-            guest.memory().read_exact(buf, &mut bytes)?;
-            entries.extend(format.parse(&bytes)?);
+            guest.memory().read_exact(call.buf, &mut bytes)?;
+            entries.extend(call.format.parse(&bytes)?);
         }
         sort_dir_entries(&mut entries);
-        Ok((entries, drained_len))
+        Ok(Some(entries))
     }
+}
+
+/// The most bytes one read of the host directory asks for. Reading it writes
+/// into the guest's buffer, whose original contents are kept to be put back.
+const DIRECTORY_DRAIN_COUNT: u32 = 64 * 1024;
+
+/// A guest `getdents` or `getdents64` call.
+#[derive(Clone, Copy)]
+struct GetdentsCall<'a> {
+    /// The call as the guest made it.
+    call: Syscall,
+    /// The same call asking for at most [`DIRECTORY_DRAIN_COUNT`] bytes.
+    drain: Syscall,
+    fd: RawFd,
+    buf: AddrMut<'a, u8>,
+    /// The guest's buffer size.
+    capacity: usize,
+    format: DirentFormat,
 }
 
 #[cfg(test)]
