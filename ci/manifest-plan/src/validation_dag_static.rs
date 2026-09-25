@@ -220,7 +220,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The manifest-gate width contract retains all 616 prior identities.
     // The GlobalTime sub-microsecond elapsed-time and environment-free config
     // fingerprint regressions retain all 610 prior selected identities.
-    ("test.regular_crates", 619),
+    // Two validate-runner tests (validate run 214 measured 620 against 618)
+    // and two stress_series declared_guest_exit tests retain all 619 prior
+    // identities.
+    ("test.regular_crates", 623),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -268,7 +271,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 619),
+    ("test.regular_crates_on_host", 623),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
