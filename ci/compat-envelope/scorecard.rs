@@ -49,12 +49,15 @@ use hermit_manifest_plan::logdiff_report::LogDiffRecords;
 use hermit_manifest_plan::logdiff_report::LogDiffReport;
 use hermit_manifest_plan::logdiff_report::LogDiffVerdict;
 use hermit_manifest_plan::logdiff_report::RecordEnvelopePolicy;
+use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
 use hermit_manifest_plan::stress_series::SeriesCoordinates;
+use hermit_manifest_plan::stress_series::SeriesDeclaredGuestExit;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictEvidence;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesOutcome;
@@ -1325,6 +1328,12 @@ struct ResultRow {
     attempts: Vec<JsonValue>,
     #[serde(default)]
     backend_parity: Option<BackendParityReport>,
+    /// The manifest's declaration that a verify cell's guest exits with one
+    /// exact nonzero code or signal. It authorizes a matched nonzero attempt,
+    /// so it is part of the evidence identity. Absent on undeclared cells and
+    /// on rows written before the runner carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_guest_exit: Option<ExpectedGuestExit>,
     /// WHERE the cell diverged, as emitted by the harness.
     ///
     /// `#[serde(default)]` for the same reason the sibling copy in
@@ -1931,6 +1940,18 @@ impl ResultRow {
         // a present typed parity witness remains part of the exact identity.
         if let Some(parity) = &self.backend_parity {
             evidence["backend_parity"] = serde_json::json!(parity);
+        }
+        // A declaration authorizes converting a matched nonzero exit from a
+        // refusal into a pass, so the complete checked declaration is part of
+        // the identity: removing or changing it cannot keep the accepted row's
+        // hash. Undeclared rows keep their historical identity.
+        if let Some(declared) = &self.expected_guest_exit {
+            validate_expected_guest_exit("result row", &self.mode, Some(declared))?;
+            evidence["expected_guest_exit"] = serde_json::json!({
+                "code": declared.code,
+                "reason": declared.reason,
+                "signal": declared.signal,
+            });
         }
         let encoded = serde_json::to_vec(&evidence)
             .map_err(|error| format!("cannot encode result evidence: {error}"))?;
@@ -3695,6 +3716,11 @@ fn retain_selected_custom_results(
                     .no_verdict_evidence
                     .as_ref()
                     .is_some_and(|evidence| evidence.evidence_sha256 != candidate.evidence_identity)
+                || !declared_guest_exit_matches(
+                    row,
+                    &candidate.evidence_identity,
+                    event.series.declared_guest_exit.as_ref(),
+                )
             {
                 return Err(format!(
                     "{} custom series classification or evidence differs from its raw attempt",
@@ -3715,6 +3741,26 @@ fn retain_selected_custom_results(
         }
     }
     Ok(retained)
+}
+
+/// Whether a series row carries exactly the declaration its raw result row
+/// was admitted under, bound to that row's evidence identity. A declared
+/// result without the audit, or an audit without a declaration, disagrees.
+fn declared_guest_exit_matches(
+    row: &ResultRow,
+    evidence_identity: &str,
+    series: Option<&SeriesDeclaredGuestExit>,
+) -> bool {
+    match (&row.expected_guest_exit, series) {
+        (None, None) => true,
+        (Some(expected), Some(series)) => {
+            expected.code == series.code
+                && expected.signal == series.signal
+                && expected.reason == series.reason
+                && series.evidence_sha256 == evidence_identity
+        }
+        _ => false,
+    }
 }
 
 fn tracked_current_summary(derived: &Derived) -> String {
@@ -13429,6 +13475,7 @@ fn self_test() -> Result<(), String> {
             first_divergent_record: None,
             first_divergent_syscall: None,
             backend_parity: None,
+            expected_guest_exit: None,
             attempts: vec![{
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
                     verified: true,
@@ -15374,6 +15421,7 @@ fn self_test() -> Result<(), String> {
         first_divergent_record: Some(12),
         first_divergent_syscall: Some(9),
         backend_parity: None,
+        expected_guest_exit: None,
         attempts: vec![validate_attempt("FAIL")],
     };
     // Compare the real producer and reader against a fixed tuple table. The
@@ -16677,6 +16725,7 @@ fn self_test() -> Result<(), String> {
             failure_class: None,
             no_verdict_evidence: None,
             pressure_evidence: None,
+            declared_guest_exit: None,
             run_index: 1,
             attempt: Some(1),
             num_runs: 1,
@@ -21543,6 +21592,7 @@ fn self_test() -> Result<(), String> {
         first_divergent_record: None,
         first_divergent_syscall: None,
         backend_parity: None,
+        expected_guest_exit: None,
         attempts: vec![serde_json::json!({
             "argv":["fixture"],
             "guest_argv":["fixture"],
@@ -21951,6 +22001,7 @@ fn self_test() -> Result<(), String> {
                 failure_class,
                 no_verdict_evidence: None,
                 pressure_evidence: None,
+                declared_guest_exit: None,
                 run_index: 1,
                 attempt: None,
                 num_runs,
@@ -27558,6 +27609,129 @@ mod evidence_identity_tests {
         let mut changed = row;
         changed.attempts[0]["status"] = serde_json::json!(74);
         assert_ne!(changed.evidence_identity().unwrap(), ORDINARY);
+    }
+
+    // Independently computed by the parent's `_cell_result_evidence_sha256`
+    // over `ordinary()` plus each declaration below.
+    const DECLARED_CODE_7: &str =
+        "0953b8206ec868fc6c4d2466b5877d479eb18a26a75eb4750f032ff11be6ad0b";
+    const DECLARED_SIGNAL_11: &str =
+        "330611d0f1cefdc37b2dc6534b4178cf2bc1f73713c2fc2517ad3dc9429ebef6";
+    const DECLARED_UNICODE_REASON: &str =
+        "32fab131e58b1532412f050c8a4f48e6bb9e44e0286cc207c55009c1709d5b4c";
+
+    fn declared(code: Option<i32>, signal: Option<i32>, reason: &str) -> ResultRow {
+        let mut row = ordinary();
+        row.expected_guest_exit = Some(ExpectedGuestExit {
+            code,
+            signal,
+            reason: reason.into(),
+        });
+        row
+    }
+
+    #[test]
+    fn declared_guest_exit_is_bound_into_the_evidence_identity() {
+        let reason = "the fixture guest fails on purpose";
+        for (row, golden) in [
+            (declared(Some(7), None, reason), DECLARED_CODE_7),
+            (declared(None, Some(11), reason), DECLARED_SIGNAL_11),
+            (
+                declared(Some(7), None, "déclaré — on purpose"),
+                DECLARED_UNICODE_REASON,
+            ),
+        ] {
+            assert_eq!(row.evidence_identity().unwrap(), golden);
+            // The declaration survives the row's own serialization.
+            let reread: ResultRow =
+                serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+            assert_eq!(reread.evidence_identity().unwrap(), golden);
+        }
+        // Removing the declaration cannot keep the declared identity; it
+        // restores exactly the historical undeclared one.
+        let mut removed = declared(Some(7), None, reason);
+        removed.expected_guest_exit = None;
+        assert_eq!(removed.evidence_identity().unwrap(), ORDINARY);
+        assert!(
+            !serde_json::to_string(&removed)
+                .unwrap()
+                .contains("expected_guest_exit")
+        );
+        // Every changed member changes the identity.
+        let mut identities = BTreeSet::from([ORDINARY.to_string()]);
+        for row in [
+            declared(Some(7), None, reason),
+            declared(Some(3), None, reason),
+            declared(None, Some(11), reason),
+            declared(None, Some(6), reason),
+            declared(Some(7), None, "a different reason"),
+        ] {
+            assert!(identities.insert(row.evidence_identity().unwrap()));
+        }
+        // A declaration that the manifest loader would refuse has no identity.
+        for (label, row) in [
+            ("code 0", declared(Some(0), None, reason)),
+            ("code 256", declared(Some(256), None, reason)),
+            ("signal 65", declared(None, Some(65), reason)),
+            ("both", declared(Some(7), Some(11), reason)),
+            ("neither", declared(None, None, reason)),
+            ("blank reason", declared(Some(7), None, "  ")),
+        ] {
+            assert!(row.evidence_identity().is_err(), "{label} had an identity");
+        }
+        let mut chaos = declared(Some(7), None, reason);
+        chaos.mode = "chaos".into();
+        assert!(chaos.evidence_identity().is_err());
+        // Unknown declaration fields are refused when the row is read.
+        let mut value = serde_json::to_value(declared(Some(7), None, reason)).unwrap();
+        value["expected_guest_exit"]["note"] = "x".into();
+        assert!(serde_json::from_value::<ResultRow>(value).is_err());
+    }
+
+    #[test]
+    fn series_audit_must_carry_exactly_the_declaration_and_its_identity() {
+        let reason = "the fixture guest fails on purpose";
+        let row = declared(Some(7), None, reason);
+        let identity = row.evidence_identity().unwrap();
+        let audit = |code, signal, reason: &str, digest: &str| SeriesDeclaredGuestExit {
+            code,
+            signal,
+            reason: reason.into(),
+            evidence_sha256: digest.into(),
+            attempts: Vec::new(),
+        };
+        assert!(declared_guest_exit_matches(
+            &row,
+            &identity,
+            Some(&audit(Some(7), None, reason, &identity))
+        ));
+        assert!(declared_guest_exit_matches(&ordinary(), ORDINARY, None));
+        for (label, series) in [
+            ("missing audit", None),
+            ("other code", Some(audit(Some(3), None, reason, &identity))),
+            (
+                "signal instead",
+                Some(audit(None, Some(7), reason, &identity)),
+            ),
+            (
+                "other reason",
+                Some(audit(Some(7), None, "other", &identity)),
+            ),
+            (
+                "undeclared identity",
+                Some(audit(Some(7), None, reason, ORDINARY)),
+            ),
+        ] {
+            assert!(
+                !declared_guest_exit_matches(&row, &identity, series.as_ref()),
+                "{label} was accepted"
+            );
+        }
+        assert!(!declared_guest_exit_matches(
+            &ordinary(),
+            ORDINARY,
+            Some(&audit(Some(7), None, reason, ORDINARY))
+        ));
     }
 
     #[test]

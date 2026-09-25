@@ -14,8 +14,10 @@ use crate::canonical_verdict::Verdict;
 pub use crate::host_capability::CapabilityVerdict as HostCapabilityVerdict;
 pub use crate::host_capability::HostCapabilities;
 pub use crate::host_capability::HostCapability;
+use crate::runner::ExpectedGuestExit;
 use crate::runner::FailureClass;
 use crate::runner::ObservedResult;
+use crate::runner::validate_expected_guest_exit;
 
 pub const STRESS_SERIES_SCHEMA_V1: &str = "stress-series/v1";
 pub const STRESS_SERIES_SCHEMA_V2: &str = "stress-series/v2";
@@ -216,6 +218,35 @@ pub struct SeriesNoVerdictEvidence {
 pub struct SeriesPressureEvidence {
     pub evidence_sha256: String,
     pub attempts: Vec<SeriesPressureAttempt>,
+}
+
+/// The manifest declaration under which a verify cell may pass although its
+/// guest ended with one exact nonzero code or signal.
+///
+/// A matched attempt with a nonzero guest exit is otherwise refused, so the
+/// declaration is an authorization rather than commentary. The writer binds
+/// the complete checked declaration into the source row's evidence identity:
+/// removing or changing it changes `evidence_sha256`. The attempts retain the
+/// process dispositions a later reader needs to audit why the row passed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDeclaredGuestExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub reason: String,
+    pub evidence_sha256: String,
+    pub attempts: Vec<SeriesDeclaredGuestExitAttempt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesDeclaredGuestExitAttempt {
+    pub index: String,
+    pub outcome: String,
+    pub status: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub verification_report_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -420,6 +451,10 @@ pub struct SeriesPayload {
     /// cannot establish a clean first attempt for sample promotion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure_evidence: Option<SeriesPressureEvidence>,
+    /// Present on every row written from a verify cell that declares an
+    /// expected nonzero guest exit. Rows without a declaration omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_guest_exit: Option<SeriesDeclaredGuestExit>,
     pub run_index: u64,
     #[serde(default)]
     pub attempt: Option<u64>,
@@ -658,6 +693,123 @@ impl SeriesRow {
         }
         if let Some(evidence) = &self.series.pressure_evidence {
             self.validate_pressure_evidence(evidence)?;
+        }
+        if let Some(declared) = &self.series.declared_guest_exit {
+            self.validate_declared_guest_exit(declared)?;
+        }
+        Ok(())
+    }
+
+    fn validate_declared_guest_exit(
+        &self,
+        declared: &SeriesDeclaredGuestExit,
+    ) -> Result<(), String> {
+        if self.schema != SeriesSchema::V3 {
+            return Err("declared_guest_exit is supported only by stress-series/v3".into());
+        }
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        let expected = ExpectedGuestExit {
+            code: declared.code,
+            signal: declared.signal,
+            reason: declared.reason.clone(),
+        };
+        validate_expected_guest_exit("declared_guest_exit", mode, Some(&expected))?;
+        if !is_sha256(&declared.evidence_sha256) {
+            return Err(format!(
+                "declared_guest_exit.evidence_sha256 must be lowercase 64-hex, got {:?}",
+                declared.evidence_sha256
+            ));
+        }
+        // The evidence identity names one outer attempt, so the row must too;
+        // a collapsed row would attach one attempt's audit to several.
+        let attempt = self
+            .series
+            .attempt
+            .ok_or("declared_guest_exit requires an explicit outer attempt")?;
+        if self.series.num_runs != 1 || self.series.last_run_index.is_some() {
+            return Err("declared_guest_exit must identify one uncollapsed outer attempt".into());
+        }
+        if self.producer == SeriesProducer::Validate && attempt != self.series.run_index {
+            return Err("validate declared_guest_exit outer attempt must equal run_index".into());
+        }
+        for (name, other) in [
+            (
+                "no_verdict_evidence",
+                self.series
+                    .no_verdict_evidence
+                    .as_ref()
+                    .map(|evidence| &evidence.evidence_sha256),
+            ),
+            (
+                "pressure_evidence",
+                self.series
+                    .pressure_evidence
+                    .as_ref()
+                    .map(|evidence| &evidence.evidence_sha256),
+            ),
+        ] {
+            if other.is_some_and(|sha| sha != &declared.evidence_sha256) {
+                return Err(format!(
+                    "declared_guest_exit and {name} name different source evidence"
+                ));
+            }
+        }
+        if declared.attempts.is_empty() {
+            return Err("declared_guest_exit.attempts must be nonempty".into());
+        }
+        let mut indices = std::collections::BTreeSet::new();
+        let mut declared_passes = 0;
+        for attempt in &declared.attempts {
+            if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
+                return Err(
+                    "declared_guest_exit attempt indices must be nonempty and unique".into(),
+                );
+            }
+            if attempt.outcome.trim().is_empty() {
+                return Err("declared_guest_exit attempt outcome must be nonempty".into());
+            }
+            if attempt.status.is_some_and(|status| status < 0)
+                || attempt.signal.is_some_and(|signal| signal <= 0)
+                || (attempt.status.is_some() && attempt.signal.is_some())
+            {
+                return Err("declared_guest_exit attempt status/signal is invalid".into());
+            }
+            if attempt
+                .verification_report_sha256
+                .as_ref()
+                .is_some_and(|sha| !is_sha256(sha))
+            {
+                return Err(
+                    "declared_guest_exit verification_report_sha256 must be lowercase 64-hex"
+                        .into(),
+                );
+            }
+            // The runner passes a declared attempt only when Hermit's status,
+            // the report and both compared outputs show the declaration. The
+            // report was checked before this row was written; Hermit's status
+            // is retained here so a reader can see what was admitted.
+            if attempt.outcome == "PASS" {
+                if attempt.timed_out
+                    || attempt.verification_report_sha256.is_none()
+                    || !expected.hermit_status_matches(attempt.status, attempt.signal)
+                {
+                    return Err(format!(
+                        "declared_guest_exit attempt {} passed without Hermit reporting the declared {}",
+                        attempt.index,
+                        match (declared.code, declared.signal) {
+                            (Some(code), _) => format!("exit code {code}"),
+                            (_, signal) => format!("signal {}", signal.unwrap_or_default()),
+                        }
+                    ));
+                }
+                declared_passes += 1;
+            }
+        }
+        if self.series.outcome == SeriesOutcome::Passed && declared_passes == 0 {
+            return Err(
+                "a passed declared_guest_exit row has no attempt that passed under the declaration"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -1180,6 +1332,7 @@ mod tests {
                 failure_class: None,
                 no_verdict_evidence: None,
                 pressure_evidence: None,
+                declared_guest_exit: None,
                 run_index: 1,
                 attempt: None,
                 num_runs: 1,
@@ -1234,6 +1387,185 @@ mod tests {
             }],
         });
         fixture
+    }
+
+    fn declared_exit_row(
+        code: Option<i32>,
+        signal: Option<i32>,
+        status: Option<i32>,
+        observed_signal: Option<i32>,
+    ) -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        fixture.series.attempt = Some(1);
+        fixture.series.declared_guest_exit = Some(SeriesDeclaredGuestExit {
+            code,
+            signal,
+            reason: "the fixture guest fails on purpose".into(),
+            evidence_sha256: "b".repeat(64),
+            attempts: vec![SeriesDeclaredGuestExitAttempt {
+                index: "1".into(),
+                outcome: "PASS".into(),
+                status,
+                signal: observed_signal,
+                timed_out: false,
+                verification_report_sha256: Some("c".repeat(64)),
+            }],
+        });
+        fixture
+    }
+
+    #[test]
+    fn declared_guest_exit_admits_each_declared_disposition() {
+        for (label, fixture) in [
+            ("exit 7", declared_exit_row(Some(7), None, Some(7), None)),
+            (
+                "signal 11",
+                declared_exit_row(None, Some(11), None, Some(11)),
+            ),
+            (
+                "signal 11 as 139",
+                declared_exit_row(None, Some(11), Some(139), None),
+            ),
+        ] {
+            fixture
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let encoded = serde_json::to_string(&fixture).unwrap();
+            let decoded: SeriesRow = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                decoded.series.declared_guest_exit,
+                fixture.series.declared_guest_exit
+            );
+            decoded.validate_for_read().unwrap();
+        }
+        // Rows without a declaration are unchanged on the wire.
+        let plain = serde_json::to_string(&row(SeriesSchema::V3)).unwrap();
+        assert!(!plain.contains("declared_guest_exit"));
+    }
+
+    fn declared(fixture: &mut SeriesRow) -> &mut SeriesDeclaredGuestExit {
+        fixture.series.declared_guest_exit.as_mut().unwrap()
+    }
+
+    #[test]
+    fn declared_guest_exit_refuses_unauditable_or_contradicted_admission() {
+        let base = || declared_exit_row(Some(7), None, Some(7), None);
+        let mut cases: Vec<(&str, SeriesRow, &str)> = Vec::new();
+        let mut other = base();
+        declared(&mut other).attempts[0].status = Some(3);
+        cases.push((
+            "hermit status disagrees",
+            other,
+            "without Hermit reporting the declared exit code 7",
+        ));
+        let mut other = declared_exit_row(None, Some(6), None, Some(11));
+        other.series.attempt = Some(1);
+        cases.push(("hermit signal disagrees", other, "declared signal 6"));
+        let mut other = base();
+        declared(&mut other).attempts[0].status = Some(0);
+        cases.push(("guest succeeded", other, "without Hermit reporting"));
+        let mut other = base();
+        declared(&mut other).attempts[0].verification_report_sha256 = None;
+        cases.push(("no report", other, "without Hermit reporting"));
+        let mut other = base();
+        declared(&mut other).attempts[0].timed_out = true;
+        cases.push(("timed out", other, "without Hermit reporting"));
+        let mut other = base();
+        declared(&mut other).attempts[0].outcome = "FAIL".into();
+        cases.push((
+            "no declared pass",
+            other,
+            "no attempt that passed under the declaration",
+        ));
+        let mut other = base();
+        declared(&mut other).attempts.clear();
+        cases.push(("no attempts", other, "attempts must be nonempty"));
+        let mut other = base();
+        declared(&mut other).code = Some(0);
+        cases.push(("code 0", other, "code must be a nonzero exit status"));
+        let mut other = base();
+        declared(&mut other).signal = Some(11);
+        cases.push(("code and signal", other, "exactly one of code or signal"));
+        let mut other = base();
+        declared(&mut other).code = None;
+        cases.push(("neither", other, "exactly one of code or signal"));
+        let mut other = declared_exit_row(None, Some(65), None, Some(65));
+        other.series.attempt = Some(1);
+        cases.push(("signal 65", other, "signal must be a signal number"));
+        let mut other = base();
+        declared(&mut other).reason = " ".into();
+        cases.push(("blank reason", other, "reason must be substantive"));
+        let mut other = base();
+        declared(&mut other).evidence_sha256 = "B".repeat(64);
+        cases.push((
+            "bad evidence digest",
+            other,
+            "evidence_sha256 must be lowercase 64-hex",
+        ));
+        let mut other = base();
+        other.series.cell = "fixture/test/chaos/ptrace".into();
+        cases.push(("chaos mode", other, "supported only by verify mode"));
+        let mut other = base();
+        other.series.attempt = None;
+        cases.push((
+            "no outer attempt",
+            other,
+            "requires an explicit outer attempt",
+        ));
+        let mut other = base();
+        other.series.num_runs = 2;
+        other.series.last_run_index = Some(2);
+        cases.push(("collapsed", other, "one uncollapsed outer attempt"));
+        let mut other = base();
+        other.series.attempt = Some(2);
+        cases.push((
+            "attempt differs from run_index",
+            other,
+            "must equal run_index",
+        ));
+        let mut other = base();
+        declared(&mut other)
+            .attempts
+            .push(declared(&mut base()).attempts[0].clone());
+        cases.push(("duplicate index", other, "nonempty and unique"));
+        let mut other = base();
+        other.series.outcome = SeriesOutcome::NoResult;
+        other.series.result = None;
+        other.series.failure_class = Some(FailureClass::NoResult);
+        other.series.no_verdict_evidence = no_verdict_row().series.no_verdict_evidence;
+        other
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .evidence_sha256 = "d".repeat(64);
+        cases.push((
+            "different source evidence",
+            other,
+            "name different source evidence",
+        ));
+        for (label, fixture, message) in cases {
+            let error = fixture
+                .validate_for_write()
+                .expect_err(&format!("{label} was accepted"));
+            assert!(error.contains(message), "{label}: {error}");
+            let error = fixture
+                .validate_for_read()
+                .expect_err(&format!("{label} was readable"));
+            assert!(error.contains(message), "{label}: {error}");
+        }
+        // A retained v2 row cannot carry the v3-only audit either.
+        let mut v2 = base();
+        v2.schema = SeriesSchema::V2;
+        let error = v2.validate_for_read().unwrap_err();
+        assert!(
+            error.contains("supported only by stress-series/v3"),
+            "{error}"
+        );
+        // Unknown audit fields are refused rather than ignored.
+        let mut encoded = serde_json::to_value(base()).unwrap();
+        encoded["series"]["declared_guest_exit"]["note"] = "x".into();
+        assert!(serde_json::from_value::<SeriesRow>(encoded).is_err());
     }
 
     #[test]
