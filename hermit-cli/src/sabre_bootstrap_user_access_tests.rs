@@ -103,27 +103,32 @@ fn actual_bootstrap_adapter_faults_keep_prefix_and_attempted_prng_cursor() {
         let pages = Pages::new();
         pages.protect_tail();
         let mut actual = root_prng(17);
-        let result = getrandom(
+        let mut records = Vec::new();
+        let result = getrandom_deferred(
             &mut actual,
             RemoteMemory(Pid::this()),
-            detcore::types::DetTid::from_raw(1),
             call(pages.at(PAGE), len),
+            &mut records,
         );
         assert!(matches!(result, Err(reverie::Error::Errno(Errno::EFAULT))));
         assert_eq!(random_response(result).unwrap(), -i64::from(libc::EFAULT));
         assert!(pages.bytes().iter().all(|b| *b == 0xa5));
         same_cursor(&actual, &oracle(&[len]).0);
+        // A failed request owes the log no record, as on the ptrace path.
+        assert_eq!(records, Vec::new());
     }
     let pages = Pages::new();
     pages.protect_tail();
     let mut actual = root_prng(17);
-    let result = getrandom(
+    let mut records = Vec::new();
+    let result = getrandom_deferred(
         &mut actual,
         RemoteMemory(Pid::this()),
-        detcore::types::DetTid::from_raw(1),
         call(pages.at(0), PAGE + 8),
+        &mut records,
     );
     assert_eq!(random_response(result).unwrap(), PAGE as i64);
+    assert_eq!(records.len(), usize::from(cfg!(debug_assertions)));
     let (expected, bytes) = oracle(&[PAGE, 8]);
     assert_eq!(&pages.bytes()[..PAGE], &bytes[..PAGE]);
     assert!(pages.bytes()[PAGE..].iter().all(|b| *b == 0xa5));
@@ -192,13 +197,15 @@ fn bootstrap_bridge_keeps_typed_error_after_real_partial_and_full_effects() {
             calls: Vec::new(),
         };
         let mut actual = root_prng(17);
-        let error = getrandom(
+        let mut records = Vec::new();
+        let error = getrandom_deferred(
             &mut actual,
             &mut memory,
-            detcore::types::DetTid::from_raw(1),
             call(pages.at(0), len),
+            &mut records,
         )
         .unwrap_err();
+        assert_eq!(records, Vec::new());
         let reverie::Error::Tool(inner) = &error else {
             panic!("fatal copy became guest result: {error:?}")
         };

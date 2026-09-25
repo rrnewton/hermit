@@ -13,12 +13,13 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
 use std::io::Read;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 /// Private env var carrying the coordinator's configuration and clock RPC fingerprint.
@@ -39,7 +40,9 @@ use reverie_syscalls::Sysno;
 // TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 
-/// Private opt-in for forwarding injected-process Detcore INFO events.
+/// Private opt-in for forwarding injected-process Detcore events. The value is
+/// the most verbose level to forward, as [`detcore::detlog::ForwardedLevel`]
+/// parses it; the coordinator filters the forwarded records again by target.
 pub const DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -56,52 +59,97 @@ fn coordinator_socket() -> Option<PathBuf> {
     remember_coordinator_socket(&RPC_SOCKET, requested.as_deref())
 }
 
-struct RawStderr;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW: Review SaBRe Detcore record capture and forwarding.
+//
+// Detcore's local tool runs inside the guest here, so its records cannot reach
+// the run's log directly. They are captured on this stack and sent to the
+// coordinator ahead of the next global request (`detcore::tool_global`), which
+// logs them where the ptrace backend's in-coordinator local tool would already
+// have logged them.
+//
+// The stack is lock-free and uses no thread-local state: records are emitted
+// from signal handlers and from libc's final exit_group, which can run after
+// Rust TLS destruction has begun. Each record carries its process and a global
+// sequence number. After a fork the child holds a copy of its parent's pending
+// records, which the parent sends; after a CLONE_VM clone both processes push
+// to one stack. A process therefore sends only its own records, puts the rest
+// back, and restores their order by sequence number.
+struct CapturedRecord {
+    pid: libc::pid_t,
+    sequence: u64,
+    record: detcore::detlog::ForwardedRecord,
+    next: *mut CapturedRecord,
+}
 
-impl Write for RawStderr {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            let written = unsafe {
-                libc::write(
-                    libc::STDERR_FILENO,
-                    bytes.as_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                )
-            };
-            if written >= 0 {
-                return Ok(written as usize);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+static CAPTURED: AtomicPtr<CapturedRecord> = AtomicPtr::new(std::ptr::null_mut());
+static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn push_captured(node: *mut CapturedRecord) {
+    let mut head = CAPTURED.load(Ordering::Relaxed);
+    loop {
+        // SAFETY: `node` is exclusively owned until the exchange publishes it.
+        unsafe { (*node).next = head };
+        match CAPTURED.compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(current) => head = current,
         }
     }
+}
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+fn capture_record(record: detcore::detlog::ForwardedRecord) {
+    capture_for(unsafe { libc::getpid() }, record)
+}
+
+fn capture_for(pid: libc::pid_t, record: detcore::detlog::ForwardedRecord) {
+    push_captured(Box::into_raw(Box::new(CapturedRecord {
+        pid,
+        sequence: CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        record,
+        next: std::ptr::null_mut(),
+    })));
+}
+
+fn take_captured_records() -> Vec<detcore::detlog::ForwardedRecord> {
+    take_captured_for(unsafe { libc::getpid() })
+}
+
+fn take_captured_for(pid: libc::pid_t) -> Vec<detcore::detlog::ForwardedRecord> {
+    let mut node = CAPTURED.swap(std::ptr::null_mut(), Ordering::Acquire);
+    let mut own = Vec::new();
+    let mut foreign = Vec::new();
+    while !node.is_null() {
+        // SAFETY: the swap detached this list; every node came from
+        // Box::into_raw in capture_record and is visited once.
+        let current = unsafe { Box::from_raw(node) };
+        node = current.next;
+        if current.pid == pid {
+            own.push(current);
+        } else {
+            foreign.push(current);
+        }
     }
+    // Re-push foreign records in any order: their owner sorts by sequence
+    // number when it takes them.
+    for record in foreign {
+        push_captured(Box::into_raw(record));
+    }
+    own.sort_unstable_by_key(|record| record.sequence);
+    own.into_iter().map(|record| record.record).collect()
 }
 
-fn forward_detlog(record_suffix: &str, message: std::fmt::Arguments<'_>) {
-    let mut stderr = RawStderr;
-    let _ = stderr.write_all(b"INFO detcore: DETLOG ");
-    let _ = stderr.write_fmt(message);
-    let _ = stderr.write_all(record_suffix.as_bytes());
-    let _ = stderr.write_all(b"\n");
-}
-
-fn init_detlog_forwarder() {
+fn init_record_capture() {
     // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
-    let requested = unsafe { sabre::take_private_env(DETLOG_FORWARD_ENV) };
-    if requested.as_deref() != Some(OsStr::new("1")) {
+    let Some(requested) = (unsafe { sabre::take_private_env(DETLOG_FORWARD_ENV) }) else {
         return;
-    }
-
-    // Stderr is protected by reverie-sabre and is captured separately during
-    // verification. A direct sink avoids tracing's thread-local dispatcher:
-    // libc may issue its final exit_group after Rust TLS destruction begins.
-    let _ = detcore::detlog::set_forwarder(forward_detlog);
+    };
+    let level = requested
+        .to_str()
+        .ok_or_else(|| format!("{DETLOG_FORWARD_ENV} is not Unicode"))
+        .and_then(str::parse::<detcore::detlog::ForwardedLevel>)
+        .unwrap_or_else(|error| panic!("{DETLOG_FORWARD_ENV}: {error}"));
+    detcore::detlog::install_capture(level, capture_record, take_captured_records)
+        .unwrap_or_else(|error| panic!("{DETLOG_FORWARD_ENV}: {error}"));
 }
 
 fn remember_coordinator_socket(
@@ -311,7 +359,7 @@ impl Plugin {
     }
 
     fn connect() -> Self {
-        init_detlog_forwarder();
+        init_record_capture();
         Self::check_coordinator_compatibility();
         let socket = coordinator_socket().unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
 
@@ -534,6 +582,59 @@ mod tests {
     use std::ffi::CStr;
 
     use super::*;
+
+    fn forwarded(fields: &str) -> detcore::detlog::ForwardedRecord {
+        detcore::detlog::ForwardedRecord {
+            level: detcore::detlog::ForwardedLevel::Info,
+            target: "detcore::random".to_owned(),
+            fields: fields.to_owned(),
+        }
+    }
+
+    fn fields(records: Vec<detcore::detlog::ForwardedRecord>) -> Vec<String> {
+        records.into_iter().map(|record| record.fields).collect()
+    }
+
+    // The only test that touches the process-wide capture stack, so nothing
+    // else pushes or drains it concurrently. The pids are not real processes.
+    #[test]
+    fn a_process_takes_only_its_own_captured_records_in_capture_order() {
+        let (parent, child) = (-7, -8);
+        capture_for(parent, forwarded("parent 1"));
+        capture_for(child, forwarded("child 1"));
+        capture_for(parent, forwarded("parent 2"));
+        capture_for(child, forwarded("child 2"));
+
+        // A forked child holds a copy of its parent's pending records, and a
+        // CLONE_VM child shares them. Neither may send or drop them.
+        assert_eq!(fields(take_captured_for(child)), ["child 1", "child 2"]);
+        capture_for(parent, forwarded("parent 3"));
+        assert_eq!(
+            fields(take_captured_for(parent)),
+            ["parent 1", "parent 2", "parent 3"]
+        );
+        assert!(take_captured_for(parent).is_empty());
+        assert!(take_captured_for(child).is_empty());
+
+        // Records put back behind a concurrent push are ordered by capture.
+        for (sequence, text) in [
+            (1_000_002, "late"),
+            (1_000_000, "early"),
+            (1_000_001, "middle"),
+        ] {
+            push_captured(Box::into_raw(Box::new(CapturedRecord {
+                pid: parent,
+                sequence,
+                record: forwarded(text),
+                next: std::ptr::null_mut(),
+            })));
+        }
+        assert_eq!(
+            fields(take_captured_for(parent)),
+            ["early", "middle", "late"]
+        );
+        assert!(CAPTURED.load(Ordering::Acquire).is_null());
+    }
 
     #[test]
     fn initial_generation_accepts_raw_worker_comm_and_rejects_invalid_identity() {

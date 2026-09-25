@@ -104,31 +104,324 @@ pub fn record_suffix(event: DetLogEvent) -> String {
     format!("{RECORD_SEPARATOR}{encoded}")
 }
 
-/// A process-local sink for deterministic INFO records.
-pub type DetlogForwarder = for<'a> fn(&str, fmt::Arguments<'a>);
+/// Severity of a [`ForwardedRecord`], mirroring [`tracing::Level`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForwardedLevel {
+    /// [`tracing::Level::ERROR`]
+    Error,
+    /// [`tracing::Level::WARN`]
+    Warn,
+    /// [`tracing::Level::INFO`]
+    Info,
+    /// [`tracing::Level::DEBUG`]
+    Debug,
+    /// [`tracing::Level::TRACE`]
+    Trace,
+}
 
-static FORWARDER: OnceLock<DetlogForwarder> = OnceLock::new();
+impl From<tracing::Level> for ForwardedLevel {
+    fn from(level: tracing::Level) -> Self {
+        match level {
+            tracing::Level::ERROR => Self::Error,
+            tracing::Level::WARN => Self::Warn,
+            tracing::Level::INFO => Self::Info,
+            tracing::Level::DEBUG => Self::Debug,
+            tracing::Level::TRACE => Self::Trace,
+        }
+    }
+}
 
-/// Installs a process-local sink for deterministic INFO records.
+impl From<ForwardedLevel> for tracing::Level {
+    fn from(level: ForwardedLevel) -> Self {
+        match level {
+            ForwardedLevel::Error => Self::ERROR,
+            ForwardedLevel::Warn => Self::WARN,
+            ForwardedLevel::Info => Self::INFO,
+            ForwardedLevel::Debug => Self::DEBUG,
+            ForwardedLevel::Trace => Self::TRACE,
+        }
+    }
+}
+
+impl ForwardedLevel {
+    /// Every level, most verbose first.
+    pub const ALL: [Self; 5] = [
+        Self::Trace,
+        Self::Debug,
+        Self::Info,
+        Self::Warn,
+        Self::Error,
+    ];
+
+    /// The lowercase name [`str::parse`] accepts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+impl std::str::FromStr for ForwardedLevel {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str() == name)
+            .ok_or_else(|| format!("{name:?} is not a Detcore record level"))
+    }
+}
+
+/// One Detcore tracing event captured in a process that cannot reach the
+/// run's log, for the coordinator to log at the point the guest reaches it.
 ///
-/// Backends whose tool runs in another process can use this to transport the
-/// same records that are normally observed through the coordinator's tracing
-/// subscriber. Only the first sink installed in a process is retained.
-pub fn set_forwarder(forwarder: DetlogForwarder) -> Result<(), DetlogForwarder> {
-    FORWARDER.set(forwarder)
+/// A backend whose local tool runs inside the guest (SaBRe) sends these ahead
+/// of each global request. The coordinator then logs them before handling that
+/// request, which is where an in-coordinator local tool (ptrace) would already
+/// have logged them. Target and level are kept so the logged record is the one
+/// the local tool emitted, not a relabelled copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedRecord {
+    /// Severity of the original event.
+    pub level: ForwardedLevel,
+    /// Target of the original event, e.g. `detcore::random`.
+    pub target: String,
+    /// The event's fields, rendered as tracing-subscriber's default formatter
+    /// renders them. ANSI sanitization is left to the logging subscriber.
+    pub fields: String,
 }
 
-/// Returns whether a process-local deterministic-record sink is installed.
-#[doc(hidden)]
-pub fn forwarding_enabled() -> bool {
-    FORWARDER.get().is_some()
+/// Whether `target` belongs to Detcore's log envelope.
+pub fn is_detcore_target(target: &str) -> bool {
+    target == "detcore" || target.starts_with("detcore::")
 }
 
-/// Emits one deterministic record through tracing and the process-local sink.
-#[doc(hidden)]
-pub fn emit_forwarded(record_suffix: &str, message: fmt::Arguments<'_>) {
-    tracing::info!("DETLOG {}{}", message, record_suffix);
-    FORWARDER.get().expect("forwarder disappeared")(record_suffix, message);
+/// Renders event fields exactly as tracing-subscriber 0.3's `DefaultFields`
+/// does with ANSI styling off, except for its message sanitization. The
+/// subscriber that logs the forwarded record sanitizes the whole rendered
+/// text, which reproduces the stock output unless a non-message field's
+/// `Debug` output contains a raw terminal control character.
+///
+/// Events bridged from the `log` crate, the only ones carrying `log.` fields,
+/// have the target `log` and are never captured, so no such field arrives here.
+struct FieldRenderer<'a> {
+    out: &'a mut String,
+}
+
+impl FieldRenderer<'_> {
+    fn pad(&mut self) {
+        if !self.out.is_empty() {
+            self.out.push(' ');
+        }
+    }
+}
+
+impl tracing::field::Visit for FieldRenderer<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.record_debug(field, &format_args!("{value}"))
+        } else {
+            self.record_debug(field, &value)
+        }
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        if let Some(source) = value.source() {
+            struct Sources<'a>(&'a (dyn std::error::Error + 'static));
+            impl fmt::Display for Sources<'_> {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    let mut list = f.debug_list();
+                    let mut current = Some(self.0);
+                    while let Some(error) = current {
+                        list.entry(&format_args!("{error}"));
+                        current = error.source();
+                    }
+                    list.finish()
+                }
+            }
+            self.record_debug(
+                field,
+                &format_args!("{} {}.sources={}", value, field.name(), Sources(source)),
+            )
+        } else {
+            self.record_debug(field, &format_args!("{value}"))
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        use std::fmt::Write as _;
+        let name = field.name();
+        self.pad();
+        let _ = match name {
+            "message" => write!(self.out, "{value:?}"),
+            name => write!(
+                self.out,
+                "{}={value:?}",
+                name.strip_prefix("r#").unwrap_or(name)
+            ),
+        };
+    }
+}
+
+/// Render one event's fields for a [`ForwardedRecord`].
+pub fn render_fields(event: &tracing::Event<'_>) -> String {
+    let mut out = String::new();
+    event.record(&mut FieldRenderer { out: &mut out });
+    out
+}
+
+/// A global subscriber that captures Detcore events instead of logging them.
+///
+/// It keeps no thread-local state and takes no lock, so a record emitted from
+/// a signal handler or after Rust TLS destruction has begun is still captured,
+/// provided it is installed as the global default and no scoped dispatcher is
+/// ever set in the process. Spans are not tracked.
+pub struct RecordCapture {
+    max_level: tracing::Level,
+    push: fn(ForwardedRecord),
+}
+
+impl RecordCapture {
+    /// Capture Detcore events at `max_level` and more severe into `push`.
+    pub fn new(max_level: tracing::Level, push: fn(ForwardedRecord)) -> Self {
+        Self { max_level, push }
+    }
+
+    fn captures(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= self.max_level && is_detcore_target(metadata.target())
+    }
+}
+
+impl tracing::Subscriber for RecordCapture {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if self.captures(metadata) {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        self.captures(metadata)
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::from_level(
+            self.max_level,
+        ))
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let metadata = event.metadata();
+        (self.push)(ForwardedRecord {
+            level: (*metadata.level()).into(),
+            target: metadata.target().to_owned(),
+            fields: render_fields(event),
+        });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Drains the records this process captured, oldest first.
+pub type RecordSource = fn() -> Vec<ForwardedRecord>;
+
+/// Logs one record received from another process.
+pub type RecordSink = fn(&ForwardedRecord);
+
+static SOURCE: OnceLock<RecordSource> = OnceLock::new();
+static SINK: OnceLock<RecordSink> = OnceLock::new();
+
+/// Capture this process's Detcore events for the coordinator's log.
+///
+/// Installs [`RecordCapture`] as the global subscriber and registers `take` as
+/// the source that global requests drain before they are sent. Fails if either
+/// is already installed; a capture that silently lost records would make the
+/// log look complete when it is not.
+pub fn install_capture(
+    max_level: ForwardedLevel,
+    push: fn(ForwardedRecord),
+    take: RecordSource,
+) -> Result<(), String> {
+    SOURCE
+        .set(take)
+        .map_err(|_| "a Detcore record source is already installed".to_owned())?;
+    tracing::subscriber::set_global_default(RecordCapture::new(max_level.into(), push))
+        .map_err(|error| format!("cannot install the Detcore record capture: {error}"))
+}
+
+/// Install `take` as this test binary's record source. Every caller must pass
+/// the same function, since the source cannot be replaced.
+#[cfg(test)]
+pub(crate) fn install_test_source(take: RecordSource) {
+    assert!(std::ptr::fn_addr_eq(*SOURCE.get_or_init(|| take), take));
+}
+
+/// Install `sink` as this test binary's record sink, as above.
+#[cfg(test)]
+pub(crate) fn install_test_sink(sink: RecordSink) {
+    assert!(std::ptr::fn_addr_eq(*SINK.get_or_init(|| sink), sink));
+}
+
+/// Records captured since the previous call, oldest first; empty unless
+/// [`install_capture`] ran in this process.
+pub(crate) fn take_records() -> Vec<ForwardedRecord> {
+    SOURCE.get().map_or_else(Vec::new, |take| take())
+}
+
+/// Registers how the coordinator logs records received from guest processes.
+/// Only the first sink installed in a process is retained.
+pub fn set_record_sink(sink: RecordSink) -> Result<(), RecordSink> {
+    SINK.set(sink)
+}
+
+/// Log a record received from another process through the registered sink.
+///
+/// Without a sink the record is still logged, under the `detcore::forwarded`
+/// target with its original target as a field, rather than dropped.
+pub fn emit_record(record: &ForwardedRecord) {
+    if let Some(sink) = SINK.get() {
+        return sink(record);
+    }
+    let (origin, fields) = (&record.target, &record.fields);
+    match tracing::Level::from(record.level) {
+        tracing::Level::ERROR => {
+            tracing::error!(target: "detcore::forwarded", origin = %origin, "{fields}")
+        }
+        tracing::Level::WARN => {
+            tracing::warn!(target: "detcore::forwarded", origin = %origin, "{fields}")
+        }
+        tracing::Level::INFO => {
+            tracing::info!(target: "detcore::forwarded", origin = %origin, "{fields}")
+        }
+        tracing::Level::DEBUG => {
+            tracing::debug!(target: "detcore::forwarded", origin = %origin, "{fields}")
+        }
+        tracing::Level::TRACE => {
+            tracing::trace!(target: "detcore::forwarded", origin = %origin, "{fields}")
+        }
+    }
 }
 
 /// Macro used to encapsulate tracing should-be-deterministic information.
@@ -136,13 +429,9 @@ pub fn emit_forwarded(record_suffix: &str, message: fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! detlog {
     (event = $event:expr; $($arg:tt)+) => {{
-        if $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO) {
+        if ::tracing::enabled!(::tracing::Level::INFO) {
             let record_suffix = $crate::detlog::record_suffix($event);
-            if $crate::detlog::forwarding_enabled() {
-                $crate::detlog::emit_forwarded(&record_suffix, format_args!($($arg)+));
-            } else {
-                ::tracing::info!("DETLOG {}{}", format_args!($($arg)+), record_suffix);
-            }
+            ::tracing::info!("DETLOG {}{}", format_args!($($arg)+), record_suffix);
         }
     }};
     ($($arg:tt)+) => {{
@@ -154,8 +443,7 @@ macro_rules! detlog {
 ///
 /// WHY THIS IS NEEDED, and why it is a macro rather than a function.
 ///
-/// `detlog!` routes to the process-local forwarder when one is installed and to
-/// `tracing::info!` otherwise. `tracing` does not evaluate a macro's value
+/// `detlog!` emits through `tracing::info!`. `tracing` does not evaluate a macro's value
 /// expressions when the level is disabled, so work done *inside* a `detlog!`
 /// argument is already free when nothing observes the record. Work done
 /// *before* the macro is not, and callers that must prepare something expensive
@@ -172,7 +460,7 @@ macro_rules! detlog {
 #[macro_export]
 macro_rules! detlog_observed {
     () => {
-        $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO)
+        ::tracing::enabled!(::tracing::Level::INFO)
     };
 }
 
