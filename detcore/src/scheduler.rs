@@ -3201,7 +3201,8 @@ impl Scheduler {
         // directed `kill` lets the kernel pick another thread. So step2c
         // takes whatever reports have arrived when it looks, and step2d may
         // advance virtual time to another thread's timer first. Signals from
-        // other guests share this limit.
+        // other guests share this limit. Tracked in
+        // https://github.com/rrnewton/hermit/issues/3222.
         if external_io_blocker
             || (self.backend_reports_physical_process_exits && rt_sigsuspend_wait.is_some())
         {
