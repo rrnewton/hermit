@@ -1807,6 +1807,9 @@ fn validate_release_candidate_version(
             "release metadata differs from current package/Hermit/Reverie provenance".to_owned(),
         );
     }
+    // Hash the bytes that are about to run, and require the same bytes after
+    // the probe, so the receipt names the executable whose version was read.
+    let candidate_sha256 = sha256(&candidate)?;
     // Deliberately omit --foreground: GNU timeout then owns a separate process
     // group and applies TERM/KILL to the bounded CLI-only process tree.
     let output = Command::new("timeout")
@@ -1823,6 +1826,9 @@ fn validate_release_candidate_version(
     }
     if !output.stderr.is_empty() {
         return Err("bounded release version probe emitted unexpected stderr".to_owned());
+    }
+    if sha256(&candidate)? != candidate_sha256 {
+        return Err("release candidate changed while its version was probed".to_owned());
     }
     write_new_file(
         version_json,
@@ -1843,7 +1849,7 @@ fn validate_release_candidate_version(
     let receipt_text = format!(
         "candidate_validation_schema\thermit-buck-release-candidate/v1\ncandidate\t{}\ncandidate_sha256\t{}\nversion\t{}\nbuild_date\t{}\nhermit_sha\t{}\nreverie_sha\t{}\nfeatures\tdbt,e9patch,sabre\nversion_probe_timeout_seconds\t10\n",
         candidate.display(),
-        sha256(&candidate)?,
+        candidate_sha256,
         version,
         build_date,
         hermit_sha,
@@ -8618,7 +8624,7 @@ mod tests {
             &root.join("candidate-validation.tsv"),
         )
         .unwrap();
-        fs::copy("/bin/true", &candidate).unwrap();
+        write_executable(&candidate, &fs::read("/bin/true").unwrap());
         assert!(
             validate_release_candidate_version(
                 &show_output,
@@ -8629,6 +8635,41 @@ mod tests {
             )
             .is_err()
         );
+        // A candidate that prints the right version but is not the file that
+        // was hashed before it ran must not be receipted: this one replaces
+        // its own path with another executable while it runs.
+        let replacement = root.join("replacement");
+        write_executable(&replacement, &fs::read("/bin/true").unwrap());
+        let rewriting = root.join("rewriting.c");
+        fs::write(
+            &rewriting,
+            format!(
+                "#include <stdio.h>\nint main(int argc, char **argv) {{ (void)argc; if (rename(\"{}\", argv[0]) != 0) return 1; puts(\"{{\\\"schema\\\":1,\\\"version\\\":\\\"0.2.0\\\",\\\"build_date\\\":\\\"2026-09-23\\\",\\\"git_sha\\\":\\\"{hermit_sha}\\\",\\\"features\\\":{{\\\"dbt\\\":true,\\\"e9patch\\\":true,\\\"sabre\\\":true}}}}\"); return 0; }}\n",
+                replacement.display()
+            ),
+        )
+        .unwrap();
+        checked_output(
+            Command::new("gcc").args([
+                rewriting.as_os_str(),
+                OsStr::new("-o"),
+                candidate.as_os_str(),
+            ]),
+            "compile rewriting release candidate fixture",
+        )
+        .unwrap();
+        let receipt = root.join("rewritten-validation.tsv");
+        assert_eq!(
+            validate_release_candidate_version(
+                &show_output,
+                &metadata,
+                &root,
+                &root.join("rewritten-version.json"),
+                &receipt,
+            ),
+            Err("release candidate changed while its version was probed".to_owned())
+        );
+        assert!(!receipt.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9544,6 +9585,27 @@ esac
             "{extra_failure}"
         );
         fs::remove_file(extra_runtime).unwrap();
+        // An empty directory is outside the closure too.
+        let extra_directory = complete_install
+            .join(UNWIND_RUNTIME_RELATIVE)
+            .join("extra.d");
+        fs::create_dir(&extra_directory).unwrap();
+        let extra_directory_failure = checked_output(
+            Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
+                candidate.as_os_str(),
+                root.join("extra-directory-artifacts").as_os_str(),
+                root.join("ignored/buck2-phase2/extra-directory.path")
+                    .as_os_str(),
+                complete_install.as_os_str(),
+            ]),
+            "refuse an extra Buck runtime directory",
+        )
+        .unwrap_err();
+        assert!(
+            extra_directory_failure.contains("outside the exact unwind closure"),
+            "{extra_directory_failure}"
+        );
+        fs::remove_dir(extra_directory).unwrap();
         let fake_bin = root.join("fake-readelf-bin");
         fs::create_dir(&fake_bin).unwrap();
         write_executable(&fake_bin.join("readelf"), b"#!/bin/sh\nexit 1\n");
