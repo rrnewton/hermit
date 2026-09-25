@@ -102,6 +102,8 @@ use crate::timeouts::LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
 #[cfg(test)]
 use crate::timeouts::NON_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 use crate::timeouts::TimeoutMultipliers;
 use crate::timeouts::resolve_test_timeouts;
@@ -272,6 +274,122 @@ pub struct ModeRecipe {
     pub cpu_timeout_seconds: BTreeMap<String, u64>,
     #[serde(default)]
     pub slow_reason: BTreeMap<String, String>,
+    pub expected_guest_exit: Option<ExpectedGuestExit>,
+}
+
+/// The one nonzero guest disposition a verify cell requires.
+///
+/// Hermit's default `--verify` policy rejects a first run that does not exit
+/// 0, so a guest that fails on purpose never reaches a comparison. Naming the
+/// exact status here runs the cell with `--verify-allow=failure` and then
+/// requires the report's guest disposition AND Hermit's own process status to
+/// match it, so a different code, a different signal, or a success all fail.
+///
+/// Hermit reports a guest's signal death either by dying from the same signal
+/// or, where it cannot re-raise it, by exiting `128 + signo`; both are the
+/// same disposition, and the report's `guest_signal` pins which signal it was.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedGuestExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub reason: String,
+}
+
+impl ExpectedGuestExit {
+    /// Whether Hermit's own process status reports this guest disposition.
+    fn hermit_status_matches(&self, code: Option<i32>, signal: Option<i32>) -> bool {
+        match (self.code, self.signal) {
+            (Some(expected), None) => code == Some(expected) && signal.is_none(),
+            (None, Some(expected)) => {
+                (code.is_none() && signal == Some(expected))
+                    || (code == Some(128 + expected) && signal.is_none())
+            }
+            _ => false,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match (self.code, self.signal) {
+            (Some(code), None) => format!("exit code {code}"),
+            (None, Some(signal)) => format!("signal {signal}"),
+            _ => "an invalid expectation".into(),
+        }
+    }
+
+    /// Check the completed comparison's guest disposition and Hermit's status.
+    fn check(
+        &self,
+        guest_exit_code: Option<i32>,
+        guest_signal: Option<i32>,
+        hermit_code: Option<i32>,
+        hermit_signal: Option<i32>,
+    ) -> Result<(), String> {
+        let observed = match (guest_exit_code, guest_signal) {
+            (Some(code), None) => format!("exit code {code}"),
+            (None, Some(signal)) => format!("signal {signal}"),
+            (None, None) => "no guest disposition".into(),
+            (Some(code), Some(signal)) => format!("exit code {code} and signal {signal}"),
+        };
+        if guest_exit_code != self.code || guest_signal != self.signal {
+            return Err(format!(
+                "guest ended with {observed}, but the manifest expects {}",
+                self.describe()
+            ));
+        }
+        if !self.hermit_status_matches(hermit_code, hermit_signal) {
+            let hermit = match (hermit_code, hermit_signal) {
+                (Some(code), _) => format!("exited with status {code}"),
+                (None, Some(signal)) => format!("was killed by signal {signal}"),
+                (None, None) => "reported no status".into(),
+            };
+            return Err(format!(
+                "guest ended with {observed}, but hermit {hermit}, which does not report {}",
+                self.describe()
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_expected_guest_exit(
+    id: &str,
+    mode: &str,
+    expected: Option<&ExpectedGuestExit>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if mode != "verify" {
+        return Err(format!(
+            "{id}: expected_guest_exit is supported only by verify mode"
+        ));
+    }
+    match (expected.code, expected.signal) {
+        (Some(code), None) if (1..=255).contains(&code) => {}
+        (Some(code), None) => {
+            return Err(format!(
+                "{id}: verify expected_guest_exit.code must be a nonzero exit status in 1..=255, not {code}"
+            ));
+        }
+        (None, Some(signal)) if (1..=64).contains(&signal) => {}
+        (None, Some(signal)) => {
+            return Err(format!(
+                "{id}: verify expected_guest_exit.signal must be a signal number in 1..=64, not {signal}"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "{id}: verify expected_guest_exit must name exactly one of code or signal"
+            ));
+        }
+    }
+    if expected.reason.trim().is_empty() {
+        return Err(format!(
+            "{id}: verify expected_guest_exit.reason must be substantive"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -929,6 +1047,7 @@ fn validate_mode_with_cpu(
             "{id}: rcb_time_disabled_reason must be substantive"
         ));
     }
+    validate_expected_guest_exit(id, mode, recipe.expected_guest_exit.as_ref())?;
     Ok(())
 }
 
@@ -1003,6 +1122,8 @@ pub struct CellRunSpec {
     pub verification_log_dir: Option<PathBuf>,
     pub sabre_path_evidence: Option<PathBuf>,
     pub cell_dir: PathBuf,
+    /// The exact nonzero guest disposition this attempt requires, if any.
+    pub expected_guest_exit: Option<ExpectedGuestExit>,
     #[serde(skip)]
     attempt: String,
     #[serde(skip)]
@@ -2227,8 +2348,13 @@ pub fn build_spec(
             if mode_recipe.rcb_time == Some(false) {
                 argv.push("--no-rcb-time".into());
             }
+            argv.push("--verify".into());
+            if mode_recipe.expected_guest_exit.is_some() {
+                // The exact disposition is enforced on the report after the
+                // comparison; this only lets a failing first run be compared.
+                argv.push("--verify-allow=failure".into());
+            }
             argv.extend([
-                "--verify".into(),
                 "--verify-json".into(),
                 verdict.to_string_lossy().into_owned(),
             ]);
@@ -2370,6 +2496,9 @@ pub fn build_spec(
         verification_log_dir,
         sabre_path_evidence,
         cell_dir: dir,
+        expected_guest_exit: (cell.id.mode == "verify")
+            .then(|| mode_recipe.expected_guest_exit.clone())
+            .flatten(),
         attempt: attempt.into(),
         fixed_workdir_source,
     })
@@ -2739,13 +2868,36 @@ fn execute_spec_until(
                         } else if let Err(error) = report.require_canonical_match() {
                             outcome = "FAIL".into();
                             reason = Some(error);
+                        } else if let Some(expected) = spec
+                            .expected_guest_exit
+                            .as_ref()
+                            .filter(|_| output.timeout.is_none())
+                        {
+                            // A matched comparison of the wrong disposition is
+                            // still a failure: the cell names one exact status.
+                            match expected.check(
+                                report.guest_exit_code,
+                                report.guest_signal,
+                                output.status.code(),
+                                std::os::unix::process::ExitStatusExt::signal(&output.status),
+                            ) {
+                                Ok(()) => {
+                                    outcome = "PASS".into();
+                                    reason = None;
+                                }
+                                Err(error) => {
+                                    outcome = "FAIL".into();
+                                    reason = Some(error);
+                                }
+                            }
                         } else if output.timeout.is_none()
                             && (output.status.success() || spec.id.mode == "chaos")
                         {
                             // Chaos deliberately admits a reproduced nonzero
                             // guest class. Verify and replay still require the
-                            // Hermit process itself to succeed, and no receipt
-                            // may erase a timeout.
+                            // Hermit process itself to succeed unless a verify
+                            // cell names its exact expected guest exit above,
+                            // and no receipt may erase a timeout.
                             outcome = "PASS".into();
                             reason = None;
                         } else if reason.is_none() {
@@ -6312,6 +6464,7 @@ mod tests {
                 + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
+                + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
@@ -6458,6 +6611,7 @@ mod tests {
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: root.clone(),
+            expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
         };
@@ -7170,6 +7324,7 @@ mod tests {
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: root.join(label),
+            expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
         }
@@ -7837,6 +7992,7 @@ int main(int argc, char **argv) {
             verification_log_dir: Some(logs),
             sabre_path_evidence: None,
             cell_dir: root.join("cell"),
+            expected_guest_exit: None,
             attempt: attempt.into(),
             fixed_workdir_source: root.join(format!("workdir/{attempt}")),
         };
@@ -8801,6 +8957,53 @@ backends_disabled:
             validate_mode("fixture/test", "verify", &missing_reason, 15)
                 .unwrap_err()
                 .contains("requires compare_io_buffers_disabled_reason")
+        );
+
+        assert!(
+            !spec
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--verify-allow"))
+        );
+        assert_eq!(spec.expected_guest_exit, None);
+        let mut expecting = cell.clone();
+        expecting
+            .test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .expected_guest_exit = Some(ExpectedGuestExit {
+            code: Some(7),
+            signal: None,
+            reason: "the fixture guest fails on purpose".into(),
+        });
+        let expecting_spec = build_spec(
+            &context,
+            &expecting,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            expecting.timeout_seconds,
+        )
+        .unwrap();
+        let separator = expecting_spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap();
+        let allow = expecting_spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--verify-allow=failure")
+            .unwrap();
+        assert!(allow < separator);
+        assert_eq!(
+            expecting_spec
+                .expected_guest_exit
+                .as_ref()
+                .and_then(|e| e.code),
+            Some(7)
         );
 
         let mut missing_rcb_reason = recipe(true).modes.remove("verify").unwrap();
@@ -10338,6 +10541,7 @@ esac
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
+            expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
         };
@@ -10382,6 +10586,7 @@ esac
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
+            expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
         };
@@ -10719,6 +10924,316 @@ esac
         assert_eq!(chaos.status, Some(7));
     }
 
+    fn expected_exit(code: Option<i32>, signal: Option<i32>) -> ExpectedGuestExit {
+        ExpectedGuestExit {
+            code,
+            signal,
+            reason: "the fixture guest fails on purpose".into(),
+        }
+    }
+
+    /// Run a fake Hermit that writes a matched canonical report carrying the
+    /// given guest disposition, then ends with `ending` (a shell statement).
+    fn attempt_with_expected_exit(
+        expected: ExpectedGuestExit,
+        guest_exit_code: Option<i32>,
+        guest_signal: Option<i32>,
+        ending: &str,
+    ) -> AttemptResult {
+        attempt_with_expected_exit_report(
+            expected,
+            expected_exit_report(guest_exit_code, guest_signal),
+            ending,
+            5,
+        )
+    }
+
+    /// A matched canonical report carrying the given guest disposition.
+    fn expected_exit_report(
+        guest_exit_code: Option<i32>,
+        guest_signal: Option<i32>,
+    ) -> VerificationReport {
+        let mut report = canonical_verification_report();
+        report.guest_exit_code = guest_exit_code;
+        report.guest_signal = guest_signal;
+        let outputs = report.compared_outputs.as_mut().unwrap();
+        for output in [&mut outputs.left, &mut outputs.right] {
+            output.exit_code = guest_exit_code;
+            output.signal = guest_signal;
+        }
+        report
+    }
+
+    /// Run a fake Hermit that writes `report`, then ends with `ending`, under
+    /// a wall backstop of `timeout_seconds`.
+    fn attempt_with_expected_exit_report(
+        expected: ExpectedGuestExit,
+        report: VerificationReport,
+        ending: &str,
+        timeout_seconds: u64,
+    ) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-expected-exit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/expected-exit".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf %s \"$1\" > \"$2\"; {ending}"),
+                "sh".into(),
+                serde_json::to_string(&report).unwrap(),
+                verdict.to_string_lossy().into_owned(),
+            ],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds,
+            verdict_path: Some(verdict),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: dir.clone(),
+            expected_guest_exit: Some(expected),
+            attempt: "1".into(),
+            fixed_workdir_source: dir.join("workdir/1"),
+        };
+        let result = execute_spec(&spec).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn expected_guest_exit_passes_only_the_exact_disposition() {
+        let exact =
+            attempt_with_expected_exit(expected_exit(Some(7), None), Some(7), None, "exit 7");
+        assert_eq!(exact.outcome, "PASS", "{:?}", exact.reason);
+
+        let other_code =
+            attempt_with_expected_exit(expected_exit(Some(7), None), Some(6), None, "exit 6");
+        assert_eq!(
+            other_code.outcome, "FAIL",
+            "{:?} {:?}",
+            other_code.error_kind, other_code.reason
+        );
+        assert_eq!(
+            other_code.reason.as_deref(),
+            Some("guest ended with exit code 6, but the manifest expects exit code 7")
+        );
+
+        // The report and Hermit's own status must agree; a report alone is
+        // not enough to call the attempt a pass.
+        let hermit_disagrees =
+            attempt_with_expected_exit(expected_exit(Some(7), None), Some(7), None, "exit 0");
+        assert_eq!(hermit_disagrees.outcome, "FAIL");
+        assert_eq!(
+            hermit_disagrees.reason.as_deref(),
+            Some(
+                "guest ended with exit code 7, but hermit exited with status 0, which does not report exit code 7"
+            )
+        );
+
+        // Fixtures that make the fake Hermit die by a signal use signals that
+        // never dump core. A core-dumping signal hands the dump to the host's
+        // core_pattern helper, which ignores RLIMIT_CORE when it is a pipe and
+        // took from 0.5 to over 5 seconds on a loaded host, past this
+        // fixture's 5-second backstop.
+        let raised = attempt_with_expected_exit(
+            expected_exit(None, Some(15)),
+            None,
+            Some(15),
+            "kill -TERM $$",
+        );
+        assert_eq!(raised.outcome, "PASS", "{:?}", raised.reason);
+        assert_eq!(raised.signal, Some(15));
+
+        let shell_status =
+            attempt_with_expected_exit(expected_exit(None, Some(11)), None, Some(11), "exit 139");
+        assert_eq!(shell_status.outcome, "PASS", "{:?}", shell_status.reason);
+
+        // An exit code of 139 is not a SIGSEGV death, even though Hermit's
+        // process status is the same number.
+        let code_not_signal =
+            attempt_with_expected_exit(expected_exit(None, Some(11)), Some(139), None, "exit 139");
+        assert_eq!(code_not_signal.outcome, "FAIL");
+        assert_eq!(
+            code_not_signal.reason.as_deref(),
+            Some("guest ended with exit code 139, but the manifest expects signal 11")
+        );
+
+        let other_signal = attempt_with_expected_exit(
+            expected_exit(None, Some(15)),
+            None,
+            Some(10),
+            "kill -USR1 $$",
+        );
+        assert_eq!(other_signal.outcome, "FAIL");
+        assert_eq!(
+            other_signal.reason.as_deref(),
+            Some("guest ended with signal 10, but the manifest expects signal 15")
+        );
+
+        // A matching signal in the report is not enough when Hermit's own
+        // status reports a success, a different signal, or 128 plus a
+        // different signal number.
+        for (ending, hermit) in [
+            ("exit 0", "exited with status 0"),
+            ("kill -USR1 $$", "was killed by signal 10"),
+            ("exit 138", "exited with status 138"),
+        ] {
+            let hermit_disagrees =
+                attempt_with_expected_exit(expected_exit(None, Some(15)), None, Some(15), ending);
+            assert_eq!(hermit_disagrees.outcome, "FAIL", "{ending}");
+            assert_eq!(
+                hermit_disagrees.reason,
+                Some(format!(
+                    "guest ended with signal 15, but hermit {hermit}, which does not report signal 15"
+                )),
+                "{ending}"
+            );
+        }
+
+        let succeeded =
+            attempt_with_expected_exit(expected_exit(Some(1), None), Some(0), None, "exit 0");
+        assert_eq!(succeeded.outcome, "FAIL");
+
+        // A matching exit code in the report is not enough when Hermit itself
+        // was killed by a signal.
+        let hermit_killed = attempt_with_expected_exit(
+            expected_exit(Some(7), None),
+            Some(7),
+            None,
+            "kill -TERM $$",
+        );
+        assert_eq!(hermit_killed.outcome, "FAIL");
+        assert_eq!(
+            hermit_killed.reason.as_deref(),
+            Some(
+                "guest ended with exit code 7, but hermit was killed by signal 15, which does not report exit code 7"
+            )
+        );
+    }
+
+    /// The expected disposition is checked only after the comparison has been
+    /// admitted as canonical and matched. Each report below carries exactly
+    /// the expected exit and Hermit exits with it, so only the canonical
+    /// checks stand between the attempt and a pass.
+    #[test]
+    fn expected_guest_exit_cannot_pass_a_diverged_or_noncanonical_comparison() {
+        let mut diverged = expected_exit_report(Some(7), None);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_scheduler_turn = Some(4);
+        diverged.first_divergent_virtual_nanoseconds = Some(7);
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_syscall = Some(2);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        let result =
+            attempt_with_expected_exit_report(expected_exit(Some(7), None), diverged, "exit 7", 5);
+        assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(
+                "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+            )
+        );
+
+        let mut stripped = expected_exit_report(Some(7), None);
+        stripped.comparison.as_mut().unwrap().strictness =
+            crate::canonical_verdict::LogCompareStrictness::Stripped;
+        let result =
+            attempt_with_expected_exit_report(expected_exit(Some(7), None), stripped, "exit 7", 5);
+        assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+        assert_eq!(
+            result.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(
+                "verification did not compare canonical non-vacuous INFO evidence: strictness=stripped compare_logs=true record_envelope=all_records_v1 messages=1/1"
+            )
+        );
+    }
+
+    /// An attempt stopped by the wall backstop is never a pass, even when it
+    /// left a matched canonical report of the expected exit and Hermit, on the
+    /// backstop's SIGTERM, still exited with that code.
+    #[test]
+    fn expected_guest_exit_cannot_pass_a_timed_out_attempt() {
+        let result = attempt_with_expected_exit_report(
+            expected_exit(Some(7), None),
+            expected_exit_report(Some(7), None),
+            "trap 'exit 7' TERM; sleep 30 & wait",
+            1,
+        );
+        assert!(result.timed_out, "{result:?}");
+        assert_eq!(result.status, Some(7), "{result:?}");
+        assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
+        assert_eq!(result.error_kind.as_deref(), Some("wall-timeout"));
+    }
+
+    #[test]
+    fn expected_guest_exit_validation_requires_one_exact_nonzero_disposition() {
+        let check = |mode: &str, expected: ExpectedGuestExit| {
+            validate_expected_guest_exit("fixture/test", mode, Some(&expected))
+        };
+        check("verify", expected_exit(Some(7), None)).unwrap();
+        check("verify", expected_exit(None, Some(11))).unwrap();
+        validate_expected_guest_exit("fixture/test", "verify", None).unwrap();
+
+        for (expected, message) in [
+            (
+                expected_exit(Some(0), None),
+                "code must be a nonzero exit status",
+            ),
+            (
+                expected_exit(Some(256), None),
+                "code must be a nonzero exit status",
+            ),
+            (
+                expected_exit(None, Some(0)),
+                "signal must be a signal number",
+            ),
+            (
+                expected_exit(None, Some(65)),
+                "signal must be a signal number",
+            ),
+            (
+                expected_exit(Some(7), Some(11)),
+                "exactly one of code or signal",
+            ),
+            (expected_exit(None, None), "exactly one of code or signal"),
+        ] {
+            let error = check("verify", expected).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+        let mut blank = expected_exit(Some(7), None);
+        blank.reason = "  ".into();
+        assert!(
+            check("verify", blank)
+                .unwrap_err()
+                .contains("reason must be substantive")
+        );
+        assert!(
+            check("chaos", expected_exit(Some(7), None))
+                .unwrap_err()
+                .contains("supported only by verify mode")
+        );
+    }
+
     #[test]
     fn chaos_assertion_does_not_relabel_an_incomplete_population_as_a_product_failure() {
         let mut outcome = "ERROR".to_string();
@@ -10795,6 +11310,7 @@ esac
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
+            expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
         };

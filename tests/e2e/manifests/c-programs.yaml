@@ -4211,7 +4211,7 @@ test:
     modes:
       verify:
         ci:
-          ptrace: false
+          ptrace: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -4219,8 +4219,9 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
+        expected_guest_exit:
+          signal: 11
+          reason: The guest deliberately races a thread that clears a pointer against a write through it; under Hermit's deterministic schedule the write always loses and the guest dies with SIGSEGV.
       naked:
         ci: false
         backends_enabled: []
@@ -7481,7 +7482,7 @@ test:
     modes:
       verify:
         ci:
-          ptrace: false
+          ptrace: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -7489,8 +7490,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []

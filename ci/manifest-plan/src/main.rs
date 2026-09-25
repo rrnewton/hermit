@@ -24,9 +24,11 @@ use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
 use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
 use hermit_manifest_plan::cli_help::is_help_flag;
+use hermit_manifest_plan::runner::ExpectedGuestExit;
 #[cfg(test)]
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
 use hermit_manifest_plan::runner::requires_capability;
+use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::runner::validate_mode_workdir;
 #[cfg(test)]
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
@@ -1251,6 +1253,7 @@ fn validate_mode_with_cpu(
             "compare_io_buffers_disabled_reason",
             "rcb_time",
             "rcb_time_disabled_reason",
+            "expected_guest_exit",
         ]),
         _ => {}
     }
@@ -1321,6 +1324,12 @@ fn validate_mode_with_cpu(
             )),
             (None | Some(true), None) => {}
         }
+        let expected_guest_exit: Option<ExpectedGuestExit> =
+            spec.get("expected_guest_exit").map(|value| {
+                parse_schema_value(value, &format!("{id}: modes.verify.expected_guest_exit"))
+            });
+        validate_expected_guest_exit(id, mode, expected_guest_exit.as_ref())
+            .unwrap_or_else(|error| die(error));
     }
     let ci_spec: CiSelectionSpec = parse_schema_value(
         spec.get("ci")
@@ -1901,6 +1910,67 @@ liteinst = "unsupported"
             "bucket",
             "portable",
             "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected_guest_exit.code must be a nonzero exit status")]
+    fn rejects_expected_guest_exit_of_success() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[expected_guest_exit]
+code = 0
+reason = "a zero status is the default expectation, not an exception"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket/test.modes.chaos: unknown keys: [\"expected_guest_exit\"]")]
+    fn rejects_expected_guest_exit_outside_verify() {
+        let spec = parse_mode(
+            r#"
+ci = false
+backends_enabled = []
+
+[expected_guest_exit]
+code = 7
+reason = "the fixture guest fails on purpose"
+
+[backends_disabled]
+ptrace = "unsupported"
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "chaos",
             90,
             &spec,
             &mut Vec::new(),

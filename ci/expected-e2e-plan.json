@@ -5972,6 +5972,34 @@
         "cpuid-faulting"
       ],
       "test": "backend-parity-c/cpuid-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/nanosleep-threads-simple"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/resource-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "shared-futex-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "shared-futex-c/qemu-hello"
+    },
+    {
+      "backend": "ptrace",
+      "category": "util-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "util-c/pmu-skid"
     }
   ],
   "schema": 1

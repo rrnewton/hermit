@@ -4359,6 +4359,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/netlink-autobind-generic",
           "mode": "verify",
           "backend": "kvm"
@@ -5230,6 +5237,13 @@
           "test": "c-programs/request-key-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/resource-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -6982,6 +6996,13 @@
       },
       "result_manifests": [
         {
+          "lane": "portable",
+          "category": "shared-futex-c",
+          "test": "shared-futex-c/qemu-hello",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -7546,6 +7567,13 @@
         "category": "util-c"
       },
       "result_manifests": [
+        {
+          "lane": "portable",
+          "category": "util-c",
+          "test": "util-c/pmu-skid",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
         {
           "kind": "structured-test-results",
           "schema": 2,
@@ -10480,6 +10508,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/netlink-autobind-generic",
           "mode": "verify",
           "backend": "ptrace"
@@ -10824,6 +10859,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/request-key-enosys",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/resource-determinism",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -11473,6 +11515,13 @@
         },
         {
           "lane": "portable",
+          "category": "shared-futex-c",
+          "test": "shared-futex-c/qemu-hello",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/auxv-loader-dump",
           "mode": "verify",
@@ -11699,6 +11748,13 @@
           "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/uuidgen-random",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "util-c",
+          "test": "util-c/pmu-skid",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -17711,6 +17767,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-simple",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/netlink-autobind-generic",
           "mode": "verify",
           "backend": "kvm"
@@ -18582,6 +18645,13 @@
           "test": "c-programs/request-key-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/resource-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -20292,6 +20362,13 @@
       },
       "result_manifests": [
         {
+          "lane": "portable",
+          "category": "shared-futex-c",
+          "test": "shared-futex-c/qemu-hello",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -20844,6 +20921,13 @@
         "category": "util-c"
       },
       "result_manifests": [
+        {
+          "lane": "portable",
+          "category": "util-c",
+          "test": "util-c/pmu-skid",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
         {
           "kind": "structured-test-results",
           "schema": 2,
