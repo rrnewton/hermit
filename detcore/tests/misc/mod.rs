@@ -9,6 +9,7 @@
 //! misc syscall tests
 
 mod notification_fds;
+mod readdir_order;
 mod vfork;
 
 use std::io::Read;

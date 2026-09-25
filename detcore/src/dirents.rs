@@ -8,13 +8,18 @@
 
 //! Linux dirent64 helpers
 
+#[cfg(test)]
 use std::cmp::Ordering;
+#[cfg(test)]
 use std::ptr;
 
+#[cfg(test)]
 use libc::strlen;
+use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Dirent64<'a> {
     pub(crate) ino: u64,
@@ -29,6 +34,7 @@ pub struct Dirent64<'a> {
 }
 
 // sort by name, but "." < ".." <= ..
+#[cfg(test)]
 #[allow(clippy::non_canonical_partial_ord_impl)]
 impl<'a> PartialOrd for Dirent64<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -46,12 +52,14 @@ impl<'a> PartialOrd for Dirent64<'a> {
     }
 }
 
+#[cfg(test)]
 impl<'a> Ord for Dirent64<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cmp(other).unwrap()
     }
 }
 
+#[cfg(test)]
 pub unsafe fn deserialize_dirents64(bytes: &[u8]) -> Vec<Dirent64<'_>> {
     unsafe {
         let mut res = Vec::new();
@@ -86,6 +94,7 @@ pub unsafe fn deserialize_dirents64(bytes: &[u8]) -> Vec<Dirent64<'_>> {
     }
 }
 
+#[cfg(test)]
 pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
     unsafe {
         let nb = bytes.len();
@@ -120,6 +129,7 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
     }
 }
 
+#[cfg(test)]
 pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64<'_>> {
     unsafe {
         let mut res = Vec::new();
@@ -154,6 +164,7 @@ pub unsafe fn deserialize_dirents(bytes: &[u8]) -> Vec<Dirent64<'_>> {
     }
 }
 
+#[cfg(test)]
 pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
     unsafe {
         let nb = bytes.len();
@@ -182,6 +193,195 @@ pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
             i += 1;
         }
         dents.len()
+    }
+}
+
+/// The two Linux directory-entry layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirentFormat {
+    /// `struct linux_dirent64`, returned by `getdents64`: `d_type` precedes
+    /// the name.
+    Dirent64,
+    /// `struct linux_dirent`, returned by the legacy `getdents`: `d_type` is
+    /// the last byte of the record.
+    Legacy,
+}
+
+impl DirentFormat {
+    /// Offset of `d_name` within a record.
+    fn name_offset(self) -> usize {
+        match self {
+            // d_ino (8), d_off (8), d_reclen (2), d_type (1)
+            Self::Dirent64 => 19,
+            // d_ino (8), d_off (8), d_reclen (2)
+            Self::Legacy => 18,
+        }
+    }
+
+    /// The record length Linux uses for a name of `name_len` bytes:
+    /// `fs/readdir.c` rounds the name, its NUL and (for the legacy layout) the
+    /// trailing `d_type` byte up to a multiple of `sizeof(long)`.
+    pub(crate) fn record_len(self, name_len: usize) -> usize {
+        let trailer = match self {
+            Self::Dirent64 => 1,
+            Self::Legacy => 2,
+        };
+        (self.name_offset() + name_len + trailer + 7) & !7
+    }
+
+    /// Decode a buffer of records exactly as the kernel wrote it.
+    pub(crate) fn parse(self, bytes: &[u8]) -> Result<Vec<DirEntry>, Errno> {
+        let mut entries = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let record = &bytes[at..];
+            if record.len() < self.name_offset() {
+                return Err(Errno::EIO);
+            }
+            let ino = u64::from_ne_bytes(record[0..8].try_into().unwrap());
+            let reclen = usize::from(u16::from_ne_bytes(record[16..18].try_into().unwrap()));
+            if reclen <= self.name_offset() || reclen > record.len() {
+                return Err(Errno::EIO);
+            }
+            let (name_field, ty) = match self {
+                Self::Dirent64 => (&record[self.name_offset()..reclen], record[18]),
+                Self::Legacy => (&record[self.name_offset()..reclen - 1], record[reclen - 1]),
+            };
+            let name_len = name_field
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or(Errno::EIO)?;
+            entries.push(DirEntry {
+                name: name_field[..name_len].to_vec(),
+                ino,
+                ty,
+            });
+            at += reclen;
+        }
+        Ok(entries)
+    }
+
+    /// Append one record to `out`, zero-filling the padding.
+    pub(crate) fn encode(self, entry: &DirEntry, ino: u64, off: i64, out: &mut Vec<u8>) {
+        let reclen = self.record_len(entry.name.len());
+        let start = out.len();
+        out.resize(start + reclen, 0);
+        let record = &mut out[start..];
+        record[0..8].copy_from_slice(&ino.to_ne_bytes());
+        record[8..16].copy_from_slice(&off.to_ne_bytes());
+        record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        let name_offset = self.name_offset();
+        record[name_offset..name_offset + entry.name.len()].copy_from_slice(&entry.name);
+        match self {
+            Self::Dirent64 => record[18] = entry.ty,
+            Self::Legacy => record[reclen - 1] = entry.ty,
+        }
+    }
+}
+
+/// One directory entry as the host reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DirEntry {
+    /// The name, without its NUL terminator.
+    pub(crate) name: Vec<u8>,
+    /// The raw host inode, determinized only when the entry is returned.
+    pub(crate) ino: u64,
+    /// `d_type`.
+    pub(crate) ty: u8,
+}
+
+/// Sort `.` first, `..` second, then by name bytes. Names within one
+/// directory are unique, so this is a total order on a directory's entries.
+pub(crate) fn sort_dir_entries(entries: &mut [DirEntry]) {
+    fn rank(name: &[u8]) -> u8 {
+        match name {
+            b"." => 0,
+            b".." => 1,
+            _ => 2,
+        }
+    }
+    entries.sort_by(|a, b| {
+        rank(&a.name)
+            .cmp(&rank(&b.name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// The guest-visible directory stream of one open file description.
+///
+/// Linux returns entries in an order and with `d_off` cookies that depend on
+/// the filesystem's on-disk layout (for ext4, a hash of each name seeded per
+/// filesystem), so neither is reproducible across hosts. Detcore instead reads
+/// the whole directory on the first `getdents` call, sorts it, and serves every
+/// later call from that snapshot. The stream position is the index of the next
+/// entry, and each entry's `d_off` is the position after it, which is what
+/// `telldir` returns and `seekdir` hands back to `lseek`.
+///
+/// Like the kernel's file position, the stream is shared by every descriptor
+/// that aliases the open file description through `dup` or `fork`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct DirectoryStream {
+    /// Sorted entries, or `None` when the next `getdents` must take a fresh
+    /// snapshot. POSIX makes `rewinddir` refresh the stream, so a seek to
+    /// position 0 drops the snapshot.
+    entries: Option<Vec<DirEntry>>,
+    /// Index of the next entry to return.
+    position: u64,
+}
+
+impl DirectoryStream {
+    pub(crate) fn needs_snapshot(&self) -> bool {
+        self.entries.is_none()
+    }
+
+    pub(crate) fn install(&mut self, entries: Vec<DirEntry>) {
+        self.entries = Some(entries);
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Move the stream position, dropping the snapshot on a rewind to 0.
+    pub(crate) fn seek(&mut self, position: u64) {
+        if position == 0 {
+            self.entries = None;
+        }
+        self.position = position;
+    }
+
+    /// Step past `count` returned entries.
+    pub(crate) fn advance(&mut self, count: usize) {
+        self.position = self.position.saturating_add(count as u64);
+    }
+
+    /// The entries the next call returns: those at the current position that
+    /// fit in `capacity` bytes. An empty result means end of directory; a
+    /// buffer too small for the first remaining entry is `EINVAL`, as on Linux.
+    pub(crate) fn next_batch(
+        &self,
+        format: DirentFormat,
+        capacity: usize,
+    ) -> Result<Vec<DirEntry>, Errno> {
+        let entries = self
+            .entries
+            .as_deref()
+            .expect("directory stream served before its snapshot was taken");
+        let start = usize::try_from(self.position).unwrap_or(usize::MAX);
+        let mut used = 0;
+        let mut batch = Vec::new();
+        for entry in entries.iter().skip(start) {
+            let reclen = format.record_len(entry.name.len());
+            if used + reclen > capacity {
+                break;
+            }
+            used += reclen;
+            batch.push(entry.clone());
+        }
+        if batch.is_empty() && start < entries.len() {
+            return Err(Errno::EINVAL);
+        }
+        Ok(batch)
     }
 }
 
@@ -674,5 +874,175 @@ mod test {
         );
         let res2 = unsafe { deserialize_dirents64(vv.as_slice()) };
         assert_eq!(res.len(), res2.len());
+    }
+
+    /// The host `d_off` of every record in a kernel buffer, in order.
+    fn host_offsets(bytes: &[u8]) -> Vec<i64> {
+        let mut offsets = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            offsets.push(i64::from_ne_bytes(
+                bytes[at + 8..at + 16].try_into().unwrap(),
+            ));
+            at += usize::from(u16::from_ne_bytes(
+                bytes[at + 16..at + 18].try_into().unwrap(),
+            ));
+        }
+        offsets
+    }
+
+    fn assert_parse_encode_reproduces_kernel_bytes(format: DirentFormat, bytes: &[u8]) {
+        let entries = format.parse(bytes).unwrap();
+        let legacy = match format {
+            DirentFormat::Dirent64 => unsafe { deserialize_dirents64(bytes) },
+            DirentFormat::Legacy => unsafe { deserialize_dirents(bytes) },
+        };
+        assert_eq!(entries.len(), legacy.len());
+        for (entry, old) in entries.iter().zip(&legacy) {
+            let name_len = old.name.iter().position(|&byte| byte == 0).unwrap();
+            assert_eq!(entry.name, &old.name[..name_len]);
+            assert_eq!(entry.ino, old.ino);
+            assert_eq!(entry.ty, old.ty);
+            assert_eq!(format.record_len(entry.name.len()), usize::from(old.reclen));
+        }
+
+        let mut encoded = Vec::new();
+        for (entry, off) in entries.iter().zip(host_offsets(bytes)) {
+            format.encode(entry, entry.ino, off, &mut encoded);
+        }
+        assert_eq!(encoded.as_slice(), bytes);
+    }
+
+    #[test]
+    fn dirent64_parse_and_encode_reproduce_kernel_records() {
+        assert_parse_encode_reproduces_kernel_bytes(DirentFormat::Dirent64, HOME_DIRENTS64);
+    }
+
+    #[test]
+    fn legacy_dirent_parse_and_encode_reproduce_kernel_records() {
+        assert_parse_encode_reproduces_kernel_bytes(DirentFormat::Legacy, HOME_DIRENTS);
+    }
+
+    #[test]
+    fn record_len_matches_linux_rounding() {
+        // fs/readdir.c: ALIGN(offsetof(d_name) + namlen + 1, 8) for dirent64,
+        // ALIGN(offsetof(d_name) + namlen + 2, 8) for the legacy layout.
+        assert_eq!(DirentFormat::Dirent64.record_len(1), 24);
+        assert_eq!(DirentFormat::Dirent64.record_len(4), 24);
+        assert_eq!(DirentFormat::Dirent64.record_len(5), 32);
+        assert_eq!(DirentFormat::Dirent64.record_len(255), 280);
+        assert_eq!(DirentFormat::Legacy.record_len(3), 24);
+        assert_eq!(DirentFormat::Legacy.record_len(4), 24);
+        assert_eq!(DirentFormat::Legacy.record_len(5), 32);
+        assert_eq!(DirentFormat::Legacy.record_len(255), 280);
+    }
+
+    #[test]
+    fn malformed_records_are_rejected_not_looped_on() {
+        let mut good = Vec::new();
+        let entry = DirEntry {
+            name: b"a".to_vec(),
+            ino: 7,
+            ty: 8,
+        };
+        DirentFormat::Dirent64.encode(&entry, 7, 1, &mut good);
+        for reclen in [0u16, 19, 32] {
+            let mut bad = good.clone();
+            bad[16..18].copy_from_slice(&reclen.to_ne_bytes());
+            assert_eq!(
+                DirentFormat::Dirent64.parse(&bad),
+                Err(Errno::EIO),
+                "reclen {reclen}"
+            );
+        }
+        assert_eq!(DirentFormat::Dirent64.parse(&good[..18]), Err(Errno::EIO));
+        let mut unterminated = good.clone();
+        unterminated[19..24].fill(b'x');
+        assert_eq!(DirentFormat::Dirent64.parse(&unterminated), Err(Errno::EIO));
+    }
+
+    fn entry(name: &str) -> DirEntry {
+        DirEntry {
+            name: name.as_bytes().to_vec(),
+            ino: name.len() as u64,
+            ty: libc::DT_REG,
+        }
+    }
+
+    fn names(entries: &[DirEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| std::str::from_utf8(&entry.name).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn dot_entries_sort_first_then_bytewise() {
+        let mut entries: Vec<_> = ["b", "..", "B", "a", ".", ".a", "-"]
+            .into_iter()
+            .map(entry)
+            .collect();
+        sort_dir_entries(&mut entries);
+        assert_eq!(names(&entries), [".", "..", "-", ".a", "B", "a", "b"]);
+    }
+
+    #[test]
+    fn stream_serves_whole_directory_in_order_across_small_buffers() {
+        let mut stream = DirectoryStream::default();
+        assert!(stream.needs_snapshot());
+        stream.install(["c", "a", "b"].into_iter().map(entry).collect());
+        assert!(!stream.needs_snapshot());
+
+        // Each one-letter dirent64 record is 24 bytes: two fit in 48.
+        let first = stream.next_batch(DirentFormat::Dirent64, 48).unwrap();
+        assert_eq!(names(&first), ["c", "a"]);
+        stream.advance(first.len());
+        assert_eq!(stream.position(), 2);
+        let second = stream.next_batch(DirentFormat::Dirent64, 48).unwrap();
+        assert_eq!(names(&second), ["b"]);
+        stream.advance(second.len());
+        assert!(
+            stream
+                .next_batch(DirentFormat::Dirent64, 48)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stream_rejects_a_buffer_too_small_for_the_next_entry() {
+        let mut stream = DirectoryStream::default();
+        stream.install(vec![entry("a")]);
+        assert_eq!(
+            stream.next_batch(DirentFormat::Dirent64, 23),
+            Err(Errno::EINVAL)
+        );
+        // Nothing was consumed: a large enough buffer still gets the entry.
+        assert_eq!(
+            names(&stream.next_batch(DirentFormat::Dirent64, 24).unwrap()),
+            ["a"]
+        );
+    }
+
+    #[test]
+    fn stream_seek_positions_by_index_and_rewind_refreshes() {
+        let mut stream = DirectoryStream::default();
+        stream.install(["a", "b", "c"].into_iter().map(entry).collect());
+        stream.seek(2);
+        assert!(!stream.needs_snapshot());
+        assert_eq!(
+            names(&stream.next_batch(DirentFormat::Legacy, 1024).unwrap()),
+            ["c"]
+        );
+        stream.seek(99);
+        assert!(
+            stream
+                .next_batch(DirentFormat::Legacy, 1024)
+                .unwrap()
+                .is_empty()
+        );
+        stream.seek(0);
+        assert!(stream.needs_snapshot());
+        assert_eq!(stream.position(), 0);
     }
 }

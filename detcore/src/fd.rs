@@ -21,6 +21,8 @@ use nix::fcntl::OFlag;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::dirents::DirEntry;
+use crate::dirents::DirectoryStream;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::TimerSlackReadPreview;
@@ -131,6 +133,10 @@ struct OpenFileDescription {
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
     procfs: Option<ProcfsFile>,
+    /// Sorted directory stream, created by the first `getdents` call that
+    /// succeeds on this open file description.
+    #[serde(default)]
+    directory: Option<DirectoryStream>,
     /// Logical timestamp of the last packet delivered through this socket.
     socket_receive_timestamp: Option<LogicalTime>,
     /// True when this open file is an `AF_NETLINK`/`NETLINK_SOCK_DIAG` socket,
@@ -218,6 +224,7 @@ impl DetFd {
                 random_device_offset: 0,
                 resource: None,
                 procfs: None,
+                directory: None,
                 socket_receive_timestamp: None,
                 sock_diag: false,
                 netlink_route: false,
@@ -493,6 +500,39 @@ impl DetFd {
             .procfs
             .as_ref()
             .and_then(|procfs| procfs.take_timer_slack_at(value, offset, maximum))
+    }
+
+    /// Whether a `getdents` call has created a directory stream here. Only a
+    /// successful read of the host directory creates one, so this also proves
+    /// the open file is a directory.
+    pub(crate) fn has_directory_stream(&self) -> bool {
+        self.description().directory.is_some()
+    }
+
+    /// Whether the next `getdents` must read the host directory.
+    pub(crate) fn directory_needs_snapshot(&self) -> bool {
+        self.description()
+            .directory
+            .as_ref()
+            .is_none_or(DirectoryStream::needs_snapshot)
+    }
+
+    /// Install a freshly read snapshot, creating the stream at position 0 if
+    /// this is the open file's first `getdents`.
+    pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>) {
+        self.description()
+            .directory
+            .get_or_insert_with(DirectoryStream::default)
+            .install(entries);
+    }
+
+    /// Run `f` on the directory stream shared by every alias of this open file.
+    pub(crate) fn with_directory_stream<R>(&self, f: impl FnOnce(&mut DirectoryStream) -> R) -> R {
+        f(self
+            .description()
+            .directory
+            .as_mut()
+            .expect("directory stream used before its first snapshot"))
     }
 
     /// Return the shared procfs cursor and initialized snapshot length.

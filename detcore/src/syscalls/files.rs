@@ -1682,13 +1682,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
         let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
-        let (fd_type, status_flags, procfs_position, resource) =
+        let (fd_type, status_flags, procfs_position, resource, directory_stream) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.status_flags(),
                     detfd.procfs_position(),
                     detfd.resource(),
+                    detfd.has_directory_stream(),
                 )
             })?;
         if fd_type == FdType::Rng {
@@ -1699,6 +1700,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if timer_slack_binding.is_some() && status_flags & libc::O_PATH != 0 {
             return Err(Errno::EBADF.into());
+        }
+        if directory_stream {
+            // Positions in a sorted directory stream are entry indices (see
+            // `DirectoryStream`), not host cookies, so the kernel position is
+            // left alone. Like tmpfs's `dcache_dir_lseek`, only SEEK_SET and
+            // SEEK_CUR are accepted.
+            let current = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.with_directory_stream(|stream| stream.position())
+            })?;
+            let requested = i128::from(call.offset());
+            let position = match call.whence() {
+                Whence::SEEK_SET => requested,
+                Whence::SEEK_CUR => i128::from(current) + requested,
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            let result = i64::try_from(position)
+                .ok()
+                .filter(|position| *position >= 0)
+                .ok_or(Errno::EINVAL)?;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.with_directory_stream(|stream| stream.seek(result as u64))
+            })?;
+            return Ok(result);
         }
         let Some((current, snapshot_len)) = procfs_position else {
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4188,35 +4212,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !guest.config().virtualize_metadata {
             return Ok(self.record_or_replay(guest, call).await?);
         }
-
-        let dirent = call.dirent().ok_or(Errno::EFAULT)?;
-
-        let nb = self.record_or_replay(guest, call).await?;
-        if nb == 0 {
-            return Ok(0);
-        }
-
-        let mut dents_bytes = vec![0; nb as usize];
-        dents_bytes.reserve_exact(128);
-
-        guest
-            .memory()
-            .read_exact(dirent.cast(), dents_bytes.as_mut_slice())?;
-
-        let mut dents = unsafe { deserialize_dirents(&dents_bytes) };
-        dents.sort();
-        for dent in &mut dents {
-            let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino.as_raw();
-        }
-
-        let mut dents_bytes = vec![0; dents_bytes.len()];
-        let _ = unsafe { serialize_dirents(&dents, &mut dents_bytes) };
-
-        guest
-            .memory()
-            .write_exact(dirent.cast(), dents_bytes.as_slice())?;
-        Ok(nb)
+        let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
+        self.serve_directory_stream(
+            guest,
+            Syscall::from(call),
+            call.fd() as i32,
+            buf,
+            call.count() as usize,
+            DirentFormat::Legacy,
+        )
+        .await
     }
 
     /// getdents64 system call.
@@ -4228,35 +4233,135 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !guest.config().virtualize_metadata {
             return Ok(self.record_or_replay(guest, call).await?);
         }
+        let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
+        self.serve_directory_stream(
+            guest,
+            Syscall::from(call),
+            call.fd() as i32,
+            buf,
+            call.count() as usize,
+            DirentFormat::Dirent64,
+        )
+        .await
+    }
 
-        let dirent = call.dirent().ok_or(Errno::EFAULT)?;
-
-        let nb = self.record_or_replay(guest, call).await?;
-        if nb == 0 {
-            return Ok(0);
+    /// Answer a `getdents` call from the open file's sorted directory stream
+    /// (see [`DirectoryStream`]), reading the host directory first if the
+    /// stream has no snapshot.
+    ///
+    /// Sorting each kernel buffer on its own is not enough: a directory larger
+    /// than one buffer (about a thousand short names for glibc's 32KiB) would
+    /// come back as sorted runs whose boundaries, and the host `d_off` cookies
+    /// inside them, depend on the filesystem's on-disk layout.
+    async fn serve_directory_stream<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        fd: RawFd,
+        buf: AddrMut<'_, u8>,
+        capacity: usize,
+        format: DirentFormat,
+    ) -> Result<i64, Error> {
+        let (known_directory, needs_snapshot) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.has_directory_stream(),
+                detfd.directory_needs_snapshot(),
+            )
+        })?;
+        let mut drained_len = 0;
+        if needs_snapshot {
+            let (entries, len) = self
+                .snapshot_directory(guest, call, fd, buf, format, known_directory)
+                .await?;
+            drained_len = len;
+            let mut entries = Some(entries);
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.install_directory_snapshot(entries.take().unwrap_or_default())
+            })?;
         }
 
-        let mut dents_bytes = vec![0; nb as usize];
-        dents_bytes.reserve_exact(128);
+        let (start, batch) = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.with_directory_stream(|stream| {
+                (stream.position(), stream.next_batch(format, capacity))
+            })
+        })?;
+        let batch = batch?;
+        let mut records = Vec::new();
+        for (index, entry) in batch.iter().enumerate() {
+            let (d_ino, _) = determinize_inode(guest, entry.ino).await;
+            let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
+            format.encode(entry, d_ino.as_raw(), d_off, &mut records);
+        }
+        let returned = records.len();
+        // Reading the host directory wrote host-ordered records into the
+        // guest's buffer; zero whatever the sorted records do not overwrite.
+        records.resize(returned.max(drained_len), 0);
+        if !records.is_empty() {
+            guest.memory().write_exact(buf, &records)?;
+        }
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.with_directory_stream(|stream| stream.advance(batch.len()))
+        })?;
+        Ok(returned as i64)
+    }
 
-        guest
-            .memory()
-            .read_exact(dirent.cast(), dents_bytes.as_mut_slice())?;
-
-        let mut dents = unsafe { deserialize_dirents64(&dents_bytes) };
-        dents.sort();
-        for dent in &mut dents {
-            let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino.as_raw();
+    /// Read the whole host directory behind `fd` by reissuing the guest's own
+    /// `getdents` call until it returns 0, and sort the result. Returns the
+    /// entries and the largest number of bytes any read wrote into the guest's
+    /// buffer.
+    ///
+    /// Every step goes through `record_or_replay`, so a replay reads the same
+    /// entries from the log. The first read must start at the beginning of
+    /// the directory, so the kernel position is rewound to 0 unless it already
+    /// is. Before the first snapshot the rewind waits for a `getdents` probe to
+    /// succeed: rewinding a non-directory would move a regular file's offset
+    /// even though `getdents` then fails with `ENOTDIR`.
+    async fn snapshot_directory<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        fd: RawFd,
+        buf: AddrMut<'_, u8>,
+        format: DirentFormat,
+        known_directory: bool,
+    ) -> Result<(Vec<DirEntry>, usize), Error> {
+        let lseek = |offset, whence| {
+            syscalls::Lseek::new()
+                .with_fd(fd)
+                .with_offset(offset)
+                .with_whence(whence)
+        };
+        let mut drained_len = 0;
+        let rewind = if known_directory {
+            true
+        } else if self
+            .record_or_replay(guest, lseek(0, Whence::SEEK_CUR))
+            .await
+            == Ok(0)
+        {
+            false
+        } else {
+            drained_len = self.record_or_replay(guest, call).await? as usize;
+            true
+        };
+        if rewind {
+            self.record_or_replay(guest, lseek(0, Whence::SEEK_SET))
+                .await?;
         }
 
-        let mut dents_bytes = vec![0; dents_bytes.len()];
-        let _ = unsafe { serialize_dirents64(&dents, &mut dents_bytes) };
-
-        guest
-            .memory()
-            .write_exact(dirent.cast(), dents_bytes.as_slice())?;
-        Ok(nb)
+        let mut entries = Vec::new();
+        loop {
+            let len = self.record_or_replay(guest, call).await? as usize;
+            if len == 0 {
+                break;
+            }
+            drained_len = drained_len.max(len);
+            let mut bytes = vec![0; len];
+            guest.memory().read_exact(buf, &mut bytes)?;
+            entries.extend(format.parse(&bytes)?);
+        }
+        sort_dir_entries(&mut entries);
+        Ok((entries, drained_len))
     }
 }
 
