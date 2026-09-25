@@ -26699,7 +26699,7 @@ mod post_verdict_transaction_tests {
                 RECONCILE,
             ),
             (
-                "omitted attempt",
+                "empty attempt list (a shape refusal, not the reconciliation)",
                 with(&|audit| audit["attempts"] = serde_json::json!([])),
                 "attempts must be nonempty",
             ),
@@ -28074,7 +28074,7 @@ mod evidence_identity_tests {
                 "dropped report digest",
                 with(&|attempts| attempts[0].verification_report_sha256 = None),
             ),
-            ("omitted attempt", with(&|attempts| attempts.clear())),
+            ("empty attempt list", with(&|attempts| attempts.clear())),
             (
                 "invented PASS appended",
                 with(&|attempts| attempts.push(invented_pass.clone())),
@@ -28103,6 +28103,66 @@ mod evidence_identity_tests {
             assert_eq!(tampered.evidence_sha256, identity, "{label}");
             assert!(
                 !declared_guest_exit_matches(&row, &identity, Some(&tampered)),
+                "{label} was accepted"
+            );
+        }
+        // A retried cell keeps its failed first attempt beside the passing
+        // retry. Each tamper below leaves a nonempty list of genuine attempts,
+        // so only whole, ordered equality with the raw projection refuses it.
+        let mut retried = row.clone();
+        let mut retry = retried.attempts[0].clone();
+        retry["index"] = "2".into();
+        retry["outcome"] = "PASS".into();
+        retry["status"] = 7.into();
+        retried.attempts.push(retry);
+        let retried_identity = retried.evidence_identity().unwrap();
+        let retried_genuine = SeriesDeclaredGuestExit {
+            evidence_sha256: retried_identity.clone(),
+            attempts: declared_guest_exit_attempts(&retried).unwrap(),
+            ..genuine.clone()
+        };
+        assert_eq!(
+            retried_genuine
+                .attempts
+                .iter()
+                .map(|attempt| attempt.outcome.as_str())
+                .collect::<Vec<_>>(),
+            ["ERROR", "PASS"]
+        );
+        assert!(declared_guest_exit_matches(
+            &retried,
+            &retried_identity,
+            Some(&retried_genuine)
+        ));
+        let with_retried = |edit: &dyn Fn(&mut Vec<SeriesDeclaredGuestExitAttempt>)| {
+            let mut audit = retried_genuine.clone();
+            edit(&mut audit.attempts);
+            audit
+        };
+        for (label, tampered) in [
+            (
+                "failed attempt dropped",
+                with_retried(&|attempts| {
+                    attempts.remove(0);
+                }),
+            ),
+            (
+                "passing retry dropped",
+                with_retried(&|attempts| attempts.truncate(1)),
+            ),
+            (
+                "genuine attempts reordered",
+                with_retried(&|attempts| attempts.swap(0, 1)),
+            ),
+            (
+                "passing retry duplicated",
+                with_retried(&|attempts| attempts.push(attempts[1].clone())),
+            ),
+        ] {
+            assert_eq!(tampered.evidence_sha256, retried_identity, "{label}");
+            assert!(!tampered.attempts.is_empty(), "{label}");
+            assert!(
+                !declared_guest_exit_matches(&retried, &retried_identity, Some(&tampered)),
                 "{label} was accepted"
             );
         }
