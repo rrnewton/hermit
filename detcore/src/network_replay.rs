@@ -4742,19 +4742,22 @@ impl NetworkReplayEngine {
         if !state.transport.is_datagram() {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
-        let Some(expected) = state.outbound.pop_front() else {
+        let Some(expected) = state.outbound.front() else {
             return Err(NetworkReplayError::TraceExhausted(channel));
         };
-        if !matches!(expected, OutboundOutcome::Datagram(ref item) if item == datagram) {
+        if !matches!(expected, OutboundOutcome::Datagram(item) if item == datagram) {
             return Err(NetworkReplayError::OutboundMismatch {
                 channel,
                 offset: state.transmitted,
             });
         }
-        state.transmitted = state
+        let transmitted = state
             .transmitted
             .checked_add(datagram.bytes.len() as u64)
             .ok_or(NetworkReplayError::Overflow)?;
+        // A refused output must leave the required trace event pending.
+        state.outbound.pop_front();
+        state.transmitted = transmitted;
         state.refresh_readiness();
         Ok(())
     }
@@ -4770,19 +4773,21 @@ impl NetworkReplayEngine {
         if !state.transport.is_datagram() {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
-        let Some(OutboundOutcome::DatagramExact(expected)) = state.outbound.pop_front() else {
+        let Some(OutboundOutcome::DatagramExact(expected)) = state.outbound.front() else {
             return Err(NetworkReplayError::OperationOrderMismatch(channel));
         };
-        if expected != *datagram {
+        if expected != datagram {
             return Err(NetworkReplayError::OutboundMismatch {
                 channel,
                 offset: state.transmitted,
             });
         }
-        state.transmitted = state
+        let transmitted = state
             .transmitted
             .checked_add(datagram.datagram.bytes.len() as u64)
             .ok_or(NetworkReplayError::Overflow)?;
+        state.outbound.pop_front();
+        state.transmitted = transmitted;
         state.refresh_readiness();
         Ok(())
     }
@@ -4798,13 +4803,14 @@ impl NetworkReplayEngine {
         let Some(OutboundOutcome::Shutdown {
             stream_offset: offset,
             direction: expected,
-        }) = state.outbound.pop_front()
+        }) = state.outbound.front()
         else {
             return Err(NetworkReplayError::UnexpectedShutdown(channel));
         };
-        if offset != state.transmitted || expected != direction {
+        if *offset != state.transmitted || *expected != direction {
             return Err(NetworkReplayError::UnexpectedShutdown(channel));
         }
+        state.outbound.pop_front();
         if matches!(
             direction,
             NetworkShutdownV2::Write | NetworkShutdownV2::Both
@@ -7140,6 +7146,109 @@ mod tests {
             engine.readiness_for_interest(ofd, true, false),
             Err(NetworkReplayError::UnsupportedReadinessMode)
         ));
+    }
+
+    #[test]
+    fn datagram_output_refusals_preserve_required_packet_and_completion() {
+        for exact in [false, true] {
+            for bytes in [Vec::new(), b"packet".to_vec()] {
+                let packet = NetworkDatagramExactV2 {
+                    datagram: NetworkDatagramV2 {
+                        sequence: 0,
+                        bytes,
+                        source: Some(NetworkAddressV2::Inet4 {
+                            address: [192, 0, 2, 2],
+                            port: 53,
+                        }),
+                        destination: None,
+                        ancillary: None,
+                        message_flags: 0,
+                    },
+                    source_length: Some(16),
+                    destination_length: None,
+                };
+                let mut input = trace();
+                input.channels[0].transport = NetworkTransportV2::Udp;
+                input.channels[0].role = NetworkEndpointRoleV2::Datagram;
+                input.inputs.clear();
+                input.outputs = vec![NetworkOutputEventV2 {
+                    channel: channel_id(),
+                    event: if exact {
+                        NetworkOutputKindV2::DatagramExact(packet.clone())
+                    } else {
+                        NetworkOutputKindV2::Datagram(packet.datagram.clone())
+                    },
+                }];
+                let mut engine = NetworkReplayEngine::replay(input).unwrap();
+                let ofd = open_file(0);
+                engine.bind(ofd, channel_id()).unwrap();
+                let pending = format!("{engine:?}");
+                // A wrong representation also cannot consume the queued one.
+                let wrong_kind = if exact {
+                    engine.transmit_datagram(ofd, &packet.datagram)
+                } else {
+                    engine.transmit_datagram_exact(ofd, &packet)
+                };
+                assert!(matches!(wrong_kind,
+                    Err(NetworkReplayError::OutboundMismatch { .. }
+                        | NetworkReplayError::OperationOrderMismatch(_))));
+                assert_eq!(format!("{engine:?}"), pending);
+                for mismatch in 0..if exact { 6 } else { 5 } {
+                    let mut wrong = packet.clone();
+                    match mismatch {
+                        0 => wrong.datagram.bytes.push(0xff),
+                        1 => wrong.datagram.sequence = 1,
+                        2 => wrong.datagram.source = None,
+                        3 => wrong.datagram.message_flags = libc::MSG_TRUNC,
+                        4 => wrong.datagram.ancillary = Some(NetworkAncillaryDataV2 {
+                            bytes: vec![1, 2, 3, 4], objects: vec![], truncated: false,
+                        }),
+                        5 => wrong.source_length = Some(8),
+                        _ => unreachable!(),
+                    }
+                    let result = if exact {
+                        engine.transmit_datagram_exact(ofd, &wrong)
+                    } else {
+                        engine.transmit_datagram(ofd, &wrong.datagram)
+                    };
+                    assert!(matches!(result, Err(NetworkReplayError::OutboundMismatch { .. })));
+                    assert_eq!(format!("{engine:?}"), pending);
+                    assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+                }
+                if exact { engine.transmit_datagram_exact(ofd, &packet).unwrap(); }
+                else { engine.transmit_datagram(ofd, &packet.datagram).unwrap(); }
+                engine.finish().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_refusals_preserve_required_output_and_direction() {
+        let mut input = trace();
+        input.inputs.clear();
+        input.outputs.push(NetworkOutputEventV2 {
+            channel: channel_id(),
+            event: NetworkOutputKindV2::Shutdown {
+                stream_offset: 7, direction: NetworkShutdownV2::Write,
+            },
+        });
+        let mut engine = NetworkReplayEngine::replay(input).unwrap();
+        let ofd = open_file(0);
+        engine.bind(ofd, channel_id()).unwrap();
+        let before_bytes = format!("{engine:?}");
+        assert!(matches!(engine.shutdown(ofd, NetworkShutdownV2::Write),
+            Err(NetworkReplayError::UnexpectedShutdown(_))));
+        assert_eq!(format!("{engine:?}"), before_bytes);
+        assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+        assert_eq!(engine.transmit_stream(ofd, b"request").unwrap(), StreamTransmitOutcome::Accepted(7));
+        let before_shutdown = format!("{engine:?}");
+        for wrong in [NetworkShutdownV2::Read, NetworkShutdownV2::Both] {
+            assert!(matches!(engine.shutdown(ofd, wrong), Err(NetworkReplayError::UnexpectedShutdown(_))));
+            assert_eq!(format!("{engine:?}"), before_shutdown);
+            assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+        }
+        engine.shutdown(ofd, NetworkShutdownV2::Write).unwrap();
+        engine.finish().unwrap();
     }
 
     #[test]
