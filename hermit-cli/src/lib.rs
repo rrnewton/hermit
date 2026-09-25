@@ -2425,6 +2425,15 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // resuming through the kernel's ptrace syscall-restart frame.
     config.backend_supports_parked_write_signal_interruption =
         matches!(backend, Backend::Ptrace | Backend::E9patch);
+    // Under ptrace every delivered signal, even an ignored one, stops the
+    // thread for its tracer, so an injected blocking syscall returns to the
+    // tool. No other backend is known to give both guarantees: DynamoRIO
+    // emulates the guest's signal mask, so DBT's raw `rt_sigprocmask` need not
+    // read it; SaBRe drops an ignored signal; LiteInst and KVM re-invoke the
+    // Tool callback on ERESTARTSYS, as above. Their external-IO blockers stay
+    // in the scheduler's pool, as before.
+    config.backend_reports_signal_interrupted_external_io =
+        matches!(backend, Backend::Ptrace | Backend::E9patch);
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -4243,6 +4252,7 @@ mod tests {
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
         assert!(!sabre.backend_defers_vfork_child_registration);
+        assert!(!sabre.backend_reports_signal_interrupted_external_io);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
@@ -4257,6 +4267,35 @@ mod tests {
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
         assert!(!ptrace.backend_defers_vfork_child_registration);
+        assert!(ptrace.backend_reports_signal_interrupted_external_io);
+    }
+
+    #[test]
+    fn only_ptrace_hosted_backends_report_signal_interrupted_external_io() {
+        // The scheduler awaits the report of an external-IO blocker it sends a
+        // timer signal to only where the backend guarantees that report.
+        for backend in [
+            Backend::Ptrace,
+            Backend::E9patch,
+            Backend::Dbt,
+            Backend::Liteinst,
+            Backend::Sabre,
+            Backend::Kvm,
+        ] {
+            // Start from the opposite value so that a backend the function
+            // forgot to set is caught whichever default the field has.
+            let expected = matches!(backend, Backend::Ptrace | Backend::E9patch);
+            let config = super::DetConfig {
+                backend_reports_signal_interrupted_external_io: !expected,
+                ..super::DetConfig::default()
+            };
+            assert_eq!(
+                prepare_backend_config(config, backend)
+                    .backend_reports_signal_interrupted_external_io,
+                expected,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

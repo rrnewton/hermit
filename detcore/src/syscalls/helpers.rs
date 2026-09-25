@@ -26,12 +26,14 @@ use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
+use crate::config::Config;
 use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::WaitSignalDisposition;
@@ -115,8 +117,41 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
-        self.record_or_replay_blocking_resource(guest, call, ResourceID::BlockingExternalIO(op_id))
-            .await
+        let signal_mask = self.external_io_signal_mask(guest, call).await?;
+        self.record_or_replay_blocking_resource(
+            guest,
+            call,
+            ResourceID::BlockingExternalIO { op_id, signal_mask },
+        )
+        .await
+    }
+
+    /// The signal mask the thread keeps for the whole of the external `call`,
+    /// read at this deterministic point so the scheduler can decide whether a
+    /// signal it sends interrupts the call; see
+    /// `Scheduler::external_io_wake_thread_group`. Only the thread itself can
+    /// change its mask, and while it is outside the runnable set it executes
+    /// nothing but `call`. A call that installs a temporary mask gives `None`,
+    /// as do record/replay modes, whose external-IO harvest this does not
+    /// change, and an unsequentialized run, where the scheduler is not asked.
+    async fn external_io_signal_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<Option<u64>, Error> {
+        if !external_io_signal_mask_is_known(&self.cfg, call) {
+            return Ok(None);
+        }
+        let mut stack = guest.stack().await;
+        let mask_addr = stack.reserve::<KernelSigset>();
+        let _mask_guard = stack.commit()?;
+        let read_mask = syscalls::RtSigprocmask::new()
+            .with_how(libc::SIG_BLOCK)
+            .with_set(None)
+            .with_oldset(Some(mask_addr.cast()))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+        guest.inject_with_retry(read_mask).await?;
+        Ok(Some(guest.memory().read_value(mask_addr)?))
     }
 
     /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
@@ -148,7 +183,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
-            ResourceID::BlockingExternalIO(op_id)
+            ResourceID::BlockingExternalIO { op_id, .. }
             | ResourceID::BlockingRtSigsuspend { op_id, .. } => *op_id,
             _ => unreachable!("blocking syscall helper requires a blocking resource"),
         };
@@ -779,6 +814,31 @@ pub fn ioaction_based_on_fd_status<
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
         Ok(IOAction::NonblockizeRetry)
+    }
+}
+
+/// Whether the tool reads the thread's signal mask for a blocking external
+/// call, so that the scheduler can send a timer signal the mask admits to that
+/// thread and await its report. The scheduler needs the thread sequentialized,
+/// and a backend that guarantees the report; record/replay keeps its recorded
+/// behavior; and a call that swaps in another mask makes the thread's own mask
+/// the wrong one.
+fn external_io_signal_mask_is_known(cfg: &Config, call: Syscall) -> bool {
+    cfg.sequentialize_threads
+        && !cfg.recordreplay_modes
+        && cfg.backend_reports_signal_interrupted_external_io
+        && !syscall_installs_temporary_signal_mask(call)
+}
+
+/// Whether `call` swaps in a temporary signal mask for its duration, so the
+/// thread's own mask does not say which signals interrupt it.
+fn syscall_installs_temporary_signal_mask(call: Syscall) -> bool {
+    match call {
+        Syscall::Pselect6(call) => call.sigmask().is_some(),
+        Syscall::Ppoll(call) => call.sigmask().is_some(),
+        Syscall::EpollPwait(call) => call.sigmask().is_some(),
+        Syscall::RtSigsuspend(_) => true,
+        other => matches!(other.number(), Sysno::epoll_pwait2 | Sysno::io_pgetevents),
     }
 }
 
@@ -1634,7 +1694,96 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
 
 #[cfg(test)]
 mod tests {
+    use reverie::syscalls::SyscallArgs;
+
     use super::*;
+
+    /// The scheduler trusts the thread's own mask for an external call only
+    /// when the call does not swap in another one, so each call that can
+    /// must be recognized, and the same call without a mask must not.
+    #[test]
+    fn syscall_installs_temporary_signal_mask_recognizes_each_mask_argument() {
+        let call = |sysno, sigmask_arg: usize, sigmask_value: usize| {
+            let mut args = [0_usize; 6];
+            args[sigmask_arg] = sigmask_value;
+            Syscall::from_raw(
+                sysno,
+                SyscallArgs::new(args[0], args[1], args[2], args[3], args[4], args[5]),
+            )
+        };
+        // The mask is argument 5 of pselect6, 3 of ppoll and 4 of epoll_pwait.
+        for (sysno, sigmask_arg) in [
+            (Sysno::pselect6, 5),
+            (Sysno::ppoll, 3),
+            (Sysno::epoll_pwait, 4),
+        ] {
+            assert!(
+                syscall_installs_temporary_signal_mask(call(sysno, sigmask_arg, 0x1000)),
+                "{sysno} with a mask"
+            );
+            assert!(
+                !syscall_installs_temporary_signal_mask(call(sysno, sigmask_arg, 0)),
+                "{sysno} without a mask"
+            );
+        }
+        for sysno in [
+            Sysno::rt_sigsuspend,
+            Sysno::epoll_pwait2,
+            Sysno::io_pgetevents,
+        ] {
+            assert!(
+                syscall_installs_temporary_signal_mask(call(sysno, 0, 0)),
+                "{sysno}"
+            );
+        }
+        for sysno in [Sysno::select, Sysno::poll, Sysno::epoll_wait, Sysno::read] {
+            assert!(
+                !syscall_installs_temporary_signal_mask(call(sysno, 0, 0)),
+                "{sysno}"
+            );
+        }
+    }
+
+    /// Each condition alone withholds the mask, so the scheduler falls back
+    /// to keeping the blocker in its pool.
+    #[test]
+    fn external_io_signal_mask_is_known_only_when_every_condition_holds() {
+        let select = Syscall::from_raw(Sysno::select, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        let masked_ppoll = Syscall::from_raw(Sysno::ppoll, SyscallArgs::new(0, 0, 0, 0x1000, 0, 0));
+        let known = Config {
+            sequentialize_threads: true,
+            recordreplay_modes: false,
+            backend_reports_signal_interrupted_external_io: true,
+            ..Config::default()
+        };
+        assert!(external_io_signal_mask_is_known(&known, select));
+        assert!(!external_io_signal_mask_is_known(&known, masked_ppoll));
+        for (config, case) in [
+            (
+                Config {
+                    sequentialize_threads: false,
+                    ..known.clone()
+                },
+                "threads not sequentialized",
+            ),
+            (
+                Config {
+                    recordreplay_modes: true,
+                    ..known.clone()
+                },
+                "record/replay",
+            ),
+            (
+                Config {
+                    backend_reports_signal_interrupted_external_io: false,
+                    ..known.clone()
+                },
+                "backend does not guarantee the report",
+            ),
+        ] {
+            assert!(!external_io_signal_mask_is_known(&config, select), "{case}");
+        }
+    }
 
     /// Bracket the millisecond-to-nanosecond timeout conversion in both
     /// directions: the non-positive values that are NOT deadlines, and the
