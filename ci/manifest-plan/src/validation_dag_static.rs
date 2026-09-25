@@ -214,7 +214,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eleven record-workload preparation controls retain all 566 prior IDs.
     // Seven census/finalized-run/scope controls retain all 577 current-main IDs.
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
-    ("test.regular_crates", 610),
+    // Six expected-guest-exit controls retain all 610 prior identities.
+    ("test.regular_crates", 616),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     ("test.hermit_unit", 723),
@@ -256,7 +257,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 610),
+    ("test.regular_crates_on_host", 616),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
