@@ -1575,10 +1575,16 @@ fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
             .iter()
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))?;
+        let expected_audit_jobs = (tag != "gate.manifest_on_host").then_some("1");
         if step.hint.preferred_inner_jobs
             != Some(crate::validation_dag_static::MANIFEST_GATE_INNER_JOBS)
             || step.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
-            || step.jobs_flag.is_some()
+            || step.jobs_flag.as_deref() != Some("")
+            || step
+                .env
+                .get("HERMIT_VALIDATE_AUDIT_JOBS")
+                .map(String::as_str)
+                != expected_audit_jobs
             || step.cmd != ordinary.cmd
             || step.timeout != wall_seconds
             || step.cpu_timeout != 600
@@ -3330,6 +3336,7 @@ sys.exit(37)
 
     #[test]
     fn manifest_gate_carries_a_one_core_admission_over_inherited_build_width() {
+        use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
 
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
@@ -3353,6 +3360,16 @@ sys.exit(37)
                 env_with_inner_jobs(step, "", Some(1)),
                 Some(("CARGO_BUILD_JOBS".into(), "1".into())),
                 "{tag} must replace an inherited CARGO_BUILD_JOBS=4 when admitted to one core"
+            );
+            assert_eq!(
+                command_with_inner_jobs(step, "-j", Some(2)),
+                step.cmd,
+                "{tag} must suppress dagrun's default -j argument and preserve the exact test-harness command"
+            );
+            assert_eq!(
+                command_with_inner_jobs(step, "-j", Some(1)),
+                step.cmd,
+                "{tag} must preserve the exact test-harness command at a reduced admission"
             );
 
             let mut unbound = step.clone();

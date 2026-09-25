@@ -44,10 +44,10 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
-const VALIDATE_AUDIT_JOBS: usize = 2;
-const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
-const SCHEDULED_BUILD_JOBS: &str = "CARGO_BUILD_JOBS";
 const DEFAULT_BUILD_JOBS: usize = 16;
+const DEFAULT_VALIDATE_AUDIT_JOBS: usize = 2;
+const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
+const VALIDATE_AUDIT_JOBS_ENV: &str = "HERMIT_VALIDATE_AUDIT_JOBS";
 
 const HELP: &str = "\
 Usage: test-harness <COMMAND> [OPTIONS]
@@ -433,30 +433,38 @@ fn build_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
     ScheduledWorkerCapacity::new(args.jobs.unwrap_or(DEFAULT_BUILD_JOBS))
 }
 
-/// Bound metadata-audit concurrency by the CPU width the outer scheduler gave
-/// this gate.
+/// Apply an explicit top-level audit width without changing each child's
+/// admitted internal build width.
 ///
-/// `gate.manifest` is normally a one-core step. Running two audit children in
-/// that cgroup lets one child's Cargo/cache work consume the quota while the
-/// other child's source-current dagrun launcher waits on the shared cache lock.
-/// The launcher's deliberately short wall-time self-test can then expire after
-/// almost no CPU time. `dagrun` exports the admitted width as
-/// `CARGO_BUILD_JOBS` at the final command boundary, so use that same authority
-/// rather than host-wide parallelism. Missing or malformed scheduler evidence
-/// stays serial; a gate explicitly granted two or more cores retains the
-/// measured two-worker path.
+/// Each child still inherits `CARGO_BUILD_JOBS`, so a child may use every core
+/// admitted to the gate for its own Cargo and helper work. Starting a second
+/// top-level audit does not create more admitted CPU; it makes the two large
+/// self-tests contend for caches while charging the same whole-step CPU cap.
+/// RUN1909 exposed the missing argv override before any audit ran. With that
+/// fixed, the exact scheduler path then consumed 601.132 CPU seconds and was
+/// killed by the unchanged 600-second cap, while isolated controls consumed
+/// 327.344 seconds for scorecard and 70.699 seconds for pressure. The ordinary
+/// gate explicitly selects one top-level worker to remove that cross-audit
+/// contention. An unaffected prebuilt gate retains the existing two-worker
+/// default; unavailable prebuilt scripts and malformed explicit values fail
+/// closed to serial execution.
 fn validation_audit_worker_capacity(
     prebuilt_rust_scripts: bool,
-    scheduled_build_jobs: Option<&str>,
+    configured_jobs: Option<&str>,
 ) -> ScheduledWorkerCapacity {
     if !prebuilt_rust_scripts {
         return ScheduledWorkerCapacity::new(1);
     }
-    let granted = scheduled_build_jobs
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-    ScheduledWorkerCapacity::new(VALIDATE_AUDIT_JOBS.min(granted))
+    let jobs = match configured_jobs {
+        None => DEFAULT_VALIDATE_AUDIT_JOBS,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .map(|value| value.min(DEFAULT_VALIDATE_AUDIT_JOBS))
+            .unwrap_or(1),
+    };
+    ScheduledWorkerCapacity::new(jobs)
 }
 
 fn required_value(values: &mut impl Iterator<Item = String>, option: &str) -> String {
@@ -616,16 +624,16 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     audit_determinism_stress_evidence(root);
     // These self-contained audits read the same checked-out tree but keep all
     // generated state in their own temporary directories. The validation DAG
-    // supplies immutable prebuilt rust-script binaries; without that guarantee,
-    // retain the old serial order instead of making rust-script compilers contend
-    // for their shared cache. Run no more than two at once: two is the largest
-    // clean concurrent validation width established on this host, and a wider
-    // unmeasured default would turn this speed change into a new concurrency
-    // assumption. Publish each completed child immediately so a later timeout
-    // retains its diagnostics; the final status summary keeps the original order.
+    // supplies immutable prebuilt rust-script binaries and the admitted
+    // CARGO_BUILD_JOBS width to each child. The ordinary DAG gate explicitly
+    // selects a serial top-level schedule so its combined CPU remains bounded
+    // by the unchanged gate cap; variants without that declaration retain the
+    // existing two-worker schedule. Publish each completed child immediately
+    // so a later timeout retains its diagnostics; the final status summary
+    // keeps the original order.
     let audit_jobs = validation_audit_worker_capacity(
         std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1"),
-        std::env::var(SCHEDULED_BUILD_JOBS).ok().as_deref(),
+        std::env::var(VALIDATE_AUDIT_JOBS_ENV).ok().as_deref(),
     )
     .configured();
     run_audits_parallel(
@@ -2433,6 +2441,7 @@ mod tests {
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
     use super::DEFAULT_BUILD_JOBS;
+    use super::DEFAULT_VALIDATE_AUDIT_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HELP;
     use super::HostCapability;
@@ -2440,7 +2449,6 @@ mod tests {
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
-    use super::VALIDATE_AUDIT_JOBS;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
@@ -3326,31 +3334,31 @@ report.write_bytes((root/'verification.json').read_bytes())
     }
 
     #[test]
-    fn validation_audits_do_not_oversubscribe_the_scheduler_grant() {
+    fn validation_audits_share_the_aggregate_cpu_cap_serially() {
         assert_eq!(
             validation_audit_worker_capacity(true, Some("1")).configured(),
-            1,
-            "the one-core gate must not start the two cache-contending audit workers"
+            1
+        );
+        assert_eq!(
+            validation_audit_worker_capacity(true, None).configured(),
+            DEFAULT_VALIDATE_AUDIT_JOBS,
+            "an unaffected prebuilt gate must retain its existing two-worker schedule"
         );
         assert_eq!(
             validation_audit_worker_capacity(true, Some("2")).configured(),
-            VALIDATE_AUDIT_JOBS
+            DEFAULT_VALIDATE_AUDIT_JOBS
         );
-        assert_eq!(
-            validation_audit_worker_capacity(true, Some("32")).configured(),
-            VALIDATE_AUDIT_JOBS
-        );
-        for unavailable in [None, Some("0"), Some("not-a-width")] {
+        for malformed in [Some("0"), Some("not-a-width")] {
             assert_eq!(
-                validation_audit_worker_capacity(true, unavailable).configured(),
+                validation_audit_worker_capacity(true, malformed).configured(),
                 1,
-                "missing or invalid scheduler capacity must fail closed to serial audits"
+                "an invalid explicit audit width must fail closed to serial execution"
             );
         }
         assert_eq!(
-            validation_audit_worker_capacity(false, Some("32")).configured(),
+            validation_audit_worker_capacity(false, Some("2")).configured(),
             1,
-            "audits without immutable prebuilt scripts retain the existing serial policy"
+            "audits without immutable prebuilt scripts retain serial execution"
         );
     }
 
