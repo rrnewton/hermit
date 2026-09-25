@@ -106,8 +106,18 @@ and publishes a closed manifest binding each candidate label/identity and its
 normalized case/role/argv, report/stdout/stderr hashes, and data-tree hashes.
 Completeness is not inferred from equal nonzero populations: before execution,
 the driver imports the official `run_matrix.py` catalog/expectation/reference
-policy, pins its hermetic workdir to `/test`, and retains a source-hash-bound
-expected ledger. For the current strict DBT mode that independently requires
+policy and retains a source-hash-bound expected ledger. Every candidate runs on
+the host through safehermit's `systemd-run --user` service, which starts in the
+initial user namespace without CAP_SYS_ADMIN, so the per-run `/test` tmpfs that
+the pinned-root node `test.dbt_parity` requests cannot be mounted there. The
+matrix therefore takes its flags and environment from the official host twin
+`test.dbt_parity_on_host`, whose commands each get a private `/tmp`. It refuses
+the twins unless the pinned node runs exactly the host payload with the same
+deadlines and differs in environment only by `HERMIT_E2E_EMPTY_WORKDIR=/test`,
+the host command is the reviewed strict invocation, the host node does not
+request `/test`, and no host variable collides with a candidate proxy binding.
+The pinned-root node itself is unchanged and still runs in authoritative
+validation. For the current strict DBT mode that independently requires
 28 TSV rows (27 selected plus the documented `pthread_lifecycle` gap), 23
 ptrace references, 81 DBT candidate runs, two global probes, and therefore 106
 proxy invocations per candidate. Cargo and Buck must each match that exact
