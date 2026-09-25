@@ -233,7 +233,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and retain all 640 prior identities (`cargo nextest list` measured 645).
     // The environment-varying config fingerprint regression retains all 645
     // prior identities: 645 + 1 = 646 (`cargo nextest list` measured 646).
-    ("test.regular_crates", 646),
+    // The detcore-sabre per-process captured-record test retains all 646 prior
+    // identities: 646 + 1 = 647 (`cargo nextest list` measured 647).
+    ("test.regular_crates", 647),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -241,7 +243,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 750 prior identities in the prepared Nextest inventory.
     // Three logdiff_report schema-2 tests and the bin/hermit matched-prefix
     // report test (d550979ad0) retain all 753 prior identities.
-    ("test.hermit_unit", 757),
+    // The forwarded-record byte-identity test is added, and the bin/hermit
+    // SaBRe DETLOG test follows its function's replacement
+    // (extracts_sabre_detlogs_and_preserves_guest_stderr becomes
+    // counts_only_syscall_detlogs_in_the_run_log); the other 756 prior
+    // identities are retained: 757 - 1 + 2 = 758 (`cargo nextest list`
+    // measured 758).
+    ("test.hermit_unit", 758),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -257,7 +265,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
-    ("test.detcore_unit", 810),
+    // The forwarded-record ordering test retains all 810 prior identities:
+    // 810 + 1 = 811 (`cargo nextest list` measured 811).
+    ("test.detcore_unit", 811),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -291,14 +301,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 810),
+    // The host node carries the identical selection: 810 + 1 = 811.
+    ("test.detcore_unit_on_host", 811),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
-    ("test.hermit_unit_on_host", 757),
+    // The host node carries the identical selection: 757 - 1 + 2 = 758.
+    ("test.hermit_unit_on_host", 758),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
-    // The host node carries the identical selection: 645 + 1 = 646.
-    ("test.regular_crates_on_host", 646),
+    // The host node carries the identical selection: 645 + 1 = 646, then
+    // 646 + 1 = 647.
+    ("test.regular_crates_on_host", 647),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
