@@ -318,8 +318,8 @@ fn read_mmsg_iovecs<M: MemoryAccess>(
 
 /// Resolve extents from a pre-call snapshot. Single-message calls are
 /// bounded by the return value; batch calls keep the per-message `msg_len`
-/// bound read after completion, and skip a message whose length field was
-/// itself overwritten by an overlapping control buffer.
+/// bound read after completion and fail closed when a delivered message's
+/// length is absent or exceeds its snapshotted capacity.
 fn pre_call_extents<M: MemoryAccess>(
     memory: &M,
     pre: &PreCallMsgExtents,
@@ -350,8 +350,9 @@ fn batch_pre_call_extents<M: MemoryAccess>(
     let count = usize::try_from(delivered)
         .unwrap_or(0)
         .min(pre.messages.len());
-    // Best-effort post-call `msg_len` values; an overlapping control buffer
-    // may have destroyed them, in which case capacity is the only bound left.
+    // Post-call `msg_len` values; an overlapping control buffer may have
+    // destroyed them individually. A wholly unreadable array restores the
+    // legacy hard error below, not a silent skip of every message.
     let post_lens: Option<Vec<u32>> = (|| {
         let address: AddrMut<'_, libc::mmsghdr> = AddrMut::from_raw(mmsg_addr)?;
         let mut headers: Vec<libc::mmsghdr> =
@@ -359,21 +360,25 @@ fn batch_pre_call_extents<M: MemoryAccess>(
         memory.read_values(address.into(), &mut headers).ok()?;
         Some(headers.iter().map(|h| h.msg_len).collect())
     })();
+    if post_lens.is_none() && count > 0 {
+        return Err(Errno::EFAULT.into());
+    }
     let mut out = Vec::new();
     for (index, iovecs) in pre.messages.iter().take(count).enumerate() {
         // Only a trustworthy post-call `msg_len` bounds the hash. When the
         // length field itself was destroyed by an overlapping control
         // buffer, hashing snapshotted capacity would digest bytes the
-        // kernel never wrote (uninitialized guest memory, free to differ
-        // between runs), so that message contributes no extent.
-        let Some(bound) = post_lens
+        // kernel never wrote; refusing is the only non-weakening option.
+        // Fail closed: a delivered message whose post-call `msg_len` is
+        // absent or exceeds its pre-call capacity has no trustworthy bound.
+        // Skipping its digest would remove bytes from strict verification
+        // (comparator weakening), so refuse the extent computation instead.
+        let bound = post_lens
             .as_ref()
             .and_then(|lens| lens.get(index).copied())
             .map(i64::from)
             .filter(|len| *len <= iovecs.iter().map(|i| i.1 as i64).sum::<i64>())
-        else {
-            continue;
-        };
+            .ok_or(Error::Errno(Errno::EFAULT))?;
         out.extend(segment_extents(iovecs, bound));
     }
     Ok(out)
@@ -1078,12 +1083,61 @@ mod tests {
         assert_eq!(completed_mmsghdr_count(1, 2), 1);
     }
 
+    /// Batch fail-closed control: a trustworthy `msg_len` resolves its
+    /// extent (positive control), while a delivered message whose post-call
+    /// `msg_len` exceeds snapshotted capacity (destroyed, as an overlapping
+    /// control buffer would) refuses the whole extent computation instead
+    /// of silently dropping its digest from strict verification.
+    #[test]
+    fn batch_message_with_untrustworthy_msg_len_fails_closed() {
+        let first = [0_u8; 4];
+        let second = [0_u8; 4];
+        let first_iovecs = [libc::iovec {
+            iov_base: first.as_ptr() as *mut libc::c_void,
+            iov_len: first.len(),
+        }];
+        let second_iovecs = [libc::iovec {
+            iov_base: second.as_ptr() as *mut libc::c_void,
+            iov_len: second.len(),
+        }];
+        // SAFETY: `mmsghdr` is a plain C record initialized below and through
+        // LocalMemory before extent computation.
+        let mut headers: Vec<libc::mmsghdr> =
+            (0..2).map(|_| unsafe { std::mem::zeroed() }).collect();
+        headers[0].msg_hdr.msg_iov = first_iovecs.as_ptr() as *mut libc::iovec;
+        headers[0].msg_hdr.msg_iovlen = 1;
+        headers[0].msg_len = 2;
+        headers[1].msg_hdr.msg_iov = second_iovecs.as_ptr() as *mut libc::iovec;
+        headers[1].msg_hdr.msg_iovlen = 1;
+        headers[1].msg_len = 2;
+        let call = Syscall::Recvmmsg(
+            syscalls::Recvmmsg::new()
+                .with_mmsg(Some(AddrMut::from_ptr(headers.as_mut_ptr()).unwrap()))
+                .with_vlen(2),
+        );
+        let memory = LocalMemory::new();
+        let pre = capture_pre_call_msg_extents(&memory, &call).expect("batch snapshot");
+        assert_eq!(
+            extents(&memory, &call, 2, Some(&pre)).unwrap().len(),
+            2,
+            "trustworthy msg_len values resolve both messages"
+        );
+        headers[1].msg_len = u32::MAX;
+        assert!(
+            extents(&memory, &call, 2, Some(&pre)).is_err(),
+            "untrustworthy msg_len must fail closed, not drop the digest"
+        );
+    }
+
     /// Regression for `c-programs/socket-timestamp-edge-cases`: the guest
     /// points `msg_control` at its own `msghdr`, so a successful receive
     /// overwrites `msg_iov`/`msg_iovlen` with control bytes. Computing
     /// extents from the post-call header reads those bytes as a pointer and
     /// fails the (successful) syscall with `EFAULT`; the pre-call snapshot
     /// must resolve the real extent instead.
+    // The post-capture header writes are read back through the guest
+    // pointer by LocalMemory, which the compiler cannot see.
+    #[allow(unused_assignments)]
     #[test]
     fn aliased_control_buffer_resolves_extents_from_the_pre_call_snapshot() {
         let payload = [0_u8; 4];

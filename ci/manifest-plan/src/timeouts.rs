@@ -72,11 +72,17 @@ pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74b
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// Two ptrace verify cells re-selected after twenty clean canonical
-/// repetitions each at the fix head (base `1bf22b4f5ba322b7cc2f80e3dd251cc2baabc548`
-/// plus the Detcore fixes in the same change): `c-programs/socket-timestamp-edge-cases`
-/// (aliased-recvmsg io-buffer EFAULT fix; 20/20 matched) and
+/// repetitions each at the evidence SHA (the commit whose Detcore tree the
+/// qualification binary was built from): `c-programs/socket-timestamp-edge-cases`
+/// (aliased-recvmsg io-buffer EFAULT fix in this change; 20/20 matched) and
 /// `system-utils/procfs-sanitized-paths` (20/20 matched under its manifest
-/// comparison profile `compare_io_buffers: false, rcb_time: false`).
+/// comparison profile `compare_io_buffers: false, rcb_time: false`). No code
+/// in this change alters procfs handling; its retained divergence was in
+/// raw `smaps` bytes the manifest profile excludes by design, and the cell
+/// is re-selected solely on the repeated clean evidence at the pinned SHA.
+pub const PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_SHA: &str =
+    "57a3083b78e308a8dbbf349075cf1891524f3b6c";
+pub const PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:20:29Z";
 pub const PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 2;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
@@ -1884,6 +1890,15 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(
+            PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_SHA,
+            "57a3083b78e308a8dbbf349075cf1891524f3b6c"
+        );
+        assert_eq!(
+            PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T03:20:29Z"
+        );
+        assert_eq!(PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT, 2);
         assert_eq!(NON_CI_CELL_COUNT, 171);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
