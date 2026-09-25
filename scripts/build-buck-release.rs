@@ -1534,6 +1534,15 @@ fn resolve_release_show_output(stdout: &str, workspace: &Path) -> Result<PathBuf
     Ok(canonical_output)
 }
 
+/// SHA-256 of the pinned Buck2 DotSlash descriptor (`bootstrap/buck2`, Buck2
+/// release 2026-08-01) under which `CommandEnd.is_success` was measured to
+/// carry no information: 21 retained builds that completed with zero errors
+/// and 1 that failed with one error all serialized `is_success=false`. A
+/// false flag is treated as advisory only under this descriptor; another
+/// Buck must be re-measured first.
+const COMMAND_END_ADVISORY_BUCK_DESCRIPTOR_SHA256: &str =
+    "40e4842f407f589acf80a40267764bea914dc4067b2faf330cc1c377080db35e";
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReleaseBuildEvidence {
     command_end_is_success: bool,
@@ -1586,6 +1595,14 @@ fn inspect_release_build_evidence(
         .get("is_success")
         .and_then(Value::as_bool)
         .ok_or_else(|| "Buck release CommandEnd lacks boolean is_success".to_owned())?;
+    if !command_success {
+        let descriptor = sha256(&workspace.join("bootstrap/buck2"))?;
+        if descriptor != COMMAND_END_ADVISORY_BUCK_DESCRIPTOR_SHA256 {
+            return Err(format!(
+                "Buck release CommandEnd.is_success=false is advisory only under the measured Buck2 descriptor {COMMAND_END_ADVISORY_BUCK_DESCRIPTOR_SHA256}; bootstrap/buck2 is {descriptor}, so re-measure the flag for this Buck before accepting it"
+            ));
+        }
+    }
     let build_completed = commands[0]
         .pointer("/build_result/build_completed")
         .and_then(Value::as_bool)
@@ -8193,6 +8210,9 @@ mod tests {
             format!("hermit//hermit-cli:hermit-release {}\n", binary.display()),
         )
         .unwrap();
+        let descriptor = root.join("bootstrap/buck2");
+        fs::create_dir_all(descriptor.parent().unwrap()).unwrap();
+        fs::copy(source_root().join("bootstrap/buck2"), &descriptor).unwrap();
         let write_event_log = |path: &Path, events: &[Value]| {
             let text = events
                 .iter()
@@ -8322,6 +8342,69 @@ mod tests {
                 &root.join("extra-target.tsv"),
             )
             .is_err()
+        );
+        // Each remaining canonical fact refuses on its own, with the flag
+        // that is advisory held at its measured value.
+        for (label, command, result, refusal) in [
+            (
+                "incomplete",
+                serde_json::json!({"is_success":false,"build_result":{"build_completed":false}}),
+                events[1].clone(),
+                "does not prove build completion",
+            ),
+            (
+                "errors",
+                events[0]["Event"]["data"]["SpanEnd"]["data"]["Command"].clone(),
+                serde_json::json!({"Result":{"result":{"build_response":{"errors":[{"message":"action failed"}],"build_targets":[{"target":"hermit//hermit-cli:hermit-release","outputs":[]}]}}}}),
+                "contains 1 build errors",
+            ),
+        ] {
+            let log = root.join(format!("{label}.json-lines.gz"));
+            write_event_log(
+                &log,
+                &[
+                    serde_json::json!({"Event":{"data":{"SpanEnd":{"data":{"Command":command}}}}}),
+                    result,
+                ],
+            );
+            let error = reconcile_release_build_evidence(
+                &log,
+                &stdout,
+                0,
+                &root,
+                &root.join(format!("{label}.tsv")),
+            )
+            .unwrap_err();
+            assert!(error.contains(refusal), "{label}: {error}");
+        }
+        // The advisory reading of is_success=false is bound to the measured
+        // Buck: under any other descriptor the same log is refused, while a
+        // true flag needs no such measurement.
+        fs::write(&descriptor, b"#!/usr/bin/env dotslash\n{}\n").unwrap();
+        let error = reconcile_release_build_evidence(
+            &event_log,
+            &stdout,
+            0,
+            &root,
+            &root.join("other-buck.tsv"),
+        )
+        .unwrap_err();
+        assert!(error.contains("re-measure the flag"), "{error}");
+        let success_log = root.join("success.json-lines.gz");
+        write_event_log(
+            &success_log,
+            &[
+                serde_json::json!({"Event":{"data":{"SpanEnd":{"data":{"Command":{"is_success":true,"build_result":{"build_completed":true}}}}}}}),
+                events[1].clone(),
+            ],
+        );
+        let success_receipt = root.join("success.tsv");
+        reconcile_release_build_evidence(&success_log, &stdout, 0, &root, &success_receipt)
+            .unwrap();
+        assert!(
+            fs::read_to_string(&success_receipt)
+                .unwrap()
+                .contains("command_end_is_success\ttrue\n")
         );
         fs::remove_dir_all(root).unwrap();
     }
