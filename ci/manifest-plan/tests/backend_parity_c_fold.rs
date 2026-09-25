@@ -133,6 +133,13 @@ const PLAN_CELLS_ADDED_AFTER_FOLD: &[(&str, &str, &str, &str)] = &[
         "verify",
         "c-programs/external-io-signal-interrupt",
     ),
+    // https://github.com/rrnewton/hermit/pull/3224 adds this test.
+    (
+        "portable",
+        "ptrace",
+        "verify",
+        "c-programs/sigsuspend-sibling-signal-wake",
+    ),
 ];
 
 /// Tests the committed cell table lists that the pre-fold table did not, as
@@ -148,6 +155,13 @@ const TESTS_ADDED_AFTER_FOLD: &[(&str, &str, &str, &str)] = &[
     // https://github.com/rrnewton/hermit/pull/3224
     (
         "c-programs/external-io-signal-interrupt",
+        "ptrace",
+        "verify",
+        "green",
+    ),
+    // https://github.com/rrnewton/hermit/pull/3224
+    (
+        "c-programs/sigsuspend-sibling-signal-wake",
         "ptrace",
         "verify",
         "green",
@@ -413,7 +427,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let lane = |name: &str| cells.iter().filter(|c| field(c, "lane") == name).count();
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
-        (862, 858, 4)
+        (863, 859, 4)
     );
     for &(added_lane, backend, mode, test) in PLAN_CELLS_ADDED_AFTER_FOLD {
         let selected = cells
@@ -480,7 +494,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
 fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
-    assert_eq!(rows.len(), 5808);
+    assert_eq!(rows.len(), 5824);
     let mut added_rows = 0;
     for &(test, backend, mode, status) in TESTS_ADDED_AFTER_FOLD {
         let own = rows
