@@ -98,6 +98,7 @@ enum ProcfsKind {
     Rtc,
     DentryState,
     Mountinfo,
+    Mounts,
     RandomUuid,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
@@ -678,6 +679,8 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
             other if is_process_file_path(other, "mountinfo") => ProcfsKind::Mountinfo,
+            "/proc/mounts" => ProcfsKind::Mounts,
+            other if is_process_file_path(other, "mounts") => ProcfsKind::Mounts,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
@@ -948,6 +951,7 @@ impl ProcfsFile {
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::Swaps => sanitize_swaps(&contents),
+            ProcfsKind::Mounts => exclude_ephemeral_host_seed_mounts_mounts_format(&contents),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => sanitize_maps(&contents, mapping_identities),
@@ -3429,11 +3433,18 @@ fn mount_peer_group(field: &[u8]) -> Result<Option<(&'static [u8], u64)>, ()> {
 /// made `/proc/<pid>/mountinfo` (and the length of every read of it) a
 /// host-timing observation — the `procfs-sanitized-paths` divergence, where
 /// one seed row changed the tail `read` length between two strict runs.
-/// The guest mount model (launch namespace; guest `mount`/`unshare`/
-/// `setns` are refused under Detcore) never contains this class, so it is
-/// excluded by class, not by instance: every ephemeral seed row is out,
-/// every other row — system, shared filesystems, Hermit-configured, or
-/// guest-visible binds — stays.
+/// This is a chosen determinism fidelity trade, stated plainly: seed rows
+/// ARE real mounts in the guest namespace (imported by shared propagation
+/// and traversable), and Linux permits no omission of a real mount from
+/// mountinfo. Hermit nevertheless excludes the class because its membership
+/// is owned by unrelated host processes and changes asynchronously — the
+/// same scope choice `DETERMINISM_ARGUMENT.md` makes for other changing
+/// host inputs, and the mount analogue of virtualizing PIDs. The guest
+/// mount model (launch namespace; guest `mount`/`unshare`/`setns` are
+/// refused under Detcore) is deterministic only with this class excluded
+/// by class, not by instance: every ephemeral seed row is out, every other
+/// row — system, shared filesystems, Hermit-configured, or guest-visible
+/// binds — stays.
 pub(crate) fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
     detcore_model::procfs::is_ephemeral_host_seed_mount(line)
 }
@@ -3445,6 +3456,18 @@ pub(crate) fn exclude_ephemeral_host_seed_mounts(contents: &[u8]) -> Vec<u8> {
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         if !is_ephemeral_host_seed_mount(body) {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+/// `exclude_ephemeral_host_seed_mounts` for `/proc/<pid>/mounts` grammar.
+pub(crate) fn exclude_ephemeral_host_seed_mounts_mounts_format(contents: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if !detcore_model::procfs::is_ephemeral_host_seed_mount_mounts_format(body) {
             out.extend_from_slice(line);
         }
     }
@@ -4844,6 +4867,36 @@ Rss:                   4 kB\n" as &[u8];
         };
         assert_eq!(render(&churned_a), render(&churned_b));
         assert!(render(&churned_a).windows(5).any(|w| w == b"/test"));
+    }
+
+    /// `/proc/<pid>/mounts` grammar carries the same seed class; it must be
+    /// excluded there too or the two guest views disagree.
+    #[test]
+    fn mounts_format_seed_rows_are_excluded_legitimate_rows_kept() {
+        let contents = b"squashfuse_ll /mnt/xarfuse/uid-1/abc-seed-nspid1_cgpid2-ns-3 fuse.squashfuse_ll rw 0 0\nnone /test tmpfs rw 0 0\nedenfs: /data fuse edenfs: rw 0 0\n";
+        let filtered = exclude_ephemeral_host_seed_mounts_mounts_format(contents);
+        assert!(!filtered.windows(7).any(|w| w == b"xarfuse"));
+        assert!(filtered.windows(5).any(|w| w == b"/test"));
+        assert!(filtered.windows(6).any(|w| w == b"edenfs"));
+    }
+
+    /// Boundary behavior (not observed in real tables — seeds are leaves
+    /// with parent 1): if a retained row's parent mount were itself an
+    /// excluded seed, the snapshot constructor's parent pass still covers
+    /// retained parents deterministically and the child row renders; the
+    /// dangling raw parent ID never reaches guest output unrewritten.
+    #[test]
+    fn retained_row_with_seed_parent_still_snapshots() {
+        let contents =
+            b"99 1 0:1 / /mnt/xarfuse/uid-1/s rw - fuse.squashfuse_ll squashfuse_ll rw\n20 99 8:1 / /child rw - ext4 /dev/a rw\n";
+        let filtered = exclude_ephemeral_host_seed_mounts(contents);
+        let rows = parse_mountinfo(&filtered).unwrap();
+        let snapshot =
+            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new())
+                .expect("parent pass must cover the retained child");
+        let rendered = sanitize_mountinfo(&filtered, &snapshot);
+        assert!(rendered.windows(6).any(|w| w == b"/child"));
+        assert!(!rendered.windows(7).any(|w| w == b"xarfuse"));
     }
 
     #[test]

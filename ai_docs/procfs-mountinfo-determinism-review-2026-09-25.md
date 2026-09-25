@@ -24,7 +24,7 @@ Base: `422f3f3a4e05353edd4f2449affc8df9241bdf51` (exact, fetched 2026-09-25).
 Guest mount namespace under Detcore is a launch-defined, immutable object:
 files.rs already records "Mount/unshare/setns are refused once Detcore
 starts". Membership of the deterministic guest view is therefore the launch
-namespace minus rows that are definitionally not namespace members:
+namespace minus rows that are chosen determinism fidelity trade (real propagated mounts, excluded for determinism scope):
 
 **Excluded class** — `fuse.squashfuse_ll` mounts under `/mnt/xarfuse/`:
 per-process ephemeral seed mounts created by host squashfuse infrastructure
@@ -67,6 +67,9 @@ unit test asserts non-seed squashfuse and non-fuse xarfuse rows survive).
 - Cell: `system-utils/procfs-sanitized-paths` canonical verify **20/20
   matched** under its manifest profile (no relaxations); cell re-enabled
   with pinned evidence (`PROCFS_MOUNTINFO_2026_09_25_*`).
+
+## Mounts view
+`/proc/<pid>/mounts` now carries the same exclusion (mounts grammar, ProcfsKind::Mounts), so the two guest views agree. KVM reverie-kvm proc_mounts capture is pre-existing and unmeasured. Retained-row-with-seed-parent refuses snapshot (fail-closed, unit-tested).
 
 Residual: a guest program that itself drives host squashfuse seeds would
 not see its own post-launch seed mounts (they were never deterministic —
