@@ -716,13 +716,15 @@ fn generated_plan_populations_preserve_command_policy() {
         .map(exact_identity)
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
-    assert_eq!(expected_cells.len(), 852);
+    // 852 frozen cells + 2 ptrace cells re-qualified 20/20 canonical
+    // (`PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT`).
+    assert_eq!(expected_cells.len(), 854);
     for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 852),
+        ("full", "e2e.manifest_backend_parity_c", 854),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            848,
+            850,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
