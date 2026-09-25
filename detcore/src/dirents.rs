@@ -239,6 +239,7 @@ impl DirentFormat {
                 return Err(Errno::EIO);
             }
             let ino = u64::from_ne_bytes(record[0..8].try_into().unwrap());
+            let off = i64::from_ne_bytes(record[8..16].try_into().unwrap());
             let reclen = usize::from(u16::from_ne_bytes(record[16..18].try_into().unwrap()));
             if reclen <= self.name_offset() || reclen > record.len() {
                 return Err(Errno::EIO);
@@ -254,6 +255,7 @@ impl DirentFormat {
             entries.push(DirEntry {
                 name: name_field[..name_len].to_vec(),
                 ino,
+                off,
                 ty,
             });
             at += reclen;
@@ -286,6 +288,10 @@ pub(crate) struct DirEntry {
     pub(crate) name: Vec<u8>,
     /// The raw host inode, determinized only when the entry is returned.
     pub(crate) ino: u64,
+    /// The host's `d_off` cookie. A [`DirectoryStream`] returns its own
+    /// offsets instead; only a descriptor Detcore does not track, which has no
+    /// stream, passes this one through.
+    pub(crate) off: i64,
     /// `d_type`.
     pub(crate) ty: u8,
 }
@@ -906,9 +912,13 @@ mod test {
             assert_eq!(format.record_len(entry.name.len()), usize::from(old.reclen));
         }
 
+        assert_eq!(
+            entries.iter().map(|entry| entry.off).collect::<Vec<_>>(),
+            host_offsets(bytes)
+        );
         let mut encoded = Vec::new();
-        for (entry, off) in entries.iter().zip(host_offsets(bytes)) {
-            format.encode(entry, entry.ino, off, &mut encoded);
+        for entry in &entries {
+            format.encode(entry, entry.ino, entry.off, &mut encoded);
         }
         assert_eq!(encoded.as_slice(), bytes);
     }
@@ -943,6 +953,7 @@ mod test {
         let entry = DirEntry {
             name: b"a".to_vec(),
             ino: 7,
+            off: 1,
             ty: 8,
         };
         DirentFormat::Dirent64.encode(&entry, 7, 1, &mut good);
@@ -965,6 +976,7 @@ mod test {
         DirEntry {
             name: name.as_bytes().to_vec(),
             ino: name.len() as u64,
+            off: 0,
             ty: libc::DT_REG,
         }
     }

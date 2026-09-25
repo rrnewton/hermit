@@ -35,8 +35,12 @@ const RUNS: usize = 5;
 const ENTRIES: usize = 3000;
 
 fn run_five_times(guest: fn()) {
+    run_five_times_with(guest, true)
+}
+
+fn run_five_times_with(guest: fn(), sequentialize_threads: bool) {
     let config = Config {
-        sequentialize_threads: true,
+        sequentialize_threads,
         max_timeslice: None,
         virtualize_metadata: true,
         ..Default::default()
@@ -335,4 +339,251 @@ fn raw_getdents_guest() {
 #[test]
 fn raw_getdents_share_one_sorted_stream() {
     run_five_times(raw_getdents_guest);
+}
+
+/// Every name in the directory, read with `getdents64` on `fd` until the end.
+fn drain_names(fd: i32) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = getdents64(fd, &mut buf).unwrap_or_else(|errno| {
+            panic!(
+                "getdents64 failed: {}",
+                std::io::Error::from_raw_os_error(errno)
+            )
+        });
+        if n == 0 {
+            return names;
+        }
+        names.extend(record_names(&buf[..n], 19));
+    }
+}
+
+/// Send `fd` to this process over a Unix socket and return the descriptor
+/// that arrives. Detcore does not track descriptors received this way.
+fn receive_descriptor(fd: i32) -> i32 {
+    /// Room for one `SCM_RIGHTS` message, aligned as a `cmsghdr` must be.
+    #[repr(C, align(8))]
+    struct Control([u8; 32]);
+
+    fn message(byte: &mut u8, control: &mut Control) -> (libc::iovec, libc::msghdr) {
+        let iov = libc::iovec {
+            iov_base: (byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iovlen = 1;
+        header.msg_control = control.0.as_mut_ptr().cast();
+        header.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as usize;
+        (iov, header)
+    }
+
+    let (sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut byte = b'x';
+    let mut control = Control([0; 32]);
+    let (mut iov, mut header) = message(&mut byte, &mut control);
+    header.msg_iov = &mut iov;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&header);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(4) as usize;
+        libc::CMSG_DATA(cmsg).cast::<i32>().write_unaligned(fd);
+        assert_eq!(libc::sendmsg(sender.as_raw_fd(), &header, 0), 1);
+    }
+
+    let mut control = Control([0; 32]);
+    let (mut iov, mut header) = message(&mut byte, &mut control);
+    header.msg_iov = &mut iov;
+    unsafe {
+        assert_eq!(libc::recvmsg(receiver.as_raw_fd(), &mut header, 0), 1);
+        let cmsg = libc::CMSG_FIRSTHDR(&header);
+        assert!(!cmsg.is_null(), "no descriptor received");
+        assert_eq!((*cmsg).cmsg_type, libc::SCM_RIGHTS);
+        libc::CMSG_DATA(cmsg).cast::<i32>().read_unaligned()
+    }
+}
+
+fn received_descriptor_guest() {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend(sorted_names());
+
+    // A descriptor that arrives over a Unix socket has no open file
+    // description in Detcore; it must still list the whole directory.
+    let dir = File::open(root.path()).unwrap();
+    let received = receive_descriptor(dir.as_raw_fd());
+    drop(dir);
+
+    let mut names = drain_names(received);
+    assert_eq!(names.len(), ENTRIES + 2, "received descriptor lost entries");
+    // Without a stream, each kernel buffer is sorted on its own, so only the
+    // set of names is fixed.
+    names.sort();
+    assert_eq!(names, expected);
+    unsafe { libc::close(received) };
+
+    println!("received descriptor ok");
+}
+
+#[test]
+fn received_descriptor_lists_whole_directory() {
+    run_five_times(received_descriptor_guest);
+}
+
+fn unsequentialized_threads_guest() {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend(sorted_names());
+
+    // Two threads read one open file description through two descriptors at
+    // the same moment. Linux returns every entry exactly once in total.
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let alias = unsafe { libc::dup(fd) };
+    assert!(alias >= 0);
+    let start = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            start.wait();
+            drain_names(fd)
+        });
+        let second = scope.spawn(|| {
+            start.wait();
+            drain_names(alias)
+        });
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    unsafe { libc::close(alias) };
+
+    let mut names = first;
+    names.extend(second);
+    assert_eq!(
+        names.len(),
+        ENTRIES + 2,
+        "concurrent readers lost or repeated entries"
+    );
+    names.sort();
+    assert_eq!(names, expected);
+
+    println!("concurrent readers ok");
+}
+
+#[test]
+fn unsequentialized_threads_share_one_stream() {
+    run_five_times_with(unsequentialized_threads_guest, false);
+}
+
+/// The name and `d_off` of each record in a raw `getdents64` buffer.
+fn records(buf: &[u8]) -> Vec<(String, i64)> {
+    let mut records = Vec::new();
+    let mut at = 0;
+    while at < buf.len() {
+        let off = i64::from_ne_bytes(buf[at + 8..at + 16].try_into().unwrap());
+        let reclen = u16::from_ne_bytes([buf[at + 16], buf[at + 17]]) as usize;
+        let name = CStr::from_bytes_until_nul(&buf[at + 19..at + reclen]).unwrap();
+        records.push((name.to_str().unwrap().to_owned(), off));
+        at += reclen;
+    }
+    records
+}
+
+fn buffer_tail_guest() {
+    // Names of many lengths, so a buffer of sorted records and a buffer of
+    // host-ordered records fill to different lengths.
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..300 {
+        let name = format!("n{}{index:03}", "x".repeat(index * 7 % 40));
+        File::create(root.path().join(name)).unwrap();
+    }
+
+    // Linux writes only the records it returns. Reading the host directory
+    // must not leave anything after them, whatever the host order.
+    for capacity in (150..=450).step_by(10) {
+        let dir = File::open(root.path()).unwrap();
+        let mut buf = vec![0xaa_u8; capacity + 64];
+        let n = getdents64(dir.as_raw_fd(), &mut buf[..capacity]).unwrap();
+        assert!(n > 0);
+        assert!(
+            buf[n..].iter().all(|&byte| byte == 0xaa),
+            "a {capacity}-byte getdents64 returned {n} bytes and changed bytes after them"
+        );
+    }
+
+    println!("buffer tail ok");
+}
+
+#[test]
+fn buffer_tail_left_untouched() {
+    run_five_times(buffer_tail_guest);
+}
+
+fn small_buffer_guest() {
+    let root = tempfile::tempdir().unwrap();
+    File::create(root.path().join("a-longer-filename")).unwrap();
+
+    // A buffer too small for the first entry is EINVAL.
+    let dir = File::open(root.path()).unwrap();
+    assert_eq!(getdents64(dir.as_raw_fd(), &mut [0; 16]), Err(libc::EINVAL));
+
+    // A 24-byte buffer holds `.` but not the 40-byte record of the long name;
+    // Linux still returns the entries that fit, one call at a time.
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let mut buf = [0u8; 24];
+    let n = getdents64(fd, &mut buf).unwrap();
+    assert_eq!(record_names(&buf[..n], 19), ["."]);
+    let mut names = vec![".".to_owned()];
+    names.extend(drain_names(fd));
+    names.sort();
+    assert_eq!(names, [".", "..", "a-longer-filename"]);
+
+    println!("small buffer ok");
+}
+
+#[test]
+fn small_buffer_returns_entries_that_fit() {
+    run_five_times(small_buffer_guest);
+}
+
+fn seek_before_first_read_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..5 {
+        File::create(root.path().join(name(index))).unwrap();
+    }
+
+    // Learn a real host position: a received descriptor has no stream, so
+    // its records carry the kernel's own `d_off` cookies. `.` comes first on
+    // Linux filesystems, and its cookie is the position after it.
+    let probe = File::open(root.path()).unwrap();
+    let received = receive_descriptor(probe.as_raw_fd());
+    drop(probe);
+    let mut buf = [0u8; 4096];
+    let n = getdents64(received, &mut buf).unwrap();
+    unsafe { libc::close(received) };
+    let cookie = records(&buf[..n])
+        .into_iter()
+        .find_map(|(name, off)| (name == ".").then_some(off))
+        .expect("no `.` entry");
+    assert_ne!(cookie, 0);
+
+    // Seeking a fresh descriptor there before its first read resumes after
+    // `.`, as on Linux, rather than restarting the directory.
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    assert_eq!(unsafe { libc::lseek(fd, cookie, libc::SEEK_SET) }, cookie);
+    let mut names = drain_names(fd);
+    names.sort();
+    let mut expected = vec!["..".to_owned()];
+    expected.extend((0..5).map(name));
+    assert_eq!(names, expected);
+
+    println!("seek before first read ok");
+}
+
+#[test]
+fn seek_before_first_read_is_kept() {
+    run_five_times(seek_before_first_read_guest);
 }
