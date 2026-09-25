@@ -225,13 +225,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The release-profile GlobalTime behind-baseline refusal test retains all
     // 623 prior identities.
     // The failed_match series-evidence test retains all 624 prior identities.
-    ("test.regular_crates", 625),
+    // One DBT signal-capability configuration control retains all 625 prior identities.
+    ("test.regular_crates", 626),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
     // retain all 750 prior identities in the prepared Nextest inventory.
-    ("test.hermit_unit", 753),
+    // One backend signal-report capability control retains all 753 prior IDs.
+    ("test.hermit_unit", 754),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -245,14 +247,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
-    ("test.detcore_unit", 807),
+    // Seventeen signal-wake scheduler and six signal-mask helper controls retain all 807 prior IDs.
+    ("test.detcore_unit", 830),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
     // The read-only proc chroot identity test retains all 170 prior identities.
-    ("test.hermit_integration", 171),
+    // Two signal_determinism rt_sigsuspend tests retain all 171 prior IDs:
+    // sigsuspend_mask_fallback_warns_in_the_compared_log and
+    // ptrace_sigsuspend_runs_without_probe_injections.
+    ("test.hermit_integration", 173),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -279,14 +285,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 807),
-    // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 171),
-    ("test.hermit_unit_on_host", 753),
+    ("test.detcore_unit_on_host", 830),
+    // Host variants select the same proc regressions and the same two
+    // signal_determinism tests, and retain prior identities.
+    ("test.hermit_integration_on_host", 173),
+    ("test.hermit_unit_on_host", 754),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 625),
+    ("test.regular_crates_on_host", 626),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
