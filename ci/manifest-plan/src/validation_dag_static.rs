@@ -277,7 +277,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
     // The forwarded-record ordering test retains all 810 prior identities:
     // 810 + 1 = 811 (`cargo nextest list` measured 811).
-    ("test.detcore_unit", 811),
+    // The forwarded-record test without a following request retains all 811
+    // prior identities: 811 + 1 = 812 (`cargo nextest list` measured 812).
+    ("test.detcore_unit", 812),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -291,7 +293,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
     ("test.cli", 88),
     ("test.liteinst_strict", 25),
-    ("test.sabre_examples", 6),
+    // The SaBRe records-without-a-later-request example retains all 6 prior
+    // identities: 6 + 1 = 7 (`cargo nextest list` measured 7).
+    ("test.sabre_examples", 7),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -311,8 +315,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    // The host node carries the identical selection: 810 + 1 = 811.
-    ("test.detcore_unit_on_host", 811),
+    // The host node carries the identical selection: 810 + 1 = 811, then
+    // 811 + 1 = 812.
+    ("test.detcore_unit_on_host", 812),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     // The host node carries the identical selection: 757 - 1 + 2 = 758.
@@ -323,7 +328,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 667 + 1 = 668.
     ("test.regular_crates_on_host", 668),
     ("test.rr_suite_contract_on_host", 1),
-    ("test.sabre_examples_on_host", 6),
+    // The host node carries the identical selection: 6 + 1 = 7.
+    ("test.sabre_examples_on_host", 7),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
