@@ -610,7 +610,9 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "195");
+            // 195 before https://github.com/rrnewton/hermit/pull/3224, plus its two
+            // signal_determinism rt_sigsuspend tests.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "197");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
