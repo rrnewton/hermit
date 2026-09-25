@@ -10,6 +10,10 @@ pub(crate) const PORTABLE_ORDINARY_COMMAND: &str = r########"./ci/hermetic/run-i
 pub(crate) const HOSTED_PARITY_COMMAND: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
 pub(crate) const HOSTED_ORDINARY_COMMAND: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
 
+/// Pinned-root names forwarded since the Buck release build joined validate.
+pub(crate) const RELEASE_BUILD_ENV: &str =
+    " --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env HERMIT_VALIDATE_BUCK_DOTSLASH";
+
 pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
     let expected = match step.tag().as_str() {
         "e2e.manifest_backend_parity_c" => {
@@ -39,11 +43,26 @@ pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
         }
         return Ok(false);
     };
-    let legacy_parity = parity.replacen(" --results ", " --jobs 8 --results ", 1);
-    let legacy_ordinary = ordinary.replacen(" --results ", " --jobs 8 --results ", 1);
+    // Plans retained before the release-build names were forwarded omit
+    // exactly that contiguous run; the refresher appends missing names in
+    // declaration order, so this is the exact older spelling, not a relaxation.
+    let pre_release_env = |command: String| match command.matches(RELEASE_BUILD_ENV).count() {
+        0 if step.tag() == "e2e.manifest_backend_parity_c_on_host" => Ok(command),
+        1 => Ok(command.replacen(RELEASE_BUILD_ENV, "", 1)),
+        _ => Err(format!(
+            "{} has no single release-build environment run to date",
+            step.tag()
+        )),
+    };
+    let previous_parity = pre_release_env(parity.clone())?;
+    let previous_ordinary = pre_release_env(ordinary.clone())?;
+    let legacy_parity = previous_parity.replacen(" --results ", " --jobs 8 --results ", 1);
+    let legacy_ordinary = previous_ordinary.replacen(" --results ", " --jobs 8 --results ", 1);
     let selects_parity = match step.cmd.as_str() {
         command if command == parity => true,
         command if command == ordinary => false,
+        command if command == previous_parity => true,
+        command if command == previous_ordinary => false,
         // Schema-10 artifacts written before scheduler-owned width retain the
         // literal worker count. They remain readable as evidence, but an
         // unrecognized command still cannot pass this exact-command check.

@@ -820,12 +820,19 @@ fn generated_plan_populations_preserve_command_policy() {
                 "legacy-guard",
                 "missing-env",
                 "duplicate-env",
+                "half-release-env",
+                "current-literal-jobs",
             ] {
                 if (mutation == "unknown-node" && !active)
                     || (label != "full"
                         && matches!(
                             mutation,
-                            "raw-command" | "legacy-guard" | "missing-env" | "duplicate-env"
+                            "raw-command"
+                                | "legacy-guard"
+                                | "missing-env"
+                                | "duplicate-env"
+                                | "half-release-env"
+                                | "current-literal-jobs"
                         ))
                 {
                     continue;
@@ -860,6 +867,18 @@ fn generated_plan_populations_preserve_command_policy() {
                         assert_eq!(step.cmd.matches(" --env CI ").count(), 1);
                         step.cmd = step.cmd.replace(" --env CI ", " --env CI --env CI ");
                     }
+                    // Only the complete older run is a historical spelling.
+                    "half-release-env" => {
+                        let dotslash = " --env HERMIT_VALIDATE_BUCK_DOTSLASH ";
+                        assert_eq!(step.cmd.matches(dotslash).count(), 1);
+                        step.cmd = step.cmd.replace(dotslash, " ");
+                    }
+                    // The literal worker count predates the release-build names,
+                    // so no generator ever wrote both.
+                    "current-literal-jobs" => {
+                        assert_eq!(step.cmd.matches(" --results ").count(), 1);
+                        step.cmd = step.cmd.replace(" --results ", " --jobs 8 --results ");
+                    }
                     _ => unreachable!(),
                 }
                 let mut changed_plan = plan.clone();
@@ -871,6 +890,36 @@ fn generated_plan_populations_preserve_command_policy() {
                 assert!(
                     changed_plan.planned_backend_parity_relations().is_err(),
                     "{label}/{active}/{mutation}"
+                );
+            }
+            // Plans retained before the release-build names were forwarded
+            // must keep reading with the same cells and parity relations.
+            for (spelling, literal_jobs) in
+                [("pre-release-env", false), ("pre-release-env-jobs", true)]
+            {
+                if label != "full" {
+                    continue;
+                }
+                let mut previous = cfg.clone();
+                let step = &mut previous.steps[index];
+                let release_env = crate::backend_parity_policy::RELEASE_BUILD_ENV;
+                assert_eq!(step.cmd.matches(release_env).count(), 1);
+                step.cmd = step.cmd.replacen(release_env, "", 1);
+                if literal_jobs {
+                    assert_eq!(step.cmd.matches(" --results ").count(), 1);
+                    step.cmd = step.cmd.replace(" --results ", " --jobs 8 --results ");
+                }
+                let mut previous_plan = plan.clone();
+                previous_plan.dag_json = dag_to_json(&previous);
+                assert_eq!(
+                    previous_plan.planned_cells().unwrap(),
+                    expected_selected,
+                    "{label}/{active}/{spelling}"
+                );
+                assert_eq!(
+                    previous_plan.planned_backend_parity_relations().unwrap(),
+                    expected_relations,
+                    "{label}/{active}/{spelling}"
                 );
             }
         }
