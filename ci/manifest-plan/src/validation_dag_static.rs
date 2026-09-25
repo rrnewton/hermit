@@ -218,13 +218,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
     // Six expected-guest-exit controls retain all 610 prior identities.
     // The manifest-gate width contract retains all 616 prior identities.
-    ("test.regular_crates", 617),
+    // The GlobalTime sub-microsecond elapsed-time and environment-free config
+    // fingerprint regressions retain all 610 prior selected identities.
+    ("test.regular_crates", 619),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     ("test.hermit_unit", 723),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
-    // Five resource-limit controls retain all 743 prior identities.
-    ("test.detcore_unit", 748),
+    // Five resource-limit controls retain all 743 prior identities. The
+    // fractional-boot uptime regression retains all 748 prior identities.
+    ("test.detcore_unit", 749),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -253,14 +256,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 748),
+    ("test.detcore_unit_on_host", 749),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 160),
     ("test.hermit_unit_on_host", 723),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 617),
+    ("test.regular_crates_on_host", 619),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -1273,7 +1276,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case "${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}" in cargo) cargo clean --release -p reverie-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && rm -rf target/install_pkg/rsrcs/hermit-runtime && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict ;; buck) cargo clean --release -p reverie-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt -p detcore-sabre -p hermit-install && ./scripts/build-buck-release.rs --validate-dag-install ;; *) echo "unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}" >&2; exit 2 ;; esac && sabre_source=target/install_pkg/rsrcs/libdetcore_sabre.so && sabre_before=$(sha256sum "$sabre_source" | cut -d' ' -f1) && install -m 755 "$sabre_source" target/ci/libdetcore_sabre.so && sabre_after=$(sha256sum "$sabre_source" | cut -d' ' -f1) && sabre_copy=$(sha256sum target/ci/libdetcore_sabre.so | cut -d' ' -f1) && test "$sabre_before" = "$sabre_after" && test "$sabre_before" = "$sabre_copy" && sha256sum target/ci/hermit-strict target/ci/libdetcore_sabre.so target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case "${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}" in cargo) cargo clean --release -p reverie-dbt -p detcore-sabre && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && rm -rf target/install_pkg/rsrcs/hermit-runtime && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict ;; buck) cargo clean --release -p reverie-dbt -p detcore-sabre && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt -p detcore-sabre -p hermit-install && ./scripts/build-buck-release.rs --validate-dag-install ;; *) echo "unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}" >&2; exit 2 ;; esac && sabre_source=target/install_pkg/rsrcs/libdetcore_sabre.so && sabre_before=$(sha256sum "$sabre_source" | cut -d' ' -f1) && install -m 755 "$sabre_source" target/ci/libdetcore_sabre.so && sabre_after=$(sha256sum "$sabre_source" | cut -d' ' -f1) && sabre_copy=$(sha256sum target/ci/libdetcore_sabre.so | cut -d' ' -f1) && test "$sabre_before" = "$sabre_after" && test "$sabre_before" = "$sabre_copy" && sha256sum target/ci/hermit-strict target/ci/libdetcore_sabre.so target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
