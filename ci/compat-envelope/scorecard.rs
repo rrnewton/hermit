@@ -4564,27 +4564,42 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
 /// A process issues hundreds of history reads (the self-test alone issued
 /// 1,086 identity checks, two Git executions each). The check is repeated only
 /// when this witness differs from the one captured around the last successful
-/// check: the complete process environment (which also selects the `git`
-/// binary through `PATH`), the canonical ledger path, the identity of its
-/// `.git` directory, and the exact bytes, or absence, of `HEAD` and of every
-/// repository, worktree, user, and system Git configuration file. No witness
-/// exists, so Git answers every time, when configuration can come from
-/// elsewhere: a `.git` file instead of a directory, a `commondir` file inside
-/// it, an explicit repository or configuration location in the environment, or
-/// an `include`/`includeIf` directive in any configuration file.
+/// check: the complete process environment, the identity and timestamps of the
+/// `git` executable that `PATH` selects, the canonical ledger path, the
+/// identity, owner, and mode of the ledger directory and of its `.git`,
+/// `.git/objects`, and `.git/refs` directories, and the exact bytes, or
+/// absence, of `HEAD` and of every repository, user, and system Git
+/// configuration file. The system file is witnessed at both locations a
+/// standard build reads (`/etc/gitconfig`, and `etc/gitconfig` under the
+/// executable's installation prefix). No witness exists, so Git answers every
+/// time, when configuration can come from elsewhere or relocate the work tree:
+/// a `.git` file instead of a directory, a `commondir` or `config.worktree`
+/// file inside it, an explicit repository or configuration location in the
+/// environment, or an `include`, `includeIf`, or `worktree` setting in any
+/// configuration file or environment-supplied configuration.
 #[derive(PartialEq)]
 struct LedgerIdentityWitness {
     ledger: PathBuf,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    git_dir: (u64, u64, u32, u32),
+    git: (PathBuf, u64, u64, u64, i64, i64),
+    directories: Vec<(u64, u64, u32, u32)>,
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl LedgerIdentityWitness {
     fn capture(ledger: &Path) -> Option<Self> {
+        let redirects = |bytes: &[u8]| {
+            [b"include".as_slice(), b"worktree".as_slice()]
+                .iter()
+                .any(|word| {
+                    bytes
+                        .windows(word.len())
+                        .any(|window| window.eq_ignore_ascii_case(word))
+                })
+        };
         let mut environment = env::vars_os().collect::<Vec<_>>();
         environment.sort();
-        if environment.iter().any(|(key, _)| {
+        if environment.iter().any(|(key, value)| {
             [
                 "GIT_DIR",
                 "GIT_COMMON_DIR",
@@ -4595,13 +4610,39 @@ impl LedgerIdentityWitness {
             ]
             .iter()
             .any(|name| key == name)
+                || ((key == "GIT_CONFIG_PARAMETERS"
+                    || key.to_string_lossy().starts_with("GIT_CONFIG_KEY_"))
+                    && redirects(value.as_encoded_bytes()))
         }) {
             return None;
         }
+        let executable = env::split_paths(&env::var_os("PATH")?)
+            .map(|directory| directory.join("git"))
+            .find(|candidate| {
+                fs::metadata(candidate)
+                    .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+            })?;
+        let executable = fs::canonicalize(executable).ok()?;
+        let binary = fs::metadata(&executable).ok()?;
+        let prefix_config = executable.parent()?.parent()?.join("etc/gitconfig");
         let git_dir = ledger.join(".git");
-        let metadata = fs::symlink_metadata(&git_dir).ok()?;
-        if !metadata.is_dir() {
-            return None;
+        let mut directories = Vec::with_capacity(4);
+        for path in [
+            ledger.to_path_buf(),
+            git_dir.clone(),
+            git_dir.join("objects"),
+            git_dir.join("refs"),
+        ] {
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.is_dir() {
+                return None;
+            }
+            directories.push((
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.mode(),
+            ));
         }
         let home = env::var_os("HOME").map(PathBuf::from);
         let xdg = env::var_os("XDG_CONFIG_HOME")
@@ -4611,6 +4652,7 @@ impl LedgerIdentityWitness {
             .map(|name| git_dir.join(name))
             .to_vec();
         paths.push(PathBuf::from("/etc/gitconfig"));
+        paths.push(prefix_config);
         paths.extend(xdg.map(|xdg| xdg.join("git/config")));
         paths.extend(home.map(|home| home.join(".gitconfig")));
         let mut files = Vec::with_capacity(paths.len());
@@ -4620,14 +4662,11 @@ impl LedgerIdentityWitness {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => return None,
             };
-            // A `commondir` moves the repository configuration to a file
-            // outside this witness.
-            if (bytes.is_some() && path.ends_with("commondir"))
-                || bytes.as_ref().is_some_and(|bytes| {
-                    bytes
-                        .windows(b"include".len())
-                        .any(|window| window.eq_ignore_ascii_case(b"include"))
-                })
+            // A `commondir` moves the repository configuration, and a
+            // `config.worktree` adds one, outside this witness.
+            if (bytes.is_some()
+                && (path.ends_with("commondir") || path.ends_with("config.worktree")))
+                || bytes.as_deref().is_some_and(redirects)
             {
                 return None;
             }
@@ -4636,12 +4675,15 @@ impl LedgerIdentityWitness {
         Some(Self {
             ledger: ledger.to_path_buf(),
             environment,
-            git_dir: (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.uid(),
-                metadata.mode(),
+            git: (
+                executable,
+                binary.dev(),
+                binary.ino(),
+                binary.size(),
+                binary.mtime(),
+                binary.mtime_nsec(),
             ),
+            directories,
             files,
         })
     }
@@ -27658,5 +27700,103 @@ mod evidence_identity_tests {
             "{error}"
         );
         assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod ledger_identity_witness_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn witness_changes_or_disappears_with_every_repository_input() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ledger = fs::canonicalize(fixture.path()).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&ledger)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "remote.origin.url", TEST_LEDGER_REPOSITORY]);
+        let dot_git = ledger.join(".git");
+        let original = LedgerIdentityWitness::capture(&ledger)
+            .expect("a plain checkout under this test's environment must have a witness");
+        let unchanged = || LedgerIdentityWitness::capture(&ledger).as_ref() == Some(&original);
+        assert!(unchanged());
+
+        // Every witnessed repository input changes the witness.
+        let config = fs::read(dot_git.join("config")).unwrap();
+        let mut moved = config.clone();
+        moved
+            .extend_from_slice(b"[remote \"origin\"]\n\turl = https://example.invalid/other.git\n");
+        fs::write(dot_git.join("config"), &moved).unwrap();
+        assert!(!unchanged(), "a rewritten remote must change the witness");
+        fs::write(dot_git.join("config"), &config).unwrap();
+        assert!(unchanged());
+
+        let head = fs::read(dot_git.join("HEAD")).unwrap();
+        fs::write(dot_git.join("HEAD"), b"ref: refs/heads/other\n").unwrap();
+        assert!(!unchanged(), "a moved HEAD must change the witness");
+        fs::write(dot_git.join("HEAD"), &head).unwrap();
+        assert!(unchanged());
+
+        let mode = fs::metadata(&ledger).unwrap().permissions();
+        fs::set_permissions(
+            &ledger,
+            fs::Permissions::from_mode((mode.mode() ^ 0o010) & 0o7777),
+        )
+        .unwrap();
+        assert!(
+            !unchanged(),
+            "a ledger directory mode change must change the witness"
+        );
+        fs::set_permissions(&ledger, mode).unwrap();
+        assert!(unchanged());
+
+        // A missing repository node leaves no witness, so Git answers.
+        for node in ["refs", "objects"] {
+            fs::rename(dot_git.join(node), ledger.join("moved")).unwrap();
+            assert!(LedgerIdentityWitness::capture(&ledger).is_none(), "{node}");
+            fs::rename(ledger.join("moved"), dot_git.join(node)).unwrap();
+            assert!(unchanged(), "{node}");
+        }
+
+        // Configuration that could come from elsewhere leaves no witness.
+        for (name, bytes) in [
+            ("commondir", b"../elsewhere\n".as_slice()),
+            ("config.worktree", b"[core]\n".as_slice()),
+        ] {
+            fs::write(dot_git.join(name), bytes).unwrap();
+            assert!(LedgerIdentityWitness::capture(&ledger).is_none(), "{name}");
+            fs::remove_file(dot_git.join(name)).unwrap();
+            assert!(unchanged(), "{name}");
+        }
+        for directive in [
+            b"[include]\n\tpath = /elsewhere\n".as_slice(),
+            b"[includeIf \"gitdir:/\"]\n\tpath = /elsewhere\n".as_slice(),
+            b"[core]\n\tworktree = /elsewhere\n".as_slice(),
+        ] {
+            let mut redirected = config.clone();
+            redirected.extend_from_slice(directive);
+            fs::write(dot_git.join("config"), &redirected).unwrap();
+            assert!(LedgerIdentityWitness::capture(&ledger).is_none());
+        }
+        fs::write(dot_git.join("config"), &config).unwrap();
+        assert!(unchanged());
+
+        // A `.git` file instead of a directory leaves no witness.
+        let checkout = tempfile::tempdir().unwrap();
+        let checkout = fs::canonicalize(checkout.path()).unwrap();
+        fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", dot_git.display()),
+        )
+        .unwrap();
+        assert!(LedgerIdentityWitness::capture(&checkout).is_none());
     }
 }
