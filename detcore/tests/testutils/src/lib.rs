@@ -104,6 +104,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_is_kvm: false,
     kvm_shared_dequeue_timers: false,
     backend_supports_parked_write_signal_interruption: true,
+    backend_reports_signal_interrupted_external_io: true,
     backend_virtualizes_capability_prctls: false,
     backend_defers_vfork_child_registration: false,
     virtualize_time: false,
@@ -194,6 +195,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_is_kvm: false,
     kvm_shared_dequeue_timers: false,
     backend_supports_parked_write_signal_interruption: true,
+    backend_reports_signal_interrupted_external_io: true,
     backend_virtualizes_capability_prctls: false,
     backend_defers_vfork_child_registration: false,
     virtualize_time: true, // stat* could depends on this
@@ -284,6 +286,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_is_kvm: false,
     kvm_shared_dequeue_timers: false,
     backend_supports_parked_write_signal_interruption: true,
+    backend_reports_signal_interrupted_external_io: true,
     backend_virtualizes_capability_prctls: false,
     backend_defers_vfork_child_registration: false,
     virtualize_time: true,

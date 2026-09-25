@@ -78,6 +78,8 @@ use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::KVM_2026_09_08_SELECTED_CI_CELL_COUNT;
@@ -105,7 +107,13 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
+#[cfg(test)]
+use crate::timeouts::SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
+#[cfg(test)]
+use crate::timeouts::VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::resolve_test_timeouts;
 use crate::timeouts::resolve_timeout_seconds;
 use crate::timeouts::timeout_multipliers_from_env;
@@ -6465,6 +6473,10 @@ mod tests {
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
+                + VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT
+                + SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT
+                + EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT
+                + SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),

@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 173;
+pub const NON_CI_CELL_COUNT: usize = 172;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -71,6 +71,64 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// `c-programs/dbt-pid-virtualization` verify on ptrace, promoted after the
+/// scheduler stopped writing a counterfeit `InboundSignal` request for a
+/// thread blocked in a real syscall. The guest's child exit sent a synthesized
+/// SIGCHLD to its vfork parent; the counterfeit lost the parent's continuation
+/// and the run hung. The cell passed ten consecutive strict verify runs, each
+/// on its first attempt, with a clean build of the evidence SHA, which contains
+/// the complete signal-wake series; the last commit that changes how the
+/// scheduler sends signals is its ancestor 504bb80506.
+pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA: &str = "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:04:59Z";
+pub const VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/sigsuspend-alarm-wake` verify on ptrace, a new guest for the
+/// other half of the same scheduler fix: `fire_alarm` signals a thread parked
+/// in the scheduler's `rt_sigsuspend` pool, which must be released to report
+/// its own interrupted syscall, and an alarm the arming thread's suspend mask
+/// blocks must go to a waiter whose mask admits it. The cell passed ten
+/// consecutive strict verify runs, each on its first attempt, with a clean
+/// build of the evidence SHA, which contains the complete signal-wake series;
+/// the last commit that changes how the scheduler sends signals is its ancestor
+/// 504bb80506. Guest source sha256
+/// 3f017b5c2a38b388301e0528f6c54296e2a9906bf69f23b9fe1cc5d70fa70ba2.
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
+    "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:03:24Z";
+pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
+/// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
+/// thread blocked in `select` over more than 64 descriptors, which Hermit runs
+/// as blocking external IO outside the run queue, with EINTR even under
+/// SA_RESTART, and the interruption must be committed at a deterministic turn
+/// while a sibling keeps the scheduler busy. Its `poll` phase is serviced by
+/// internal polling and is only a control. The cell passed ten consecutive
+/// strict verify runs, each on its first attempt, with a clean build of the
+/// evidence SHA, which contains the complete signal-wake series; the last
+/// commit that changes how the scheduler sends signals is its ancestor
+/// 504bb80506. Guest source sha256
+/// e8babb4316082311cdbb50cfce2128d58b0d7482e5de7d0c29dbeaca066afa40.
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
+    "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:04:39Z";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/sigsuspend-sibling-signal-wake` verify on ptrace, a new guest
+/// for two defects the signal-wake series fixes: a sibling's `tgkill` must end an
+/// `rt_sigsuspend` wait after a signal the process ignores reached the waiter
+/// first. The scheduler must requeue a waiter another guest's signal released
+/// instead of reporting a deadlock, and the real `rt_sigsuspend` must run in
+/// place rather than behind injected probe syscalls. The guest repeats both
+/// phases 25 times, because either defect loses a host-timing race only some
+/// of the time. The cell passed ten consecutive strict verify runs, each on its
+/// first attempt, with a clean build of the evidence SHA, which contains the
+/// complete signal-wake series; the last commits that change how the scheduler
+/// and `rt_sigsuspend` handle these waiters are its ancestors 504bb80506 and
+/// d85c42963d. Guest source sha256
+/// 71588c7e072454ca46298972b24ce4f93a35df407efbace484c27212c9faa69f.
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
+    "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:03:06Z";
+pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1877,7 +1935,43 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
-        assert_eq!(NON_CI_CELL_COUNT, 173);
+        assert_eq!(
+            VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA,
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
+        );
+        assert_eq!(
+            VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T17:04:59Z"
+        );
+        assert_eq!(VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
+        );
+        assert_eq!(
+            SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T17:03:24Z"
+        );
+        assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
+        );
+        assert_eq!(
+            EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T17:04:39Z"
+        );
+        assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA,
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
+        );
+        assert_eq!(
+            SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T17:03:06Z"
+        );
+        assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(NON_CI_CELL_COUNT, 172);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

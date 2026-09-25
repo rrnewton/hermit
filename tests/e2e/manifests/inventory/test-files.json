@@ -987,8 +987,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/dbt_pid_virtualization.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_pid_virtualization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/dbt_pid_virtualization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it prints virtualized pid, ppid and tid identities across fork, a grandchild, exec, waitid, vfork and vfork-plus-exec children, and checks kill and waitpid refusals for an unknown pid, so a child exit must be reported to its parent at a scheduler-ordered point"
     },
     {
       "disposition": "manifest-test",
@@ -1037,6 +1037,12 @@
       "path": "tests/c/exec_clock_continuity.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/external_io_signal_interrupt.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/external_io_signal_interrupt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends a select wait over more than 64 descriptors, which Hermit runs as blocking external IO, on a never-readable socket exactly once with EINTR on the waiting thread, including under SA_RESTART (a poll phase under SA_RESTART is an internal-polling control), with a sibling that sleeps past the alarm without blocking it, and with a sibling that blocks it while taking short sleeps, so the scheduler must send the alarm to the blocker whose mask admits it and await that thread's own report at a deterministic turn"
     },
     {
       "disposition": "manifest-test",
@@ -1841,6 +1847,18 @@
       "path": "tests/c/sigpipe_siginfo.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sigpipe_siginfo.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/sigsuspend_alarm_wake.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/sigsuspend_alarm_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends an rt_sigsuspend wait exactly once with EINTR and restores the blocked mask, so the scheduler must release the parked waiter and await its own report rather than fabricate one; a second phase requires an alarm that the arming thread's suspend mask blocks to reach the worker whose suspend mask admits it"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/sigsuspend_sibling_signal_wake.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/sigsuspend_sibling_signal_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a sibling thread's tgkill ends an rt_sigsuspend wait exactly once with EINTR on the waiting thread after a signal the process ignores (a SIG_IGN alarm, then a default-ignored SIGCHLD from an exiting child) reached the waiter first, so the scheduler must requeue a waiter released by another guest's signal and await its report, and the real rt_sigsuspend must run in place rather than behind injected probe syscalls"
     },
     {
       "disposition": "manifest-test",

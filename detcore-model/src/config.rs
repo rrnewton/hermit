@@ -180,6 +180,14 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_parked_write_signal_interruption: bool,
 
+    /// The host thread's blocked mask and pending signals in `/proc/<tid>/status` are the guest
+    /// thread's own, and every signal delivered to a thread blocked in external IO makes that syscall
+    /// return to the tool, even when the guest ignores the signal. Only then can the scheduler
+    /// send a timer signal thread-directed to such a thread and await its report.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_reports_signal_interrupted_external_io: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
     /// The execution backend virtualizes capability bounding-set and ambient-capability state.
@@ -1459,6 +1467,7 @@ mod tests {
         assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(config.backend_supports_parked_write_signal_interruption);
+        assert!(config.backend_reports_signal_interrupted_external_io);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
     }

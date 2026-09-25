@@ -253,7 +253,16 @@ pub enum ResourceID {
 
     /// Permission to perform blocking IO with an endpoint outside the deterministic container.
     /// In general these should be recorded if strict reproducibility is to be achieved.
-    BlockingExternalIO(ExternalOpId),
+    BlockingExternalIO {
+        /// The operation this wait belongs to.
+        op_id: ExternalOpId,
+        /// The thread's signal mask as a kernel sigset (bit `n - 1` blocks
+        /// signal `n`), when it stays in force for the whole call. `None` when
+        /// the call installs a temporary mask, or when the tool did not read
+        /// it. The scheduler reads it to decide whether a signal it sends
+        /// interrupts the call.
+        signal_mask: Option<u64>,
+    },
 
     // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler token.
     /// A `CLONE_VFORK` parent entering the kernel. The scheduler must not admit
@@ -319,7 +328,14 @@ pub enum ResourceID {
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.
-    BlockingRtSigsuspend(ExternalOpId),
+    BlockingRtSigsuspend {
+        /// The operation this wait belongs to.
+        op_id: ExternalOpId,
+        /// The guest's temporary mask as a kernel sigset: bit `n - 1` blocks
+        /// signal `n`. The scheduler reads it to decide whether a signal it
+        /// sends can end the wait.
+        temporary_mask: u64,
+    },
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -508,12 +524,24 @@ mod tests {
         let tid1 = DetTid::from_raw(1);
         let tid2 = DetTid::from_raw(2);
         assert_ne!(
-            ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
-            ResourceID::BlockingExternalIO(ExternalOpId::new(tid2, 7))
+            ResourceID::BlockingExternalIO {
+                op_id: ExternalOpId::new(tid1, 7),
+                signal_mask: None,
+            },
+            ResourceID::BlockingExternalIO {
+                op_id: ExternalOpId::new(tid2, 7),
+                signal_mask: None,
+            }
         );
         assert_ne!(
-            ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
-            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(tid1, 7))
+            ResourceID::BlockingExternalIO {
+                op_id: ExternalOpId::new(tid1, 7),
+                signal_mask: None,
+            },
+            ResourceID::BlockingRtSigsuspend {
+                op_id: ExternalOpId::new(tid1, 7),
+                temporary_mask: 0,
+            }
         );
         assert_ne!(
             ResourceID::ParentContinue {
