@@ -6,20 +6,23 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// An alarm interrupts a thread blocked in external IO: select(2) or poll(2)
-// on a socket that never becomes readable. Linux ends each wait with EINTR,
-// even under SA_RESTART, because select and poll are never restarted after a
-// handler (signal(7)). Under Hermit the wait runs outside the deterministic
-// run queue, so only the scheduler's alarm can end it.
+// An alarm interrupts a thread blocked in select(2) on a socket that never
+// becomes readable. Linux ends the wait with EINTR, even under SA_RESTART,
+// because select and poll are never restarted after a handler (signal(7)).
+// Hermit runs a select over more than 64 descriptors as a blocking host call,
+// outside the deterministic run queue, so only the scheduler's alarm can end
+// it.
 //
-// Phase 1 is the plain case. Phases 2 and 3 install the handler with
-// SA_RESTART, so a wait that the tracer reports as ERESTARTSYS would restart
-// and never end. Phase 4 adds a sibling that sleeps past the alarm without
-// blocking it, so a process-directed alarm the kernel gives to the sibling
-// would leave the select waiting forever. Phase 5 adds a sibling that blocks
-// the alarm and keeps the scheduler busy with short sleeps, so the wait's end
-// must be committed at a deterministic turn for two runs to agree; phases 6
-// to 8 repeat it.
+// Phase 1 is the plain case. Phase 2 installs the handler with SA_RESTART, so
+// a wait that the tracer reports as ERESTARTSYS would restart and never end.
+// Phase 3 is a control: poll(-1) under SA_RESTART, which Hermit services by
+// polling inside the run queue rather than as a blocking host call, so it does
+// not reach the external-IO path. Phase 4 adds a sibling that sleeps past the
+// alarm without blocking it, so a process-directed alarm the kernel gives to
+// the sibling would leave the select waiting forever. Phase 5 adds a sibling
+// that blocks the alarm and keeps the scheduler busy with short sleeps, so the
+// wait's end must be committed at a deterministic turn for two runs to agree;
+// phases 6 to 8 repeat it.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -35,7 +38,8 @@
 #include <time.h>
 #include <unistd.h>
 
-// Above 64, so glibc's select passes a large nfds straight to the kernel.
+// Above 64, so Hermit runs select as a blocking host call instead of polling
+// the descriptor set inside the run queue.
 #define WAIT_FD 80
 #define MAX_TICKS 5000
 
