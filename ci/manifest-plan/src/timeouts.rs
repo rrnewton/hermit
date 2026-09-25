@@ -94,6 +94,19 @@ pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
     "2a8d03bf26a938587eefa04e0a28055e5a9c1c5c";
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T12:59:46Z";
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
+/// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
+/// thread blocked in `select` or `poll` outside the run queue with EINTR, even
+/// under SA_RESTART, and the interruption must be committed at a
+/// deterministic turn while a sibling keeps the scheduler busy. The cell
+/// passed ten consecutive strict verify runs, each on its first attempt, with
+/// a build of the evidence SHA, which is the last commit that changes how the
+/// scheduler sends signals; guest source sha256
+/// 498b0cc606dba6549c0805ddea281538eeae8d21ec314151bbec416e4d42362b.
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
+    "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:00:39Z";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1918,6 +1931,15 @@ mod tests {
             "2026-09-25T12:59:46Z"
         );
         assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
+            "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d"
+        );
+        assert_eq!(
+            EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T14:00:39Z"
+        );
+        assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 172);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()

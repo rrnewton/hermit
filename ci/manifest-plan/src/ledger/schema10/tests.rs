@@ -899,9 +899,9 @@ fn generated_plan_populations_preserve_command_policy() {
     // The frozen 856-cell population gains precisely these three portable RNG
     // cells, plus each cell promoted after them. Preserve raw cardinality as well
     // as the set: duplicates are not cells.
-    assert!(exact_rng_population(&raw_expected, 861));
+    assert!(exact_rng_population(&raw_expected, 862));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(expected_cells.len(), 861);
+    assert_eq!(expected_cells.len(), 862);
     let rng = raw_expected
         .iter()
         .enumerate()
@@ -911,13 +911,13 @@ fn generated_plan_populations_preserve_command_policy() {
     assert_eq!(rng.len(), 3);
     let mut renamed = raw_expected.clone();
     renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
-    assert!(!exact_rng_population(&renamed, 861));
+    assert!(!exact_rng_population(&renamed, 862));
     let mut duplicate = raw_expected.clone();
     duplicate[rng[0]] = duplicate[rng[1]].clone();
-    assert!(!exact_rng_population(&duplicate, 861));
+    assert!(!exact_rng_population(&duplicate, 862));
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
-    assert!(!exact_rng_population(&missing, 861));
+    assert!(!exact_rng_population(&missing, 862));
     let pre_fold_json = pre_fold_expected_json(&expected_json);
     let pre_fold_cells = crate::validation_dag::expected_cells_from_json(&pre_fold_json)
         .unwrap()
@@ -925,19 +925,19 @@ fn generated_plan_populations_preserve_command_policy() {
         .map(exact_identity)
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
-    assert_eq!(pre_fold_cells.len(), 861);
+    assert_eq!(pre_fold_cells.len(), 862);
     for (label, tag, retained_command, cell_count) in [
         (
             "full",
             "e2e.manifest_backend_parity_c",
             LAST_LIVE_PORTABLE_PARITY_SELECTOR,
-            861,
+            862,
         ),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            857,
+            858,
         ),
     ] {
         let live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
