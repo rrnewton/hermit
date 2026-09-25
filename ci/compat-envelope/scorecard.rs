@@ -1996,8 +1996,29 @@ impl ResultRow {
                     index + 1
                 )
             })?;
+            self.require_declared_disposition(index, attempt, &report)?;
         }
         Ok(())
+    }
+
+    /// Both readers of a matched attempt, the `verify-results` admission gate
+    /// and the comparison evidence behind the catalogue, share this check: a
+    /// declared row's match counts only if it ends exactly as declared.
+    fn require_declared_disposition(
+        &self,
+        index: usize,
+        attempt: &JsonValue,
+        report: &canonical_verdict::VerificationReport,
+    ) -> Result<(), String> {
+        match &self.expected_guest_exit {
+            Some(declared) if !declared_failure_matches(&self.mode, declared, attempt, report) => {
+                Err(format!(
+                    "attempt {} matched report does not end as its row declares",
+                    index + 1
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Require the exact `BitwiseInfoV1` comparison recorded by validate,
@@ -2362,15 +2383,7 @@ impl ResultRow {
                         canonical_verdict::Verdict::Matched
                             if report.verified && report.bitwise_parity =>
                         {
-                            if let Some(declared) = &self.expected_guest_exit {
-                                if !declared_failure_matches(&self.mode, declared, attempt, &report)
-                                {
-                                    return Err(format!(
-                                        "attempt {} matched report does not end as its row declares",
-                                        index + 1
-                                    ));
-                                }
-                            }
+                            self.require_declared_disposition(index, attempt, &report)?;
                         }
                         canonical_verdict::Verdict::Matched => {
                             return Err(format!(
@@ -26730,6 +26743,10 @@ mod post_verdict_transaction_tests {
         fixture.publish_rows(std::slice::from_ref(&row));
         let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
         let identity = candidates[&id][0].evidence_identity.clone();
+        // The `verify-results` admission gate reads the same candidates; the
+        // genuine declared row is admitted there as well.
+        let expected = BTreeSet::from([id.clone()]);
+        assert_eq!(verify_candidate_set(&expected, candidates), Ok(1));
 
         let genuine = serde_json::json!({
             "code": 3, "signal": null, "reason": reason, "evidence_sha256": identity,
@@ -26839,7 +26856,9 @@ mod post_verdict_transaction_tests {
         // report whose two outputs differ, or whose outputs disagree with its
         // own guest disposition, is already refused by the canonical report
         // parser, so only the consistent tamper, all three saying 4, reaches
-        // and needs the reader's own declaration check.
+        // and needs the reader's own declaration check. Each row is refused by
+        // both readers: its comparison evidence and the `verify-results`
+        // admission gate over the same candidates.
         const DISPOSITION: &str = "matched report does not end as its row declares";
         const INCONSISTENT: &str = "output disposition contradicts its verification result";
         const OPERANDS: &str = "verification operands differ in status, stdout, or stderr";
@@ -26891,6 +26910,9 @@ mod post_verdict_transaction_tests {
                 .err()
                 .unwrap_or_else(|| panic!("{label}: the raw row's evidence was admitted"));
             assert!(error.contains(refusal), "{label}: {error}");
+            let error = verify_candidate_set(&expected, candidates)
+                .expect_err(&format!("{label}: verify-results admitted the raw row"));
+            assert!(error.contains(refusal), "{label} verify-results: {error}");
             let error = publish_raw_snapshot(&mut fixture, &[event(Some(audit))]).unwrap_err();
             assert!(error.contains(refusal), "{label}: {error}");
             assert!(
@@ -26908,6 +26930,12 @@ mod post_verdict_transaction_tests {
             .err()
             .expect("Hermit status 4: the raw row's evidence was admitted");
         assert!(error.contains(DISPOSITION), "Hermit status 4: {error}");
+        let error = verify_candidate_set(&expected, candidates)
+            .expect_err("Hermit status 4: verify-results admitted the raw row");
+        assert!(
+            error.contains(DISPOSITION),
+            "Hermit status 4 verify-results: {error}"
+        );
     }
 
     /// The reader's own declaration check, over every declared form: an exit
