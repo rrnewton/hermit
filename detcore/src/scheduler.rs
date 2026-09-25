@@ -2989,12 +2989,26 @@ impl Scheduler {
     /// mask the scheduler knows, so a released waiter is never chosen, and a
     /// target outside the pool, or with no admitting waiter to take its
     /// place, is returned unchanged.
+    ///
+    /// Only a backend that guarantees the chosen waiter reports the signal
+    /// (`backend_reports_signal_interrupted_external_io`) redirects. Elsewhere
+    /// the scheduler does not await that report, so a redirect would change
+    /// the delivery without making it deterministic, and the target stands.
+    ///
+    /// Known limit: a POSIX timer created with `SIGEV_THREAD_ID` is treated as
+    /// process-directed by `handle_timer_create`, so it can be redirected here
+    /// as well. That erasure predates the redirect: its process-directed
+    /// `kill` already let the kernel give the signal to any thread that
+    /// admits it, and the redirect picks from that same set.
     fn redirect_past_blocking_rt_sigsuspend(
         &mut self,
         detpid: DetPid,
         target: DetTid,
         signal: Signal,
     ) -> DetTid {
+        if !self.backend_reports_signal_interrupted_external_io {
+            return target;
+        }
         let reason = match self.blocked.rt_sigsuspend_blockers.get(&target) {
             Some(wait) if wait.released => "was released by an earlier guest signal",
             Some(wait) if wait.blocks(signal) => "is blocked by its rt_sigsuspend mask",
@@ -3025,9 +3039,12 @@ impl Scheduler {
     ///
     /// Only this case needs a thread-directed send, because only here does the
     /// scheduler await that target's own report: `wake_signaled_guest` requeues
-    /// it, or on SaBRe leaves it in its pool until it reports. Any
-    /// other target keeps the process-directed send, which lets the kernel give
-    /// the signal to a sibling when the target's mask blocks it, as Linux does.
+    /// it. That needs a backend on which the signal is guaranteed to make the
+    /// waiter report (`backend_reports_signal_interrupted_external_io`); on
+    /// any other backend the waiter stays in its pool and the process-directed
+    /// send stands. Any other target keeps the process-directed send, which
+    /// lets the kernel give the signal to a sibling when the target's mask
+    /// blocks it, as Linux does.
     ///
     /// A waiter released by another guest's signal keeps the process-directed
     /// send too. It may be running a handler, or be back under its original
@@ -3036,6 +3053,9 @@ impl Scheduler {
     /// On ptrace that waiter reports anyway, for the signal that released it,
     /// because even a signal it ignores stops it for its tracer.
     fn rt_sigsuspend_wake_thread_group(&self, dettid: DetTid, signal: Signal) -> Option<DetPid> {
+        if !self.backend_reports_signal_interrupted_external_io {
+            return None;
+        }
         let wait = self.blocked.rt_sigsuspend_blockers.get(&dettid)?;
         if !wait.known_to_admit(signal) {
             return None;
@@ -3059,8 +3079,12 @@ impl Scheduler {
     /// A `vfork` parent is excluded: the kernel's wait for its child ends
     /// only for a fatal signal, so no report is coming. A blocker with an
     /// unknown mask, or one another guest's signal released, keeps the
-    /// process-directed send, as in `rt_sigsuspend_wake_thread_group`.
+    /// process-directed send, as in `rt_sigsuspend_wake_thread_group`, and so
+    /// does every blocker on a backend that does not guarantee the report.
     fn external_io_wake_thread_group(&self, dettid: DetTid, signal: Signal) -> Option<DetPid> {
+        if !self.backend_reports_signal_interrupted_external_io {
+            return None;
+        }
         let wait = self.blocked.external_io_blockers.get(&dettid)?;
         if !wait.known_to_admit(signal) || self.vfork_barriers.contains_key(&dettid) {
             return None;
@@ -3479,8 +3503,14 @@ impl Scheduler {
         // `requeue_signal_released_waiters` awaits the report at a
         // deterministic point. Tracked in
         // https://github.com/rrnewton/hermit/issues/3222.
+        //
+        // An `rt_sigsuspend` waiter stays in its pool too on every backend
+        // without that guarantee, not only SaBRe: DBT emulates the guest's
+        // mask inside DynamoRIO, and LiteInst and KVM re-invoke the Tool
+        // callback, so the report the scheduler would await might never come.
         if external_io_blocker
-            || (self.backend_reports_physical_process_exits && rt_sigsuspend_wait.is_some())
+            || (!self.backend_reports_signal_interrupted_external_io
+                && rt_sigsuspend_wait.is_some())
         {
             debug!(
                 "[dtid {}] signal {} stays pending until the blocked operation reports it.",
@@ -3491,7 +3521,12 @@ impl Scheduler {
         // `rt_sigsuspend` can only complete through a signal its temporary
         // mask admits. Such a signal makes the thread rejoin the run queue at
         // this deterministic point, and the scheduler awaits its own
-        // `InboundSignal` request there. `signal_guest` sent the signal to this
+        // `InboundSignal` request there. An admitted signal that the thread
+        // ignores does not end the wait on Linux, but on ptrace it still stops
+        // the thread for its tracer: the interrupted call returns
+        // `ERESTARTNOHAND`, the thread reports the signal, and the kernel's
+        // restart arrives as a new `rt_sigsuspend` that re-enters the pool, so
+        // the guest still sees one uninterrupted wait. `signal_guest` sent the signal to this
         // thread alone, so the report comes from it even when it had not yet
         // entered `rt_sigsuspend`. A waiter that another guest's signal had
         // already released was sent it process-directed instead, and reports
@@ -3510,7 +3545,7 @@ impl Scheduler {
                 return;
             }
             info!(
-                "[dtid {}] signal {} releases rt_sigsuspend; awaiting its report",
+                "[dtid {}] signal {} is admitted by the rt_sigsuspend mask; awaiting its report",
                 dettid, signal
             );
             self.remove_blocking_entries(&dettid);
@@ -7574,9 +7609,10 @@ mod test {
         assert!(!scheduler.run_queue.contains_tid(waiter));
 
         // A backend that does not guarantee the report keeps even a blocker
-        // whose mask admits the signal in its pool: SaBRe drops an ignored
-        // signal, and LiteInst and KVM re-invoke the Tool callback. The tool
-        // reads no mask there, so this blocker's mask is hypothetical.
+        // whose mask admits the signal in its pool, and sends it the signal
+        // process-directed as before: SaBRe drops an ignored signal, and
+        // LiteInst and KVM re-invoke the Tool callback. The tool reads no mask
+        // there, so this blocker's mask is hypothetical.
         let sabre = Config {
             backend_reports_physical_process_exits: true,
             backend_reports_signal_interrupted_external_io: false,
@@ -7587,12 +7623,12 @@ mod test {
             ..Config::default()
         };
         for config in [&sabre, &other] {
-            let (mut scheduler, leader, waiter) = external_io_group(config);
+            let (mut scheduler, _leader, waiter) = external_io_group(config);
             let wait = ExternalIoWait::new(ExternalOpId::new(waiter, 291), Some(0));
             scheduler.blocked.external_io_blockers.insert(waiter, wait);
             assert_eq!(
                 scheduler.signal_send(waiter, Signal::SIGALRM),
-                SignalSend::ThreadDirected(leader)
+                SignalSend::ProcessDirected
             );
             scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
             assert_eq!(
@@ -7738,32 +7774,73 @@ mod test {
     }
 
     #[test]
-    fn signal_leaves_sabre_rt_sigsuspend_waiting_for_its_own_report() {
-        let config = Config {
+    fn signal_leaves_rt_sigsuspend_in_its_pool_on_a_backend_without_a_guaranteed_report() {
+        // Only a backend that guarantees the waiter reports a signal it is
+        // sent (`backend_reports_signal_interrupted_external_io`) may requeue
+        // it to await that report. SaBRe drops an ignored signal, DBT emulates
+        // the mask inside DynamoRIO, and LiteInst and KVM re-invoke the Tool
+        // callback; requeued there, the scheduler could wait for a report that
+        // never comes. So even a waiter whose mask admits the signal stays in
+        // its pool, the alarm is not redirected to it, and the send stays
+        // process-directed, as for external-IO blockers on those backends.
+        let sabre = Config {
             backend_reports_physical_process_exits: true,
+            backend_reports_signal_interrupted_external_io: false,
             ..Config::default()
         };
-        let mut scheduler = Scheduler::new(&config);
-        let waiter = DetTid::from_raw(11);
-        let op_id = ExternalOpId::new(waiter, 291);
-        register_known_thread(&mut scheduler, waiter);
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, RtSigsuspendWait::new(op_id, 0));
-
-        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
-
-        assert_eq!(
+        let other = Config {
+            backend_reports_signal_interrupted_external_io: false,
+            ..Config::default()
+        };
+        for config in [&sabre, &other] {
+            let (mut scheduler, leader, waiter) = external_io_group(config);
+            let op_id = ExternalOpId::new(waiter, 291);
+            let alarm_bit = 1_u64 << (Signal::SIGALRM as i32 - 1);
+            scheduler.blocked.rt_sigsuspend_blockers.insert(
+                leader,
+                RtSigsuspendWait::new(ExternalOpId::new(leader, 7), alarm_bit),
+            );
             scheduler
                 .blocked
                 .rt_sigsuspend_blockers
-                .get(&waiter)
-                .map(|wait| wait.op_id),
-            Some(op_id)
+                .insert(waiter, RtSigsuspendWait::new(op_id, 0));
+
+            assert_eq!(
+                scheduler.redirect_past_blocking_rt_sigsuspend(leader, leader, Signal::SIGALRM),
+                leader
+            );
+            assert_eq!(
+                scheduler.signal_send(waiter, Signal::SIGALRM),
+                SignalSend::ProcessDirected
+            );
+
+            scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+            assert_eq!(
+                scheduler
+                    .blocked
+                    .rt_sigsuspend_blockers
+                    .get(&waiter)
+                    .map(|wait| wait.op_id),
+                Some(op_id)
+            );
+            assert!(!scheduler.run_queue.contains_tid(waiter));
+            assert_eq!(request_resources(&scheduler, waiter), None);
+        }
+
+        // The same waiter on ptrace is sent the signal thread-directed and
+        // requeued, so the gate above is what keeps it in its pool.
+        let (mut scheduler, leader, waiter) = external_io_group(&Config::default());
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait::new(ExternalOpId::new(waiter, 291), 0),
         );
-        assert!(!scheduler.run_queue.contains_tid(waiter));
-        assert_eq!(request_resources(&scheduler, waiter), None);
+        assert_eq!(
+            scheduler.signal_send(waiter, Signal::SIGALRM),
+            SignalSend::ThreadDirected(leader)
+        );
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+        assert!(scheduler.run_queue.contains_tid(waiter));
     }
 
     #[test]
