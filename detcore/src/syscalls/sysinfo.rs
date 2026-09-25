@@ -85,7 +85,7 @@ fn sysinfo_uptime_seconds(
     uptime_offset_seconds: u64,
 ) -> u64 {
     let elapsed = now - boot;
-    let fractional = u64::from(elapsed.as_nanos() % NANOS_PER_SECOND != 0);
+    let fractional = u64::from(!elapsed.as_nanos().is_multiple_of(NANOS_PER_SECOND));
     uptime_offset_seconds + elapsed.as_secs() + fractional
 }
 
