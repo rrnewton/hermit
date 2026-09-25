@@ -122,11 +122,14 @@ binds beneath the command directory, and has safehermit execute the stage inside
 its bounded service. A readback written immediately before the candidate starts
 must show the command directory as `/tmp`, `/tmp` as the working directory and
 `TMPDIR`, and root mapped from exactly the proxy's uid; otherwise the invocation
-is refused. The proxy refuses the twins unless the pinned node runs exactly the
-host payload with the same deadlines and differs in environment only by
-`HERMIT_E2E_EMPTY_WORKDIR=/test`, the host command is the reviewed strict
-invocation, the host node does not request `/test`, and no host variable
-collides with a candidate proxy binding.
+is refused. Each DBT invocation retains that readback and a typed record of
+the stage (`private-tmp.json`); the retained audit requires both for every DBT
+run and neither for any other role, re-checks the readback against the record,
+and binds both hashes in the invocation manifest. The proxy refuses the twins
+unless the pinned node runs exactly the host payload with the same deadlines and
+differs in environment only by `HERMIT_E2E_EMPTY_WORKDIR=/test`, the host command
+is the reviewed strict invocation, the host node does not request `/test`, and no
+host variable collides with a candidate proxy binding.
 The pinned-root node itself is unchanged and still runs in authoritative
 validation. For the current strict DBT mode that independently requires
 28 TSV rows (27 selected plus the documented `pthread_lifecycle` gap), 23
