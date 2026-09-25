@@ -208,9 +208,10 @@ static bool check_stable(const char *root, const char *label,
 
 static bool is_zero_kb_field(const char *name) {
   static const char *fields[] = {
-      "Rss",           "Pss",        "Pss_Dirty",    "Pss_Anon",
-      "Pss_File",      "Pss_Shmem",  "Shared_Clean", "Shared_Dirty",
-      "Private_Clean", "Referenced", "KSM",          "SwapPss",
+      "Rss",           "Pss",           "Pss_Dirty",    "Pss_Anon",
+      "Pss_File",      "Pss_Shmem",     "Shared_Clean", "Shared_Dirty",
+      "Private_Clean", "Private_Dirty", "Referenced",   "KSM",
+      "SwapPss",
   };
   for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); ++index) {
     if (strcmp(name, fields[index]) == 0) {

@@ -2906,6 +2906,7 @@ fn sanitize_smaps_rollup(contents: &[u8]) -> Vec<u8> {
         "Shared_Clean",
         "Shared_Dirty",
         "Private_Clean",
+        "Private_Dirty",
         "Referenced",
         "KSM",
         "SwapPss",
@@ -2980,6 +2981,10 @@ fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> 
         "Shared_Clean",
         "Shared_Dirty",
         "Private_Clean",
+        // Counts a page as dirty when its page-cache copy is dirty, not only
+        // when the guest wrote it, so a freshly written executable reports
+        // 4 kB per text mapping until host writeback runs.
+        "Private_Dirty",
         "Referenced",
         "KSM",
         "SwapPss",
@@ -3018,11 +3023,9 @@ fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> 
                 accounting_count += 1;
             } else {
                 let valid_static_field = match label {
-                    "Size" | "KernelPageSize" | "MMUPageSize" | "Private_Dirty" | "Anonymous"
-                    | "LazyFree" | "AnonHugePages" | "ShmemPmdMapped" | "FilePmdMapped"
-                    | "Shared_Hugetlb" | "Private_Hugetlb" | "Swap" | "Locked" => {
-                        is_smaps_kilobyte_value(value)
-                    }
+                    "Size" | "KernelPageSize" | "MMUPageSize" | "Anonymous" | "LazyFree"
+                    | "AnonHugePages" | "ShmemPmdMapped" | "FilePmdMapped" | "Shared_Hugetlb"
+                    | "Private_Hugetlb" | "Swap" | "Locked" => is_smaps_kilobyte_value(value),
                     "THPeligible" | "ProtectionKey" => is_smaps_integer_value(value),
                     "VmFlags" => value
                         .split_whitespace()
@@ -5760,10 +5763,40 @@ MMUPageSize:           4 kB\n\
 Rss:\t0 kB\n\
 Pss:\t0 kB\n\
 Shared_Clean:\t0 kB\n\
-Private_Dirty:         0 kB\n\
+Private_Dirty:\t0 kB\n\
 THPeligible:           0\n\
 ProtectionKey:         0\n\
 VmFlags: rd ex mr mw me ac\n"
+        );
+    }
+
+    /// Measured on a ptrace run of a just-compiled executable: its three
+    /// read-only and text mappings reported `Private_Dirty: 4 kB` until host
+    /// writeback cleaned the page cache, then `0 kB`, with no guest write in
+    /// between. Two verify runs that straddled writeback diverged.
+    #[test]
+    fn smaps_hides_page_cache_dirty_state() {
+        let dirty = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n\
+Private_Dirty:         4 kB\n\
+VmFlags: rd mr mw me\n";
+        let clean = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:                   4 kB\n\
+Private_Dirty:         0 kB\n\
+VmFlags: rd mr mw me\n";
+
+        let expected = b"00400000-00401000 r--p 00000000 00:2a 99 /guest\n\
+Size:                  4 kB\n\
+Rss:\t0 kB\n\
+Private_Dirty:\t0 kB\n\
+VmFlags: rd mr mw me\n";
+        assert_eq!(sanitize_smaps(dirty, &BTreeMap::new()), expected);
+        assert_eq!(sanitize_smaps(clean, &BTreeMap::new()), expected);
+        assert_eq!(
+            sanitize_smaps_rollup(b"Private_Dirty:        12 kB\n"),
+            b"Private_Dirty:\t0 kB\n"
         );
     }
 
