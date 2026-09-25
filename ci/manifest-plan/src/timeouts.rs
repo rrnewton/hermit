@@ -131,6 +131,19 @@ pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
     "d3c13a40a243715c1688cb9ba3baa01ce37aed89";
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T10:52:42Z";
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
+/// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
+/// thread blocked in `select` or `poll` outside the run queue with EINTR, even
+/// under SA_RESTART, and the interruption must be committed at a
+/// deterministic turn while a sibling keeps the scheduler busy. The cell
+/// passed ten consecutive strict verify runs, each on its first attempt, with
+/// a build of the evidence SHA, which is the last commit that changes how the
+/// scheduler sends signals; guest source sha256
+/// 498b0cc606dba6549c0805ddea281538eeae8d21ec314151bbec416e4d42362b.
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
+    "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:00:39Z";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
 /// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
@@ -2052,6 +2065,15 @@ mod tests {
             "2026-09-25T10:52:42Z"
         );
         assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
+            "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d"
+        );
+        assert_eq!(
+            EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T14:00:39Z"
+        );
+        assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             SELECT_REPLAY_2026_10_03_TESTS.len()

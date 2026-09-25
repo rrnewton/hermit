@@ -349,6 +349,12 @@
       "why": "tests/c/exit_reaping_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this auto-reap and SIGCHLD probe and runs its three modes under strict verification on ptrace and on in-guest LiteInst, asserting the same exact output from both; it remains a guest fixture because a generic manifest cannot express one program run in three modes with per-mode expected lines on two backends in one test."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/external_io_signal_interrupt.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/external_io_signal_interrupt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends a select wait over more than 64 descriptors, which Hermit runs as blocking external IO, on a never-readable socket exactly once with EINTR on the waiting thread, including under SA_RESTART (a poll phase under SA_RESTART is an internal-polling control), with a sibling that sleeps past the alarm without blocking it, and with a sibling that blocks it while taking short sleeps, so the scheduler must send the alarm to the blocker whose mask admits it and await that thread's own report at a deterministic turn"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/external_signal_interrupt.c",
       "runner": "hermit-cli/tests/external_signal_interrupt.rs",
