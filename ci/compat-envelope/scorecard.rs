@@ -58,6 +58,7 @@ use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
 use hermit_manifest_plan::stress_series::SeriesCoordinates;
 use hermit_manifest_plan::stress_series::SeriesDeclaredGuestExit;
+use hermit_manifest_plan::stress_series::SeriesDeclaredGuestExitAttempt;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictEvidence;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesOutcome;
@@ -3743,9 +3744,58 @@ fn retain_selected_custom_results(
     Ok(retained)
 }
 
+/// Every current raw result and each validate series event that covers the
+/// same run, cell, source tree and outer attempt must agree on the guest-exit
+/// declaration, its evidence identity, and the complete attempt audit. This
+/// runs over comparable cells as well as selected custom commands, because
+/// declared verify rows are ordinary comparable cells.
+///
+/// The audit is retained on the series row precisely so that it outlives the
+/// transient raw artifacts. A series event whose raw row is not in this census
+/// is therefore not reconciled here; only its own shape is checked on read.
+fn reconcile_declared_guest_exits(
+    results: &BTreeMap<CellId, Vec<ResultCandidate>>,
+    series: &[SeriesRow],
+) -> Result<(), String> {
+    for (id, candidates) in results {
+        let key = series_cell_key(id);
+        for candidate in candidates {
+            let row = &candidate.row;
+            for event in series.iter().filter(|event| {
+                event.producer == SeriesProducer::Validate
+                    && event.run_id == row.run_id
+                    && event.cell() == key
+                    && event.series.tree == row.hermit_sha
+                    && event.series.run_index <= row.attempt
+                    && series_last_run_index(event).is_some_and(|last| row.attempt <= last)
+            }) {
+                if !declared_guest_exit_matches(
+                    row,
+                    &candidate.evidence_identity,
+                    event.series.declared_guest_exit.as_ref(),
+                ) {
+                    return Err(format!(
+                        "{} outer attempt {} series event {} disagrees with its raw result's guest-exit declaration, evidence identity or attempts",
+                        display_id(id),
+                        row.attempt,
+                        event.event_id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether a series row carries exactly the declaration its raw result row
-/// was admitted under, bound to that row's evidence identity. A declared
+/// was admitted under, bound to that row's evidence identity, and exactly the
+/// attempt audit the series writer projects from that same raw row. A declared
 /// result without the audit, or an audit without a declaration, disagrees.
+///
+/// The digest alone does not bind the audit's attempts: a series row could
+/// keep the real identity while altering a report digest, omitting a failed
+/// attempt, or inventing a PASS. The attempts are therefore re-derived from
+/// the raw row and compared whole, in order.
 fn declared_guest_exit_matches(
     row: &ResultRow,
     evidence_identity: &str,
@@ -3758,9 +3808,53 @@ fn declared_guest_exit_matches(
                 && expected.signal == series.signal
                 && expected.reason == series.reason
                 && series.evidence_sha256 == evidence_identity
+                && declared_guest_exit_attempts(row)
+                    .is_some_and(|attempts| attempts == series.attempts)
         }
         _ => false,
     }
+}
+
+/// The attempt audit the series writer (`_declared_guest_exit_evidence` in
+/// `ci-hub/series/series.py`) projects from a raw result row. `None` when the
+/// writer would have refused the row, so a malformed raw attempt can never
+/// match any audit.
+fn declared_guest_exit_attempts(row: &ResultRow) -> Option<Vec<SeriesDeclaredGuestExitAttempt>> {
+    if row.attempts.is_empty() {
+        return None;
+    }
+    row.attempts
+        .iter()
+        .map(|attempt| {
+            let attempt = attempt.as_object()?;
+            let text = |name: &str| {
+                attempt
+                    .get(name)?
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+            };
+            let disposition = |name: &str| match attempt.get(name) {
+                None | Some(JsonValue::Null) => Some(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .map(Some),
+            };
+            let verification_report_sha256 = match attempt.get("verification_report_sha256") {
+                None | Some(JsonValue::Null) => None,
+                Some(value) => Some(value.as_str().filter(|value| is_sha256(value))?.to_owned()),
+            };
+            Some(SeriesDeclaredGuestExitAttempt {
+                index: text("index")?,
+                outcome: text("outcome")?,
+                status: disposition("status")?,
+                signal: disposition("signal")?,
+                timed_out: attempt.get("timed_out")?.as_bool()?,
+                verification_report_sha256,
+            })
+        })
+        .collect()
 }
 
 fn tracked_current_summary(derived: &Derived) -> String {
@@ -7898,6 +7992,7 @@ where
         &result_rows,
         &snapshot.rows,
     )?;
+    reconcile_declared_guest_exits(&result_rows, &snapshot.rows)?;
     // The complete census and finalized proof above still cover every raw row.
     // Only comparable cells enter the existing grade/observation projection.
     let result_rows = result_rows
@@ -11184,6 +11279,7 @@ fn validate_scorecard_snapshot(
         "failure_class",
         "no_verdict_evidence",
         "pressure_evidence",
+        "declared_guest_exit",
         "run_index",
         "attempt",
         "num_runs",
@@ -26468,6 +26564,200 @@ mod post_verdict_transaction_tests {
         assert_eq!(serde_json::to_value(tracked.cells).unwrap(), comparable);
     }
 
+    /// Publish `events` verbatim as the held scorecard snapshot, bypassing
+    /// `SeriesRow` serialization so a test can present bytes the typed writer
+    /// would never produce, and run the production projector over them.
+    fn publish_raw_snapshot(fixture: &mut Fixture, events: &[JsonValue]) -> Result<(), String> {
+        let mut value =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+        value["rows"] = serde_json::json!(events);
+        value["rows_read"] = events.len().into();
+        value["source"]["published_rows"] = events.len().into();
+        value["rows_sha256"] = format!(
+            "{:x}",
+            Sha256::digest(canonical_snapshot_rows_bytes(events).unwrap())
+        )
+        .into();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &value).unwrap();
+        fixture.publish()
+    }
+
+    /// A declared verify cell is an ordinary comparable cell whose series row
+    /// retains the complete attempt audit, so the reason a nonzero guest exit
+    /// passed outlives the transient raw run artifacts. Drive that audit
+    /// through the production path end to end -- the held snapshot parser, the
+    /// raw result reader and the write-back reconciliation -- and require that
+    /// only the audit projected from the raw row publishes.
+    #[test]
+    fn declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let id = CellId {
+            lane: "portable".into(),
+            category: "util-c".into(),
+            test: "util-c/pmu-skid".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        };
+        assert!(
+            fixture.cells().cells.iter().any(|cell| cell.id == id),
+            "the declared cell must be comparable, not a selected custom command"
+        );
+        let reason = "the fixture guest exits 3 on purpose";
+        let mut row = result_row(&measured);
+        for (key, value) in [
+            ("lane", &id.lane),
+            ("category", &id.category),
+            ("test", &id.test),
+            ("mode", &id.mode),
+            ("backend", &id.backend),
+        ] {
+            row[key] = value.clone().into();
+        }
+        let argv = vec![
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-allow=failure",
+            "--",
+            "fixture",
+        ];
+        row["argv"] = serde_json::json!(argv);
+        row["effective_args"] = serde_json::json!(&argv[1..]);
+        row["shell_command"] = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        )
+        .into();
+        for key in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+            row["attempts"][0][key] = row[key].clone();
+        }
+        // Hermit exits with the guest's status under --verify-allow=failure,
+        // and both compared runs show the declared exit.
+        row["expected_guest_exit"] =
+            serde_json::json!({"code": 3, "signal": null, "reason": reason});
+        row["attempts"][0]["status"] = 3.into();
+        let mut report: JsonValue =
+            serde_json::from_str(row["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        report["guest_exit_code"] = 3.into();
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["exit_code"] = 3.into();
+        }
+        let report = serde_json::to_string(&report).unwrap();
+        let report_sha256 = format!("{:x}", Sha256::digest(report.as_bytes()));
+        row["attempts"][0]["verification_report_sha256"] = report_sha256.clone().into();
+        row["attempts"][0]["verification_report"] = report.into();
+        fixture.publish_rows(std::slice::from_ref(&row));
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let identity = candidates[&id][0].evidence_identity.clone();
+
+        let genuine = serde_json::json!({
+            "code": 3, "signal": null, "reason": reason, "evidence_sha256": identity,
+            "attempts": [{"index": "1", "outcome": "PASS", "status": 3, "signal": null,
+                "timed_out": false, "verification_report_sha256": report_sha256}]
+        });
+        let event = |audit: Option<JsonValue>| {
+            let mut series = serde_json::json!({
+                "cell": series_cell_key(&id), "tree": measured, "outcome": "passed",
+                "result": "pass", "failure_class": null, "run_index": 1, "attempt": 1,
+                "num_runs": 1, "source_tree_dirty": false, "machine_shortname": "fixture",
+                "kernel_version": "fixture",
+                "host_capabilities": {
+                    "cpuid-faulting": {"present": false, "evidence": "synthetic fixture"},
+                    "kvm": {"present": false, "evidence": "synthetic fixture"}}
+            });
+            if let Some(audit) = audit {
+                series["declared_guest_exit"] = audit;
+            }
+            serde_json::json!({
+                "schema": "stress-series/v3", "event_id": "declared-exit",
+                "event_type": "series.observation", "emitted_at": "2026-09-22T00:00:00Z",
+                "team": "hermit", "host": "fixture", "producer": "validate",
+                "run_id": row["run_id"], "series": series
+            })
+        };
+        let with = |edit: &dyn Fn(&mut JsonValue)| {
+            let mut audit = genuine.clone();
+            edit(&mut audit);
+            event(Some(audit))
+        };
+        const RECONCILE: &str = "disagrees with its raw result's guest-exit declaration";
+        let mut unknown_series_field = event(Some(genuine.clone()));
+        unknown_series_field["series"]["declared_guest_exit_note"] = "x".into();
+        for (label, tampered, refusal) in [
+            (
+                "altered report digest",
+                with(&|audit| {
+                    audit["attempts"][0]["verification_report_sha256"] = "e".repeat(64).into()
+                }),
+                RECONCILE,
+            ),
+            (
+                "omitted attempt",
+                with(&|audit| audit["attempts"] = serde_json::json!([])),
+                "attempts must be nonempty",
+            ),
+            (
+                "invented PASS",
+                with(&|audit| {
+                    audit["attempts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "index": "2", "outcome": "PASS", "status": 3, "signal": null,
+                            "timed_out": false, "verification_report_sha256": "e".repeat(64)
+                        }))
+                }),
+                RECONCILE,
+            ),
+            ("audit dropped", event(None), RECONCILE),
+            (
+                "declaration changed",
+                with(&|audit| audit["reason"] = "another reason".into()),
+                RECONCILE,
+            ),
+            (
+                "another identity",
+                with(&|audit| audit["evidence_sha256"] = "0".repeat(64).into()),
+                RECONCILE,
+            ),
+            (
+                "unknown audit field",
+                with(&|audit| audit["note"] = "x".into()),
+                "is malformed",
+            ),
+            (
+                "unknown series field",
+                unknown_series_field,
+                "series has an unknown field",
+            ),
+        ] {
+            let error = publish_raw_snapshot(&mut fixture, &[tampered]).unwrap_err();
+            assert!(error.contains(refusal), "{label}: {error}");
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "{label} changed history"
+            );
+        }
+
+        publish_raw_snapshot(&mut fixture, &[event(Some(genuine.clone()))]).unwrap();
+        let published = fixture.cells();
+        let cell = published.cells.iter().find(|cell| cell.id == id).unwrap();
+        assert!(
+            cell.observations.iter().any(|observation| {
+                observation.hermit_shas.contains(&measured)
+                    && observation.results.contains(&ObservedResult::Pass)
+            }),
+            "the genuine declared attempt did not publish"
+        );
+    }
+
     #[test]
     fn invalid_snapshot_refuses_before_history_work_but_after_publication_authority() {
         let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
@@ -27693,12 +27983,25 @@ mod evidence_identity_tests {
         let reason = "the fixture guest fails on purpose";
         let row = declared(Some(7), None, reason);
         let identity = row.evidence_identity().unwrap();
+        // The fixture row's single raw attempt, exactly as the series writer
+        // projects it.
+        let projected = vec![SeriesDeclaredGuestExitAttempt {
+            index: "1".into(),
+            outcome: "ERROR".into(),
+            status: Some(75),
+            signal: None,
+            timed_out: false,
+            verification_report_sha256: Some(
+                "0cf756d63a02c73f989586d9f6572c428ce52d55a510ffa4659baab4bdcef405".into(),
+            ),
+        }];
+        assert_eq!(declared_guest_exit_attempts(&row).unwrap(), projected);
         let audit = |code, signal, reason: &str, digest: &str| SeriesDeclaredGuestExit {
             code,
             signal,
             reason: reason.into(),
             evidence_sha256: digest.into(),
-            attempts: Vec::new(),
+            attempts: projected.clone(),
         };
         assert!(declared_guest_exit_matches(
             &row,
@@ -27732,6 +28035,112 @@ mod evidence_identity_tests {
             ORDINARY,
             Some(&audit(Some(7), None, reason, ORDINARY))
         ));
+    }
+
+    #[test]
+    fn series_audit_attempts_must_equal_the_raw_row_projection() {
+        let reason = "the fixture guest fails on purpose";
+        let row = declared(Some(7), None, reason);
+        let identity = row.evidence_identity().unwrap();
+        let genuine = SeriesDeclaredGuestExit {
+            code: Some(7),
+            signal: None,
+            reason: reason.into(),
+            evidence_sha256: identity.clone(),
+            attempts: declared_guest_exit_attempts(&row).unwrap(),
+        };
+        assert!(declared_guest_exit_matches(&row, &identity, Some(&genuine)));
+        let with = |edit: &dyn Fn(&mut Vec<SeriesDeclaredGuestExitAttempt>)| {
+            let mut audit = genuine.clone();
+            edit(&mut audit.attempts);
+            audit
+        };
+        let invented_pass = SeriesDeclaredGuestExitAttempt {
+            index: "2".into(),
+            outcome: "PASS".into(),
+            status: Some(7),
+            signal: None,
+            timed_out: false,
+            verification_report_sha256: Some("e".repeat(64)),
+        };
+        // Each tamper keeps the real raw-row evidence identity; only the
+        // attempt comparison can refuse it.
+        for (label, tampered) in [
+            (
+                "altered report digest",
+                with(&|attempts| attempts[0].verification_report_sha256 = Some("e".repeat(64))),
+            ),
+            (
+                "dropped report digest",
+                with(&|attempts| attempts[0].verification_report_sha256 = None),
+            ),
+            ("omitted attempt", with(&|attempts| attempts.clear())),
+            (
+                "invented PASS appended",
+                with(&|attempts| attempts.push(invented_pass.clone())),
+            ),
+            (
+                "invented PASS replacing the failure",
+                with(&|attempts| attempts[0] = invented_pass.clone()),
+            ),
+            (
+                "failure relabelled PASS",
+                with(&|attempts| {
+                    attempts[0].outcome = "PASS".into();
+                    attempts[0].status = Some(7);
+                }),
+            ),
+            (
+                "reordered",
+                with(&|attempts| attempts.insert(0, invented_pass.clone())),
+            ),
+            ("timeout hidden", {
+                let mut audit = genuine.clone();
+                audit.attempts[0].timed_out = true;
+                audit
+            }),
+        ] {
+            assert_eq!(tampered.evidence_sha256, identity, "{label}");
+            assert!(
+                !declared_guest_exit_matches(&row, &identity, Some(&tampered)),
+                "{label} was accepted"
+            );
+        }
+        // A raw attempt the series writer would refuse projects to nothing,
+        // so no audit can match it.
+        for (label, field, value) in [
+            ("blank index", "index", serde_json::json!(" ")),
+            ("numeric index", "index", serde_json::json!(1)),
+            ("missing outcome", "outcome", JsonValue::Null),
+            ("negative status", "status", serde_json::json!(-1)),
+            ("boolean signal", "signal", serde_json::json!(true)),
+            ("fractional status", "status", serde_json::json!(7.0)),
+            ("string timed_out", "timed_out", serde_json::json!("false")),
+            (
+                "uppercase report digest",
+                "verification_report_sha256",
+                serde_json::json!(
+                    "0CF756D63A02C73F989586D9F6572C428CE52D55A510FFA4659BAAB4BDCEF405"
+                ),
+            ),
+        ] {
+            let mut malformed = row.clone();
+            malformed.attempts[0][field] = value;
+            assert!(
+                declared_guest_exit_attempts(&malformed).is_none(),
+                "{label} projected"
+            );
+            let identity = malformed.evidence_identity().unwrap();
+            let mut audit = genuine.clone();
+            audit.evidence_sha256 = identity.clone();
+            assert!(
+                !declared_guest_exit_matches(&malformed, &identity, Some(&audit)),
+                "{label} was accepted"
+            );
+        }
+        let mut empty = row.clone();
+        empty.attempts.clear();
+        assert!(declared_guest_exit_attempts(&empty).is_none());
     }
 
     #[test]
