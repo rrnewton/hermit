@@ -80,6 +80,18 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA: &str = "ef2e6307b35b0d4b1aac32895f2ca527e26525e4";
 pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:25:51Z";
 pub const VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/sigsuspend-alarm-wake` verify on ptrace, a new guest for the
+/// other half of the same scheduler fix: `fire_alarm` signals a thread parked
+/// in the scheduler's `rt_sigsuspend` pool, which must be released to report
+/// its own interrupted syscall. The guest is added by the commit that selects
+/// it, so the SHA names the scheduler source the evidence binary was built
+/// from, including the `rt_sigsuspend` mask check; the ten consecutive strict
+/// verify runs used guest source sha256
+/// 266615f93b82f8b3c108514903885631be1b025c2bc0c689d1182947c62307da.
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
+    "d8c5c0ed43f71cadef3ceedef9537f96e8a183e2";
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T10:41:54Z";
+pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1895,6 +1907,15 @@ mod tests {
             "2026-09-25T09:25:51Z"
         );
         assert_eq!(VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
+            "d8c5c0ed43f71cadef3ceedef9537f96e8a183e2"
+        );
+        assert_eq!(
+            SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T10:41:54Z"
+        );
+        assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 172);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
