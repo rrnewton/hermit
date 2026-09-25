@@ -1498,6 +1498,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             old_robust_list_head = thread_state.take_robust_list_for_exec();
         }
 
+        // A successful exec replaces the image holding any records this
+        // handler captured, so send them first.
+        let time = guest.thread_state().thread_logical_time.clone();
+        crate::tool_global::flush_records(guest, time, old_mm_id).await;
+
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
 
