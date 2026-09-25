@@ -13728,6 +13728,10 @@ fn self_test() -> Result<(), String> {
                 })
                 .unwrap();
                 serde_json::json!({
+                    // The runner's status for this report's clean guest exit;
+                    // a matched attempt without one is refused.
+                    "status": 0,
+                    "signal": null,
                     "argv":["hermit","run"],
                     "guest_argv":["fixture"],
                     "env":{"LC_ALL":"C"},
