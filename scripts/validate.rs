@@ -17015,7 +17015,12 @@ mod nextest_timeout_tests {
                 // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
                 + 1
                 // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-                + 1,
+                + 1
+                // Four portable ptrace verify cells of https://github.com/rrnewton/hermit/pull/3224:
+                // c-programs/dbt-pid-virtualization, c-programs/sigsuspend-alarm-wake,
+                // c-programs/external-io-signal-interrupt and
+                // c-programs/sigsuspend-sibling-signal-wake.
+                + 4,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
