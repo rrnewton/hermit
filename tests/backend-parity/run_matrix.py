@@ -30,6 +30,13 @@ BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
 ISOLATED_WORKDIR_ENV = "HERMIT_E2E_EMPTY_WORKDIR"
 HERMETIC_TEST_WORKDIR = "/test"
+# The Buck shadow's candidate proxy launches Hermit through safehermit, whose
+# host disk bound needs the initial user namespace and whose systemd unit would
+# escape an outer one anyway.  For that machine-checked proxy only, this stage
+# is handed to the proxy as data and runs one process lower, inside the unit.
+MATRIX_PROXY_ENV = "HERMIT_BUCK_PHASE1_MATRIX_PROXY"
+MATRIX_PROXY = REPOSITORY / "scripts/build-buck-release.rs"
+MATRIX_PRIVATE_TMP_HANDOFF = "--matrix-private-tmp"
 
 DBT_PRIVATE_TMP_SCRIPT = """\
 private_tmp=$1
@@ -345,6 +352,25 @@ def command_in_private_tmp(
         *mounts,
         *command,
     ]
+
+
+def dbt_private_tmp_command(
+    command: list[str], host_tmp: Path, preserve: tuple[Path, ...] = ()
+) -> list[str]:
+    """Wrap a DBT command, or hand the same stage to the shadow proxy."""
+    wrapped = command_in_private_tmp(command, host_tmp, preserve)
+    mode = os.environ.get(MATRIX_PROXY_ENV, "")
+    if mode == "":
+        return wrapped
+    if mode != "1":
+        raise MatrixError(f"{MATRIX_PROXY_ENV} must be 1 when set, got {mode!r}")
+    if Path(command[0]).resolve() != MATRIX_PROXY.resolve():
+        raise MatrixError(
+            f"{MATRIX_PROXY_ENV}=1 hands the private /tmp stage only to "
+            f"{MATRIX_PROXY}, not {command[0]}"
+        )
+    stage = wrapped[: len(wrapped) - len(command)]
+    return [command[0], MATRIX_PRIVATE_TMP_HANDOFF, str(len(stage)), *stage, *command[1:]]
 
 
 def compile_fixture(source: Path, output: Path, *flags: str) -> Path:
@@ -811,7 +837,7 @@ def hermit_command(
             preserve.append(verify_json.parent)
         if install_dir := os.environ.get("HERMIT_INSTALL_DIR"):
             preserve.append(Path(install_dir))
-        return command_in_private_tmp(command, host_tmp, tuple(preserve))
+        return dbt_private_tmp_command(command, host_tmp, tuple(preserve))
     return command
 
 
