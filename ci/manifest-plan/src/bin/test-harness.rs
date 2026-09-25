@@ -3348,6 +3348,11 @@ report.write_bytes((root/'verification.json').read_bytes())
             validation_audit_worker_capacity(true, Some("2")).configured(),
             DEFAULT_VALIDATE_AUDIT_JOBS
         );
+        assert_eq!(
+            validation_audit_worker_capacity(true, Some("32")).configured(),
+            DEFAULT_VALIDATE_AUDIT_JOBS,
+            "an oversized explicit width must remain clamped to two audit workers"
+        );
         for malformed in [Some("0"), Some("not-a-width")] {
             assert_eq!(
                 validation_audit_worker_capacity(true, malformed).configured(),
