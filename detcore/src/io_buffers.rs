@@ -167,6 +167,27 @@ fn iovec_extents_from_slice(iovecs: &[libc::iovec], moved: i64) -> Vec<BufferExt
     out
 }
 
+/// `iovec_extents_from_slice` over plain (address, capacity) segments.
+fn segment_extents(segments: &[(usize, usize)], moved: i64) -> Vec<BufferExtent> {
+    let mut remaining = u64::try_from(moved).unwrap_or(0);
+    let mut out = Vec::new();
+    for &(addr, len) in segments {
+        if remaining == 0 {
+            break;
+        }
+        if addr == 0 || len == 0 {
+            continue;
+        }
+        let take = (len as u64).min(remaining);
+        out.push(BufferExtent {
+            addr: addr as u64,
+            len: take,
+        });
+        remaining -= take;
+    }
+    out
+}
+
 /// Return the guest `iovec` array described by a vectored I/O syscall.
 ///
 /// Keep the family in one match so adding a syscall variant cannot update the
@@ -202,6 +223,160 @@ fn msghdr_extents<M: MemoryAccess>(
     let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(msg_addr).ok_or(Errno::EFAULT)?;
     let message: libc::msghdr = memory.read_value(address)?;
     iovec_extents(memory, message.msg_iov as usize, message.msg_iovlen, moved)
+}
+
+/// Per-message `iovec` arrays snapshotted before a message syscall runs.
+///
+/// Linux permits `msg_control` to overlap the `msghdr` itself, so after a
+/// successful receive the header fields this module needs (`msg_iov`,
+/// `msg_iovlen`) may hold control data instead of pointers. Re-reading the
+/// header at that point turns a successful receive into an artificial
+/// `EFAULT` -- exactly what `handle_recvmsg` already avoids for its own
+/// timestamp rewrite. The snapshot is taken pre-dispatch in `lib.rs`.
+#[derive(Debug, Clone)]
+pub(crate) struct PreCallMsgExtents {
+    /// (address, capacity) per segment, per message. Plain scalars, not
+    /// `libc::iovec`, so the snapshot stays `Send` across syscall awaits.
+    messages: Vec<Vec<(usize, usize)>>,
+}
+
+fn read_iovec_array<M: MemoryAccess>(
+    memory: &M,
+    iov_addr: usize,
+    iov_count: usize,
+) -> Result<Vec<(usize, usize)>, Error> {
+    if iov_addr == 0 || iov_count == 0 {
+        return Ok(Vec::new());
+    }
+    let count = iov_count.min(libc::UIO_MAXIOV as usize);
+    let address: AddrMut<'_, libc::iovec> = AddrMut::from_raw(iov_addr).ok_or(Errno::EFAULT)?;
+    // SAFETY: `iovec` is a plain C record; an all-zero value is a valid
+    // staging value immediately overwritten by `read_values`.
+    let mut iovecs: Vec<libc::iovec> = (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    memory.read_values(address.into(), &mut iovecs)?;
+    Ok(iovecs
+        .iter()
+        .map(|iov| (iov.iov_base as usize, iov.iov_len))
+        .collect())
+}
+
+/// Snapshot the message headers of a `recvmsg`/`sendmsg`/`recvmmsg`/
+/// `sendmmsg` call before dispatch, or `None` for any other syscall.
+pub(crate) fn capture_pre_call_msg_extents<M: MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+) -> Option<PreCallMsgExtents> {
+    let snapshot = match call {
+        Syscall::Recvmsg(c) => {
+            let addr = c.msg().map_or(0, |p| p.as_raw());
+            let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(addr)?;
+            let message: libc::msghdr = memory.read_value(address).ok()?;
+            vec![read_iovec_array(memory, message.msg_iov as usize, message.msg_iovlen).ok()?]
+        }
+        Syscall::Sendmsg(c) => {
+            let addr = c.msg().map_or(0, |p| p.as_raw());
+            let address: AddrMut<'_, libc::msghdr> = AddrMut::from_raw(addr)?;
+            let message: libc::msghdr = memory.read_value(address).ok()?;
+            vec![read_iovec_array(memory, message.msg_iov as usize, message.msg_iovlen).ok()?]
+        }
+        Syscall::Recvmmsg(c) => {
+            read_mmsg_iovecs(memory, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen()).ok()?
+        }
+        Syscall::Sendmmsg(c) => {
+            read_mmsg_iovecs(memory, c.msgvec().map_or(0, |p| p.as_raw()), c.vlen()).ok()?
+        }
+        _ => return None,
+    };
+    Some(PreCallMsgExtents { messages: snapshot })
+}
+
+fn read_mmsg_iovecs<M: MemoryAccess>(
+    memory: &M,
+    mmsg_addr: usize,
+    vlen: u32,
+) -> Result<Vec<Vec<(usize, usize)>>, Error> {
+    if mmsg_addr == 0 || vlen == 0 {
+        return Ok(Vec::new());
+    }
+    let count = (vlen as usize).min(libc::UIO_MAXIOV as usize);
+    let address: AddrMut<'_, libc::mmsghdr> = AddrMut::from_raw(mmsg_addr).ok_or(Errno::EFAULT)?;
+    // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a valid
+    // staging value immediately overwritten by `read_values`.
+    let mut headers: Vec<libc::mmsghdr> =
+        (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    memory.read_values(address.into(), &mut headers)?;
+    let mut out = Vec::with_capacity(headers.len());
+    for header in &headers {
+        out.push(read_iovec_array(
+            memory,
+            header.msg_hdr.msg_iov as usize,
+            header.msg_hdr.msg_iovlen,
+        )?);
+    }
+    Ok(out)
+}
+
+/// Resolve extents from a pre-call snapshot. Single-message calls are
+/// bounded by the return value; batch calls keep the per-message `msg_len`
+/// bound read after completion, and skip a message whose length field was
+/// itself overwritten by an overlapping control buffer.
+fn pre_call_extents<M: MemoryAccess>(
+    memory: &M,
+    pre: &PreCallMsgExtents,
+    call: &Syscall,
+    ret: i64,
+) -> Result<Vec<BufferExtent>, Error> {
+    match call {
+        Syscall::Recvmsg(_) | Syscall::Sendmsg(_) => Ok(segment_extents(
+            pre.messages.first().map_or(&[][..], Vec::as_slice),
+            ret,
+        )),
+        Syscall::Recvmmsg(c) => {
+            batch_pre_call_extents(memory, pre, c.mmsg().map_or(0, |p| p.as_raw()), ret)
+        }
+        Syscall::Sendmmsg(c) => {
+            batch_pre_call_extents(memory, pre, c.msgvec().map_or(0, |p| p.as_raw()), ret)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn batch_pre_call_extents<M: MemoryAccess>(
+    memory: &M,
+    pre: &PreCallMsgExtents,
+    mmsg_addr: usize,
+    delivered: i64,
+) -> Result<Vec<BufferExtent>, Error> {
+    let count = usize::try_from(delivered)
+        .unwrap_or(0)
+        .min(pre.messages.len());
+    // Best-effort post-call `msg_len` values; an overlapping control buffer
+    // may have destroyed them, in which case capacity is the only bound left.
+    let post_lens: Option<Vec<u32>> = (|| {
+        let address: AddrMut<'_, libc::mmsghdr> = AddrMut::from_raw(mmsg_addr)?;
+        let mut headers: Vec<libc::mmsghdr> =
+            (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+        memory.read_values(address.into(), &mut headers).ok()?;
+        Some(headers.iter().map(|h| h.msg_len).collect())
+    })();
+    let mut out = Vec::new();
+    for (index, iovecs) in pre.messages.iter().take(count).enumerate() {
+        // Only a trustworthy post-call `msg_len` bounds the hash. When the
+        // length field itself was destroyed by an overlapping control
+        // buffer, hashing snapshotted capacity would digest bytes the
+        // kernel never wrote (uninitialized guest memory, free to differ
+        // between runs), so that message contributes no extent.
+        let Some(bound) = post_lens
+            .as_ref()
+            .and_then(|lens| lens.get(index).copied())
+            .map(i64::from)
+            .filter(|len| *len <= iovecs.iter().map(|i| i.1 as i64).sum::<i64>())
+        else {
+            continue;
+        };
+        out.extend(segment_extents(iovecs, bound));
+    }
+    Ok(out)
 }
 
 /// Number of completed messages whose per-message lengths are meaningful.
@@ -317,6 +492,7 @@ fn extents<M: MemoryAccess>(
     memory: &M,
     call: &Syscall,
     ret: i64,
+    pre: Option<&PreCallMsgExtents>,
 ) -> Result<Vec<BufferExtent>, Error> {
     // Nothing was written on a failed or empty call -- for every syscall whose
     // return value is a byte count. `ret_gates_output` is what keeps the poll
@@ -324,6 +500,16 @@ fn extents<M: MemoryAccess>(
     // so the exclusion cannot be undone by moving code.
     if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
+    }
+    // Message syscalls resolve from the pre-call snapshot when one exists:
+    // the post-call header may have been overwritten by its own control data.
+    if let Some(pre) = pre
+        && matches!(
+            call,
+            Syscall::Recvmsg(_) | Syscall::Sendmsg(_) | Syscall::Recvmmsg(_) | Syscall::Sendmmsg(_)
+        )
+    {
+        return pre_call_extents(memory, pre, call, ret);
     }
     if let Some((iov_addr, iov_count)) = iovec_extent_arguments(call) {
         return iovec_extents(memory, iov_addr, iov_count, ret);
@@ -485,6 +671,7 @@ pub(crate) fn detlog_io_buffers<G, T>(
     call: &Syscall,
     ret: i64,
     dettid: DetTid,
+    pre: Option<&PreCallMsgExtents>,
 ) -> Result<(), Error>
 where
     G: Guest<T>,
@@ -516,7 +703,7 @@ where
     };
     let moved_extents = {
         let memory = guest.memory();
-        extents(&memory, call, ret)?
+        extents(&memory, call, ret, pre)?
     };
     for extent in moved_extents {
         let (whole, chunk, chunks) = extent_digests(guest, extent.addr, extent.len)?;
@@ -765,9 +952,9 @@ mod tests {
                 iovec_extent_arguments(&call),
                 Some((iovecs.as_ptr() as usize, 3))
             );
-            assert_eq!(extents(&memory, &call, 6).unwrap(), expected);
-            assert!(extents(&memory, &call, 0).unwrap().is_empty());
-            assert!(extents(&memory, &call, -1).unwrap().is_empty());
+            assert_eq!(extents(&memory, &call, 6, None).unwrap(), expected);
+            assert!(extents(&memory, &call, 0, None).unwrap().is_empty());
+            assert!(extents(&memory, &call, -1, None).unwrap().is_empty());
         }
     }
 
@@ -865,7 +1052,7 @@ mod tests {
                 len: 2,
             },
         ];
-        assert_eq!(extents(&memory, &call, 1).unwrap(), first_message);
+        assert_eq!(extents(&memory, &call, 1, None).unwrap(), first_message);
 
         let both_messages = vec![
             BufferExtent {
@@ -885,9 +1072,53 @@ mod tests {
                 len: 4,
             },
         ];
-        assert_eq!(extents(&memory, &call, 2).unwrap(), both_messages);
-        assert!(extents(&memory, &call, 0).unwrap().is_empty());
-        assert!(extents(&memory, &call, -1).unwrap().is_empty());
+        assert_eq!(extents(&memory, &call, 2, None).unwrap(), both_messages);
+        assert!(extents(&memory, &call, 0, None).unwrap().is_empty());
+        assert!(extents(&memory, &call, -1, None).unwrap().is_empty());
         assert_eq!(completed_mmsghdr_count(1, 2), 1);
+    }
+
+    /// Regression for `c-programs/socket-timestamp-edge-cases`: the guest
+    /// points `msg_control` at its own `msghdr`, so a successful receive
+    /// overwrites `msg_iov`/`msg_iovlen` with control bytes. Computing
+    /// extents from the post-call header reads those bytes as a pointer and
+    /// fails the (successful) syscall with `EFAULT`; the pre-call snapshot
+    /// must resolve the real extent instead.
+    #[test]
+    fn aliased_control_buffer_resolves_extents_from_the_pre_call_snapshot() {
+        let payload = [0_u8; 4];
+        let iovecs = [libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        }];
+        // SAFETY: `msghdr` is a plain C record initialized below before
+        // LocalMemory reads it.
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = iovecs.as_ptr() as *mut libc::iovec;
+        header.msg_iovlen = iovecs.len();
+        let call = Syscall::Recvmsg(
+            syscalls::Recvmsg::new().with_msg(Some(AddrMut::from_ptr(&header).unwrap())),
+        );
+        let memory = LocalMemory::new();
+        let pre = capture_pre_call_msg_extents(&memory, &call)
+            .expect("recvmsg snapshot must be captured");
+
+        // Simulate the kernel writing a cmsg over the header: `msg_iov` no
+        // longer holds a readable pointer.
+        header.msg_iov = 0xdead_beefusize as *mut libc::iovec;
+        header.msg_iovlen = 0x1bad_b002;
+
+        assert!(
+            extents(&memory, &call, 1, None).is_err(),
+            "post-call-only resolution must fail on the overwritten header"
+        );
+        assert_eq!(
+            extents(&memory, &call, 1, Some(&pre)).unwrap(),
+            vec![BufferExtent {
+                addr: payload.as_ptr() as u64,
+                len: 1,
+            }],
+            "pre-call snapshot must resolve the extent the kernel filled"
+        );
     }
 }

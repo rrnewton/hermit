@@ -59,6 +59,13 @@ pub const KVM_2026_09_08_MAX_REQUIRED_WALL_SECONDS: u64 = 20;
 pub const IPC_DETERMINISM_CHAOS_EVIDENCE_SHA: &str = "0b26fb782192e017ef9103e27d017f8c73ceeeb4";
 pub const IPC_DETERMINISM_CHAOS_EVIDENCE_COMPLETED_UTC: &str = "2026-09-15T22:07:28Z";
 pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
+/// Two ptrace verify cells re-selected after twenty clean canonical
+/// repetitions each at the fix head (base `1bf22b4f5ba322b7cc2f80e3dd251cc2baabc548`
+/// plus the Detcore fixes in the same change): `c-programs/socket-timestamp-edge-cases`
+/// (aliased-recvmsg io-buffer EFAULT fix; 20/20 matched) and
+/// `system-utils/procfs-sanitized-paths` (20/20 matched under its manifest
+/// comparison profile `compare_io_buffers: false, rcb_time: false`).
+pub const PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 2;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.

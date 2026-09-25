@@ -1580,7 +1580,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+            FdType::Timerfd => return self.handle_timerfd_read(guest, call).await,
+            FdType::Signalfd | FdType::Eventfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -3872,6 +3873,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Timerfd,
         )
         .await?;
+        // All Detcore clocks read one virtual timeline (see
+        // handle_clock_gettime), so the id is recorded for introspection;
+        // deadlines for every clockid are computed on that same timeline.
+        let clockid = reverie::syscalls::FromToRaw::into_raw(call.clockid()) as i32;
+        let _ = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.with_timerfd(|state| state.clockid = clockid)
+        });
         Ok(fd as i64)
     }
 
@@ -3886,22 +3894,154 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(self.record_or_replay(guest, call).await?)
     }
 
-    /// timerfd_settime system call.
+    /// The detfd must name a timerfd. Linux returns `EINVAL` (not `EBADF`)
+    /// for a descriptor of the wrong type on timerfd calls, verified against
+    /// a pipe descriptor natively.
+    fn require_timerfd<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> Result<(), Error> {
+        let ty = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.ty())
+            .map_err(Error::Errno)?;
+        if ty != FdType::Timerfd {
+            return Err(Errno::EINVAL.into());
+        }
+        Ok(())
+    }
+
+    /// timerfd_settime: arm/disarm against the virtual clock. The host
+    /// descriptor is deliberately never armed, so host time cannot make the
+    /// timerfd readable early (the `timer-family-identity` divergence).
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdSettime,
     ) -> Result<i64, Error> {
-        self.notification_fd_control(guest, call.into()).await
+        Self::require_timerfd(guest, call.fd())?;
+        if call.flags() & !libc::TFD_TIMER_ABSTIME != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let new_ptr = call.new_value().ok_or(Errno::EFAULT)?;
+        let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
+        for ts in [new.it_value, new.it_interval] {
+            if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+                return Err(Errno::EINVAL.into());
+            }
+        }
+        let now = thread_observe_time(guest).await;
+        let interval_ns = super::time::timespec_to_ns(new.it_interval);
+        let value_ns = super::time::timespec_to_ns(new.it_value);
+        let deadline = if value_ns == 0 {
+            None
+        } else if call.flags() & libc::TFD_TIMER_ABSTIME != 0 {
+            Some(LogicalTime::from_nanos(value_ns))
+        } else {
+            Some(now + std::time::Duration::from_nanos(value_ns))
+        };
+        let old = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| {
+                detfd.with_timerfd(|state| {
+                    state.collect(now);
+                    let old = *state;
+                    state.deadline = deadline;
+                    state.interval_nanos = interval_ns;
+                    state.pending = 0;
+                    old
+                })
+            })
+            .map_err(Error::Errno)?;
+        if let Some(old_ptr) = call.old_value() {
+            guest
+                .memory()
+                .write_value(old_ptr, &crate::fd::timerfd_itimerspec(old, now))?;
+        }
+        Ok(0)
     }
 
-    /// timerfd_gettime system call.
+    /// timerfd_gettime: report virtual remaining time and interval.
     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdGettime,
     ) -> Result<i64, Error> {
-        self.notification_fd_control(guest, call.into()).await
+        Self::require_timerfd(guest, call.fd())?;
+        let curr_ptr = call.value().ok_or(Errno::EFAULT)?;
+        let now = thread_observe_time(guest).await;
+        let state = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| {
+                detfd.with_timerfd(|state| {
+                    state.collect(now);
+                    *state
+                })
+            })
+            .map_err(Error::Errno)?;
+        guest
+            .memory()
+            .write_value(curr_ptr, &crate::fd::timerfd_itimerspec(state, now))?;
+        Ok(0)
+    }
+
+    /// Read a virtual timerfd: return and clear pending expirations, or wait
+    /// (blocking descriptor) / `EAGAIN` (nonblocking) until the virtual
+    /// deadline. Never reads the host descriptor.
+    pub async fn handle_timerfd_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<i64, Error> {
+        let buf = call.buf().ok_or(Errno::EFAULT)?;
+        if call.len() < 8 {
+            return Err(Errno::EINVAL.into());
+        }
+        loop {
+            let now = thread_observe_time(guest).await;
+            let (pending, deadline, nonblocking) = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| {
+                    (
+                        detfd.with_timerfd(|state| state.collect(now)),
+                        detfd.timerfd_state().deadline,
+                        detfd.is_nonblocking(),
+                    )
+                })
+                .map_err(Error::Errno)?;
+            if pending > 0 {
+                guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| {
+                        detfd.with_timerfd(|state| state.pending = 0)
+                    })
+                    .map_err(Error::Errno)?;
+                guest.memory().write_exact(buf, &pending.to_ne_bytes())?;
+                return Ok(8);
+            }
+            if nonblocking {
+                return Err(Errno::EAGAIN.into());
+            }
+            let Some(deadline) = deadline else {
+                // Disarmed: Linux blocks until another thread arms the
+                // timerfd (or a signal arrives), so poll the virtual state
+                // through the scheduler instead of inventing EAGAIN.
+                let mut rsrc = Resources::new(guest.thread_state().dettid);
+                rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+                rsrc.fyi("timerfd_read");
+                if matches!(
+                    resource_request(guest, rsrc).await,
+                    ResumeStatus::Signaled(_)
+                ) {
+                    return Err(Errno::EINTR.into());
+                }
+                continue;
+            };
+            let request = Self::sleep_request_abs(guest, deadline).await;
+            if matches!(
+                resource_request(guest, request).await,
+                ResumeStatus::Signaled(_)
+            ) {
+                return Err(Errno::EINTR.into());
+            }
+        }
     }
 
     /// inotify_init1 system call.

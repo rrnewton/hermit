@@ -55,14 +55,14 @@ fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
 
 /// Flatten a `timespec` to nanoseconds. Negative fields are not valid for the
 /// timer syscalls we handle; treat them as zero rather than panicking.
-fn timespec_to_ns(ts: libc::timespec) -> u64 {
+pub(crate) fn timespec_to_ns(ts: libc::timespec) -> u64 {
     let secs = ts.tv_sec.max(0) as u64;
     let nsec = ts.tv_nsec.max(0) as u64;
     secs.saturating_mul(1_000_000_000).saturating_add(nsec)
 }
 
 /// Inverse of [`timespec_to_ns`].
-fn ns_to_timespec(ns: u64) -> libc::timespec {
+pub(crate) fn ns_to_timespec(ns: u64) -> libc::timespec {
     libc::timespec {
         tv_sec: (ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (ns % 1_000_000_000) as libc::c_long,

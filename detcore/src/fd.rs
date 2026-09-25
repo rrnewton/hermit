@@ -166,6 +166,16 @@ struct OpenFileDescription {
     /// after entering the guest can already carry a lock.
     #[serde(default)]
     flock_mode_known: bool,
+    /// Virtual timerfd state, shared by every alias of the timerfd. The host
+    /// descriptor is never armed: expiry is computed from virtual time so
+    /// `read`/`poll`/`epoll` readiness cannot leak host timing.
+    #[serde(default)]
+    timerfd: TimerfdVirtual,
+    /// Epoll interest list (`target fd -> (events, data)`) for an epoll
+    /// instance, recorded at `epoll_ctl` so `epoll_wait` can synthesize
+    /// virtual-timerfd readiness without consulting the host.
+    #[serde(default)]
+    epoll_targets: std::collections::BTreeMap<RawFd, (u32, u64)>,
     /// Whether Detcore has EVER known this description's lock state.
     ///
     /// This separates two different unknowns that `flock_mode_known == false`
@@ -176,6 +186,63 @@ struct OpenFileDescription {
     /// wrong. Only the second is a reason to refuse `vfork`.
     #[serde(default)]
     flock_mode_ever_known: bool,
+}
+
+/// Virtual state of one timerfd: an absolute virtual deadline, a repeat
+/// interval (`0` = one-shot), and expirations not yet consumed by `read`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TimerfdVirtual {
+    pub clockid: i32,
+    pub deadline: Option<LogicalTime>,
+    pub interval_nanos: u64,
+    pub pending: u64,
+}
+
+impl TimerfdVirtual {
+    /// Fold every expiry at or before `now` into `pending`, advancing an
+    /// interval timer's deadline past `now`. Returns the pending count.
+    pub fn collect(&mut self, now: LogicalTime) -> u64 {
+        self.collect_added(now).0
+    }
+
+    /// Like `collect`, also returning how many expirations this call added
+    /// (edge-triggered readiness fires exactly when that count is nonzero).
+    pub fn collect_added(&mut self, now: LogicalTime) -> (u64, u64) {
+        let before = self.pending;
+        let Some(deadline) = self.deadline else {
+            return (self.pending, 0);
+        };
+        if now < deadline {
+            return (self.pending, 0);
+        }
+        if self.interval_nanos == 0 {
+            self.pending += 1;
+            self.deadline = None;
+            return (self.pending, self.pending - before);
+        }
+        let elapsed = u128::from(now.as_nanos() - deadline.as_nanos());
+        let interval = u128::from(self.interval_nanos);
+        let count = elapsed / interval + 1;
+        self.pending = self.pending.saturating_add(count as u64);
+        let next = u128::from(deadline.as_nanos()) + count * interval;
+        self.deadline = Some(LogicalTime::from_big_nanos(next));
+        (self.pending, self.pending - before)
+    }
+}
+
+/// Render virtual timerfd state as the `itimerspec` Linux reports.
+pub(crate) fn timerfd_itimerspec(state: TimerfdVirtual, now: LogicalTime) -> libc::itimerspec {
+    let remaining = match state.deadline {
+        Some(deadline) if deadline > now => deadline.as_nanos() - now.as_nanos(),
+        // An expired timer reports 0, like Linux; callers collect first, so
+        // an interval timer reaches here with its next deadline in future.
+        Some(_) => 0,
+        None => 0,
+    };
+    libc::itimerspec {
+        it_interval: crate::syscalls::time::ns_to_timespec(state.interval_nanos),
+        it_value: crate::syscalls::time::ns_to_timespec(remaining),
+    }
 }
 
 impl PartialEq for DetFd {
@@ -225,6 +292,8 @@ impl DetFd {
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
+                timerfd: TimerfdVirtual::default(),
+                epoll_targets: std::collections::BTreeMap::new(),
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -553,6 +622,38 @@ impl DetFd {
         self.description().socket_receive_timestamp
     }
 
+    /// Mutate this timerfd's virtual state under its open-file lock.
+    pub(crate) fn with_timerfd<R>(&self, f: impl FnOnce(&mut TimerfdVirtual) -> R) -> R {
+        f(&mut self.description().timerfd)
+    }
+
+    /// Snapshot this timerfd's virtual state.
+    pub(crate) fn timerfd_state(&self) -> TimerfdVirtual {
+        self.description().timerfd
+    }
+
+    /// Record one epoll interest entry (ADD/MOD) or remove it (DEL).
+    pub(crate) fn epoll_set_target(&self, target: RawFd, entry: Option<(u32, u64)>) {
+        let mut description = self.description();
+        match entry {
+            Some(entry) => {
+                description.epoll_targets.insert(target, entry);
+            }
+            None => {
+                description.epoll_targets.remove(&target);
+            }
+        }
+    }
+
+    /// Snapshot this epoll instance's interest list.
+    pub(crate) fn epoll_targets(&self) -> Vec<(RawFd, (u32, u64))> {
+        self.description()
+            .epoll_targets
+            .iter()
+            .map(|(fd, entry)| (*fd, *entry))
+            .collect()
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1064)
     /// Mark this open file as a `NETLINK_SOCK_DIAG` socket. Shared across every
@@ -652,6 +753,30 @@ impl fmt::Display for DetFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timerfd_virtual_collects_only_at_or_after_the_virtual_deadline() {
+        let at = |ns| LogicalTime::from_nanos(ns);
+        let mut state = TimerfdVirtual {
+            clockid: libc::CLOCK_MONOTONIC,
+            deadline: Some(at(40_000_000)),
+            interval_nanos: 0,
+            pending: 0,
+        };
+        assert_eq!(state.collect(at(39_999_999)), 0, "host-early must not fire");
+        assert_eq!(state.collect(at(40_000_000)), 1);
+        assert_eq!(state.deadline, None, "one-shot disarms after expiry");
+        // Interval timers fold every elapsed period and stay armed.
+        let mut periodic = TimerfdVirtual {
+            clockid: libc::CLOCK_MONOTONIC,
+            deadline: Some(at(10_000_000)),
+            interval_nanos: 10_000_000,
+            pending: 0,
+        };
+        assert_eq!(periodic.collect(at(35_000_000)), 3);
+        assert_eq!(periodic.deadline, Some(at(40_000_000)));
+        assert_eq!(periodic.collect(at(35_000_000)), 3, "no double counting");
+    }
 
     #[test]
     fn dup_shares_open_file_state_but_not_slot_flags() {
