@@ -2827,11 +2827,59 @@ impl Scheduler {
             );
             return;
         };
+        let target = self.redirect_past_blocking_rt_sigsuspend(dpid, target, sig);
         info!(
             "[dtid {}] Alarm fired, delivering signal {} to guest.",
             target, sig
         );
         self.signal_guest(target, sig);
+    }
+
+    /// An alarm is process-directed, so Linux delivers it to any thread of the
+    /// group that does not block it. When the selected target waits in
+    /// `rt_sigsuspend` under a temporary mask that blocks `signal`, choose
+    /// instead the lowest-dettid `rt_sigsuspend` waiter of the same group whose
+    /// mask admits it.
+    ///
+    /// Without this the choice is left to the host kernel. A thread-directed
+    /// pidfd leaves the signal pending on the masked thread, so a waiter that
+    /// could take it is never woken. A process-directed `kill` lets the kernel
+    /// reroute it to such a waiter, but the scheduler learns that only when the
+    /// waiter's report arrives, and an otherwise idle scheduler can declare a
+    /// terminal deadlock first. Choosing the waiter here makes the delivery a
+    /// scheduler decision. The kernel honours it on both paths: a sleeping
+    /// thread that does not block the signal is the one `kill` of its own tid
+    /// picks.
+    ///
+    /// Only `rt_sigsuspend` waiters have a mask the scheduler knows, so any
+    /// other target is returned unchanged.
+    fn redirect_past_blocking_rt_sigsuspend(
+        &mut self,
+        detpid: DetPid,
+        target: DetTid,
+        signal: Signal,
+    ) -> DetTid {
+        match self.blocked.rt_sigsuspend_blockers.get(&target) {
+            Some(wait) if wait.blocks(signal) => {}
+            _ => return target,
+        }
+        let group = self.thread_tree.my_thread_group(&detpid);
+        let admitting = self
+            .blocked
+            .rt_sigsuspend_blockers
+            .iter()
+            .find(|(dettid, wait)| group.contains(dettid) && !wait.blocks(signal))
+            .map(|(dettid, _)| *dettid);
+        match admitting {
+            Some(waiter) => {
+                info!(
+                    "[dtid {}] signal {} is blocked by its rt_sigsuspend mask; delivering to rt_sigsuspend waiter {} whose mask admits it",
+                    target, signal, waiter
+                );
+                waiter
+            }
+            None => target,
+        }
     }
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
@@ -7833,6 +7881,85 @@ mod test {
         assert_eq!(
             scheduler.select_signal_target(leader, Some(leader)),
             Some(worker)
+        );
+    }
+
+    #[test]
+    fn alarm_blocked_by_the_targets_rt_sigsuspend_mask_goes_to_a_waiter_that_admits_it() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        let other_leader = DetTid::from_raw(200);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        scheduler
+            .thread_tree
+            .add_child(other_leader, other_leader, true);
+        for tid in [leader, worker, other_leader] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let bit = |signal: Signal| 1_u64 << (signal as i32 - 1);
+        let wait = |tid: DetTid, temporary_mask: u64| RtSigsuspendWait {
+            op_id: ExternalOpId::new(tid, 7),
+            temporary_mask,
+        };
+
+        // Not a masked waiter: the selected target stands.
+        assert_eq!(
+            scheduler.redirect_past_blocking_rt_sigsuspend(leader, leader, Signal::SIGALRM),
+            leader
+        );
+
+        // Another process's waiter admits SIGALRM, but a signal never crosses
+        // a thread group.
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(other_leader, wait(other_leader, 0));
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(leader, wait(leader, bit(Signal::SIGALRM)));
+        assert_eq!(
+            scheduler.redirect_past_blocking_rt_sigsuspend(leader, leader, Signal::SIGALRM),
+            leader
+        );
+
+        // A group waiter whose mask also blocks it cannot take it either.
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            worker,
+            wait(worker, bit(Signal::SIGALRM) | bit(Signal::SIGUSR1)),
+        );
+        assert_eq!(
+            scheduler.redirect_past_blocking_rt_sigsuspend(leader, leader, Signal::SIGALRM),
+            leader
+        );
+
+        // A group waiter whose mask admits it is chosen, as Linux may.
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(worker, wait(worker, bit(Signal::SIGUSR1)));
+        assert_eq!(
+            scheduler.redirect_past_blocking_rt_sigsuspend(leader, leader, Signal::SIGALRM),
+            worker
+        );
+
+        // The chosen waiter leaves its pool to report the interrupted wait;
+        // the masked target keeps waiting.
+        scheduler.wake_signaled_guest(worker, Signal::SIGALRM);
+        assert!(scheduler.run_queue.contains_tid(worker));
+        assert!(
+            !scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .contains_key(&worker)
+        );
+        assert!(
+            scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .contains_key(&leader)
         );
     }
 
