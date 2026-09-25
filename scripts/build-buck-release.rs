@@ -3870,6 +3870,9 @@ fn behavioral_parity(
     evidence_dir: &Path,
 ) -> Result<(), String> {
     {
+        // The trajectory compares Cargo with Buck on ptrace alone; it is not
+        // DBT or KVM virtual-time evidence (docs/BUCK2_OSS.md, Virtual-time
+        // scope).
         let backend = "ptrace";
         let fixture = compile_clock_fixture(root, evidence_dir)?;
         let fixture_text = fixture.to_string_lossy();
