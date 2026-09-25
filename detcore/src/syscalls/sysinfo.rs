@@ -59,17 +59,34 @@ fn logical_clock_ticks(
     clock_t_from_ticks(ticks)
 }
 
-/// Render Linux's whole-second uptime from an absolute logical clock.
+/// Render the whole-second part of `/proc/uptime` from an absolute logical clock.
 ///
+/// Linux's `uptime_proc_show` prints `tv_sec` followed by truncated
+/// centiseconds, so the integer part is the floor of the elapsed time.
 /// Subtract before truncating. Truncating `now` and `boot` separately makes a
 /// sub-second run appear one second old whenever it crosses an absolute-second
 /// boundary, even though less than one logical second elapsed.
-fn logical_uptime_seconds(
+fn procfs_uptime_seconds(
     now: crate::types::LogicalTime,
     boot: crate::types::LogicalTime,
     uptime_offset_seconds: u64,
 ) -> u64 {
     uptime_offset_seconds + (now - boot).as_secs()
+}
+
+/// Render `sysinfo(2)`'s `uptime` from an absolute logical clock.
+///
+/// Linux's `do_sysinfo` reports `tv_sec + (tv_nsec ? 1 : 0)`: any fractional
+/// elapsed second rounds UP, unlike `/proc/uptime`. The same subtract-first
+/// rule applies, so the rounding sees only elapsed logical time.
+fn sysinfo_uptime_seconds(
+    now: crate::types::LogicalTime,
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> u64 {
+    let elapsed = now - boot;
+    let fractional = u64::from(elapsed.as_nanos() % NANOS_PER_SECOND != 0);
+    uptime_offset_seconds + elapsed.as_secs() + fractional
 }
 
 fn prlimit_targets_current_process(
@@ -362,12 +379,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    pub(super) async fn calculate_uptime<G: Guest<Self>>(
+    /// Whole-second `/proc/uptime` value (floor of elapsed logical time).
+    pub(super) async fn calculate_procfs_uptime<G: Guest<Self>>(
         &self,
         guest: &mut G,
     ) -> Result<u64, Error> {
         let global_time = thread_observe_time(guest).await;
-        Ok(logical_uptime_seconds(
+        Ok(procfs_uptime_seconds(
+            global_time,
+            crate::types::DetTime::new(&self.cfg).as_nanos(),
+            self.cfg.sysinfo_uptime_offset,
+        ))
+    }
+
+    /// `sysinfo(2)` uptime (ceiling of elapsed logical time, as Linux reports).
+    async fn calculate_sysinfo_uptime<G: Guest<Self>>(&self, guest: &mut G) -> Result<u64, Error> {
+        let global_time = thread_observe_time(guest).await;
+        Ok(sysinfo_uptime_seconds(
             global_time,
             crate::types::DetTime::new(&self.cfg).as_nanos(),
             self.cfg.sysinfo_uptime_offset,
@@ -380,7 +408,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<syscalls::SysInfo, Error> {
         let memory = configured_memory(self.cfg.memory);
         Ok(syscalls::SysInfo {
-            uptime: self.calculate_uptime(guest).await?,
+            uptime: self.calculate_sysinfo_uptime(guest).await?,
             loads_1: 1,
             loads_5: 1,
             loads_15: 1,
@@ -447,17 +475,50 @@ mod tests {
     }
 
     #[test]
-    fn uptime_subtracts_fractional_boot_before_truncating() {
+    fn procfs_uptime_subtracts_fractional_boot_before_truncating() {
         let boot = LogicalTime::from_nanos(1_000_999_999_999);
 
         assert_eq!(
-            logical_uptime_seconds(boot + LogicalTime::from_nanos(1), boot, 120),
+            procfs_uptime_seconds(boot + LogicalTime::from_nanos(1), boot, 120),
             120
         );
         assert_eq!(
-            logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
+            procfs_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
             121
         );
+    }
+
+    #[test]
+    fn sysinfo_uptime_rounds_fractional_elapsed_up_like_linux() {
+        // A boot instant with a fractional absolute second: rounding must see
+        // only the elapsed time, never the absolute boundary crossing.
+        let boot = LogicalTime::from_nanos(1_000_999_999_999);
+
+        assert_eq!(sysinfo_uptime_seconds(boot, boot, 120), 120);
+        assert_eq!(
+            sysinfo_uptime_seconds(boot + LogicalTime::from_nanos(1), boot, 120),
+            121
+        );
+        assert_eq!(
+            sysinfo_uptime_seconds(boot + LogicalTime::from_millis(999), boot, 120),
+            121
+        );
+        assert_eq!(
+            sysinfo_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
+            121
+        );
+        assert_eq!(
+            sysinfo_uptime_seconds(
+                boot + LogicalTime::from_secs(1) + LogicalTime::from_nanos(1),
+                boot,
+                120
+            ),
+            122
+        );
+        // The floor-based procfs value differs exactly on fractional elapsed.
+        let fractional = boot + LogicalTime::from_millis(1_500);
+        assert_eq!(procfs_uptime_seconds(fractional, boot, 120), 121);
+        assert_eq!(sysinfo_uptime_seconds(fractional, boot, 120), 122);
     }
 
     #[test]
