@@ -4211,6 +4211,73 @@ struct PrivateTmpStage {
     argv: Vec<String>,
 }
 
+/// What a DBT invocation recorded about its private /tmp before safehermit ran,
+/// so the retained audit can re-check the readback without the (deleted) host
+/// directory.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MatrixPrivateTmpEvidence {
+    schema: String,
+    host_tmp: PathBuf,
+    host_tmp_device: u64,
+    host_tmp_inode: u64,
+    proxy_uid: u32,
+    binds: Vec<(PathBuf, PathBuf)>,
+    unshare: PathBuf,
+    unshare_sha256: String,
+    candidate: PathBuf,
+    candidate_sha256: String,
+}
+
+const MATRIX_PRIVATE_TMP_SCHEMA: &str = "hermit-matrix-private-tmp/v2";
+
+/// Re-check a retained invocation's private /tmp evidence: the typed record,
+/// the in-unit readback against it, and that safehermit launched the recorded
+/// unshare.
+fn verify_retained_private_tmp(invocation: &Path, description: &str) -> Result<String, String> {
+    let path = invocation.join("private-tmp.json");
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {description} private /tmp evidence: {error}"))?;
+    let evidence: MatrixPrivateTmpEvidence =
+        decode_typed_json(&text, "matrix private /tmp evidence")?;
+    let beneath = |destination: &Path| {
+        destination.starts_with(&evidence.host_tmp) && destination != evidence.host_tmp
+    };
+    if evidence.schema != MATRIX_PRIVATE_TMP_SCHEMA
+        || !evidence.host_tmp.is_absolute()
+        || !evidence.unshare.is_absolute()
+        || !evidence.candidate.is_absolute()
+        || evidence.candidate.starts_with("/tmp")
+        || !valid_sha256(&evidence.unshare_sha256)
+        || !valid_sha256(&evidence.candidate_sha256)
+        || evidence
+            .binds
+            .iter()
+            .any(|(source, destination)| !source.is_absolute() || !beneath(destination))
+    {
+        return Err(format!(
+            "{description} private /tmp evidence has invalid semantics: {}",
+            path.display()
+        ));
+    }
+    let readback = invocation.join("private-tmp.readback");
+    let observed = fs::read_to_string(&readback)
+        .map_err(|error| format!("cannot read {description} private /tmp readback: {error}"))?;
+    require_private_tmp_readback(
+        &observed,
+        evidence.host_tmp_device,
+        evidence.host_tmp_inode,
+        evidence.proxy_uid,
+    )
+    .map_err(|error| format!("{description}: {error}: {}", readback.display()))?;
+    require_safehermit_launched(
+        &invocation.join("safehermit.report"),
+        &evidence.unshare_sha256,
+        description,
+    )?;
+    sha256(&path)
+}
+
 fn split_private_tmp_handoff(
     arguments: Vec<String>,
 ) -> Result<(Option<PrivateTmpStage>, Vec<String>), String> {
@@ -4465,19 +4532,27 @@ fn matrix_candidate_proxy_from(
         }
         let unshare = executable_on_path(&stage.argv[0])?;
         let unshare_sha256 = sha256(&unshare)?;
+        let host = fs::metadata(&stage.host_tmp)
+            .map_err(|error| format!("cannot stat {}: {error}", stage.host_tmp.display()))?;
+        let proxy_uid = fs::metadata("/proc/self")
+            .map_err(|error| format!("cannot read the proxy's uid: {error}"))?
+            .uid();
         write_new_file(
             &invocation.join("private-tmp.json"),
             format!(
                 "{}\n",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "schema": "hermit-matrix-private-tmp/v1",
-                    "host_tmp": stage.host_tmp,
-                    "binds": stage.mounts,
-                    "unshare": unshare,
-                    "unshare_sha256": unshare_sha256,
-                    "candidate": binary,
-                    "candidate_sha256": binary_sha256,
-                }))
+                serde_json::to_string_pretty(&MatrixPrivateTmpEvidence {
+                    schema: MATRIX_PRIVATE_TMP_SCHEMA.to_owned(),
+                    host_tmp: stage.host_tmp.clone(),
+                    host_tmp_device: host.dev(),
+                    host_tmp_inode: host.ino(),
+                    proxy_uid,
+                    binds: stage.mounts.clone(),
+                    unshare: unshare.clone(),
+                    unshare_sha256: unshare_sha256.clone(),
+                    candidate: binary.clone(),
+                    candidate_sha256: binary_sha256.clone(),
+                })
                 .map_err(|error| format!("failed to encode private /tmp evidence: {error}"))?
             )
             .as_bytes(),
@@ -4522,19 +4597,26 @@ fn matrix_candidate_proxy_from(
     }
     if let Some(stage) = &private_tmp {
         let readback = invocation.join("private-tmp.readback");
-        let observed = fs::read_to_string(&readback).map_err(|error| {
-            format!(
-                "{description} left no private /tmp readback at {}: {error}",
+        if !readback.is_file() {
+            return Err(format!(
+                "{description} left no private /tmp readback at {}",
                 readback.display()
-            )
-        })?;
+            ));
+        }
+        verify_retained_private_tmp(&invocation, &description)?;
+        let recorded: MatrixPrivateTmpEvidence = decode_typed_json(
+            &fs::read_to_string(invocation.join("private-tmp.json"))
+                .map_err(|error| format!("cannot reread private /tmp evidence: {error}"))?,
+            "matrix private /tmp evidence",
+        )?;
         let host = fs::metadata(&stage.host_tmp)
             .map_err(|error| format!("cannot stat {}: {error}", stage.host_tmp.display()))?;
-        let uid = fs::metadata("/proc/self")
-            .map_err(|error| format!("cannot read the proxy's uid: {error}"))?
-            .uid();
-        require_private_tmp_readback(&observed, host.dev(), host.ino(), uid)
-            .map_err(|error| format!("{description}: {error}: {}", readback.display()))?;
+        if (host.dev(), host.ino()) != (recorded.host_tmp_device, recorded.host_tmp_inode) {
+            return Err(format!(
+                "{description}: private /tmp host directory {} was replaced while the candidate ran",
+                stage.host_tmp.display()
+            ));
+        }
         eprintln!(
             "{description}: isolation.private_tmp=APPLIED:{} with {} binds, read back inside the safehermit unit",
             stage.host_tmp.display(),
@@ -5301,6 +5383,10 @@ struct MatrixCandidateInvocationBinding {
     safehermit_report_sha256: String,
     stdout_sha256: String,
     stderr_sha256: String,
+    /// Present exactly for `dbt-run`: the retained private /tmp record and its
+    /// in-unit readback.
+    private_tmp_sha256: Option<String>,
+    private_tmp_readback_sha256: Option<String>,
     data_sha256: BTreeMap<String, String>,
     data_directories: Vec<String>,
 }
@@ -5587,6 +5673,20 @@ fn collect_matrix_data_directories(
     Ok(())
 }
 
+/// v2 binds each `dbt-run`'s private /tmp record and readback.
+const MATRIX_CANDIDATE_INVOCATIONS_SCHEMA: &str = "hermit-matrix-candidate-invocations/v2";
+const MATRIX_INVOCATION_FILES: [&str; 5] =
+    ["data", "invocation.json", "safehermit.report", "stderr", "stdout"];
+const MATRIX_PRIVATE_TMP_INVOCATION_FILES: [&str; 7] = [
+    "data",
+    "invocation.json",
+    "private-tmp.json",
+    "private-tmp.readback",
+    "safehermit.report",
+    "stderr",
+    "stdout",
+];
+
 fn inspect_matrix_candidate_invocations(
     evidence_dir: &Path,
 ) -> Result<MatrixCandidateInvocationManifest, String> {
@@ -5654,14 +5754,8 @@ fn inspect_matrix_candidate_invocations(
                     .map_err(|_| "matrix candidate invocation filename is not UTF-8".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if actual_names
-            != [
-                "data",
-                "invocation.json",
-                "safehermit.report",
-                "stderr",
-                "stdout",
-            ]
+        if actual_names != MATRIX_INVOCATION_FILES
+            && actual_names != MATRIX_PRIVATE_TMP_INVOCATION_FILES
         {
             return Err(format!(
                 "matrix candidate invocation {name:?} has unexpected file population {actual_names:?}"
@@ -5701,6 +5795,17 @@ fn inspect_matrix_candidate_invocations(
                 "matrix candidate invocation {name:?} has invalid typed metadata"
             ));
         }
+        let expected_names: &[&str] = if invocation_metadata.role == "dbt-run" {
+            &MATRIX_PRIVATE_TMP_INVOCATION_FILES
+        } else {
+            &MATRIX_INVOCATION_FILES
+        };
+        if actual_names != expected_names {
+            return Err(format!(
+                "matrix candidate invocation {name:?} with role {} must hold exactly {expected_names:?}, found {actual_names:?}",
+                invocation_metadata.role
+            ));
+        }
         let data = require_absolute_directory(
             &path.join("data"),
             "matrix candidate invocation data directory",
@@ -5715,10 +5820,17 @@ fn inspect_matrix_candidate_invocations(
             &mut data_rows,
         )?;
         data_rows.sort();
-        validate_and_surface_safehermit_report(
-            &report,
-            &format!("retained {candidate_label} DBT matrix invocation {identity}"),
-        )?;
+        let description = format!("retained {candidate_label} DBT matrix invocation {identity}");
+        validate_and_surface_safehermit_report(&report, &description)?;
+        let (private_tmp_sha256, private_tmp_readback_sha256) =
+            if invocation_metadata.role == "dbt-run" {
+                (
+                    Some(verify_retained_private_tmp(&path, &description)?),
+                    Some(sha256(&path.join("private-tmp.readback"))?),
+                )
+            } else {
+                (None, None)
+            };
         invocations.push(MatrixCandidateInvocationBinding {
             candidate_label: candidate_label.to_owned(),
             identity: identity.to_owned(),
@@ -5729,6 +5841,8 @@ fn inspect_matrix_candidate_invocations(
             safehermit_report_sha256: sha256(&report)?,
             stdout_sha256: sha256(&path.join("stdout"))?,
             stderr_sha256: sha256(&path.join("stderr"))?,
+            private_tmp_sha256,
+            private_tmp_readback_sha256,
             data_sha256: data_rows.into_iter().collect(),
             data_directories,
         });
@@ -5747,7 +5861,7 @@ fn inspect_matrix_candidate_invocations(
         ));
     }
     Ok(MatrixCandidateInvocationManifest {
-        manifest_schema: "hermit-matrix-candidate-invocations/v1".to_owned(),
+        manifest_schema: MATRIX_CANDIDATE_INVOCATIONS_SCHEMA.to_owned(),
         invocations,
     })
 }
@@ -5755,7 +5869,7 @@ fn inspect_matrix_candidate_invocations(
 fn render_matrix_candidate_invocation_manifest(
     manifest: &MatrixCandidateInvocationManifest,
 ) -> Result<String, String> {
-    if manifest.manifest_schema != "hermit-matrix-candidate-invocations/v1"
+    if manifest.manifest_schema != MATRIX_CANDIDATE_INVOCATIONS_SCHEMA
         || manifest.invocations.is_empty()
         || manifest.invocations.iter().any(|invocation| {
             !matches!(invocation.candidate_label.as_str(), "cargo" | "buck")
@@ -5770,6 +5884,15 @@ fn render_matrix_candidate_invocation_manifest(
                 || !valid_sha256(&invocation.safehermit_report_sha256)
                 || !valid_sha256(&invocation.stdout_sha256)
                 || !valid_sha256(&invocation.stderr_sha256)
+                || [
+                    &invocation.private_tmp_sha256,
+                    &invocation.private_tmp_readback_sha256,
+                ]
+                .iter()
+                .any(|hash| match hash {
+                    Some(hash) => invocation.role != "dbt-run" || !valid_sha256(hash),
+                    None => invocation.role == "dbt-run",
+                })
                 || invocation.data_sha256.iter().any(|(relative, hash)| {
                     let path = Path::new(relative);
                     !valid_sha256(hash)
@@ -10290,6 +10413,9 @@ mod tests {
                         safehermit_report_sha256: hash.clone(),
                         stdout_sha256: hash.clone(),
                         stderr_sha256: hash.clone(),
+                        private_tmp_sha256: (expected.role == "dbt-run").then(|| hash.clone()),
+                        private_tmp_readback_sha256: (expected.role == "dbt-run")
+                            .then(|| hash.clone()),
                         data_sha256: BTreeMap::new(),
                         data_directories: Vec::new(),
                     });
@@ -10297,7 +10423,7 @@ mod tests {
             }
         }
         let manifest = MatrixCandidateInvocationManifest {
-            manifest_schema: "hermit-matrix-candidate-invocations/v1".to_owned(),
+            manifest_schema: MATRIX_CANDIDATE_INVOCATIONS_SCHEMA.to_owned(),
             invocations,
         };
         validate_matrix_candidate_completeness(&repository, &evidence, &manifest).unwrap();
@@ -10397,7 +10523,33 @@ mod tests {
         let root = fixture_root("matrix-candidate-invocation-manifest");
         let invocations = root.join("matrix-candidate-invocations");
         fs::create_dir_all(&invocations).unwrap();
-        for name in ["cargo-observed-1", "buck-observed-2"] {
+        let host_tmp = root.join("host-tmp");
+        fs::create_dir(&host_tmp).unwrap();
+        let host = fs::metadata(&host_tmp).unwrap();
+        let unshare_sha256 = "b".repeat(64);
+        let report = |launched: &str| {
+            format!(
+                "safehermit: binary_sha256={launched}\nsafehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n"
+            )
+        };
+        let private_tmp = MatrixPrivateTmpEvidence {
+            schema: MATRIX_PRIVATE_TMP_SCHEMA.to_owned(),
+            host_tmp: host_tmp.clone(),
+            host_tmp_device: host.dev(),
+            host_tmp_inode: host.ino(),
+            proxy_uid: 4242,
+            binds: vec![(root.clone(), host_tmp.join("fixture"))],
+            unshare: PathBuf::from("/usr/bin/unshare"),
+            unshare_sha256: unshare_sha256.clone(),
+            candidate: PathBuf::from("/opt/candidate/hermit"),
+            candidate_sha256: "c".repeat(64),
+        };
+        let readback = format!(
+            "tmp={}:{}\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 4242 1\n",
+            host.dev(),
+            host.ino()
+        );
+        let write_invocation = |name: &str, role: &str| {
             let invocation = invocations.join(name);
             fs::create_dir(&invocation).unwrap();
             fs::create_dir(invocation.join("data")).unwrap();
@@ -10411,7 +10563,7 @@ mod tests {
                 serde_json::to_vec_pretty(&MatrixProxyInvocation {
                     invocation_schema: "hermit-matrix-proxy-invocation/v1".to_owned(),
                     case_identity: "exit_zero".to_owned(),
-                    role: "dbt-run".to_owned(),
+                    role: role.to_owned(),
                     normalized_argv: vec![
                         "run".to_owned(),
                         "--".to_owned(),
@@ -10423,12 +10575,22 @@ mod tests {
             .unwrap();
             fs::write(invocation.join("stdout"), format!("{name} stdout\n")).unwrap();
             fs::write(invocation.join("stderr"), format!("{name} stderr\n")).unwrap();
-            fs::write(
-                invocation.join("safehermit.report"),
-                b"safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
-            )
-            .unwrap();
-        }
+            if role == "dbt-run" {
+                fs::write(invocation.join("safehermit.report"), report(&unshare_sha256)).unwrap();
+                fs::write(
+                    invocation.join("private-tmp.json"),
+                    serde_json::to_vec_pretty(&private_tmp).unwrap(),
+                )
+                .unwrap();
+                fs::write(invocation.join("private-tmp.readback"), &readback).unwrap();
+            } else {
+                fs::write(invocation.join("safehermit.report"), report(&"d".repeat(64))).unwrap();
+            }
+        };
+        write_invocation("cargo-observed-1", "dbt-run");
+        write_invocation("buck-observed-2", "dbt-run");
+        write_invocation("cargo-reference-3", "ptrace-reference");
+        write_invocation("buck-reference-4", "ptrace-reference");
         let manifest = root.join("matrix-candidate-invocations.json");
         let observed = inspect_matrix_candidate_invocations(&root).unwrap();
         atomic_write_new(
@@ -10438,8 +10600,91 @@ mod tests {
         .unwrap();
         let (retained, retained_hash) =
             verify_retained_matrix_candidate_invocation_manifest(&root).unwrap();
-        assert_eq!(retained.invocations.len(), 2);
+        assert_eq!(retained.invocations.len(), 4);
         assert_eq!(retained_hash, sha256(&manifest).unwrap());
+        for invocation in &retained.invocations {
+            let private = invocation.role == "dbt-run";
+            assert_eq!(invocation.private_tmp_sha256.is_some(), private);
+            assert_eq!(invocation.private_tmp_readback_sha256.is_some(), private);
+        }
+
+        // Private /tmp evidence is re-checked by content, not only hashed.
+        let dbt = invocations.join("cargo-observed-1");
+        let refuses = |needle: &str| {
+            let error = inspect_matrix_candidate_invocations(&root).unwrap_err();
+            assert!(error.contains(needle), "{needle}: {error}");
+        };
+        for (file, bytes, needle) in [
+            (
+                "private-tmp.readback",
+                readback.replace("uid_map=0 4242 1", "uid_map=0 0 4294967295"),
+                "does not match the host directory and mapping",
+            ),
+            (
+                "private-tmp.readback",
+                readback.replace("cwd=/tmp", "cwd=/home"),
+                "does not match the host directory and mapping",
+            ),
+            (
+                "safehermit.report",
+                report(&"c".repeat(64)),
+                "records launched binary",
+            ),
+            (
+                "private-tmp.json",
+                serde_json::to_string(&MatrixPrivateTmpEvidence {
+                    binds: vec![(root.clone(), root.join("outside"))],
+                    ..private_tmp.clone()
+                })
+                .unwrap(),
+                "invalid semantics",
+            ),
+            (
+                "private-tmp.json",
+                serde_json::to_string(&MatrixPrivateTmpEvidence {
+                    schema: "hermit-matrix-private-tmp/v1".to_owned(),
+                    ..private_tmp.clone()
+                })
+                .unwrap(),
+                "invalid semantics",
+            ),
+        ] {
+            let path = dbt.join(file);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, bytes).unwrap();
+            refuses(needle);
+            fs::write(&path, original).unwrap();
+        }
+        for file in ["private-tmp.json", "private-tmp.readback"] {
+            let path = dbt.join(file);
+            let original = fs::read(&path).unwrap();
+            fs::remove_file(&path).unwrap();
+            refuses("unexpected file population");
+            fs::write(&path, original).unwrap();
+        }
+        // The population must follow the role in both directions.
+        let reference = invocations.join("cargo-reference-3");
+        fs::copy(dbt.join("private-tmp.json"), reference.join("private-tmp.json")).unwrap();
+        fs::copy(dbt.join("private-tmp.readback"), reference.join("private-tmp.readback")).unwrap();
+        refuses("with role ptrace-reference must hold exactly");
+        fs::remove_file(reference.join("private-tmp.json")).unwrap();
+        fs::remove_file(reference.join("private-tmp.readback")).unwrap();
+        let metadata = dbt.join("invocation.json");
+        let original_metadata = fs::read_to_string(&metadata).unwrap();
+        fs::write(
+            &metadata,
+            original_metadata.replace("\"dbt-run\"", "\"ptrace-reference\""),
+        )
+        .unwrap();
+        refuses("with role ptrace-reference must hold exactly");
+        fs::write(&metadata, &original_metadata).unwrap();
+        inspect_matrix_candidate_invocations(&root).unwrap();
+
+        let readback_path = dbt.join("private-tmp.readback");
+        fs::write(&readback_path, readback.replace("tmp=", "tmp=1")).unwrap();
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        fs::write(&readback_path, &readback).unwrap();
+        verify_retained_matrix_candidate_invocation_manifest(&root).unwrap();
 
         let original_manifest = fs::read_to_string(&manifest).unwrap();
         fs::write(
@@ -10500,33 +10745,8 @@ mod tests {
         assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
         fs::remove_file(&link).unwrap();
 
-        for name in ["cargo-extra-observed", "buck-extra-observed"] {
-            let invocation = invocations.join(name);
-            fs::create_dir(&invocation).unwrap();
-            fs::create_dir(invocation.join("data")).unwrap();
-            fs::write(
-                invocation.join("invocation.json"),
-                serde_json::to_vec_pretty(&MatrixProxyInvocation {
-                    invocation_schema: "hermit-matrix-proxy-invocation/v1".to_owned(),
-                    case_identity: "exit_zero".to_owned(),
-                    role: "dbt-run".to_owned(),
-                    normalized_argv: vec![
-                        "run".to_owned(),
-                        "--".to_owned(),
-                        "/bin/true".to_owned(),
-                    ],
-                })
-                .unwrap(),
-            )
-            .unwrap();
-            fs::write(invocation.join("stdout"), b"extra stdout\n").unwrap();
-            fs::write(invocation.join("stderr"), b"extra stderr\n").unwrap();
-            fs::write(
-                invocation.join("safehermit.report"),
-                b"safehermit: bound.wall=APPLIED:120s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
-            )
-            .unwrap();
-        }
+        write_invocation("cargo-extra-observed", "ptrace-reference");
+        write_invocation("buck-extra-observed", "ptrace-reference");
         assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
         fs::remove_dir_all(invocations.join("cargo-extra-observed")).unwrap();
         fs::remove_dir_all(invocations.join("buck-extra-observed")).unwrap();
