@@ -18,11 +18,14 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan still selects 859 cells, 855 portable and 4
-//!    privileged, with per-(lane, backend, mode) counts equal to the pre-fold
-//!    plan's.
-//! 3. The committed compatibility cell table still has 5776 rows with
-//!    per-(backend, mode, status) counts equal to the pre-fold table's.
+//! 2. The committed CI plan selects the pre-fold plan's 859 cells, 855
+//!    portable and 4 privileged, with per-(lane, backend, mode) counts equal to
+//!    the pre-fold plan's, plus exactly the cells `PLAN_CELLS_ADDED_AFTER_FOLD`
+//!    names.
+//! 3. The committed compatibility cell table holds the pre-fold table's 5776
+//!    rows with per-(backend, mode, status) counts equal to the pre-fold
+//!    table's, plus the rows of each test `TESTS_ADDED_AFTER_FOLD` names; a row
+//!    `CELL_STATUS_CHANGES_AFTER_FOLD` names counts under its pre-fold status.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -104,6 +107,41 @@ const CELL_COUNTS: &[(&str, &str, &str, usize)] = &[
     ("sabre", "verify", "not-applicable", 217),
     ("sabre", "verify", "red", 32),
 ];
+
+/// Cells the committed plan selects that the pre-fold plan did not, as
+/// (lane, backend, mode, test), each under the change that selected it.
+/// Every other committed cell is counted against `PLAN_COUNTS`.
+const PLAN_CELLS_ADDED_AFTER_FOLD: &[(&str, &str, &str, &str)] = &[
+    // https://github.com/rrnewton/hermit/pull/3224 promotes this existing test.
+    (
+        "portable",
+        "ptrace",
+        "verify",
+        "c-programs/dbt-pid-virtualization",
+    ),
+];
+
+/// Tests the committed cell table lists that the pre-fold table did not, as
+/// (test, backend, mode, status) of the one row that is not `not-applicable`.
+const TESTS_ADDED_AFTER_FOLD: &[(&str, &str, &str, &str)] = &[];
+
+/// Pre-fold rows whose status changed after the fold, as (test, backend,
+/// mode, pre-fold status, committed status).
+const CELL_STATUS_CHANGES_AFTER_FOLD: &[(&str, &str, &str, &str, &str)] = &[
+    // https://github.com/rrnewton/hermit/pull/3224
+    (
+        "c-programs/dbt-pid-virtualization",
+        "ptrace",
+        "verify",
+        "red",
+        "green",
+    ),
+];
+
+/// The cell table has one row per test for each of these 16 (backend, mode)
+/// pairs: dbt, kvm, liteinst, ptrace and sabre each in verify, replay and
+/// chaos, and native in naked.
+const ROWS_PER_TEST: usize = 16;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -319,6 +357,26 @@ fn the_retired_id_map_is_a_bijection_onto_live_ids() {
     }
 }
 
+/// Whether `cell` is the plan cell (lane, backend, mode, test).
+fn is_cell(cell: &JsonValue, lane: &str, backend: &str, mode: &str, test: &str) -> bool {
+    field(cell, "lane") == lane
+        && field(cell, "backend") == backend
+        && field(cell, "mode") == mode
+        && field(cell, "test") == test
+}
+
+/// Whether `cell` is one of `PLAN_CELLS_ADDED_AFTER_FOLD`.
+fn added_after_fold(cell: &JsonValue) -> bool {
+    PLAN_CELLS_ADDED_AFTER_FOLD
+        .iter()
+        .any(|&(lane, backend, mode, test)| is_cell(cell, lane, backend, mode, test))
+}
+
+/// Whether `row` is the cell-table row of (test, backend, mode).
+fn is_row(row: &JsonValue, test: &str, backend: &str, mode: &str) -> bool {
+    field(row, "test") == test && field(row, "backend") == backend && field(row, "mode") == mode
+}
+
 #[test]
 fn the_committed_plan_keeps_its_cell_counts() {
     let plan = read_json("ci/expected-e2e-plan.json");
@@ -326,10 +384,30 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let lane = |name: &str| cells.iter().filter(|c| field(c, "lane") == name).count();
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
+        (860, 856, 4)
+    );
+    for &(added_lane, backend, mode, test) in PLAN_CELLS_ADDED_AFTER_FOLD {
+        let selected = cells
+            .iter()
+            .filter(|cell| is_cell(cell, added_lane, backend, mode, test))
+            .count();
+        assert_eq!(selected, 1, "{added_lane} {backend} {mode} {test}");
+    }
+    let pre_fold = cells
+        .iter()
+        .filter(|cell| !added_after_fold(cell))
+        .collect::<Vec<_>>();
+    let pre_fold_lane = |name: &str| pre_fold.iter().filter(|c| field(c, "lane") == name).count();
+    assert_eq!(
+        (
+            pre_fold.len(),
+            pre_fold_lane("portable"),
+            pre_fold_lane("privileged")
+        ),
         (859, 855, 4)
     );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
-    for cell in cells {
+    for cell in &pre_fold {
         let key = (
             field(cell, "lane").to_string(),
             field(cell, "backend").to_string(),
@@ -344,6 +422,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(counts, expected);
     // The folded cells now belong to c-programs: 437 portable c-programs cells
     // and 276 portable plus 3 privileged backend-parity-c cells before the fold.
+    // A cell added after the fold is not counted here.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -353,7 +432,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         if successors.contains(field(cell, "test")) {
             assert_eq!(category, SUCCESSOR_BUCKET, "{cell}");
         }
-        if category == SUCCESSOR_BUCKET {
+        if category == SUCCESSOR_BUCKET && !added_after_fold(cell) {
             *by_bucket
                 .entry((field(cell, "lane").into(), category.into()))
                 .or_default() += 1;
@@ -373,6 +452,35 @@ fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
     assert_eq!(rows.len(), 5776);
+    let mut added_rows = 0;
+    for &(test, backend, mode, status) in TESTS_ADDED_AFTER_FOLD {
+        let own = rows
+            .iter()
+            .filter(|row| field(row, "test") == test)
+            .collect::<Vec<_>>();
+        assert_eq!(own.len(), ROWS_PER_TEST, "{test}");
+        let applicable = own
+            .iter()
+            .filter(|row| field(row, "status") != "not-applicable")
+            .collect::<Vec<_>>();
+        assert_eq!(applicable.len(), 1, "{test}");
+        assert!(is_row(applicable[0], test, backend, mode), "{test}");
+        assert_eq!(field(applicable[0], "status"), status, "{test}");
+        added_rows += own.len();
+    }
+    assert_eq!(rows.len() - added_rows, 5776);
+    for &(test, backend, mode, _, status) in CELL_STATUS_CHANGES_AFTER_FOLD {
+        let matching = rows
+            .iter()
+            .filter(|row| is_row(row, test, backend, mode))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{test} {backend} {mode}");
+        assert_eq!(
+            field(matching[0], "status"),
+            status,
+            "{test} {backend} {mode}"
+        );
+    }
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
         assert_ne!(field(row, "category"), RETIRED_BUCKET, "{row}");
@@ -380,10 +488,23 @@ fn the_committed_cell_table_keeps_its_row_counts() {
             !field(row, "test").starts_with("backend-parity-c/"),
             "{row}"
         );
+        if TESTS_ADDED_AFTER_FOLD
+            .iter()
+            .any(|&(test, ..)| field(row, "test") == test)
+        {
+            continue;
+        }
+        let status = match CELL_STATUS_CHANGES_AFTER_FOLD
+            .iter()
+            .find(|&&(test, backend, mode, ..)| is_row(row, test, backend, mode))
+        {
+            Some(&(.., pre_fold, _)) => pre_fold,
+            None => field(row, "status"),
+        };
         let key = (
             field(row, "backend").to_string(),
             field(row, "mode").to_string(),
-            field(row, "status").to_string(),
+            status.to_string(),
         );
         *counts.entry(key).or_default() += 1;
     }
