@@ -76,10 +76,10 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// `/mnt/xarfuse/`): `system-utils/procfs-sanitized-paths` passed twenty
 /// consecutive strict canonical repetitions at the evidence head under its
 /// manifest comparison profile (`compare_io_buffers: false, rcb_time: false`).
-/// The evidence SHA is the first commit of this change (the tree the
+/// Evidence SHA is the first commit of this change (the tree the
 /// qualification binary was built from).
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
-    "422f3f3a4e05353edd4f2449affc8df9241bdf51";
+    "9721082f52fec889af9100c39a7d581d2eb1e044";
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:23:58Z";
 pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
@@ -1890,7 +1890,7 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
-            "PENDING_FIRST_COMMIT"
+            "9721082f52fec889af9100c39a7d581d2eb1e044"
         );
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
