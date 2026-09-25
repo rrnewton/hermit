@@ -29,6 +29,16 @@ pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate
 /// created by host squashfuse infrastructure for one host process. See
 /// `detcore::procfs::exclude_ephemeral_host_seed_mounts` for why this class
 /// is outside the guest mount model.
+/// Same ephemeral seed class in `/proc/<pid>/mounts` grammar
+/// (`source mountpoint fstype options …`).
+pub fn is_ephemeral_host_seed_mount_mounts_format(line: &[u8]) -> bool {
+    let mut fields = line.split(|byte| *byte == b' ');
+    let _source = fields.next();
+    let mount_point = fields.next().unwrap_or_default();
+    let fs_type = fields.next().unwrap_or_default();
+    fs_type == b"fuse.squashfuse_ll" && mount_point.starts_with(b"/mnt/xarfuse/")
+}
+
 pub fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
     let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
     let Some(separator) = fields.iter().position(|field| *field == b"-") else {
