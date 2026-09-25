@@ -91,6 +91,9 @@ mod validate_admission;
 #[path = "lib/validate_pinned_image.rs"]
 mod validate_pinned_image;
 
+#[path = "lib/exec_safe_fs.rs"]
+mod exec_safe_fs;
+
 #[path = "lib/validate_receipt.rs"]
 mod validate_receipt;
 
@@ -1831,7 +1834,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     // Overlay exactly this test's production files, then commit only when that
     // changed the clone. The real child therefore still runs from a clean SHA.
     for relative in SUBMODULE_SERVICE_FIXTURE_SOURCES {
-        std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
+        exec_safe_fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
             format!("submodule service result: cannot copy {relative} into fixture: {error}")
         })?;
     }
@@ -5785,11 +5788,11 @@ mod ordinary_artifact_pointer_tests {
             "verify-hermit-e2e-artifact.sh",
             "run-with-hermit-e2e-artifact.sh",
         ] {
-            std::fs::copy(source.join("ci").join(name), root.join("ci").join(name)).unwrap();
+            exec_safe_fs::copy(source.join("ci").join(name), root.join("ci").join(name)).unwrap();
         }
         let binary = root.join("fixture-hermit");
         std::fs::write(&binary, format!("#!/bin/sh\n# {marker}\nexit 0\n")).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        exec_safe_fs::set_executable(&binary, 0o700).unwrap();
         let install = root.join("fixture-install");
         for name in [
             "libdetcore_dbt.so",
@@ -5804,7 +5807,7 @@ mod ordinary_artifact_pointer_tests {
             let path = install.join("rsrcs").join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, format!("#!/bin/sh\n# {marker} {name}\nexit 0\n")).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            exec_safe_fs::set_executable(path, 0o700).unwrap();
         }
         let pointer = root.join("target/ci/hermit-e2e-artifact.path");
         let output = Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
@@ -7769,8 +7772,13 @@ fn make_self_test_tree_read_only(path: &Path) -> Result<(), String> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
             .map_err(|error| format!("tool authority self-test cannot freeze directory: {error}"))?;
     } else if metadata.is_file() {
-        let mode = if metadata.mode() & 0o111 != 0 { 0o555 } else { 0o444 };
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        // An executable is replaced by a fresh inode that no write descriptor
+        // inherited by a concurrent spawn can name (see exec_safe_fs).
+        if metadata.mode() & 0o111 != 0 {
+            exec_safe_fs::set_executable(path, 0o555)
+        } else {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+        }
             .map_err(|error| format!("tool authority self-test cannot freeze file: {error}"))?;
     }
     Ok(())
@@ -10500,7 +10508,7 @@ fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Resul
             &stub,
             "#!/bin/sh\nprintf 'partial producer output\\n'\nexit 23\n",
         )
-        .and_then(|()| std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| exec_safe_fs::set_executable(&stub, 0o755))
         .map_err(|error| format!("compression fixture: failing producer: {error}"))?;
         for (kind, nodes) in [
             ("constructed", constructed.iter().collect::<Vec<_>>()),
@@ -10929,7 +10937,7 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
     // Its own ROOT_DIR resolves inside this private tree, so the test needs no
     // alternate-DAG override and cannot launch the product validation graph.
     for relative in ["ci/run-dag.sh", "ci/configure-build-jobs.sh"] {
-        std::fs::copy(root.join(relative), fixture_root.join(relative))
+        exec_safe_fs::copy(root.join(relative), fixture_root.join(relative))
             .map_err(|error| format!("raw run-dag engine: cannot copy {relative}: {error}"))?;
     }
     std::os::unix::fs::symlink(root.join("agent-utils"), fixture_root.join("agent-utils"))
@@ -11090,7 +11098,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         "#!/bin/sh\nset -eu\nprintf '%s\\n' invoked >>\"$RUN_DAG_INVOKED\"\ntest \"$1\" = run\ntest \"$2\" = --dag\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\ntest \"$4\" = --labels\ntest \"$5\" = \"$RUN_DAG_EXPECTED_LABEL\"\nshift 5\ntest \"$*\" = \"${RUN_DAG_EXPECTED_SUFFIX:-}\"\ntest -n \"$VALIDATE_RUN_STATE\"\ntest -n \"$E2E_RESULT_ROOT\"\ntest -n \"$E2E_BUILD_ROOT\"\ntest -z \"${HERMIT_VALIDATE_RELEASE_BUILD_MODE+x}\"\ntest -z \"${HERMIT_VALIDATE_BUCK_DOTSLASH+x}\"\n",
     )
     .map_err(|error| format!("raw run-dag: cannot write capture runner: {error}"))?;
-    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+    exec_safe_fs::set_executable(&runner, 0o755)
         .map_err(|error| format!("raw run-dag: cannot chmod capture runner: {error}"))?;
 
     for (lane, label) in [
@@ -14383,9 +14391,7 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
 "#,
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&podman).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&podman, permissions).unwrap();
+        exec_safe_fs::set_executable(&podman, 0o755).unwrap();
         let path = format!(
             "{}:{}",
             bin.display(),
@@ -14657,7 +14663,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
     "${forwarded[@]}" "$TIMEOUT_POLICY_TEST_EXE" \
     --exact nextest_timeout_tests::timeout_policy_subprocess_reads_the_forwarded_environment --nocapture
 "#).unwrap();
-        std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exec_safe_fs::set_executable(&podman, 0o755).unwrap();
         let cfg = validate_plan::validation_config(root).unwrap();
         let quick = cfg
             .steps
@@ -14786,14 +14792,14 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
             "run-in-pinned-root.sh",
             "image.digest",
         ] {
-            std::fs::copy(
+            exec_safe_fs::copy(
                 root.join("ci/hermetic").join(name),
                 copied_scripts.join(name),
             )
             .unwrap();
         }
         for name in ["portable-shards.json", "expected-e2e-plan.json"] {
-            std::fs::copy(
+            exec_safe_fs::copy(
                 root.join("ci").join(name),
                 copied_root.join("ci").join(name),
             )
@@ -17709,7 +17715,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                         launcher.display()
                     )
                 })?;
-                std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                exec_safe_fs::set_executable(&launcher, 0o755)
                     .map_err(|error| {
                         format!(
                             "front-door process bracket: cannot chmod {}: {error}",
@@ -19119,10 +19125,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     })
     .and_then(|_| std::fs::write(&log, "fixture\n"))
     .map_err(|error| format!("tool-root split: cannot write fixture: {error}"))?;
-    std::fs::set_permissions(
-        state_root.join("ci-hub/ci-hub"),
-        std::fs::Permissions::from_mode(0o755),
-    )
+    exec_safe_fs::set_executable(state_root.join("ci-hub/ci-hub"), 0o755)
     .map_err(|error| format!("tool-root split: cannot chmod fixture: {error}"))?;
     git(&state_root, &["init", "-b", "main"])?;
     git(&state_root, &["config", "user.email", "fixture@example.com"])?;
@@ -19141,28 +19144,25 @@ fn tool_root_split_bracket() -> Result<(), String> {
     std::fs::create_dir_all(frozen_root.join("ci-hub/validate"))
         .and_then(|_| std::fs::create_dir_all(frozen_root.join("ci-hub/ledger")))
         .and_then(|_| {
-            std::fs::copy(
+            exec_safe_fs::copy(
                 state_root.join("ci-hub/ci-hub"),
                 frozen_root.join("ci-hub/ci-hub"),
             )
         })
         .and_then(|_| {
-            std::fs::copy(
+            exec_safe_fs::copy(
                 state_root.join("ci-hub/validate/finalize_receipt.py"),
                 frozen_root.join("ci-hub/validate/finalize_receipt.py"),
             )
         })
         .and_then(|_| {
-            std::fs::copy(
+            exec_safe_fs::copy(
                 state_root.join("ci-hub/ledger/validate_rows.py"),
                 frozen_root.join("ci-hub/ledger/validate_rows.py"),
             )
         })
         .map_err(|error| format!("tool-root split: cannot create frozen fixture: {error}"))?;
-    std::fs::set_permissions(
-        frozen_root.join("ci-hub/ci-hub"),
-        std::fs::Permissions::from_mode(0o755),
-    )
+    exec_safe_fs::set_executable(frozen_root.join("ci-hub/ci-hub"), 0o755)
     .map_err(|error| format!("tool-root split: cannot chmod frozen fixture: {error}"))?;
     make_self_test_tree_read_only(&frozen_root)?;
     std::fs::create_dir_all(&target_root)
@@ -19281,7 +19281,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     install_self_test_tool_authority(&valid_authority);
 
     let copied_authority = root.join("copied-authority.json");
-    std::fs::copy(&valid_authority.authority_path, &copied_authority)
+    exec_safe_fs::copy(&valid_authority.authority_path, &copied_authority)
         .and_then(|_| {
             std::fs::set_permissions(
                 &copied_authority,
@@ -24340,7 +24340,7 @@ mod committed_selection_preservation_tests {
         ] {
             let dest = fixture.join(path);
             std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-            std::fs::copy(root.join(path), dest).unwrap();
+            exec_safe_fs::copy(root.join(path), dest).unwrap();
         }
         std::fs::create_dir(fixture.join("scripts")).unwrap();
         let driver = fixture.join("scripts/validate.rs");
@@ -24348,7 +24348,7 @@ mod committed_selection_preservation_tests {
         // their complete shard/workflow inputs execute unchanged. The plan is
         // the actual committed hosted selection loaded above.
         std::fs::write(&driver, "#!/usr/bin/env bash\nset -euo pipefail\n[[ $# == 3 && $1 == --hosted-portable-only && $2 == --show-plan-json && $3 == --skip-inner-dirty-working-tree-and-rebase-freshness-checks ]] || exit 90\ncat ./plan.json\n").unwrap();
-        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exec_safe_fs::set_executable(&driver, 0o755).unwrap();
         let run = |script: &str, selected: &serde_json::Value, exported: &serde_json::Value| {
             std::fs::write(
                 fixture.join("ci/portable-shards.json"),
@@ -24695,10 +24695,7 @@ mod fused_privileged_build_tests {
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions).unwrap();
+        crate::exec_safe_fs::write_executable(path, contents, 0o700).unwrap();
     }
 
     fn cold_fixture(repository: &Path, helper: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -24709,7 +24706,7 @@ mod fused_privileged_build_tests {
         write_executable(&root.path().join("bin/cargo"), include_str!("../ci/tests/nextest-preparation-cargo-fixture.py"));
         std::os::unix::fs::symlink(helper, root.path().join("ci/nextest-binaries.rs")).unwrap();
         std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
-        std::fs::copy(repository.join("ci/dag/validate.json"), root.path().join("ci/dag/validate.json")).unwrap();
+        exec_safe_fs::copy(repository.join("ci/dag/validate.json"), root.path().join("ci/dag/validate.json")).unwrap();
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.path().join("guest-names.json"), serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap()).unwrap();
         std::fs::write(root.path().join(".gitignore"), "/target/\n/custom-cargo-target/\n/cargo-calls\n").unwrap();
@@ -24801,13 +24798,12 @@ mod fused_privileged_build_tests {
         let wrapper_bytes = std::fs::read(&wrapper).unwrap();
         for mode in ["missing", "stale"] {
             if mode == "missing" { std::fs::remove_file(&wrapper).unwrap(); }
-            else { std::fs::write(&wrapper, "#!/bin/sh\nexit 23\n").unwrap(); }
+            else { crate::exec_safe_fs::write_executable(&wrapper, "#!/bin/sh\nexit 23\n", 0o755).unwrap(); }
             assert!(!run_build("./ci/nextest-binaries.rs cpu-wrapper", root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper");
             assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "accepted {mode} wrapper through the barrier");
             assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a {mode} wrapper cannot cause a fallback build");
-            write_executable(&wrapper, std::str::from_utf8(&wrapper_bytes).unwrap());
-            // write_executable uses 0700; preserve the producer's original mode.
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Preserve the producer's original mode.
+            crate::exec_safe_fs::write_executable(&wrapper, &wrapper_bytes, 0o755).unwrap();
         }
         let no_build = run_build("HERMIT_PREPARED_NEXTEST_REQUIRED=1 ./ci/nextest-binaries.rs build-cpu-wrapper", root.path(), &bin, &log, "current");
         assert!(!no_build.status.success(), "an official consumer cannot invoke standalone preparation");
@@ -26076,7 +26072,7 @@ with (root/'calls.jsonl').open('a') as out:
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exec_safe_fs::set_executable(&script, 0o755).unwrap();
         let _lock = match validate_runtime::acquire_invocation_lock(root, "full", HEAD) {
             validate_runtime::LockOutcome::Acquired(lock) => lock,
             _ => panic!("the private invocation lock must be available"),
@@ -26252,7 +26248,7 @@ with (root/'calls.jsonl').open('a') as out:
             std::fs::create_dir_all(root.join("ci/dag")).unwrap();
             // Keep the real, nonempty manifest population. This selected plan
             // runs a package test and deliberately selects none of its cells.
-            std::fs::copy(
+            exec_safe_fs::copy(
                 source.join("ci/expected-e2e-plan.json"),
                 root.join("ci/expected-e2e-plan.json"),
             )
