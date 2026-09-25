@@ -169,19 +169,36 @@ impl Replay {
         })
     }
 
-    /// Waits for the replay to finish and returns its exit status.
-    pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
-        let (exit_status, global_state) = self.tracer.wait().await?;
-        self.chroot.remove()?;
+    /// Waits with the original materialization/chroot guards held through cleanup.
+    pub async fn wait(
+        self,
+        control: std::rc::Rc<crate::ptrace_completion::Control>,
+    ) -> Result<ExitStatus, crate::Error> {
+        let Self {
+            tracer,
+            chroot,
+            _materialization_scope,
+        } = self;
+        let (exit_status, global_state) = crate::ptrace_completion::wait(tracer, control).await?;
         global_state.clean_up(false, &None).await;
+        chroot.remove()?;
         Ok(exit_status)
     }
 
-    /// Waits for the replay to finish and collects its output.
-    pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
-        let (output, global_state) = self.tracer.wait_with_output().await?;
-        self.chroot.remove()?;
+    /// Captures output with the same owner/guard contract as plain replay.
+    pub async fn wait_with_output(
+        self,
+        control: std::rc::Rc<crate::ptrace_completion::Control>,
+    ) -> Result<Output, crate::Error> {
+        let Self {
+            tracer,
+            chroot,
+            _materialization_scope,
+        } = self;
+        let (output, global_state) =
+            crate::ptrace_completion::wait_with_output(tracer, control).await?;
         global_state.clean_up(false, &None).await;
+        chroot.remove()?;
         Ok(output)
     }
 }

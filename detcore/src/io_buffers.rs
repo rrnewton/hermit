@@ -66,6 +66,67 @@ pub struct BufferExtent {
     pub len: u64,
 }
 
+/// Bind successful RNG output to the very array the synchronous handler used.
+/// The return count, not the declared capacity, bounds each observed extent.
+pub(crate) fn rng_readv_extents(
+    iovecs: &[crate::iovecs::ImportedIovec],
+    written: usize,
+) -> Result<Vec<BufferExtent>, Error> {
+    let mut output = rng_observation_vec(iovecs.len(), "imported geometry")?;
+    let mut remaining = written;
+    for iov in iovecs {
+        let take = remaining.min(iov.len);
+        remaining -= take;
+        if take > 0 {
+            output.push(BufferExtent {
+                addr: iov.base as u64,
+                len: take as u64,
+            });
+        }
+    }
+    Ok(output)
+}
+
+/// RNG observation happens after the output and cursor have committed. A
+/// recoverable reservation failure must stop the tool, not become guest errno.
+/// This does not promise to catch physical OOM or other logging allocations.
+fn rng_observation_vec<T>(capacity: usize, purpose: &str) -> Result<Vec<T>, Error> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(capacity).map_err(|error| {
+        Error::Tool(anyhow::anyhow!(
+            "RNG readv observation after cursor commit: cannot reserve {purpose}: {error}"
+        ))
+    })?;
+    Ok(output)
+}
+
+fn observed_extents(
+    memory: &impl MemoryAccess,
+    call: &Syscall,
+    ret: i64,
+    rng_output: Option<&[BufferExtent]>,
+) -> Result<Vec<BufferExtent>, Error> {
+    if let Some(output) = rng_output {
+        if ret <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut observed = rng_observation_vec(output.len(), "observed geometry")?;
+        let mut remaining = ret as u64;
+        for extent in output {
+            let take = remaining.min(extent.len);
+            remaining -= take;
+            if take > 0 {
+                observed.push(BufferExtent {
+                    addr: extent.addr,
+                    len: take,
+                });
+            }
+        }
+        return Ok(observed);
+    }
+    extents(memory, call, ret)
+}
+
 /// Direction of travel, recorded so a reader can tell a value the kernel
 /// produced from one the guest produced without knowing every syscall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,13 +486,20 @@ fn extent_digests<G, T>(
     guest: &mut G,
     addr: u64,
     len: u64,
+    rng_output: bool,
 ) -> Result<(Digest, usize, Vec<String>), Error>
 where
     G: Guest<T>,
     T: Tool,
 {
     let size = len as usize;
-    let mut buf = vec![0u8; size];
+    let mut buf = if rng_output {
+        let mut buf = rng_observation_vec(size, "digest payload")?;
+        buf.resize(size, 0u8);
+        buf
+    } else {
+        vec![0u8; size]
+    };
     if size > 0 {
         let start = Addr::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
         guest.memory().read_values(start, buf.as_mut_slice())?;
@@ -485,6 +553,7 @@ pub(crate) fn detlog_io_buffers<G, T>(
     call: &Syscall,
     ret: i64,
     dettid: DetTid,
+    rng_output: Option<&[BufferExtent]>,
 ) -> Result<(), Error>
 where
     G: Guest<T>,
@@ -516,10 +585,22 @@ where
     };
     let moved_extents = {
         let memory = guest.memory();
-        extents(&memory, call, ret)?
+        observed_extents(&memory, call, ret, rng_output)?
     };
     for extent in moved_extents {
-        let (whole, chunk, chunks) = extent_digests(guest, extent.addr, extent.len)?;
+        let (whole, chunk, chunks) =
+            extent_digests(guest, extent.addr, extent.len, rng_output.is_some()).map_err(
+                |error| {
+                    if rng_output.is_some() {
+                        Error::Tool(anyhow::Error::new(error).context(format!(
+                            "RNG readv observation after cursor commit: digest read at {:#x}+{}",
+                            extent.addr, extent.len
+                        )))
+                    } else {
+                        error
+                    }
+                },
+            )?;
         let located = if chunks.is_empty() {
             String::new()
         } else {
@@ -541,9 +622,831 @@ where
 }
 
 #[cfg(test)]
+mod event_tests {
+    include!("io_buffers/user_access_event_tests.rs");
+    use std::io::IoSlice;
+    use std::io::IoSliceMut;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use nix::fcntl::OFlag;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use tokio::sync::oneshot;
+    use tracing::Event;
+    use tracing::Id;
+    use tracing::Level;
+    use tracing::Metadata;
+    use tracing::Subscriber;
+    use tracing::field::Field;
+    use tracing::field::Visit;
+    use tracing::span::Attributes;
+    use tracing::span::Record;
+
+    use super::*;
+    use crate::Config;
+    use crate::Detcore;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::fd::DetFd;
+    use crate::fd::FdType;
+    use crate::resources::Permission;
+    use crate::resources::ResourceID;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::tool_global::ResumeStatus;
+    use crate::types::DetPid;
+    use crate::types::OpenFileId;
+
+    const FD: i32 = 3;
+    const IOV: usize = 0x1000;
+    const FIRST_DEST: usize = 0x2000;
+    const RETRY_DEST: usize = 0x3000;
+    const PIPE_BYTES: &[u8; 4] = b"pipe";
+    const CANARY: u8 = 0xa5;
+
+    // Numeric guest addresses never become host slices. The fixed arena also
+    // makes corrupted descriptors fail promptly rather than allocate by length.
+    #[derive(Clone)]
+    struct EventMemory(Arc<Mutex<Vec<u8>>>, Arc<Mutex<MemoryReads>>);
+
+    #[derive(Default)]
+    struct MemoryReads {
+        imported_entries: usize,
+        observer_reads: Vec<(usize, usize)>,
+        digest_error: Option<Errno>,
+        user_copy_audit: bool,
+        copy_done: bool,
+        copy_actions: std::collections::VecDeque<(usize, Result<usize, Errno>)>,
+        copy_lengths: Vec<usize>,
+        after_copy: Vec<&'static str>,
+    }
+
+    impl EventMemory {
+        fn new() -> Self {
+            Self(
+                Arc::new(Mutex::new(vec![CANARY; 0x4000])),
+                Arc::new(Mutex::new(MemoryReads::default())),
+            )
+        }
+
+        fn put_iovec(&self, index: usize, base: usize, len: usize) {
+            let start = IOV + index * std::mem::size_of::<libc::iovec>();
+            let mut bytes = self.0.lock().unwrap();
+            bytes[start..start + 8].copy_from_slice(&base.to_ne_bytes());
+            bytes[start + 8..start + 16].copy_from_slice(&len.to_ne_bytes());
+        }
+
+        fn iovec(&self, index: usize) -> (usize, usize) {
+            let address = IOV + index * std::mem::size_of::<libc::iovec>();
+            let iov: libc::iovec = self
+                .read_value(Addr::<libc::iovec>::from_raw(address).unwrap())
+                .unwrap();
+            (iov.iov_base as usize, iov.iov_len)
+        }
+
+        fn bytes(&self, address: usize, len: usize) -> Vec<u8> {
+            self.0.lock().unwrap()[address..address + len].to_vec()
+        }
+
+        fn copy_read(&self, start: usize, buf: &mut [u8]) -> Result<(), Errno> {
+            let end = start.checked_add(buf.len()).ok_or(Errno::EFAULT)?;
+            let bytes = self.0.lock().unwrap();
+            buf.copy_from_slice(bytes.get(start..end).ok_or(Errno::EFAULT)?);
+            Ok(())
+        }
+    }
+
+    impl MemoryAccess for EventMemory {
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            buf: &[u8],
+        ) -> Result<usize, Errno> {
+            let (written, outcome) = {
+                let mut audit = self.1.lock().unwrap();
+                audit.copy_lengths.push(buf.len());
+                audit
+                    .copy_actions
+                    .pop_front()
+                    .unwrap_or((buf.len(), Ok(buf.len())))
+            };
+            assert!(written <= buf.len());
+            let start = addr.as_raw();
+            let end = start.checked_add(written).ok_or(Errno::EFAULT)?;
+            self.0
+                .lock()
+                .unwrap()
+                .get_mut(start..end)
+                .ok_or(Errno::EFAULT)?
+                .copy_from_slice(&buf[..written]);
+            self.1.lock().unwrap().copy_done = true;
+            outcome
+        }
+
+        fn read_vectored(
+            &self,
+            _remote: &[IoSlice],
+            _local: &mut [IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("event fixture must use its scalar memory override")
+        }
+
+        fn write_vectored(
+            &mut self,
+            _local: &[IoSlice],
+            _remote: &mut [IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("event fixture must use its scalar memory override")
+        }
+
+        fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+        where
+            A: Into<Addr<'a, u8>>,
+        {
+            let start = addr.into().as_raw();
+            let mut reads = self.1.lock().unwrap();
+            reads.observer_reads.push((start, buf.len()));
+            if reads.user_copy_audit && reads.copy_done {
+                reads.after_copy.push("memory-read");
+            }
+            if start == FIRST_DEST
+                && let Some(error) = reads.digest_error
+            {
+                return Err(error);
+            }
+            drop(reads);
+            self.copy_read(start, buf)?;
+            Ok(buf.len())
+        }
+
+        fn read_exact_with_user_access<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<(), Errno>
+        where
+            A: Into<Addr<'a, u8>>,
+        {
+            {
+                let mut reads = self.1.lock().unwrap();
+                reads.imported_entries += 1;
+                if reads.user_copy_audit && reads.copy_done {
+                    reads.after_copy.push("user-read");
+                }
+            }
+            self.copy_read(addr.into().as_raw(), buf)
+        }
+
+        fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+            assert!(
+                !self.1.lock().unwrap().user_copy_audit,
+                "random output used debugger write"
+            );
+            let start = addr.as_raw();
+            let end = start.checked_add(buf.len()).ok_or(Errno::EFAULT)?;
+            let mut bytes = self.0.lock().unwrap();
+            bytes
+                .get_mut(start..end)
+                .ok_or(Errno::EFAULT)?
+                .copy_from_slice(buf);
+            Ok(buf.len())
+        }
+    }
+
+    type RetryGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    struct EventGuest {
+        config: Config,
+        thread: ThreadState<()>,
+        memory: EventMemory,
+        injected_iovecs: Vec<(usize, usize)>,
+        injected_zero_reads: usize,
+        polls: Mutex<Vec<u32>>,
+        releases: Mutex<usize>,
+        retry_gate: Mutex<Option<RetryGate>>,
+    }
+
+    impl EventGuest {
+        fn audit_call(&self, operation: &'static str) -> bool {
+            let mut audit = self.memory.1.lock().unwrap();
+            if audit.user_copy_audit && audit.copy_done {
+                audit.after_copy.push(operation);
+            }
+            audit.user_copy_audit
+        }
+    }
+
+    struct UnusedStack;
+    struct UnusedStackGuard;
+
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for UnusedStack {
+        type StackGuard = UnusedStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("readv event must not use a guest stack")
+        }
+
+        fn capacity(&self) -> usize {
+            panic!("readv event must not use a guest stack")
+        }
+
+        fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
+            panic!("readv event must not use a guest stack")
+        }
+
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("readv event must not use a guest stack")
+        }
+
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("readv event must not use a guest stack")
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for EventGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let response = match message.2 {
+                GlobalRequest::RequestResources(request, _) => {
+                    assert_eq!(request.resources.len(), 1);
+                    assert_eq!(
+                        request.resources.get(&ResourceID::InternalIOPolling),
+                        Some(&Permission::W)
+                    );
+                    self.polls.lock().unwrap().push(request.poll_attempt);
+                    match request.poll_attempt {
+                        0 => {}
+                        1 => {
+                            assert_eq!(self.injected_iovecs, [(FIRST_DEST, 8)]);
+                            let (parked, resume) = self.retry_gate.lock().unwrap().take().unwrap();
+                            parked.send(()).unwrap();
+                            resume.await.unwrap();
+                        }
+                        attempt => panic!("unexpected extra readv poll {attempt}"),
+                    }
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
+                GlobalRequest::ReleaseAllResources => {
+                    self.audit_call("release");
+                    *self.releases.lock().unwrap() += 1;
+                    GlobalResponse::ReleaseAllResources(())
+                }
+                request => panic!("unexpected readv event RPC: {request:?}"),
+            };
+            (None, response)
+        }
+
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for EventGuest {
+        type Memory = EventMemory;
+        type Stack = UnusedStack;
+
+        fn tid(&self) -> Pid {
+            Pid::from_raw(self.thread.dettid.as_raw())
+        }
+
+        fn pid(&self) -> Pid {
+            Pid::from_raw(self.thread.detpid.unwrap().as_raw())
+        }
+
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+
+        fn memory(&self) -> Self::Memory {
+            self.memory.clone()
+        }
+
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            if self.audit_call("regs") {
+                return libc::user_regs_struct {
+                    rip: 0x4000,
+                    eflags: 2,
+                    ..unsafe { std::mem::zeroed() }
+                };
+            }
+            panic!("buffer observation must not request register evidence")
+        }
+
+        async fn set_regs(&mut self, _regs: libc::user_regs_struct) -> Result<(), Error> {
+            assert!(self.audit_call("set-regs"));
+            Ok(())
+        }
+
+        fn detlog_memory_regions(&self) -> Option<Vec<reverie::DetlogMemoryRegion>> {
+            if !self.audit_call("memory-regions") {
+                return None;
+            }
+            Some(vec![
+                reverie::DetlogMemoryRegion {
+                    kind: reverie::DetlogRegionKind::Stack,
+                    start: FIRST_DEST as u64,
+                    end: (FIRST_DEST + 8) as u64,
+                },
+                reverie::DetlogMemoryRegion {
+                    kind: reverie::DetlogRegionKind::Heap,
+                    start: RETRY_DEST as u64,
+                    end: (RETRY_DEST + 8) as u64,
+                },
+            ])
+        }
+
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("readv event must not use a guest stack")
+        }
+
+        async fn daemonize(&mut self) {
+            panic!("readv event must not daemonize")
+        }
+
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, args) = syscall.into_parts();
+            if let Syscall::Read(call) = Syscall::from_raw(number, args) {
+                assert_eq!(call.len(), 0);
+                self.injected_zero_reads += 1;
+                if call.fd() == -1 {
+                    return Err(Errno::EBADF);
+                }
+                assert_eq!(call.fd(), FD);
+                assert_ne!(
+                    self.thread.with_detfd(FD, |fd| fd.ty()).unwrap(),
+                    FdType::Rng
+                );
+                return Err(Errno::EINVAL);
+            }
+            let Syscall::Readv(call) = Syscall::from_raw(number, args) else {
+                panic!("unexpected injected syscall {number}");
+            };
+            assert_eq!(call.fd(), FD);
+            assert_eq!(call.iov().unwrap().as_raw(), IOV);
+            assert_eq!(call.len(), 1);
+            assert_eq!(
+                self.thread.with_detfd(FD, |fd| fd.ty()).unwrap(),
+                FdType::Pipe,
+                "an RNG readv must be emulated without injection"
+            );
+            // Each actual nonblocking kernel attempt imports its own array.
+            // The first attempt moves nothing; only the retry writes bytes.
+            let (base, len) = self.memory.iovec(0);
+            self.injected_iovecs.push((base, len));
+            match self.injected_iovecs.len() {
+                1 => Err(Errno::EAGAIN),
+                2 => {
+                    assert!(len >= PIPE_BYTES.len());
+                    self.memory
+                        .write_exact(AddrMut::from_raw(base).unwrap(), PIPE_BYTES)?;
+                    Ok(PIPE_BYTES.len() as i64)
+                }
+                attempt => panic!("unexpected extra readv injection {attempt}"),
+            }
+        }
+
+        async fn tail_inject<S: SyscallInfo>(&mut self, _syscall: S) -> reverie::Never {
+            panic!("readv must return through the event observer")
+        }
+
+        fn set_timer(&mut self, _schedule: reverie::TimerSchedule) -> Result<(), Error> {
+            if self.audit_call("timer") {
+                return Ok(());
+            }
+            panic!("event fixture has no PMU timeslice")
+        }
+
+        fn set_timer_precise(&mut self, _schedule: reverie::TimerSchedule) -> Result<(), Error> {
+            if self.audit_call("timer") {
+                return Ok(());
+            }
+            panic!("event fixture has no PMU timeslice")
+        }
+
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            if self.audit_call("clock") {
+                return Ok(0);
+            }
+            panic!("event fixture must not read a host clock")
+        }
+    }
+
+    fn event_guest(ty: FdType, retry_gate: Option<RetryGate>) -> (Detcore, EventGuest) {
+        let config = Config {
+            seed: 0,
+            rng_seed: Some(0),
+            sequentialize_threads: true,
+            recordreplay_modes: false,
+            record_preemptions: false,
+            max_timeslice: None,
+            detlog_io_buffers: true,
+            detlog_heap: false,
+            detlog_stack: false,
+            detlog_regs: false,
+            backend_is_kvm: true,
+            syscall_clobbers_virtualized_by_backend: true,
+            ..Config::default()
+        };
+        let pid = DetPid::from_raw(1);
+        let mut thread = ThreadState::new(pid, &config, ());
+        thread.detpid = Some(pid);
+        let fd = DetFd::new(FD, OFlag::O_RDONLY, ty, OpenFileId::new(pid, 99));
+        if ty == FdType::Pipe {
+            fd.set_physically_nonblocking();
+        }
+        thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .file_handles
+            .insert(FD, fd);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let guest = EventGuest {
+            config,
+            thread,
+            memory: EventMemory::new(),
+            injected_iovecs: Vec::new(),
+            injected_zero_reads: 0,
+            polls: Mutex::new(Vec::new()),
+            releases: Mutex::new(0),
+            retry_gate: Mutex::new(retry_gate),
+        };
+        (tool, guest)
+    }
+
+    #[derive(Clone, Default)]
+    struct BufferLog(Arc<Mutex<Vec<String>>>);
+
+    struct MessageVisitor(Option<String>);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl Subscriber for BufferLog {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::INFO
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0
+                && message.contains("[iobuf]")
+            {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn readv(count: usize) -> Syscall {
+        reverie::syscalls::Readv::new()
+            .with_fd(FD)
+            .with_iov(Addr::from_raw(IOV))
+            .with_len(count)
+            .into()
+    }
+
+    fn assert_extent(message: &str, address: usize, bytes: &[u8]) {
+        let expected = format!(
+            "[iobuf][dtid 1] readv in fd={FD} {address:#x}+{}->{}",
+            bytes.len(),
+            Digest::new(bytes)
+        );
+        assert!(
+            message.contains(&expected),
+            "expected {expected}, got {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipe_readv_event_observes_destination_imported_after_retry_wait() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, FIRST_DEST, 8);
+
+        // This is the real Detcore syscall-event dispatch and observation path,
+        // including its nonblocking EAGAIN retry. No helper supplies geometry.
+        let event = tool.handle_syscall_event(&mut guest, readv(1));
+        let mutate_during_retry = async {
+            parked_rx.await.unwrap();
+            assert_eq!(memory.iovec(0), (FIRST_DEST, 8));
+            assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+            memory.put_iovec(0, RETRY_DEST, 8);
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(event, mutate_during_retry)
+        })
+        .await
+        .expect("readv did not cross its retry resource wait");
+        assert_eq!(result.unwrap(), 4);
+        assert_eq!(guest.injected_iovecs, [(FIRST_DEST, 8), (RETRY_DEST, 8)]);
+        assert_eq!(*guest.polls.lock().unwrap(), [0, 1]);
+        assert_eq!(*guest.releases.lock().unwrap(), 1);
+        assert_eq!(guest.thread.stats.syscall_count, 1);
+        assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+        assert_eq!(
+            memory.bytes(RETRY_DEST, 4).as_slice(),
+            PIPE_BYTES.as_slice()
+        );
+        assert_eq!(memory.bytes(RETRY_DEST + 4, 4), [CANARY; 4]);
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_extent(&messages[0], RETRY_DEST, PIPE_BYTES);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_observes_imported_array_after_output_overwrites_it() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (tool, mut guest) = event_guest(FdType::Rng, None);
+        let memory = guest.memory.clone();
+        let second_iovec = IOV + std::mem::size_of::<libc::iovec>();
+        memory.put_iovec(0, second_iovec, 16);
+        memory.put_iovec(1, FIRST_DEST, 4);
+        let original_second_iovec = memory.bytes(second_iovec, 16);
+
+        let result = tool.handle_syscall_event(&mut guest, readv(2)).await;
+        assert_eq!(result.unwrap(), 20);
+        let expected = [
+            41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112, 185, 2, 75, 148,
+        ];
+        assert_eq!(memory.bytes(second_iovec, 16), expected[..16]);
+        assert_ne!(memory.bytes(second_iovec, 16), original_second_iovec);
+        assert_eq!(memory.bytes(FIRST_DEST, 4), expected[16..]);
+        assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4]);
+        assert!(guest.injected_iovecs.is_empty());
+        assert!(guest.polls.lock().unwrap().is_empty());
+        assert_eq!(*guest.releases.lock().unwrap(), 1);
+        assert_eq!(guest.thread.stats.syscall_count, 1);
+        assert_eq!(
+            guest
+                .thread
+                .with_detfd(FD, |fd| fd.random_device_offset())
+                .unwrap(),
+            20
+        );
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_extent(&messages[0], second_iovec, &expected[..16]);
+        assert_extent(&messages[1], FIRST_DEST, &expected[16..]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_digest_failure_is_terminal_after_bytes_and_cursor_commit() {
+        for fault in [Errno::EFAULT, Errno::EIO] {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (tool, mut guest) = event_guest(FdType::Rng, None);
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, RETRY_DEST, 3);
+            memory.put_iovec(1, FIRST_DEST, 5);
+            memory.1.lock().unwrap().digest_error = Some(fault);
+
+            let result = tool.handle_syscall_event(&mut guest, readv(2)).await;
+            let Err(Error::Tool(error)) = result else {
+                panic!("completed RNG readv digest failure became guest result: {result:?}");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("RNG readv observation after cursor commit")
+            );
+            assert!(error.chain().any(|cause| {
+                matches!(cause.downcast_ref::<Error>(), Some(Error::Errno(error)) if *error == fault)
+            }));
+            assert_eq!(memory.bytes(RETRY_DEST, 4), [41, 114, 187, CANARY]);
+            assert_eq!(memory.bytes(FIRST_DEST, 6), [4, 77, 150, 223, 40, CANARY]);
+            assert_eq!(
+                guest
+                    .thread
+                    .with_detfd(FD, |fd| fd.random_device_offset())
+                    .unwrap(),
+                8
+            );
+            assert_eq!(*guest.releases.lock().unwrap(), 1);
+            assert!(guest.injected_iovecs.is_empty());
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(reads.imported_entries, 2);
+            assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_extent(&messages[0], RETRY_DEST, &[41, 114, 187]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_observer_configuration_and_subscription_are_inert() {
+        for (configured, subscribed) in [(true, true), (false, true), (true, false)] {
+            let logs = BufferLog::default();
+            let dispatch = if subscribed {
+                tracing::Dispatch::new(logs.clone())
+            } else {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            };
+            let _subscriber = tracing::dispatcher::set_default(&dispatch);
+            let (mut tool, mut guest) = event_guest(FdType::Rng, None);
+            tool.cfg.detlog_io_buffers = configured;
+            guest.config.detlog_io_buffers = configured;
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, 3);
+            memory.put_iovec(1, RETRY_DEST, 5);
+
+            // Import and evidence must narrow the same raw count. In particular,
+            // the observer must not fetch 1024 descriptors after a two-entry read.
+            let result = tool
+                .handle_syscall_event(&mut guest, readv((1_usize << 32) | 2))
+                .await;
+            assert_eq!(result.unwrap(), 8);
+            assert_eq!(memory.bytes(FIRST_DEST, 4), [41, 114, 187, CANARY]);
+            assert_eq!(memory.bytes(RETRY_DEST, 6), [4, 77, 150, 223, 40, CANARY]);
+            assert_eq!(
+                guest
+                    .thread
+                    .with_detfd(FD, |fd| fd.random_device_offset())
+                    .unwrap(),
+                8
+            );
+            assert_eq!(*guest.releases.lock().unwrap(), 1);
+            assert!(guest.injected_iovecs.is_empty());
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(reads.imported_entries, 2);
+            let messages = logs.0.lock().unwrap();
+            if configured && subscribed {
+                assert_eq!(reads.observer_reads, [(FIRST_DEST, 3), (RETRY_DEST, 5)]);
+                assert_eq!(messages.len(), 2);
+                assert_extent(&messages[0], FIRST_DEST, &[41, 114, 187]);
+                assert_extent(&messages[1], RETRY_DEST, &[4, 77, 150, 223, 40]);
+            } else {
+                assert!(
+                    reads.observer_reads.is_empty(),
+                    "disabled observer read guest bytes"
+                );
+                assert!(messages.is_empty(), "disabled observer emitted hashes");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_zero_and_malformed_requests_have_no_observer_effects() {
+        for (count, length, expected, imports) in [
+            (0, 3, Ok(0), 0),
+            (1025, 3, Err(Errno::EINVAL), 0),
+            (1, usize::MAX, Err(Errno::EINVAL), 1),
+        ] {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (tool, mut guest) = event_guest(FdType::Rng, None);
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, length);
+            let result = tool.handle_syscall_event(&mut guest, readv(count)).await;
+            assert_eq!(
+                result.map_err(|error| error.into_errno().unwrap()),
+                expected
+            );
+            assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+            assert_eq!(
+                guest
+                    .thread
+                    .with_detfd(FD, |fd| fd.random_device_offset())
+                    .unwrap(),
+                0
+            );
+            assert_eq!(*guest.releases.lock().unwrap(), 1);
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(reads.imported_entries, imports);
+            assert!(reads.observer_reads.is_empty());
+            assert!(logs.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_scalar_zero_read_checks_access_without_touching_replay_placeholders() {
+        for mode in [
+            OFlag::O_RDONLY,
+            OFlag::O_RDWR,
+            OFlag::O_WRONLY,
+            OFlag::O_ACCMODE,
+            OFlag::O_PATH,
+        ] {
+            for address in [0, usize::MAX] {
+                let logs = BufferLog::default();
+                let _subscriber = tracing::subscriber::set_default(logs.clone());
+                let (tool, mut guest) = event_guest(FdType::Rng, None);
+                let fd = DetFd::new(
+                    FD,
+                    mode,
+                    FdType::Rng,
+                    OpenFileId::new(DetTid::from_raw(1), 99),
+                );
+                fd.advance_random_device_offset(7);
+                guest
+                    .thread
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .file_handles
+                    .insert(FD, fd);
+                let call = reverie::syscalls::Read::new()
+                    .with_fd(FD)
+                    .with_buf(AddrMut::from_raw(address))
+                    .with_len(0);
+                let result = tool.handle_syscall_event(&mut guest, call.into()).await;
+                let expected = if mode == OFlag::O_RDONLY || mode == OFlag::O_RDWR {
+                    if address == 0 {
+                        Ok(0)
+                    } else {
+                        Err(Errno::EFAULT)
+                    }
+                } else {
+                    Err(Errno::EBADF)
+                };
+                assert_eq!(
+                    result.map_err(|error| error.into_errno().unwrap()),
+                    expected
+                );
+                assert_eq!(
+                    guest
+                        .thread
+                        .with_detfd(FD, |fd| fd.random_device_offset())
+                        .unwrap(),
+                    7
+                );
+                assert!(guest.injected_iovecs.is_empty());
+                assert_eq!(guest.injected_zero_reads, 0);
+                assert!(guest.polls.lock().unwrap().is_empty());
+                let reads = guest.memory.1.lock().unwrap();
+                assert_eq!(reads.imported_entries, 0);
+                assert!(reads.observer_reads.is_empty());
+                assert!(logs.0.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_rng_zero_reads_keep_the_backend_result() {
+        for (fd, expected) in [(FD, Errno::EINVAL), (-1, Errno::EBADF)] {
+            let (tool, mut guest) = event_guest(FdType::Regular, None);
+            let call = reverie::syscalls::Read::new().with_fd(fd).with_len(0);
+            let result = tool.handle_syscall_event(&mut guest, call.into()).await;
+            assert!(matches!(result, Err(Error::Errno(error)) if error == expected));
+            // The incumbent fd precheck rejects -1 before the handler's
+            // injected zero-read path. A valid ordinary fd still reaches it.
+            assert_eq!(guest.injected_zero_reads, usize::from(fd == FD));
+            assert!(guest.memory.1.lock().unwrap().observer_reads.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use reverie::syscalls;
     use reverie::syscalls::LocalMemory;
+
+    #[test]
+    fn rng_observation_capacity_failure_is_a_tool_error() {
+        let error = rng_observation_vec::<u8>(usize::MAX, "digest payload").unwrap_err();
+        let Error::Tool(error) = error else {
+            panic!("post-commit allocation failure must not become guest errno");
+        };
+        assert!(error.to_string().contains("after cursor commit"));
+        assert!(error.to_string().contains("digest payload"));
+    }
 
     /// A divergence must be LOCATED, not merely detected -- that is the whole
     /// reason the chunk list exists, so it is asserted rather than assumed.

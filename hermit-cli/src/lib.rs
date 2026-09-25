@@ -30,6 +30,7 @@ mod interp;
 pub mod liteinst_bootstrap;
 pub mod liteinst_record;
 mod metadata;
+mod ptrace_completion;
 pub mod run_evidence;
 
 pub use canonical_verdict::Verdict;
@@ -342,9 +343,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -384,12 +382,10 @@ use goblin::elf::header;
 use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
-use nix::sys::signal::SaFlags;
-use nix::sys::signal::SigAction;
-use nix::sys::signal::SigHandler;
-use nix::sys::signal::SigSet;
-use nix::sys::signal::Signal;
-use nix::sys::signal::sigaction;
+pub use ptrace_completion::HermitCleanupStage;
+pub use ptrace_completion::HermitCleanupUnconfirmed;
+pub use ptrace_completion::HermitPtraceFailure;
+pub use ptrace_completion::RecoveryRefusal;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
@@ -2355,12 +2351,14 @@ pub fn run_with_backend(
 
 /// [`run_with_backend`] with a hermit-enforced wall-clock bound on the guest.
 ///
-/// `timeout: None` is byte-for-byte the old behaviour: no alarm is armed and no
-/// timer is created, so an unbounded run is not paying for a feature it did not
-/// ask for. See `with_run_deadline` in this module for what firing actually
-/// does; it is private, so this deliberately names it rather than linking to
-/// it — a public doc link to a private item is refused by
-/// `-D rustdoc::private-intra-doc-links`.
+/// This library never installs a process alarm. Ordinary ptrace keeps the
+/// original runtime, operation, failed GlobalState and backing guards when a
+/// finite cleanup attempt is unconfirmed; downcast [`HermitCleanupUnconfirmed`]
+/// and recover it on the original process/thread. A timeout is measured before
+/// startup and is not a certificate of cleanup. `None` leaves execution
+/// unbounded, but fatal cleanup attempts remain finite. Nonordinary backends
+/// retain their existing cooperative timeout/drop semantics. Synchronous stalls
+/// require caller-owned supervision; only the CLI owns its hard alarm fallback.
 ///
 /// ⚠️ NOT PART OF `DetConfig`, DELIBERATELY. A wall-clock bound is host state,
 /// and `DetConfig` is the determinism configuration that is serialized to disk
@@ -2375,6 +2373,23 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    if backend == Backend::Ptrace {
+        let summary_path = print_summary_to_json_file.clone();
+        return ptrace_completion::run(timeout, move |control| async move {
+            let report = SkidOvershootReport::begin(true);
+            let config = prepare_backend_config(config, backend);
+            let result = dispatch_backend(
+                command,
+                config,
+                print_summary,
+                &summary_path,
+                backend,
+                Some(control),
+            )
+            .await;
+            report.finish(result)
+        });
+    }
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
@@ -2491,7 +2506,7 @@ impl std::fmt::Display for GuestTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Guest exceeded the --timeout bound of {} seconds; hermit tore the container down",
+            "Guest exceeded the --timeout bound of {} seconds",
             self.limit.as_secs()
         )
     }
@@ -2499,195 +2514,21 @@ impl std::fmt::Display for GuestTimedOut {
 
 impl std::error::Error for GuestTimedOut {}
 
-/// How long the unwind gets before the hard fallback fires.
-///
-/// The fallback exists because the gentle path can itself wedge: if the guest
-/// is stopped in a way that keeps a tracer task from completing, dropping the
-/// future never returns and the deadline would be as inert as the mechanisms
-/// this replaces. Ten seconds is the same grace the per-cell
-/// `timeout --kill-after=10s` already uses, so the two tiers agree rather than
-/// racing on different numbers.
-const RUN_TIMEOUT_UNWIND_GRACE: Duration = Duration::from_secs(10);
-
-/// Bound `guest` by `timeout`, preferring an unwind over a kill.
-///
-/// ⚠️ THE UNWIND IS THE POINT. `tokio::time::timeout` DROPS the guest future on
-/// expiry, and dropping it is what runs every `Drop` in the async stack:
-/// reverie detaches and reaps its tracees, detcore's global state is dropped,
-/// and the error then propagates out through `with_container`, so the container
-/// init returns NORMALLY instead of `_exit`ing. The mounts and the guest go away
-/// because the namespace is torn down in order, not because the kernel demolished
-/// it under us.
-///
-/// Contrast `record_start.rs`'s `recording_timeout_handler`, which this follows
-/// in SHAPE but deliberately not in ACTION: it `_exit(124)`s from a signal
-/// handler, skipping every destructor, because a signal handler may only call
-/// async-signal-safe functions and cannot unwind. That remains the right answer
-/// for the FALLBACK tier below and the wrong one for the primary path.
-///
-/// ⚠️ WHY A FALLBACK IS STILL REQUIRED. The primary path depends on the runtime
-/// reaching the timer, and on the dropped future actually completing its own
-/// teardown. Neither is guaranteed for an arbitrary wedged guest. A bound that
-/// works only when the run was healthy enough not to need it is the inert
-/// mechanism this exists to remove, so the alarm below is armed FIRST and is
-/// disarmed by RAII only once the unwind has finished.
+/// Nonordinary backends retain their existing cooperative timeout behavior.
+/// There is no process-wide alarm in this library. A caller needing a bound on
+/// synchronous stalls must own external supervision; the CLI arms its own
+/// separate init-process fallback before invoking the library. Ordinary ptrace
+/// uses the retained whole-operation driver instead of cancelling this future.
 async fn with_run_deadline<F>(timeout: Option<Duration>, guest: F) -> Result<ExitStatus, Error>
 where
     F: std::future::Future<Output = Result<ExitStatus, Error>>,
 {
-    let Some(limit) = timeout else {
-        return guest.await;
-    };
-
-    // Armed before the guest starts and dropped after it finishes, so the
-    // window it covers is exactly the window the bound applies to.
-    let _fallback = RunTimeoutFallback::arm(limit + RUN_TIMEOUT_UNWIND_GRACE)?;
-
-    match tokio::time::timeout(limit, guest).await {
-        Ok(result) => result,
-        // The future has already been dropped by `timeout` at this point; every
-        // destructor in the guest stack has run before we get here.
-        Err(_elapsed) => {
-            stall_the_unwind_if_asked();
-            Err(Error::new(GuestTimedOut { limit }))
-        }
-    }
-}
-
-/// Test-only: hold the post-expiry path open past the grace so the SIGALRM
-/// fallback is the thing that ends the run.
-///
-/// ⚠️ THIS EXISTS BECAUSE THE FALLBACK COULD NOT BE MADE TO FIRE ANY OTHER WAY,
-/// AND AN UNEXERCISED SAFETY PATH IS THE FAILURE MODE THIS PROJECT KEEPS
-/// FINDING. Measured 2026-08-26 at this commit: the primary path fired at
-/// exactly the bound for a userspace spinner, a guest blocked reading a pipe
-/// with no writer, a guest that `SIGSTOP`s itself, an eight-thread guest
-/// ignoring `SIGTERM`, and a multi-process guest ignoring `SIGTERM` -- five
-/// shapes, five clean unwinds, no wedge. That is a good result for the primary
-/// path and it leaves the fallback with zero executions, which is exactly the
-/// mechanism-that-has-never-run shape.
-///
-/// ⚠️ WHAT THIS DOES AND DOES NOT REPRODUCE, stated precisely rather than
-/// implied. It reproduces the CONDITION the fallback is specified against --
-/// the post-expiry path not completing within `RUN_TIMEOUT_UNWIND_GRACE` -- and
-/// it exercises the real alarm, the real inherited-mask handling, the real
-/// handler, the real message and the real `_exit`. It does NOT reproduce any
-/// particular upstream CAUSE of a slow unwind, because none is known; the delay
-/// is here, after the drop, rather than inside a wedged destructor. A future
-/// reader must not read a passing fallback test as evidence that some specific
-/// teardown hang is handled.
-///
-/// Deliberately keyed off an environment variable named like the existing
-/// `HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE` rather than a `cfg(test)` gate:
-/// the fallback lives in the shipped binary and must be exercised there, not in
-/// a differently-compiled one.
-fn stall_the_unwind_if_asked() {
-    const STALL_ENV: &str = "HERMIT_INTERNAL_RUN_TIMEOUT_STALL_UNWIND";
-    if std::env::var_os(STALL_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
-        return;
-    }
-    // Comfortably past the grace, so the alarm -- not this sleep -- ends the
-    // process. If the fallback is broken this returns and the caller sees an
-    // ordinary timeout, which is what makes the test able to fail.
-    std::thread::sleep(RUN_TIMEOUT_UNWIND_GRACE + Duration::from_secs(5));
-}
-
-static RUN_TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
-static RUN_TIMEOUT_MESSAGE_LEN: AtomicUsize = AtomicUsize::new(0);
-
-/// The hard fallback: fires only if the unwind above did not finish in time.
-///
-/// Identical in construction to `record_start.rs`'s `recording_timeout_handler`
-/// -- non-blocking stderr so a full pipe cannot wedge the handler, then
-/// `_exit` -- and identical in exit code, because "a deadline fired" is one
-/// meaning and 124 already carries it for GNU `timeout`, for `safehermit`'s wall
-/// bound, and for `hermit record`'s own deadline. Reusing it here adds no new
-/// collision; inventing a fourth number for the same event would.
-extern "C" fn run_timeout_fallback_handler(_signal: libc::c_int) {
-    let len = RUN_TIMEOUT_MESSAGE_LEN.load(Ordering::Acquire);
-    let message = RUN_TIMEOUT_MESSAGE.load(Ordering::Acquire);
-    if !message.is_null() && len != 0 {
-        // SAFETY: the message is leaked before the timer is armed, and
-        // fcntl(2), write(2) and _exit(2) are async-signal-safe.
-        unsafe {
-            let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
-            if flags != -1 {
-                libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-            libc::write(libc::STDERR_FILENO, message.cast(), len);
-        }
-    }
-    // Exiting the namespace init tears down the container and its tracees.
-    // SAFETY: _exit(2) is async-signal-safe and runs no Rust destructors --
-    // which is precisely why this is the fallback and not the primary path.
-    unsafe { libc::_exit(HERMIT_DEADLINE_EXIT) }
-}
-
-struct RunTimeoutFallback {
-    previous_handler: SigAction,
-    reblock_sigalrm: bool,
-}
-
-impl RunTimeoutFallback {
-    fn arm(after: Duration) -> Result<Self, Error> {
-        let seconds: libc::c_uint = after
-            .as_secs()
-            .try_into()
-            .map_err(|_| Error::msg("--timeout exceeds the platform alarm limit"))?;
-        let message = Box::leak(
-            format!(
-                "HERMIT_RUN_TIMEOUT_FALLBACK: the --timeout unwind did not complete within {} seconds; \
-                 the container was terminated without a clean teardown\n",
-                RUN_TIMEOUT_UNWIND_GRACE.as_secs()
-            )
-            .into_boxed_str(),
-        );
-        RUN_TIMEOUT_MESSAGE.store(message.as_mut_ptr(), Ordering::Release);
-        RUN_TIMEOUT_MESSAGE_LEN.store(message.len(), Ordering::Release);
-
-        let action = SigAction::new(
-            SigHandler::Handler(run_timeout_fallback_handler),
-            SaFlags::SA_RESETHAND,
-            SigSet::empty(),
-        );
-        // SAFETY: the handler uses only async-signal-safe operations and stays
-        // installed until this guard disarms it.
-        let previous_handler = unsafe { sigaction(Signal::SIGALRM, &action) }?;
-
-        // A blocked SIGALRM stays pending forever and the handler never runs,
-        // silently disabling the fallback. `record_start.rs` learned this too.
-        let mut alarm = SigSet::empty();
-        alarm.add(Signal::SIGALRM);
-        let reblock_sigalrm = SigSet::thread_get_mask()
-            .map(|mask| mask.contains(Signal::SIGALRM))
-            .unwrap_or(false);
-        if reblock_sigalrm {
-            let _ = alarm.thread_unblock();
-        }
-
-        // SAFETY: `seconds` fits c_uint.
-        unsafe { libc::alarm(seconds) };
-        Ok(Self {
-            previous_handler,
-            reblock_sigalrm,
-        })
-    }
-}
-
-impl Drop for RunTimeoutFallback {
-    fn drop(&mut self) {
-        // SAFETY: disarm the alarm before restoring the inherited handler.
-        unsafe {
-            libc::alarm(0);
-            let _ = sigaction(Signal::SIGALRM, &self.previous_handler);
-        }
-        if self.reblock_sigalrm {
-            let mut alarm = SigSet::empty();
-            alarm.add(Signal::SIGALRM);
-            let _ = alarm.thread_block();
-        }
-        RUN_TIMEOUT_MESSAGE_LEN.store(0, Ordering::Release);
-        RUN_TIMEOUT_MESSAGE.store(std::ptr::null_mut(), Ordering::Release);
+    match timeout {
+        None => guest.await,
+        Some(limit) => match tokio::time::timeout(limit, guest).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::new(GuestTimedOut { limit })),
+        },
     }
 }
 
@@ -2707,6 +2548,7 @@ async fn run_with_backend_inner(
             print_summary,
             print_summary_to_json_file,
             backend,
+            None,
         )
         .await
     })
@@ -2719,6 +2561,7 @@ async fn dispatch_backend(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
+    control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<ExitStatus, Error> {
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -2786,7 +2629,10 @@ async fn dispatch_backend(
             builder = builder.sequentialized_guest();
         }
     }
-    let (exit_status, global_state) = builder.spawn().await?.wait().await?;
+    let control = control
+        .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
+    let (exit_status, global_state) =
+        ptrace_completion::wait(builder.spawn().await?, control).await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await; // Before it's dropped by this function.
@@ -2842,6 +2688,22 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    if backend == Backend::Ptrace {
+        let summary_path = print_summary_to_json_file.clone();
+        return ptrace_completion::run(timeout, move |control| async move {
+            let report = SkidOvershootReport::begin(true);
+            let result = dispatch_output_backend(
+                command,
+                prepare_backend_config(config, backend),
+                print_summary,
+                &summary_path,
+                backend,
+                Some(control),
+            )
+            .await;
+            report.finish(result)
+        });
+    }
     let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
         command,
         config,
@@ -2869,6 +2731,22 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(Output, u64), Error> {
+    if backend == Backend::Ptrace {
+        let summary_path = print_summary_to_json_file.clone();
+        return ptrace_completion::run(timeout, move |control| async move {
+            let report = SkidOvershootReport::begin(true);
+            let result = dispatch_output_backend(
+                command,
+                prepare_backend_config(config, backend),
+                print_summary,
+                &summary_path,
+                backend,
+                Some(control),
+            )
+            .await;
+            report.finish_with_count(result)
+        });
+    }
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         // Reserve before the Tokio runtime can reuse a closed fd 0. KVM
@@ -2904,10 +2782,10 @@ async fn run_with_output_backend_inner(
             print_summary,
             print_summary_to_json_file,
             backend,
+            None,
         )
         .await;
     };
-    let _fallback = RunTimeoutFallback::arm(limit + RUN_TIMEOUT_UNWIND_GRACE)?;
     match tokio::time::timeout(
         limit,
         dispatch_output_backend(
@@ -2916,6 +2794,7 @@ async fn run_with_output_backend_inner(
             print_summary,
             print_summary_to_json_file,
             backend,
+            None,
         ),
     )
     .await
@@ -2931,6 +2810,7 @@ async fn dispatch_output_backend(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
+    control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         return run_kvm(
@@ -3008,7 +2888,10 @@ async fn dispatch_output_backend(
             builder = builder.sequentialized_guest();
         }
     }
-    let (output, global_state) = builder.spawn().await?.wait_with_output().await?;
+    let control = control
+        .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
+    let (output, global_state) =
+        ptrace_completion::wait_with_output(builder.spawn().await?, control).await?;
     global_state
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
@@ -3100,9 +2983,15 @@ impl HermitData {
     /// with producer-owned root provenance must use
     /// [`Self::record_with_mountinfo`].
     pub fn record(&self, command: Command) -> Result<Recording, Error> {
-        let data = self.create_recording_dir()?;
-        let exit_status = record_to(command, data.path())?;
-        self.commit_recording(data, exit_status)
+        let store = Self {
+            data_dir: self.data_dir.clone(),
+        };
+        ptrace_completion::run(None, move |control| async move {
+            let data = store.create_recording_dir()?;
+            let exit_status =
+                record_to_async(command, data.path(), Vec::new(), None, control).await?;
+            store.commit_recording(data, exit_status)
+        })
     }
 
     /// Records with mountinfo provenance captured from the active container.
@@ -3111,9 +3000,22 @@ impl HermitData {
         command: Command,
         mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     ) -> Result<Recording, Error> {
-        let data = self.create_recording_dir()?;
-        let exit_status = record_to_with_mountinfo(command, data.path(), mountinfo_root_rewrites)?;
-        self.commit_recording(data, exit_status)
+        let store = Self {
+            data_dir: self.data_dir.clone(),
+        };
+        ptrace_completion::run(None, move |control| async move {
+            let data = store.create_recording_dir()?;
+            let mount_ids = capture_mountinfo_identity_order()?;
+            let exit_status = record_to_async(
+                command,
+                data.path(),
+                mountinfo_root_rewrites,
+                Some(mount_ids),
+                control,
+            )
+            .await?;
+            store.commit_recording(data, exit_status)
+        })
     }
 
     /// Creates a temporary directory for a recording that has not been committed yet.
@@ -3282,32 +3184,35 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
     }
 }
 
-/// Records to the specified directory, which must already exist.
-///
-/// This low-level API supplies no pre-captured mount provenance. Detcore reads
-/// the completed guest namespace after command mounts and stdio are installed.
-/// Container-aware callers with producer-owned provenance must use
-/// [`record_to_with_mountinfo`].
-#[tokio::main(flavor = "current_thread")]
-pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    record_to_async(command, dir, Vec::new(), None).await
+/// Records to an existing directory. The caller must keep its backing resources
+/// alive through any [`HermitCleanupUnconfirmed`] recovery. [`HermitData::record`]
+/// owns its temporary recording directory inside the retained operation.
+pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
+    let dir = dir.to_owned();
+    ptrace_completion::run(None, move |control| async move {
+        record_to_async(command, &dir, Vec::new(), None, control).await
+    })
 }
 
-/// Records to the specified directory with exact mountinfo provenance.
-#[tokio::main(flavor = "current_thread")]
-pub async fn record_to_with_mountinfo(
+/// Records with producer-owned mountinfo provenance. The directory-lifetime
+/// obligation is the same as [`record_to`].
+pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
 ) -> Result<ExitStatus, Error> {
-    let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
-    record_to_async(
-        command,
-        dir,
-        mountinfo_root_rewrites,
-        Some(mountinfo_mount_ids),
-    )
-    .await
+    let dir = dir.to_owned();
+    ptrace_completion::run(None, move |control| async move {
+        let mount_ids = capture_mountinfo_identity_order()?;
+        record_to_async(
+            command,
+            &dir,
+            mountinfo_root_rewrites,
+            Some(mount_ids),
+            control,
+        )
+        .await
+    })
 }
 
 async fn record_to_async(
@@ -3315,45 +3220,46 @@ async fn record_to_async(
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let report = SkidOvershootReport::begin(true);
     let result = async {
         Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
             .await?
-            .wait()
+            .wait(control)
             .await
     }
     .await;
-    skid_overshoot_report.finish(result)
+    report.finish(result)
 }
 
-/// Records to the specified directory, which must already exist. The
-/// stderr/stdout of the recording is captured in `Output`.
-///
-/// This low-level API supplies no pre-captured mount provenance. Detcore reads
-/// the completed guest namespace after command mounts and stdio are installed.
-/// Container-aware callers with producer-owned provenance must use
-/// [`record_with_output_with_mountinfo`].
-#[tokio::main(flavor = "current_thread")]
-pub async fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
-    record_with_output_async(command, dir, Vec::new(), None).await
+/// Records and captures output. Keep the directory's backing resources alive
+/// through any cleanup checkpoint, as for [`record_to`].
+pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
+    let dir = dir.to_owned();
+    ptrace_completion::run(None, move |control| async move {
+        record_with_output_async(command, &dir, Vec::new(), None, control).await
+    })
 }
 
 /// Records with captured output and exact mountinfo provenance.
-#[tokio::main(flavor = "current_thread")]
-pub async fn record_with_output_with_mountinfo(
+pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
 ) -> Result<Output, Error> {
-    let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
-    record_with_output_async(
-        command,
-        dir,
-        mountinfo_root_rewrites,
-        Some(mountinfo_mount_ids),
-    )
-    .await
+    let dir = dir.to_owned();
+    ptrace_completion::run(None, move |control| async move {
+        let mount_ids = capture_mountinfo_identity_order()?;
+        record_with_output_async(
+            command,
+            &dir,
+            mountinfo_root_rewrites,
+            Some(mount_ids),
+            control,
+        )
+        .await
+    })
 }
 
 async fn record_with_output_async(
@@ -3361,89 +3267,78 @@ async fn record_with_output_async(
     dir: &Path,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
+    let report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-
     let result = async {
         Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
             .await?
-            .wait_with_output()
+            .wait_with_output(control)
             .await
     }
     .await;
-    skid_overshoot_report.finish(result)
+    report.finish(result)
 }
 
-/// Replays from the specified directory.
-#[tokio::main(flavor = "current_thread")]
-pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async { Ok(Replay::spawn(dir, false, None, &[]).await?.wait().await?) }.await;
-    skid_overshoot_report.finish(result)
+/// Replays an existing recording. Materialization and chroot guards remain with
+/// the original runtime through any cleanup checkpoint.
+pub fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
+    replay_plain(dir, None, &[])
 }
 
 /// Replays with a gdb server.
-#[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async {
-        Ok(Replay::spawn(dir, false, Some(port), &[])
-            .await?
-            .wait()
-            .await?)
-    }
-    .await;
-    skid_overshoot_report.finish(result)
+pub fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
+    replay_plain(dir, Some(port), &[])
 }
 
-/// Replays with a gdb server and applies mounts inside the replay chroot.
-#[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_gdbserver_and_mounts(
+/// Replays with a gdb server and mounts inside the replay chroot.
+pub fn replay_with_gdbserver_and_mounts(
     dir: &Path,
     port: u16,
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async {
-        Ok(Replay::spawn(dir, false, Some(port), mounts)
-            .await?
-            .wait()
-            .await?)
-    }
-    .await;
-    skid_overshoot_report.finish(result)
+    replay_plain(dir, Some(port), mounts)
 }
 
-/// Replays from the specified directory which must already exist. The
-/// stderr/stdout of the replay is captured in `Output`.
-#[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async {
-        Ok(Replay::spawn(dir, true, None, &[])
-            .await?
-            .wait_with_output()
-            .await?)
-    }
-    .await;
-    skid_overshoot_report.finish(result)
+fn replay_plain(dir: &Path, port: Option<u16>, mounts: &[Mount]) -> Result<ExitStatus, Error> {
+    let dir = dir.to_owned();
+    let mounts = mounts.to_vec();
+    ptrace_completion::run(None, move |control| async move {
+        let report = SkidOvershootReport::begin(true);
+        let result = async {
+            Replay::spawn(&dir, false, port, &mounts)
+                .await?
+                .wait(control)
+                .await
+        }
+        .await;
+        report.finish(result)
+    })
 }
 
-/// Replays with captured output and applies the requested mounts inside the replay chroot.
-#[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
-    let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async {
-        Ok(Replay::spawn(dir, true, None, mounts)
-            .await?
-            .wait_with_output()
-            .await?)
-    }
-    .await;
-    skid_overshoot_report.finish(result)
+/// Replays with captured output.
+pub fn replay_with_output(dir: &Path) -> Result<Output, Error> {
+    replay_with_output_and_mounts(dir, &[])
+}
+
+/// Replays with captured output and mounts inside the replay chroot.
+pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
+    let dir = dir.to_owned();
+    let mounts = mounts.to_vec();
+    ptrace_completion::run(None, move |control| async move {
+        let report = SkidOvershootReport::begin(true);
+        let result = async {
+            Replay::spawn(&dir, true, None, &mounts)
+                .await?
+                .wait_with_output(control)
+                .await
+        }
+        .await;
+        report.finish(result)
+    })
 }
 
 #[cfg(test)]

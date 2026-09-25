@@ -409,7 +409,29 @@ fi
 # Neither changes these build inputs. Preserve CMAKE/CMAKE_GENERATOR,
 # the 16-job clamp, and the 1050 effective-job-second threshold. This is
 # source-identity carry, not new calibration or runtime qualification.
-expected_pin=c444c4ff15b6f5985082317e7c93b370e67571c1
+# CARRY TO afc71332b51344e22ce082c64fbf7c534fca1986 (2026-09-25): relative to
+# c444c4ff15b6f5985082317e7c93b370e67571c1, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0, the DynamoRIO vendor tree
+# remains 117d54d744df23921c531d0fe08537249f5a510a, and third-party/
+# remains tree fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. Preserve
+# CMAKE/CMAKE_GENERATOR, the 16-job clamp and 1050 effective-job-second
+# threshold. This is source-identity carry, not a new calibration.
+# CARRY TO 05400652a6fc1a7403a2b5cdec40bd4f4631eac3 (2026-09-25): relative to
+# afc71332b51344e22ce082c64fbf7c534fca1986, the complete reverie-dbt tree remains
+# a62d15302ee5e907667d1c02f6e629177ad87f61; build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a. The only new product paths are
+# reverie-process owned-container source/tests. Preserve CMAKE/CMAKE_GENERATOR,
+# the 16-job clamp and 1050 effective-job-second threshold. This is unchanged
+# source-input carry, not fresh calibration or runtime qualification.
+# CARRY TO 95bc2b1daf9e4d0cd9bd158c5846374244a08d40 (2026-09-25): relative to
+# 05400652a6fc1a7403a2b5cdec40bd4f4631eac3, the complete reverie-dbt tree remains
+# a62d15302ee5e907667d1c02f6e629177ad87f61; build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a. Preserve CMAKE/CMAKE_GENERATOR,
+# the 16-job clamp and 1050 effective-job-second threshold. This is unchanged
+# source-input carry, not fresh calibration or runtime qualification.
+expected_pin=95bc2b1daf9e4d0cd9bd158c5846374244a08d40
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
