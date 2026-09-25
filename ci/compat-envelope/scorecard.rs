@@ -1996,17 +1996,57 @@ impl ResultRow {
                     index + 1
                 )
             })?;
-            self.require_matched_disposition(index, attempt, &report)?;
+            if !self.matched_attempt_passed(index, attempt, &report)? {
+                return Err(format!(
+                    "attempt {} matched report belongs to an attempt that did not pass",
+                    index + 1
+                ));
+            }
         }
         Ok(())
     }
 
-    /// Both readers of a matched attempt, the `verify-results` admission gate
-    /// and the comparison evidence behind the catalogue, share this check,
-    /// which is the series writer's (`_typed_comparison_attempt` in
-    /// `ci-hub/series/series.py`): a declared row's match counts only if it
-    /// ends exactly as declared, and an undeclared row's only if it ends as
-    /// `undeclared_match_ends_cleanly` requires.
+    /// Both readers of a verified, bitwise-matched attempt, the
+    /// `verify-results` admission gate and the comparison evidence behind the
+    /// catalogue, share this classification, which is the series writer's
+    /// (`_typed_comparison_attempt` in `ci-hub/series/series.py`).
+    ///
+    /// `Ok(true)`: the runner passed the attempt, so the match may be
+    /// credited. `Ok(false)`: the runner completed the attempt as FAIL or
+    /// ERROR, for example a declared cell that ended differently; the match
+    /// is retained evidence that earns no credit. `Err`: a PASS attempt the
+    /// runner cannot write, one that timed out, records an error kind, or
+    /// ends in a disposition its row does not allow, or an unknown outcome.
+    fn matched_attempt_passed(
+        &self,
+        index: usize,
+        attempt: &JsonValue,
+        report: &canonical_verdict::VerificationReport,
+    ) -> Result<bool, String> {
+        match attempt.get("outcome").and_then(JsonValue::as_str) {
+            Some("PASS") => {
+                if attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(false)
+                    || !attempt.get("error_kind").is_none_or(JsonValue::is_null)
+                {
+                    return Err(format!(
+                        "attempt {} matched report is a PASS that timed out or records an error kind",
+                        index + 1
+                    ));
+                }
+                self.require_matched_disposition(index, attempt, report)?;
+                Ok(true)
+            }
+            Some("FAIL" | "ERROR") => Ok(false),
+            other => Err(format!(
+                "attempt {} matched report has an unknown attempt outcome {other:?}",
+                index + 1
+            )),
+        }
+    }
+
+    /// A declared row's match counts only if it ends exactly as declared, and
+    /// an undeclared row's only if it ends as `undeclared_match_ends_cleanly`
+    /// requires.
     fn require_matched_disposition(
         &self,
         index: usize,
@@ -2390,7 +2430,39 @@ impl ResultRow {
                         canonical_verdict::Verdict::Matched
                             if report.verified && report.bitwise_parity =>
                         {
-                            self.require_matched_disposition(index, attempt, &report)?;
+                            if !self.matched_attempt_passed(index, attempt, &report)? {
+                                if self.outcome == "PASS" {
+                                    return Err(format!(
+                                        "attempt {} matched report belongs to an attempt that did not pass",
+                                        index + 1
+                                    ));
+                                }
+                                // A completed failure keeps its red: a declared
+                                // cell that ended differently, or an undeclared
+                                // verify or replay that exited nonzero, is the
+                                // runner's crash-error, exactly the attempts
+                                // the series writer projects as a failed match.
+                                // Other non-passing attempts keep the result
+                                // already established, such as a timeout.
+                                if attempt.get("outcome").and_then(JsonValue::as_str)
+                                    == Some("FAIL")
+                                    && attempt.get("timed_out").and_then(JsonValue::as_bool)
+                                        == Some(false)
+                                    && attempt.get("error_kind").is_none_or(JsonValue::is_null)
+                                    && self
+                                        .require_matched_disposition(index, attempt, &report)
+                                        .is_err()
+                                {
+                                    no_verdict_result.get_or_insert(ObservedResult::CrashError);
+                                }
+                                unavailable.get_or_insert_with(|| {
+                                    format!(
+                                        "attempt {} matched comparison belongs to an attempt the runner did not pass",
+                                        index + 1
+                                    )
+                                });
+                                continue;
+                            }
                         }
                         canonical_verdict::Verdict::Matched => {
                             return Err(format!(
@@ -13728,8 +13800,12 @@ fn self_test() -> Result<(), String> {
                 })
                 .unwrap();
                 serde_json::json!({
-                    // The runner's status for this report's clean guest exit;
-                    // a matched attempt without one is refused.
+                    // The runner's record of this report's passing attempt: a
+                    // matched attempt counts only with outcome PASS, no
+                    // timeout or error kind, and a clean guest exit.
+                    "outcome": "PASS",
+                    "timed_out": false,
+                    "error_kind": null,
                     "status": 0,
                     "signal": null,
                     "argv":["hermit","run"],
@@ -26690,17 +26766,11 @@ mod post_verdict_transaction_tests {
         fixture.publish()
     }
 
-    /// A declared verify cell is an ordinary comparable cell whose series row
-    /// retains the complete attempt audit, so the reason a nonzero guest exit
-    /// passed outlives the transient raw run artifacts. Drive that audit
-    /// through the production path end to end -- the held snapshot parser, the
-    /// raw result reader and the write-back reconciliation -- and require that
-    /// only the audit projected from the raw row publishes.
-    #[test]
-    fn declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
-        let mut fixture = Fixture::new();
-        let measured = fixture.options.results_head.clone().unwrap();
+    const DECLARED_EXIT_REASON: &str = "the fixture guest exits 3 on purpose";
+
+    /// The runner's row for the comparable `util-c/pmu-skid` verify cell,
+    /// declared to exit 3, whose one attempt matched with exit 3 and passed.
+    fn declared_exit_row(measured: &str) -> (CellId, JsonValue) {
         let id = CellId {
             lane: "portable".into(),
             category: "util-c".into(),
@@ -26708,12 +26778,8 @@ mod post_verdict_transaction_tests {
             mode: "verify".into(),
             backend: "ptrace".into(),
         };
-        assert!(
-            fixture.cells().cells.iter().any(|cell| cell.id == id),
-            "the declared cell must be comparable, not a selected custom command"
-        );
-        let reason = "the fixture guest exits 3 on purpose";
-        let mut row = result_row(&measured);
+        let reason = DECLARED_EXIT_REASON;
+        let mut row = result_row(measured);
         for (key, value) in [
             ("lane", &id.lane),
             ("category", &id.category),
@@ -26757,9 +26823,53 @@ mod post_verdict_transaction_tests {
             report["compared_outputs"][side]["exit_code"] = 3.into();
         }
         let report = serde_json::to_string(&report).unwrap();
-        let report_sha256 = format!("{:x}", Sha256::digest(report.as_bytes()));
-        row["attempts"][0]["verification_report_sha256"] = report_sha256.clone().into();
+        row["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
         row["attempts"][0]["verification_report"] = report.into();
+        (id, row)
+    }
+
+    /// `row` with Hermit's status, the report's guest disposition and both
+    /// compared outputs saying `code`, the report digest recomputed: the
+    /// coherent row of a run that ended with `code`.
+    fn with_matched_exit(row: &JsonValue, code: i64) -> JsonValue {
+        let mut row = row.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(row["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        report["guest_exit_code"] = code.into();
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["exit_code"] = code.into();
+        }
+        let report = serde_json::to_string(&report).unwrap();
+        row["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        row["attempts"][0]["verification_report"] = report.into();
+        row["attempts"][0]["status"] = code.into();
+        row
+    }
+
+    /// A declared verify cell is an ordinary comparable cell whose series row
+    /// retains the complete attempt audit, so the reason a nonzero guest exit
+    /// passed outlives the transient raw run artifacts. Drive that audit
+    /// through the production path end to end -- the held snapshot parser, the
+    /// raw result reader and the write-back reconciliation -- and require that
+    /// only the audit projected from the raw row publishes.
+    #[test]
+    fn declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let reason = DECLARED_EXIT_REASON;
+        let (id, row) = declared_exit_row(&measured);
+        assert!(
+            fixture.cells().cells.iter().any(|cell| cell.id == id),
+            "the declared cell must be comparable, not a selected custom command"
+        );
+        let report_sha256 = row["attempts"][0]["verification_report_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
         fixture.publish_rows(std::slice::from_ref(&row));
         let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
         let identity = candidates[&id][0].evidence_identity.clone();
@@ -26980,6 +27090,269 @@ mod post_verdict_transaction_tests {
             error.contains(UNDECLARED),
             "undeclared exit 3 verify-results: {error}"
         );
+    }
+
+    /// The runner's own red for a matched comparison: a declared cell that
+    /// ended differently, or an undeclared verify that exited nonzero, is an
+    /// attempt FAIL inside a crash-error/product_failure row. Neither reader
+    /// credits its match, and neither lets it abort the rest of the run: the
+    /// catalogue fold retains it as a crash-error beside a valid sibling that
+    /// still passes, and `verify-results` names it as non-passing while it
+    /// admits the sibling.
+    #[test]
+    fn a_matched_attempt_the_runner_failed_is_retained_red_beside_a_valid_sibling() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, declared) = declared_exit_row(&measured);
+        let sibling = fixture.row.clone();
+        let sibling_id = fixture.id.clone();
+        let failed_row = |row: &JsonValue| {
+            let mut row = row.clone();
+            row["attempts"][0]["outcome"] = "FAIL".into();
+            row["outcome"] = "FAIL".into();
+            row["result"] = "crash-error".into();
+            row["failure_class"] = "product_failure".into();
+            row
+        };
+        let mut undeclared = failed_row(&declared);
+        undeclared
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        let depth = BTreeMap::from([(
+            "hermit".to_string(),
+            SourceDepth {
+                commits: 20,
+                first_parent: 20,
+            },
+        )]);
+        // A matched comparison whose attempt then hit its wall-clock limit is
+        // the runner's timeout, not a product failure: it keeps that result.
+        let mut timed_out = declared.clone();
+        timed_out["attempts"][0]["outcome"] = "FAIL".into();
+        timed_out["attempts"][0]["timed_out"] = true.into();
+        timed_out["attempts"][0]["error_kind"] = "wall-timeout".into();
+        timed_out["outcome"] = "ERROR".into();
+        timed_out["result"] = "timeout".into();
+        timed_out["failure_class"] = "no_result".into();
+        timed_out["error_kind"] = "wall-timeout".into();
+        for (label, failed, retained) in [
+            (
+                "declared 3, ended 4",
+                failed_row(&with_matched_exit(&declared, 4)),
+                ObservedResult::CrashError,
+            ),
+            (
+                "undeclared verify exited 3",
+                undeclared,
+                ObservedResult::CrashError,
+            ),
+            (
+                "matched, then timed out",
+                timed_out,
+                ObservedResult::Timeout,
+            ),
+        ] {
+            fixture.publish_rows(&[sibling.clone(), failed]);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            match candidates[&id][0].evidence(&id, ResultInput::Current) {
+                Ok(ValidateRowEvidence::Unavailable { reason, result }) => {
+                    assert!(
+                        reason.contains(
+                            "matched comparison belongs to an attempt the runner did not pass"
+                        ),
+                        "{label}: {reason}"
+                    );
+                    assert_eq!(result, Some(retained), "{label}");
+                }
+                other => panic!("{label}: the red was not retained: {other:?}"),
+            }
+            let mut tracked = fixture.cells();
+            let fold = apply_validate_results(
+                &mut tracked,
+                &candidates,
+                &measured,
+                "tree-1",
+                &depth,
+                true,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("{label}: the fold was aborted: {error}"));
+            assert_eq!(fold.passed, 1, "{label}: the sibling did not pass");
+            assert_eq!(fold.errored.len(), 1, "{label}: {:?}", fold.errored);
+            assert!(
+                fold.errored[0].contains(&display_id(&id)),
+                "{label}: {:?}",
+                fold.errored
+            );
+            let results = |cell_id: &CellId| {
+                let cell = tracked
+                    .cells
+                    .iter()
+                    .find(|cell| &cell.id == cell_id)
+                    .unwrap();
+                assert!(cell.last_tested.is_some(), "{label}: {cell_id:?} unstamped");
+                cell.observations
+                    .iter()
+                    .flat_map(|observation| observation.results.iter().copied())
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(
+                results(&sibling_id),
+                BTreeSet::from([ObservedResult::Pass]),
+                "{label}"
+            );
+            assert_eq!(results(&id), BTreeSet::from([retained]), "{label}");
+            let error = verify_candidate_set(
+                &BTreeSet::from([id.clone(), sibling_id.clone()]),
+                candidates,
+            )
+            .expect_err(&format!("{label}: verify-results admitted the red"));
+            assert!(
+                error.contains("0 missing, 1 non-passing") && error.contains(&display_id(&id)),
+                "{label} verify-results: {error}"
+            );
+        }
+    }
+
+    /// A matched attempt counts only if the runner passed it, exactly as the
+    /// series writer reads it: outcome PASS, `timed_out` false and no error
+    /// kind, as well as the status and signal its row allows. A PASS row whose
+    /// matched attempt the runner did not pass, or a PASS attempt carrying a
+    /// timeout or an error kind, is evidence the runner cannot write, so both
+    /// readers refuse it rather than retaining it.
+    #[test]
+    fn a_matched_attempt_counts_only_if_the_runner_passed_it() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, mut declared) = declared_exit_row(&measured);
+        // `run --verify` compares under virtual time; with the producer's
+        // exact policy the genuine row's evidence is a credited match, so each
+        // refusal below is the attempt metadata's alone.
+        let mut report: JsonValue = serde_json::from_str(
+            declared["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report["comparison"]["virtualize_time"] = true.into();
+        let report = serde_json::to_string(&report).unwrap();
+        declared["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        declared["attempts"][0]["verification_report"] = report.into();
+        let expected = BTreeSet::from([id.clone()]);
+        const NOT_PASSED: &str = "attempt 1 matched report belongs to an attempt that did not pass";
+        const PASS_METADATA: &str =
+            "attempt 1 matched report is a PASS that timed out or records an error kind";
+        const UNKNOWN: &str = "attempt 1 matched report has an unknown attempt outcome";
+        let edited = |edit: &dyn Fn(&mut JsonValue)| {
+            let mut row = declared.clone();
+            edit(&mut row["attempts"][0]);
+            row
+        };
+        // Admitted: an absent error kind is the writer's null.
+        let mut absent_error_kind = declared.clone();
+        absent_error_kind["attempts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("error_kind");
+        for (label, row) in [
+            ("genuine", declared.clone()),
+            ("error_kind absent", absent_error_kind),
+        ] {
+            fixture.publish_rows(std::slice::from_ref(&row));
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            let evidence = candidates[&id][0].evidence(&id, ResultInput::Current);
+            assert!(
+                matches!(evidence, Ok(ValidateRowEvidence::Matched { .. })),
+                "{label}: the passing attempt was not credited: {evidence:?}"
+            );
+            assert_eq!(
+                verify_candidate_set(&expected, candidates),
+                Ok(1),
+                "{label}"
+            );
+        }
+        for (label, row, refusal) in [
+            (
+                "attempt FAIL in a PASS row",
+                edited(&|attempt| attempt["outcome"] = "FAIL".into()),
+                NOT_PASSED,
+            ),
+            (
+                "attempt ERROR in a PASS row",
+                edited(&|attempt| {
+                    attempt["outcome"] = "ERROR".into();
+                    attempt["error_kind"] = "incomplete-verification-evidence".into();
+                }),
+                NOT_PASSED,
+            ),
+            (
+                "PASS attempt timed out",
+                edited(&|attempt| attempt["timed_out"] = true.into()),
+                PASS_METADATA,
+            ),
+            (
+                "PASS attempt timeout state absent",
+                edited(&|attempt| {
+                    attempt.as_object_mut().unwrap().remove("timed_out");
+                }),
+                PASS_METADATA,
+            ),
+            (
+                "PASS attempt timeout state not a boolean",
+                edited(&|attempt| attempt["timed_out"] = "false".into()),
+                PASS_METADATA,
+            ),
+            (
+                "PASS attempt records an error kind",
+                edited(&|attempt| attempt["error_kind"] = "infrastructure".into()),
+                PASS_METADATA,
+            ),
+            (
+                "PASS attempt records an empty error kind",
+                edited(&|attempt| attempt["error_kind"] = "".into()),
+                PASS_METADATA,
+            ),
+            (
+                "unknown attempt outcome",
+                edited(&|attempt| attempt["outcome"] = "SKIP".into()),
+                UNKNOWN,
+            ),
+            (
+                "attempt outcome absent",
+                edited(&|attempt| {
+                    attempt.as_object_mut().unwrap().remove("outcome");
+                }),
+                UNKNOWN,
+            ),
+        ] {
+            fixture.publish_rows(std::slice::from_ref(&row));
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            let error = candidates[&id][0]
+                .evidence(&id, ResultInput::Current)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the raw row's evidence was admitted"));
+            assert!(error.contains(refusal), "{label}: {error}");
+            let error = verify_candidate_set(&expected, candidates)
+                .expect_err(&format!("{label}: verify-results admitted the raw row"));
+            assert!(error.contains(refusal), "{label} verify-results: {error}");
+        }
+        // A PASS attempt the runner cannot write stays refused inside a failed
+        // row too: retention is for the runner's reds, not for contradictions.
+        let mut contradictory = edited(&|attempt| attempt["timed_out"] = true.into());
+        contradictory["outcome"] = "FAIL".into();
+        contradictory["result"] = "crash-error".into();
+        contradictory["failure_class"] = "product_failure".into();
+        fixture.publish_rows(std::slice::from_ref(&contradictory));
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let error = candidates[&id][0]
+            .evidence(&id, ResultInput::Current)
+            .err()
+            .expect("timed-out PASS attempt in a FAIL row: the evidence was admitted");
+        assert!(error.contains(PASS_METADATA), "{error}");
     }
 
     /// An undeclared matched attempt ends as the series writer requires:
