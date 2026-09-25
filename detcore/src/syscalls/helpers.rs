@@ -838,9 +838,23 @@ pub fn ioaction_based_on_fd_status<
 /// The `SigBlk` field of a `/proc/<tid>/status` file: the thread's blocked
 /// signal mask, as kernel sigset bits in hexadecimal.
 fn blocked_mask_from_proc_status(status: &str) -> Option<u64> {
-    let field = status
-        .lines()
-        .find_map(|line| line.strip_prefix("SigBlk:"))?;
+    sigset_from_proc_status(status, "SigBlk:")
+}
+
+/// What `rt_sigpending` would return for the thread a `/proc/<tid>/status`
+/// file describes: the signals pending for the thread (`SigPnd`) or its
+/// process (`ShdPnd`) that the thread blocks (`SigBlk`).
+pub(crate) fn blocked_pending_signals_from_proc_status(status: &str) -> Option<u64> {
+    let thread = sigset_from_proc_status(status, "SigPnd:")?;
+    let shared = sigset_from_proc_status(status, "ShdPnd:")?;
+    let blocked = sigset_from_proc_status(status, "SigBlk:")?;
+    Some((thread | shared) & blocked)
+}
+
+/// The sigset field named `prefix` of a `/proc/<tid>/status` file, as kernel
+/// sigset bits in hexadecimal.
+fn sigset_from_proc_status(status: &str, prefix: &str) -> Option<u64> {
+    let field = status.lines().find_map(|line| line.strip_prefix(prefix))?;
     u64::from_str_radix(field.trim(), 16).ok()
 }
 
@@ -1851,6 +1865,81 @@ mod tests {
                 blocked_mask_from_proc_status(&status),
                 Some(1 << (libc::SIGUSR2 - 1))
             );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn blocked_pending_signals_are_the_pending_fields_under_sigblk() {
+        // Thread-directed SIGINT (bit 1) and process-directed SIGUSR2 (bit 11)
+        // are both blocked; SIGHUP (bit 0) is pending but not blocked, which
+        // `rt_sigpending` never reports either.
+        let status = "Name:\tf\nSigPnd:\t0000000000000003\nShdPnd:\t0000000000000800\n\
+                      SigBlk:\t0000000000000802\nSigIgn:\t0000000000000000\n";
+        assert_eq!(
+            blocked_pending_signals_from_proc_status(status),
+            Some(0x802)
+        );
+        // Any missing or unreadable field refuses rather than guessing.
+        for status in [
+            "ShdPnd:\t0\nSigBlk:\t0\n",
+            "SigPnd:\t0\nSigBlk:\t0\n",
+            "SigPnd:\t0\nShdPnd:\t0\n",
+            "SigPnd:\t0\nShdPnd:\tzz\nSigBlk:\t0\n",
+        ] {
+            assert_eq!(
+                blocked_pending_signals_from_proc_status(status),
+                None,
+                "{status:?}"
+            );
+        }
+    }
+
+    /// The live thread's own procfs entry agrees with `rt_sigpending` for a
+    /// blocked thread-directed signal. A process-directed one could be taken
+    /// by any other thread of the test binary, so the parser test above
+    /// covers `ShdPnd`.
+    #[test]
+    fn blocked_pending_signals_match_rt_sigpending_for_this_thread() {
+        std::thread::spawn(|| {
+            let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGURG);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let tid = unsafe { libc::gettid() };
+            let before = std::fs::read_to_string(format!("/proc/{tid}/status")).unwrap();
+            assert_eq!(blocked_pending_signals_from_proc_status(&before), Some(0));
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGURG) },
+                0
+            );
+            let status = std::fs::read_to_string(format!("/proc/{tid}/status")).unwrap();
+            let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::sigpending(&mut pending) }, 0);
+            let from_syscall: u64 = (1..=64)
+                .filter(|&signal| unsafe { libc::sigismember(&pending, signal) } == 1)
+                .map(|signal| 1_u64 << (signal - 1))
+                .sum();
+            assert_eq!(from_syscall, 1 << (libc::SIGURG - 1));
+            assert_eq!(
+                blocked_pending_signals_from_proc_status(&status),
+                Some(from_syscall)
+            );
+            // Consume the signal so it cannot outlive this thread's mask.
+            let mut signal = 0;
+            let mut urg: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut urg);
+                libc::sigaddset(&mut urg, libc::SIGURG);
+                assert_eq!(libc::sigwait(&urg, &mut signal), 0);
+            }
+            assert_eq!(signal, libc::SIGURG);
         })
         .join()
         .unwrap();
