@@ -76,10 +76,11 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// thread blocked in a real syscall. The guest's child exit sent a synthesized
 /// SIGCHLD to its vfork parent; the counterfeit lost the parent's continuation
 /// and the run hung. The cell passed ten consecutive strict verify runs, each
-/// on its first attempt, with a clean build of the evidence SHA, which is the
-/// last commit that changes how the scheduler sends signals.
-pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA: &str = "2a8d03bf26a938587eefa04e0a28055e5a9c1c5c";
-pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T13:00:04Z";
+/// on its first attempt, with a clean build of the evidence SHA, which contains
+/// the complete signal-wake series; the last commit that changes how the
+/// scheduler sends signals is its ancestor 504bb80506.
+pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA: &str = "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:04:59Z";
 pub const VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/sigsuspend-alarm-wake` verify on ptrace, a new guest for the
 /// other half of the same scheduler fix: `fire_alarm` signals a thread parked
@@ -87,12 +88,13 @@ pub const VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// its own interrupted syscall, and an alarm the arming thread's suspend mask
 /// blocks must go to a waiter whose mask admits it. The cell passed ten
 /// consecutive strict verify runs, each on its first attempt, with a clean
-/// build of the evidence SHA, which is the last commit that changes how the
-/// scheduler sends signals; guest source sha256
+/// build of the evidence SHA, which contains the complete signal-wake series;
+/// the last commit that changes how the scheduler sends signals is its ancestor
+/// 504bb80506. Guest source sha256
 /// 3f017b5c2a38b388301e0528f6c54296e2a9906bf69f23b9fe1cc5d70fa70ba2.
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
-    "2a8d03bf26a938587eefa04e0a28055e5a9c1c5c";
-pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T12:59:46Z";
+    "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:03:24Z";
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
 /// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
@@ -102,28 +104,30 @@ pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// while a sibling keeps the scheduler busy. Its `poll` phase is serviced by
 /// internal polling and is only a control. The cell passed ten consecutive
 /// strict verify runs, each on its first attempt, with a clean build of the
-/// evidence SHA; the last commit that changes how the scheduler sends signals
-/// is its ancestor 4a30a8a40d3c. Guest source sha256
+/// evidence SHA, which contains the complete signal-wake series; the last
+/// commit that changes how the scheduler sends signals is its ancestor
+/// 504bb80506. Guest source sha256
 /// e8babb4316082311cdbb50cfce2128d58b0d7482e5de7d0c29dbeaca066afa40.
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
-    "1b9874539b954e65c6229b91aeb263e9ec91c611";
-pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:38:24Z";
+    "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:04:39Z";
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/sigsuspend-sibling-signal-wake` verify on ptrace, a new guest
-/// for the defects fixed at the evidence SHA: a sibling's `tgkill` must end an
+/// for two defects the signal-wake series fixes: a sibling's `tgkill` must end an
 /// `rt_sigsuspend` wait after a signal the process ignores reached the waiter
 /// first. The scheduler must requeue a waiter another guest's signal released
 /// instead of reporting a deadlock, and the real `rt_sigsuspend` must run in
 /// place rather than behind injected probe syscalls. The guest repeats both
 /// phases 25 times, because either defect loses a host-timing race only some
 /// of the time. The cell passed ten consecutive strict verify runs, each on its
-/// first attempt, with a clean build of the evidence SHA, the commit that
-/// introduced the repetition; the last commit that changes how the scheduler
-/// handles these waiters is its ancestor 3af2a07119b1. Guest source sha256
+/// first attempt, with a clean build of the evidence SHA, which contains the
+/// complete signal-wake series; the last commits that change how the scheduler
+/// and `rt_sigsuspend` handle these waiters are its ancestors 504bb80506 and
+/// d85c42963d. Guest source sha256
 /// 71588c7e072454ca46298972b24ce4f93a35df407efbace484c27212c9faa69f.
 pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
-    "f3f8148d9dfa106304b21ba0b94f6b8805282deb";
-pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T16:45:17Z";
+    "d56f0263f92a6131a52dfac6232444726ee5898f";
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:03:06Z";
 pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
@@ -1933,38 +1937,38 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA,
-            "2a8d03bf26a938587eefa04e0a28055e5a9c1c5c"
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
         );
         assert_eq!(
             VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T13:00:04Z"
+            "2026-09-25T17:04:59Z"
         );
         assert_eq!(VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
-            "2a8d03bf26a938587eefa04e0a28055e5a9c1c5c"
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
         );
         assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T12:59:46Z"
+            "2026-09-25T17:03:24Z"
         );
         assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
-            "1b9874539b954e65c6229b91aeb263e9ec91c611"
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
         );
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T14:38:24Z"
+            "2026-09-25T17:04:39Z"
         );
         assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA,
-            "f3f8148d9dfa106304b21ba0b94f6b8805282deb"
+            "d56f0263f92a6131a52dfac6232444726ee5898f"
         );
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T16:45:17Z"
+            "2026-09-25T17:03:06Z"
         );
         assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 172);
