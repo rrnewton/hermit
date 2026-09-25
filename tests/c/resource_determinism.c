@@ -531,6 +531,34 @@ static void check_sysinfo_memory_matches_configured_memory(void) {
   puts("sysinfo memory matches configured memory");
 }
 
+// Linux reports times(2) in USER_HZ (100 per second) ticks, so a clock only
+// advances once 10ms of the matching time has accumulated. A fixed handful of
+// cheap syscalls does not guarantee that: 2048 getpid calls take well under a
+// millisecond on Linux and under Detcore's modeled syscall costs alike. Keep
+// issuing syscall work until this process's system CPU clock crosses a tick,
+// and bound the loop so a clock that never advances still fails the checks
+// that follow instead of hanging.
+enum { SYSTEM_TICK_WORK_BOUND = 100000 };
+
+static void syscall_work_until_system_tick(clock_t start_stime) {
+  for (int i = 0; i < SYSTEM_TICK_WORK_BOUND; ++i) {
+    int fd = dup(STDOUT_FILENO);
+    if (fd < 0) {
+      fail("dup for times work");
+    }
+    if (close(fd) != 0) {
+      fail("close for times work");
+    }
+    struct tms usage;
+    if (times(&usage) == (clock_t)-1) {
+      fail("times during work");
+    }
+    if (usage.tms_stime > start_stime) {
+      return;
+    }
+  }
+}
+
 static void check_times(void) {
   struct tms first_usage;
   struct tms second_usage;
@@ -542,10 +570,7 @@ static void check_times(void) {
     fail("times first");
   }
 
-  // Syscall-heavy work advances logical execution time even on no-PMU hosts.
-  for (int i = 0; i < 2048; ++i) {
-    (void)syscall(SYS_getpid);
-  }
+  syscall_work_until_system_tick(first_usage.tms_stime);
   clock_t second = times(&second_usage);
   if (second == (clock_t)-1) {
     fail("times second");
@@ -562,14 +587,19 @@ static void check_times(void) {
   clock_t child_system_before = second_usage.tms_cstime;
   struct rusage child_rusage_before =
       read_rusage(RUSAGE_CHILDREN, "children before fork", 0, 1);
+  // The child's work loop can exit through fail(); flush first so exit(3)
+  // cannot replay the parent's buffered output from the child.
+  fflush(stdout);
   pid_t child = fork();
   if (child < 0) {
     fail("times fork");
   }
   if (child == 0) {
-    for (int i = 0; i < 2048; ++i) {
-      (void)syscall(SYS_getpid);
+    struct tms child_start;
+    if (times(&child_start) == (clock_t)-1) {
+      _exit(1);
     }
+    syscall_work_until_system_tick(child_start.tms_stime);
     _exit(0);
   }
 

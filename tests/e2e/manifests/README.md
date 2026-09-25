@@ -230,6 +230,27 @@ empty vectors retain their exact argument boundaries.
 The only valid backend for `naked` is `native`; other modes accept only the five
 Hermit backends.
 
+A verify cell whose guest ends unsuccessfully on purpose declares exactly how it
+ends. `expected_guest_exit` names exactly one of a nonzero `code` (1-255) or a
+`signal` (1-64), plus a substantive `reason`:
+
+```yaml
+test:
+  - id: example/exits-seven
+    modes:
+      verify:
+        expected_guest_exit:
+          code: 7
+          reason: The guest returns 7 so the test can prove Hermit reports it exactly.
+```
+
+The harness then passes `--verify-allow=failure`, so Hermit compares both runs
+instead of refusing the first. The cell passes only when the canonical report
+matches, the report's guest status is exactly the declared one, and Hermit's own
+process status reports it: the same exit code, or for a signal either death by
+that signal or exit status 128 plus the signal number. Any other ending,
+including a successful one, fails. The key is rejected outside `verify` mode.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;
