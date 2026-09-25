@@ -1288,7 +1288,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Read,
     ) -> Result<(), Error> {
         let contents = self.snapshot_procfs(guest, call).await?;
-        let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
+        let virtual_uptime_seconds = self.calculate_procfs_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
         // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
