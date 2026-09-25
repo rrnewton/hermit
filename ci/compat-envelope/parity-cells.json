@@ -12,7 +12,7 @@
   },
   "counts": {
     "all": {
-      "cells": 1452,
+      "cells": 1456,
       "applicable": 604,
       "selectable": 501,
       "selected": 192,
@@ -20,28 +20,28 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 363,
+        "cells": 364,
         "applicable": 61,
         "selectable": 0,
         "selected": 14,
         "selected_selectable": 0
       },
       "kvm": {
-        "cells": 363,
+        "cells": 364,
         "applicable": 250,
         "selectable": 243,
         "selected": 77,
         "selected_selectable": 76
       },
       "liteinst": {
-        "cells": 363,
+        "cells": 364,
         "applicable": 149,
         "selectable": 146,
         "selected": 99,
         "selected_selectable": 98
       },
       "sabre": {
-        "cells": 363,
+        "cells": 364,
         "applicable": 144,
         "selectable": 112,
         "selected": 2,
@@ -934,6 +934,10 @@
     {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify KVM separately"},
     {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify LiteInst separately"},
     {"test_id":"c-programs/sigsuspend-alarm-wake","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify SaBRe separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: backend_reports_signal_interrupted_external_io is false on DBT, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify DBT separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: backend_reports_signal_interrupted_external_io is false on KVM, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify KVM separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: backend_reports_signal_interrupted_external_io is false on LiteInst, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify LiteInst separately"},
+    {"test_id":"c-programs/sigsuspend-sibling-signal-wake","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: backend_reports_signal_interrupted_external_io is false on SaBRe, so a waiter released by another guest's signal stays in the scheduler's pool and the suspend mask is read by an injected probe; qualify SaBRe separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
     {"test_id":"c-programs/sigtimedwait-no-timeout","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
