@@ -835,12 +835,6 @@ pub fn ioaction_based_on_fd_status<
     }
 }
 
-/// Whether the tool reads the thread's signal mask for a blocking external
-/// call, so that the scheduler can send a timer signal the mask admits to that
-/// thread and await its report. The scheduler needs the thread sequentialized,
-/// and a backend that guarantees the report; record/replay keeps its recorded
-/// behavior; and a call that swaps in another mask makes the thread's own mask
-/// the wrong one.
 /// The `SigBlk` field of a `/proc/<tid>/status` file: the thread's blocked
 /// signal mask, as kernel sigset bits in hexadecimal.
 fn blocked_mask_from_proc_status(status: &str) -> Option<u64> {
@@ -850,6 +844,12 @@ fn blocked_mask_from_proc_status(status: &str) -> Option<u64> {
     u64::from_str_radix(field.trim(), 16).ok()
 }
 
+/// Whether the tool reads the thread's signal mask for a blocking external
+/// call, so that the scheduler can send a timer signal the mask admits to that
+/// thread and await its report. The scheduler needs the thread sequentialized,
+/// and a backend that guarantees the report; record/replay keeps its recorded
+/// behavior; and a call that swaps in another mask makes the thread's own mask
+/// the wrong one.
 fn external_io_signal_mask_is_known(cfg: &Config, call: Syscall) -> bool {
     cfg.sequentialize_threads
         && !cfg.recordreplay_modes
@@ -858,7 +858,11 @@ fn external_io_signal_mask_is_known(cfg: &Config, call: Syscall) -> bool {
 }
 
 /// Whether `call` swaps in a temporary signal mask for its duration, so the
-/// thread's own mask does not say which signals interrupt it.
+/// thread's own mask does not say which signals interrupt it. `pselect6`'s
+/// sixth argument points at a `{ sigset pointer, size }` pair, and this does
+/// not read it: glibc's `pselect(..., NULL)` passes a pair whose sigset pointer
+/// is null, which installs no mask but still counts here, so that call keeps
+/// the unknown mask and the scheduler's previous harvest.
 fn syscall_installs_temporary_signal_mask(call: Syscall) -> bool {
     match call {
         Syscall::Pselect6(call) => call.sigmask().is_some(),
