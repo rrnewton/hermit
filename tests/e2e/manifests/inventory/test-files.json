@@ -536,6 +536,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/external_io_signal_interrupt.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/external_io_signal_interrupt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends a select or poll wait on a never-readable socket exactly once with EINTR on the waiting thread, including under SA_RESTART, with a sibling that sleeps past the alarm without blocking it, and with a sibling that blocks it while taking short sleeps, so the scheduler must send the alarm to the blocker whose mask admits it and await that thread's own report at a deterministic turn"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/faccessat2_flags.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/faccessat2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
