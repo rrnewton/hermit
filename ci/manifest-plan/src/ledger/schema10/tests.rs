@@ -967,8 +967,8 @@ fn generated_plan_populations_preserve_command_policy() {
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
     // Portable ptrace verify cells from https://github.com/rrnewton/hermit/pull/3224:
     // the c-programs/dbt-pid-virtualization promotion and the new
-    // c-programs/sigsuspend-alarm-wake.
-    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 2;
+    // c-programs/sigsuspend-alarm-wake and c-programs/external-io-signal-interrupt.
+    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 3;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1014,7 +1014,7 @@ fn generated_plan_populations_preserve_command_policy() {
         hosted_cells.len(),
         // The new KVM row is also excluded from hosted runs: https://github.com/rrnewton/reverie/issues/905.
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 2 - (241 + 6 + 3 + 1 + 1 + 1)
+        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 3 - (241 + 6 + 3 + 1 + 1 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1064,7 +1064,7 @@ fn generated_plan_populations_preserve_command_policy() {
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
             // This pre-exclusion shape also owns the new KVM row: https://github.com/rrnewton/reverie/issues/905.
             // The ordinary syncfs KVM row adds one too: https://github.com/rrnewton/reverie/issues/838.
-            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 2,
+            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 3,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
