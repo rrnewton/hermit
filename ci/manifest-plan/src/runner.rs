@@ -6312,10 +6312,13 @@ mod tests {
                 + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
+                + crate::timeouts::PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
-            NON_CI_CELL_COUNT - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT,
+            NON_CI_CELL_COUNT
+                - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
+                - crate::timeouts::PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT,
             "the current manifest census records every enabled ci:false cell"
         );
 
