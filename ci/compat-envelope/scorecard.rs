@@ -2360,7 +2360,18 @@ impl ResultRow {
                 canonical_verdict::Verdict::Matched | canonical_verdict::Verdict::Diverged => {
                     match report.verdict {
                         canonical_verdict::Verdict::Matched
-                            if report.verified && report.bitwise_parity => {}
+                            if report.verified && report.bitwise_parity =>
+                        {
+                            if let Some(declared) = &self.expected_guest_exit {
+                                if !declared_failure_matches(&self.mode, declared, attempt, &report)
+                                {
+                                    return Err(format!(
+                                        "attempt {} matched report does not end as its row declares",
+                                        index + 1
+                                    ));
+                                }
+                            }
+                        }
                         canonical_verdict::Verdict::Matched => {
                             return Err(format!(
                                 "attempt {} typed match report is internally inconsistent",
@@ -3813,6 +3824,69 @@ fn declared_guest_exit_matches(
         }
         _ => false,
     }
+}
+
+/// Whether a matched attempt ended exactly as its row declares, mirroring the
+/// series writer's `_declared_failure_matches` (`ci-hub/series/series.py`). The
+/// reader checks this itself rather than trusting the producer: every digest
+/// on a result row can be recomputed, so a declaration whose report says
+/// otherwise would otherwise still hash coherently.
+///
+/// Hermit ran in verify mode with `--verify-allow=failure` before the guest
+/// separator; Hermit's status reports the declared disposition (a signal death
+/// either as that signal or as `128 + signo`); and the report's guest
+/// disposition and both compared outputs name exactly the declared code or
+/// signal.
+fn declared_failure_matches(
+    mode: &str,
+    declared: &ExpectedGuestExit,
+    attempt: &JsonValue,
+    report: &canonical_verdict::VerificationReport,
+) -> bool {
+    let Some(argv) = attempt
+        .get("argv")
+        .and_then(JsonValue::as_array)
+        .and_then(|argv| {
+            argv.iter()
+                .map(JsonValue::as_str)
+                .collect::<Option<Vec<_>>>()
+        })
+    else {
+        return false;
+    };
+    let hermit_args = argv
+        .iter()
+        .position(|arg| *arg == "--")
+        .map_or(&argv[..], |separator| &argv[..separator]);
+    if mode != "verify" || !hermit_args.contains(&"--verify-allow=failure") {
+        return false;
+    }
+    let disposition = |name: &str| match attempt.get(name) {
+        None | Some(JsonValue::Null) => Some(None),
+        Some(value) => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(Some),
+    };
+    let (Some(status), Some(signal)) = (disposition("status"), disposition("signal")) else {
+        return false;
+    };
+    let hermit_matches = match (declared.code, declared.signal) {
+        (Some(code), None) => status == Some(code) && signal.is_none(),
+        (None, Some(declared_signal)) => {
+            (status.is_none() && signal == Some(declared_signal))
+                || (status == declared_signal.checked_add(128) && signal.is_none())
+        }
+        _ => false,
+    };
+    let names_declaration =
+        |code: Option<i32>, signal: Option<i32>| code == declared.code && signal == declared.signal;
+    hermit_matches
+        && names_declaration(report.guest_exit_code, report.guest_signal)
+        && report.compared_outputs.as_ref().is_some_and(|outputs| {
+            names_declaration(outputs.left.exit_code, outputs.left.signal)
+                && names_declaration(outputs.right.exit_code, outputs.right.signal)
+        })
 }
 
 /// The attempt audit the series writer (`_declared_guest_exit_evidence` in
@@ -26756,6 +26830,250 @@ mod post_verdict_transaction_tests {
             }),
             "the genuine declared attempt did not publish"
         );
+
+        // Coherently rehashed raw+series pairs. The genuine row above was built
+        // the same way (report edited, then its digest recomputed), so this
+        // procedure alone does not refuse a row. Here the declaration and
+        // Hermit's status still say 3 while the report or its compared outputs
+        // say 4; the series audit is re-derived from each tampered raw row. A
+        // report whose two outputs differ, or whose outputs disagree with its
+        // own guest disposition, is already refused by the canonical report
+        // parser, so only the consistent tamper, all three saying 4, reaches
+        // and needs the reader's own declaration check.
+        const DISPOSITION: &str = "matched report does not end as its row declares";
+        const INCONSISTENT: &str = "output disposition contradicts its verification result";
+        const OPERANDS: &str = "verification operands differ in status, stdout, or stderr";
+        let history = read_history_files(&fixture.root).unwrap();
+        for (label, fields, refusal) in [
+            (
+                "report and both outputs say 4",
+                &["guest", "left", "right"][..],
+                DISPOSITION,
+            ),
+            (
+                "report guest disposition says 4",
+                &["guest"][..],
+                INCONSISTENT,
+            ),
+            ("left output says 4", &["left"][..], OPERANDS),
+            ("right output says 4", &["right"][..], OPERANDS),
+        ] {
+            let mut tampered = row.clone();
+            let mut report: JsonValue = serde_json::from_str(
+                tampered["attempts"][0]["verification_report"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            for field in fields {
+                match *field {
+                    "guest" => report["guest_exit_code"] = 4.into(),
+                    side => report["compared_outputs"][side]["exit_code"] = 4.into(),
+                }
+            }
+            let report = serde_json::to_string(&report).unwrap();
+            let report_sha256 = format!("{:x}", Sha256::digest(report.as_bytes()));
+            tampered["attempts"][0]["verification_report_sha256"] = report_sha256.clone().into();
+            tampered["attempts"][0]["verification_report"] = report.into();
+            let parsed: ResultRow = serde_json::from_value(tampered.clone()).unwrap();
+            let mut audit = genuine.clone();
+            audit["evidence_sha256"] = parsed.evidence_identity().unwrap().into();
+            audit["attempts"][0]["verification_report_sha256"] = report_sha256.into();
+            assert_eq!(
+                serde_json::to_value(declared_guest_exit_attempts(&parsed).unwrap()).unwrap(),
+                audit["attempts"],
+                "{label}: the audit must be the tampered row's own projection"
+            );
+            fixture.publish_rows(std::slice::from_ref(&tampered));
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            let error = candidates[&id][0]
+                .evidence(&id, ResultInput::Current)
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the raw row's evidence was admitted"));
+            assert!(error.contains(refusal), "{label}: {error}");
+            let error = publish_raw_snapshot(&mut fixture, &[event(Some(audit))]).unwrap_err();
+            assert!(error.contains(refusal), "{label}: {error}");
+            assert!(
+                read_history_files(&fixture.root).unwrap() == history,
+                "{label} changed history"
+            );
+        }
+        // Hermit's own status disagreeing with a report that still says 3.
+        let mut tampered = row.clone();
+        tampered["attempts"][0]["status"] = 4.into();
+        fixture.publish_rows(std::slice::from_ref(&tampered));
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let error = candidates[&id][0]
+            .evidence(&id, ResultInput::Current)
+            .err()
+            .expect("Hermit status 4: the raw row's evidence was admitted");
+        assert!(error.contains(DISPOSITION), "Hermit status 4: {error}");
+    }
+
+    /// The reader's own declaration check, over every declared form: an exit
+    /// code, a signal death, and a signal reported by Hermit as `128 + signo`.
+    #[test]
+    fn declared_failure_must_name_the_declaration_in_status_report_and_outputs() {
+        let row = result_row(&"a".repeat(40));
+        let base = canonical_verdict::VerificationReport::from_current_json_slice(
+            row["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let declared = |code, signal| ExpectedGuestExit {
+            code,
+            signal,
+            reason: "the fixture guest fails on purpose".into(),
+        };
+        let attempt = |status: Option<i32>, signal: Option<i32>, argv: &[&str]| serde_json::json!({"argv": argv, "status": status, "signal": signal});
+        let report = |code: Option<i32>, signal: Option<i32>| {
+            let mut report = base.clone();
+            report.guest_exit_code = code;
+            report.guest_signal = signal;
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            for output in [&mut outputs.left, &mut outputs.right] {
+                output.exit_code = code;
+                output.signal = signal;
+            }
+            report
+        };
+        const ALLOW: &[&str] = &["hermit", "run", "--verify-allow=failure", "--", "guest"];
+        let code_3 = declared(Some(3), None);
+        let signal_11 = declared(None, Some(11));
+        for (label, declared, attempt, report) in [
+            (
+                "declared code",
+                &code_3,
+                attempt(Some(3), None, ALLOW),
+                report(Some(3), None),
+            ),
+            (
+                "signal death",
+                &signal_11,
+                attempt(None, Some(11), ALLOW),
+                report(None, Some(11)),
+            ),
+            (
+                "signal as 128 + signo",
+                &signal_11,
+                attempt(Some(139), None, ALLOW),
+                report(None, Some(11)),
+            ),
+        ] {
+            assert!(
+                declared_failure_matches("verify", declared, &attempt, &report),
+                "{label} was refused"
+            );
+            assert!(
+                !declared_failure_matches("chaos", declared, &attempt, &report),
+                "{label} was accepted outside verify mode"
+            );
+        }
+        let mut one_output = report(Some(3), None);
+        one_output
+            .compared_outputs
+            .as_mut()
+            .unwrap()
+            .right
+            .exit_code = Some(4);
+        let mut no_outputs = report(Some(3), None);
+        no_outputs.compared_outputs = None;
+        // The canonical parser already refuses a report whose guest
+        // disposition differs from its outputs; the reader must not rely on
+        // that to name the declaration.
+        let mut guest_only = report(Some(3), None);
+        guest_only.guest_exit_code = Some(4);
+        for (label, declared, attempt, report) in [
+            (
+                "report and both outputs say 4",
+                &code_3,
+                attempt(Some(3), None, ALLOW),
+                report(Some(4), None),
+            ),
+            (
+                "report guest disposition alone says 4",
+                &code_3,
+                attempt(Some(3), None, ALLOW),
+                guest_only,
+            ),
+            (
+                "one output says 4",
+                &code_3,
+                attempt(Some(3), None, ALLOW),
+                one_output,
+            ),
+            (
+                "outputs omitted",
+                &code_3,
+                attempt(Some(3), None, ALLOW),
+                no_outputs,
+            ),
+            (
+                "Hermit status 4",
+                &code_3,
+                attempt(Some(4), None, ALLOW),
+                report(Some(3), None),
+            ),
+            (
+                "Hermit reports a signal beside the code",
+                &code_3,
+                attempt(Some(3), Some(3), ALLOW),
+                report(Some(3), None),
+            ),
+            (
+                "report names a signal for a declared code",
+                &code_3,
+                attempt(Some(3), None, ALLOW),
+                report(None, Some(3)),
+            ),
+            (
+                "no --verify-allow=failure",
+                &code_3,
+                attempt(Some(3), None, &["hermit", "run", "--", "guest"]),
+                report(Some(3), None),
+            ),
+            (
+                "--verify-allow=failure only in the guest argv",
+                &code_3,
+                attempt(
+                    Some(3),
+                    None,
+                    &["hermit", "run", "--", "guest", "--verify-allow=failure"],
+                ),
+                report(Some(3), None),
+            ),
+            (
+                "Hermit status is the bare signal number",
+                &signal_11,
+                attempt(Some(11), None, ALLOW),
+                report(None, Some(11)),
+            ),
+            (
+                "Hermit reports both 128 + signo and the signal",
+                &signal_11,
+                attempt(Some(139), Some(11), ALLOW),
+                report(None, Some(11)),
+            ),
+            (
+                "report says another signal",
+                &signal_11,
+                attempt(None, Some(11), ALLOW),
+                report(None, Some(6)),
+            ),
+            (
+                "report names a code for a declared signal",
+                &signal_11,
+                attempt(Some(139), None, ALLOW),
+                report(Some(139), None),
+            ),
+        ] {
+            assert!(
+                !declared_failure_matches("verify", declared, &attempt, &report),
+                "{label} was accepted"
+            );
+        }
     }
 
     #[test]
