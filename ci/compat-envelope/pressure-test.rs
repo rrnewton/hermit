@@ -5194,6 +5194,55 @@ fn result_row_matches_cell(
     };
     result_row_identity_and_invocation_match(row, slug, metadata, cell, expected_required)
         && exit_matches
+        && matched_attempts_end_as_declared(row)
+}
+
+/// The scorecard's rule for a matched comparison (`require_matched_disposition`
+/// in scorecard.rs), applied before a PASS is credited here rather than
+/// trusting the runner's outcome. A row that declares a guest exit must have
+/// run verify under `--verify-allow=failure`, with Hermit's status, the
+/// report's guest disposition and both compared outputs all naming exactly the
+/// declaration. An undeclared row must end with a non-negative status (0
+/// outside chaos) and no signal. A report this cannot parse is refused.
+fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
+    if row.outcome != "PASS" || !matches!(row.mode.as_str(), "verify" | "replay" | "chaos") {
+        return true;
+    }
+    row.attempts.iter().all(|attempt| {
+        let Some(raw) = &attempt.verification_report else {
+            return true;
+        };
+        let Ok(report) = VerificationReport::from_current_json_slice(raw.as_bytes()) else {
+            return false;
+        };
+        if report.verdict != Verdict::Matched {
+            return true;
+        }
+        let Some(declared) = &row.expected_guest_exit else {
+            return attempt
+                .status
+                .is_some_and(|status| status >= 0 && (row.mode == "chaos" || status == 0))
+                && attempt.signal.is_none();
+        };
+        let hermit_args = attempt
+            .argv
+            .iter()
+            .position(|arg| arg == "--")
+            .map_or(&attempt.argv[..], |separator| &attempt.argv[..separator]);
+        let names_declaration = |code: Option<i32>, signal: Option<i32>| {
+            code == declared.code && signal == declared.signal
+        };
+        row.mode == "verify"
+            && hermit_args
+                .iter()
+                .any(|arg| arg == "--verify-allow=failure")
+            && declared.hermit_status_matches(attempt.status, attempt.signal)
+            && names_declaration(report.guest_exit_code, report.guest_signal)
+            && report.compared_outputs.as_ref().is_some_and(|outputs| {
+                names_declaration(outputs.left.exit_code, outputs.left.signal)
+                    && names_declaration(outputs.right.exit_code, outputs.right.signal)
+            })
+    })
 }
 
 fn invocation_attempts(row: &CellResult) -> Result<&[AttemptResult], String> {
@@ -8461,6 +8510,67 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
         sabre_path_evidence_sha256: None,
         reason: None,
     }
+}
+
+/// `row` rewritten as a PASS whose single attempt carries a canonical matched
+/// verify report: Hermit exited `status`, the report's guest and the two
+/// compared outputs exited `left` and `right`, and the row declares
+/// `declared` as its expected guest exit code.
+fn matched_pass_row(
+    row: &CellResult,
+    argv: &[&str],
+    status: i32,
+    (left, right): (i32, i32),
+    declared: Option<i32>,
+) -> Result<CellResult, String> {
+    let mut row = row.clone();
+    row.outcome = "PASS".into();
+    row.result = Some(ObservedResult::Pass);
+    row.failure_class = None;
+    row.argv = argv.iter().map(|arg| (*arg).to_owned()).collect();
+    row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
+    row.expected_guest_exit =
+        declared.map(|code| hermit_manifest_plan::runner::ExpectedGuestExit {
+            code: Some(code),
+            signal: None,
+            reason: "pressure-test self-test declaration".into(),
+        });
+    let mut attempt = fixture_attempt("PASS", status);
+    attempt.argv = row.argv.clone();
+    attempt.guest_argv = row.guest_argv.clone();
+    attempt.env = row.env.clone();
+    attempt.cwd = row.cwd.clone();
+    attempt.shell_command = row.shell_command.clone();
+    let mut report = serde_json::to_value(VerificationReport::no_result())
+        .map_err(|error| format!("cannot encode matched report fixture: {error}"))?;
+    report["verified"] = json!(true);
+    report["bitwise_parity"] = json!(true);
+    report["verdict"] = json!("matched");
+    report["no_result_reason"] = JsonValue::Null;
+    report["guest_exit_code"] = json!(left);
+    let output = |code: i32| {
+        json!({"exit_code": code, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stdout_bytes": 0,
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "stderr_bytes": 0})
+    };
+    report["compared_outputs"] = json!({"left": output(left), "right": output(right)});
+    report["compared_log_messages"] = json!({"left": 17, "right": 17});
+    report["comparison"] = json!({
+        "strictness":"canonical", "display_name":"BitwiseInfoV1", "compare_logs":true,
+        "compare_io_buffers":true, "log_scope":"info", "record_envelope":"all_records_v1",
+        "virtualize_time":true, "strip_lines":false,
+        "canonicalize_addresses":true, "full_trace":true, "exact_remainder":true,
+        "stripped_prefixes":["real-wall-clock-prefix/v1"],
+        "canonicalizations":["host-address-to-first-appearance-ordinal/v1"],
+        "ignore_lines":false, "skip_commit":false, "skip_detlog":false
+    });
+    let raw = serde_json::to_string(&report)
+        .map_err(|error| format!("cannot encode matched report fixture: {error}"))?;
+    attempt.verification_report_sha256 =
+        Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+    attempt.verification_report = Some(raw);
+    row.attempts = vec![attempt];
+    Ok(row)
 }
 
 fn pressure_timeout_self_test() -> Result<(), String> {
@@ -13260,6 +13370,101 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot write malformed appended-row fixture: {e}"))?;
     if read_result_rows(&appended_results).is_ok() {
         return Err("a malformed appended result row was accepted".into());
+    }
+    // A matched PASS is credited only when it ends as its row declares, the
+    // rule the scorecard applies to the same row.
+    let plain = [
+        "hermit",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        "fixture",
+    ];
+    let allowed = [
+        "hermit",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-allow=failure",
+        "--",
+        "fixture",
+    ];
+    for (label, argv, status, outputs, declared, accepted) in [
+        (
+            "an undeclared clean match",
+            &plain[..],
+            0,
+            (0, 0),
+            None,
+            true,
+        ),
+        (
+            "an undeclared nonzero match",
+            &plain[..],
+            17,
+            (17, 17),
+            None,
+            false,
+        ),
+        (
+            "a declared match",
+            &allowed[..],
+            17,
+            (17, 17),
+            Some(17),
+            true,
+        ),
+        (
+            "a declared match without --verify-allow=failure",
+            &plain[..],
+            17,
+            (17, 17),
+            Some(17),
+            false,
+        ),
+        (
+            "a declared match Hermit did not report",
+            &allowed[..],
+            0,
+            (17, 17),
+            Some(17),
+            false,
+        ),
+        (
+            "a declared match one output does not show",
+            &allowed[..],
+            17,
+            (17, 0),
+            Some(17),
+            false,
+        ),
+        (
+            "another declared code",
+            &allowed[..],
+            17,
+            (17, 17),
+            Some(16),
+            false,
+        ),
+    ] {
+        let row = matched_pass_row(&result_row, argv, status, outputs, declared)?;
+        if result_row_matches_cell(
+            &row,
+            &sample_slug,
+            &sample_metadata,
+            &sample_a,
+            true,
+            Some(0),
+        ) != accepted
+        {
+            return Err(format!(
+                "{label} was {} as a pass",
+                if accepted { "refused" } else { "accepted" }
+            ));
+        }
     }
     result_row.attempts[0].argv = vec!["hermit".into(), "run".into(), "--hidden-policy".into()];
     if result_row_matches_cell(
