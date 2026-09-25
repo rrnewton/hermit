@@ -131,10 +131,13 @@ pub const E9PATCH_COMPAT_TOTAL: usize = 155;
 /// the executable corpus but retained in the canonical denominator and table.
 /// Under `strict` these are NONBLOCKING: the row keeps running so the gap stays
 /// visible, mirroring the gcc vfork precedent.
+///
+/// Empty today. `make` was listed for a fail-closed `setresuid` refusal; that syscall has
+/// been determinized, and the exact `compat.make` command now passes (run 213 at
+/// 96b4b3bf3, plus five focused reruns and a `--verify-strict` L2 match), so its row was a
+/// stale expectation that only produced a STALE warning. A `make` failure now blocks.
 pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        ("make", "fail-closed --strict rejects the unsupported setresuid syscall"),
-    ])
+    BTreeMap::new()
 }
 
 /// `PORTABLE_STRICT_DIAGNOSTIC_FAILURES` (validate.sh:1147). Bounded diagnostics
