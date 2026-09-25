@@ -10736,13 +10736,10 @@ mod tests {
                 .unwrap(),
                 "twice",
             ),
-            (
-                "private-tmp.json",
-                serde_json::to_string(&buck_private_tmp).unwrap(),
-                "but the leg's candidate is",
-            ),
             // The named file still hashes to this leg's candidate, so only the
-            // recorded-candidate equality can refuse this record.
+            // recorded-candidate equality can refuse this record. It precedes
+            // the whole-Buck record, which the re-hash would also refuse, so
+            // removing the equality is reported as an acceptance.
             (
                 "private-tmp.json",
                 serde_json::to_string(&MatrixPrivateTmpEvidence {
@@ -10750,6 +10747,11 @@ mod tests {
                     ..private_tmp.clone()
                 })
                 .unwrap(),
+                "but the leg's candidate is",
+            ),
+            (
+                "private-tmp.json",
+                serde_json::to_string(&buck_private_tmp).unwrap(),
                 "but the leg's candidate is",
             ),
             (
