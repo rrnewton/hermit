@@ -3417,6 +3417,40 @@ fn mount_peer_group(field: &[u8]) -> Result<Option<(&'static [u8], u64)>, ()> {
     Ok(None)
 }
 
+/// True for one ephemeral per-process host FUSE seed mount row.
+///
+/// The host's squashfuse infrastructure creates one `fuse.squashfuse_ll`
+/// mount per host process under `/mnt/xarfuse/uid-<uid>/<hash>-seed-…`.
+/// Those rows are other processes' runtime state imported into the guest
+/// namespace by shared mount propagation: they are not created by Hermit,
+/// by the guest session, or by any ancestor the guest can name, their
+/// mountpoints embed a host PID, and they appear/disappear asynchronously
+/// as unrelated host processes live and die. Passing membership through
+/// made `/proc/<pid>/mountinfo` (and the length of every read of it) a
+/// host-timing observation — the `procfs-sanitized-paths` divergence, where
+/// one seed row changed the tail `read` length between two strict runs.
+/// The guest mount model (launch namespace; guest `mount`/`unshare`/
+/// `setns` are refused under Detcore) never contains this class, so it is
+/// excluded by class, not by instance: every ephemeral seed row is out,
+/// every other row — system, shared filesystems, Hermit-configured, or
+/// guest-visible binds — stays.
+pub(crate) fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
+    detcore_model::procfs::is_ephemeral_host_seed_mount(line)
+}
+
+/// Drop ephemeral host seed rows from raw mountinfo contents. Row order of
+/// everything retained is preserved.
+pub(crate) fn exclude_ephemeral_host_seed_mounts(contents: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if !is_ephemeral_host_seed_mount(body) {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
 fn sanitize_mountinfo(contents: &[u8], snapshot: &MountInfoSnapshot) -> Vec<u8> {
     fn rewrite_root_prefix(field: &[u8], rewrites: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
         for (raw, deterministic) in rewrites {
@@ -4750,6 +4784,66 @@ Rss:                   4 kB\n" as &[u8];
             );
             assert_eq!(file.take(usize::MAX), Some(Vec::new()), "{path}");
         }
+    }
+
+    const SEED_ROW: &[u8] = b"76 1 0:50 / /mnt/xarfuse/uid-212630/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw,nosuid,nodev,relatime master:48 - fuse.squashfuse_ll squashfuse_ll rw,user_id=212630,group_id=100,allow_other\n";
+    const SEED_ROW_2: &[u8] = b"83 1 0:57 / /mnt/xarfuse/uid-0/695e3eea-seed-nspid4026531836_cgpid52904797-ns-4026531832 rw,nosuid,nodev,relatime master:55 - fuse.squashfuse_ll squashfuse_ll rw,user_id=0,group_id=0,allow_other\n";
+    const LEGIT_ROWS: &[u8] = b"18 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime master:18 - proc proc rw\n100 1 0:70 / /test rw,relatime - tmpfs none rw,uid=212630,gid=100\n37 32 0:36 / /data/users/newton/local/fbsource rw,nosuid,relatime master:34 - fuse edenfs: rw,user_id=212630,group_id=100\n";
+
+    /// The class predicate is by meaning (ephemeral per-process host seed),
+    /// not by the instances seen on one host: a squashfuse mount elsewhere
+    /// and a non-squashfuse mount under the seed prefix both stay.
+    #[test]
+    fn ephemeral_host_seed_mount_class_is_precise() {
+        assert!(is_ephemeral_host_seed_mount(
+            SEED_ROW.strip_suffix(b"\n").unwrap()
+        ));
+        assert!(!is_ephemeral_host_seed_mount(
+            b"76 1 0:50 / /var/releases/www rw - fuse.squashfuse_ll squashfuse_ll rw"
+        ));
+        assert!(!is_ephemeral_host_seed_mount(
+            b"76 1 0:50 / /mnt/xarfuse/uid-1/x rw - tmpfs none rw"
+        ));
+        for line in LEGIT_ROWS.split_inclusive(|b| *b == b'\n') {
+            assert!(!is_ephemeral_host_seed_mount(
+                line.strip_suffix(b"\n").unwrap_or(line)
+            ));
+        }
+    }
+
+    /// Discriminating regression for the host-membership leak: two host
+    /// tables differing only in seed-row membership/order (host churn
+    /// between two strict runs) must produce identical guest contents,
+    /// while every legitimate row survives in order.
+    #[test]
+    fn seed_churn_does_not_change_guest_mountinfo_membership() {
+        let mut churned_a = LEGIT_ROWS.to_vec();
+        churned_a.extend_from_slice(SEED_ROW);
+        let mut churned_b = Vec::new();
+        churned_b.extend_from_slice(SEED_ROW_2);
+        churned_b.extend_from_slice(LEGIT_ROWS);
+        churned_b.extend_from_slice(SEED_ROW);
+        assert_eq!(
+            exclude_ephemeral_host_seed_mounts(&churned_a),
+            LEGIT_ROWS.to_vec(),
+            "seed rows must be excluded, legitimate rows kept in order"
+        );
+        assert_eq!(
+            exclude_ephemeral_host_seed_mounts(&churned_a),
+            exclude_ephemeral_host_seed_mounts(&churned_b),
+            "host seed churn must not change guest-visible membership"
+        );
+        // And through the full sanitize path with identities assigned over
+        // the filtered membership, both churn variants render identically.
+        let render = |contents: &[u8]| {
+            let filtered = exclude_ephemeral_host_seed_mounts(contents);
+            let rows = parse_mountinfo(&filtered).unwrap();
+            let snapshot =
+                MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).unwrap();
+            sanitize_mountinfo(&filtered, &snapshot)
+        };
+        assert_eq!(render(&churned_a), render(&churned_b));
+        assert!(render(&churned_a).windows(5).any(|w| w == b"/test"));
     }
 
     #[test]
