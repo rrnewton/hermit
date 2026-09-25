@@ -9468,7 +9468,8 @@ mod tests {
     /// `run --backend ptrace --base-env=minimal --epoch=2026-01-01T00:00:00+00:00
     /// --max-timeslice=200000000 --strict --verify --verify-strict` through
     /// safehermit with both a Cargo- and a Buck-built candidate (the shadow
-    /// artifacts of 246a7701d); the two were byte-identical and both reports
+    /// artifacts of the pre-rebase form of "Run the shadow DBT matrix under the
+    /// official host twin's contract"); the two were byte-identical and both reports
     /// gave 48,760,645 virtual ns. Hermit returned the same epoch-anchored
     /// value for both clocks there; the tests below prove nothing requires it.
     const CAPTURED_CLOCK_TRAJECTORY: &str = "\
