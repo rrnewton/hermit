@@ -12149,6 +12149,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         attempts: vec![fixture_attempt("FAIL", 1)],
         reason: None,
         artifact_dir: sample_artifact_dir.to_string_lossy().into_owned(),
+        expected_guest_exit: None,
     };
     if !result_row_matches_cell(
         &result_row,
@@ -13445,6 +13446,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .join("green-a-verify-ptrace")
             .to_string_lossy()
             .into_owned(),
+        expected_guest_exit: None,
     };
     if !result_row_matches_cell(
         &repeated_result_row,
