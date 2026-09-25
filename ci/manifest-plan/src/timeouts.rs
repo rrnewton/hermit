@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 177;
+pub const NON_CI_CELL_COUNT: usize = 173;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -59,6 +59,18 @@ pub const KVM_2026_09_08_MAX_REQUIRED_WALL_SECONDS: u64 = 20;
 pub const IPC_DETERMINISM_CHAOS_EVIDENCE_SHA: &str = "0b26fb782192e017ef9103e27d017f8c73ceeeb4";
 pub const IPC_DETERMINISM_CHAOS_EVIDENCE_COMPLETED_UTC: &str = "2026-09-15T22:07:28Z";
 pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
+/// Four ptrace verify cells promoted after their quarantine causes were fixed:
+/// `c-programs/nanosleep-threads-simple`, `c-programs/resource-determinism`,
+/// `shared-futex-c/qemu-hello` and `util-c/pmu-skid`.
+///
+/// Three of them end with a deterministic nonzero guest disposition and now
+/// declare it through `expected_guest_exit`, which is checked only after the
+/// unchanged canonical L2 match; `resource-determinism` needed a guest loop long
+/// enough to cross one virtual `times()` tick. Each cell passed five
+/// consecutive strict verify runs on the ptrace backend at the evidence SHA.
+pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
+pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
+pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1856,7 +1868,16 @@ mod tests {
             "2026-09-15T22:07:28Z"
         );
         assert_eq!(IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT, 1);
-        assert_eq!(NON_CI_CELL_COUNT, 177);
+        assert_eq!(
+            PTRACE_2026_09_24_EVIDENCE_SHA,
+            "17effafddad25b445d21beb33fd74bc4bf5c7bf1"
+        );
+        assert_eq!(
+            PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T03:15:24Z"
+        );
+        assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(NON_CI_CELL_COUNT, 173);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
