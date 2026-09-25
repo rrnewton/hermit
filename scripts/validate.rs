@@ -732,6 +732,28 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
 const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
+const RELEASE_BUILDER_CARGO: &str = validate_receipt::RELEASE_BUILDER_CARGO;
+const RELEASE_BUILDER_BUCK: &str = "buck";
+
+/// The binary every E2E cell of a run executes, as `build.e2e_artifact`
+/// publishes it for each builder.
+fn e2e_payload_identity(release_builder: &str) -> serde_json::Value {
+    if release_builder == RELEASE_BUILDER_BUCK {
+        serde_json::json!({
+            "path": "target/ci/hermit-strict",
+            "profile": "release",
+            "debug_assertions": false,
+            "overflow_checks": false,
+        })
+    } else {
+        serde_json::json!({
+            "path": "target/debug/hermit",
+            "profile": "debug",
+            "debug_assertions": true,
+            "overflow_checks": true,
+        })
+    }
+}
 const BUCK_DOTSLASH_ENV: &str = "HERMIT_VALIDATE_BUCK_DOTSLASH";
 
 fn establish_release_build_environment(args: &Args) -> Result<(), String> {
@@ -2769,6 +2791,7 @@ fn self_test() -> Result<(), String> {
         profile: "full",
         host: "fixture-host",
         toolchain: "fixture-toolchain",
+        release_builder: RELEASE_BUILDER_CARGO,
     };
     let current_cache_schema = if validate_evidence::ENABLED {
         10
@@ -4498,6 +4521,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         in_place_attribution.commit_anchored,
         in_place_attribution.tree_dirty,
         "full",
+        RELEASE_BUILDER_CARGO,
     )
     .is_ok()
     {
@@ -4580,6 +4604,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
             disposable_attribution.commit_anchored,
             disposable_attribution.tree_dirty,
             "full",
+            RELEASE_BUILDER_CARGO,
         )
         .is_err()
     {
@@ -16822,6 +16847,10 @@ struct LedgerCtx {
     cwd: String,
     profile: String,
     selection_mode: String,
+    /// `cargo` or `buck`: which builder produced the E2E payload. A Buck run's
+    /// E2E cells execute the release binary, without debug assertions or
+    /// overflow checks, so its row is neither a Cargo cache hit nor a receipt.
+    release_builder: &'static str,
     cache_state: String,
     commit: String,
     tree: String,
@@ -19934,6 +19963,8 @@ fn write_ledger_with_snapshot(
         "cwd": ctx.cwd,
         "profile": ctx.profile,
         "selection_mode": ctx.selection_mode,
+        "release_builder": ctx.release_builder,
+        "e2e_payload": e2e_payload_identity(ctx.release_builder),
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
         "tree": ctx.tree,
@@ -22383,11 +22414,15 @@ fn run(
             );
         }
     };
-    if args.buck_release_dotslash.is_some() {
-        // Tree/profile cache identity predates the release-builder dimension.
-        // Never answer an explicit Buck request with an earlier Cargo green.
+    let release_builder = if args.buck_release_dotslash.is_some() {
+        // The cache key names the builder, so a Cargo green can never answer
+        // a Buck request; a Buck row does not bind its binary, so it is never
+        // reused either.
         plan.cacheable = false;
-    }
+        RELEASE_BUILDER_BUCK
+    } else {
+        RELEASE_BUILDER_CARGO
+    };
 
     if plan.committed_selection.is_none() {
         if let Err(error) =
@@ -22750,6 +22785,7 @@ fn run(
         profile: &plan.profile,
         host: &host,
         toolchain: &toolchain,
+        release_builder,
     };
     // A nested payload never consults the cache: the outer run already did, and a
     // payload that "hit" would report a green for a lane it never ran.
@@ -23385,6 +23421,7 @@ fn run(
         cwd: root.to_string_lossy().into(),
         profile: plan.profile.clone(),
         selection_mode: plan.selection_mode.into(),
+        release_builder,
         cache_state: cache.into(),
         commit: commit.clone(),
         tree: admitted_context
@@ -23871,6 +23908,7 @@ fn run(
         commit_anchored,
         attribution_tree_dirty,
         &plan.profile,
+        release_builder,
     ) {
         Ok(()) => {
             let _ = validate_receipt::publish();
@@ -24175,6 +24213,7 @@ fn stop_test_seam(
         cwd: root.to_string_lossy().into(),
         profile: profile.to_string(),
         selection_mode: "full".into(),
+        release_builder: RELEASE_BUILDER_CARGO,
         cache_state: cache_state(root).into(),
         commit,
         tree: git_tree(),
@@ -25872,6 +25911,75 @@ mod scorecard_cutover_tests {
     }
 
     #[test]
+    fn a_buck_row_names_its_release_payload_and_mints_neither_cache_nor_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = "c".repeat(40);
+        let key = validate_history::CacheKey {
+            tree: &tree,
+            profile: "full",
+            host: "scorecard-fixture",
+            toolchain: "fixture-python-unittest",
+            release_builder: RELEASE_BUILDER_CARGO,
+        };
+        for (builder, cargo_reusable) in [(RELEASE_BUILDER_CARGO, true), (RELEASE_BUILDER_BUCK, false)] {
+            let mut ctx = context(temp.path(), "full", builder, HEAD.into(), tree.clone());
+            ctx.selection_mode = "full".into();
+            ctx.release_builder = builder;
+            let ledger = temp.path().join(format!("{builder}.jsonl"));
+            let row = write_ledger(
+                &ledger,
+                &ctx,
+                &[],
+                &[],
+                &[],
+                &[],
+                &BTreeSet::new(),
+                0.0,
+                75,
+                "",
+                false,
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+            let retained: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+            assert_eq!(retained["release_builder"], builder);
+            assert_eq!(retained["e2e_payload"], e2e_payload_identity(builder));
+            let release = builder == RELEASE_BUILDER_BUCK;
+            assert_eq!(retained["e2e_payload"]["profile"], if release { "release" } else { "debug" });
+            assert_eq!(retained["e2e_payload"]["debug_assertions"], !release);
+            assert_eq!(retained["e2e_payload"]["overflow_checks"], !release);
+
+            // Give the written identity a qualifying green and ask the Cargo key.
+            let mut green = row.clone();
+            for (field, value) in [
+                ("result", serde_json::json!("pass")),
+                ("failures", serde_json::json!(0)),
+                ("producer", serde_json::json!("hermit-validate-rs")),
+                ("executed_nodes", serde_json::json!(5)),
+                ("executed_tests", serde_json::json!(9)),
+                ("gates_expected", serde_json::json!(5)),
+                ("gates_run", serde_json::json!(5)),
+                ("coverage", serde_json::json!({"planned_test_nodes": 5, "executed_test_nodes": 5, "absent_nodes": []})),
+            ] {
+                green[field] = value;
+            }
+            assert_eq!(
+                validate_history::cache_lookup(std::slice::from_ref(&green), "pass", &key).is_some(),
+                cargo_reusable,
+                "{builder} green against a Cargo cache key"
+            );
+            assert_eq!(
+                validate_receipt::eligible(0, 0, true, true, false, "full", builder).is_ok(),
+                cargo_reusable,
+                "{builder} green as a full-suite receipt"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_selections_and_other_labels_do_not_acquire_full_scope() {
         let source = test_source_root();
         let (committed, _, _) = load_committed_validation_dag(&source).unwrap();
@@ -26055,6 +26163,7 @@ with (root/'calls.jsonl').open('a') as out:
             cwd: root.display().to_string(),
             profile: profile.into(),
             selection_mode: "selected".into(),
+            release_builder: RELEASE_BUILDER_CARGO,
             cache_state: "cold".into(),
             commit,
             tree,
