@@ -1543,11 +1543,38 @@ fn resolve_release_show_output(stdout: &str, workspace: &Path) -> Result<PathBuf
 const COMMAND_END_ADVISORY_BUCK_DESCRIPTOR_SHA256: &str =
     "40e4842f407f589acf80a40267764bea914dc4067b2faf330cc1c377080db35e";
 
+/// Buck2 `ActionExecutionKind` values (buck2 `app/buck2_data/data.proto`) that
+/// this local-only build may report, by name. Every other value, including
+/// REMOTE (2), ACTION_CACHE (3), REMOTE_DEP_FILE_CACHE (9), REMOTE_WORKER (11)
+/// and any value this table does not know, is refused: a remote result is not
+/// evidence of a local build of the bound inputs.
+const LOCAL_ACTION_EXECUTION_KINDS: [(u64, &str); 6] = [
+    (1, "local"),
+    (4, "simple"),
+    (6, "deferred"),
+    (7, "local_dep_file"),
+    (8, "local_worker"),
+    (10, "local_action_cache"),
+];
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReleaseBuildEvidence {
     command_end_is_success: bool,
+    /// Count of each executed action's kind, keyed by the names above. Empty
+    /// when the daemon reused every action result without running anything.
+    action_executions: BTreeMap<&'static str, u64>,
     output: PathBuf,
     output_sha256: String,
+}
+
+impl ReleaseBuildEvidence {
+    fn action_execution_summary(&self) -> String {
+        LOCAL_ACTION_EXECUTION_KINDS
+            .iter()
+            .map(|(_, name)| format!("{name}={}", self.action_executions.get(name).unwrap_or(&0)))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 fn inspect_release_build_evidence(
@@ -1570,6 +1597,7 @@ fn inspect_release_build_evidence(
         .map_err(|error| format!("Buck release event log is not UTF-8 JSON-lines: {error}"))?;
     let mut commands = Vec::new();
     let mut results = Vec::new();
+    let mut action_executions = BTreeMap::new();
     for (index, line) in text.lines().enumerate() {
         let event: Value = serde_json::from_str(line).map_err(|error| {
             format!(
@@ -1579,6 +1607,28 @@ fn inspect_release_build_evidence(
         })?;
         if let Some(command) = event.pointer("/Event/data/SpanEnd/data/Command") {
             commands.push(command.clone());
+        }
+        if let Some(action) = event.pointer("/Event/data/SpanEnd/data/ActionExecution") {
+            let kind = action
+                .get("execution_kind")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "Buck release event log line {} has an ActionExecution without an integer execution_kind",
+                        index + 1
+                    )
+                })?;
+            let name = LOCAL_ACTION_EXECUTION_KINDS
+                .iter()
+                .find(|(value, _)| *value == kind)
+                .map(|(_, name)| *name)
+                .ok_or_else(|| {
+                    format!(
+                        "Buck release event log line {} reports action execution_kind {kind}, which is not a local kind; a remote or unknown result is not a local build",
+                        index + 1
+                    )
+                })?;
+            *action_executions.entry(name).or_insert(0) += 1;
         }
         if let Some(result) = event.pointer("/Result/result/build_response") {
             results.push(result.clone());
@@ -1647,6 +1697,7 @@ fn inspect_release_build_evidence(
     let output_hash = sha256(&canonical_output)?;
     Ok(ReleaseBuildEvidence {
         command_end_is_success: command_success,
+        action_executions,
         output: canonical_output,
         output_sha256: output_hash,
     })
@@ -1661,8 +1712,9 @@ fn reconcile_release_build_evidence(
 ) -> Result<(), String> {
     let evidence = inspect_release_build_evidence(event_log, show_output, shell_exit, workspace)?;
     let receipt_text = format!(
-        "reconciliation_schema\thermit-buck-release-build/v1\nshell_exit\t0\ncommand_end_is_success\t{}\ncommand_end_status\tadvisory-known-inconsistent\nbuild_completed\ttrue\nresult_errors\t0\nrelease_target\thermit//hermit-cli:hermit-release\nrelease_output\t{}\nrelease_output_sha256\t{}\n",
+        "reconciliation_schema\thermit-buck-release-build/v1\nshell_exit\t0\ncommand_end_is_success\t{}\ncommand_end_status\tadvisory-known-inconsistent\nbuild_completed\ttrue\nresult_errors\t0\naction_executions\t{}\nremote_action_executions\t0\nrelease_target\thermit//hermit-cli:hermit-release\nrelease_output\t{}\nrelease_output_sha256\t{}\n",
         evidence.command_end_is_success,
+        evidence.action_execution_summary(),
         evidence.output.display(),
         evidence.output_sha256,
     );
@@ -6829,7 +6881,7 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     let event_log = evidence_dir.join("buck-build.json-lines.gz");
     let build = Command::new(&buck_snapshot.path)
         .current_dir(&root)
-        .args(["build", "--show-output", "--event-log"])
+        .args(["build", "--no-remote-cache", "--show-output", "--event-log"])
         .arg(&event_log)
         .args([
             "-c",
@@ -6871,6 +6923,13 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     let show_output = evidence_dir.join("buck-build.stdout");
     let build_evidence =
         inspect_release_build_evidence(&event_log, &show_output, shell_exit, &root)?;
+    atomic_write_new(
+        &evidence_dir.join("buck-action-executions.tsv"),
+        &format!(
+            "action_executions\t{}\nremote_action_executions\t0\n",
+            build_evidence.action_execution_summary()
+        ),
+    )?;
     let candidate = resolve_release_show_output(&stdout, &root)?;
     if candidate != build_evidence.output || sha256(&candidate)? != build_evidence.output_sha256 {
         return Err(
@@ -7140,7 +7199,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     let event_log = evidence_dir.join("buck-build.json-lines.gz");
     let build = Command::new(&buck_executable)
         .current_dir(&root)
-        .args(["build", "--show-output", "--event-log"])
+        .args(["build", "--no-remote-cache", "--show-output", "--event-log"])
         .arg(&event_log)
         .args([
             "-c",
@@ -8247,6 +8306,9 @@ mod tests {
         assert!(text.contains("command_end_is_success\tfalse\n"));
         assert!(text.contains("command_end_status\tadvisory-known-inconsistent\n"));
         assert!(text.contains(&sha256(&binary).unwrap()));
+        assert!(text.contains(
+            "action_executions\tlocal=0,simple=0,deferred=0,local_dep_file=0,local_worker=0,local_action_cache=0\nremote_action_executions\t0\n"
+        ));
 
         let elf_bytes = fs::read(&binary).unwrap();
         fs::write(&binary, b"not an ELF binary\n").unwrap();
@@ -8373,6 +8435,79 @@ mod tests {
                 0,
                 &root,
                 &root.join(format!("{label}.tsv")),
+            )
+            .unwrap_err();
+            assert!(error.contains(refusal), "{label}: {error}");
+        }
+        // Executed actions are counted by kind, and a remote, remotely cached
+        // or unknown kind refuses the log as evidence of a local build.
+        let action = |kind: Value| serde_json::json!({"Event":{"data":{"SpanEnd":{"data":{"ActionExecution":{"execution_kind":kind}}}}}});
+        let counted_log = root.join("counted.json-lines.gz");
+        write_event_log(
+            &counted_log,
+            &[
+                action(1.into()),
+                action(4.into()),
+                action(4.into()),
+                action(10.into()),
+                events[0].clone(),
+                events[1].clone(),
+            ],
+        );
+        let counted = root.join("counted.tsv");
+        reconcile_release_build_evidence(&counted_log, &stdout, 0, &root, &counted).unwrap();
+        assert!(fs::read_to_string(&counted).unwrap().contains(
+            "action_executions\tlocal=1,simple=2,deferred=0,local_dep_file=0,local_worker=0,local_action_cache=1\n"
+        ));
+        for (label, kind, refusal) in [
+            (
+                "remote",
+                Value::from(2),
+                "execution_kind 2, which is not a local kind",
+            ),
+            (
+                "action-cache",
+                Value::from(3),
+                "execution_kind 3, which is not a local kind",
+            ),
+            (
+                "remote-dep-file",
+                Value::from(9),
+                "execution_kind 9, which is not a local kind",
+            ),
+            (
+                "remote-worker",
+                Value::from(11),
+                "execution_kind 11, which is not a local kind",
+            ),
+            (
+                "unknown",
+                Value::from(12),
+                "execution_kind 12, which is not a local kind",
+            ),
+            ("missing", Value::Null, "without an integer execution_kind"),
+            (
+                "named",
+                Value::from("LOCAL"),
+                "without an integer execution_kind",
+            ),
+        ] {
+            let log = root.join(format!("{label}-action.json-lines.gz"));
+            write_event_log(
+                &log,
+                &[
+                    action(1.into()),
+                    action(kind),
+                    events[0].clone(),
+                    events[1].clone(),
+                ],
+            );
+            let error = reconcile_release_build_evidence(
+                &log,
+                &stdout,
+                0,
+                &root,
+                &root.join(format!("{label}-action.tsv")),
             )
             .unwrap_err();
             assert!(error.contains(refusal), "{label}: {error}");
