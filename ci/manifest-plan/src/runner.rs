@@ -8547,6 +8547,7 @@ mod tests {
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
+                + crate::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT
                 + 3 // the exact RNG identities asserted above
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
