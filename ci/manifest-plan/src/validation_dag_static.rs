@@ -30,6 +30,8 @@ pub(super) const RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 
 pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
+pub(super) const MANIFEST_GATE_INNER_JOBS: i64 = 2;
+const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their seven top-level audits run serially inside the shared aggregate budget: the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged."########;
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -215,7 +217,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven census/finalized-run/scope controls retain all 577 current-main IDs.
     // Three epoch controls and the dagrun-preparation placement control retain all 606 prior IDs.
     // Six expected-guest-exit controls retain all 610 prior identities.
-    ("test.regular_crates", 616),
+    // The manifest-gate width contract retains all 616 prior identities.
+    ("test.regular_crates", 617),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     ("test.hermit_unit", 723),
@@ -257,7 +260,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 616),
+    ("test.regular_crates_on_host", 617),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -625,7 +628,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"gate"########,
         job: r########"manifest"########,
         desc: r########"Centralized test manifest and inventory"########,
-        description: r########""########,
+        description: MANIFEST_GATE_DESCRIPTION,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -638,14 +641,17 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         manifest: None,
         integration_test_binaries: None,
         deps: &[r########"setup.manifest_plan"########],
-        env: &[],
+        env: &[(
+            r########"HERMIT_VALIDATE_AUDIT_JOBS"########,
+            r########"1"########,
+        )],
         hint: HintSpec {
             resources: &[],
             est_duration_s: 0.0,
             rss_baseline_bytes: Some(5368709120),
             hard_mem_max_bytes: Some(5368709120),
             classification: StepClass::Light,
-            preferred_inner_jobs: None,
+            preferred_inner_jobs: Some(MANIFEST_GATE_INNER_JOBS),
             measured_effective_cores: None,
             measured_cpu_utilization: None,
         },
@@ -653,8 +659,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 900,
         cpu_timeout: 600,
-        jobs_flag: None,
-        jobs_env: None,
+        jobs_flag: Some(r########""########),
+        jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
         group: r########"build"########,
@@ -5859,7 +5865,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         group: r########"gate"########,
         job: r########"manifest_on_host"########,
         desc: r########"Centralized test manifest and inventory"########,
-        description: r########""########,
+        description: MANIFEST_GATE_DESCRIPTION,
         labels: &[r########"hosted-privileged"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate"########,
         cmdtype: CmdType::Unknown,
@@ -5873,7 +5879,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             rss_baseline_bytes: Some(5368709120),
             hard_mem_max_bytes: Some(5368709120),
             classification: StepClass::Light,
-            preferred_inner_jobs: None,
+            preferred_inner_jobs: Some(MANIFEST_GATE_INNER_JOBS),
             measured_effective_cores: None,
             measured_cpu_utilization: None,
         },
@@ -5881,8 +5887,8 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         engine_only: false,
         timeout: 180,
         cpu_timeout: 600,
-        jobs_flag: None,
-        jobs_env: None,
+        jobs_flag: Some(r########""########),
+        jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
         group: r########"privileged-only-build"########,
