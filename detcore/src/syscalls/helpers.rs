@@ -125,13 +125,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::RtSigsuspend,
+        temporary_mask: u64,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
         self.record_or_replay_blocking_resource(
             guest,
             call.into(),
-            ResourceID::BlockingRtSigsuspend(op_id),
+            ResourceID::BlockingRtSigsuspend {
+                op_id,
+                temporary_mask,
+            },
         )
         .await
     }
@@ -144,9 +148,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
-            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id) => {
-                *op_id
-            }
+            ResourceID::BlockingExternalIO(op_id)
+            | ResourceID::BlockingRtSigsuspend { op_id, .. } => *op_id,
             _ => unreachable!("blocking syscall helper requires a blocking resource"),
         };
         // Internal-vs-external fd classification happens at the call sites that hold the
