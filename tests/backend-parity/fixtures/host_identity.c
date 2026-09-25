@@ -50,7 +50,10 @@
 #define VIRT_MACHINE  "x86_64"
 #define VIRT_TOTALRAM 1000000000UL
 #define VIRT_PROCS    1U
-#define VIRT_UPTIME   120L
+/* Boot offset 120s plus a nonzero sub-second logical elapsed time. Linux
+   sysinfo(2) rounds any fractional elapsed second UP (do_sysinfo), so the
+   guest observes 121, not the 120 that the floor-based /proc/uptime shows. */
+#define VIRT_UPTIME   121L
 #define VIRT_AFFINITY 1
 
 static int fail(const char* field, const char* got) {
