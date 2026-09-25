@@ -24,6 +24,21 @@ pub struct MountInfoRow {
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
 
+/// True for one ephemeral per-process host FUSE seed mount row: a
+/// `fuse.squashfuse_ll` mount under `/mnt/xarfuse/uid-<uid>/<hash>-seed-…`,
+/// created by host squashfuse infrastructure for one host process. See
+/// `detcore::procfs::exclude_ephemeral_host_seed_mounts` for why this class
+/// is outside the guest mount model.
+pub fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
+    let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+    let Some(separator) = fields.iter().position(|field| *field == b"-") else {
+        return false;
+    };
+    let mount_point = fields.get(4).copied().unwrap_or_default();
+    let fs_type = fields.get(separator + 1).copied().unwrap_or_default();
+    fs_type == b"fuse.squashfuse_ll" && mount_point.starts_with(b"/mnt/xarfuse/")
+}
+
 /// Whether every visible mount ID occurs once and in the same relative order
 /// as the producer-captured namespace.
 pub fn mount_ids_are_ordered_subset(visible: &[u64], captured: &[u64]) -> bool {
