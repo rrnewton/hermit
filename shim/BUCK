@@ -17,16 +17,23 @@ load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 
 oncall("open_source")
 
-# Cargo's release profile applies these settings to the target dependency
-# closure while leaving host build scripts/proc macros in their execution
-# configuration. The dedicated configured platform below gives Buck the same
-# split without changing the default Hermit target or its dependency graph.
+# These flags reproduce Cargo's default release profile (the workspace
+# declares no [profile.release]) for the target dependency closure, while host
+# build scripts/proc macros keep their execution configuration. Measured with this
+# toolchain, Cargo's release rustc line carries -Copt-level=3,
+# -Cembed-bitcode=no and, on the final binary, -Cstrip=debuginfo; the other
+# values below are rustc's implicit defaults at opt-level 3. Cargo's default
+# `lto = false` passes no -Clto flag, leaving rustc's thin local LTO in
+# effect, so none appears here: -Clto=off would be `lto = "off"`, different
+# code generation. The one difference is -Cstrip=none, which keeps the
+# precompiled std debuginfo at link time and does not change generated code.
+# The dedicated configured platform below gives Buck the same split without
+# changing the default Hermit target or its dependency graph.
 HERMIT_RELEASE_RUSTC_FLAGS = [
     "-Ccodegen-units=16",
     "-Cdebuginfo=0",
     "-Cdebug-assertions=no",
     "-Cembed-bitcode=no",
-    "-Clto=off",
     "-Copt-level=3",
     "-Coverflow-checks=no",
     "-Cpanic=unwind",
