@@ -346,10 +346,11 @@ pub struct RtSigsuspendWait {
     /// blocks signal `n`.
     pub temporary_mask: u64,
     /// Another guest has queued a signal for this thread that the temporary
-    /// mask admits. That signal ends the wait, and the kernel restores the
-    /// original mask and may run a handler under its `sa_mask` before the
-    /// thread reports, so the scheduler no longer knows which signals the
-    /// thread takes. Set by `notify_signal_pending`.
+    /// mask admits. That signal ends the wait. Once the thread is let go, the
+    /// kernel may run a handler under its `sa_mask` and then restores the
+    /// original mask, so a signal sent to this thread now can be left pending
+    /// under a mask the scheduler never saw. The scheduler no longer knows
+    /// which signals the thread takes. Set by `notify_signal_pending`.
     ///
     /// Known gap: only senders that call `notify_signal_pending` set it, which
     /// are `kill`, `tgkill`, `tkill`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`.
