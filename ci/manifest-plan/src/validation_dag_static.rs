@@ -237,7 +237,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 653 prior identities (`cargo nextest list` measured 663).
     // The series parity post-pass adds one parity test (a rejected operand is
     // unavailable) and retains all 663 prior identities (measured 664).
-    ("test.regular_crates", 664),
+    // e8007f971a7 and ad21724d5f6 each add one parity test without raising
+    // this constant (`cargo nextest list` measured 666 at ad21724d5f6).
+    // The environment-varying config fingerprint regression retains all 666
+    // prior identities: 666 + 1 = 667 (`cargo nextest list` measured 667).
+    ("test.regular_crates", 667),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -301,8 +305,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.hermit_unit_on_host", 757),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
-    // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 664),
+    // The host node carries the identical selection: 666 + 1 = 667.
+    ("test.regular_crates_on_host", 667),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
