@@ -86,9 +86,10 @@ the DotSlash descriptor and resolved Buck executable, then invokes only the
 snapshotted Buck binary for version, build, and log decoding. Before any Cargo
 probe it snapshots the caller's binary and complete install bundle into the
 exclusive evidence directory. Every subsequent probe, comparison, matrix, and
-receipt fact uses that tested snapshot, never the mutable caller paths. Buck
-receives a second verified copy of the snapshotted install tree, and the two
-complete resource manifests must be byte-identical. Before the first probe the
+receipt fact uses that tested snapshot, never the mutable caller paths. The
+Buck candidate's bundle is published separately from the caller's pre-overlay
+install tree, and the two complete resource manifests must be byte-identical,
+so any change to that tree between the two publications is refused. Before the first probe the
 wrapper also snapshots the
 reviewed `ROOT/bin/safehermit` plus its required
 `ROOT/scripts/bounded-run-space` companion into the evidence tree, executes
