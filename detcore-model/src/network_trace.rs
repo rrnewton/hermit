@@ -32,6 +32,8 @@ use serde::Serialize;
 
 mod accepted;
 pub use accepted::*;
+mod native_receive;
+pub use native_receive::*;
 
 use crate::fd::OpenFileId;
 use crate::time::LogicalTime;
@@ -44,6 +46,8 @@ pub const NETWORK_TRACE_VERSION_V1: u32 = 1;
 pub const NETWORK_TRACE_VERSION_V2: u32 = 2;
 /// Explicit receive-copy-unit envelope around unchanged V2 history.
 pub const NETWORK_TRACE_VERSION_V3: u32 = 3;
+/// Explicit native observations and typed receive-entry release prerequisites.
+pub const NETWORK_TRACE_VERSION_V4: u32 = 4;
 /// Maximum one observation unit under DeclaredCopyUnitsV1, not a syscall limit.
 pub const NETWORK_RECEIVE_UNIT_V3_MAX: usize = 1024;
 /// Refuse hostile or corrupt length headers before allocating memory.
