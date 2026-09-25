@@ -2785,6 +2785,9 @@ impl Scheduler {
                 TimedEvent::SignalEvt(id, tid, sig) => {
                     self.dispatch_timed_signal(time_ns, id, tid, sig, true)
                 }
+                // Virtual timerfd expiry: no thread wake, no signal. Readiness
+                // is recomputed by detcore from virtual time on the next probe.
+                TimedEvent::TimerFdEvt(_, _) => {}
             }
             true
         } else {
@@ -3846,6 +3849,9 @@ impl Scheduler {
                     TimedEvent::SignalEvt(id, dtid, sig) => {
                         self.dispatch_timed_signal(event_ns, id, dtid, sig, false)
                     }
+                    // Virtual timerfd expiry: time already advanced above;
+                    // readiness is recomputed by detcore from virtual time.
+                    TimedEvent::TimerFdEvt(_, _) => {}
                 }
                 return Err(SkipTurn);
             }
@@ -5100,6 +5106,7 @@ impl Scheduler {
                         }
                     }
                     TimedEvent::SignalEvt(_, _, _) => {}
+                    TimedEvent::TimerFdEvt(_, _) => {}
                 }
             }
             if self.blocked.external_io_blockers.contains_key(&dtid) {
@@ -5441,6 +5448,23 @@ impl Scheduler {
             self.blocked
                 .timed_waiters
                 .remove_posix_timer(detpid, timer_id);
+        }
+    }
+
+    /// Register, re-arm, or disarm a virtual timerfd deadline.
+    pub fn register_timerfd(
+        &mut self,
+        detpid: DetPid,
+        fd: i32,
+        deadline: Option<LogicalTime>,
+        interval: LogicalTime,
+    ) {
+        if let Some(deadline) = deadline {
+            self.blocked
+                .timed_waiters
+                .insert_timerfd(deadline, detpid, fd, interval);
+        } else {
+            self.blocked.timed_waiters.remove_timerfd(detpid, fd);
         }
     }
 

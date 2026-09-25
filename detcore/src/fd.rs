@@ -166,6 +166,15 @@ struct OpenFileDescription {
     /// after entering the guest can already carry a lock.
     #[serde(default)]
     flock_mode_known: bool,
+    /// Virtual timerfd state (FdType::Timerfd only). The host timerfd is a
+    /// never-armed poll vessel; all guest-visible semantics derive from this.
+    #[serde(default)]
+    timerfd: Option<TimerFdState>,
+    /// Detcore shadow of epoll interests in virtual timerfds (FdType::Epoll
+    /// only), keyed by target guest fd. Host epoll cannot see virtual
+    /// readiness, so waits merge this shadow with host probe results.
+    #[serde(default)]
+    epoll_timerfds: std::collections::BTreeMap<i32, EpollTimerInterest>,
     /// Whether Detcore has EVER known this description's lock state.
     ///
     /// This separates two different unknowns that `flock_mode_known == false`
@@ -176,6 +185,83 @@ struct OpenFileDescription {
     /// wrong. Only the second is a reason to refuse `vfork`.
     #[serde(default)]
     flock_mode_ever_known: bool,
+}
+
+/// One epoll interest in a virtual timerfd, mirrored from epoll_ctl.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct EpollTimerInterest {
+    /// Guest-requested event mask (EPOLLIN etc).
+    pub events: u32,
+    /// Guest data.u64 echoed back on readiness.
+    pub data: u64,
+    /// EPOLLET latch: true once reported until pending drains or MOD re-arms.
+    pub edge_reported: bool,
+}
+
+/// Virtual timerfd state, in detcore's single logical-time domain.
+/// Deadlines are stored as logical instants (CLOCK_REALTIME arming is
+/// converted through the run's fixed virtual epoch; clock_settime is not
+/// virtualized today, so that conversion is exact).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TimerFdState {
+    /// clockid passed to timerfd_create.
+    pub clockid: i32,
+    /// Next expiry instant, or None when disarmed.
+    pub deadline: Option<LogicalTime>,
+    /// Reload interval; zero means one-shot.
+    pub interval: LogicalTime,
+    /// Expirations already consumed by guest reads.
+    pub consumed: u64,
+    /// TFD_TIMER_CANCEL_ON_SET was requested (no producer bumps the clock
+    /// generation today, so cancellation is unreachable; see design doc).
+    pub cancel_on_set: bool,
+}
+
+impl TimerFdState {
+    pub fn new(clockid: i32) -> Self {
+        Self {
+            clockid,
+            deadline: None,
+            interval: LogicalTime::ZERO,
+            consumed: 0,
+            cancel_on_set: false,
+        }
+    }
+
+    /// Total expirations that have occurred by `now` (pure function).
+    pub fn expirations(&self, now: LogicalTime) -> u64 {
+        let Some(deadline) = self.deadline else {
+            return 0;
+        };
+        if now < deadline {
+            return 0;
+        }
+        if self.interval == LogicalTime::ZERO {
+            return 1;
+        }
+        1 + (now.as_nanos() - deadline.as_nanos()) / self.interval.as_nanos()
+    }
+
+    /// Expirations available to read/poll at `now`.
+    pub fn pending(&self, now: LogicalTime) -> u64 {
+        self.expirations(now).saturating_sub(self.consumed)
+    }
+
+    /// Next expiry instant strictly after `now`, for gettime reporting.
+    pub fn next_expiry(&self, now: LogicalTime) -> Option<LogicalTime> {
+        let deadline = self.deadline?;
+        if self.interval == LogicalTime::ZERO {
+            return (now < deadline).then_some(deadline);
+        }
+        if now < deadline {
+            return Some(deadline);
+        }
+        let elapsed = now.as_nanos() - deadline.as_nanos();
+        let k = elapsed / self.interval.as_nanos() + 1;
+        Some(LogicalTime::from_nanos(
+            deadline.as_nanos() + k * self.interval.as_nanos(),
+        ))
+    }
 }
 
 impl PartialEq for DetFd {
@@ -225,6 +311,8 @@ impl DetFd {
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
+                timerfd: None,
+                epoll_timerfds: Default::default(),
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -553,6 +641,47 @@ impl DetFd {
         self.description().socket_receive_timestamp
     }
 
+    /// Initialize virtual timerfd state on this open file description.
+    pub(crate) fn init_timerfd(&self, clockid: i32) {
+        self.description().timerfd = Some(TimerFdState::new(clockid));
+    }
+
+    /// Snapshot of the virtual timerfd state, if this fd is a managed timerfd.
+    pub(crate) fn timerfd_state(&self) -> Option<TimerFdState> {
+        self.description().timerfd
+    }
+
+    /// Mutate the virtual timerfd state; returns false for non-timerfds.
+    pub(crate) fn with_timerfd_mut<R>(&self, f: impl FnOnce(&mut TimerFdState) -> R) -> Option<R> {
+        self.description().timerfd.as_mut().map(f)
+    }
+
+    /// Record/replace an epoll interest in a virtual timerfd (ADD/MOD).
+    pub(crate) fn epoll_timer_add(&self, fd: i32, interest: EpollTimerInterest) {
+        self.description().epoll_timerfds.insert(fd, interest);
+    }
+
+    /// Drop an epoll interest in a virtual timerfd (DEL or close).
+    pub(crate) fn epoll_timer_remove(&self, fd: i32) {
+        self.description().epoll_timerfds.remove(&fd);
+    }
+
+    /// Snapshot of this epoll instance's virtual timerfd interests.
+    pub(crate) fn epoll_timer_interests(&self) -> Vec<(i32, EpollTimerInterest)> {
+        self.description()
+            .epoll_timerfds
+            .iter()
+            .map(|(fd, interest)| (*fd, *interest))
+            .collect()
+    }
+
+    /// Update the ET latch for one interest after a wait reports it.
+    pub(crate) fn epoll_timer_set_edge(&self, fd: i32, reported: bool) {
+        if let Some(interest) = self.description().epoll_timerfds.get_mut(&fd) {
+            interest.edge_reported = reported;
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1064)
     /// Mark this open file as a `NETLINK_SOCK_DIAG` socket. Shared across every
@@ -876,4 +1005,30 @@ mod tests {
 
         assert_ne!(first.open_file_id(), second.open_file_id());
     }
+
+    #[test]
+    fn timerfd_state_counts_periodic_expirations() {
+        let mut s = TimerFdState::new(libc::CLOCK_MONOTONIC);
+        assert_eq!(s.pending(LogicalTime::from_nanos(1000)), 0);
+        s.deadline = Some(LogicalTime::from_nanos(100));
+        s.interval = LogicalTime::from_nanos(50);
+        assert_eq!(s.expirations(LogicalTime::from_nanos(99)), 0);
+        assert_eq!(s.expirations(LogicalTime::from_nanos(100)), 1);
+        assert_eq!(s.expirations(LogicalTime::from_nanos(430)), 7);
+        s.consumed = 7;
+        assert_eq!(s.pending(LogicalTime::from_nanos(430)), 0);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(430)),
+            Some(LogicalTime::from_nanos(450))
+        );
+        // One-shot: exactly one expiration, no next expiry after it.
+        s.interval = LogicalTime::ZERO;
+        s.consumed = 0;
+        assert_eq!(s.expirations(LogicalTime::from_nanos(10_000)), 1);
+        assert_eq!(s.next_expiry(LogicalTime::from_nanos(10_000)), None);
+        // Disarmed: nothing.
+        s.deadline = None;
+        assert_eq!(s.expirations(LogicalTime::from_nanos(10_000)), 0);
+    }
+
 }

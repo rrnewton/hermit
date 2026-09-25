@@ -1,0 +1,3 @@
+# Periodic virtual timerfd + nanosleep: expirations are a pure function of
+# virtual time (30/60/90ms within a 100ms sleep => count 3, deterministically).
+RUN: %hermit run --strict -- %me
