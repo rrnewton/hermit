@@ -299,6 +299,11 @@ pub(crate) struct DirEntry {
 /// Sort `.` first, `..` second, then by name bytes. Names within one
 /// directory are unique, so this is a total order on a directory's entries.
 pub(crate) fn sort_dir_entries(entries: &mut [DirEntry]) {
+    entries.sort_by(compare_dir_entries);
+}
+
+/// The order of [`sort_dir_entries`].
+fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
     fn rank(name: &[u8]) -> u8 {
         match name {
             b"." => 0,
@@ -306,11 +311,9 @@ pub(crate) fn sort_dir_entries(entries: &mut [DirEntry]) {
             _ => 2,
         }
     }
-    entries.sort_by(|a, b| {
-        rank(&a.name)
-            .cmp(&rank(&b.name))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    rank(&a.name)
+        .cmp(&rank(&b.name))
+        .then_with(|| a.name.cmp(&b.name))
 }
 
 /// The guest-visible directory stream of one open file description.
@@ -325,14 +328,25 @@ pub(crate) fn sort_dir_entries(entries: &mut [DirEntry]) {
 ///
 /// Like the kernel's file position, the stream is shared by every descriptor
 /// that aliases the open file description through `dup` or `fork`.
+///
+/// A descriptor Detcore does not track (one received through `SCM_RIGHTS`, for
+/// example) can alias the same open file and read it from the kernel position.
+/// The stream keeps that position where such a reader gets every entry the
+/// stream has not returned (see [`DirectoryStream::kernel_target`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct DirectoryStream {
     /// Sorted entries, or `None` when the next `getdents` must take a fresh
     /// snapshot. POSIX makes `rewinddir` refresh the stream, so a seek to
     /// position 0 drops the snapshot.
     entries: Option<Vec<DirEntry>>,
+    /// For each position from 0 to the number of entries, the earliest host
+    /// position from which the kernel returns every entry at or after that
+    /// position in the stream.
+    resume: Vec<i64>,
     /// Index of the next entry to return.
     position: u64,
+    /// The host position the kernel was last left at.
+    kernel_position: i64,
 }
 
 impl DirectoryStream {
@@ -340,8 +354,29 @@ impl DirectoryStream {
         self.entries.is_none()
     }
 
+    /// Install the entries of a whole directory, read from the kernel in host
+    /// order until the end, which is where the kernel position is left.
     pub(crate) fn install(&mut self, entries: Vec<DirEntry>) {
-        self.entries = Some(entries);
+        // An entry's host `d_off` is the host position after it, so reading
+        // from the position after entry `i - 1` returns entries `i` onwards in
+        // host order. For each stream position, start at the entry with the
+        // lowest host index among those not yet returned.
+        let host_offsets: Vec<i64> = entries.iter().map(|entry| entry.off).collect();
+        let mut indexed: Vec<(usize, DirEntry)> = entries.into_iter().enumerate().collect();
+        indexed.sort_by(|(_, a), (_, b)| compare_dir_entries(a, b));
+        let end = host_offsets.last().copied().unwrap_or(0);
+        let mut resume = vec![end; indexed.len() + 1];
+        let mut earliest = usize::MAX;
+        for (position, (host_index, _)) in indexed.iter().enumerate().rev() {
+            earliest = earliest.min(*host_index);
+            resume[position] = match earliest {
+                0 => 0,
+                index => host_offsets[index - 1],
+            };
+        }
+        self.entries = Some(indexed.into_iter().map(|(_, entry)| entry).collect());
+        self.resume = resume;
+        self.kernel_position = end;
     }
 
     pub(crate) fn position(&self) -> u64 {
@@ -352,6 +387,7 @@ impl DirectoryStream {
     pub(crate) fn seek(&mut self, position: u64) {
         if position == 0 {
             self.entries = None;
+            self.resume = Vec::new();
         }
         self.position = position;
     }
@@ -359,6 +395,29 @@ impl DirectoryStream {
     /// Step past `count` returned entries.
     pub(crate) fn advance(&mut self, count: usize) {
         self.position = self.position.saturating_add(count as u64);
+    }
+
+    /// The host position to move the kernel to, or `None` if it is already
+    /// there. Reading from it returns every entry the stream has not returned,
+    /// but may also repeat some that it has, because the host order differs.
+    /// At the end of the stream it is the end of the directory; without a
+    /// snapshot, it is the start.
+    pub(crate) fn kernel_target(&self) -> Option<i64> {
+        let target = match &self.entries {
+            None => 0,
+            Some(entries) => {
+                let position = usize::try_from(self.position)
+                    .unwrap_or(usize::MAX)
+                    .min(entries.len());
+                self.resume.get(position).copied().unwrap_or(0)
+            }
+        };
+        (target != self.kernel_position).then_some(target)
+    }
+
+    /// Record that the kernel position was moved to `position`.
+    pub(crate) fn kernel_moved(&mut self, position: i64) {
+        self.kernel_position = position;
     }
 
     /// The entries the next call returns: those at the current position that
@@ -1007,11 +1066,11 @@ mod test {
 
         // Each one-letter dirent64 record is 24 bytes: two fit in 48.
         let first = stream.next_batch(DirentFormat::Dirent64, 48).unwrap();
-        assert_eq!(names(&first), ["c", "a"]);
+        assert_eq!(names(&first), ["a", "b"]);
         stream.advance(first.len());
         assert_eq!(stream.position(), 2);
         let second = stream.next_batch(DirentFormat::Dirent64, 48).unwrap();
-        assert_eq!(names(&second), ["b"]);
+        assert_eq!(names(&second), ["c"]);
         stream.advance(second.len());
         assert!(
             stream
@@ -1056,5 +1115,49 @@ mod test {
         stream.seek(0);
         assert!(stream.needs_snapshot());
         assert_eq!(stream.position(), 0);
+    }
+
+    #[test]
+    fn stream_keeps_the_kernel_where_every_unreturned_entry_follows() {
+        // Host order c, a, d, b; each host `d_off` is the position after it.
+        let host = [("c", 10), ("a", 20), ("d", 30), ("b", 40)];
+        let mut stream = DirectoryStream::default();
+        stream.install(
+            host.iter()
+                .map(|&(name, off)| DirEntry { off, ..entry(name) })
+                .collect(),
+        );
+
+        // After each stream position, the host position that the kernel
+        // must read from to return every entry not yet returned.
+        let expected = [
+            // a b c d: all remain; c is first in host order.
+            (0, Some(0)),
+            // b c d remain; c is first in host order.
+            (1, Some(0)),
+            // c d remain; c is first in host order.
+            (2, Some(0)),
+            // d remains; it follows a, the host position 20.
+            (3, Some(20)),
+            // None remain: the end of the directory, where reading the
+            // snapshot left the kernel.
+            (4, None),
+        ];
+        for (position, target) in expected {
+            stream.position = position;
+            assert_eq!(stream.kernel_target(), target, "position {position}");
+        }
+
+        stream.position = 3;
+        stream.kernel_moved(20);
+        assert_eq!(stream.kernel_target(), None);
+        stream.position = 99;
+        assert_eq!(stream.kernel_target(), Some(40));
+
+        // A rewind drops the snapshot and the kernel returns to the start.
+        stream.seek(0);
+        assert_eq!(stream.kernel_target(), Some(0));
+        stream.kernel_moved(0);
+        assert_eq!(stream.kernel_target(), None);
     }
 }
