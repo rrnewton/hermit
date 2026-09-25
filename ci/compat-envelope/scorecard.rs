@@ -4525,6 +4525,10 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
         .ok_or("history unavailable: the existing hermit_test_ledger checkout was not found")?;
     let ledger = fs::canonicalize(&candidate)
         .map_err(|error| format!("history unavailable at {}: {error}", candidate.display()))?;
+    let witness = LedgerIdentityWitness::capture(&ledger);
+    if witness.is_some() && *verified_ledger_identity() == witness {
+        return Ok(ledger);
+    }
     let git = |args: &[&str]| -> Result<String, String> {
         let output = Command::new("git")
             .args(args)
@@ -4547,7 +4551,103 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
     {
         return Err("history repository is not the expected hermit_test_ledger checkout".into());
     }
+    // Remember only a success whose inputs did not move while Git answered.
+    if witness.is_some() && LedgerIdentityWitness::capture(&ledger) == witness {
+        *verified_ledger_identity() = witness;
+    }
     Ok(ledger)
+}
+
+/// Every input that the two Git identity answers in `ledger_root` depend on
+/// and that can change while this process runs, read without running Git.
+///
+/// A process issues hundreds of history reads (the self-test alone issued
+/// 1,086 identity checks, two Git executions each). The check is repeated only
+/// when this witness differs from the one captured around the last successful
+/// check: the complete process environment (which also selects the `git`
+/// binary through `PATH`), the canonical ledger path, the identity of its
+/// `.git` directory, and the exact bytes, or absence, of `HEAD` and of every
+/// repository, worktree, user, and system Git configuration file. No witness
+/// exists, so Git answers every time, when configuration can come from
+/// elsewhere: a `.git` file instead of a directory, an explicit repository or
+/// configuration location in the environment, or an `include`/`includeIf`
+/// directive in any configuration file.
+#[derive(PartialEq)]
+struct LedgerIdentityWitness {
+    ledger: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    git_dir: (u64, u64, u32, u32),
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+impl LedgerIdentityWitness {
+    fn capture(ledger: &Path) -> Option<Self> {
+        let mut environment = env::vars_os().collect::<Vec<_>>();
+        environment.sort();
+        if environment.iter().any(|(key, _)| {
+            [
+                "GIT_DIR",
+                "GIT_COMMON_DIR",
+                "GIT_WORK_TREE",
+                "GIT_CONFIG",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+            ]
+            .iter()
+            .any(|name| key == name)
+        }) {
+            return None;
+        }
+        let git_dir = ledger.join(".git");
+        let metadata = fs::symlink_metadata(&git_dir).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        let home = env::var_os("HOME").map(PathBuf::from);
+        let xdg = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".config")));
+        let mut paths = ["HEAD", "commondir", "config", "config.worktree"]
+            .map(|name| git_dir.join(name))
+            .to_vec();
+        paths.push(PathBuf::from("/etc/gitconfig"));
+        paths.extend(xdg.map(|xdg| xdg.join("git/config")));
+        paths.extend(home.map(|home| home.join(".gitconfig")));
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return None,
+            };
+            if bytes.as_ref().is_some_and(|bytes| {
+                bytes
+                    .windows(b"include".len())
+                    .any(|window| window.eq_ignore_ascii_case(b"include"))
+            }) {
+                return None;
+            }
+            files.push((path, bytes));
+        }
+        Some(Self {
+            ledger: ledger.to_path_buf(),
+            environment,
+            git_dir: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.uid(),
+                metadata.mode(),
+            ),
+            files,
+        })
+    }
+}
+
+fn verified_ledger_identity() -> std::sync::MutexGuard<'static, Option<LedgerIdentityWitness>> {
+    static VERIFIED: std::sync::Mutex<Option<LedgerIdentityWitness>> = std::sync::Mutex::new(None);
+    VERIFIED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
