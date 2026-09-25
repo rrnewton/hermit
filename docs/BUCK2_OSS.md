@@ -153,6 +153,32 @@ duration-normalized results from the official DBT parity matrix. Buck event
 evidence is retained as `.json-lines.gz` and must decode through
 `buck2 log summary` before the wrapper can pass.
 
+### Virtual-time scope
+
+The fixed-epoch clock trajectory gate establishes Cargo-versus-Buck parity for
+the ptrace backend only. It runs `tests/c/clock_exec_continuity.c` under
+`--backend ptrace` with a pinned `--epoch` and timeslice, and requires
+byte-identical trajectories and exactly equal strict reports, virtual time
+included. It is not evidence of virtual-time parity between backends, and it
+says nothing about DBT or KVM virtual time:
+
+- The DBT matrix runs the simpler `tests/c/clock_determinism.c` fixture. Its
+  clock rows are repeatability contracts within one backend, and
+  `tests/backend-parity/run_matrix.py` deliberately excludes them from
+  cross-backend byte comparison. The shadow compares only the Cargo and Buck
+  matrix case identities and outcomes.
+- The shadow runs no KVM guest. In validation, the KVM verify cell
+  `system-utils/proc-uptime` reads `/proc/uptime` and checks repeatability. It
+  does not exercise `sysinfo(2)`, exec or thread continuity, or an exact
+  trajectory.
+- The `system-utils/clock-exec-continuity` manifest cell enables verify mode
+  on ptrace only. DBT and KVM stay disabled until their post-exec clock paths
+  are qualified against the ptrace baseline.
+
+A cross-backend virtual-time claim needs that coverage first: the same pinned
+trajectory run on each backend, with a comparator that defines what must be
+equal between backends.
+
 ## Public nightly evidence and the full-parity boundary
 
 `.github/workflows/buck2-oss-nightly.yml` is schedule/manual only and has
