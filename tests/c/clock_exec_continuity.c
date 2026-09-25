@@ -19,23 +19,42 @@
  * check that samples the clock once per process cannot see it at all --
  * the first reads agree perfectly, which is precisely the bug.
  *
- * So this guard deliberately does the two things such a check does not:
- *   1. it reads REPEATEDLY inside each generation, not once, and
+ * So this guard deliberately does the things such a check does not:
+ *   1. it reads REPEATEDLY inside each generation, not once,
  *   2. it carries the previous generation's readings ACROSS AN EXEC and
- *      asserts continuity over that boundary.
+ *      asserts continuity over that boundary,
+ *   3. it brackets fixed amounts of guest work with reads, so committed
+ *      progress is visible in the trajectory, and
+ *   4. it samples from threads that run one at a time (each is joined before
+ *      the next starts), so a per-thread clock origin or reset is visible
+ *      while the emitted order stays deterministic without a scheduler.
  *
  * It must also not be satisfiable by making time COARSER -- that would be the
  * defect guarding itself. Note where that property actually comes from: every
  * leg below (round origin, strict advance, cross-exec continuity, distinct
- * per-exec origins) is BROKEN by coarsening rather than satisfied by it, so
- * coarsening can never buy a pass here.
+ * per-exec origins, cross-thread continuity) is BROKEN by coarsening rather
+ * than satisfied by it, so coarsening can never buy a pass here.
  *
  * There is deliberately NO absolute nanosecond floor on the gap between reads.
  * An earlier draft asserted one and it was wrong: the per-read advance is a
  * function of the run configuration, measured at ~10us under
  * `--strict --base-env=minimal` and ~5ms under the portable verify profile.
  * A constant calibrated on one of those fails the other, which would make this
- * guard a source of false reds rather than a detector of the defect.
+ * guard a source of false reds rather than a detector of the defect. For the
+ * same reason the work segments only assert that time advanced: exact costs
+ * depend on the epoch, the timeslice, and the backend, none of which this
+ * program controls. (Record mode currently refuses its clock_gettime.) Exact
+ * virtual-time relations between segments belong to callers that pin those
+ * inputs and compare whole trajectories.
+ *
+ * Every stdout line before the final verdict is one closed trajectory record:
+ *   sample gen=G source=main index=I ns=T
+ *   work gen=G index=I iterations=N before_ns=T after_ns=T checksum=X
+ *   sample gen=G source=thread index=I thread=K ns=T
+ *   gen=G first=T last=T min_delta=D
+ * Records appear in the order the reads happened, so every timestamp in
+ * emission order is strictly greater than the one before it, including
+ * across exec and thread boundaries.
  *
  * Usage (the guest re-execs itself; the arguments are internal):
  *   clock_exec_continuity [generation prev_last_ns gen0_first_ns]
@@ -44,6 +63,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +76,14 @@ enum { READS_PER_GENERATION = 8 };
 /* Generations, i.e. execs performed. Two boundaries is enough to prove the
  * per-exec reset; more only lengthens the test. */
 enum { FINAL_GENERATION = 2 };
+/* Serialized sampling threads per generation, and reads by each. */
+enum { THREADS_PER_GENERATION = 2 };
+enum { READS_PER_THREAD = 4 };
+/* Work segments: none, one unit twice, then two units. Under a pinned epoch,
+ * parse_clock_trajectory in scripts/build-buck-release.rs requires equal work
+ * to cost equal virtual time and more work to cost strictly more. */
+enum { WORK_SEGMENTS = 4 };
+static const long WORK_ITERATIONS[WORK_SEGMENTS] = {0, 100000, 100000, 200000};
 #define NS_PER_SEC 1000000000LL
 
 static int64_t read_clock_ns(void) {
@@ -78,6 +106,52 @@ static int64_t parse_ns(const char* text) {
   return (int64_t)value;
 }
 
+/* A fixed, data-dependent loop of conditional branches. The volatile sink
+ * keeps -O0 or a smarter compiler from deleting it. */
+static volatile uint64_t work_sink;
+
+static uint64_t do_work(long iterations) {
+  uint64_t value = 27;
+  for (long i = 0; i < iterations; i++) {
+    if (value & 1) {
+      value = value * 3 + 1;
+    } else {
+      value >>= 1;
+    }
+  }
+  work_sink = value;
+  return value;
+}
+
+static int64_t thread_readings[READS_PER_THREAD];
+
+static void* sample_thread(void* unused) {
+  (void)unused;
+  for (int i = 0; i < READS_PER_THREAD; i++) {
+    thread_readings[i] = read_clock_ns();
+  }
+  return NULL;
+}
+
+/* Fails the generation unless `now` is strictly after `before`. */
+static void require_after(
+    long generation,
+    const char* what,
+    int64_t now,
+    int64_t before) {
+  if (now <= before) {
+    fprintf(
+        stderr,
+        "FAIL gen=%ld %s read %" PRId64 " is not after the preceding read %" PRId64
+        ": virtual time is frozen, coarsened, reset, or went backwards\n",
+        generation,
+        what,
+        now,
+        before);
+    exit(1);
+  }
+}
+
 int main(int argc, char** argv) {
   long generation = 0;
   int64_t previous_last = 0;
@@ -98,7 +172,6 @@ int main(int argc, char** argv) {
   }
 
   const int64_t first = readings[0];
-  const int64_t last = readings[READS_PER_GENERATION - 1];
 
   /*
    * (1) A round origin is the #1095 signature. The configured epoch is a whole
@@ -180,6 +253,66 @@ int main(int argc, char** argv) {
           generation,
           first);
       return 1;
+    }
+  }
+
+  for (int i = 0; i < READS_PER_GENERATION; i++) {
+    printf(
+        "sample gen=%ld source=main index=%d ns=%" PRId64 "\n",
+        generation,
+        i,
+        readings[i]);
+  }
+
+  /*
+   * (6) Committed work advances time. Each segment is bracketed by reads and
+   * must end strictly after it began, and after the previous segment ended.
+   */
+  int64_t last = readings[READS_PER_GENERATION - 1];
+  for (int i = 0; i < WORK_SEGMENTS; i++) {
+    const int64_t before = read_clock_ns();
+    require_after(generation, "work-start", before, last);
+    const uint64_t checksum = do_work(WORK_ITERATIONS[i]);
+    const int64_t after = read_clock_ns();
+    require_after(generation, "work-end", after, before);
+    printf(
+        "work gen=%ld index=%d iterations=%ld before_ns=%" PRId64 " after_ns=%" PRId64
+        " checksum=%" PRIu64 "\n",
+        generation,
+        i,
+        WORK_ITERATIONS[i],
+        before,
+        after,
+        checksum);
+    last = after;
+  }
+
+  /*
+   * (7) Threads share the process clock. Each thread runs alone (it is joined
+   * before the next is created), so its reads must continue the trajectory:
+   * a per-thread origin, freeze, or reset shows up as a non-advancing read.
+   */
+  for (int thread = 0; thread < THREADS_PER_GENERATION; thread++) {
+    pthread_t handle;
+    int error = pthread_create(&handle, NULL, sample_thread, NULL);
+    if (error != 0) {
+      fprintf(stderr, "pthread_create failed: %s\n", strerror(error));
+      return 1;
+    }
+    error = pthread_join(handle, NULL);
+    if (error != 0) {
+      fprintf(stderr, "pthread_join failed: %s\n", strerror(error));
+      return 1;
+    }
+    for (int i = 0; i < READS_PER_THREAD; i++) {
+      require_after(generation, "thread", thread_readings[i], last);
+      printf(
+          "sample gen=%ld source=thread index=%d thread=%d ns=%" PRId64 "\n",
+          generation,
+          i,
+          thread,
+          thread_readings[i]);
+      last = thread_readings[i];
     }
   }
 
