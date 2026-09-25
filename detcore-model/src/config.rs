@@ -1857,6 +1857,70 @@ mod tests {
         assert_eq!(canonical.sched_seed, None);
     }
 
+    #[test]
+    fn config_fingerprint_ignores_hermit_environment_defaults() {
+        const CHILD: &str = "DETCORE_CONFIG_FINGERPRINT_TEST_CHILD";
+        const ENVIRONMENT: [&str; 3] = ["HERMIT_EPOCH", "HERMIT_PRNG", "HERMIT_SCHED_SEED"];
+        if std::env::var_os(CHILD).is_some() {
+            let config = Config::default();
+            println!("child-fingerprint={}", config_wire_fingerprint());
+            println!("child-epoch={}", config.epoch.to_rfc3339());
+            println!("child-seed={}", config.seed);
+            println!("child-sched_seed={:?}", config.sched_seed);
+            return;
+        }
+        // The coordinator runs with the harness's HERMIT_EPOCH; a guest launched
+        // with `--base-env=minimal` does not. Both must publish one fingerprint.
+        let run = |values: &[&str]| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::config_fingerprint_ignores_hermit_environment_defaults",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            for (name, value) in ENVIRONMENT.iter().zip(values) {
+                command.env(name, value);
+            }
+            if values.is_empty() {
+                for name in ENVIRONMENT {
+                    command.env_remove(name);
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let field = |name: &str| {
+                // libtest may print its own `test ... ` prefix on the same line.
+                let marker = format!("child-{name}=");
+                stdout
+                    .lines()
+                    .find_map(|line| Some(&line[line.find(&marker)? + marker.len()..]))
+                    .unwrap_or_else(|| panic!("child printed no {name}: {stdout}"))
+                    .to_owned()
+            };
+            (
+                field("fingerprint"),
+                field("epoch"),
+                field("seed"),
+                field("sched_seed"),
+            )
+        };
+        let (plain, plain_epoch, plain_seed, plain_sched_seed) = run(&[]);
+        let (inherited, inherited_epoch, inherited_seed, inherited_sched_seed) =
+            run(&["2000-12-31T23:59:59Z", "7", "9"]);
+        // Admission control: the environment really reached clap's defaults, so
+        // equal fingerprints below cannot come from a child that ignored it.
+        assert_ne!(plain_epoch, inherited_epoch);
+        assert_eq!(inherited_epoch, "2000-12-31T23:59:59+00:00");
+        assert_ne!(plain_seed, inherited_seed);
+        assert_ne!(plain_sched_seed, inherited_sched_seed);
+        assert_eq!(plain, inherited);
+        assert_eq!(plain, config_wire_fingerprint());
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
