@@ -1756,7 +1756,7 @@ test:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: The guard joins each sampling thread before starting the next, so there is no interleaving to explore
+          ptrace: Main blocks in join while each sampler runs and prints only after it, so no schedule changes the observable output
           dbt: Chaos scheduling is unsupported by DBI
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
