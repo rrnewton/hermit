@@ -47,14 +47,29 @@
  * virtual-time relations between segments belong to callers that pin those
  * inputs and compare whole trajectories.
  *
+ * Which clock carries which claim follows Linux. Every leg above reads
+ * CLOCK_MONOTONIC, which Linux keeps system-wide: it continues across exec and
+ * threads and never steps, but its absolute value (time since an unspecified
+ * point) is not a contract. Only CLOCK_REALTIME is defined relative to the Unix
+ * epoch, so the two `realtime` records below, one after the opening
+ * MONOTONIC reads and one after the threads, are the only reads a caller may
+ * compare against a configured `--epoch`. No record relates the two clocks.
+ * Hermit currently answers every clockid with the same epoch-anchored value
+ * (handle_clock_gettime in detcore/src/syscalls/time.rs ignores the clockid);
+ * that is a known deviation from Linux, tracked as TaskGraph task
+ * hermit-clock-gettime-ignores-clockid, and nothing here may depend on it.
+ *
  * Every stdout line before the final verdict is one closed trajectory record:
  *   sample gen=G source=main index=I ns=T
+ *   realtime gen=G phase=open ns=T
  *   work gen=G index=I iterations=N before_ns=T after_ns=T checksum=X
  *   sample gen=G source=thread index=I thread=K ns=T
+ *   realtime gen=G phase=close ns=T
  *   gen=G first=T last=T min_delta=D
- * Records appear in the order the reads happened, so every timestamp in
- * emission order is strictly greater than the one before it, including
- * across exec and thread boundaries.
+ * Records appear in the order the reads happened. Within each clock, every
+ * timestamp in emission order is strictly greater than that clock's previous
+ * one, including across exec and thread boundaries; the fixture itself asserts
+ * this for CLOCK_MONOTONIC and leaves the REALTIME anchors to callers.
  *
  * Usage (the guest re-execs itself; the arguments are internal):
  *   clock_exec_continuity [generation prev_last_ns gen0_first_ns]
@@ -86,13 +101,18 @@ enum { WORK_SEGMENTS = 4 };
 static const long WORK_ITERATIONS[WORK_SEGMENTS] = {0, 100000, 100000, 200000};
 #define NS_PER_SEC 1000000000LL
 
-static int64_t read_clock_ns(void) {
+static int64_t read_clockid_ns(clockid_t clock) {
   struct timespec now;
-  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+  if (clock_gettime(clock, &now) != 0) {
     fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
     exit(1);
   }
   return (int64_t)now.tv_sec * NS_PER_SEC + now.tv_nsec;
+}
+
+/* The continuity trajectory. */
+static int64_t read_clock_ns(void) {
+  return read_clockid_ns(CLOCK_MONOTONIC);
 }
 
 static int64_t parse_ns(const char* text) {
@@ -263,6 +283,12 @@ int main(int argc, char** argv) {
         i,
         readings[i]);
   }
+  /* The epoch anchor, read after the opening MONOTONIC reads so that the
+   * first clock read of every process is still the one leg (1) checks. */
+  printf(
+      "realtime gen=%ld phase=open ns=%" PRId64 "\n",
+      generation,
+      read_clockid_ns(CLOCK_REALTIME));
 
   /*
    * (6) Committed work advances time. Each segment is bracketed by reads and
@@ -315,6 +341,11 @@ int main(int argc, char** argv) {
       last = thread_readings[i];
     }
   }
+
+  printf(
+      "realtime gen=%ld phase=close ns=%" PRId64 "\n",
+      generation,
+      read_clockid_ns(CLOCK_REALTIME));
 
   printf(
       "gen=%ld first=%" PRId64 " last=%" PRId64 " min_delta=%" PRId64 "\n",
