@@ -147,6 +147,20 @@ pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
     "1b9874539b954e65c6229b91aeb263e9ec91c611";
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:38:24Z";
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/sigsuspend-sibling-signal-wake` verify on ptrace, a new guest
+/// for the defects fixed at the evidence SHA: a sibling's `tgkill` must end an
+/// `rt_sigsuspend` wait after a signal the process ignores reached the waiter
+/// first. The scheduler must requeue a waiter another guest's signal released
+/// instead of reporting a deadlock, and the real `rt_sigsuspend` must run in
+/// place rather than behind injected probe syscalls. The cell passed ten
+/// consecutive strict verify runs, each on its first attempt, with a build of
+/// the evidence SHA, which is the last commit that changes how the scheduler
+/// handles these waiters. Guest source sha256
+/// 96bcc5e240133faae7db68b7316744bd543913f4cfc7abda380f4a6f15410c0e.
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
+    "3af2a07119b1cb2593255c02c064cdb8dbc76f44";
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T15:21:13Z";
+pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
 /// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
@@ -2074,6 +2088,15 @@ mod tests {
             "2026-09-25T14:38:24Z"
         );
         assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA,
+            "3af2a07119b1cb2593255c02c064cdb8dbc76f44"
+        );
+        assert_eq!(
+            SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T15:21:13Z"
+        );
+        assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             SELECT_REPLAY_2026_10_03_TESTS.len()
