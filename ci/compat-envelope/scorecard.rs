@@ -4569,9 +4569,9 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
 /// `.git` directory, and the exact bytes, or absence, of `HEAD` and of every
 /// repository, worktree, user, and system Git configuration file. No witness
 /// exists, so Git answers every time, when configuration can come from
-/// elsewhere: a `.git` file instead of a directory, an explicit repository or
-/// configuration location in the environment, or an `include`/`includeIf`
-/// directive in any configuration file.
+/// elsewhere: a `.git` file instead of a directory, a `commondir` file inside
+/// it, an explicit repository or configuration location in the environment, or
+/// an `include`/`includeIf` directive in any configuration file.
 #[derive(PartialEq)]
 struct LedgerIdentityWitness {
     ledger: PathBuf,
@@ -4620,11 +4620,15 @@ impl LedgerIdentityWitness {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => return None,
             };
-            if bytes.as_ref().is_some_and(|bytes| {
-                bytes
-                    .windows(b"include".len())
-                    .any(|window| window.eq_ignore_ascii_case(b"include"))
-            }) {
+            // A `commondir` moves the repository configuration to a file
+            // outside this witness.
+            if (bytes.is_some() && path.ends_with("commondir"))
+                || bytes.as_ref().is_some_and(|bytes| {
+                    bytes
+                        .windows(b"include".len())
+                        .any(|window| window.eq_ignore_ascii_case(b"include"))
+                })
+            {
                 return None;
             }
             files.push((path, bytes));
