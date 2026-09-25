@@ -133,9 +133,10 @@ pub const E9PATCH_COMPAT_TOTAL: usize = 155;
 /// visible, mirroring the gcc vfork precedent.
 ///
 /// Empty today. `make` was listed for a fail-closed `setresuid` refusal; that syscall has
-/// been determinized, and the exact `compat.make` command now passes (run 213 at
-/// 96b4b3bf3, plus five focused reruns and a `--verify-strict` L2 match), so its row was a
-/// stale expectation that only produced a STALE warning. A `make` failure now blocks.
+/// been determinized, and the exact `compat.make` command now passes (validate run 213,
+/// measured at a pre-rebase commit of this change, plus five focused reruns and a
+/// `--verify-strict` L2 match), so its row was a stale expectation that only produced a
+/// STALE warning. A `make` failure now blocks.
 pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::new()
 }
