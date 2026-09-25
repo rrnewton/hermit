@@ -39,6 +39,14 @@
  *    With only the first defect fixed, strict verify of ignored-alarm diverged
  *    in 7 of 10 runs.
  *
+ * Both defects lose a host-timing race only some of the time: measured with
+ * each restored and the two phases run once, a strict verify caught the first
+ * in 3 of 9 runs and the second in 3 of 8. The phases therefore repeat ROUNDS
+ * times in one run, so a single CI run meets either race many times. In ten
+ * harness verify runs per setting, the lost requeue failed 1 run at 1 round, 5
+ * at 5 and 9 at 25; the injected probes failed 2, 7 and 10. The fixed tree
+ * passed all 30 runs.
+ *
  * `sigsuspend_alarm_wake.c` covers the scheduler's own alarm waking a
  * `sigsuspend` whose mask admits a caught SIGALRM; this guest covers the wake
  * that comes from another guest thread.
@@ -55,6 +63,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define ROUNDS 25
 
 static volatile sig_atomic_t usr2_runs = 0;
 static volatile sig_atomic_t usr2_on_waiter = 0;
@@ -160,9 +170,11 @@ int main(void) {
   }
   waiter_tid = (pid_t)syscall(SYS_gettid);
 
-  if (phase("ignored-alarm", 0) != 0 || phase("ignored-chld", 1) != 0) {
-    puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED");
-    return 1;
+  for (int round = 0; round < ROUNDS; round++) {
+    if (phase("ignored-alarm", 0) != 0 || phase("ignored-chld", 1) != 0) {
+      puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED");
+      return 1;
+    }
   }
   puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_OK");
   return 0;
