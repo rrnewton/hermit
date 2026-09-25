@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use nix::fcntl::OFlag;
+use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -571,12 +572,17 @@ impl DetFd {
     }
 
     /// Run `f` on the directory stream shared by every alias of this open file.
-    pub(crate) fn with_directory_stream<R>(&self, f: impl FnOnce(&mut DirectoryStream) -> R) -> R {
-        f(self
-            .description()
+    /// `EBADF` if there is none: under `--no-sequentialize-threads`, another
+    /// thread can close or replace the descriptor after its caller found one.
+    pub(crate) fn with_directory_stream<R>(
+        &self,
+        f: impl FnOnce(&mut DirectoryStream) -> R,
+    ) -> Result<R, Errno> {
+        self.description()
             .directory
             .as_mut()
-            .expect("directory stream used before its first snapshot"))
+            .map(f)
+            .ok_or(Errno::EBADF)
     }
 
     /// Return the shared procfs cursor and initialized snapshot length.
