@@ -3017,9 +3017,9 @@ impl Scheduler {
         self.runqueue_push_front(dettid);
     }
 
-    /// Send a signal to the guest. A scheduler-parked thread is made runnable immediately. SaBRe
-    /// external syscalls remain blocked until the signal interrupts them and their real
-    /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
+    /// Send a signal to the guest. A scheduler-parked thread is made runnable immediately. A
+    /// thread executing a blocking syscall in the background reports the signal itself; see
+    /// `wake_signaled_guest` for which pool waits where.
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread.",
@@ -3097,14 +3097,16 @@ impl Scheduler {
             "[dtid {}] make pending signal {} visible to the scheduler.",
             dettid, signal
         );
-        // `rt_sigsuspend_blockers` joins `external_io_blockers` here per main's
-        // rt_sigsuspend work; both mean the thread is parked outside the
-        // scheduler and must await its own continuation.
-        let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
-            || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
-        let await_external_continuation =
-            self.backend_reports_physical_process_exits && has_external_blocker;
-        if cfg!(debug_assertions) && !await_external_continuation {
+        // A thread in a background pool may still be inside its real blocking
+        // syscall, so its request can be empty. It must never receive the
+        // counterfeit `InboundSignal` below: when the thread then reports the
+        // physical signal itself, `install_resource_origin` finds a full
+        // request without its origin and fails the run with a protocol
+        // `Phase` error. Each pool instead waits for the thread's own report.
+        let external_io_blocker = self.blocked.external_io_blockers.contains_key(&dettid);
+        let rt_sigsuspend_blocker = self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
+        let has_external_blocker = external_io_blocker || rt_sigsuspend_blocker;
+        if cfg!(debug_assertions) && !has_external_blocker {
             let nxtturn = self
                 .next_turns
                 .get(&dettid)
@@ -3114,7 +3116,39 @@ impl Scheduler {
                 "signal_guest: thread should be parked in the scheduler"
             );
         }
-        if await_external_continuation {
+        // Blocking external IO, including a `vfork` parent, stays in its pool.
+        // If the signal interrupts the syscall, the thread's `InboundSignal`
+        // request is harvested by `step2c_process_io_blockers`, as for a
+        // signal sent by another guest. Otherwise the signal stays pending
+        // until the thread's continuation returns it to the scheduler. A
+        // `vfork` parent is always in the second case: the kernel's wait for
+        // the child to exec or exit ends only for a fatal signal. SaBRe keeps
+        // `rt_sigsuspend` blockers here as well, because its external
+        // syscalls report their own continuation.
+        if external_io_blocker
+            || (self.backend_reports_physical_process_exits && rt_sigsuspend_blocker)
+        {
+            debug!(
+                "[dtid {}] signal {} stays pending until the blocked operation reports it.",
+                dettid, signal
+            );
+            return;
+        }
+        // `rt_sigsuspend` can only complete through a signal, so the thread
+        // rejoins the run queue at this deterministic point, and the scheduler
+        // awaits its own `InboundSignal` request there. Left in its pool, an
+        // otherwise empty scheduler would report a terminal deadlock before the
+        // thread's report arrived. Known limit: the scheduler cannot see the
+        // suspend mask, so a signal that mask blocks produces no report, and
+        // the scheduler waits on this thread until a host signal ends the
+        // suspend. Before this change that case failed the run instead.
+        if rt_sigsuspend_blocker {
+            info!(
+                "[dtid {}] signal {} releases rt_sigsuspend; awaiting its report",
+                dettid, signal
+            );
+            self.remove_blocking_entries(&dettid);
+            self.requeue_unblocked_thread(dettid);
             return;
         }
 
@@ -3251,7 +3285,11 @@ impl Scheduler {
             // Counterfeit the entry as though the thread had requested this resource from the start:
             nxt.req = Ivar::full(Ok(rsrcs));
         }
+        self.requeue_unblocked_thread(dettid);
+    }
 
+    /// Requeue a thread that a signal or ready I/O has just made runnable.
+    fn requeue_unblocked_thread(&mut self, dettid: DetTid) {
         // Targeted chaos (T137242449): a force-unblocked thread (e.g. woken by a
         // signal or ready I/O) is normally requeued at the back of its priority
         // level, so it runs after everything already queued. Randomizing whether
@@ -6844,6 +6882,143 @@ mod test {
         assert!(scheduler.step2c_process_io_blockers().is_ok());
         assert!(scheduler.blocked.external_io_blockers.is_empty());
         assert!(scheduler.run_queue.contains_tid(waiter));
+    }
+
+    fn request_resources(scheduler: &Scheduler, dettid: DetTid) -> Option<Vec<ResourceID>> {
+        scheduler.next_turns[&dettid]
+            .req
+            .try_read()
+            .map(|request| request.unwrap().resources.keys().cloned().collect())
+    }
+
+    #[test]
+    fn child_exit_signal_leaves_vfork_parent_waiting_for_its_continuation() {
+        // A synthesized SIGCHLD reaches a vfork parent that is still inside its
+        // real vfork, so its request is empty. The signal must stay pending: a
+        // counterfeit request would put a thread that cannot answer on the run
+        // queue and lose the continuation that releases the vfork barrier.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        register_known_thread(&mut scheduler, parent);
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        scheduler.blocked.external_io_blockers.insert(parent, op_id);
+
+        scheduler.wake_signaled_guest(parent, Signal::SIGCHLD);
+
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&parent),
+            Some(&op_id)
+        );
+        assert!(!scheduler.run_queue.contains_tid(parent));
+        assert_eq!(request_resources(&scheduler, parent), None);
+
+        // The child has exited, so the parent's own continuation arrives and the
+        // ordinary barrier and blocker paths return it to the run queue.
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns.get_mut(&parent).unwrap().req = Ivar::full(Ok(continuation));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(parent));
+        assert_eq!(
+            request_resources(&scheduler, parent),
+            Some(vec![ResourceID::BlockedExternalContinue(op_id)])
+        );
+    }
+
+    #[test]
+    fn child_exit_signal_does_not_replace_a_posted_vfork_continuation() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        register_known_thread(&mut scheduler, parent);
+        scheduler.next_turns.get_mut(&parent).unwrap().req = Ivar::full(Ok(continuation));
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        scheduler.blocked.external_io_blockers.insert(parent, op_id);
+
+        scheduler.wake_signaled_guest(parent, Signal::SIGCHLD);
+
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&parent),
+            Some(&op_id)
+        );
+        assert!(!scheduler.run_queue.contains_tid(parent));
+        assert_eq!(
+            request_resources(&scheduler, parent),
+            Some(vec![ResourceID::BlockedExternalContinue(op_id)])
+        );
+    }
+
+    #[test]
+    fn signal_leaves_blocking_external_io_waiting_for_its_own_report() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waiter = DetTid::from_raw(11);
+        let op_id = ExternalOpId::new(waiter, 291);
+        register_known_thread(&mut scheduler, waiter);
+        scheduler.blocked.external_io_blockers.insert(waiter, op_id);
+
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&waiter),
+            Some(&op_id)
+        );
+        assert!(!scheduler.run_queue.contains_tid(waiter));
+        assert_eq!(request_resources(&scheduler, waiter), None);
+    }
+
+    #[test]
+    fn signal_requeues_rt_sigsuspend_without_counterfeiting_its_report() {
+        // rt_sigsuspend completes only through a signal. Left in its pool, an
+        // otherwise idle scheduler would report a terminal deadlock, so the
+        // thread rejoins the run queue with its request still empty and the
+        // scheduler awaits the thread's own InboundSignal report.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waiter = DetTid::from_raw(11);
+        let op_id = ExternalOpId::new(waiter, 291);
+        register_known_thread(&mut scheduler, waiter);
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(waiter, op_id);
+
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+        assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(waiter));
+        assert_eq!(request_resources(&scheduler, waiter), None);
+    }
+
+    #[test]
+    fn signal_leaves_sabre_rt_sigsuspend_waiting_for_its_own_report() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let waiter = DetTid::from_raw(11);
+        let op_id = ExternalOpId::new(waiter, 291);
+        register_known_thread(&mut scheduler, waiter);
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(waiter, op_id);
+
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+        assert_eq!(
+            scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
+            Some(&op_id)
+        );
+        assert!(!scheduler.run_queue.contains_tid(waiter));
+        assert_eq!(request_resources(&scheduler, waiter), None);
     }
 
     #[test]
