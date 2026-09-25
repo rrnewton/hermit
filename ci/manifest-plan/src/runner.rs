@@ -10940,14 +10940,18 @@ esac
         guest_signal: Option<i32>,
         ending: &str,
     ) -> AttemptResult {
-        let dir = std::env::temp_dir().join(format!(
-            "hermit-runner-expected-exit-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let verdict = dir.join("verdict.json");
+        attempt_with_expected_exit_report(
+            expected,
+            expected_exit_report(guest_exit_code, guest_signal),
+            ending,
+        )
+    }
+
+    /// A matched canonical report carrying the given guest disposition.
+    fn expected_exit_report(
+        guest_exit_code: Option<i32>,
+        guest_signal: Option<i32>,
+    ) -> VerificationReport {
         let mut report = canonical_verification_report();
         report.guest_exit_code = guest_exit_code;
         report.guest_signal = guest_signal;
@@ -10956,6 +10960,23 @@ esac
             output.exit_code = guest_exit_code;
             output.signal = guest_signal;
         }
+        report
+    }
+
+    /// Run a fake Hermit that writes `report`, then ends with `ending`.
+    fn attempt_with_expected_exit_report(
+        expected: ExpectedGuestExit,
+        report: VerificationReport,
+        ending: &str,
+    ) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-expected-exit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
         let spec = CellRunSpec {
             id: CellId {
                 test: "fixture/expected-exit".into(),
@@ -11082,6 +11103,50 @@ esac
         let succeeded =
             attempt_with_expected_exit(expected_exit(Some(1), None), Some(0), None, "exit 0");
         assert_eq!(succeeded.outcome, "FAIL");
+    }
+
+    /// The expected disposition is checked only after the comparison has been
+    /// admitted as canonical and matched. Each report below carries exactly
+    /// the expected exit and Hermit exits with it, so only the canonical
+    /// checks stand between the attempt and a pass.
+    #[test]
+    fn expected_guest_exit_cannot_pass_a_diverged_or_noncanonical_comparison() {
+        let mut diverged = expected_exit_report(Some(7), None);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_scheduler_turn = Some(4);
+        diverged.first_divergent_virtual_nanoseconds = Some(7);
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_syscall = Some(2);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        let result =
+            attempt_with_expected_exit_report(expected_exit(Some(7), None), diverged, "exit 7");
+        assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(
+                "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+            )
+        );
+
+        let mut stripped = expected_exit_report(Some(7), None);
+        stripped.comparison.as_mut().unwrap().strictness =
+            crate::canonical_verdict::LogCompareStrictness::Stripped;
+        let result =
+            attempt_with_expected_exit_report(expected_exit(Some(7), None), stripped, "exit 7");
+        assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+        assert_eq!(
+            result.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(
+                "verification did not compare canonical non-vacuous INFO evidence: strictness=stripped compare_logs=true record_envelope=all_records_v1 messages=1/1"
+            )
+        );
     }
 
     #[test]
