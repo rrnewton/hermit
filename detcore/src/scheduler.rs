@@ -283,7 +283,7 @@ pub struct BlockedPool {
     /// Threads executing the real `rt_sigsuspend` outside the runnable set.
     /// These retain the kernel's atomic temporary-mask semantics, but unlike
     /// arbitrary external IO they cannot complete without a signal.
-    pub rt_sigsuspend_blockers: BTreeMap<DetTid, ExternalOpId>,
+    pub rt_sigsuspend_blockers: BTreeMap<DetTid, RtSigsuspendWait>,
 
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
@@ -341,6 +341,27 @@ impl BlockedPool {
 /// A signal may interrupt a real blocking syscall before its ordinary
 /// continuation request is posted, so an inbound-signal request is ready too.
 /// `vfork` is excluded because a signal does not satisfy its child barrier.
+/// A thread executing the real `rt_sigsuspend` outside the runnable set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtSigsuspendWait {
+    /// The operation this wait belongs to.
+    pub op_id: ExternalOpId,
+    /// The temporary mask the guest passed, as a kernel sigset: bit `n - 1`
+    /// blocks signal `n`.
+    pub temporary_mask: u64,
+}
+
+impl RtSigsuspendWait {
+    /// Whether the temporary mask keeps `signal` from ending this wait. Linux
+    /// never lets `rt_sigsuspend` block `SIGKILL` or `SIGSTOP`.
+    fn blocks(&self, signal: Signal) -> bool {
+        if matches!(signal, Signal::SIGKILL | Signal::SIGSTOP) {
+            return false;
+        }
+        self.temporary_mask & (1_u64 << (signal as i32 - 1)) != 0
+    }
+}
+
 fn blocking_request_is_ready(
     req: &Resources,
     expected: ExternalOpId,
@@ -3104,8 +3125,8 @@ impl Scheduler {
         // request without its origin and fails the run with a protocol
         // `Phase` error. Each pool instead waits for the thread's own report.
         let external_io_blocker = self.blocked.external_io_blockers.contains_key(&dettid);
-        let rt_sigsuspend_blocker = self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
-        let has_external_blocker = external_io_blocker || rt_sigsuspend_blocker;
+        let rt_sigsuspend_wait = self.blocked.rt_sigsuspend_blockers.get(&dettid).copied();
+        let has_external_blocker = external_io_blocker || rt_sigsuspend_wait.is_some();
         if cfg!(debug_assertions) && !has_external_blocker {
             let nxtturn = self
                 .next_turns
@@ -3125,8 +3146,16 @@ impl Scheduler {
         // the child to exec or exit ends only for a fatal signal. SaBRe keeps
         // `rt_sigsuspend` blockers here as well, because its external
         // syscalls report their own continuation.
+        //
+        // Known limit: that harvest is not at a deterministic point. The
+        // scheduler cannot tell whether a report is coming, because it does
+        // not know this thread's signal mask, and on ptrace the process-
+        // directed `kill` lets the kernel pick another thread. So step2c
+        // takes whatever reports have arrived when it looks, and step2d may
+        // advance virtual time to another thread's timer first. Signals from
+        // other guests share this limit.
         if external_io_blocker
-            || (self.backend_reports_physical_process_exits && rt_sigsuspend_blocker)
+            || (self.backend_reports_physical_process_exits && rt_sigsuspend_wait.is_some())
         {
             debug!(
                 "[dtid {}] signal {} stays pending until the blocked operation reports it.",
@@ -3134,15 +3163,22 @@ impl Scheduler {
             );
             return;
         }
-        // `rt_sigsuspend` can only complete through a signal, so the thread
-        // rejoins the run queue at this deterministic point, and the scheduler
-        // awaits its own `InboundSignal` request there. Left in its pool, an
-        // otherwise empty scheduler would report a terminal deadlock before the
-        // thread's report arrived. Known limit: the scheduler cannot see the
-        // suspend mask, so a signal that mask blocks produces no report, and
-        // the scheduler waits on this thread until a host signal ends the
-        // suspend. Before this change that case failed the run instead.
-        if rt_sigsuspend_blocker {
+        // `rt_sigsuspend` can only complete through a signal its temporary
+        // mask admits. Such a signal makes the thread rejoin the run queue at
+        // this deterministic point, and the scheduler awaits its own
+        // `InboundSignal` request there. Left in its pool, an otherwise empty
+        // scheduler would report a terminal deadlock before the thread's
+        // report arrived. A signal the mask blocks cannot end the wait and
+        // produces no report, so the thread stays in its pool, where step2d
+        // reports a terminal deadlock if nothing else can wake it.
+        if let Some(wait) = rt_sigsuspend_wait {
+            if wait.blocks(signal) {
+                info!(
+                    "[dtid {}] signal {} is blocked by the rt_sigsuspend mask {:#x}; the wait continues",
+                    dettid, signal, wait.temporary_mask
+                );
+                return;
+            }
             info!(
                 "[dtid {}] signal {} releases rt_sigsuspend; awaiting its report",
                 dettid, signal
@@ -3320,7 +3356,7 @@ impl Scheduler {
                     self.blocked
                         .rt_sigsuspend_blockers
                         .iter()
-                        .map(|(dtid, op_id)| (*dtid, *op_id, true)),
+                        .map(|(dtid, wait)| (*dtid, wait.op_id, true)),
                 )
                 .collect();
             blockers.sort_by_key(|(dtid, _, _)| *dtid);
@@ -3692,8 +3728,12 @@ impl Scheduler {
                 "  rt_sigsuspend blockers ({}), by dettid:",
                 self.blocked.rt_sigsuspend_blockers.len()
             );
-            for (dettid, op) in self.blocked.rt_sigsuspend_blockers.iter() {
-                let _ = writeln!(out, "    dtid {}: {:?}", dettid, op);
+            for (dettid, wait) in self.blocked.rt_sigsuspend_blockers.iter() {
+                let _ = writeln!(
+                    out,
+                    "    dtid {}: {:?}, temporary mask {:#x}",
+                    dettid, wait.op_id, wait.temporary_mask
+                );
             }
         }
 
@@ -4114,7 +4154,7 @@ impl Scheduler {
             // Thread BEGINS a blocking syscall outside the runnable set.
             ResourceID::BlockingExternalIO(op_id)
             | ResourceID::BlockingVfork(op_id)
-            | ResourceID::BlockingRtSigsuspend(op_id) => {
+            | ResourceID::BlockingRtSigsuspend { op_id, .. } => {
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     assert!(self.vfork_barriers.insert(dettid, None).is_none());
                 }
@@ -4151,12 +4191,23 @@ impl Scheduler {
 
                 // Only once the ivars are cleared and the guest is ready to issue
                 // BlockedExternalContinue do we record which blocked pool owns it.
-                let old = if matches!(rid, ResourceID::BlockingRtSigsuspend(_)) {
-                    self.blocked.rt_sigsuspend_blockers.insert(dettid, *op_id)
-                } else {
-                    self.blocked.external_io_blockers.insert(dettid, *op_id)
-                };
-                assert!(old.is_none(), "thread started a second external operation");
+                let started_twice =
+                    if let ResourceID::BlockingRtSigsuspend { temporary_mask, .. } = rid {
+                        let wait = RtSigsuspendWait {
+                            op_id: *op_id,
+                            temporary_mask: *temporary_mask,
+                        };
+                        self.blocked
+                            .rt_sigsuspend_blockers
+                            .insert(dettid, wait)
+                            .is_some()
+                    } else {
+                        self.blocked
+                            .external_io_blockers
+                            .insert(dettid, *op_id)
+                            .is_some()
+                    };
+                assert!(!started_twice, "thread started a second external operation");
                 Err(SkipTurn)
             }
 
@@ -6837,10 +6888,13 @@ mod test {
             ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
             Permission::RW,
         );
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, op_id);
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id,
+                temporary_mask: 0,
+            },
+        );
         scheduler.next_turns.insert(
             waiter,
             ThreadNextTurn {
@@ -6984,16 +7038,82 @@ mod test {
         let waiter = DetTid::from_raw(11);
         let op_id = ExternalOpId::new(waiter, 291);
         register_known_thread(&mut scheduler, waiter);
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, op_id);
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id,
+                temporary_mask: 0,
+            },
+        );
 
         scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
 
         assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
         assert!(scheduler.run_queue.contains_tid(waiter));
         assert_eq!(request_resources(&scheduler, waiter), None);
+    }
+
+    #[test]
+    fn signal_blocked_by_the_rt_sigsuspend_mask_leaves_the_wait_in_its_pool() {
+        // A signal the temporary mask blocks cannot end the wait, so it must
+        // not requeue the thread: the scheduler would then wait for a report
+        // that never comes. Left in its pool, a waiter with nothing else able
+        // to wake it gets the terminal deadlock verdict instead of a hang.
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let waiter = DetTid::from_raw(11);
+        let op_id = ExternalOpId::new(waiter, 291);
+        register_known_thread(&mut scheduler, waiter);
+        let alarm_bit = 1_u64 << (Signal::SIGALRM as i32 - 1);
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id,
+                temporary_mask: alarm_bit,
+            },
+        );
+
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+        assert_eq!(
+            scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .get(&waiter)
+                .map(|wait| wait.op_id),
+            Some(op_id)
+        );
+        assert!(!scheduler.run_queue.contains_tid(waiter));
+        assert_eq!(request_resources(&scheduler, waiter), None);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("a waiter whose mask blocks the only signal is a terminal deadlock");
+        assert!(
+            report.contains("thread(s) waiting in rt_sigsuspend with no possible signal"),
+            "unexpected report:\n{report}"
+        );
+        assert!(
+            report.contains(&format!("temporary mask {:#x}", alarm_bit)),
+            "unexpected report:\n{report}"
+        );
+    }
+
+    #[test]
+    fn rt_sigsuspend_mask_uses_kernel_sigset_bits_and_cannot_block_kill_or_stop() {
+        let wait = |temporary_mask| RtSigsuspendWait {
+            op_id: ExternalOpId::new(DetTid::from_raw(11), 291),
+            temporary_mask,
+        };
+        let usr1_only = wait(1_u64 << (Signal::SIGUSR1 as i32 - 1));
+        assert!(usr1_only.blocks(Signal::SIGUSR1));
+        assert!(!usr1_only.blocks(Signal::SIGALRM));
+        assert!(!wait(0).blocks(Signal::SIGALRM));
+        let everything = wait(u64::MAX);
+        assert!(everything.blocks(Signal::SIGALRM));
+        assert!(!everything.blocks(Signal::SIGKILL));
+        assert!(!everything.blocks(Signal::SIGSTOP));
     }
 
     #[test]
@@ -7006,16 +7126,23 @@ mod test {
         let waiter = DetTid::from_raw(11);
         let op_id = ExternalOpId::new(waiter, 291);
         register_known_thread(&mut scheduler, waiter);
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, op_id);
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id,
+                temporary_mask: 0,
+            },
+        );
 
         scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
 
         assert_eq!(
-            scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
-            Some(&op_id)
+            scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .get(&waiter)
+                .map(|wait| wait.op_id),
+            Some(op_id)
         );
         assert!(!scheduler.run_queue.contains_tid(waiter));
         assert_eq!(request_resources(&scheduler, waiter), None);
@@ -8125,10 +8252,13 @@ mod test {
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let waiter = DetTid::from_raw(100);
         let op_id = ExternalOpId::new(waiter, 7);
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, op_id);
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id,
+                temporary_mask: 0,
+            },
+        );
 
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         let report = scheduler
@@ -8141,8 +8271,12 @@ mod test {
         assert!(report.contains("external IO blockers: none"));
         assert!(report.contains("rt_sigsuspend blockers (1), by dettid:"));
         assert_eq!(
-            scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
-            Some(&op_id)
+            scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .get(&waiter)
+                .map(|wait| wait.op_id),
+            Some(op_id)
         );
     }
 
@@ -8155,10 +8289,13 @@ mod test {
         let deadline = initial_time + LogicalTime::from_nanos(1_000);
         let waiter = DetTid::from_raw(100);
         let sleeper = DetTid::from_raw(101);
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, ExternalOpId::new(waiter, 7));
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id: ExternalOpId::new(waiter, 7),
+                temporary_mask: 0,
+            },
+        );
         scheduler.blocked.timed_waiters.insert(deadline, sleeper);
         scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
         scheduler.next_turns.insert(
@@ -8191,10 +8328,13 @@ mod test {
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let waiter = DetTid::from_raw(100);
         let io_thread = DetTid::from_raw(101);
-        scheduler
-            .blocked
-            .rt_sigsuspend_blockers
-            .insert(waiter, ExternalOpId::new(waiter, 7));
+        scheduler.blocked.rt_sigsuspend_blockers.insert(
+            waiter,
+            RtSigsuspendWait {
+                op_id: ExternalOpId::new(waiter, 7),
+                temporary_mask: 0,
+            },
+        );
         scheduler
             .blocked
             .external_io_blockers

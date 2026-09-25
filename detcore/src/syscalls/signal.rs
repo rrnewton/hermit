@@ -425,7 +425,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // performs delivery and restores the old mask.
             self.record_or_replay_blocking(guest, call.into()).await
         } else {
-            self.record_or_replay_rt_sigsuspend(guest, call).await
+            self.record_or_replay_rt_sigsuspend(guest, call, temporary_mask)
+                .await
         }
     }
 
