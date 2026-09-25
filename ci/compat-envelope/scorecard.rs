@@ -1996,15 +1996,18 @@ impl ResultRow {
                     index + 1
                 )
             })?;
-            self.require_declared_disposition(index, attempt, &report)?;
+            self.require_matched_disposition(index, attempt, &report)?;
         }
         Ok(())
     }
 
     /// Both readers of a matched attempt, the `verify-results` admission gate
-    /// and the comparison evidence behind the catalogue, share this check: a
-    /// declared row's match counts only if it ends exactly as declared.
-    fn require_declared_disposition(
+    /// and the comparison evidence behind the catalogue, share this check,
+    /// which is the series writer's (`_typed_comparison_attempt` in
+    /// `ci-hub/series/series.py`): a declared row's match counts only if it
+    /// ends exactly as declared, and an undeclared row's only if it ends as
+    /// `undeclared_match_ends_cleanly` requires.
+    fn require_matched_disposition(
         &self,
         index: usize,
         attempt: &JsonValue,
@@ -2017,6 +2020,10 @@ impl ResultRow {
                     index + 1
                 ))
             }
+            None if !undeclared_match_ends_cleanly(&self.mode, attempt) => Err(format!(
+                "attempt {} matched report ends with a status or signal its row does not declare",
+                index + 1
+            )),
             _ => Ok(()),
         }
     }
@@ -2383,7 +2390,7 @@ impl ResultRow {
                         canonical_verdict::Verdict::Matched
                             if report.verified && report.bitwise_parity =>
                         {
-                            self.require_declared_disposition(index, attempt, &report)?;
+                            self.require_matched_disposition(index, attempt, &report)?;
                         }
                         canonical_verdict::Verdict::Matched => {
                             return Err(format!(
@@ -3900,6 +3907,15 @@ fn declared_failure_matches(
             names_declaration(outputs.left.exit_code, outputs.left.signal)
                 && names_declaration(outputs.right.exit_code, outputs.right.signal)
         })
+}
+
+/// The series writer's rule for a matched attempt whose row declares no guest
+/// exit: Hermit reported a non-negative integer status and no signal, and
+/// outside chaos mode that status is 0.
+fn undeclared_match_ends_cleanly(mode: &str, attempt: &JsonValue) -> bool {
+    let status = attempt.get("status").and_then(JsonValue::as_i64);
+    matches!(status, Some(status) if status >= 0 && (mode == "chaos" || status == 0))
+        && attempt.get("signal").is_none_or(JsonValue::is_null)
 }
 
 /// The attempt audit the series writer (`_declared_guest_exit_evidence` in
@@ -26936,6 +26952,126 @@ mod post_verdict_transaction_tests {
             error.contains(DISPOSITION),
             "Hermit status 4 verify-results: {error}"
         );
+        // The same coherent exit-3 row without its declaration: the shape a
+        // runner that omits `expected_guest_exit` writes for this cell, and
+        // the one the series writer refuses as "matched report is internally
+        // inconsistent". Both readers refuse it too.
+        const UNDECLARED: &str =
+            "attempt 1 matched report ends with a status or signal its row does not declare";
+        let mut undeclared = row.clone();
+        undeclared
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        fixture.publish_rows(std::slice::from_ref(&undeclared));
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let error = candidates[&id][0]
+            .evidence(&id, ResultInput::Current)
+            .err()
+            .expect("undeclared exit 3: the raw row's evidence was admitted");
+        assert!(error.contains(UNDECLARED), "undeclared exit 3: {error}");
+        let error = verify_candidate_set(&expected, candidates)
+            .expect_err("undeclared exit 3: verify-results admitted the raw row");
+        assert!(
+            error.contains(UNDECLARED),
+            "undeclared exit 3 verify-results: {error}"
+        );
+    }
+
+    /// An undeclared matched attempt ends as the series writer requires:
+    /// status 0 and no signal, where chaos mode also admits a nonzero status.
+    #[test]
+    fn undeclared_match_must_end_cleanly() {
+        let attempt = |status: JsonValue, signal: JsonValue| serde_json::json!({"status": status, "signal": signal});
+        let null = JsonValue::Null;
+        let missing = serde_json::json!({});
+        for (label, mode, attempt, clean) in [
+            (
+                "verify status 0",
+                "verify",
+                attempt(0.into(), null.clone()),
+                true,
+            ),
+            (
+                "replay status 0",
+                "replay",
+                attempt(0.into(), null.clone()),
+                true,
+            ),
+            (
+                "chaos status 3",
+                "chaos",
+                attempt(3.into(), null.clone()),
+                true,
+            ),
+            (
+                "signal key absent",
+                "verify",
+                serde_json::json!({"status": 0}),
+                true,
+            ),
+            (
+                "verify status 3",
+                "verify",
+                attempt(3.into(), null.clone()),
+                false,
+            ),
+            (
+                "replay status 3",
+                "replay",
+                attempt(3.into(), null.clone()),
+                false,
+            ),
+            (
+                "signal 11 as 128 + signo",
+                "verify",
+                attempt(139.into(), null.clone()),
+                false,
+            ),
+            (
+                "signal 11 death",
+                "verify",
+                attempt(null.clone(), 11.into()),
+                false,
+            ),
+            (
+                "chaos signal 11 death",
+                "chaos",
+                attempt(null.clone(), 11.into()),
+                false,
+            ),
+            (
+                "status 0 beside a signal",
+                "verify",
+                attempt(0.into(), 11.into()),
+                false,
+            ),
+            (
+                "chaos negative status",
+                "chaos",
+                attempt((-1).into(), null.clone()),
+                false,
+            ),
+            ("status absent", "verify", missing, false),
+            (
+                "boolean status",
+                "verify",
+                attempt(false.into(), null.clone()),
+                false,
+            ),
+            (
+                "fractional status",
+                "verify",
+                attempt(0.0.into(), null.clone()),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                undeclared_match_ends_cleanly(mode, &attempt),
+                clean,
+                "{label}"
+            );
+        }
     }
 
     /// The reader's own declaration check, over every declared form: an exit
