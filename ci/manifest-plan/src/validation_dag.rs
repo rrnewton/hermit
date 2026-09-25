@@ -1559,6 +1559,38 @@ fn assert_dagrun_preparation_placement(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
+    let ordinary = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "gate.manifest")
+        .ok_or("committed DAG lost gate.manifest")?;
+    for (tag, wall_seconds) in [
+        ("gate.manifest", 900),
+        ("quick-super-gate.manifest", 900),
+        ("gate.manifest_on_host", 180),
+    ] {
+        let step = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG lost {tag}"))?;
+        if step.hint.preferred_inner_jobs
+            != Some(crate::validation_dag_static::MANIFEST_GATE_INNER_JOBS)
+            || step.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
+            || step.jobs_flag.is_some()
+            || step.cmd != ordinary.cmd
+            || step.timeout != wall_seconds
+            || step.cpu_timeout != 600
+        {
+            return Err(format!(
+                "{tag} must retain the exact audit command and {wall_seconds}s wall/600s CPU caps while reserving the two-worker width and carrying every smaller admission through CARGO_BUILD_JOBS: {step:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
     let by_tag = cfg
         .steps
@@ -1613,6 +1645,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
+    assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
     if cfg.steps.len() != 1605 {
         return Err(format!(
@@ -3293,6 +3326,57 @@ sys.exit(37)
             error.contains("build.rust_scripts") && error.contains("before opening"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn manifest_gate_carries_a_one_core_admission_over_inherited_build_width() {
+        use dagrun::model::env_with_inner_jobs;
+
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_manifest_gate_width_contract(&committed).unwrap();
+        for tag in [
+            "gate.manifest",
+            "quick-super-gate.manifest",
+            "gate.manifest_on_host",
+        ] {
+            let step = committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            assert_eq!(
+                env_with_inner_jobs(step, "", Some(2)),
+                Some(("CARGO_BUILD_JOBS".into(), "2".into())),
+                "{tag} must expose both admitted workers on an unconstrained host"
+            );
+            assert_eq!(
+                env_with_inner_jobs(step, "", Some(1)),
+                Some(("CARGO_BUILD_JOBS".into(), "1".into())),
+                "{tag} must replace an inherited CARGO_BUILD_JOBS=4 when admitted to one core"
+            );
+
+            let mut unbound = step.clone();
+            unbound.jobs_env = None;
+            let inherited = ("CARGO_BUILD_JOBS".to_string(), "4".to_string());
+            let opponent = env_with_inner_jobs(&unbound, "", Some(1)).unwrap_or(inherited);
+            assert_eq!(
+                opponent,
+                ("CARGO_BUILD_JOBS".into(), "4".into()),
+                "the opponent must preserve the RUN1902 oversubscription mechanism"
+            );
+            let mut broken = committed.clone();
+            broken
+                .steps
+                .iter_mut()
+                .find(|candidate| candidate.tag() == tag)
+                .unwrap()
+                .jobs_env = None;
+            assert!(
+                assert_manifest_gate_width_contract(&broken)
+                    .unwrap_err()
+                    .contains(tag)
+            );
+        }
     }
 
     #[test]

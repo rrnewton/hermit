@@ -120,7 +120,7 @@
       "group": "gate",
       "job": "manifest",
       "desc": "Centralized test manifest and inventory",
-      "description": "",
+      "description": "AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-worker width on ordinary hosts, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into test-harness so a one-core admission runs the same seven audits serially and is still refused by the preserved 600-second CPU cap if it cannot finish. Two cores are the qualifying admission. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged.",
       "labels": [
         "full",
         "hosted-portable",
@@ -137,14 +137,14 @@
       "timeout": 900,
       "cpu_timeout": 600,
       "jobs_flag": null,
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
         "rss_baseline_bytes": 5368709120,
         "hard_mem_max_bytes": 5368709120,
         "classification": "light",
-        "preferred_inner_jobs": null,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -21107,7 +21107,7 @@
       "group": "gate",
       "job": "manifest_on_host",
       "desc": "Centralized test manifest and inventory",
-      "description": "",
+      "description": "AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-worker width on ordinary hosts, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into test-harness so a one-core admission runs the same seven audits serially and is still refused by the preserved 600-second CPU cap if it cannot finish. Two cores are the qualifying admission. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged.",
       "labels": [
         "hosted-privileged"
       ],
@@ -21122,14 +21122,14 @@
       "timeout": 180,
       "cpu_timeout": 600,
       "jobs_flag": null,
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
         "rss_baseline_bytes": 5368709120,
         "hard_mem_max_bytes": 5368709120,
         "classification": "light",
-        "preferred_inner_jobs": null,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -69780,7 +69780,7 @@
       "group": "quick-super-gate",
       "job": "manifest",
       "desc": "Centralized test manifest and inventory",
-      "description": "",
+      "description": "AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-worker width on ordinary hosts, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into test-harness so a one-core admission runs the same seven audits serially and is still refused by the preserved 600-second CPU cap if it cannot finish. Two cores are the qualifying admission. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged.",
       "labels": [
         "quick",
         "super"
@@ -69796,14 +69796,14 @@
       "timeout": 900,
       "cpu_timeout": 600,
       "jobs_flag": null,
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
         "rss_baseline_bytes": 5368709120,
         "hard_mem_max_bytes": 5368709120,
         "classification": "light",
-        "preferred_inner_jobs": null,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
