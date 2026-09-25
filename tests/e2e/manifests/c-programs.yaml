@@ -8202,10 +8202,10 @@ test:
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify DBT separately
-          kvm: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify KVM separately
-          sabre: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify SaBRe separately
-          liteinst: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify LiteInst separately
+          dbt: backend_reports_signal_interrupted_external_io is false on DBT, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222
+          kvm: backend_reports_signal_interrupted_external_io is false on KVM, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222
+          sabre: backend_reports_signal_interrupted_external_io is false on SaBRe, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222
+          liteinst: backend_reports_signal_interrupted_external_io is false on LiteInst, so an alarm interrupting external IO keeps the nondeterministic harvest of https://github.com/rrnewton/hermit/issues/3222
       naked:
         ci: false
         ci_disabled_reason: This fixture asserts interrupted external-IO behavior under verification; it has no native nondeterminism oracle.

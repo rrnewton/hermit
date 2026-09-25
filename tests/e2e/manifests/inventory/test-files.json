@@ -1042,7 +1042,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/external_io_signal_interrupt.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
-      "why": "tests/c/external_io_signal_interrupt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends a select or poll wait on a never-readable socket exactly once with EINTR on the waiting thread, including under SA_RESTART, with a sibling that sleeps past the alarm without blocking it, and with a sibling that blocks it while taking short sleeps, so the scheduler must send the alarm to the blocker whose mask admits it and await that thread's own report at a deterministic turn"
+      "why": "tests/c/external_io_signal_interrupt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends a select wait over more than 64 descriptors, which Hermit runs as blocking external IO, on a never-readable socket exactly once with EINTR on the waiting thread, including under SA_RESTART (a poll phase under SA_RESTART is an internal-polling control), with a sibling that sleeps past the alarm without blocking it, and with a sibling that blocks it while taking short sleeps, so the scheduler must send the alarm to the blocker whose mask admits it and await that thread's own report at a deterministic turn"
     },
     {
       "disposition": "manifest-test",
