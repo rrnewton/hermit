@@ -3061,14 +3061,32 @@ pub(crate) async fn send_global<R>(
 where
     R: GlobalRPC<GlobalState> + ?Sized,
 {
-    let records = crate::detlog::take_records();
-    if !records.is_empty() {
-        let (_, response) = reverie
-            .send_rpc((time.clone(), mm, GlobalRequest::ForwardedRecords(records)))
-            .await;
-        assert_eq!(response, GlobalResponse::ForwardedRecords);
-    }
+    flush_records(reverie, time.clone(), mm).await;
     reverie.send_rpc((time, mm, request)).await
+}
+
+/// Send the coordinator any records this process captured since it last sent
+/// them; without captured records this sends nothing.
+///
+/// [`send_global`] alone would leave the records a handler emits after its
+/// last global request waiting for the next one, which need not come: the
+/// guest may be killed, may exec, or may run without sequentialized threads,
+/// where most handlers send no request at all. So every point at which Detcore
+/// hands control back to the guest, or gives it up, calls this, and a record
+/// never outlives the callback that emitted it. Only a process killed in the
+/// middle of a callback loses that callback's records.
+pub(crate) async fn flush_records<R>(reverie: &R, time: DetTime, mm: MmId)
+where
+    R: GlobalRPC<GlobalState> + ?Sized,
+{
+    let records = crate::detlog::take_records();
+    if records.is_empty() {
+        return;
+    }
+    let (_, response) = reverie
+        .send_rpc((time, mm, GlobalRequest::ForwardedRecords(records)))
+        .await;
+    assert_eq!(response, GlobalResponse::ForwardedRecords);
 }
 
 pub async fn send_and_update_time<G, T>(
@@ -7379,6 +7397,7 @@ mod forwarded_record_tests {
     use super::GlobalRequest;
     use super::GlobalResponse;
     use super::GlobalState;
+    use super::flush_records;
     use super::send_global;
     use crate::config::Config;
     use crate::types::*;
@@ -7514,5 +7533,41 @@ mod forwarded_record_tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[2], (request, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn captured_records_are_logged_without_a_following_request() {
+        crate::detlog::install_test_source(take_captured_for_test);
+        crate::detlog::install_test_sink(emit_for_test);
+        let state = GlobalState::initialize(&Config::default(), false);
+        let dettid = DetTid::from_raw(19);
+        let seen = Mutex::new(Vec::new());
+        let effects = Mutex::new(Vec::new());
+        let rpc = ForwardingRpc {
+            state: &state,
+            sender: dettid,
+            seen: &seen,
+            effects: &effects,
+        };
+        let time = DetTime::new(&state.cfg);
+        let mm = MmId::initial(dettid);
+        let turn = state.sched.lock().unwrap().turn;
+        let clocks = serde_json::to_value(&*state.global_time.lock().unwrap()).unwrap();
+
+        let last = capture_for_test("DETLOG last");
+        flush_records(&rpc, time.clone(), mm).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(
+                GlobalRequest::ForwardedRecords(vec![last.clone()]),
+                vec![last]
+            )],
+            "the record is logged, and nothing else is sent"
+        );
+        assert_eq!(*effects.lock().unwrap(), [(turn, clocks)]);
+
+        // With nothing captured, nothing is sent.
+        flush_records(&rpc, time, mm).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

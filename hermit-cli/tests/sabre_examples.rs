@@ -9,6 +9,7 @@
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -193,7 +194,28 @@ fn controller_diagnostics(path: Option<&Path>) -> String {
     .unwrap_or_else(|| "unavailable".to_owned())
 }
 
-fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+fn run_bounded(command: Command, label: &str, diagnostic_log: Option<&Path>) -> Output {
+    let rendered = format!("{command:?}");
+    let (output, timed_out) = run_bounded_to_exit(command, label, diagnostic_log);
+    if timed_out || !output.status.success() {
+        panic!(
+            "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}\ncontroller diagnostics:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            controller_diagnostics(diagnostic_log),
+        );
+    }
+    output
+}
+
+/// Run `command` to exit or to a 45-second bound, returning its output and
+/// whether the bound was hit, whatever its status.
+fn run_bounded_to_exit(
+    mut command: Command,
+    label: &str,
+    diagnostic_log: Option<&Path>,
+) -> (Output, bool) {
     // Verification observes the guest's current directory. The source checkout is shared by
     // concurrent validation nodes, so Cargo or another test can change its metadata or entries
     // between Run1 and Run2. Keep this invocation in one empty directory until both runs and
@@ -244,16 +266,7 @@ fn run_bounded(mut command: Command, label: &str, diagnostic_log: Option<&Path>)
             controller_diagnostics(diagnostic_log),
         )
     });
-    if timed_out || !output.status.success() {
-        panic!(
-            "{label} failed: {rendered}\nstatus: {}\ntimed out: {timed_out}\nstdout:\n{}\nstderr:\n{}\ncontroller diagnostics:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            controller_diagnostics(diagnostic_log),
-        );
-    }
-    output
+    (output, timed_out)
 }
 
 fn example_command(
@@ -770,4 +783,117 @@ int main(void) {
     );
 
     assert_backend_parity_and_sabre_verify(&program, &[], &loader, "public libc getrandom");
+}
+
+/// Run `script` under SaBRe without sequentialized threads, where most
+/// handlers send the coordinator no request, and return Hermit's output and
+/// the run's log.
+fn unsequentialized_sabre_run(loader: &Path, script: &str, label: &str) -> (Output, String) {
+    // Hermit gives the guest a private /tmp, so keep the log in the host-visible
+    // Cargo target directory.
+    let log = tempfile::Builder::new()
+        .prefix("sabre-unsequentialized-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap_or_else(|error| panic!("failed to create {label} log: {error}"));
+    let (_log_file, log) = log
+        .keep()
+        .unwrap_or_else(|error| panic!("failed to retain {label} log: {error}"));
+    eprintln!("SaBRe log for {label}: {}", log.display());
+    let mut command = Command::new(hermit_binary());
+    command
+        .arg("--log=info")
+        .arg("--log-file")
+        .arg(&log)
+        .arg("run")
+        .env("HERMIT_SABRE_BINARY", loader)
+        .args([
+            "--backend",
+            "sabre",
+            "--no-sequentialize-threads",
+            COMPARISON_EPOCH,
+        ])
+        .args(
+            execution_root_args(std::env::var_os(ISOLATED_WORKDIR_ENV).as_deref())
+                .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}")),
+        )
+        .args(["--", "/bin/sh", "-c", script]);
+    let (output, timed_out) = run_bounded_to_exit(command, label, None);
+    assert!(!timed_out, "{label} timed out");
+    let log = std::fs::read_to_string(&log)
+        .unwrap_or_else(|error| panic!("failed to read {label} log {}: {error}", log.display()));
+    (output, log)
+}
+
+fn syscall_records(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains(" DETLOG [syscall]"))
+        .collect()
+}
+
+// The SaBRe local tool runs in the guest and sends its records to the
+// coordinator's log with the guest's next global request. A record must still
+// arrive when no request follows it: here the guest's last handlers send none.
+#[test]
+fn sabre_records_reach_the_log_without_a_later_request() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+
+    let (output, log) = unsequentialized_sabre_run(&loader, "echo forwarded", "exiting guest");
+    assert!(
+        output.status.success(),
+        "{:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "forwarded\n");
+    let records = syscall_records(&log);
+    assert!(
+        records
+            .last()
+            .is_some_and(|record| record.contains("inbound syscall: exit_group(0) = ?")),
+        "the guest's final record, its exit_group entry, is the log's last syscall record:\n{}",
+        records.join("\n")
+    );
+
+    // An exec replaces the image holding the exec handler's own records.
+    let (output, log) =
+        unsequentialized_sabre_run(&loader, "echo forwarded; exec /bin/true", "exec guest");
+    assert!(
+        output.status.success(),
+        "{:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = syscall_records(&log);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.contains("inbound syscall: execve(")
+                && record.contains("/bin/true")),
+        "the exec's entry record, emitted in the replaced image, is logged:\n{}",
+        records.join("\n")
+    );
+
+    // A guest killed between handlers keeps the records of the handlers it
+    // completed. (The handler it dies in cannot send its own.)
+    let (output, log) =
+        unsequentialized_sabre_run(&loader, "echo forwarded; kill -9 $$", "killed guest");
+    // Hermit ends with its guest's death signal.
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGKILL),
+        "{:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "forwarded\n");
+    let records = syscall_records(&log);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.contains(": write(1, ") && record.contains(", 10) = Ok(10)")),
+        "the completed write of \"forwarded\\n\" is logged:\n{}",
+        records.join("\n")
+    );
 }

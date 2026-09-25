@@ -71,10 +71,11 @@ fn coordinator_socket() -> Option<PathBuf> {
 // The stack is lock-free and uses no thread-local state: records are emitted
 // from signal handlers and from libc's final exit_group, which can run after
 // Rust TLS destruction has begun. Each record carries its process and a global
-// sequence number. After a fork the child holds a copy of its parent's pending
-// records, which the parent sends; after a CLONE_VM clone both processes push
-// to one stack. A process therefore sends only its own records, puts the rest
-// back, and restores their order by sequence number.
+// sequence number. After a CLONE_VM clone (vfork) both processes push to one
+// stack, so a process sends only its own records, puts the rest back, and
+// restores their order by sequence number. The stack's head lives in a page the
+// kernel zeroes in a fork child, so a child never sees the copy of its parent's
+// pending records that fork gives it; the parent sends those itself.
 struct CapturedRecord {
     pid: libc::pid_t,
     sequence: u64,
@@ -82,15 +83,69 @@ struct CapturedRecord {
     next: *mut CapturedRecord,
 }
 
-static CAPTURED: AtomicPtr<CapturedRecord> = AtomicPtr::new(std::ptr::null_mut());
+static CAPTURED_PAGE: AtomicPtr<AtomicPtr<CapturedRecord>> = AtomicPtr::new(std::ptr::null_mut());
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The capture stack's head, mapped on first use.
+fn captured() -> &'static AtomicPtr<CapturedRecord> {
+    let mut page = CAPTURED_PAGE.load(Ordering::Acquire);
+    if page.is_null() {
+        page = map_captured_page();
+    }
+    // SAFETY: the page is never unmapped once published.
+    unsafe { &*page }
+}
+
+fn map_captured_page() -> *mut AtomicPtr<CapturedRecord> {
+    // SAFETY: sysconf and an anonymous mapping have no preconditions.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let page = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if page == libc::MAP_FAILED {
+        panic!(
+            "cannot map the Detcore record capture stack: {}",
+            io::Error::last_os_error()
+        );
+    }
+    // SAFETY: `page` is this function's own mapping of `size` bytes.
+    if unsafe { libc::madvise(page, size, libc::MADV_WIPEONFORK) } != 0 {
+        panic!(
+            "cannot keep a fork child from inheriting captured Detcore records: {}",
+            io::Error::last_os_error()
+        );
+    }
+    // A zeroed page holds a null head: an empty stack.
+    let page = page.cast::<AtomicPtr<CapturedRecord>>();
+    match CAPTURED_PAGE.compare_exchange(
+        std::ptr::null_mut(),
+        page,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => page,
+        Err(published) => {
+            // SAFETY: the losing mapping was never published.
+            unsafe { libc::munmap(page.cast(), size) };
+            published
+        }
+    }
+}
+
 fn push_captured(node: *mut CapturedRecord) {
-    let mut head = CAPTURED.load(Ordering::Relaxed);
+    let captured = captured();
+    let mut head = captured.load(Ordering::Relaxed);
     loop {
         // SAFETY: `node` is exclusively owned until the exchange publishes it.
         unsafe { (*node).next = head };
-        match CAPTURED.compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed) {
+        match captured.compare_exchange_weak(head, node, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => return,
             Err(current) => head = current,
         }
@@ -115,7 +170,7 @@ fn take_captured_records() -> Vec<detcore::detlog::ForwardedRecord> {
 }
 
 fn take_captured_for(pid: libc::pid_t) -> Vec<detcore::detlog::ForwardedRecord> {
-    let mut node = CAPTURED.swap(std::ptr::null_mut(), Ordering::Acquire);
+    let mut node = captured().swap(std::ptr::null_mut(), Ordering::Acquire);
     let mut own = Vec::new();
     let mut foreign = Vec::new();
     while !node.is_null() {
@@ -148,6 +203,9 @@ fn init_record_capture() {
         .ok_or_else(|| format!("{DETLOG_FORWARD_ENV} is not Unicode"))
         .and_then(str::parse::<detcore::detlog::ForwardedLevel>)
         .unwrap_or_else(|error| panic!("{DETLOG_FORWARD_ENV}: {error}"));
+    // Map the stack now rather than in the first capture, which may run in a
+    // signal handler.
+    captured();
     detcore::detlog::install_capture(level, capture_record, take_captured_records)
         .unwrap_or_else(|error| panic!("{DETLOG_FORWARD_ENV}: {error}"));
 }
@@ -605,8 +663,8 @@ mod tests {
         capture_for(parent, forwarded("parent 2"));
         capture_for(child, forwarded("child 2"));
 
-        // A forked child holds a copy of its parent's pending records, and a
-        // CLONE_VM child shares them. Neither may send or drop them.
+        // A CLONE_VM child shares its parent's pending records, and may
+        // neither send nor drop them.
         assert_eq!(fields(take_captured_for(child)), ["child 1", "child 2"]);
         capture_for(parent, forwarded("parent 3"));
         assert_eq!(
@@ -633,7 +691,31 @@ mod tests {
             fields(take_captured_for(parent)),
             ["early", "middle", "late"]
         );
-        assert!(CAPTURED.load(Ordering::Acquire).is_null());
+        assert!(captured().load(Ordering::Acquire).is_null());
+
+        // A fork child starts with an empty stack, so not even a child that
+        // took its parent's pid could send the parent's copy of a record.
+        capture_for(parent, forwarded("before fork"));
+        // SAFETY: the child only reads an atomic and exits.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork: {}", io::Error::last_os_error()),
+            0 => unsafe {
+                libc::_exit(if captured().load(Ordering::Acquire).is_null() {
+                    0
+                } else {
+                    1
+                })
+            },
+            child => {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "the fork child inherited a pending record (wait status {status:#x})"
+                );
+            }
+        }
+        assert_eq!(fields(take_captured_for(parent)), ["before fork"]);
     }
 
     #[test]
