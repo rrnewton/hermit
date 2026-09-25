@@ -370,8 +370,20 @@ fn default_dbt_config() -> Config {
 /// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
 /// the single external scheduler.
 fn load_dbt_config() -> (Config, ConfigSource) {
-    let (mut config, source) = match std::env::var(DETCONFIG_ENV) {
-        Ok(value) if !value.is_empty() => match serde_json::from_str::<Config>(&value) {
+    dbt_config_from(std::env::var(DETCONFIG_ENV).ok().as_deref())
+}
+
+/// [`load_dbt_config`] for an explicit [`DETCONFIG_ENV`] value.
+///
+/// The ptrace-only capabilities are cleared whatever the source. `Config`
+/// defaults both to true, so a standalone run, an unparsable value, or a
+/// value that omits the field would otherwise claim them. DynamoRIO emulates
+/// the guest's signal mask inside the runtime, so neither the host thread's
+/// `/proc` signal state nor a report for every signal that interrupts a
+/// blocking call is available here.
+fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
+    let (mut config, source) = match value {
+        Some(value) if !value.is_empty() => match serde_json::from_str::<Config>(value) {
             Ok(config) => (config, ConfigSource::Cli),
             Err(_) => (default_dbt_config(), ConfigSource::ParseFallback),
         },
@@ -380,6 +392,7 @@ fn load_dbt_config() -> (Config, ConfigSource) {
     config.max_timeslice = None;
     config.sequentialize_threads = true;
     config.backend_supports_parked_write_signal_interruption = false;
+    config.backend_reports_signal_interrupted_external_io = false;
     (config, source)
 }
 
@@ -2347,6 +2360,53 @@ mod tests {
     unsafe extern "C" fn test_emit_evidence(_bytes: *const u8, _length: usize) {}
 
     unsafe extern "C" fn test_idle() {}
+
+    #[test]
+    fn every_config_source_clears_the_ptrace_only_signal_capabilities() {
+        let claims_both = serde_json::to_string(&Config {
+            backend_supports_parked_write_signal_interruption: true,
+            backend_reports_signal_interrupted_external_io: true,
+            ..Config::default()
+        })
+        .unwrap();
+        let mut omits_both: serde_json::Value = serde_json::from_str(&claims_both).unwrap();
+        let fields = omits_both.as_object_mut().unwrap();
+        assert!(
+            fields
+                .remove("backend_supports_parked_write_signal_interruption")
+                .is_some()
+        );
+        assert!(
+            fields
+                .remove("backend_reports_signal_interrupted_external_io")
+                .is_some()
+        );
+        let omits_both = omits_both.to_string();
+        // Both fields deserialize to true when absent, so this case would
+        // claim them without the reset.
+        let absent: Config = serde_json::from_str(&omits_both).unwrap();
+        assert!(absent.backend_supports_parked_write_signal_interruption);
+        assert!(absent.backend_reports_signal_interrupted_external_io);
+
+        for (value, cli) in [
+            (Some(claims_both.as_str()), true),
+            (Some(omits_both.as_str()), true),
+            (Some("{not json"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            let (config, source) = dbt_config_from(value);
+            assert_eq!(matches!(source, ConfigSource::Cli), cli, "{value:?}");
+            assert!(
+                !config.backend_supports_parked_write_signal_interruption,
+                "{value:?}"
+            );
+            assert!(
+                !config.backend_reports_signal_interrupted_external_io,
+                "{value:?}"
+            );
+        }
+    }
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
