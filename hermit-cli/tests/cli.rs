@@ -3540,6 +3540,13 @@ fn run_kvm_preserves_closed_standard_input() {
     assert!(native.status.success(), "native {mode} control: {native:?}");
     assert_eq!(stdout(&native), expected);
     assert_eq!(stderr(&native), "");
+    // A run that samples its epoch from the host reports it on stderr, so pin
+    // the epoch and require exactly that one diagnostic line and nothing else.
+    let epoch = "2026-01-01T00:00:00.123456789+00:00";
+    let epoch_arg = format!("--epoch={epoch}");
+    let expected_stderr = format!(
+        "hermit: virtual-time epoch={epoch} source=explicit; reproduce with --epoch={epoch}\n"
+    );
     for backend in ["ptrace", "kvm"] {
         let args = [
             "run",
@@ -3547,6 +3554,7 @@ fn run_kvm_preserves_closed_standard_input() {
             backend,
             "--strict",
             "--base-env=minimal",
+            &epoch_arg,
             "--",
         ];
         let output = hermit_command(&args)
@@ -3558,7 +3566,7 @@ fn run_kvm_preserves_closed_standard_input() {
             .expect("failed to run stdio-inode identity fixture");
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");
-        assert_eq!(stderr(&output), "", "{backend} {mode}");
+        assert_eq!(stderr(&output), expected_stderr, "{backend} {mode}");
     }
 }
 
