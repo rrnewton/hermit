@@ -2336,7 +2336,7 @@ fn self_test() -> Result<(), String> {
     //
     // Bound to the shipped `compat_summary_with_tables`, not a copy of its logic, so the two
     // cannot drift. The table is planted rather than real because the shipped
-    // `known_failclosed()` holds ONE row today, which cannot express "one listed row blocks
+    // `known_failclosed()` holds NO rows today, which cannot express "one listed row blocks
     // while another listed row is exempt" in a single run -- and the answer to that is a
     // planted table in the bracket, never an invented row in production.
     {
@@ -11866,8 +11866,8 @@ fn print_compat_summary(
 ///
 /// Production calls it through [`print_compat_summary`] with the REAL tables, so nothing is
 /// weakened; the tables are parameters purely so a bracket can exercise this exact code against
-/// a planted table. That matters here because the shipped `known_failclosed()` currently holds a
-/// single row, which is not enough to distinguish "listed and blocking" from "listed and
+/// a planted table. That matters here because the shipped `known_failclosed()` is currently
+/// empty, which is not enough to distinguish "listed and blocking" from "listed and
 /// exempt" in one run -- and the fix for that must not be to add a fake row to production.
 fn compat_summary_with_tables(
     mode: CompatMode,
