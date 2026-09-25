@@ -127,13 +127,12 @@ impl AcceptedStreamModelV1 {
         let mut last = BTreeMap::new();
         let mut listener_closes = BTreeMap::new();
         for child in &self.children {
-            if let ChildDispositionV1::UnacceptedListenerClose { release } = child.disposition {
-                if listener_closes
+            if let ChildDispositionV1::UnacceptedListenerClose { release } = child.disposition
+                && listener_closes
                     .insert(child.listener, release)
                     .is_some_and(|previous| previous != release)
-                {
-                    return Err(invalid());
-                }
+            {
+                return Err(invalid());
             }
         }
         for (index, child) in self.children.iter().enumerate() {
@@ -182,23 +181,21 @@ impl AcceptedStreamModelV1 {
                     return Err(invalid());
                 }
             }
-            if let Some(close) = listener_closes.get(&child.listener) {
-                if child.release.not_before_global_time > close.not_before_global_time
+            if let Some(close) = listener_closes.get(&child.listener)
+                && (child.release.not_before_global_time > close.not_before_global_time
                     || trace.history.inputs.iter().any(|input| {
                         input.channel == child.listener
                             && input.release.not_before_global_time > close.not_before_global_time
-                    })
-                {
-                    return Err(invalid());
-                }
+                    }))
+            {
+                return Err(invalid());
             }
             if let Some((time, prefix)) = last.insert(
                 child.listener,
                 (child.release.not_before_global_time, child.history_prefix),
-            ) {
-                if time > child.release.not_before_global_time || prefix > child.history_prefix {
-                    return Err(invalid());
-                }
+            ) && (time > child.release.not_before_global_time || prefix > child.history_prefix)
+            {
+                return Err(invalid());
             }
             match &child.disposition {
                 ChildDispositionV1::Accepted {
