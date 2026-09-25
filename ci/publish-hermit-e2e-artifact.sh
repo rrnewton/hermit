@@ -120,9 +120,11 @@ stage="$bundle_root/.tmp-$$"
 pointer_tmp="$pointer.tmp-$$"
 before_manifest=$(mktemp)
 after_manifest=$(mktemp)
+overlay_before_manifest=$(mktemp)
+overlay_after_manifest=$(mktemp)
 function cleanup {
     rm -rf "$stage"
-    rm -f "$pointer_tmp" "$before_manifest" "$after_manifest"
+    rm -f "$pointer_tmp" "$before_manifest" "$after_manifest" "$overlay_before_manifest" "$overlay_after_manifest"
 }
 trap cleanup EXIT
 [[ ! -e $stage ]] || fail "staging path already exists: $stage"
@@ -164,12 +166,24 @@ if [[ $kind == complete ]]; then
     cmp -s "$before_manifest" "$after_manifest" || fail "source install bundle changed during publication: $source_install"
     if [[ -n $runtime_overlay ]]; then
         require_runtime_resources "$runtime_overlay"
+        tree_manifest "$runtime_overlay" >"$overlay_before_manifest"
         mkdir -p "$stage/install/rsrcs"
         cp -aL "$runtime_overlay/rsrcs/hermit-runtime" "$stage/install/rsrcs/"
+        tree_manifest "$runtime_overlay" >"$overlay_after_manifest"
+        cmp -s "$overlay_before_manifest" "$overlay_after_manifest" || fail "runtime overlay changed during publication: $runtime_overlay"
     fi
     tree_manifest "$stage/install" >"$stage/resources.sha256"
     if [[ -z $runtime_overlay ]]; then
         cmp -s "$before_manifest" "$stage/resources.sha256" || fail "published resource bytes do not match source bundle: $source_install"
+    else
+        # The stage is exactly the source bundle plus the overlay closure: the
+        # source carries no hermit-runtime (require_complete_resources refused
+        # one above), so each part is compared to its own origin, not trusted
+        # to cp.
+        cmp -s "$before_manifest" <(awk '$2 !~ /^rsrcs\/hermit-runtime\//' "$stage/resources.sha256") ||
+            fail "published resource bytes outside the runtime overlay do not match source bundle: $source_install"
+        cmp -s "$overlay_before_manifest" <(awk '$2 ~ /^rsrcs\/hermit-runtime\//' "$stage/resources.sha256") ||
+            fail "published runtime overlay bytes do not match the overlay: $runtime_overlay"
     fi
     require_complete_resources "$stage/install" "$runtime_required"
     [[ -z $(find "$stage/install" -type l -print -quit) ]] ||

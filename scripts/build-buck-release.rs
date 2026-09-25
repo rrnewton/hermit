@@ -7570,11 +7570,27 @@ mod tests {
             .to_path_buf()
     }
 
+    /// Write an executable fixture without this parallel test process ever
+    /// holding the executed inode open for writing: a sibling test's spawn
+    /// inherits any such descriptor and makes the file busy (ETXTBSY). The
+    /// bytes go to a never-executed staging file; an `install` child creates
+    /// the executable inode (see scripts/lib/exec_safe_fs.rs).
     fn write_executable(path: &Path, contents: &[u8]) {
-        fs::write(path, contents).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        let staging = path.with_file_name(format!(
+            ".{}.staging.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            unique_identity().unwrap()
+        ));
+        fs::write(&staging, contents).unwrap();
+        let installed = checked_output(
+            Command::new("install")
+                .args(["-m", "755", "-T", "--"])
+                .arg(&staging)
+                .arg(path),
+            "install executable fixture",
+        );
+        fs::remove_file(&staging).unwrap();
+        installed.unwrap();
     }
 
     fn write_complete_install(root: &Path, reverie_sha: &str) {
@@ -9037,6 +9053,139 @@ mod tests {
             changed.contains("refusing mixed mutable caller inputs"),
             "{changed}"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The overlay form of the publisher compares each part of the stage to
+    /// its own origin instead of trusting `cp`: the source-bundle part to the
+    /// caller install, the runtime part to the overlay, and the overlay to
+    /// itself across the copy. A `cp` on PATH that corrupts exactly one of
+    /// those is refused by exactly that check; the same `cp` left transparent
+    /// publishes, so the refusals come from the checks and not the shim.
+    #[test]
+    fn overlay_publication_compares_each_staged_part_to_its_origin() {
+        let root = fixture_root("overlay-stage-origin");
+        fs::create_dir_all(root.join("ci")).unwrap();
+        for name in [
+            "publish-hermit-e2e-artifact.sh",
+            "verify-hermit-e2e-artifact.sh",
+        ] {
+            let source = fs::read(source_root().join("ci").join(name)).unwrap();
+            write_executable(&root.join("ci").join(name), &source);
+        }
+        let candidate = root.join("candidate-hermit");
+        let candidate_source = root.join("candidate.c");
+        fs::write(&candidate_source, b"int main(void) { return 0; }\n").unwrap();
+        checked_output(
+            Command::new("gcc")
+                .arg(&candidate_source)
+                .arg("-o")
+                .arg(&candidate),
+            "compile fixture candidate ELF",
+        )
+        .unwrap();
+        let unwind_evidence = root.join("unwind-evidence");
+        fs::create_dir_all(&unwind_evidence).unwrap();
+        let unwind =
+            publish_unwind_buck_input(&root, &unwind_evidence, require_unwind_closure().unwrap())
+                .unwrap();
+        let caller = root.join("caller-install");
+        write_complete_install(&caller, &"1".repeat(40));
+        fs::remove_dir_all(caller.join(UNWIND_RUNTIME_RELATIVE)).unwrap();
+        let real_cp = env::split_paths(&env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("cp"))
+            .find(|path| path.is_file())
+            .unwrap();
+        let fake_bin = root.join("fake-cp-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        write_executable(
+            &fake_bin.join("cp"),
+            format!(
+                r#"#!/bin/sh
+set -e
+'{real_cp}' "$@"
+for last; do :; done
+case "$FAKE_CP_MODE" in
+stage-source)
+    case "$last" in */install/) printf x >>"${{last}}rsrcs/libdetcore_dbt.so" ;; esac ;;
+stage-overlay)
+    case "$last" in */install/rsrcs/)
+        chmod u+w "${{last}}hermit-runtime/{UNWIND_CORE_SONAME}"
+        printf x >>"${{last}}hermit-runtime/{UNWIND_CORE_SONAME}" ;; esac ;;
+overlay-source)
+    for source; do
+        case "$source" in */rsrcs/hermit-runtime)
+            chmod u+w "$source/{UNWIND_CORE_SONAME}"
+            printf x >>"$source/{UNWIND_CORE_SONAME}"
+            break ;; esac
+    done ;;
+esac
+"#,
+                real_cp = real_cp.display()
+            )
+            .as_bytes(),
+        );
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        for (mode, refusal) in [
+            ("none", None),
+            (
+                "stage-source",
+                Some(
+                    "published resource bytes outside the runtime overlay do not match source bundle",
+                ),
+            ),
+            (
+                "stage-overlay",
+                Some("published runtime overlay bytes do not match the overlay"),
+            ),
+            (
+                "overlay-source",
+                Some("runtime overlay changed during publication"),
+            ),
+        ] {
+            // Each case mutates at most its own fresh overlay copy.
+            let evidence = root.join(format!("evidence-{mode}"));
+            fs::create_dir_all(&evidence).unwrap();
+            let runtime_install = prepare_runtime_install(&evidence, &unwind).unwrap();
+            let result = checked_output(
+                Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
+                    .arg(&candidate)
+                    .arg(root.join(format!("artifacts-{mode}")))
+                    .arg(evidence.join("artifact.path"))
+                    .arg(&caller)
+                    .arg("--runtime-overlay")
+                    .arg(&runtime_install)
+                    .env("PATH", &path)
+                    .env("FAKE_CP_MODE", mode),
+                &format!("overlay publication with cp mode {mode}"),
+            );
+            match refusal {
+                None => {
+                    result.unwrap();
+                    let bundle = PathBuf::from(
+                        fs::read_to_string(evidence.join("artifact.path"))
+                            .unwrap()
+                            .trim(),
+                    );
+                    assert_eq!(
+                        fs::read_to_string(bundle.join("runtime-contract")).unwrap(),
+                        "explicit-runtime-overlay-v1\n"
+                    );
+                }
+                Some(refusal) => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains(refusal), "{mode}: {error}");
+                    assert!(
+                        !evidence.join("artifact.path").exists(),
+                        "{mode}: a refused publication must not write its pointer"
+                    );
+                }
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
