@@ -350,6 +350,16 @@ pub struct RtSigsuspendWait {
     /// original mask and may run a handler under its `sa_mask` before the
     /// thread reports, so the scheduler no longer knows which signals the
     /// thread takes. Set by `notify_signal_pending`.
+    ///
+    /// Known gap: only senders that call `notify_signal_pending` set it, which
+    /// are `kill`, `tgkill`, `tkill`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`.
+    /// A `pidfd_send_signal`, a signal the kernel raises itself (a POSIX timer,
+    /// `SIGIO`, `SIGPIPE`, a child's exit), or a process-directed send of the
+    /// scheduler's own that the kernel gave to this thread rather than the one
+    /// chosen, can end the wait without setting it. The scheduler then still
+    /// believes the temporary mask is in force and may pick this thread for a
+    /// later alarm the restored mask blocks. Backends that send through pidfds
+    /// never read this flag: `signal_send` returns `SignalSend::Pidfd` first.
     pub released: bool,
 }
 
@@ -2896,9 +2906,18 @@ impl Scheduler {
     /// scheduler decision, and `signal_guest` sends it thread-directed so the
     /// kernel cannot move it; see `rt_sigsuspend_wake_thread_group`.
     ///
+    /// A target that another guest's signal released is redirected the same
+    /// way, because its mask is no longer known and the scheduler would not
+    /// await its report for this signal: left to the process-directed send,
+    /// the report of whichever thread the kernel picked would arrive only at
+    /// step2c's nondeterministic harvest, and step2d could declare a terminal
+    /// deadlock first. Giving a process-directed signal to a thread whose mask
+    /// admits it is always a delivery Linux could make.
+    ///
     /// Only an `rt_sigsuspend` waiter that no guest signal has released has a
-    /// mask the scheduler knows, so any other target is returned unchanged,
-    /// and a released waiter is never chosen.
+    /// mask the scheduler knows, so a released waiter is never chosen, and a
+    /// target outside the pool, or with no admitting waiter to take its
+    /// place, is returned unchanged.
     fn redirect_past_blocking_rt_sigsuspend(
         &mut self,
         detpid: DetPid,
@@ -2906,7 +2925,7 @@ impl Scheduler {
         signal: Signal,
     ) -> DetTid {
         match self.blocked.rt_sigsuspend_blockers.get(&target) {
-            Some(wait) if !wait.released && wait.blocks(signal) => {}
+            Some(wait) if wait.released || wait.blocks(signal) => {}
             _ => return target,
         }
         let group = self.thread_tree.my_thread_group(&detpid);
@@ -7276,6 +7295,12 @@ mod test {
         assert!(everything.blocks(Signal::SIGALRM));
         assert!(!everything.blocks(Signal::SIGKILL));
         assert!(!everything.blocks(Signal::SIGSTOP));
+        // Realtime signals use the high bits; signal 64 is bit 63.
+        assert!(wait(1_u64 << 63).blocks_raw(64));
+        assert!(!wait(1_u64 << 63).blocks_raw(63));
+        for out_of_range in [0, 65, -1, i32::MIN] {
+            assert!(!everything.blocks_raw(out_of_range));
+        }
     }
 
     #[test]
@@ -8161,6 +8186,12 @@ mod test {
             scheduler.signal_send(released, Signal::SIGUSR1),
             SignalSend::ThreadDirected(leader)
         );
+        // A target whose known mask admits the signal keeps it, even though
+        // another waiter admits it too.
+        assert_eq!(
+            scheduler.redirect_past_blocking_rt_sigsuspend(leader, sleeper, Signal::SIGUSR1),
+            sleeper
+        );
 
         // A realtime guest signal the mask admits releases the wait, though
         // `Signal` cannot name it.
@@ -8185,12 +8216,27 @@ mod test {
             SignalSend::ThreadDirected(leader)
         );
 
-        // Selected directly, a released target is not redirected by its old
-        // temporary mask, which blocks SIGALRM: the process-directed send
-        // lets the kernel pick the thread.
+        // Selected directly, a released target is redirected to that waiter
+        // too, whatever its old temporary mask said: the scheduler would not
+        // await the released target's report for this signal. Its old mask
+        // admits SIGUSR1 and blocks SIGALRM; both go to the sleeper.
+        for signal in [Signal::SIGUSR1, Signal::SIGALRM] {
+            assert_eq!(
+                scheduler.redirect_past_blocking_rt_sigsuspend(leader, released, signal),
+                sleeper
+            );
+        }
+
+        // With no admitting waiter left, the released target stays, and the
+        // process-directed send lets the kernel pick the thread.
+        scheduler.blocked.rt_sigsuspend_blockers.remove(&sleeper);
         assert_eq!(
             scheduler.redirect_past_blocking_rt_sigsuspend(leader, released, Signal::SIGALRM),
             released
+        );
+        assert_eq!(
+            scheduler.signal_send(released, Signal::SIGALRM),
+            SignalSend::ProcessDirected
         );
     }
 
