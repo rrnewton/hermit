@@ -187,6 +187,15 @@ pub struct CacheKey<'a> {
     pub profile: &'a str,
     pub host: &'a str,
     pub toolchain: &'a str,
+    /// `cargo` or `buck`. A row written before this field existed was a Cargo
+    /// run. Only a PASS must share it: a red on the same tree is a red under
+    /// either builder.
+    pub release_builder: &'a str,
+}
+
+/// Builder that produced the E2E payload a row executed; absent means Cargo.
+fn row_release_builder(row: &serde_json::Value) -> &str {
+    row.get("release_builder").and_then(|v| v.as_str()).unwrap_or("cargo")
 }
 
 /// The gate-coverage half of the predicate, shared by both producers.
@@ -401,7 +410,9 @@ pub fn cache_lookup(
         if !row_matches_key(row, key) || s(row, "result") != want_result {
             continue;
         }
-        if want_result == "pass" && !pass_row_qualifies(row) {
+        if want_result == "pass"
+            && (row_release_builder(row) != key.release_builder || !pass_row_qualifies(row))
+        {
             continue;
         }
         let newer = match best {
@@ -584,7 +595,13 @@ pub fn self_test() -> Result<String, String> {
         }
         v
     };
-    let key = CacheKey { tree: "T", profile: "full", host: "h1", toolchain: "rustc 1.0" };
+    let key = CacheKey {
+        tree: "T",
+        profile: "full",
+        host: "h1",
+        toolchain: "rustc 1.0",
+        release_builder: "cargo",
+    };
 
     // POSITIVE, both producers. A predicate that refuses everything would look
     // correct with negatives alone, so each authority gets a counted accept.
@@ -612,6 +629,9 @@ pub fn self_test() -> Result<String, String> {
         ("different profile", base(serde_json::json!({"profile": "quick", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("different host", base(serde_json::json!({"host": "h2", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("different toolchain", base(serde_json::json!({"toolchain": "rustc 2.0", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        // A Buck run executed the release payload, without debug assertions or
+        // overflow checks: it is not the run a Cargo request asks for.
+        ("Buck release payload", base(serde_json::json!({"release_builder": "buck", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("selective run", base(serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("not commit-anchored", base(serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("dirty tree", base(serde_json::json!({"tree_dirty": true, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
@@ -634,6 +654,23 @@ pub fn self_test() -> Result<String, String> {
     for (why, row) in &negatives {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_some() {
             return Err(format!("cache: a row with {why} must NOT be a hit"));
+        }
+        refused += 1;
+    }
+
+    // Builder identity, in both directions. A row that names cargo is the
+    // same run as a legacy row; a Buck key must refuse either, and a Buck red
+    // must still latch the Cargo key for its tree.
+    let mut cargo_named = rs_pass.clone();
+    cargo_named["release_builder"] = serde_json::json!("cargo");
+    if cache_lookup(std::slice::from_ref(&cargo_named), "pass", &key).is_none() {
+        return Err("cache: a row naming the cargo builder must be a Cargo HIT".into());
+    }
+    accepted += 1;
+    let buck_key = CacheKey { release_builder: "buck", ..key };
+    for (why, row) in [("legacy", &rs_pass), ("cargo-named", &cargo_named)] {
+        if cache_lookup(std::slice::from_ref(row), "pass", &buck_key).is_some() {
+            return Err(format!("cache: a {why} Cargo green answered a Buck request"));
         }
         refused += 1;
     }
@@ -702,6 +739,11 @@ pub fn self_test() -> Result<String, String> {
         if cache_lookup(&rows, "pass", &key).is_some() {
             return Err("cache: a genuine same-key failure must latch over a PASS".into());
         }
+    }
+    let mut buck_failing = failing.clone();
+    buck_failing["release_builder"] = serde_json::json!("buck");
+    if cache_lookup(&[buck_failing, rs_pass.clone()], "pass", &key).is_some() {
+        return Err("cache: a Buck red on the same tree must latch over a Cargo PASS".into());
     }
 
     // Environment and incomplete evidence remain non-poisoning.

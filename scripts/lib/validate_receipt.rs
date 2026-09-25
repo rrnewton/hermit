@@ -52,12 +52,17 @@ pub enum Publication {
     Attempted { pr: String },
 }
 
-/// The five conditions `validate.sh:1735` requires before publishing.
+/// Builder whose E2E payload is the debug binary a receipt certifies.
+pub const RELEASE_BUILDER_CARGO: &str = "cargo";
+
+/// The five conditions `validate.sh:1735` requires before publishing, plus the
+/// builder.
 ///
 /// Expressed as a pure predicate so it can be bracketed on both sides. Note
 /// `profile == "full"`: a focused or selective green is real evidence about what
 /// it ran, but it is not the full-suite receipt the label claims, so it must not
-/// mint one.
+/// mint one. The same holds for a Buck run: its E2E cells executed the release
+/// payload, without debug assertions or overflow checks.
 pub fn eligible(
     exit_code: u8,
     failures: usize,
@@ -65,6 +70,7 @@ pub fn eligible(
     commit_anchored: bool,
     tree_dirty: bool,
     profile: &str,
+    release_builder: &str,
 ) -> Result<(), String> {
     if exit_code != 0 || failures != 0 {
         return Err("the run was not green".into());
@@ -80,6 +86,13 @@ pub fn eligible(
     }
     if profile != "full" {
         return Err(format!("profile is {profile}, not the full suite"));
+    }
+    if release_builder != RELEASE_BUILDER_CARGO {
+        return Err(format!(
+            "release builder is {release_builder}: its E2E cells ran the release payload \
+             without debug assertions or overflow checks, which is supplemental evidence, \
+             not the full-suite receipt"
+        ));
     }
     Ok(())
 }
@@ -218,26 +231,27 @@ pub fn self_test() -> Result<String, String> {
     }
     // Positive: exactly one qualifying combination must be ACCEPTED, so the
     // predicate is not vacuously restrictive.
-    eligible(0, 0, true, true, false, "full")
+    eligible(0, 0, true, true, false, "full", "cargo")
         .map_err(|e| format!("receipt: the one qualifying case must be eligible, got: {e}"))?;
     let mut accepted = 1usize;
     // Negative: each condition, spoiled alone, must be REFUSED.
     let negatives: Vec<(&str, Result<(), String>)> = vec![
-        ("nonzero exit", eligible(1, 0, true, true, false, "full")),
-        ("nonzero failures", eligible(0, 1, true, true, false, "full")),
-        ("--no-label-pr", eligible(0, 0, false, true, false, "full")),
-        ("not commit-anchored", eligible(0, 0, true, false, false, "full")),
-        ("dirty tree", eligible(0, 0, true, true, true, "full")),
-        ("quick profile", eligible(0, 0, true, true, false, "quick")),
-        ("portable-only profile", eligible(0, 0, true, true, false, "portable-only")),
-        ("super profile", eligible(0, 0, true, true, false, "super")),
-        ("envelope-only profile", eligible(0, 0, true, true, false, "envelope-only")),
-        ("selective profile", eligible(0, 0, true, true, false, "selective")),
-        ("focused compat profile", eligible(0, 0, true, true, false, "strict-compat-only")),
+        ("nonzero exit", eligible(1, 0, true, true, false, "full", "cargo")),
+        ("nonzero failures", eligible(0, 1, true, true, false, "full", "cargo")),
+        ("--no-label-pr", eligible(0, 0, false, true, false, "full", "cargo")),
+        ("not commit-anchored", eligible(0, 0, true, false, false, "full", "cargo")),
+        ("dirty tree", eligible(0, 0, true, true, true, "full", "cargo")),
+        ("quick profile", eligible(0, 0, true, true, false, "quick", "cargo")),
+        ("portable-only profile", eligible(0, 0, true, true, false, "portable-only", "cargo")),
+        ("super profile", eligible(0, 0, true, true, false, "super", "cargo")),
+        ("envelope-only profile", eligible(0, 0, true, true, false, "envelope-only", "cargo")),
+        ("selective profile", eligible(0, 0, true, true, false, "selective", "cargo")),
+        ("focused compat profile", eligible(0, 0, true, true, false, "strict-compat-only", "cargo")),
         (
             "cell requalification profile",
-            eligible(0, 0, true, true, false, "cell-requalification"),
+            eligible(0, 0, true, true, false, "cell-requalification", "cargo"),
         ),
+        ("Buck release payload", eligible(0, 0, true, true, false, "full", "buck")),
     ];
     let mut refused = 0usize;
     for (why, r) in &negatives {
@@ -249,17 +263,25 @@ pub fn self_test() -> Result<String, String> {
     // A green super or envelope run is real, but it is NOT the full-suite
     // receipt; confirm the profile gate is what refuses it (not some other
     // condition), so the refusal cannot silently move.
-    if let Err(e) = eligible(0, 0, true, true, false, "super") {
+    if let Err(e) = eligible(0, 0, true, true, false, "super", "cargo") {
         if !e.contains("not the full suite") {
             return Err(format!("receipt: super must be refused BY THE PROFILE gate, got: {e}"));
         }
     }
-    let focused_error = eligible(0, 0, true, true, false, "cell-requalification")
+    let focused_error = eligible(0, 0, true, true, false, "cell-requalification", "cargo")
         .err()
         .ok_or("focused evidence must not authorize a full-suite receipt")?;
     if focused_error != "profile is cell-requalification, not the full suite" {
         return Err(format!(
             "receipt: requalification must be refused BY THE PROFILE gate, got: {focused_error}"
+        ));
+    }
+    let buck_error = eligible(0, 0, true, true, false, "full", "buck")
+        .err()
+        .ok_or("a Buck release-payload green must not authorize a full-suite receipt")?;
+    if !buck_error.starts_with("release builder is buck:") {
+        return Err(format!(
+            "receipt: a Buck green must be refused BY THE BUILDER gate, got: {buck_error}"
         ));
     }
     accepted += 0;

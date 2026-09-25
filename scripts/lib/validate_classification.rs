@@ -1212,6 +1212,7 @@ mod ledger_tests {
                 cwd: dir.path().display().to_string(),
                 profile: "full".into(),
                 selection_mode: "full".into(),
+                release_builder: super::super::RELEASE_BUILDER_CARGO,
                 cache_state: "warm".into(),
                 commit: "535b48a113390f0084eac204b54de67dacc24f29".into(),
                 tree: "d0fc13f45eb671585d1aa26c7fcf3fdb4ca480c7".into(),

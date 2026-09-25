@@ -287,7 +287,23 @@ one explicit opt-in for the complete `full`, `portable-only`, and
 
 The normal dev-hermit admission boundary still applies; this example documents
 driver arguments rather than bypassing `ci-hub`. Buck mode is never inferred
-from ambient environment and cannot reuse the older tree/profile result cache.
+from ambient environment.
+
+A Buck-mode run tests a different binary. In Cargo mode every E2E cell runs
+the debug `target/debug/hermit`, which has debug assertions and overflow
+checks. In Buck mode the cells run the release `target/ci/hermit-strict`,
+built with `-Cdebug-assertions=no -Coverflow-checks=no -Copt-level=3`. The
+ledger row records this as `release_builder` (`cargo` or `buck`) and
+`e2e_payload`, which gives the path, profile, and both check settings. A Buck
+row is supplemental evidence only:
+
+- It is never a cache hit for a Cargo request.
+- A Buck request is never answered from the cache.
+- It never makes a run eligible for the full-suite receipt label.
+- The parent's local-validation status does not count it as a full green.
+
+A red Buck row on the same tree still blocks Cargo cache reuse, because a
+failure is a failure whichever builder produced the binary.
 A missing launcher, malformed provenance, failed regeneration or build,
 unreadable event log, unexpected target/output, non-x86_64 executable, or hash
 mismatch refuses the run. None falls back to Cargo.
