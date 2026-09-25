@@ -987,8 +987,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/dbt_pid_virtualization.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_pid_virtualization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/dbt_pid_virtualization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it prints virtualized pid, ppid and tid identities across fork, a grandchild, exec, waitid, vfork and vfork-plus-exec children, and checks kill and waitpid refusals for an unknown pid, so a child exit must be reported to its parent at a scheduler-ordered point"
     },
     {
       "disposition": "manifest-test",
