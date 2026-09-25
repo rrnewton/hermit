@@ -224,7 +224,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests retain all 619 prior identities (`cargo nextest list` measured 623).
     // The release-profile GlobalTime behind-baseline refusal test retains all
     // 623 prior identities.
-    ("test.regular_crates", 624),
+    // The failed_match series-evidence test retains all 624 prior identities.
+    ("test.regular_crates", 625),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -272,7 +273,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 624),
+    ("test.regular_crates_on_host", 625),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
