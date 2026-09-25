@@ -17131,7 +17131,12 @@ mod nextest_timeout_tests {
                 // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
                 + 1
                 // The 128 SaBRe verify cells promoted on 2026-10-03.
-                + hermit_manifest_plan::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT,
+                + hermit_manifest_plan::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
+                // Four portable ptrace verify cells of https://github.com/rrnewton/hermit/pull/3224:
+                // c-programs/dbt-pid-virtualization, c-programs/sigsuspend-alarm-wake,
+                // c-programs/external-io-signal-interrupt and
+                // c-programs/sigsuspend-sibling-signal-wake.
+                + 4,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
