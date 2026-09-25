@@ -114,14 +114,16 @@ pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `rt_sigsuspend` wait after a signal the process ignores reached the waiter
 /// first. The scheduler must requeue a waiter another guest's signal released
 /// instead of reporting a deadlock, and the real `rt_sigsuspend` must run in
-/// place rather than behind injected probe syscalls. The cell passed ten
-/// consecutive strict verify runs, each on its first attempt, with a build of
-/// the evidence SHA, which is the last commit that changes how the scheduler
-/// handles these waiters. Guest source sha256
-/// 96bcc5e240133faae7db68b7316744bd543913f4cfc7abda380f4a6f15410c0e.
+/// place rather than behind injected probe syscalls. The guest repeats both
+/// phases 25 times, because either defect loses a host-timing race only some
+/// of the time. The cell passed ten consecutive strict verify runs, each on its
+/// first attempt, with a clean build of the evidence SHA, the commit that
+/// introduced the repetition; the last commit that changes how the scheduler
+/// handles these waiters is its ancestor 3af2a07119b1. Guest source sha256
+/// 71588c7e072454ca46298972b24ce4f93a35df407efbace484c27212c9faa69f.
 pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
-    "3af2a07119b1cb2593255c02c064cdb8dbc76f44";
-pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T15:21:13Z";
+    "f3f8148d9dfa106304b21ba0b94f6b8805282deb";
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T16:45:17Z";
 pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
@@ -1958,11 +1960,11 @@ mod tests {
         assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA,
-            "3af2a07119b1cb2593255c02c064cdb8dbc76f44"
+            "f3f8148d9dfa106304b21ba0b94f6b8805282deb"
         );
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T15:21:13Z"
+            "2026-09-25T16:45:17Z"
         );
         assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 172);
