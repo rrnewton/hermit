@@ -20,8 +20,10 @@ mod analyze;
 mod backends;
 mod bisect;
 mod clean;
+mod cli_owned_lifecycle;
 mod container;
 mod gdb_client;
+mod gdb_watch_helper;
 mod global_opts;
 mod guest_capture;
 mod host_capabilities;
@@ -30,6 +32,7 @@ mod instruction_map;
 mod list;
 mod logdiff;
 mod oci;
+mod owned_container;
 mod podman_store;
 mod record;
 mod record_envelope;
@@ -38,6 +41,7 @@ mod remove;
 mod replay;
 mod run;
 mod run_evidence;
+mod run_timeout;
 mod schedule_search;
 mod staged_summary;
 mod strace;
@@ -438,6 +442,18 @@ impl Subcommand {
 
 #[fbinit::main]
 fn main() {
+    if let Some(status) = cli_owned_lifecycle::maybe_run() {
+        std::process::exit(status);
+    }
+    if let Some(result) = gdb_watch_helper::maybe_run() {
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("GDB helper failed: {error:#}");
+                std::process::exit(125);
+            }
+        }
+    }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
     // shared mapping that children inherit across fork. A mapping made after the

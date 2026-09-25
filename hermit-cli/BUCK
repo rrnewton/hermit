@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.2.0",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "c444c4ff15b6f5985082317e7c93b370e67571c1",
+    "HERMIT_REVERIE_PIN": "95bc2b1daf9e4d0cd9bd158c5846374244a08d40",
 }
 
 rust_library(

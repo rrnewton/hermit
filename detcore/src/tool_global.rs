@@ -3659,14 +3659,16 @@ where
         ev
     };
 
-    if let Some(rip) = ev.end_rip {
+    if tracing::enabled!(tracing::Level::TRACE)
+        && let Some(rip) = ev.end_rip
+    {
         let rip_addr = AddrMut::<u16>::from_raw(rip.into()).unwrap();
-        let rip_contents: u16 = guest
-            .memory()
-            .read_value(rip_addr)
-            .expect("memory read succeeds");
+        // These bytes are diagnostic, not part of the recorded event. A guest
+        // may legitimately make its memory unreadable (PR_SET_DUMPABLE), so
+        // preserve that observation without unwinding the live run owner.
+        let rip_contents = guest.memory().read_value(rip_addr);
         trace!(
-            "Tracing sched event, after which rip is {}, next two instruction bytes {:#06x}",
+            "Tracing sched event, after which rip is {}, next two instruction bytes {:?}",
             rip, rip_contents
         );
     }

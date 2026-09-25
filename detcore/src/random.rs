@@ -14,6 +14,7 @@ use std::hash::Hasher;
 use rand::RngExt as _;
 use rand::SeedableRng as _;
 use rand_pcg::Pcg64Mcg;
+use reverie::Error;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::Getrandom;
@@ -27,6 +28,41 @@ use crate::detlog;
 use crate::types::DetTid;
 
 pub(crate) const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
+
+/// A user-access random copy failed for a reason other than a guest fault.
+///
+/// Memory may already contain a copied prefix, or even the entire attempted
+/// write. This is a failed run, not a guest errno or a successful short read.
+#[derive(Debug)]
+pub struct RandomCopyFailure {
+    errno: Errno,
+}
+
+impl RandomCopyFailure {
+    /// The exact error returned by the backend's user-access copy.
+    pub fn errno(&self) -> Errno {
+        self.errno
+    }
+}
+
+impl std::fmt::Display for RandomCopyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "random user-access copy failed: {}", self.errno)
+    }
+}
+
+impl std::error::Error for RandomCopyFailure {}
+
+pub(crate) fn copy_error(error: Errno) -> Error {
+    match error {
+        Errno::EFAULT => Error::Errno(error),
+        errno => Error::Tool(anyhow::Error::new(RandomCopyFailure { errno })),
+    }
+}
+
+pub(crate) fn is_copy_failure(error: &Error) -> bool {
+    matches!(error, Error::Tool(inner) if inner.is::<RandomCopyFailure>())
+}
 
 /// Construct the root guest stream from its configured seed, without creating
 /// a thread or discovering any process metadata.
@@ -220,12 +256,13 @@ pub(crate) fn write_random_chunk(
     const PTRACE_WORD_SPLIT: usize = std::mem::size_of::<u64>() / 2;
 
     if local_buf.len() != std::mem::size_of::<u64>() {
-        return memory.write(remote_buf, local_buf);
+        return memory.write_with_user_access(remote_buf, local_buf);
     }
 
-    // safeptrace uses PTRACE_POKEDATA for exactly eight bytes, which bypasses guest page
-    // protections. Split that case so getrandom observes the same EFAULT boundary as Linux.
-    let first = memory.write(remote_buf, &local_buf[..PTRACE_WORD_SPLIT])?;
+    // Preserve the existing eight-byte split and its prefix semantics. Every
+    // length now uses the explicit user-access capability; debugger writes can
+    // bypass protection for other sizes too (including the KVM backend).
+    let first = memory.write_with_user_access(remote_buf, &local_buf[..PTRACE_WORD_SPLIT])?;
     if first < PTRACE_WORD_SPLIT {
         return Ok(first);
     }
@@ -236,9 +273,10 @@ pub(crate) fn write_random_chunk(
     else {
         return Ok(first);
     };
-    match memory.write(second_buf, &local_buf[PTRACE_WORD_SPLIT..]) {
+    match memory.write_with_user_access(second_buf, &local_buf[PTRACE_WORD_SPLIT..]) {
         Ok(second) => Ok(first + second),
-        Err(_) => Ok(first),
+        Err(Errno::EFAULT) => Ok(first),
+        Err(error) => Err(error),
     }
 }
 
@@ -251,7 +289,7 @@ pub fn fill_bytes(
     len: usize,
     dettid: DetTid,
     source: &str,
-) -> Result<usize, Errno> {
+) -> Result<usize, Error> {
     let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
     let mut hasher = DefaultHasher::new();
     let mut written = 0;
@@ -263,23 +301,23 @@ pub fn fill_bytes(
             .and_then(AddrMut::<u8>::from_raw)
         {
             Some(address) => address,
-            None if written == 0 => return Err(Errno::EFAULT),
+            None if written == 0 => return Err(Errno::EFAULT.into()),
             None => break,
         };
         let chunk_len = (len - written).min(RANDOM_FILL_CHUNK_BYTES);
-        // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
+        // Keep the existing aligned scratch and full attempted-chunk draw.
         let local_buf = unsafe {
             std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
         };
         prng.fill(local_buf);
         let n = match write_random_chunk(&mut memory, remote_chunk, local_buf) {
             Ok(n) => n,
-            Err(_) if written > 0 => break,
-            Err(error) => return Err(error),
+            Err(Errno::EFAULT) if written > 0 => break,
+            Err(error) => return Err(copy_error(error)),
         };
         if n == 0 {
             if written == 0 {
-                return Err(Errno::EFAULT);
+                return Err(Errno::EFAULT.into());
             }
             break;
         }
@@ -310,7 +348,7 @@ pub fn getrandom(
     memory: impl MemoryAccess,
     dettid: DetTid,
     call: Getrandom,
-) -> Result<i64, Errno> {
+) -> Result<i64, Error> {
     validate_getrandom_flags(call.flags())?;
     let len = getrandom_request_len(call.buflen());
     if len == 0 {
@@ -339,6 +377,7 @@ pub fn initialize_auxv(
 
 #[cfg(test)]
 mod tests {
+    include!("random/user_access_tests.rs");
     use std::io::IoSlice;
     use std::io::IoSliceMut;
 
@@ -352,6 +391,32 @@ mod tests {
     struct OwnMemory;
 
     impl MemoryAccess for OwnMemory {
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, Errno> {
+            addr.as_raw()
+                .checked_add(bytes.len())
+                .ok_or(Errno::EFAULT)?;
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            let local = libc::iovec {
+                iov_base: bytes.as_ptr().cast_mut().cast(),
+                iov_len: bytes.len(),
+            };
+            let remote = libc::iovec {
+                iov_base: addr.as_raw() as *mut libc::c_void,
+                iov_len: bytes.len(),
+            };
+            let n = unsafe { libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) };
+            if n < 0 {
+                Err(Errno::last())
+            } else {
+                Ok(n as usize)
+            }
+        }
         fn read_vectored(
             &self,
             remote: &[IoSlice],
@@ -393,6 +458,74 @@ mod tests {
             } else {
                 Ok(n as usize)
             }
+        }
+    }
+
+    struct SecondHalfFailure {
+        error: Errno,
+        bytes: [u8; 8],
+        writes: Vec<(usize, Vec<u8>)>,
+    }
+
+    impl MemoryAccess for SecondHalfFailure {
+        fn read_vectored(
+            &self,
+            _remote: &[IoSlice],
+            _local: &mut [IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("random copying must not read guest memory")
+        }
+
+        fn write_vectored(
+            &mut self,
+            _local: &[IoSlice],
+            _remote: &mut [IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("random copying must use the user-access capability")
+        }
+
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            buf: &[u8],
+        ) -> Result<usize, Errno> {
+            self.writes.push((addr.as_raw(), buf.to_vec()));
+            match self.writes.len() {
+                1 => {
+                    assert_eq!(addr.as_raw(), 0x1000);
+                    assert_eq!(buf.len(), 4);
+                    self.bytes[..4].copy_from_slice(buf);
+                    Ok(4)
+                }
+                2 => {
+                    assert_eq!(addr.as_raw(), 0x1004);
+                    assert_eq!(buf.len(), 4);
+                    Err(self.error)
+                }
+                _ => panic!("random copying retried a failed write"),
+            }
+        }
+    }
+
+    #[test]
+    fn eight_byte_random_copy_distinguishes_faults_from_backend_errors() {
+        for (error, expected) in [(Errno::EFAULT, Ok(4)), (Errno::EIO, Err(Errno::EIO))] {
+            let mut memory = SecondHalfFailure {
+                error,
+                bytes: [0xa5; 8],
+                writes: Vec::new(),
+            };
+            let address = AddrMut::from_raw(0x1000).unwrap();
+
+            assert_eq!(
+                write_random_chunk(&mut memory, address, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                expected
+            );
+            assert_eq!(memory.bytes, [1, 2, 3, 4, 0xa5, 0xa5, 0xa5, 0xa5]);
+            assert_eq!(
+                memory.writes,
+                [(0x1000, vec![1, 2, 3, 4]), (0x1004, vec![5, 6, 7, 8])]
+            );
         }
     }
 
@@ -454,6 +587,19 @@ mod tests {
         };
         call
     }
+    // Existing guest-errno cases must still be guest errnos. A terminal Tool
+    // error here is a failed assertion, never a successful errno projection.
+    fn guest_getrandom(
+        prng: &mut Pcg64Mcg,
+        memory: impl MemoryAccess,
+        tid: DetTid,
+        call: Getrandom,
+    ) -> Result<i64, Errno> {
+        super::getrandom(prng, memory, tid, call).map_err(|error| match error {
+            Error::Errno(errno) => errno,
+            other => panic!("unexpected terminal failure in guest-errno companion: {other:?}"),
+        })
+    }
     fn same_state(a: &Pcg64Mcg, b: &Pcg64Mcg) {
         assert_eq!(
             serde_json::to_vec(a).unwrap(),
@@ -473,7 +619,7 @@ mod tests {
         };
         let mut stream = root_prng(config.rng_seed());
         initialize_auxv(&mut stream, OwnMemory, pages.address(0), tid).unwrap();
-        getrandom(
+        guest_getrandom(
             &mut stream,
             OwnMemory,
             tid,
@@ -650,7 +796,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                getrandom(&mut actual, OwnMemory, tid, call(buffer, len, flags)),
+                guest_getrandom(&mut actual, OwnMemory, tid, call(buffer, len, flags)),
                 result
             );
             same_state(&actual, &expected);
@@ -660,7 +806,7 @@ mod tests {
             let mut bytes = vec![0; len];
             expected.fill(&mut bytes[..]);
             assert_eq!(
-                getrandom(
+                guest_getrandom(
                     &mut actual,
                     OwnMemory,
                     tid,
@@ -676,7 +822,7 @@ mod tests {
         let mut discarded = [0u8; 8];
         expected.fill(&mut discarded[..]);
         assert_eq!(
-            getrandom(
+            guest_getrandom(
                 &mut actual,
                 OwnMemory,
                 tid,
@@ -693,7 +839,7 @@ mod tests {
             let mut bytes = vec![0; len];
             expected.fill(&mut bytes[..]);
             assert_eq!(
-                getrandom(
+                guest_getrandom(
                     &mut actual,
                     OwnMemory,
                     tid,
