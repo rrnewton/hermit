@@ -61,7 +61,8 @@ implemented together.
 external potentially blocking syscall through
 `record_or_replay_blocking`. The thread:
 
-1. submits `BlockingExternalIO(ExternalOpId { tid, syscall_count })`;
+1. submits `BlockingExternalIO { op_id: ExternalOpId { tid, syscall_count },
+   signal_mask: None }` (record/replay never reads the signal mask);
 2. leaves the run queue and performs the real blocking operation;
 3. asks the Recorder or Replayer subtool to service that syscall;
 4. submits `BlockedExternalContinue` after the operation returns; and
