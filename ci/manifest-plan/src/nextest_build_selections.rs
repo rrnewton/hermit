@@ -608,7 +608,9 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "193");
+            // 193 before https://github.com/rrnewton/hermit/pull/3224, plus its two
+            // signal_determinism rt_sigsuspend tests.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "195");
             // The canonical first-seen mtime regression
             // (https://github.com/rrnewton/hermit/issues/3639).
             assert!(
