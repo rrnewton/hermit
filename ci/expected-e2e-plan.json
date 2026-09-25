@@ -6007,13 +6007,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/socket-timestamp-edge-cases"
-    },
-    {
-      "backend": "ptrace",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "system-utils/procfs-sanitized-paths"
     }
   ],
   "schema": 1

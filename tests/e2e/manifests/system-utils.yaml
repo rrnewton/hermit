@@ -1275,7 +1275,9 @@ test:
         ci_disabled_reason: 'NOT-EXERCISED: native execution removes every sanitizer under test and fails the guest assertions.'
       verify:
         ci:
-          ptrace: true
+          ptrace: false
+        ci_disabled_reason:
+          ptrace: {"evidence": "Re-qualification at 4fc9246afc0841e33ec0a3d3f91c1767f0ec7967: 18/20 canonical matched, 1 no_result (not_run), 1 diverged at read length 1231 vs 1061 bytes (syscall 275); earlier 20/20 at 57a3083b78e308a8dbbf349075cf1891524f3b6c did not hold at head", "reason": "Repeated canonical verification at the current head retained a determinism failure; sanitized procfs content length varies intermittently between runs, so the cell remains quarantined.", "result": "determinism-failure"}
         compare_io_buffers: false
         compare_io_buffers_disabled_reason: The guest asserts sanitizer-specific invariants for sixteen procfs files that legitimately retain process, virtual-time, topology, or host data; comparing their raw whole-file bytes would manufacture flakes.
         rcb_time: false

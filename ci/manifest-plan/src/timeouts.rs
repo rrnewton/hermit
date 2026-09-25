@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 171;
+pub const NON_CI_CELL_COUNT: usize = 172;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -71,19 +71,17 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
-/// Two ptrace verify cells re-selected after twenty clean canonical
-/// repetitions each at the evidence SHA (the commit whose Detcore tree the
-/// qualification binary was built from): `c-programs/socket-timestamp-edge-cases`
-/// (aliased-recvmsg io-buffer EFAULT fix in this change; 20/20 matched) and
-/// `system-utils/procfs-sanitized-paths` (20/20 matched under its manifest
-/// comparison profile `compare_io_buffers: false, rcb_time: false`). No code
-/// in this change alters procfs handling; its retained divergence was in
-/// raw `smaps` bytes the manifest profile excludes by design, and the cell
-/// is re-selected solely on the repeated clean evidence at the pinned SHA.
+/// One ptrace verify cell re-selected after twenty clean canonical
+/// repetitions at the evidence SHA (the head this change ships):
+/// `c-programs/socket-timestamp-edge-cases` (aliased-recvmsg io-buffer
+/// EFAULT fix in this change; 20/20 matched, runs recorded at the pinned
+/// SHA). `system-utils/procfs-sanitized-paths` was re-measured at the same
+/// head and is NOT re-selected: 18/20 matched with one determinism
+/// divergence, so it stays quarantined with its evidence in the manifest.
 pub const PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_SHA: &str =
-    "57a3083b78e308a8dbbf349075cf1891524f3b6c";
-pub const PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:20:29Z";
-pub const PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 2;
+    "4fc9246afc0841e33ec0a3d3f91c1767f0ec7967";
+pub const PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T08:05:25Z";
+pub const PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1892,14 +1890,14 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_SHA,
-            "57a3083b78e308a8dbbf349075cf1891524f3b6c"
+            "4fc9246afc0841e33ec0a3d3f91c1767f0ec7967"
         );
         assert_eq!(
             PTRACE_REQUALIFIED_2026_09_24_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T03:20:29Z"
+            "2026-09-25T08:05:25Z"
         );
-        assert_eq!(PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT, 2);
-        assert_eq!(NON_CI_CELL_COUNT, 171);
+        assert_eq!(PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(NON_CI_CELL_COUNT, 172);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
