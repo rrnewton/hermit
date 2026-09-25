@@ -1040,6 +1040,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/external_io_signal_interrupt.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/external_io_signal_interrupt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends a select or poll wait on a never-readable socket exactly once with EINTR on the waiting thread, including under SA_RESTART, with a sibling that sleeps past the alarm without blocking it, and with a sibling that blocks it while taking short sleeps, so the scheduler must send the alarm to the blocker whose mask admits it and await that thread's own report at a deterministic turn"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/file_timestamp_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/file_timestamp_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
