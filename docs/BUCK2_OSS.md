@@ -111,11 +111,22 @@ the host through safehermit's `systemd-run --user` service, which starts in the
 initial user namespace without CAP_SYS_ADMIN, so the per-run `/test` tmpfs that
 the pinned-root node `test.dbt_parity` requests cannot be mounted there. The
 matrix therefore takes its flags and environment from the official host twin
-`test.dbt_parity_on_host`, whose commands each get a private `/tmp`. It refuses
-the twins unless the pinned node runs exactly the host payload with the same
-deadlines and differs in environment only by `HERMIT_E2E_EMPTY_WORKDIR=/test`,
-the host command is the reviewed strict invocation, the host node does not
-request `/test`, and no host variable collides with a candidate proxy binding.
+`test.dbt_parity_on_host`. That twin runs each DBT command inside a rootless
+user+mount namespace whose `/tmp` is a per-command directory. The proxy must not
+start there: safehermit's disk bound needs host `sudo`, and its service would
+escape the namespace anyway, so the guest would silently run on the host `/tmp`.
+For the proxy only, `run_matrix.py` instead hands over its unchanged
+private-`/tmp` stage (`--matrix-private-tmp`) as data. The proxy refuses to run
+outside the initial user namespace, accepts only that exact stage with canonical
+binds beneath the command directory, and has safehermit execute the stage inside
+its bounded service. A readback written immediately before the candidate starts
+must show the command directory as `/tmp`, `/tmp` as the working directory and
+`TMPDIR`, and root mapped from exactly the proxy's uid; otherwise the invocation
+is refused. The proxy refuses the twins unless the pinned node runs exactly the
+host payload with the same deadlines and differs in environment only by
+`HERMIT_E2E_EMPTY_WORKDIR=/test`, the host command is the reviewed strict
+invocation, the host node does not request `/test`, and no host variable
+collides with a candidate proxy binding.
 The pinned-root node itself is unchanged and still runs in authoritative
 validation. For the current strict DBT mode that independently requires
 28 TSV rows (27 selected plus the documented `pthread_lifecycle` gap), 23
