@@ -196,6 +196,13 @@ exactly one Result with zero errors and the canonical release target; and
 exactly one executable output path named by stdout whose canonical realpath is
 under the checkout's `buck-out/`, ends in the measured configured-target layout
 `hermit-cli/___hermit-release__/hermit`, and is an executable x86_64 ELF.
+Every Buck build these tools run passes `--no-remote-cache`, and the checkout
+configures no remote execution. The reconciler also counts each executed
+action's `execution_kind` from the event log. It accepts only the local kinds
+(`local`, `simple`, `deferred`, `local_dep_file`, `local_worker`,
+`local_action_cache`) and refuses any remote, remote-cache, or unknown kind.
+The per-kind counts are recorded in the receipt, so a daemon that reused
+every result (no actions) is distinguishable from a local rebuild.
 Before upload, a separate 10-second process-group-bounded CLI-only probe decodes
 that candidate's typed `version --json` and requires the exact metadata and
 `dbt`/`e9patch`/`sabre` feature facts. This rejects an executable decoy without
