@@ -5991,6 +5991,7 @@ mod tests {
                 + EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT
                 + SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT
                 + TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT
+                + crate::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
