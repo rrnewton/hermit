@@ -80,6 +80,19 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA: &str = "ef2e6307b35b0d4b1aac32895f2ca527e26525e4";
 pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:25:51Z";
 pub const VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/sigsuspend-alarm-wake` verify on ptrace, a new guest for the
+/// other half of the same scheduler fix: `fire_alarm` signals a thread parked
+/// in the scheduler's `rt_sigsuspend` pool, which must be released to report
+/// its own interrupted syscall, and an alarm the arming thread's suspend mask
+/// blocks must go to a waiter whose mask admits it. The guest is added by the
+/// commit that selects it, so the SHA names the scheduler source the evidence
+/// binary was built from; the ten consecutive strict verify runs used guest
+/// source sha256
+/// 3f017b5c2a38b388301e0528f6c54296e2a9906bf69f23b9fe1cc5d70fa70ba2.
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
+    "d3c13a40a243715c1688cb9ba3baa01ce37aed89";
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T10:52:42Z";
+pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1895,6 +1908,15 @@ mod tests {
             "2026-09-25T09:25:51Z"
         );
         assert_eq!(VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
+            "d3c13a40a243715c1688cb9ba3baa01ce37aed89"
+        );
+        assert_eq!(
+            SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T10:52:42Z"
+        );
+        assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 172);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
