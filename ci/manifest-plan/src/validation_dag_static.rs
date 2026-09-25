@@ -241,7 +241,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // e8007f971a7 adds relative_artifacts_and_hermit_paths_are_still_measured
     // and ad21724d5f6 adds only_a_program_name_without_a_slash_is_left_for_path;
     // both retain all 664 prior identities (`cargo nextest list` measured 666).
-    ("test.regular_crates", 676),
+    // One DBT signal-capability configuration control retains all 676 prior identities:
+    // 676 + 1 = 677.
+    ("test.regular_crates", 677),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -263,7 +265,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_bridge_is_not_installed_by_a_process_that_is_pid_1) retain all 754
     // prior identities (`cargo nextest list --profile ci` measured 758;
     // https://github.com/rrnewton/hermit/issues/3354).
-    ("test.hermit_unit", 758),
+    // One backend signal-report capability control retains all 758 prior IDs.
+    ("test.hermit_unit", 759),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -279,7 +282,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
-    ("test.detcore_unit", 810),
+    // Seventeen signal-wake scheduler and six signal-mask helper controls retain all 810 prior IDs:
+    // 810 + 23 = 833.
+    ("test.detcore_unit", 833),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -292,7 +297,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3354) adds one more. Both
     // retain all 171 prior identities (`cargo nextest list --profile ci`
     // measured 173).
-    ("test.hermit_integration", 173),
+    // Two signal_determinism rt_sigsuspend tests retain all 173 prior IDs:
+    // sigsuspend_mask_fallback_warns_in_the_compared_log and
+    // ptrace_sigsuspend_runs_without_probe_injections.
+    ("test.hermit_integration", 175),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -325,14 +333,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 810),
-    // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 173),
-    ("test.hermit_unit_on_host", 758),
+    ("test.detcore_unit_on_host", 833),
+    // Host variants select the same proc regressions and the same two
+    // signal_determinism tests, and retain prior identities.
+    ("test.hermit_integration_on_host", 175),
+    ("test.hermit_unit_on_host", 759),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 676),
+    ("test.regular_crates_on_host", 677),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
