@@ -298,7 +298,7 @@ pub struct ExpectedGuestExit {
 
 impl ExpectedGuestExit {
     /// Whether Hermit's own process status reports this guest disposition.
-    fn hermit_status_matches(&self, code: Option<i32>, signal: Option<i32>) -> bool {
+    pub fn hermit_status_matches(&self, code: Option<i32>, signal: Option<i32>) -> bool {
         match (self.code, self.signal) {
             (Some(expected), None) => code == Some(expected) && signal.is_none(),
             (None, Some(expected)) => {
