@@ -86,6 +86,19 @@ fn sysinfo_uptime_seconds(
     Ok(uptime_offset_seconds.wrapping_add(seconds))
 }
 
+/// Render Linux's whole-second uptime from an absolute logical clock.
+///
+/// Subtract before truncating. Truncating `now` and `boot` separately makes a
+/// sub-second run appear one second old whenever it crosses an absolute-second
+/// boundary, even though less than one logical second elapsed.
+fn logical_uptime_seconds(
+    now: crate::types::LogicalTime,
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> u64 {
+    uptime_offset_seconds + (now - boot).as_secs()
+}
+
 fn prlimit_targets_current_process(
     target_pid: i32,
     deterministic_pid: Option<i32>,
@@ -381,8 +394,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
     ) -> Result<u64, Error> {
         let global_time = thread_observe_time(guest).await;
-        Ok(self.cfg.sysinfo_uptime_offset + global_time.as_secs()
-            - crate::types::DetTime::new(&self.cfg).as_nanos().as_secs())
+        Ok(logical_uptime_seconds(
+            global_time,
+            crate::types::DetTime::new(&self.cfg).as_nanos(),
+            self.cfg.sysinfo_uptime_offset,
+        ))
     }
 
     async fn collect_sysinfo<G: Guest<Self>>(
@@ -596,6 +612,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "sysinfo observed logical time 999 ns before epoch 1000 ns"
+        );
+    }
+
+    #[test]
+    fn uptime_subtracts_fractional_boot_before_truncating() {
+        let boot = LogicalTime::from_nanos(1_000_999_999_999);
+
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_nanos(1), boot, 120),
+            120
+        );
+        assert_eq!(
+            logical_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
+            121
         );
     }
 

@@ -965,8 +965,10 @@ mod global_time_tests {
 
     #[test]
     fn submicrosecond_epoch_starts_with_zero_elapsed_time() {
-        let mut config = Config::default();
-        config.epoch = "2026-09-24T23:52:07.760605385Z".parse().unwrap();
+        let config = Config {
+            epoch: "2026-09-24T23:52:07.760605385Z".parse().unwrap(),
+            ..Config::default()
+        };
         let mut time = GlobalTime::new(&config);
         assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO);
         time.add_extra_time(Duration::from_nanos(1));

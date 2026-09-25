@@ -408,6 +408,10 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
                 "install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so",
             )
             || !source.contains("sabre_before=$(sha256sum \"$sabre_source\"")
+            || source
+                .matches("cargo clean --release -p reverie-dbt -p detcore-sabre")
+                .count()
+                != 2
             || !source.contains("rm -rf target/install_pkg/rsrcs/hermit-runtime")
         {
             return Err(format!("release-artifact bracket: {tag} can bypass the selected artifact"));
