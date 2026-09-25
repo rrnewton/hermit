@@ -950,8 +950,14 @@ impl GlobalTime {
     /// baseline. `DetTime` stores the epoch at microsecond precision, so
     /// subtracting the original nanosecond `DateTime` can underflow for an
     /// otherwise empty run whose epoch has a sub-microsecond component.
-    pub fn elapsed_nanos(&self) -> LogicalDuration {
-        self.total - self.starting_nanos
+    ///
+    /// Global time never falls behind its own baseline; `None` reports that
+    /// broken invariant in every build profile instead of wrapping in release.
+    pub fn elapsed_nanos(&self) -> Option<LogicalDuration> {
+        self.total
+            .as_nanos()
+            .checked_sub(self.starting_nanos.as_nanos())
+            .map(LogicalTime::from_nanos)
     }
 }
 
@@ -970,9 +976,16 @@ mod global_time_tests {
             ..Config::default()
         };
         let mut time = GlobalTime::new(&config);
-        assert_eq!(time.elapsed_nanos(), LogicalTime::ZERO);
+        assert_eq!(time.elapsed_nanos(), Some(LogicalTime::ZERO));
         time.add_extra_time(Duration::from_nanos(1));
-        assert_eq!(time.elapsed_nanos(), LogicalTime::from_nanos(1));
+        assert_eq!(time.elapsed_nanos(), Some(LogicalTime::from_nanos(1)));
+    }
+
+    #[test]
+    fn global_time_behind_its_baseline_is_refused_not_wrapped() {
+        let mut time = GlobalTime::new(&Config::default());
+        time.total = LogicalTime::from_nanos(time.starting_nanos.as_nanos() - 1);
+        assert_eq!(time.elapsed_nanos(), None);
     }
 
     #[test]
