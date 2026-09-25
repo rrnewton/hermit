@@ -4232,9 +4232,13 @@ struct MatrixPrivateTmpEvidence {
 const MATRIX_PRIVATE_TMP_SCHEMA: &str = "hermit-matrix-private-tmp/v2";
 
 /// Re-check a retained invocation's private /tmp evidence: the typed record,
-/// the in-unit readback against it, and that safehermit launched the recorded
-/// unshare.
-fn verify_retained_private_tmp(invocation: &Path, description: &str) -> Result<String, String> {
+/// the recorded candidate against the leg's candidate bytes, the in-unit
+/// readback against it, and that safehermit launched the recorded unshare.
+fn verify_retained_private_tmp(
+    invocation: &Path,
+    description: &str,
+    expected_candidate_sha256: &str,
+) -> Result<String, String> {
     let path = invocation.join("private-tmp.json");
     let text = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {description} private /tmp evidence: {error}"))?;
@@ -4258,6 +4262,31 @@ fn verify_retained_private_tmp(invocation: &Path, description: &str) -> Result<S
         return Err(format!(
             "{description} private /tmp evidence has invalid semantics: {}",
             path.display()
+        ));
+    }
+    let mut destinations = BTreeSet::new();
+    if let Some((_, destination)) = evidence
+        .binds
+        .iter()
+        .find(|(_, destination)| !destinations.insert(destination))
+    {
+        return Err(format!(
+            "{description} private /tmp evidence binds {} twice: {}",
+            destination.display(),
+            path.display()
+        ));
+    }
+    if evidence.candidate_sha256 != expected_candidate_sha256 {
+        return Err(format!(
+            "{description} private /tmp evidence records candidate {} but the leg's candidate is {expected_candidate_sha256}",
+            evidence.candidate_sha256
+        ));
+    }
+    let candidate_sha256 = sha256(&evidence.candidate)?;
+    if candidate_sha256 != expected_candidate_sha256 {
+        return Err(format!(
+            "{description} private /tmp candidate {} now hashes to {candidate_sha256}, not {expected_candidate_sha256}",
+            evidence.candidate.display()
         ));
     }
     let readback = invocation.join("private-tmp.readback");
@@ -4603,7 +4632,7 @@ fn matrix_candidate_proxy_from(
                 readback.display()
             ));
         }
-        verify_retained_private_tmp(&invocation, &description)?;
+        verify_retained_private_tmp(&invocation, &description, &binary_sha256)?;
         let recorded: MatrixPrivateTmpEvidence = decode_typed_json(
             &fs::read_to_string(invocation.join("private-tmp.json"))
                 .map_err(|error| format!("cannot reread private /tmp evidence: {error}"))?,
@@ -5689,6 +5718,8 @@ const MATRIX_PRIVATE_TMP_INVOCATION_FILES: [&str; 7] = [
 
 fn inspect_matrix_candidate_invocations(
     evidence_dir: &Path,
+    cargo_candidate_sha256: &str,
+    buck_candidate_sha256: &str,
 ) -> Result<MatrixCandidateInvocationManifest, String> {
     let root = require_absolute_directory(
         &evidence_dir.join("matrix-candidate-invocations"),
@@ -5719,15 +5750,16 @@ fn inspect_matrix_candidate_invocations(
             .file_name()
             .into_string()
             .map_err(|_| "matrix candidate invocation identity is not UTF-8".to_owned())?;
-        let (candidate_label, identity) = if let Some(identity) = name.strip_prefix("cargo-") {
-            ("cargo", identity)
-        } else if let Some(identity) = name.strip_prefix("buck-") {
-            ("buck", identity)
-        } else {
-            return Err(format!(
-                "unexpected matrix candidate invocation identity {name:?}"
-            ));
-        };
+        let (candidate_label, candidate_sha256, identity) =
+            if let Some(identity) = name.strip_prefix("cargo-") {
+                ("cargo", cargo_candidate_sha256, identity)
+            } else if let Some(identity) = name.strip_prefix("buck-") {
+                ("buck", buck_candidate_sha256, identity)
+            } else {
+                return Err(format!(
+                    "unexpected matrix candidate invocation identity {name:?}"
+                ));
+            };
         if identity.is_empty()
             || !identity
                 .bytes()
@@ -5825,10 +5857,15 @@ fn inspect_matrix_candidate_invocations(
         let (private_tmp_sha256, private_tmp_readback_sha256) =
             if invocation_metadata.role == "dbt-run" {
                 (
-                    Some(verify_retained_private_tmp(&path, &description)?),
+                    Some(verify_retained_private_tmp(
+                        &path,
+                        &description,
+                        candidate_sha256,
+                    )?),
                     Some(sha256(&path.join("private-tmp.readback"))?),
                 )
             } else {
+                require_safehermit_launched(&report, candidate_sha256, &description)?;
                 (None, None)
             };
         invocations.push(MatrixCandidateInvocationBinding {
@@ -5971,9 +6008,15 @@ fn validate_matrix_candidate_completeness(
 fn publish_matrix_candidate_invocation_manifest(
     repository_root: &Path,
     evidence_dir: &Path,
+    cargo_candidate_sha256: &str,
+    buck_candidate_sha256: &str,
 ) -> Result<PathBuf, String> {
     let path = evidence_dir.join("matrix-candidate-invocations.json");
-    let manifest = inspect_matrix_candidate_invocations(evidence_dir)?;
+    let manifest = inspect_matrix_candidate_invocations(
+        evidence_dir,
+        cargo_candidate_sha256,
+        buck_candidate_sha256,
+    )?;
     validate_matrix_candidate_completeness(repository_root, evidence_dir, &manifest)?;
     let text = render_matrix_candidate_invocation_manifest(&manifest)?;
     atomic_write_new(&path, &text)?;
@@ -5982,6 +6025,8 @@ fn publish_matrix_candidate_invocation_manifest(
 
 fn verify_retained_matrix_candidate_invocation_manifest(
     evidence_dir: &Path,
+    cargo_candidate_sha256: &str,
+    buck_candidate_sha256: &str,
 ) -> Result<(MatrixCandidateInvocationManifest, String), String> {
     let path = require_nonempty_regular_file(
         &evidence_dir.join("matrix-candidate-invocations.json"),
@@ -6001,7 +6046,11 @@ fn verify_retained_matrix_candidate_invocation_manifest(
     let retained: MatrixCandidateInvocationManifest =
         decode_typed_json(&retained_text, "matrix candidate invocation manifest")?;
     let canonical_retained = render_matrix_candidate_invocation_manifest(&retained)?;
-    let recomputed = inspect_matrix_candidate_invocations(evidence_dir)?;
+    let recomputed = inspect_matrix_candidate_invocations(
+        evidence_dir,
+        cargo_candidate_sha256,
+        buck_candidate_sha256,
+    )?;
     let canonical_recomputed = render_matrix_candidate_invocation_manifest(&recomputed)?;
     if retained_text != canonical_retained
         || canonical_retained != canonical_recomputed
@@ -6018,9 +6067,14 @@ fn verify_retained_matrix_candidate_invocation_manifest(
 fn verify_matrix_candidate_invocation_manifest(
     repository_root: &Path,
     evidence_dir: &Path,
+    cargo_candidate_sha256: &str,
+    buck_candidate_sha256: &str,
 ) -> Result<MatrixCandidateInvocationFacts, String> {
-    let (retained, manifest_sha256) =
-        verify_retained_matrix_candidate_invocation_manifest(evidence_dir)?;
+    let (retained, manifest_sha256) = verify_retained_matrix_candidate_invocation_manifest(
+        evidence_dir,
+        cargo_candidate_sha256,
+        buck_candidate_sha256,
+    )?;
     let (expected_ledger_sha256, expected_invocation_count) =
         validate_matrix_candidate_completeness(repository_root, evidence_dir, &retained)?;
     Ok(MatrixCandidateInvocationFacts {
@@ -6211,8 +6265,12 @@ fn recompute_final_receipt(
         &buck_matrix,
     )?;
     verify_candidate_invocation_reports(context.evidence_dir)?;
-    let matrix_candidate_invocations =
-        verify_matrix_candidate_invocation_manifest(context.root, context.evidence_dir)?;
+    let matrix_candidate_invocations = verify_matrix_candidate_invocation_manifest(
+        context.root,
+        context.evidence_dir,
+        &sha256(&context.cargo_bundle.binary)?,
+        &sha256(&context.buck_bundle.binary)?,
+    )?;
     let event_log = context.evidence_dir.join("buck-build.json-lines.gz");
     validate_log_header(&event_log)?;
     verify_retained_buck_log_summary(
@@ -7314,7 +7372,12 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         &cargo_matrix,
         &buck_matrix,
     )?;
-    publish_matrix_candidate_invocation_manifest(&root, &evidence_dir)?;
+    publish_matrix_candidate_invocation_manifest(
+        &root,
+        &evidence_dir,
+        &sha256(&cargo_bundle.binary)?,
+        &sha256(&buck_bundle.binary)?,
+    )?;
     let final_provenance = exact_provenance(&root, &cargo_build_info)?;
     if final_provenance != provenance {
         return Err(
@@ -10541,8 +10604,18 @@ mod tests {
             binds: vec![(root.clone(), host_tmp.join("fixture"))],
             unshare: PathBuf::from("/usr/bin/unshare"),
             unshare_sha256: unshare_sha256.clone(),
-            candidate: PathBuf::from("/opt/candidate/hermit"),
-            candidate_sha256: "c".repeat(64),
+            candidate: PathBuf::from("/bin/true"),
+            candidate_sha256: sha256(Path::new("/bin/true")).unwrap(),
+        };
+        // Distinct real candidates outside /tmp, so a retained record is
+        // re-hashed and routed to its own leg's candidate.
+        let cargo_sha256 = private_tmp.candidate_sha256.clone();
+        let buck_sha256 = sha256(Path::new("/bin/false")).unwrap();
+        assert_ne!(cargo_sha256, buck_sha256);
+        let buck_private_tmp = MatrixPrivateTmpEvidence {
+            candidate: PathBuf::from("/bin/false"),
+            candidate_sha256: buck_sha256.clone(),
+            ..private_tmp.clone()
         };
         let readback = format!(
             "tmp={}:{}\ncwd=/tmp\ntmpdir=/tmp\nuid_map=0 4242 1\n",
@@ -10575,16 +10648,19 @@ mod tests {
             .unwrap();
             fs::write(invocation.join("stdout"), format!("{name} stdout\n")).unwrap();
             fs::write(invocation.join("stderr"), format!("{name} stderr\n")).unwrap();
+            let buck = name.starts_with("buck-");
             if role == "dbt-run" {
                 fs::write(invocation.join("safehermit.report"), report(&unshare_sha256)).unwrap();
                 fs::write(
                     invocation.join("private-tmp.json"),
-                    serde_json::to_vec_pretty(&private_tmp).unwrap(),
+                    serde_json::to_vec_pretty(if buck { &buck_private_tmp } else { &private_tmp })
+                        .unwrap(),
                 )
                 .unwrap();
                 fs::write(invocation.join("private-tmp.readback"), &readback).unwrap();
             } else {
-                fs::write(invocation.join("safehermit.report"), report(&"d".repeat(64))).unwrap();
+                let launched = if buck { &buck_sha256 } else { &cargo_sha256 };
+                fs::write(invocation.join("safehermit.report"), report(launched)).unwrap();
             }
         };
         write_invocation("cargo-observed-1", "dbt-run");
@@ -10592,14 +10668,14 @@ mod tests {
         write_invocation("cargo-reference-3", "ptrace-reference");
         write_invocation("buck-reference-4", "ptrace-reference");
         let manifest = root.join("matrix-candidate-invocations.json");
-        let observed = inspect_matrix_candidate_invocations(&root).unwrap();
+        let observed = inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
         atomic_write_new(
             &manifest,
             &render_matrix_candidate_invocation_manifest(&observed).unwrap(),
         )
         .unwrap();
         let (retained, retained_hash) =
-            verify_retained_matrix_candidate_invocation_manifest(&root).unwrap();
+            verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).unwrap();
         assert_eq!(retained.invocations.len(), 4);
         assert_eq!(retained_hash, sha256(&manifest).unwrap());
         for invocation in &retained.invocations {
@@ -10611,7 +10687,7 @@ mod tests {
         // Private /tmp evidence is re-checked by content, not only hashed.
         let dbt = invocations.join("cargo-observed-1");
         let refuses = |needle: &str| {
-            let error = inspect_matrix_candidate_invocations(&root).unwrap_err();
+            let error = inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap_err();
             assert!(error.contains(needle), "{needle}: {error}");
         };
         for (file, bytes, needle) in [
@@ -10648,6 +10724,32 @@ mod tests {
                 .unwrap(),
                 "invalid semantics",
             ),
+            (
+                "private-tmp.json",
+                serde_json::to_string(&MatrixPrivateTmpEvidence {
+                    binds: vec![
+                        (root.clone(), host_tmp.join("fixture")),
+                        (host_tmp.clone(), host_tmp.join("fixture")),
+                    ],
+                    ..private_tmp.clone()
+                })
+                .unwrap(),
+                "twice",
+            ),
+            (
+                "private-tmp.json",
+                serde_json::to_string(&buck_private_tmp).unwrap(),
+                "but the leg's candidate is",
+            ),
+            (
+                "private-tmp.json",
+                serde_json::to_string(&MatrixPrivateTmpEvidence {
+                    candidate: PathBuf::from("/bin/false"),
+                    ..private_tmp.clone()
+                })
+                .unwrap(),
+                "now hashes to",
+            ),
         ] {
             let path = dbt.join(file);
             let original = fs::read(&path).unwrap();
@@ -10678,13 +10780,25 @@ mod tests {
         .unwrap();
         refuses("with role ptrace-reference must hold exactly");
         fs::write(&metadata, &original_metadata).unwrap();
-        inspect_matrix_candidate_invocations(&root).unwrap();
+        // A retained reference must have been launched by safehermit as its
+        // own leg's candidate, not merely carry applied bounds.
+        let reference_report = reference.join("safehermit.report");
+        for launched in [&buck_sha256, &unshare_sha256] {
+            fs::write(&reference_report, report(launched)).unwrap();
+            refuses("records launched binary");
+        }
+        fs::write(&reference_report, report(&cargo_sha256)).unwrap();
+        // Swapping the legs' candidates refuses every retained invocation.
+        assert!(
+            inspect_matrix_candidate_invocations(&root, &buck_sha256, &cargo_sha256).is_err()
+        );
+        inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
 
         let readback_path = dbt.join("private-tmp.readback");
         fs::write(&readback_path, readback.replace("tmp=", "tmp=1")).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&readback_path, &readback).unwrap();
-        verify_retained_matrix_candidate_invocation_manifest(&root).unwrap();
+        verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).unwrap();
 
         let original_manifest = fs::read_to_string(&manifest).unwrap();
         fs::write(
@@ -10692,34 +10806,34 @@ mod tests {
             original_manifest.replace("observed-1", "mutated-1"),
         )
         .unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&manifest, &original_manifest).unwrap();
 
         fs::remove_file(&manifest).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&manifest, &original_manifest).unwrap();
 
         let stdout = invocations.join("cargo-observed-1/stdout");
         let original_stdout = fs::read(&stdout).unwrap();
         fs::write(&stdout, b"mutated stdout\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&stdout, original_stdout).unwrap();
 
         let data = invocations.join("cargo-observed-1/data/runtime.log");
         let original_data = fs::read(&data).unwrap();
         fs::write(&data, b"mutated data\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&data, original_data).unwrap();
 
         let empty_directory = invocations.join("cargo-observed-1/data/late-empty-directory");
         fs::create_dir(&empty_directory).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::remove_dir(&empty_directory).unwrap();
 
         let stderr = invocations.join("cargo-observed-1/stderr");
         let original_stderr = fs::read(&stderr).unwrap();
         fs::write(&stderr, b"mutated stderr\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&stderr, original_stderr).unwrap();
 
         let report = invocations.join("buck-observed-2/safehermit.report");
@@ -10729,30 +10843,30 @@ mod tests {
             b"safehermit: bound.wall=APPLIED:119s\nsafehermit: bound.cgroup=APPLIED:MemoryMax=2G\nsafehermit: bound.disk=APPLIED:8G\nsafehermit: bound.bytes=APPLIED:67108864\nsafehermit: bound.logfilter=NOT_APPLIED:by owner ruling\n",
         )
         .unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&report, &original_report).unwrap();
         fs::remove_file(&report).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::write(&report, &original_report).unwrap();
 
         let extra = invocations.join("cargo-observed-1/extra");
         fs::write(&extra, b"unexpected\n").unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::remove_file(&extra).unwrap();
 
         let link = invocations.join("cargo-observed-1/linked");
         std::os::unix::fs::symlink("stdout", &link).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::remove_file(&link).unwrap();
 
         write_invocation("cargo-extra-observed", "ptrace-reference");
         write_invocation("buck-extra-observed", "ptrace-reference");
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::remove_dir_all(invocations.join("cargo-extra-observed")).unwrap();
         fs::remove_dir_all(invocations.join("buck-extra-observed")).unwrap();
 
         fs::remove_dir_all(invocations.join("buck-observed-2")).unwrap();
-        assert!(verify_retained_matrix_candidate_invocation_manifest(&root).is_err());
+        assert!(verify_retained_matrix_candidate_invocation_manifest(&root, &cargo_sha256, &buck_sha256).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
