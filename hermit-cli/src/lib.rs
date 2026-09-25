@@ -5158,14 +5158,35 @@ mod tests {
             }
         }
 
-        fn run_log(output: &Output) -> impl tracing::Subscriber + Send + Sync {
-            let output = output.clone();
-            tracing_subscriber::fmt()
-                .with_timer(FixedTime)
-                .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-                .with_ansi(false)
-                .with_writer(move || output.clone())
-                .finish()
+        // The shape of Hermit's run subscriber (bin/hermit/tracing.rs): a
+        // public log layer under the run's per-target filter, and an evidence
+        // layer at INFO, each filtering on its own. The public filter here
+        // drops one Detcore submodule's INFO record that the evidence keeps.
+        fn run_log(
+            public: &Output,
+            evidence: &Output,
+        ) -> impl tracing::Subscriber + Send + Sync + use<> {
+            use tracing_subscriber::Layer;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let (public, evidence) = (public.clone(), evidence.clone());
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(FixedTime)
+                        .with_ansi(false)
+                        .with_writer(move || public.clone())
+                        .with_filter(tracing_subscriber::EnvFilter::new(
+                            "warn,detcore=info,detcore::random=warn",
+                        )),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(FixedTime)
+                        .with_ansi(false)
+                        .with_writer(move || evidence.clone())
+                        .with_filter(tracing::level_filters::LevelFilter::INFO),
+                )
         }
 
         fn emit() {
@@ -5193,18 +5214,22 @@ mod tests {
             CAPTURED.lock().unwrap().push(record);
         }
 
-        let direct = Output::default();
-        tracing::subscriber::with_default(run_log(&direct), emit);
+        let (direct, direct_evidence) = (Output::default(), Output::default());
+        tracing::subscriber::with_default(run_log(&direct, &direct_evidence), emit);
         tracing::subscriber::with_default(RecordCapture::new(tracing::Level::INFO, push), emit);
         let records = std::mem::take(&mut *CAPTURED.lock().unwrap());
         assert_eq!(records.len(), 4, "{records:?}");
-        let forwarded = Output::default();
-        tracing::subscriber::with_default(run_log(&forwarded), || {
+        let (forwarded, forwarded_evidence) = (Output::default(), Output::default());
+        tracing::subscriber::with_default(run_log(&forwarded, &forwarded_evidence), || {
             records.iter().for_each(log_forwarded_record)
         });
 
-        let direct = String::from_utf8(direct.0.lock().unwrap().clone()).unwrap();
-        let forwarded = String::from_utf8(forwarded.0.lock().unwrap().clone()).unwrap();
+        let text = |output: Output| String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let (direct, forwarded) = (text(direct), text(forwarded));
+        assert_eq!(direct.lines().count(), 3, "{direct}");
+        assert!(!direct.contains("AT_RANDOM"), "{direct}");
+        assert_eq!(forwarded, direct);
+        let (direct, forwarded) = (text(direct_evidence), text(forwarded_evidence));
         assert_eq!(direct.lines().count(), 4, "{direct}");
         assert!(direct.contains(r#"name="a b" shown=c d"#), "{direct}");
         assert_eq!(forwarded, direct);
