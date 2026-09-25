@@ -145,7 +145,6 @@ pub(crate) fn admit(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
 
@@ -184,12 +183,12 @@ mod tests {
             let here = dir.path().join("ci/hermetic");
             std::fs::create_dir_all(&here).unwrap();
             for name in ["run-in-pinned-root.sh", "image.digest"] {
-                std::fs::copy(root().join("ci/hermetic").join(name), here.join(name)).unwrap();
+                crate::exec_safe_fs::copy(root().join("ci/hermetic").join(name), here.join(name)).unwrap();
             }
             let bin = dir.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
             let podman = bin.join("podman");
-            std::fs::write(
+            crate::exec_safe_fs::write_executable(
                 &podman,
                 r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -211,9 +210,9 @@ fi
 echo 'unexpected mutating or unknown Podman command' >&2
 exit 91
 "#,
+                0o755,
             )
             .unwrap();
-            std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
             let reference = std::fs::read_to_string(here.join("image.digest"))
                 .unwrap()
                 .trim()
