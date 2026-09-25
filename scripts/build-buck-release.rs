@@ -3218,6 +3218,31 @@ fn publish_verified_bundle(
     inspect_published_bundle(&canonical_resolved, name)
 }
 
+/// Publish the Buck candidate from the same pre-overlay caller install as
+/// Cargo. The published Cargo install already carries the overlay's
+/// hermit-runtime copy, which the publisher correctly refuses as an undeclared
+/// closure in a source bundle. Reading the caller twice is safe because the
+/// manifest comparison refuses any change between the two publications.
+fn publish_buck_shadow_bundle(
+    root: &Path,
+    evidence_dir: &Path,
+    buck_binary: &Path,
+    caller_install_bundle: &Path,
+    runtime_install: &Path,
+    cargo_bundle: &PublishedBundle,
+) -> Result<PublishedBundle, String> {
+    let buck_bundle = publish_verified_bundle(
+        root,
+        evidence_dir,
+        "buck",
+        buck_binary,
+        caller_install_bundle,
+        runtime_install,
+    )?;
+    require_equal_resource_manifests(cargo_bundle, &buck_bundle)?;
+    Ok(buck_bundle)
+}
+
 #[derive(Debug)]
 struct CandidateOutput {
     stdout: String,
@@ -6380,7 +6405,6 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         &runtime_install,
     )?;
     drop(caller_cargo_binary);
-    drop(caller_install_bundle);
     let safehermit_bundle = snapshot_safehermit_bundle(&caller_safehermit, &evidence_dir)?;
     drop(caller_safehermit);
     let safehermit = safehermit_bundle.launcher.clone();
@@ -6540,15 +6564,15 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     validate_release_needed_libraries(&needed_libraries(&buck_binary)?)?;
     validate_release_rpath(&buck_binary)?;
 
-    let buck_bundle = publish_verified_bundle(
+    let buck_bundle = publish_buck_shadow_bundle(
         &root,
         &evidence_dir,
-        "buck",
         &buck_binary,
-        &cargo_bundle.install,
+        &caller_install_bundle,
         &runtime_install,
+        &cargo_bundle,
     )?;
-    require_equal_resource_manifests(&cargo_bundle, &buck_bundle)?;
+    drop(caller_install_bundle);
 
     let buck_version_data = evidence_dir.join("buck-version-data");
     let buck_version_output = run_safehermit(CandidateInvocation {
@@ -8110,6 +8134,88 @@ mod tests {
         )
         .unwrap();
         assert!(verify_install_bundle(&root, &reverie_sha).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn buck_shadow_publishes_from_the_pre_overlay_caller_install() {
+        let root = fixture_root("buck-shadow-publication-source");
+        fs::create_dir_all(root.join("ci")).unwrap();
+        for name in [
+            "publish-hermit-e2e-artifact.sh",
+            "verify-hermit-e2e-artifact.sh",
+        ] {
+            fs::copy(
+                source_root().join("ci").join(name),
+                root.join("ci").join(name),
+            )
+            .unwrap();
+        }
+        let candidate = root.join("candidate-hermit");
+        let candidate_source = root.join("candidate.c");
+        fs::write(&candidate_source, b"int main(void) { return 0; }\n").unwrap();
+        checked_output(
+            Command::new("gcc")
+                .arg(&candidate_source)
+                .arg("-o")
+                .arg(&candidate),
+            "compile fixture candidate ELF",
+        )
+        .unwrap();
+        let evidence = root.join("evidence");
+        fs::create_dir_all(&evidence).unwrap();
+        let unwind =
+            publish_unwind_buck_input(&root, &evidence, require_unwind_closure().unwrap()).unwrap();
+        let runtime_install = prepare_runtime_install(&evidence, &unwind).unwrap();
+        // The caller bundle matches the DAG's prepared install: complete, but
+        // without a hermit-runtime closure, which only the overlay supplies.
+        let caller = root.join("caller-install");
+        write_complete_install(&caller, &"1".repeat(40));
+        fs::remove_dir_all(caller.join(UNWIND_RUNTIME_RELATIVE)).unwrap();
+
+        let cargo = publish_verified_bundle(
+            &root,
+            &evidence,
+            "cargo",
+            &candidate,
+            &caller,
+            &runtime_install,
+        )
+        .unwrap();
+        // The published Cargo install carries the overlay copy, so it can never
+        // be a source bundle for a second overlaid publication.
+        assert!(cargo.install.join(UNWIND_RUNTIME_RELATIVE).is_dir());
+
+        let buck = publish_buck_shadow_bundle(
+            &root,
+            &evidence,
+            &candidate,
+            &caller,
+            &runtime_install,
+            &cargo,
+        )
+        .unwrap();
+        assert_eq!(buck.resource_inventory, cargo.resource_inventory);
+        assert_ne!(buck.root, cargo.root);
+
+        // A caller install that changes between the two publications is still
+        // refused as mixed input rather than published.
+        fs::write(caller.join("rsrcs/unprobed-resource"), b"generation-two\n").unwrap();
+        let changed_evidence = root.join("changed-evidence");
+        fs::create_dir_all(&changed_evidence).unwrap();
+        let changed = publish_buck_shadow_bundle(
+            &root,
+            &changed_evidence,
+            &candidate,
+            &caller,
+            &runtime_install,
+            &cargo,
+        )
+        .unwrap_err();
+        assert!(
+            changed.contains("refusing mixed mutable caller inputs"),
+            "{changed}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
