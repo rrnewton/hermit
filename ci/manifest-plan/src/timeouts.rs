@@ -96,16 +96,18 @@ pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
 /// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
-/// thread blocked in `select` or `poll` outside the run queue with EINTR, even
-/// under SA_RESTART, and the interruption must be committed at a
-/// deterministic turn while a sibling keeps the scheduler busy. The cell
-/// passed ten consecutive strict verify runs, each on its first attempt, with
-/// a build of the evidence SHA, which is the last commit that changes how the
-/// scheduler sends signals; guest source sha256
-/// 498b0cc606dba6549c0805ddea281538eeae8d21ec314151bbec416e4d42362b.
+/// thread blocked in `select` over more than 64 descriptors, which Hermit runs
+/// as blocking external IO outside the run queue, with EINTR even under
+/// SA_RESTART, and the interruption must be committed at a deterministic turn
+/// while a sibling keeps the scheduler busy. Its `poll` phase is serviced by
+/// internal polling and is only a control. The cell passed ten consecutive
+/// strict verify runs, each on its first attempt, with a clean build of the
+/// evidence SHA; the last commit that changes how the scheduler sends signals
+/// is its ancestor 4a30a8a40d3c. Guest source sha256
+/// e8babb4316082311cdbb50cfce2128d58b0d7482e5de7d0c29dbeaca066afa40.
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
-    "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d";
-pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:00:39Z";
+    "1b9874539b954e65c6229b91aeb263e9ec91c611";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:38:24Z";
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
@@ -1933,11 +1935,11 @@ mod tests {
         assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
-            "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d"
+            "1b9874539b954e65c6229b91aeb263e9ec91c611"
         );
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T14:00:39Z"
+            "2026-09-25T14:38:24Z"
         );
         assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 172);
