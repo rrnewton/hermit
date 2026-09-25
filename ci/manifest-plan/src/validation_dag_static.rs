@@ -569,7 +569,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validation_dag::tests::committed_buck_e2e_selection_replaces_22_nodes_with_18,
     // added with the full-buck-e2e label (Buck as the E2E runner), retains all
     // 840 prior identities.
-    ("test.regular_crates", 841),
+    // One DBT signal-capability configuration control
+    // (every_config_source_clears_the_ptrace_only_signal_capabilities;
+    // https://github.com/rrnewton/hermit/pull/3224) retains all 841 prior identities.
+    ("test.regular_crates", 842),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -677,7 +680,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a skid overshoot no longer erases a refused comparison's reason, so the
     // SKID-RETRY of https://github.com/rrnewton/hermit/issues/1845 cannot
     // retry it) retains all 816 prior identities.
-    ("test.hermit_unit", 817),
+    // One backend signal-report capability control
+    // (only_ptrace_hosted_backends_report_signal_interrupted_external_io;
+    // https://github.com/rrnewton/hermit/pull/3224) retains all 817 prior IDs.
+    ("test.hermit_unit", 818),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -742,7 +748,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bootstrap_syscall_marks_its_resource_requests_only_while_it_is_uncharged,
     // https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities: 876 + 2 = 878.
-    ("test.detcore_unit", 878),
+    // Seventeen signal-wake scheduler and six signal-mask helper controls
+    // (https://github.com/rrnewton/hermit/pull/3224) retain all 878 prior
+    // identities: 878 + 23 = 901.
+    ("test.detcore_unit", 901),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -800,7 +809,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_renamed_over_target_does_not_get_the_explicit_mtime
     // (https://github.com/rrnewton/hermit/issues/3565); they retain all 193
     // prior identities.
-    ("test.hermit_integration", 195),
+    // Two signal_determinism rt_sigsuspend tests
+    // (https://github.com/rrnewton/hermit/pull/3224) retain all 195 prior IDs:
+    // sigsuspend_mask_fallback_warns_in_the_compared_log and
+    // ptrace_sigsuspend_runs_without_probe_injections.
+    ("test.hermit_integration", 197),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -958,7 +971,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two bootstrap-turn scheduler-time tests listed for test.detcore_unit
     // (https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities.
-    ("test.detcore_unit_on_host", 878),
+    // The host twin also selects the 23 signal-wake controls of
+    // https://github.com/rrnewton/hermit/pull/3224.
+    ("test.detcore_unit_on_host", 901),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -971,7 +986,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3639).
     // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
-    ("test.hermit_integration_on_host", 195),
+    // The host twin also selects the two signal_determinism tests
+    // (https://github.com/rrnewton/hermit/pull/3224).
+    ("test.hermit_integration_on_host", 197),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -985,6 +1002,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3547).
     // The host twin carries the same dispatch-record change (+2, -1;
     // https://github.com/rrnewton/hermit/pull/3522).
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
     // The host node carries the identical selection.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3603 test.
     // The host twin selects the same eighteen
@@ -992,7 +1010,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same 562b7dd7a635 test.
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
-    ("test.hermit_unit_on_host", 817),
+    ("test.hermit_unit_on_host", 818),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -1025,7 +1043,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 838, and the retained-PASS re-decision test listed there retains
     // all 839.
     // committed_buck_e2e_selection_replaces_22_nodes_with_18 retains all 840.
-    ("test.regular_crates_on_host", 841),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
+    ("test.regular_crates_on_host", 842),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
