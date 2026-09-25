@@ -11016,14 +11016,19 @@ esac
             )
         );
 
+        // Fixtures that make the fake Hermit die by a signal use signals that
+        // never dump core. A core-dumping signal hands the dump to the host's
+        // core_pattern helper, which ignores RLIMIT_CORE when it is a pipe and
+        // took from 0.5 to over 5 seconds on a loaded host, past this
+        // fixture's 5-second backstop.
         let raised = attempt_with_expected_exit(
-            expected_exit(None, Some(11)),
+            expected_exit(None, Some(15)),
             None,
-            Some(11),
-            "kill -SEGV $$",
+            Some(15),
+            "kill -TERM $$",
         );
         assert_eq!(raised.outcome, "PASS", "{:?}", raised.reason);
-        assert_eq!(raised.signal, Some(11));
+        assert_eq!(raised.signal, Some(15));
 
         let shell_status =
             attempt_with_expected_exit(expected_exit(None, Some(11)), None, Some(11), "exit 139");
@@ -11040,16 +11045,36 @@ esac
         );
 
         let other_signal = attempt_with_expected_exit(
-            expected_exit(None, Some(11)),
+            expected_exit(None, Some(15)),
             None,
-            Some(6),
-            "kill -ABRT $$",
+            Some(10),
+            "kill -USR1 $$",
         );
         assert_eq!(other_signal.outcome, "FAIL");
         assert_eq!(
             other_signal.reason.as_deref(),
-            Some("guest ended with signal 6, but the manifest expects signal 11")
+            Some("guest ended with signal 10, but the manifest expects signal 15")
         );
+
+        // A matching signal in the report is not enough when Hermit's own
+        // status reports a success, a different signal, or 128 plus a
+        // different signal number.
+        for (ending, hermit) in [
+            ("exit 0", "exited with status 0"),
+            ("kill -USR1 $$", "was killed by signal 10"),
+            ("exit 138", "exited with status 138"),
+        ] {
+            let hermit_disagrees =
+                attempt_with_expected_exit(expected_exit(None, Some(15)), None, Some(15), ending);
+            assert_eq!(hermit_disagrees.outcome, "FAIL", "{ending}");
+            assert_eq!(
+                hermit_disagrees.reason,
+                Some(format!(
+                    "guest ended with signal 15, but hermit {hermit}, which does not report signal 15"
+                )),
+                "{ending}"
+            );
+        }
 
         let succeeded =
             attempt_with_expected_exit(expected_exit(Some(1), None), Some(0), None, "exit 0");

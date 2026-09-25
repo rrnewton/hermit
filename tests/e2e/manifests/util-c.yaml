@@ -29,8 +29,8 @@ test:
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         expected_guest_exit:
-          code: 1
-          reason: Detcore refuses guest ptrace with a deterministic EPERM (the privileged-observation boundary), so the child cannot enter its PTRACE_TRACEME stop and this host PMU diagnostic reports that and exits 1.
+          code: 3
+          reason: Detcore refuses guest ptrace with a deterministic EPERM (the privileged-observation boundary), so PTRACE_TRACEME fails in the child and this host PMU diagnostic exits with its dedicated refused-ptrace status 3 (EXIT_PTRACE_REFUSED), distinct from the EXIT_FAILURE that every other failure path returns.
       naked:
         ci: false
         backends_enabled: []
