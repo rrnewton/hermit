@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 173;
+pub const NON_CI_CELL_COUNT: usize = 171;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -71,6 +71,13 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// Two ptrace verify cells re-selected after twenty clean canonical
+/// repetitions each at the fix head (base `1bf22b4f5ba322b7cc2f80e3dd251cc2baabc548`
+/// plus the Detcore fixes in the same change): `c-programs/socket-timestamp-edge-cases`
+/// (aliased-recvmsg io-buffer EFAULT fix; 20/20 matched) and
+/// `system-utils/procfs-sanitized-paths` (20/20 matched under its manifest
+/// comparison profile `compare_io_buffers: false, rcb_time: false`).
+pub const PTRACE_REQUALIFIED_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 2;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1877,7 +1884,7 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
-        assert_eq!(NON_CI_CELL_COUNT, 173);
+        assert_eq!(NON_CI_CELL_COUNT, 171);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

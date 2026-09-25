@@ -5584,6 +5584,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "kvm"
@@ -7348,6 +7355,13 @@
           "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/proc-uptime",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -11012,6 +11026,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "ptrace"
@@ -11671,6 +11692,13 @@
           "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/proc-uptime",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -18992,6 +19020,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "kvm"
@@ -20708,6 +20743,13 @@
           "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/proc-uptime",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
           "backend": "ptrace"
         },
