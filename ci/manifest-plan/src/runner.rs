@@ -10944,6 +10944,7 @@ esac
             expected,
             expected_exit_report(guest_exit_code, guest_signal),
             ending,
+            5,
         )
     }
 
@@ -10963,11 +10964,13 @@ esac
         report
     }
 
-    /// Run a fake Hermit that writes `report`, then ends with `ending`.
+    /// Run a fake Hermit that writes `report`, then ends with `ending`, under
+    /// a wall backstop of `timeout_seconds`.
     fn attempt_with_expected_exit_report(
         expected: ExpectedGuestExit,
         report: VerificationReport,
         ending: &str,
+        timeout_seconds: u64,
     ) -> AttemptResult {
         let dir = std::env::temp_dir().join(format!(
             "hermit-runner-expected-exit-{}-{:?}",
@@ -10996,7 +10999,7 @@ esac
                 verdict.to_string_lossy().into_owned(),
             ],
             guest_argv: vec!["fixture".into()],
-            timeout_seconds: 5,
+            timeout_seconds,
             verdict_path: Some(verdict),
             verification_log_dir: None,
             sabre_path_evidence: None,
@@ -11103,6 +11106,22 @@ esac
         let succeeded =
             attempt_with_expected_exit(expected_exit(Some(1), None), Some(0), None, "exit 0");
         assert_eq!(succeeded.outcome, "FAIL");
+
+        // A matching exit code in the report is not enough when Hermit itself
+        // was killed by a signal.
+        let hermit_killed = attempt_with_expected_exit(
+            expected_exit(Some(7), None),
+            Some(7),
+            None,
+            "kill -TERM $$",
+        );
+        assert_eq!(hermit_killed.outcome, "FAIL");
+        assert_eq!(
+            hermit_killed.reason.as_deref(),
+            Some(
+                "guest ended with exit code 7, but hermit was killed by signal 15, which does not report exit code 7"
+            )
+        );
     }
 
     /// The expected disposition is checked only after the comparison has been
@@ -11122,7 +11141,7 @@ esac
         diverged.first_divergent_left_message = Some("left".into());
         diverged.first_divergent_right_message = Some("right".into());
         let result =
-            attempt_with_expected_exit_report(expected_exit(Some(7), None), diverged, "exit 7");
+            attempt_with_expected_exit_report(expected_exit(Some(7), None), diverged, "exit 7", 5);
         assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
         assert_eq!(
             result.reason.as_deref(),
@@ -11135,7 +11154,7 @@ esac
         stripped.comparison.as_mut().unwrap().strictness =
             crate::canonical_verdict::LogCompareStrictness::Stripped;
         let result =
-            attempt_with_expected_exit_report(expected_exit(Some(7), None), stripped, "exit 7");
+            attempt_with_expected_exit_report(expected_exit(Some(7), None), stripped, "exit 7", 5);
         assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
         assert_eq!(
             result.error_kind.as_deref(),
@@ -11147,6 +11166,23 @@ esac
                 "verification did not compare canonical non-vacuous INFO evidence: strictness=stripped compare_logs=true record_envelope=all_records_v1 messages=1/1"
             )
         );
+    }
+
+    /// An attempt stopped by the wall backstop is never a pass, even when it
+    /// left a matched canonical report of the expected exit and Hermit, on the
+    /// backstop's SIGTERM, still exited with that code.
+    #[test]
+    fn expected_guest_exit_cannot_pass_a_timed_out_attempt() {
+        let result = attempt_with_expected_exit_report(
+            expected_exit(Some(7), None),
+            expected_exit_report(Some(7), None),
+            "trap 'exit 7' TERM; sleep 30 & wait",
+            1,
+        );
+        assert!(result.timed_out, "{result:?}");
+        assert_eq!(result.status, Some(7), "{result:?}");
+        assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
+        assert_eq!(result.error_kind.as_deref(), Some("wall-timeout"));
     }
 
     #[test]
