@@ -4891,9 +4891,8 @@ Rss:                   4 kB\n" as &[u8];
             b"99 1 0:1 / /mnt/xarfuse/uid-1/s rw - fuse.squashfuse_ll squashfuse_ll rw\n20 99 8:1 / /child rw - ext4 /dev/a rw\n";
         let filtered = exclude_ephemeral_host_seed_mounts(contents);
         let rows = parse_mountinfo(&filtered).unwrap();
-        let snapshot =
-            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new())
-                .expect("parent pass must cover the retained child");
+        let snapshot = MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new())
+            .expect("parent pass must cover the retained child");
         let rendered = sanitize_mountinfo(&filtered, &snapshot);
         assert!(rendered.windows(6).any(|w| w == b"/child"));
         assert!(!rendered.windows(7).any(|w| w == b"xarfuse"));
