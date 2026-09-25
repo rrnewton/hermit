@@ -4663,11 +4663,12 @@ impl NetworkReplayEngine {
                 if accepted == 0 && !bytes.is_empty() {
                     return Err(NetworkReplayError::TraceExhausted(channel));
                 }
-                *consumed += accepted;
-                state.transmitted = state
+                let transmitted = state
                     .transmitted
                     .checked_add(accepted as u64)
                     .ok_or(NetworkReplayError::Overflow)?;
+                *consumed += accepted;
+                state.transmitted = transmitted;
                 if *consumed == expected.len() {
                     state.outbound.pop_front();
                 }
@@ -4724,12 +4725,13 @@ impl NetworkReplayEngine {
         if accepted == 0 {
             return Ok(StreamTransmitOutcome::Accepted(0));
         }
-        *consumed = accepted;
-        expected_ancillary.take();
-        state.transmitted = state
+        let transmitted = state
             .transmitted
             .checked_add(accepted as u64)
             .ok_or(NetworkReplayError::Overflow)?;
+        *consumed = accepted;
+        expected_ancillary.take();
+        state.transmitted = transmitted;
         if accepted == expected.len() {
             state.outbound.pop_front();
         }
@@ -7418,6 +7420,58 @@ mod tests {
             StreamTransmitOutcome::Accepted(1));
         assert_eq!(engine.transmit_stream(ofd, b"d").unwrap(), StreamTransmitOutcome::Accepted(1));
         engine.finish().unwrap();
+    }
+
+    #[test]
+    fn stream_output_overflow_preserves_required_bytes_ancillary_and_completion() {
+        // Exercise the engine's refusal invariant at an unreachable-by-small-
+        // fixture frontier, without allocating a u64-sized trace.
+        for message in [false, true] {
+            let ancillary = NetworkAncillaryDataV2 {
+                bytes: vec![0; 4], objects: vec![], truncated: false,
+            };
+            let mut history = trace();
+            history.inputs.clear();
+            history.outputs = vec![NetworkOutputEventV2 {
+                channel: channel_id(),
+                event: if message {
+                    NetworkOutputKindV2::StreamMessage {
+                        stream_offset: 0, bytes: b"ab".to_vec(),
+                        ancillary: ancillary.clone(), message_flags: 0,
+                    }
+                } else {
+                    NetworkOutputKindV2::StreamBytes {
+                        stream_offset: 0, bytes: b"ab".to_vec(),
+                    }
+                },
+            }];
+            let mut engine = NetworkReplayEngine::replay(history).unwrap();
+            let ofd = open_file(0);
+            engine.bind(ofd, channel_id()).unwrap();
+            engine.channels.get_mut(&channel_id()).unwrap().transmitted = u64::MAX;
+            let pending = format!("{engine:?}");
+            for _ in 0..2 {
+                let result = if message {
+                    engine.transmit_stream_message(ofd, b"a", &ancillary, 0)
+                } else {
+                    engine.transmit_stream(ofd, b"a")
+                };
+                assert!(matches!(result, Err(NetworkReplayError::Overflow)));
+                assert_eq!(format!("{engine:?}"), pending);
+                assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+            }
+            // Clearing only the injected frontier must leave the original
+            // bytes and ancillary available to complete exactly once.
+            engine.channels.get_mut(&channel_id()).unwrap().transmitted = 0;
+            let result = if message {
+                engine.transmit_stream_message(ofd, b"a", &ancillary, 0)
+            } else {
+                engine.transmit_stream(ofd, b"a")
+            };
+            assert_eq!(result.unwrap(), StreamTransmitOutcome::Accepted(1));
+            assert_eq!(engine.transmit_stream(ofd, b"b").unwrap(), StreamTransmitOutcome::Accepted(1));
+            engine.finish().unwrap();
+        }
     }
 
     #[test]
