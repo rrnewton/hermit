@@ -137,9 +137,10 @@ struct OpenFileDescription {
     /// succeeds on this open file description.
     #[serde(default)]
     directory: Option<DirectoryStream>,
-    /// True once `getdents` on this open file reads the host directory one
+    /// True while `getdents` on this open file reads the host directory one
     /// kernel buffer at a time, because no whole-directory snapshot can stand
-    /// in for its position. See `use_host_directory_order`.
+    /// in for its position. See `use_host_directory_order`; an `lseek` back
+    /// to 0 clears it.
     #[serde(default)]
     directory_host_order: bool,
     /// Held across a whole `getdents` or `lseek` on this open file
@@ -536,14 +537,20 @@ impl DetFd {
         self.description().directory_host_order
     }
 
-    /// Read this open file's directory one kernel buffer at a time from now
-    /// on: its position was moved before the first `getdents`, or the guest's
-    /// buffer cannot hold every entry. Any stream is dropped, so `lseek`
-    /// reaches the kernel again.
+    /// Read this open file's directory one kernel buffer at a time until it
+    /// is seeked back to 0: its position was moved before the first
+    /// `getdents`, or the guest's buffer cannot take every entry. Any stream
+    /// is dropped, so `lseek` reaches the kernel again.
     pub(crate) fn use_host_directory_order(&self) {
         let mut description = self.description();
         description.directory_host_order = true;
         description.directory = None;
+    }
+
+    /// Serve this open file's directory as a sorted stream again, from its
+    /// next `getdents`: its kernel position is back at 0.
+    pub(crate) fn use_directory_stream(&self) {
+        self.description().directory_host_order = false;
     }
 
     /// Whether the next `getdents` must read the host directory.
@@ -554,8 +561,8 @@ impl DetFd {
             .is_none_or(DirectoryStream::needs_snapshot)
     }
 
-    /// Install a freshly read snapshot, creating the stream at position 0 if
-    /// this is the open file's first `getdents`.
+    /// Install a snapshot freshly read in host order, creating the stream at
+    /// position 0 if this is the open file's first `getdents`.
     pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>) {
         self.description()
             .directory
