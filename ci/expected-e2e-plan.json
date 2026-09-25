@@ -6056,6 +6056,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/timerfd-semantics"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/procfs-sanitized-paths"
     }
   ],
   "schema": 1
