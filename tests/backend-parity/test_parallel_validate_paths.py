@@ -350,5 +350,85 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
             self.assertEqual((tmp_b / fixed_name).read_text(), "run-b\n")
 
 
+    def test_shadow_proxy_receives_the_private_tmp_stage_outside_it(self) -> None:
+        """safehermit must not start inside run_matrix's user namespace.
+
+        Its disk bound needs host sudo and its systemd unit escapes an outer
+        namespace, so the Buck shadow proxy is handed the unchanged stage as
+        data and enters it inside safehermit's unit instead.
+        """
+        run_matrix = load("proxy_private_tmp_run_matrix", "run_matrix.py")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            host_tmp = root / "host-tmp"
+            host_tmp.mkdir()
+            observed = root / "proxy-uid-map"
+            proxy = root / "scripts" / "build-buck-release.rs"
+            proxy.parent.mkdir()
+            proxy.write_text(
+                "#!/bin/sh\n"
+                f"cat /proc/self/uid_map > {observed}\n"
+                "printf '%s\\0' \"$@\"\n"
+            )
+            proxy.chmod(0o755)
+            guest = ["/guest"]
+            official = run_matrix.hermit_command(
+                proxy, "dbt", guest, "exit_zero", True, host_tmp
+            )
+            self.assertEqual(official[0], "unshare")
+            inner = official[official.index(str(proxy)) :]
+            stage = official[: official.index(str(proxy))]
+
+            with mock.patch.dict(
+                os.environ, {run_matrix.MATRIX_PROXY_ENV: "1"}
+            ), mock.patch.object(run_matrix, "MATRIX_PROXY", proxy):
+                handed = run_matrix.hermit_command(
+                    proxy, "dbt", guest, "exit_zero", True, host_tmp
+                )
+                self.assertEqual(
+                    handed,
+                    [
+                        str(proxy),
+                        run_matrix.MATRIX_PRIVATE_TMP_HANDOFF,
+                        str(len(stage)),
+                        *stage,
+                        *inner[1:],
+                    ],
+                )
+                # Only DBT commands carry the stage at all.
+                self.assertEqual(
+                    run_matrix.hermit_command(
+                        proxy, "ptrace", guest, "exit_zero", True, host_tmp
+                    )[0],
+                    str(proxy),
+                )
+                executed = subprocess.run(
+                    handed,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                self.assertEqual(executed.stdout.split("\0")[:-1], handed[1:])
+                # The killing check: the proxy, and so safehermit, ran in this
+                # test's own user namespace rather than a root-mapped child.
+                self.assertEqual(
+                    observed.read_text(), Path("/proc/self/uid_map").read_text()
+                )
+
+                other = root / "release" / "hermit"
+                other.parent.mkdir()
+                with self.assertRaisesRegex(run_matrix.MatrixError, "only to"):
+                    run_matrix.hermit_command(
+                        other, "dbt", guest, "exit_zero", True, host_tmp
+                    )
+            with mock.patch.dict(os.environ, {run_matrix.MATRIX_PROXY_ENV: "0"}):
+                with self.assertRaisesRegex(run_matrix.MatrixError, "must be 1"):
+                    run_matrix.hermit_command(
+                        proxy, "dbt", guest, "exit_zero", True, host_tmp
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
