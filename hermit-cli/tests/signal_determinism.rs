@@ -285,6 +285,41 @@ fn sigsuspend_invalid_arguments_preserve_linux_error_order() {
     );
 }
 
+/// A mask the tool cannot read directly is checked with an injected probe,
+/// which makes the real call an injection again, so the fallback must say so
+/// in the log that `--verify` compares. The invalid pointer in this scenario
+/// is the one input that always takes it.
+#[test]
+fn sigsuspend_mask_fallback_warns_in_the_compared_log() {
+    let _guard = hermit_signal_lock();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=warn",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+    ]);
+    command
+        .arg(signal_guest())
+        .arg("sigsuspend-invalid-arguments");
+    let output = command_output(command, "sigsuspend mask fallback scenario");
+    assert_eq!(
+        output.stdout,
+        b"rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warnings = stderr
+        .matches(
+            "could not read the rt_sigsuspend mask directly; checking it with an injected rt_sigprocmask",
+        )
+        .count();
+    // Only the invalid pointer reaches the read; the invalid size is refused
+    // first.
+    assert_eq!(warnings, 1, "stderr:\n{stderr}");
+}
+
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_sigsuspend_invalid_pointer_does_not_fault_in_the_tool() {
