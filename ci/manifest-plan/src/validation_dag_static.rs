@@ -219,10 +219,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Six expected-guest-exit controls retain all 610 prior identities.
     // The manifest-gate width contract retains all 616 prior identities.
     // The GlobalTime sub-microsecond elapsed-time and environment-free config
-    // fingerprint regressions retain all 610 prior selected identities.
-    // Two validate-runner tests (validate run 214 measured 620 against 618)
-    // and two stress_series declared_guest_exit tests retain all 619 prior
-    // identities.
+    // fingerprint regressions retain all 617 prior selected identities.
+    // Two validate-runner tests and two stress_series declared_guest_exit
+    // tests retain all 619 prior identities (`cargo nextest list` measured 623).
     ("test.regular_crates", 623),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
