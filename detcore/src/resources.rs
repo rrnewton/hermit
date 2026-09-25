@@ -319,7 +319,14 @@ pub enum ResourceID {
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.
-    BlockingRtSigsuspend(ExternalOpId),
+    BlockingRtSigsuspend {
+        /// The operation this wait belongs to.
+        op_id: ExternalOpId,
+        /// The guest's temporary mask as a kernel sigset: bit `n - 1` blocks
+        /// signal `n`. The scheduler reads it to decide whether a signal it
+        /// sends can end the wait.
+        temporary_mask: u64,
+    },
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -513,7 +520,10 @@ mod tests {
         );
         assert_ne!(
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
-            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(tid1, 7))
+            ResourceID::BlockingRtSigsuspend {
+                op_id: ExternalOpId::new(tid1, 7),
+                temporary_mask: 0,
+            }
         );
         assert_ne!(
             ResourceID::ParentContinue {
