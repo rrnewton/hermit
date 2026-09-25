@@ -29,12 +29,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::ensure;
+use detcore::random::DeferredRecord;
 use detcore::random::InitialImage;
 use detcore::random::LoaderState;
 use detcore::random::encode_continuation;
 use detcore::random::encode_initial_state;
-use detcore::random::getrandom;
-use detcore::random::initialize_auxv;
+use detcore::random::getrandom_deferred;
+use detcore::random::initialize_auxv_deferred;
 use detcore::random::root_prng;
 use nix::unistd::Pid;
 use object::Object;
@@ -1138,6 +1139,10 @@ pub(super) struct Bootstrap {
     generation: u64,
     image: Option<InitialImage>,
     prng: rand_pcg::Pcg64Mcg,
+    // The records the random operations above owe the log. They are handed to
+    // the guest's local tool, which logs them when it takes over, rather than
+    // logged here ahead of the scheduler records that precede them in a run.
+    records: Vec<DeferredRecord>,
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
@@ -1304,6 +1309,7 @@ impl Bootstrap {
             generation,
             image: None,
             prng,
+            records: Vec::new(),
             taken: false,
             sigill: None,
             initial_random,
@@ -1462,11 +1468,11 @@ impl Bootstrap {
             row.permissions.contains('x'),
             "interpreter entry not executable"
         );
-        initialize_auxv(
+        initialize_auxv_deferred(
             &mut self.prng,
             RemoteMemory(pid),
             AddrMut::from_raw(random).ok_or_else(|| anyhow!("null final AT_RANDOM"))?,
-            detcore::types::DetTid::from_raw(pid.as_raw()),
+            &mut self.records,
         )?;
         self.image = Some(InitialImage {
             pid: pid.as_raw(),
@@ -1882,12 +1888,8 @@ impl Bootstrap {
                 let Syscall::Getrandom(call) = call else {
                     unreachable!()
                 };
-                match getrandom(
-                    &mut self.prng,
-                    RemoteMemory(pid),
-                    detcore::types::DetTid::from_raw(pid.as_raw()),
-                    call,
-                ) {
+                match getrandom_deferred(&mut self.prng, RemoteMemory(pid), call, &mut self.records)
+                {
                     Ok(n) => n,
                     Err(e) => -(e.into_raw() as i64),
                 }
@@ -1899,7 +1901,8 @@ impl Bootstrap {
                 );
                 let image = self.image.ok_or_else(|| anyhow!("TAKE before IMAGE"))?;
                 self.check_current_auxv(pid, &rows, image)?;
-                let bytes = encode_initial_state(&self.launch.config, image, &self.prng)?;
+                let bytes =
+                    encode_initial_state(&self.launch.config, image, &self.prng, &self.records)?;
                 let result = Self::write_take(pid, regs, &bytes)?;
                 if result > 0 {
                     self.taken = true;

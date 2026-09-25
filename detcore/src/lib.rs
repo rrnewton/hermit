@@ -1522,6 +1522,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     pedigree: child_pedigree.clone(),
                     initialized_random_auxv: None,
+                    initial_random_records: Vec::new(),
                     stats: ThreadStats::new(),
                     file_metadata: {
                         debug!(
@@ -1732,9 +1733,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .thread_state_mut()
             .complete_initial_random_auxv(auxv.at_random().map(|p| p.as_raw()))
             .expect("authenticated initial random handoff no longer matches this image");
-        // The successful early write already emitted the ordinary auxv INFO
-        // record. Consume only its fact here: no second draw, write or event.
-        if !initialized && let Some(ptr) = auxv.at_random() {
+        if let Some(records) = initialized {
+            // The early write and requests already drew and wrote. Emit the
+            // records they deferred here, where the ordinary auxv record is
+            // emitted: no second draw or write.
+            let dettid = guest.thread_state().dettid;
+            for record in &records {
+                random::emit_deferred(record, dettid);
+            }
+        } else if let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
             let memory = guest.memory();

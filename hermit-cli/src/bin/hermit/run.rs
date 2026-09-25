@@ -11,9 +11,10 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroU64;
@@ -94,7 +95,6 @@ use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
-const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -293,30 +293,20 @@ fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>
     Ok(summary)
 }
 
-fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
-    let mut log = OpenOptions::new().append(true).open(path)?;
-    let mut guest_stderr = Vec::with_capacity(stderr.len());
-    let mut syscall_records = 0;
-    for line in stderr.split_inclusive(|byte| *byte == b'\n') {
-        let start = line
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .unwrap_or(line.len());
-        let payload = line[start..].strip_suffix(b"\n").unwrap_or(&line[start..]);
-        let payload = payload.strip_suffix(b"\r").unwrap_or(payload);
-        if payload.starts_with(b"INFO detcore") && contains_bytes(payload, b" DETLOG ") {
-            log.write_all(NORMALIZED_SABRE_DETLOG_TIMESTAMP.as_bytes())?;
-            log.write_all(b" ")?;
-            log.write_all(payload)?;
-            log.write_all(b"\n")?;
-            syscall_records += usize::from(contains_bytes(payload, b"DETLOG [syscall]"));
-        } else {
-            guest_stderr.extend_from_slice(line);
-        }
+/// Count the syscall DETLOG records in a SaBRe run's log.
+///
+/// The guest's local tool forwards its records to the coordinator, which logs
+/// them in place (`detcore::detlog::ForwardedRecord`). A log with none of them
+/// means forwarding did not happen, and comparing it would compare only the
+/// coordinator's records.
+fn count_sabre_syscall_detlogs(path: &Path) -> Result<usize, Error> {
+    let mut count = 0;
+    for line in BufReader::new(File::open(path)?).split(b'\n') {
+        count += usize::from(contains_bytes(&line?, b" DETLOG [syscall]"));
     }
-    *stderr = guest_stderr;
-    Ok(syscall_records)
+    Ok(count)
 }
+
 struct PreparedMounts {
     mounts: Vec<Mount>,
     identity_sources: IdentityGuard,
@@ -4339,7 +4329,7 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (mut out1, skid_overshoots_run1) = match run_verification_execution(
+        let (out1, skid_overshoots_run1) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
             || run1_options.run_verify(log1_file, global),
@@ -4372,7 +4362,7 @@ impl RunOpts {
             }
         };
         let sabre_syscalls1 = match (self.selected_backend() == Backend::Sabre)
-            .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
+            .then(|| count_sabre_syscall_detlogs(&log1_path))
             .transpose()
         {
             Ok(count) => count,
@@ -4500,7 +4490,7 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let (mut out2, skid_overshoots_run2) = match run_verification_execution(
+        let (out2, skid_overshoots_run2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
             || run2_options.run_verify(log2_file, global),
@@ -4535,7 +4525,7 @@ impl RunOpts {
             }
         };
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
-            let sabre_syscalls2 = match extract_sabre_detlogs(&log2_path, &mut out2.stderr) {
+            let sabre_syscalls2 = match count_sabre_syscall_detlogs(&log2_path) {
                 Ok(count) => count,
                 Err(error) => {
                     if self.keep_logs {
@@ -4553,7 +4543,7 @@ impl RunOpts {
                 )));
             }
             eprintln!(
-                ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                ":: SaBRe syscall DETLOG records logged: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
             );
         }
 
@@ -5675,30 +5665,18 @@ mod tests {
     }
 
     #[test]
-    fn extracts_sabre_detlogs_and_preserves_guest_stderr() {
+    fn counts_only_syscall_detlogs_in_the_run_log() {
         let log = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             log.path(),
-            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
+            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
+             2026-08-02T00:00:00.000001Z INFO detcore::scheduler: DETLOG scheduler event\n\
+             2026-08-02T00:00:00.000002Z INFO detcore::syscalls: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n\
+             2026-08-02T00:00:00.000003Z INFO detcore: inbound syscall: getpid() = ?\n\
+             2026-08-02T00:00:00.000004Z INFO detcore::syscalls: DETLOG [syscall] finish syscall #2: exit_group(0)",
         )
         .unwrap();
-        let mut stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
-              INFO detcore: DETLOG scheduler event\n\
-              INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n"
-            .to_vec();
-        let syscall_records = extract_sabre_detlogs(log.path(), &mut stderr).unwrap();
-
-        assert_eq!(syscall_records, 1);
-        assert_eq!(
-            stderr,
-            b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(log.path()).unwrap(),
-            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
-             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG scheduler event\n\
-             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
-        );
+        assert_eq!(count_sabre_syscall_detlogs(log.path()).unwrap(), 2);
     }
 
     /// The four branches of [`summary_dir_under`].

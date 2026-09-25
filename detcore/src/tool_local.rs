@@ -1826,6 +1826,11 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) initialized_random_auxv: Option<crate::random::InitialImage>,
 
+    /// Records owed for that write and any early requests, emitted and
+    /// consumed with it by the first post-exec callback.
+    #[serde(default)]
+    pub(crate) initial_random_records: Vec<crate::random::DeferredRecord>,
+
     /// RNG to drive chaos scheduling decisions, separate from other (guest) RNG.
     pub chaos_prng: Pcg64Mcg,
 
@@ -2194,6 +2199,7 @@ impl<T> ThreadState<T> {
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),
             initialized_random_auxv: None,
+            initial_random_records: Vec::new(),
             chaos_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed()),
             thread_logical_time,
             committed_clock_value: 0,
@@ -2235,24 +2241,27 @@ impl<T> ThreadState<T> {
         {
             return Err(Errno::EPROTO);
         }
-        let prng = crate::random::decode_initial_state(bytes, config, image)?;
+        let (prng, records) = crate::random::decode_initial_state(bytes, config, image)?;
         self.prng = prng;
         self.initialized_random_auxv = Some(image);
+        self.initial_random_records = records;
         Ok(())
     }
 
+    /// Consume the authenticated early auxv write, if any, returning the
+    /// records it still owes the log.
     pub(crate) fn complete_initial_random_auxv(
         &mut self,
         pointer: Option<usize>,
-    ) -> Result<bool, Errno> {
+    ) -> Result<Option<Vec<crate::random::DeferredRecord>>, Errno> {
         let Some(image) = self.initialized_random_auxv else {
-            return Ok(false);
+            return Ok(None);
         };
         if pointer != Some(image.at_random) || self.dettid.as_raw() != image.pid {
             return Err(Errno::EPROTO);
         }
         self.initialized_random_auxv = None;
-        Ok(true)
+        Ok(Some(std::mem::take(&mut self.initial_random_records)))
     }
 
     pub(crate) fn record_robust_list_head(&mut self, head: Option<usize>) {

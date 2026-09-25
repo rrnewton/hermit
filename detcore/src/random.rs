@@ -63,6 +63,49 @@ impl InitialImage {
     }
 }
 
+/// Current version of the initial random-state handoff.
+const INITIAL_STATE_VERSION: u32 = 2;
+
+/// A deterministic record whose fact a backend established before Detcore's
+/// log was reachable from the guest.
+///
+/// The SaBRe loader bootstrap performs the initial auxv write and early
+/// getrandom requests from the coordinator, before the guest's local tool
+/// exists. Logging them there would place them ahead of scheduler records that
+/// the ptrace backend logs first. The bootstrap hands these facts over with the
+/// stream instead, and the local tool emits the ordinary records for them in
+/// its first post-exec callback, where the ptrace backend emits the auxv one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum DeferredRecord {
+    /// The 16 bytes written to the initial auxv `AT_RANDOM` target.
+    AuxvRandom {
+        /// Bytes drawn and written.
+        value: [u8; 16],
+    },
+    /// A completed guest-memory fill. Debug builds only, like its record.
+    Fill {
+        /// The request that filled memory, e.g. `getrandom`.
+        source: String,
+        /// Bytes written.
+        written: usize,
+        /// Hash of the bytes written.
+        hash: u64,
+    },
+}
+
+/// Emit the ordinary deterministic record for a deferred fact.
+pub fn emit_deferred(record: &DeferredRecord, dettid: DetTid) {
+    match record {
+        DeferredRecord::AuxvRandom { value } => log_auxv(dettid, value),
+        DeferredRecord::Fill {
+            source,
+            written,
+            hash,
+        } => log_fill(dettid, source, *written, *hash),
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InitialRandomState {
@@ -81,6 +124,9 @@ pub enum LoaderState {
     InitialRandom {
         /// Stream after the real auxv and getrandom operations.
         prng: Pcg64Mcg,
+        /// Records for those operations, in the order they happened.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        records: Vec<DeferredRecord>,
     },
     /// A later real kernel exec observed in this owned process lineage.
     ObservedExecContinuation,
@@ -108,19 +154,24 @@ fn configuration_identity(config: &crate::Config) -> Result<[u8; 32], Errno> {
     Ok(writer.0.finalize().into())
 }
 
-/// Encode only the actual PRNG and completed auxv identity. No clock, metadata,
-/// chaos RNG, scheduler state or request history is transferred.
+/// Encode only the actual PRNG, completed auxv identity and the records those
+/// operations owe the log. No clock, metadata, chaos RNG, scheduler state or
+/// request history is transferred.
 pub fn encode_initial_state(
     config: &crate::Config,
     image: InitialImage,
     prng: &Pcg64Mcg,
+    records: &[DeferredRecord],
 ) -> Result<Vec<u8>, Errno> {
     image.validate()?;
     let value = InitialRandomState {
-        version: 1,
+        version: INITIAL_STATE_VERSION,
         configuration: configuration_identity(config)?,
         image,
-        state: LoaderState::InitialRandom { prng: prng.clone() },
+        state: LoaderState::InitialRandom {
+            prng: prng.clone(),
+            records: records.to_vec(),
+        },
     };
     encode_state(value)
 }
@@ -137,7 +188,7 @@ pub fn encode_continuation(
         return Err(Errno::EPROTO);
     }
     encode_state(InitialRandomState {
-        version: 1,
+        version: INITIAL_STATE_VERSION,
         configuration: configuration_identity(config)?,
         image,
         state,
@@ -164,7 +215,7 @@ pub fn decode_loader_state(
         return Err(Errno::EPROTO);
     }
     let value: InitialRandomState = serde_json::from_slice(bytes).map_err(|_| Errno::EPROTO)?;
-    if value.version != 1
+    if value.version != INITIAL_STATE_VERSION
         || value.configuration != configuration_identity(config)?
         || value.image != expected
         || serde_json::to_vec(&value).map_err(|_| Errno::EPROTO)? != bytes
@@ -180,9 +231,9 @@ pub(crate) fn decode_initial_state(
     bytes: &[u8],
     config: &crate::Config,
     expected: InitialImage,
-) -> Result<Pcg64Mcg, Errno> {
+) -> Result<(Pcg64Mcg, Vec<DeferredRecord>), Errno> {
     match decode_loader_state(bytes, config, expected)? {
-        LoaderState::InitialRandom { prng } => Ok(prng),
+        LoaderState::InitialRandom { prng, records } => Ok((prng, records)),
         LoaderState::ObservedExecContinuation | LoaderState::InitialStaticLegacy => {
             Err(Errno::EPROTO)
         }
@@ -246,12 +297,25 @@ pub(crate) fn write_random_chunk(
 /// normal Detcore handler. No syscall/scheduler accounting is performed here.
 pub fn fill_bytes(
     prng: &mut Pcg64Mcg,
-    mut memory: impl MemoryAccess,
+    memory: impl MemoryAccess,
     remote_buf: AddrMut<u8>,
     len: usize,
     dettid: DetTid,
     source: &str,
 ) -> Result<usize, Errno> {
+    let (written, hash) = fill_unlogged(prng, memory, remote_buf, len)?;
+    log_fill(dettid, source, written, hash);
+    Ok(written)
+}
+
+/// [`fill_bytes`] without its record: the bytes written and, in debug builds,
+/// their hash (zero otherwise).
+fn fill_unlogged(
+    prng: &mut Pcg64Mcg,
+    mut memory: impl MemoryAccess,
+    remote_buf: AddrMut<u8>,
+    len: usize,
+) -> Result<(usize, u64), Errno> {
     let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
     let mut hasher = DefaultHasher::new();
     let mut written = 0;
@@ -292,16 +356,19 @@ pub fn fill_bytes(
         }
     }
 
+    Ok((written, hasher.finish()))
+}
+
+fn log_fill(dettid: DetTid, source: &str, written: usize, hash: u64) {
     if cfg!(debug_assertions) {
         detlog!(
             "[dtid {}] USER RAND [{}] Filled guest memory with {} random bytes, hash of bytes: {}",
             dettid,
             source,
             written,
-            hasher.finish()
+            hash
         );
     }
-    Ok(written)
 }
 
 /// Apply getrandom's existing flag, length, null-buffer and fill semantics.
@@ -311,13 +378,41 @@ pub fn getrandom(
     dettid: DetTid,
     call: Getrandom,
 ) -> Result<i64, Errno> {
+    let Some((buf, len)) = getrandom_request(&call)? else {
+        return Ok(0);
+    };
+    fill_bytes(prng, memory, buf, len, dettid, "getrandom").map(|n| n as i64)
+}
+
+/// [`getrandom`], appending its record's fact to `records` instead of logging
+/// it. See [`DeferredRecord`].
+pub fn getrandom_deferred(
+    prng: &mut Pcg64Mcg,
+    memory: impl MemoryAccess,
+    call: Getrandom,
+    records: &mut Vec<DeferredRecord>,
+) -> Result<i64, Errno> {
+    let Some((buf, len)) = getrandom_request(&call)? else {
+        return Ok(0);
+    };
+    let (written, hash) = fill_unlogged(prng, memory, buf, len)?;
+    if cfg!(debug_assertions) {
+        records.push(DeferredRecord::Fill {
+            source: "getrandom".to_owned(),
+            written,
+            hash,
+        });
+    }
+    Ok(written as i64)
+}
+
+fn getrandom_request(call: &Getrandom) -> Result<Option<(AddrMut<'_, u8>, usize)>, Errno> {
     validate_getrandom_flags(call.flags())?;
     let len = getrandom_request_len(call.buflen());
     if len == 0 {
-        return Ok(0);
+        return Ok(None);
     }
-    let buf = call.buf().ok_or(Errno::EFAULT)?;
-    fill_bytes(prng, memory, buf, len, dettid, "getrandom").map(|n| n as i64)
+    Ok(Some((call.buf().ok_or(Errno::EFAULT)?, len)))
 }
 
 /// Draw and write the actual initial auxv bytes. A write failure preserves the
@@ -329,12 +424,29 @@ pub fn initialize_auxv(
     dettid: DetTid,
 ) -> Result<(), Errno> {
     let bytes: [u8; 16] = prng.random();
+    log_auxv(dettid, &bytes);
+    memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)
+}
+
+/// [`initialize_auxv`], appending its record's fact to `records` instead of
+/// logging it. See [`DeferredRecord`].
+pub fn initialize_auxv_deferred(
+    prng: &mut Pcg64Mcg,
+    mut memory: impl MemoryAccess,
+    pointer: AddrMut<u8>,
+    records: &mut Vec<DeferredRecord>,
+) -> Result<(), Errno> {
+    let bytes: [u8; 16] = prng.random();
+    records.push(DeferredRecord::AuxvRandom { value: bytes });
+    memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)
+}
+
+fn log_auxv(dettid: DetTid, bytes: &[u8; 16]) {
     detlog!(
         "[post_exec, dtid {}] init auxv AT_RANDOM value to {:?}",
         dettid,
         bytes
     );
-    memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)
 }
 
 #[cfg(test)]
@@ -480,18 +592,60 @@ mod tests {
             call(pages.address(32).as_raw(), 8, 1),
         )
         .unwrap();
-        let encoded = encode_initial_state(&config, image, &stream).unwrap();
-        same_state(
-            &decode_initial_state(&encoded, &config, image).unwrap(),
-            &stream,
+        // The bootstrap's deferred operations draw and write exactly what the
+        // logged ones do; only the record moves.
+        let mut deferred_stream = root_prng(config.rng_seed());
+        let mut records = Vec::new();
+        initialize_auxv_deferred(
+            &mut deferred_stream,
+            OwnMemory,
+            pages.address(64),
+            &mut records,
+        )
+        .unwrap();
+        getrandom_deferred(
+            &mut deferred_stream,
+            OwnMemory,
+            call(pages.address(96).as_raw(), 8, 1),
+            &mut records,
+        )
+        .unwrap();
+        same_state(&deferred_stream, &stream);
+        assert_eq!(pages.bytes(0, 16), pages.bytes(64, 16));
+        assert_eq!(pages.bytes(32, 8), pages.bytes(96, 8));
+        let DeferredRecord::AuxvRandom { value } = &records[0] else {
+            panic!("the auxv record must come first: {records:?}");
+        };
+        assert_eq!(value.as_slice(), pages.bytes(0, 16));
+        assert_eq!(records.len(), if cfg!(debug_assertions) { 2 } else { 1 });
+
+        let encoded = encode_initial_state(&config, image, &stream, &records).unwrap();
+        let (decoded, decoded_records) = decode_initial_state(&encoded, &config, image).unwrap();
+        same_state(&decoded, &stream);
+        assert_eq!(decoded_records, records);
+        let bare = encode_initial_state(&config, image, &stream, &[]).unwrap();
+        assert!(
+            !String::from_utf8(bare.clone()).unwrap().contains("records"),
+            "an empty record list must keep the canonical encoding without the field"
         );
+        // The prng object closes, then InitialRandom, state and the envelope.
+        let explicit_empty = String::from_utf8(bare.clone())
+            .unwrap()
+            .strip_suffix("}}}}")
+            .map(|prefix| format!("{prefix}}},\"records\":[]}}}}}}"))
+            .expect("the initial state ends with its nested objects")
+            .into_bytes();
+        // It is well-formed; only the canonical re-encoding rejects it.
+        assert!(serde_json::from_slice::<InitialRandomState>(&explicit_empty).is_ok());
         for bad in [
             Vec::new(),
             [encoded.as_slice(), b" "].concat(),
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":1", "\"version\":2")
+                .replace("\"version\":2", "\"version\":1")
                 .into_bytes(),
+            // An explicit empty list is an alternate representation.
+            explicit_empty,
         ] {
             assert!(decode_initial_state(&bad, &config, image).is_err());
         }
@@ -555,9 +709,10 @@ mod tests {
                 &memory_before
             ));
             assert!(
-                !untouched
+                untouched
                     .complete_initial_random_auxv(Some(image.at_random))
                     .unwrap()
+                    .is_none()
             );
             assert!(matches!(
                 decode_loader_state(
@@ -609,17 +764,19 @@ mod tests {
             .unwrap();
         // handle_post_exec sets this before consuming the completion fact.
         state.past_global_first_execve = true;
-        assert!(
+        assert_eq!(
             state
                 .complete_initial_random_auxv(Some(image.at_random))
-                .unwrap()
+                .unwrap(),
+            Some(records.clone())
         );
         assert_eq!(pages.bytes(0, 16), [0x7c; 16]);
         same_state(&state.prng, &stream);
         assert!(
-            !state
+            state
                 .complete_initial_random_auxv(Some(image.at_random))
                 .unwrap()
+                .is_none()
         );
         assert!(
             state

@@ -950,6 +950,15 @@ impl GlobalTool for GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
+        // Log the sender's captured records where its local tool reached this
+        // point, ahead of anything the request that follows them logs. Nothing
+        // else about the sender is admitted or accounted for this message.
+        if let GlobalRequest::ForwardedRecords(records) = &request {
+            for record in records {
+                crate::detlog::emit_record(record);
+            }
+            return (None, R::ForwardedRecords);
+        }
         let time_from_guest = guest_time.as_nanos();
         if let GlobalRequest::SignalDequeued {
             detpid,
@@ -1079,6 +1088,9 @@ impl GlobalTool for GlobalState {
         let resp = match request {
             GlobalRequest::SignalDequeued { .. } => {
                 unreachable!("consuming path handled before ordinary cancellation")
+            }
+            GlobalRequest::ForwardedRecords(_) => {
+                unreachable!("forwarded records are logged before admission")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -2861,6 +2873,11 @@ pub enum GlobalRequest {
     /// Deliver robust-futex wakes collected before exit after the backend has
     /// confirmed that Linux's physical task cleanup completed.
     RobustListWakes(Vec<(DetTid, FutexID)>),
+
+    /// Log records the sender's local tool emitted where the run's log is not
+    /// reachable, before the request that follows them. Carries no scheduler,
+    /// clock or thread effect; see [`crate::detlog::ForwardedRecord`].
+    ForwardedRecords(Vec<crate::detlog::ForwardedRecord>),
 }
 
 /// Responses from the global object
@@ -2931,6 +2948,7 @@ pub enum GlobalResponse {
     ReleasePort(Option<u16>),
     PortFull,
     RobustListWakes(Vec<u64>),
+    ForwardedRecords,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3029,6 +3047,30 @@ where
     assert_eq!(response, GlobalResponse::SetChildTidAddress(()));
 }
 
+/// Send one global request, preceded by any records this process captured
+/// for the coordinator's log since its previous request.
+///
+/// Every global request goes through here so that the coordinator logs a
+/// guest-resident local tool's records at the same point, relative to its own
+/// records, as it logs an in-coordinator local tool's. Without a record source
+/// (every backend but SaBRe) this is exactly `send_rpc`.
+pub(crate) async fn send_global<R>(
+    reverie: &R,
+    (time, mm, request): (DetTime, MmId, GlobalRequest),
+) -> (Option<LogicalTime>, GlobalResponse)
+where
+    R: GlobalRPC<GlobalState> + ?Sized,
+{
+    let records = crate::detlog::take_records();
+    if !records.is_empty() {
+        let (_, response) = reverie
+            .send_rpc((time.clone(), mm, GlobalRequest::ForwardedRecords(records)))
+            .await;
+        assert_eq!(response, GlobalResponse::ForwardedRecords);
+    }
+    reverie.send_rpc((time, mm, request)).await
+}
+
 pub async fn send_and_update_time<G, T>(
     guest: &mut G,
     request: GlobalRequest,
@@ -3039,7 +3081,7 @@ where
 {
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
-    let resp = guest.send_rpc((mytime, mm, request)).await;
+    let resp = send_global(guest, (mytime, mm, request)).await;
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
         trace!(
@@ -3334,9 +3376,11 @@ pub(crate) async fn deregister_thread<R>(
     if cfg.sequentialize_threads {
         let mm = thread.mm;
         // TODO: void_send_rpc
-        let resp = reverie
-            .send_rpc((threads_time, mm, GlobalRequest::DeregisterThread(thread)))
-            .await;
+        let resp = send_global(
+            reverie,
+            (threads_time, mm, GlobalRequest::DeregisterThread(thread)),
+        )
+        .await;
         // We can't update the thread time here.  But it's dead anyway!
         match resp.1 {
             GlobalResponse::DeregisterThread(x) => x,
@@ -3357,9 +3401,11 @@ pub(crate) async fn acknowledge_robust_list_exit_time<R>(
 where
     R: GlobalRPC<GlobalState>,
 {
-    let response = reverie
-        .send_rpc((threads_time, mm, GlobalRequest::RobustListWakes(Vec::new())))
-        .await;
+    let response = send_global(
+        reverie,
+        (threads_time, mm, GlobalRequest::RobustListWakes(Vec::new())),
+    )
+    .await;
     match response.1 {
         GlobalResponse::RobustListWakes(counts) => {
             assert!(
@@ -3388,8 +3434,9 @@ where
     if wakes.is_empty() {
         return Vec::new();
     }
-    let response = reverie
-        .send_rpc((
+    let response = send_global(
+        reverie,
+        (
             threads_time,
             mm,
             GlobalRequest::RobustListWakes(
@@ -3398,8 +3445,9 @@ where
                     .map(|(owner, wake)| (owner, wake.futex))
                     .collect(),
             ),
-        ))
-        .await;
+        ),
+    )
+    .await;
     match response.1 {
         GlobalResponse::RobustListWakes(counts) => counts,
         _ => unreachable!(),
@@ -4004,9 +4052,7 @@ where
         let mytime = guest.thread_state().thread_logical_time.clone();
         let mm = guest.thread_state().mm_id;
         // TODO: void_send_rpc
-        let _ = guest
-            .send_rpc((mytime, mm, GlobalRequest::UnrecoverableShutdown))
-            .await;
+        let _ = send_global(guest, (mytime, mm, GlobalRequest::UnrecoverableShutdown)).await;
     }
 
     // In this scenario a backtrace doesn't really help us.
@@ -7319,5 +7365,154 @@ mod robust_exit_clock_tests {
                 assert!(!sched.note_deregistration_accounted(owner.dettid));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarded_record_tests {
+    use std::sync::Mutex;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+
+    use super::GlobalRequest;
+    use super::GlobalResponse;
+    use super::GlobalState;
+    use super::send_global;
+    use crate::config::Config;
+    use crate::types::*;
+
+    // Records captured by a test, per thread: tests share the process-wide
+    // record source and sink, and each #[tokio::test] runs on its own thread.
+    type ThreadRecords = Mutex<Vec<(std::thread::ThreadId, crate::detlog::ForwardedRecord)>>;
+    static CAPTURED_FOR_TEST: ThreadRecords = Mutex::new(Vec::new());
+    static EMITTED_FOR_TEST: ThreadRecords = Mutex::new(Vec::new());
+
+    fn take_for_this_thread(records: &ThreadRecords) -> Vec<crate::detlog::ForwardedRecord> {
+        let this = std::thread::current().id();
+        let mut records = records.lock().unwrap();
+        let (mine, others) = std::mem::take(&mut *records)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(thread, _)| *thread == this);
+        *records = others;
+        mine.into_iter().map(|(_, record)| record).collect()
+    }
+
+    fn take_captured_for_test() -> Vec<crate::detlog::ForwardedRecord> {
+        take_for_this_thread(&CAPTURED_FOR_TEST)
+    }
+
+    fn emit_for_test(record: &crate::detlog::ForwardedRecord) {
+        EMITTED_FOR_TEST
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), record.clone()));
+    }
+
+    fn capture_for_test(fields: &str) -> crate::detlog::ForwardedRecord {
+        let record = crate::detlog::ForwardedRecord {
+            level: crate::detlog::ForwardedLevel::Info,
+            target: "detcore::random".to_owned(),
+            fields: fields.to_owned(),
+        };
+        CAPTURED_FOR_TEST
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), record.clone()));
+        record
+    }
+
+    struct ForwardingRpc<'a> {
+        state: &'a GlobalState,
+        sender: DetTid,
+        // Each request as it reaches the coordinator, with the records the
+        // coordinator had logged for this thread by the time it answered.
+        seen: &'a Mutex<Vec<(GlobalRequest, Vec<crate::detlog::ForwardedRecord>)>>,
+        // The scheduler turn and global clocks after each answer.
+        effects: &'a Mutex<Vec<(u64, serde_json::Value)>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ForwardingRpc<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let kind = request.2.clone();
+            let response = self
+                .state
+                .receive_rpc(Tid::from_raw(self.sender.as_raw()), request)
+                .await;
+            let logged = take_for_this_thread(&EMITTED_FOR_TEST);
+            self.seen.lock().unwrap().push((kind, logged));
+            let turn = self.state.sched.lock().unwrap().turn;
+            let clocks = serde_json::to_value(&*self.state.global_time.lock().unwrap()).unwrap();
+            self.effects.lock().unwrap().push((turn, clocks));
+            response
+        }
+
+        fn config(&self) -> &Config {
+            &self.state.cfg
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_records_are_logged_before_the_request_they_precede() {
+        crate::detlog::install_test_source(take_captured_for_test);
+        crate::detlog::install_test_sink(emit_for_test);
+        let state = GlobalState::initialize(
+            &Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            },
+            false,
+        );
+        let dettid = DetTid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(dettid, dettid, true);
+        let seen = Mutex::new(Vec::new());
+        let effects = Mutex::new(Vec::new());
+        let rpc = ForwardingRpc {
+            state: &state,
+            sender: dettid,
+            seen: &seen,
+            effects: &effects,
+        };
+        let time = DetTime::new(&state.cfg);
+        let mm = MmId::initial(dettid);
+        let turn = state.sched.lock().unwrap().turn;
+        let clocks = serde_json::to_value(&*state.global_time.lock().unwrap()).unwrap();
+
+        let first = capture_for_test("DETLOG first");
+        let second = capture_for_test("DETLOG second");
+        let request = GlobalRequest::RobustListWakes(Vec::new());
+        let response = send_global(&rpc, (time.clone(), mm, request.clone())).await;
+        assert_eq!(response.1, GlobalResponse::RobustListWakes(Vec::new()));
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(
+                seen[0],
+                (
+                    GlobalRequest::ForwardedRecords(vec![first.clone(), second.clone()]),
+                    vec![first, second]
+                ),
+                "the records are logged, oldest first, before the request is sent"
+            );
+            assert_eq!(seen[1], (request.clone(), Vec::new()));
+        }
+        // Logging them admits nothing and moves no clock.
+        assert_eq!(effects.lock().unwrap()[0], (turn, clocks));
+
+        // Drained: with nothing captured, the request is sent alone.
+        send_global(&rpc, (time, mm, request.clone())).await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2], (request, Vec::new()));
     }
 }
