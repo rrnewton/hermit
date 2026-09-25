@@ -2275,6 +2275,8 @@ impl ResultRow {
         let mut saw_no_result = false;
         let mut saw_not_run = false;
         let mut unavailable = None;
+        let mut retained_failed_match = false;
+        let mut retained_crash = false;
         let mut operand_verifications = Vec::new();
         let mut admitted_policies = Vec::new();
 
@@ -2437,24 +2439,58 @@ impl ResultRow {
                                         index + 1
                                     ));
                                 }
+                                // A matched report names no divergence, in the
+                                // report or in the attempt that carries it.
+                                if report.first_divergent_scheduler_turn.is_some()
+                                    || report.first_divergent_virtual_nanoseconds.is_some()
+                                    || report.first_divergent_record.is_some()
+                                    || report.first_divergent_syscall.is_some()
+                                    || [
+                                        "first_divergent_scheduler_turn",
+                                        "first_divergent_virtual_nanoseconds",
+                                        "first_divergent_record",
+                                        "first_divergent_syscall",
+                                    ]
+                                    .iter()
+                                    .any(|field| {
+                                        attempt.get(field).is_some_and(|value| !value.is_null())
+                                    })
+                                {
+                                    return Err(format!(
+                                        "attempt {} matched report the runner did not pass carries a divergence coordinate",
+                                        index + 1
+                                    ));
+                                }
                                 // A completed failure keeps its red: a declared
                                 // cell that ended differently, or an undeclared
                                 // verify or replay that exited nonzero, is the
                                 // runner's crash-error, exactly the attempts
                                 // the series writer projects as a failed match.
-                                // Other non-passing attempts keep the result
-                                // already established, such as a timeout.
+                                // The runner writes a FAIL without a timeout or
+                                // error kind only for that disposition, so one
+                                // that ended as its row allows is a
+                                // contradiction. Other non-passing attempts
+                                // keep the result already established, such as
+                                // a timeout.
                                 if attempt.get("outcome").and_then(JsonValue::as_str)
                                     == Some("FAIL")
                                     && attempt.get("timed_out").and_then(JsonValue::as_bool)
                                         == Some(false)
                                     && attempt.get("error_kind").is_none_or(JsonValue::is_null)
-                                    && self
-                                        .require_matched_disposition(index, attempt, &report)
-                                        .is_err()
                                 {
+                                    if self
+                                        .require_matched_disposition(index, attempt, &report)
+                                        .is_ok()
+                                    {
+                                        return Err(format!(
+                                            "attempt {} is a FAIL whose matched report ends as its row allows",
+                                            index + 1
+                                        ));
+                                    }
+                                    retained_crash = true;
                                     no_verdict_result.get_or_insert(ObservedResult::CrashError);
                                 }
+                                retained_failed_match = true;
                                 unavailable.get_or_insert_with(|| {
                                     format!(
                                         "attempt {} matched comparison belongs to an attempt the runner did not pass",
@@ -2803,6 +2839,43 @@ impl ResultRow {
         }
         if saw_no_result && !DivergenceCoordinates::from_row(self).is_empty() {
             return Err("no_result row carries a divergence coordinate".into());
+        }
+        // A retained failed match earns no credit, but its row must still be
+        // the red the runner writes for it: no divergence coordinate and no
+        // comparison-failure or passing result.
+        if retained_failed_match {
+            if !DivergenceCoordinates::from_row(self).is_empty() {
+                return Err(
+                    "row retaining a matched attempt the runner did not pass carries a divergence coordinate"
+                        .into(),
+                );
+            }
+            let timed_out = self
+                .attempts
+                .iter()
+                .any(|attempt| attempt.get("timed_out").and_then(JsonValue::as_bool) == Some(true));
+            let consistent = match self.result {
+                None
+                | Some(
+                    ObservedResult::CrashError
+                    | ObservedResult::SandboxDenied
+                    | ObservedResult::InfrastructureError,
+                ) => true,
+                Some(ObservedResult::Timeout) => timed_out,
+                Some(ObservedResult::Oom) => !retained_crash,
+                Some(
+                    ObservedResult::Pass
+                    | ObservedResult::DeterminismFailure
+                    | ObservedResult::ParityFailure
+                    | ObservedResult::ReplayFailure,
+                ) => false,
+            };
+            if !consistent {
+                return Err(format!(
+                    "row retaining a matched attempt the runner did not pass records result {:?}",
+                    self.result
+                ));
+            }
         }
         if saw_not_run && !saw_canonical_match {
             return Ok(ValidateRowEvidence::NotRun {
@@ -6780,7 +6853,9 @@ fn apply_validate_results_from(
             // Re-importing the same retained evidence must be byte-idempotent.
             // Positions are vectors, so appending them when the invocation set
             // rejected a duplicate would silently inflate the sample count.
-            if inserted && inserted_parity && store_positions {
+            // Evidence retained without a verdict is not a sample of where a
+            // counted divergence was.
+            if inserted && inserted_parity && store_positions && unavailable_reason.is_none() {
                 observation
                     .first_divergent_scheduler_turn
                     .record(row.first_divergent_scheduler_turn);
@@ -21082,6 +21157,43 @@ fn self_test() -> Result<(), String> {
         }
     }
 
+    // A divergence retained without a verdict (its attempt relaxed the
+    // comparator) is not a counted location, so it is not a position sample.
+    let mut relaxed = validate_row.clone();
+    relaxed.run_id = "fixture-relaxed-divergence".into();
+    let mut report: JsonValue = serde_json::from_str(
+        relaxed.attempts[0]["verification_report"]
+            .as_str()
+            .ok_or("divergence fixture has no embedded report")?,
+    )
+    .map_err(|error| error.to_string())?;
+    report["comparison"]["skip_detlog"] = true.into();
+    let report = report.to_string();
+    relaxed.attempts[0]["verification_report_sha256"] =
+        format!("{:x}", Sha256::digest(report.as_bytes())).into();
+    relaxed.attempts[0]["verification_report"] = report.into();
+    let (tracked, fold) = fold_fixture_row(relaxed)?;
+    if fold.located != 0
+        || fold.errored.len() != 1
+        || tracked.cells[0].observations.iter().any(|observation| {
+            !observation
+                .first_divergent_scheduler_turn
+                .positions
+                .is_empty()
+                || !observation
+                    .first_divergent_virtual_nanoseconds
+                    .positions
+                    .is_empty()
+                || !observation.first_divergent_record.positions.is_empty()
+                || !observation.first_divergent_syscall.positions.is_empty()
+        })
+    {
+        return Err(format!(
+            "a divergence without a verdict recorded a position sample: {fold:?} {:?}",
+            tracked.cells[0].observations
+        ));
+    }
+
     for (outcome, expected_passes, expected_errors) in
         [("PASS", 1usize, 0usize), ("FAIL", 0usize, 1usize)]
     {
@@ -27090,6 +27202,105 @@ mod post_verdict_transaction_tests {
             error.contains(UNDECLARED),
             "undeclared exit 3 verify-results: {error}"
         );
+    }
+
+    /// Retention is only for the red the runner actually writes. A retained
+    /// failed match whose row or attempt or embedded report carries a
+    /// divergence coordinate, whose row records a comparison failure or an
+    /// unproven timeout, or whose FAIL ended as its row allows, is a
+    /// contradiction and aborts the fold rather than being kept as red.
+    #[test]
+    fn a_retained_failed_match_refuses_what_the_runner_cannot_write() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, declared) = declared_exit_row(&measured);
+        let sibling = fixture.row.clone();
+        // The runner's crash-error for a declared cell that ended 4, not 3.
+        let mut failed = with_matched_exit(&declared, 4);
+        failed["attempts"][0]["outcome"] = "FAIL".into();
+        failed["outcome"] = "FAIL".into();
+        failed["result"] = "crash-error".into();
+        failed["failure_class"] = "product_failure".into();
+        let mut row_coordinate = failed.clone();
+        row_coordinate["first_divergent_record"] = 12.into();
+        let mut attempt_coordinate = failed.clone();
+        attempt_coordinate["attempts"][0]["first_divergent_scheduler_turn"] = 7.into();
+        let mut report_coordinate = failed.clone();
+        let mut report: JsonValue = serde_json::from_str(
+            report_coordinate["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report["first_divergent_record"] = 12.into();
+        let report = serde_json::to_string(&report).unwrap();
+        report_coordinate["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        report_coordinate["attempts"][0]["verification_report"] = report.into();
+        let mut comparison_failure = failed.clone();
+        comparison_failure["result"] = "determinism-failure".into();
+        let mut unproven_timeout = failed.clone();
+        unproven_timeout["outcome"] = "ERROR".into();
+        unproven_timeout["result"] = "timeout".into();
+        unproven_timeout["failure_class"] = "no_result".into();
+        unproven_timeout["error_kind"] = "wall-timeout".into();
+        // A FAIL attempt that ended exactly as declared, with no timeout or
+        // error kind, is not an attempt the runner writes.
+        let mut clean_fail = declared.clone();
+        clean_fail["attempts"][0]["outcome"] = "FAIL".into();
+        clean_fail["outcome"] = "FAIL".into();
+        clean_fail["result"] = "crash-error".into();
+        clean_fail["failure_class"] = "product_failure".into();
+        for (label, row, expected) in [
+            (
+                "row coordinate",
+                row_coordinate,
+                "row retaining a matched attempt the runner did not pass carries a divergence coordinate",
+            ),
+            (
+                "attempt coordinate",
+                attempt_coordinate,
+                "matched report the runner did not pass carries a divergence coordinate",
+            ),
+            (
+                "report coordinate",
+                report_coordinate,
+                "matched report the runner did not pass carries a divergence coordinate",
+            ),
+            (
+                "comparison-failure result",
+                comparison_failure,
+                "records result Some(DeterminismFailure)",
+            ),
+            (
+                "timeout with no timed-out attempt",
+                unproven_timeout,
+                "records result Some(Timeout)",
+            ),
+            (
+                "FAIL that ended as declared",
+                clean_fail,
+                "is a FAIL whose matched report ends as its row allows",
+            ),
+        ] {
+            fixture.publish_rows(&[sibling.clone(), row]);
+            let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+            match candidates[&id][0].evidence(&id, ResultInput::Current) {
+                Err(error) => assert!(error.contains(expected), "{label}: {error}"),
+                other => panic!("{label}: the contradiction was retained: {other:?}"),
+            }
+        }
+        // The control: the same crash-error without a contradiction is kept.
+        fixture.publish_rows(&[sibling, failed]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        assert!(matches!(
+            candidates[&id][0].evidence(&id, ResultInput::Current),
+            Ok(ValidateRowEvidence::Unavailable {
+                result: Some(ObservedResult::CrashError),
+                ..
+            })
+        ));
     }
 
     /// The runner's own red for a matched comparison: a declared cell that
