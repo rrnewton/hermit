@@ -179,6 +179,12 @@ pub enum SeriesNoVerdictKind {
     MissingReportTimeout,
     NoncanonicalMatch,
     NoncanonicalDivergence,
+    /// A canonical match whose attempt the runner failed because the process
+    /// did not end as its row allows: a declared verify cell that ended
+    /// differently, or an undeclared verify or replay that exited nonzero.
+    /// It earns no credit; it is the crash-error red, retained beside its
+    /// siblings instead of refusing the whole run.
+    FailedMatch,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -867,7 +873,8 @@ impl SeriesRow {
                             | SeriesNoVerdictKind::ContainerFailed =>
                                 (Verdict::NoResult, Some(kind)),
                             SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
-                            SeriesNoVerdictKind::NoncanonicalMatch => (Verdict::Matched, None),
+                            SeriesNoVerdictKind::NoncanonicalMatch
+                            | SeriesNoVerdictKind::FailedMatch => (Verdict::Matched, None),
                             SeriesNoVerdictKind::NoncanonicalDivergence => (Verdict::Diverged, None),
                             SeriesNoVerdictKind::MissingReportTimeout =>
                                 return Err("pressure_evidence supplied a report for a missing-report disposition".into()),
@@ -1105,6 +1112,33 @@ impl SeriesRow {
                     {
                         return Err(
                             "noncanonical_divergence evidence must carry attempt outcome FAIL, no error_kind, exactly one nonzero status or signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::FailedMatch => {
+                    // The runner writes exactly this for the disposition: a
+                    // FAIL with neither a timeout nor an error kind, a
+                    // completed process, and a crash-error row. Chaos
+                    // admits any reproduced status, so it has no such red.
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::Errored
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || (disposition.status.is_none() && disposition.signal.is_none())
+                        || disposition.verification_report_sha256.is_none()
+                        || !matches!(mode, "verify" | "replay")
+                        || self.series.result != Some(ObservedResult::CrashError)
+                    {
+                        return Err(
+                            "failed_match evidence must carry attempt outcome FAIL, no error_kind, a completed status or signal, timed_out=false, a verification report, errored disposition, a verify or replay cell, and a crash-error result"
+                                .into(),
+                        );
+                    }
+                    // Undeclared, only a nonzero exit fails a match.
+                    if self.series.declared_guest_exit.is_none() && disposition.status == Some(0) {
+                        return Err(
+                            "failed_match evidence without a declared guest exit must record a nonzero status or a signal"
                                 .into(),
                         );
                     }
@@ -1926,6 +1960,109 @@ mod tests {
                     "{error_kind}: accepted {mutation} on projection"
                 );
             }
+        }
+    }
+
+    /// The retained red of a matched attempt the runner failed: admitted in
+    /// exactly the runner's shape, refused in every other.
+    #[test]
+    fn failed_match_evidence_is_the_crash_error_red_and_nothing_else() {
+        let failed_match = || {
+            let mut fixture = no_verdict_row();
+            fixture.series.outcome = SeriesOutcome::Errored;
+            fixture.series.result = Some(ObservedResult::CrashError);
+            fixture.series.failure_class = Some(FailureClass::ProductFailure);
+            let disposition = &mut fixture
+                .series
+                .no_verdict_evidence
+                .as_mut()
+                .unwrap()
+                .attempts[0];
+            disposition.kind = SeriesNoVerdictKind::FailedMatch;
+            disposition.attempt_outcome = "FAIL".into();
+            disposition.disposition = SeriesOutcome::Errored;
+            disposition.error_kind = None;
+            disposition.status = Some(3);
+            fixture
+        };
+        failed_match().validate_for_write().unwrap();
+        let mut signalled = failed_match();
+        let disposition = &mut signalled
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.status = None;
+        disposition.signal = Some(11);
+        signalled.validate_for_write().unwrap();
+        let mut replay = failed_match();
+        replay.series.cell = "fixture/test/replay/ptrace".into();
+        replay.validate_for_write().unwrap();
+
+        const SHAPE: &str = "failed_match evidence must carry";
+        type Edit = fn(&mut SeriesRow);
+        let edits: [(&str, Edit, &str); 10] = [
+            (
+                "attempt PASS",
+                |row| attempt(row).attempt_outcome = "PASS".into(),
+                SHAPE,
+            ),
+            (
+                "attempt ERROR",
+                |row| attempt(row).attempt_outcome = "ERROR".into(),
+                SHAPE,
+            ),
+            ("timed out", |row| attempt(row).timed_out = true, SHAPE),
+            (
+                "error kind",
+                |row| attempt(row).error_kind = Some("wall-timeout".into()),
+                SHAPE,
+            ),
+            (
+                "no process disposition",
+                |row| attempt(row).status = None,
+                SHAPE,
+            ),
+            (
+                "no verification report",
+                |row| attempt(row).verification_report_sha256 = None,
+                SHAPE,
+            ),
+            (
+                "no_result disposition",
+                |row| attempt(row).disposition = SeriesOutcome::NoResult,
+                SHAPE,
+            ),
+            (
+                "chaos cell",
+                |row| row.series.cell = "fixture/test/chaos/ptrace".into(),
+                SHAPE,
+            ),
+            (
+                "infrastructure row",
+                |row| {
+                    row.series.result = None;
+                    row.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+                },
+                SHAPE,
+            ),
+            (
+                "undeclared exit 0",
+                |row| attempt(row).status = Some(0),
+                "without a declared guest exit must record a nonzero status",
+            ),
+        ];
+        fn attempt(row: &mut SeriesRow) -> &mut SeriesAttemptDisposition {
+            &mut row.series.no_verdict_evidence.as_mut().unwrap().attempts[0]
+        }
+        for (label, edit, expected) in edits {
+            let mut row = failed_match();
+            edit(&mut row);
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(error.contains(expected), "{label}: {error}");
         }
     }
 
