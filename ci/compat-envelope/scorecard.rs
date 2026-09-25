@@ -10618,15 +10618,18 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     }
     if let Some(evidence) = &row.series.no_verdict_evidence {
         // Callers validate the exact disposition/classification tuple before
-        // projection. Retain this typed product crash without treating any
-        // other no-result kind as a crash or granting comparison credit.
+        // projection. Retain these typed product crashes, a container failure
+        // or a match the runner failed, without treating any other no-result
+        // kind as a crash or granting comparison credit.
         let result = if evidence.attempts.iter().any(|attempt| attempt.timed_out) {
             Some(ObservedResult::Timeout)
         } else if row.series.result == Some(ObservedResult::CrashError)
-            && evidence
-                .attempts
-                .iter()
-                .any(|attempt| attempt.kind == SeriesNoVerdictKind::ContainerFailed)
+            && evidence.attempts.iter().any(|attempt| {
+                matches!(
+                    attempt.kind,
+                    SeriesNoVerdictKind::ContainerFailed | SeriesNoVerdictKind::FailedMatch
+                )
+            })
         {
             Some(ObservedResult::CrashError)
         } else {
@@ -23191,6 +23194,35 @@ fn self_test() -> Result<(), String> {
         let (projected, outcome) = project_series_fixture(&[historical])?;
         if !projected.cells[0].observations[0].results.is_empty() || outcome.no_verdict_rows != 1 {
             return Err("container projection broadened unrelated no-result observations".into());
+        }
+        // A match the runner failed is the same retained crash-error red,
+        // measured without a verdict and never a comparison.
+        let mut failed_match = container_series.clone();
+        let disposition = &mut failed_match
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        disposition.kind = SeriesNoVerdictKind::FailedMatch;
+        disposition.disposition = SeriesOutcome::Errored;
+        failed_match.validate_for_write()?;
+        let (projected, outcome) = project_series_fixture(std::slice::from_ref(&failed_match))?;
+        let observation = &projected.cells[0].observations[0];
+        if series_evidence(&failed_match, &projected.cells[0].id)
+            != Some(SeriesEvidence {
+                result: Some(ObservedResult::CrashError),
+                no_verdict: true,
+            })
+            || projected.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+            || observation.results != BTreeSet::from([ObservedResult::CrashError])
+            || !observation.canonical_comparisons.is_empty()
+            || !observation.backend_parity_comparisons.is_empty()
+            || outcome.no_verdict_rows != 1
+        {
+            return Err(format!(
+                "{run} failed match did not project as retained crash-error red"
+            ));
         }
         // The real series admission gate must still reject malformed or
         // contradictory tuples atomically, including alongside a valid row.
