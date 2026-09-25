@@ -125,6 +125,7 @@ fn smaps_consumers_are_deterministic_under_strict_verify() {
         "Shared_Clean",
         "Shared_Dirty",
         "Private_Clean",
+        "Private_Dirty",
         "Referenced",
         "KSM",
         "SwapPss",
