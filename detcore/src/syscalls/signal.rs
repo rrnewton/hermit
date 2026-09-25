@@ -406,6 +406,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
+        // Known limit: the scheduler keeps this copy of the mask, and the real
+        // call copies it again from the guest pointer once the thread has left
+        // the run queue. A sibling that rewrites the sigset in between, which
+        // races with the call in the guest program itself, can make the two
+        // differ, and the kernel's copy then lands at a host-timed moment.
+        // This is the non-interference assumption the scheduler already makes
+        // for every action it starts in the background; see the `BACKGROUND`
+        // commit in `Scheduler::block_for_one_resource`.
         let temporary_mask = self.read_rt_sigsuspend_mask(guest, mask_addr).await?;
         let pending = self.blocked_pending_signals(guest).await?;
 
