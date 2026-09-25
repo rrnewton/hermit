@@ -24,6 +24,7 @@ mod accepted_service;
 mod accepted_transport;
 pub mod capability_unit;
 pub mod guard;
+mod grouped_broker;
 mod parent;
 mod physical;
 #[path = "network_runtime/release/module.rs"]
