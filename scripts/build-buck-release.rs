@@ -8185,6 +8185,21 @@ mod tests {
         // The published Cargo install carries the overlay copy, so it can never
         // be a source bundle for a second overlaid publication.
         assert!(cargo.install.join(UNWIND_RUNTIME_RELATIVE).is_dir());
+        let overlaid_evidence = root.join("overlaid-evidence");
+        fs::create_dir_all(&overlaid_evidence).unwrap();
+        let overlaid = publish_buck_shadow_bundle(
+            &root,
+            &overlaid_evidence,
+            &candidate,
+            &cargo.install,
+            &runtime_install,
+            &cargo,
+        )
+        .unwrap_err();
+        assert!(
+            overlaid.contains("undeclared Hermit runtime closure"),
+            "{overlaid}"
+        );
 
         let buck = publish_buck_shadow_bundle(
             &root,
