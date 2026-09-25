@@ -6916,6 +6916,10 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let rows = read_result_candidate_files(&census.inputs(), &head)?;
     let series = snapshot_series_source(&ledger_root(root, false)?.join("series"))?;
     let events = read_series_rows(&series)?;
+    // The same audit the snapshot refresh applies: a series event covering one
+    // of these raw rows must carry exactly the declaration, identity and
+    // attempts that row was admitted under.
+    reconcile_declared_guest_exits(&rows, &events)?;
     let binding_snapshot = AttemptBindingSnapshot::captured(&series, &events)?;
     let depth = source_depths(root, &head)?;
     if !depth.contains_key("reverie") {
@@ -26966,6 +26970,9 @@ mod post_verdict_transaction_tests {
         for side in ["left", "right"] {
             report["compared_outputs"][side]["exit_code"] = 3.into();
         }
+        // The base row is a replay comparison, which leaves time real; a verify
+        // comparison virtualizes it, and the fold refuses any other policy.
+        report["comparison"]["virtualize_time"] = true.into();
         let report = serde_json::to_string(&report).unwrap();
         row["attempts"][0]["verification_report_sha256"] =
             format!("{:x}", Sha256::digest(report.as_bytes())).into();
@@ -27233,6 +27240,96 @@ mod post_verdict_transaction_tests {
         assert!(
             error.contains(UNDECLARED),
             "undeclared exit 3 verify-results: {error}"
+        );
+    }
+
+    /// `observe-results` reads the committed series beside the raw rows it
+    /// folds, so it applies the same declared-exit reconciliation as the
+    /// snapshot refresh: a series event covering a declared raw row that
+    /// disagrees with it aborts the fold before history is touched, and the
+    /// event projected from that row is accepted.
+    #[test]
+    fn observe_results_reconciles_declared_guest_exits_with_committed_series() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let head = fixture.options.expected_head.clone();
+        let (id, row) = declared_exit_row(&head);
+        // The census binds the fixture row's run and source, here the head.
+        fixture.row = row.clone();
+        fixture.publish_rows(std::slice::from_ref(&row));
+        let candidates = read_result_candidates(&fixture.options.results, &head).unwrap();
+        let identity = candidates[&id][0].evidence_identity.clone();
+        let genuine = serde_json::json!({
+            "code": 3, "signal": null, "reason": DECLARED_EXIT_REASON,
+            "evidence_sha256": identity,
+            "attempts": [{"index": "1", "outcome": "PASS", "status": 3, "signal": null,
+                "timed_out": false,
+                "verification_report_sha256": row["attempts"][0]["verification_report_sha256"]}]
+        });
+        let event = |audit: Option<JsonValue>| {
+            let mut series = serde_json::json!({
+                "cell": series_cell_key(&id), "tree": head, "outcome": "passed",
+                "result": "pass", "failure_class": null, "run_index": 1, "attempt": 1,
+                "num_runs": 1, "source_tree_dirty": false, "machine_shortname": "fixture",
+                "kernel_version": "fixture",
+                "host_capabilities": {
+                    "cpuid-faulting": {"present": false, "evidence": "synthetic fixture"},
+                    "kvm": {"present": false, "evidence": "synthetic fixture"}}
+            });
+            if let Some(audit) = audit {
+                series["declared_guest_exit"] = audit;
+            }
+            serde_json::json!({
+                "schema": "stress-series/v3", "event_id": "declared-exit",
+                "event_type": "series.observation", "emitted_at": "2026-09-22T00:00:00Z",
+                "team": "hermit", "host": "fixture", "producer": "validate",
+                "run_id": row["run_id"], "series": series
+            })
+        };
+        let commit_series = |fixture: &Fixture, event: &JsonValue, message: &str| {
+            fs::create_dir_all(fixture.ledger.join("series/hermit/fixture")).unwrap();
+            fs::write(
+                fixture.ledger.join("series/hermit/fixture/2026-09.jsonl"),
+                format!("{}\n", serde_json::to_string(event).unwrap()),
+            )
+            .unwrap();
+            git(&fixture.ledger, &["add", "series"]);
+            commit(&fixture.ledger, message);
+        };
+        let mut altered_reason = genuine.clone();
+        altered_reason["reason"] = "another reason".into();
+        let mut altered_report = genuine.clone();
+        altered_report["attempts"][0]["verification_report_sha256"] = "e".repeat(64).into();
+        let mut other_identity = genuine.clone();
+        other_identity["evidence_sha256"] = "0".repeat(64).into();
+        let history = read_history_files(&fixture.root).unwrap();
+        for (label, audit) in [
+            ("declaration changed", Some(altered_reason)),
+            ("report digest altered", Some(altered_report)),
+            ("another identity", Some(other_identity)),
+            ("audit dropped", None),
+        ] {
+            commit_series(&fixture, &event(audit), label);
+            let error = observe_results(&fixture.root, &fixture.options.results).unwrap_err();
+            assert!(
+                error.contains("disagrees with its raw result's guest-exit declaration"),
+                "{label}: {error}"
+            );
+            assert!(
+                read_history_files(&fixture.root).unwrap() == history,
+                "{label} changed history"
+            );
+        }
+        commit_series(&fixture, &event(Some(genuine)), "genuine declared audit");
+        observe_results(&fixture.root, &fixture.options.results).unwrap();
+        let published = fixture.cells();
+        let cell = published.cells.iter().find(|cell| cell.id == id).unwrap();
+        assert!(
+            cell.observations.iter().any(|observation| {
+                observation.hermit_shas.contains(&head)
+                    && observation.results.contains(&ObservedResult::Pass)
+            }),
+            "the genuine declared attempt folded no pass"
         );
     }
 
