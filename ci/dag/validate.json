@@ -5411,6 +5411,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigtimedwait-no-timeout",
           "mode": "verify",
           "backend": "ptrace"
@@ -10980,6 +10987,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -18855,6 +18869,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
           "mode": "verify",
           "backend": "ptrace"
         },

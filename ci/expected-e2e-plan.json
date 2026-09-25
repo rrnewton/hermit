@@ -6021,6 +6021,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/external-io-signal-interrupt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigsuspend-sibling-signal-wake"
     }
   ],
   "schema": 1
