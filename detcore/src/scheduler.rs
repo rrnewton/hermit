@@ -2847,9 +2847,8 @@ impl Scheduler {
     /// reroute it to such a waiter, but the scheduler learns that only when the
     /// waiter's report arrives, and an otherwise idle scheduler can declare a
     /// terminal deadlock first. Choosing the waiter here makes the delivery a
-    /// scheduler decision. The kernel honours it on both paths: a sleeping
-    /// thread that does not block the signal is the one `kill` of its own tid
-    /// picks.
+    /// scheduler decision, and `signal_guest` sends it thread-directed so the
+    /// kernel cannot move it; see `rt_sigsuspend_wake_thread_group`.
     ///
     /// Only `rt_sigsuspend` waiters have a mask the scheduler knows, so any
     /// other target is returned unchanged.
@@ -2880,6 +2879,23 @@ impl Scheduler {
             }
             None => target,
         }
+    }
+
+    /// The thread group to name in a thread-directed send when `signal` ends
+    /// `dettid`'s `rt_sigsuspend` wait, or `None` when the process-directed
+    /// send stands.
+    ///
+    /// Only this case needs a thread-directed send, because only here does the
+    /// scheduler await that target's own report: `wake_signaled_guest` requeues
+    /// it, or on SaBRe leaves it in its pool until it reports. Any
+    /// other target keeps the process-directed send, which lets the kernel give
+    /// the signal to a sibling when the target's mask blocks it, as Linux does.
+    fn rt_sigsuspend_wake_thread_group(&self, dettid: DetTid, signal: Signal) -> Option<DetPid> {
+        let wait = self.blocked.rt_sigsuspend_blockers.get(&dettid)?;
+        if wait.blocks(signal) {
+            return None;
+        }
+        self.thread_tree.thread_to_leader.get(&dettid).copied()
     }
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
@@ -3117,6 +3133,29 @@ impl Scheduler {
                 )
             });
             return;
+        } else if let Some(tgid) = self.rt_sigsuspend_wake_thread_group(dettid, signal) {
+            // `wake_signaled_guest` requeues this waiter and awaits its report,
+            // so the signal must reach this thread and no other. It joined its
+            // pool when it was resumed, not when it fell asleep, so it may still
+            // be stopped before its `rt_sigsuspend` with its original mask. A
+            // process-directed `kill` then skips it and wakes any sibling that
+            // admits the signal, and this thread never reports. Measured
+            // natively in that state: `kill` ran the handler on a sibling in 5
+            // of 5 runs; `tgkill` left it pending on the stopped thread, which
+            // took it once resumed, in 5 of 5.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    tgid.as_raw(),
+                    dettid.as_raw(),
+                    signal as libc::c_int,
+                )
+            };
+            if rc < 0 {
+                Err(nix::errno::Errno::last())
+            } else {
+                Ok(())
+            }
         } else {
             let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
             signal::kill(pid, signal)
@@ -3215,7 +3254,9 @@ impl Scheduler {
         // `rt_sigsuspend` can only complete through a signal its temporary
         // mask admits. Such a signal makes the thread rejoin the run queue at
         // this deterministic point, and the scheduler awaits its own
-        // `InboundSignal` request there. Left in its pool, an otherwise empty
+        // `InboundSignal` request there. `signal_guest` sent the signal to this
+        // thread alone, so the report comes from it even when it had not yet
+        // entered `rt_sigsuspend`. Left in its pool, an otherwise empty
         // scheduler would report a terminal deadlock before the thread's
         // report arrived. A signal the mask blocks cannot end the wait and
         // produces no report, so the thread stays in its pool, where step2d
@@ -7946,6 +7987,32 @@ mod test {
             worker
         );
 
+        // The chosen waiter is signalled thread-directed, naming its own
+        // group, so the kernel cannot hand the signal to a sibling while the
+        // waiter is still stopped before its `rt_sigsuspend`. A waiter whose
+        // mask blocks the signal, and a thread outside the pool, keep the
+        // process-directed send.
+        assert_eq!(
+            scheduler.rt_sigsuspend_wake_thread_group(worker, Signal::SIGALRM),
+            Some(leader)
+        );
+        assert_eq!(
+            scheduler.rt_sigsuspend_wake_thread_group(other_leader, Signal::SIGALRM),
+            Some(other_leader)
+        );
+        assert_eq!(
+            scheduler.rt_sigsuspend_wake_thread_group(leader, Signal::SIGALRM),
+            None
+        );
+        assert_eq!(
+            scheduler.rt_sigsuspend_wake_thread_group(leader, Signal::SIGKILL),
+            Some(leader)
+        );
+        assert_eq!(
+            scheduler.rt_sigsuspend_wake_thread_group(worker, Signal::SIGUSR1),
+            None
+        );
+
         // The chosen waiter leaves its pool to report the interrupted wait;
         // the masked target keeps waiting.
         scheduler.wake_signaled_guest(worker, Signal::SIGALRM);
@@ -7961,6 +8028,44 @@ mod test {
                 .blocked
                 .rt_sigsuspend_blockers
                 .contains_key(&leader)
+        );
+        assert_eq!(
+            scheduler.rt_sigsuspend_wake_thread_group(worker, Signal::SIGALRM),
+            None
+        );
+    }
+
+    #[test]
+    fn alarm_redirect_picks_the_lowest_dettid_of_several_admitting_waiters() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(100);
+        let low = DetTid::from_raw(101);
+        let high = DetTid::from_raw(102);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, low, false);
+        scheduler.thread_tree.add_child(leader, high, false);
+        for tid in [leader, low, high] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let wait = |tid: DetTid, temporary_mask: u64| RtSigsuspendWait {
+            op_id: ExternalOpId::new(tid, 7),
+            temporary_mask,
+        };
+        let alarm_bit = 1_u64 << (Signal::SIGALRM as i32 - 1);
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(leader, wait(leader, alarm_bit));
+        // Insert the higher dettid first so insertion order cannot pick it.
+        for tid in [high, low] {
+            scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .insert(tid, wait(tid, 0));
+        }
+        assert_eq!(
+            scheduler.redirect_past_blocking_rt_sigsuspend(leader, leader, Signal::SIGALRM),
+            low
         );
     }
 
