@@ -346,11 +346,17 @@ pub struct RtSigsuspendWait {
     /// blocks signal `n`.
     pub temporary_mask: u64,
     /// Another guest has queued a signal for this thread that the temporary
-    /// mask admits. That signal ends the wait. Once the thread is let go, the
-    /// kernel may run a handler under its `sa_mask` and then restores the
-    /// original mask, so a signal sent to this thread now can be left pending
-    /// under a mask the scheduler never saw. The scheduler no longer knows
-    /// which signals the thread takes. Set by `notify_signal_pending`.
+    /// mask admits. On ptrace that signal stops the thread for its tracer even
+    /// when the thread ignores it, so the thread reports it. A caught signal
+    /// ends the wait; an ignored one (`SIG_IGN`, or ignored by default, such
+    /// as `SIGCHLD`) does not. The mark does not check the disposition, which
+    /// errs on the safe side: a released waiter only loses thread-directed
+    /// sends and is never chosen by the alarm redirect. Once a caught signal
+    /// lets the thread go, the kernel may run a handler under its `sa_mask`
+    /// and then restores the original mask, so a signal sent to this thread
+    /// now can be left pending under a mask the scheduler never saw. The
+    /// scheduler no longer knows which signals the thread takes. Set by
+    /// `notify_signal_pending`.
     ///
     /// Known gap: only senders that call `notify_signal_pending` set it, which
     /// are `kill`, `tgkill`, `tkill`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`.
@@ -2980,10 +2986,11 @@ impl Scheduler {
         target: DetTid,
         signal: Signal,
     ) -> DetTid {
-        match self.blocked.rt_sigsuspend_blockers.get(&target) {
-            Some(wait) if wait.released || wait.blocks(signal) => {}
+        let reason = match self.blocked.rt_sigsuspend_blockers.get(&target) {
+            Some(wait) if wait.released => "was released by an earlier guest signal",
+            Some(wait) if wait.blocks(signal) => "is blocked by its rt_sigsuspend mask",
             _ => return target,
-        }
+        };
         let group = self.thread_tree.my_thread_group(&detpid);
         let admitting = self
             .blocked
@@ -2994,8 +3001,8 @@ impl Scheduler {
         match admitting {
             Some(waiter) => {
                 info!(
-                    "[dtid {}] signal {} is blocked by its rt_sigsuspend mask; delivering to rt_sigsuspend waiter {} whose mask admits it",
-                    target, signal, waiter
+                    "[dtid {}] signal {}: the target {}; delivering to rt_sigsuspend waiter {} whose mask admits it",
+                    target, signal, reason, waiter
                 );
                 waiter
             }
@@ -3017,7 +3024,8 @@ impl Scheduler {
     /// send too. It may be running a handler, or be back under its original
     /// mask, and either may block `signal`; a thread-directed send would then
     /// strand it there while Linux would give it to a sibling that admits it.
-    /// That waiter reports anyway, for the signal that released it.
+    /// On ptrace that waiter reports anyway, for the signal that released it,
+    /// because even a signal it ignores stops it for its tracer.
     fn rt_sigsuspend_wake_thread_group(&self, dettid: DetTid, signal: Signal) -> Option<DetPid> {
         let wait = self.blocked.rt_sigsuspend_blockers.get(&dettid)?;
         if !wait.known_to_admit(signal) {
