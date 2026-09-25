@@ -10741,6 +10741,17 @@ mod tests {
                 serde_json::to_string(&buck_private_tmp).unwrap(),
                 "but the leg's candidate is",
             ),
+            // The named file still hashes to this leg's candidate, so only the
+            // recorded-candidate equality can refuse this record.
+            (
+                "private-tmp.json",
+                serde_json::to_string(&MatrixPrivateTmpEvidence {
+                    candidate_sha256: buck_sha256.clone(),
+                    ..private_tmp.clone()
+                })
+                .unwrap(),
+                "but the leg's candidate is",
+            ),
             (
                 "private-tmp.json",
                 serde_json::to_string(&MatrixPrivateTmpEvidence {
@@ -10788,10 +10799,29 @@ mod tests {
             refuses("records launched binary");
         }
         fs::write(&reference_report, report(&cargo_sha256)).unwrap();
-        // Swapping the legs' candidates refuses every retained invocation.
+        // Swapping the legs' candidates refuses the audit.
         assert!(
             inspect_matrix_candidate_invocations(&root, &buck_sha256, &cargo_sha256).is_err()
         );
+        inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
+        // Relabelling any single retained invocation to the other leg refuses
+        // that invocation: each is audited against its own leg's bytes.
+        for (name, relabelled) in [
+            ("cargo-observed-1", "buck-observed-1"),
+            ("buck-observed-2", "cargo-observed-2"),
+            ("cargo-reference-3", "buck-reference-3"),
+            ("buck-reference-4", "cargo-reference-4"),
+        ] {
+            fs::rename(invocations.join(name), invocations.join(relabelled)).unwrap();
+            let error =
+                inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap_err();
+            let (label, identity) = relabelled.split_once('-').unwrap();
+            assert!(
+                error.contains(&format!("retained {label} DBT matrix invocation {identity} ")),
+                "{relabelled}: {error}"
+            );
+            fs::rename(invocations.join(relabelled), invocations.join(name)).unwrap();
+        }
         inspect_matrix_candidate_invocations(&root, &cargo_sha256, &buck_sha256).unwrap();
 
         let readback_path = dbt.join("private-tmp.readback");
