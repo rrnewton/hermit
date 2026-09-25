@@ -3602,10 +3602,17 @@ fn verify_report(
 /// An omitted `--epoch` captures host time per invocation, which is the only
 /// reason two builds' virtual clocks ever differed; pinned, the trajectory and
 /// the whole strict report, virtual time included, must be exactly equal.
+/// Linux defines only CLOCK_REALTIME against the Unix epoch, so only the
+/// fixture's `realtime` anchors are compared with it. CLOCK_MONOTONIC counts
+/// from an unspecified point and is checked purely relatively. Hermit today
+/// returns the same epoch-anchored value for every clockid
+/// (`handle_clock_gettime` in detcore/src/syscalls/time.rs ignores it); that
+/// known deviation, tracked as TaskGraph task
+/// hermit-clock-gettime-ignores-clockid, must not become load-bearing here.
 const CLOCK_PARITY_EPOCH: &str = "2026-01-01T00:00:00+00:00";
 const CLOCK_PARITY_EPOCH_NS: u64 = 1_767_225_600_000_000_000;
-/// Startup costs virtual milliseconds; a first read this far past the epoch
-/// means the epoch was not applied.
+/// Startup costs virtual milliseconds; a first REALTIME anchor this far past
+/// the epoch means the epoch was not applied.
 const CLOCK_PARITY_STARTUP_BOUND_NS: u64 = 60_000_000_000;
 /// Each scheduler turn adds 500,000 virtual ns, so a turn inside a work segment
 /// breaks the exact work-cost relations below. Pinned to the default, about 50
@@ -3631,10 +3638,10 @@ fn take_canonical_decimal(text: &str) -> Option<(u64, &str)> {
     Some((number.parse().ok()?, rest))
 }
 
-fn clock_advance(last: &mut u64, value: u64) -> Result<(), String> {
+fn clock_advance(clock: &str, last: &mut u64, value: u64) -> Result<(), String> {
     if value <= *last {
         return Err(format!(
-            "clock read {value} does not advance past {last}: virtual time froze, went \
+            "{clock} read {value} does not advance past {last}: virtual time froze, went \
              backwards, or was reset"
         ));
     }
@@ -3642,18 +3649,31 @@ fn clock_advance(last: &mut u64, value: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// What a valid clock trajectory binds to the strict report's virtual time.
+#[derive(Debug, PartialEq, Eq)]
+struct ClockTrajectory {
+    /// The last CLOCK_REALTIME anchor: the only reads defined against the epoch.
+    realtime_last: u64,
+    /// Last minus first CLOCK_MONOTONIC read; their absolute values carry no claim.
+    monotonic_span: u64,
+}
+
 /// Validates the fixture's exact stdout as a closed trajectory (3 generations
-/// of 8 main reads, the 4 work segments, and 2 serialized threads of 4 reads,
-/// then a summary; see the fixture header) and returns the last read. Every
-/// read must advance past the one before it in emission order, starting from
-/// the pinned epoch and across exec and thread boundaries; generation 0 must
-/// open within the startup bound; no generation may open on a whole second;
-/// checksums must match; equal work must cost exactly equal virtual time, more
-/// work strictly more, and double work exactly its two halves (cost3 - cost0 ==
-/// (cost1 - cost0) + (cost2 - cost0)); and summaries must match their samples.
-/// The work-cost relations are exact only while no scheduler turn falls inside
-/// a segment, which `CLOCK_PARITY_MAX_TIMESLICE` pins.
-fn parse_clock_trajectory(stdout: &str) -> Result<u64, String> {
+/// of 8 main reads, a REALTIME anchor, the 4 work segments, 2 serialized
+/// threads of 4 reads, a second REALTIME anchor, then a summary; see the
+/// fixture header). The two clocks are checked independently and never
+/// against each other. Every MONOTONIC read must advance past the previous
+/// one in emission order, across exec and thread boundaries, with no absolute
+/// floor or window. Every REALTIME anchor must advance past the previous one,
+/// starting from the pinned epoch, and generation 0's must open within the
+/// startup bound. No generation's first MONOTONIC read or opening REALTIME
+/// anchor may sit on a whole second; checksums must match; equal work must cost
+/// exactly equal virtual time, more work strictly more, and double work exactly
+/// its two halves (cost3 - cost0 == (cost1 - cost0) + (cost2 - cost0)); and
+/// summaries must match their samples. The work-cost relations are exact only
+/// while no scheduler turn falls inside a segment, which
+/// `CLOCK_PARITY_MAX_TIMESLICE` pins.
+fn parse_clock_trajectory(stdout: &str) -> Result<ClockTrajectory, String> {
     let body = stdout
         .strip_suffix('\n')
         .ok_or("clock trajectory must end with one newline")?;
@@ -3677,20 +3697,32 @@ fn parse_clock_trajectory(stdout: &str) -> Result<u64, String> {
             _ => Err(format!("clock trajectory {line:?} has trailing text")),
         }
     };
-    let mut last = CLOCK_PARITY_EPOCH_NS;
+    const MONOTONIC: &str = "CLOCK_MONOTONIC";
+    const REALTIME: &str = "CLOCK_REALTIME";
+    let mut last = 0;
+    let mut monotonic_first = None;
+    let mut realtime = CLOCK_PARITY_EPOCH_NS;
     for generation in 0..3 {
         let mut main = Vec::new();
         for index in 0..8 {
             let ns = record(format!("sample gen={generation} source=main index={index}"), &["ns"])?[0];
-            clock_advance(&mut last, ns)?;
+            clock_advance(MONOTONIC, &mut last, ns)?;
             main.push(ns);
         }
         let first = main[0];
-        if generation == 0 && first - CLOCK_PARITY_EPOCH_NS >= CLOCK_PARITY_STARTUP_BOUND_NS {
-            return Err(format!("clock trajectory opens {first}, outside the startup bound"));
-        }
+        monotonic_first.get_or_insert(first);
         if first % 1_000_000_000 == 0 {
             return Err(format!("clock generation {generation} opens on a whole second {first}"));
+        }
+        let open = record(format!("realtime gen={generation} phase=open"), &["ns"])?[0];
+        clock_advance(REALTIME, &mut realtime, open)?;
+        if generation == 0 && open - CLOCK_PARITY_EPOCH_NS >= CLOCK_PARITY_STARTUP_BOUND_NS {
+            return Err(format!("clock REALTIME anchor opens {open}, outside the startup bound"));
+        }
+        if open % 1_000_000_000 == 0 {
+            return Err(format!(
+                "clock generation {generation} REALTIME anchor opens on a whole second {open}"
+            ));
         }
         let mut cost = Vec::new();
         for (index, iterations) in CLOCK_FIXTURE_WORK_ITERATIONS.iter().enumerate() {
@@ -3698,8 +3730,8 @@ fn parse_clock_trajectory(stdout: &str) -> Result<u64, String> {
                 format!("work gen={generation} index={index} iterations={iterations}"),
                 &["before_ns", "after_ns", "checksum"],
             )?;
-            clock_advance(&mut last, work[0])?;
-            clock_advance(&mut last, work[1])?;
+            clock_advance(MONOTONIC, &mut last, work[0])?;
+            clock_advance(MONOTONIC, &mut last, work[1])?;
             if work[2] != clock_fixture_work_checksum(*iterations) {
                 return Err(format!("clock work {index} checksum {} is wrong", work[2]));
             }
@@ -3717,9 +3749,11 @@ fn parse_clock_trajectory(stdout: &str) -> Result<u64, String> {
         for thread in 0..2 {
             for index in 0..4 {
                 let head = format!("sample gen={generation} source=thread index={index} thread={thread}");
-                clock_advance(&mut last, record(head, &["ns"])?[0])?;
+                clock_advance(MONOTONIC, &mut last, record(head, &["ns"])?[0])?;
             }
         }
+        let close = record(format!("realtime gen={generation} phase=close"), &["ns"])?[0];
+        clock_advance(REALTIME, &mut realtime, close)?;
         let min_delta = main.windows(2).map(|pair| pair[1] - pair[0]).min().unwrap_or(0);
         if record(format!("gen={generation}"), &["first", "last", "min_delta"])?
             != [first, last, min_delta]
@@ -3728,15 +3762,20 @@ fn parse_clock_trajectory(stdout: &str) -> Result<u64, String> {
         }
     }
     record("clock exec continuity holds across 2 execs".to_owned(), &[])?;
-    match lines.next() {
-        None => Ok(last),
-        Some(extra) => Err(format!("clock trajectory has an extra record {extra:?}")),
+    match (lines.next(), monotonic_first) {
+        (None, Some(first)) => Ok(ClockTrajectory {
+            realtime_last: realtime,
+            monotonic_span: last - first,
+        }),
+        (Some(extra), _) => Err(format!("clock trajectory has an extra record {extra:?}")),
+        (None, None) => Err("clock trajectory has no MONOTONIC read".to_owned()),
     }
 }
 
 /// Requires both builds' trajectories to be valid and byte-identical, their
 /// strict reports to be exactly equal, and the report to bind the trajectory:
-/// it compared these stdout bytes and its virtual time outlasts the last read.
+/// it compared these stdout bytes, and its virtual time outlasts both the last
+/// REALTIME anchor's distance from the epoch and the MONOTONIC span.
 fn verify_clock_parity(
     cargo_stdout: &[u8],
     buck_stdout: &[u8],
@@ -3745,7 +3784,8 @@ fn verify_clock_parity(
 ) -> Result<VerificationReport, String> {
     let utf8 = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string());
     let (cargo_text, buck_text) = (utf8(cargo_stdout)?, utf8(buck_stdout)?);
-    let last = parse_clock_trajectory(&cargo_text).map_err(|error| format!("Cargo {error}"))?;
+    let trajectory =
+        parse_clock_trajectory(&cargo_text).map_err(|error| format!("Cargo {error}"))?;
     parse_clock_trajectory(&buck_text).map_err(|error| format!("Buck {error}"))?;
     require_equal("ptrace fixed-epoch clock trajectory", &cargo_text, &buck_text)?;
     let report = verify_report(cargo_report, true)?;
@@ -3760,8 +3800,13 @@ fn verify_clock_parity(
     }
     let virtual_ns = report.runtime.as_ref().and_then(|runtime| runtime.run1.as_ref());
     match virtual_ns {
-        Some(run) if run.virtual_nanoseconds > last - CLOCK_PARITY_EPOCH_NS => Ok(report),
-        Some(_) => Err("clock strict report virtual time ends before the last read".to_owned()),
+        Some(run) if run.virtual_nanoseconds <= trajectory.realtime_last - CLOCK_PARITY_EPOCH_NS => {
+            Err("clock strict report virtual time ends before the last REALTIME anchor".to_owned())
+        }
+        Some(run) if run.virtual_nanoseconds <= trajectory.monotonic_span => {
+            Err("clock strict report virtual time is shorter than the MONOTONIC span".to_owned())
+        }
+        Some(_) => Ok(report),
         None => Err("clock strict report lacks a runtime summary".to_owned()),
     }
 }
@@ -7211,7 +7256,7 @@ mod tests {
         ] {
             fs::write(root.join(name), contents).unwrap();
         }
-        let run = clock_runtime_report(48_690_715);
+        let run = clock_runtime_report(CAPTURED_VIRTUAL_NS);
         let record = canonical_report(false);
         for name in ["cargo-ptrace-verify.json", "buck-ptrace-verify.json"] {
             write_report(root, name, &run);
@@ -8305,7 +8350,7 @@ mod tests {
         let run_path = fixture.join("buck-ptrace-verify.json");
         let original_run = fs::read(&run_path).unwrap();
         // Only the compared INFO counts differ from the retained Cargo report.
-        let mut changed_run = clock_runtime_report(48_690_715);
+        let mut changed_run = clock_runtime_report(CAPTURED_VIRTUAL_NS);
         changed_run["compared_log_messages"]["left"] = serde_json::json!(13);
         changed_run["compared_log_messages"]["right"] = serde_json::json!(13);
         fs::write(&run_path, serde_json::to_vec(&changed_run).unwrap()).unwrap();
@@ -8937,93 +8982,108 @@ mod tests {
 
     /// Exact stdout of the clock fixture under the pinned epoch, captured from
     /// `run --backend ptrace --base-env=minimal --epoch=2026-01-01T00:00:00+00:00
-    /// --strict --verify --verify-strict` with both a Cargo- and a Buck-built
-    /// candidate; the two were byte-identical. That run used the default
-    /// max timeslice, which is the value `CLOCK_PARITY_MAX_TIMESLICE` pins.
+    /// --max-timeslice=200000000 --strict --verify --verify-strict` through
+    /// safehermit with both a Cargo- and a Buck-built candidate (the shadow
+    /// artifacts of 246a7701d); the two were byte-identical and both reports
+    /// gave 48,760,645 virtual ns. Hermit returned the same epoch-anchored
+    /// value for both clocks there; the tests below prove nothing requires it.
     const CAPTURED_CLOCK_TRAJECTORY: &str = "\
-        sample gen=0 source=main index=0 ns=1767225600002243075\n\
-        sample gen=0 source=main index=1 ns=1767225600002253115\n\
-        sample gen=0 source=main index=2 ns=1767225600002263155\n\
-        sample gen=0 source=main index=3 ns=1767225600002273195\n\
-        sample gen=0 source=main index=4 ns=1767225600002283235\n\
-        sample gen=0 source=main index=5 ns=1767225600002293275\n\
-        sample gen=0 source=main index=6 ns=1767225600002303315\n\
-        sample gen=0 source=main index=7 ns=1767225600002313355\n\
-        work gen=0 index=0 iterations=0 before_ns=1767225600002377795 after_ns=1767225600002387845 checksum=27\n\
-        work gen=0 index=1 iterations=100000 before_ns=1767225600002401805 after_ns=1767225600004411855 checksum=4\n\
-        work gen=0 index=2 iterations=100000 before_ns=1767225600004425895 after_ns=1767225600006435945 checksum=4\n\
-        work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600010460035 checksum=2\n\
-        sample gen=0 source=thread index=0 thread=0 ns=1767225600011247845\n\
-        sample gen=0 source=thread index=1 thread=0 ns=1767225600011257885\n\
-        sample gen=0 source=thread index=2 thread=0 ns=1767225600011267925\n\
-        sample gen=0 source=thread index=3 thread=0 ns=1767225600011277965\n\
-        sample gen=0 source=thread index=0 thread=1 ns=1767225600013817945\n\
-        sample gen=0 source=thread index=1 thread=1 ns=1767225600013827985\n\
-        sample gen=0 source=thread index=2 thread=1 ns=1767225600013838025\n\
-        sample gen=0 source=thread index=3 thread=1 ns=1767225600013848065\n\
-        gen=0 first=1767225600002243075 last=1767225600013848065 min_delta=10040\n\
-        sample gen=1 source=main index=0 ns=1767225600017891900\n\
-        sample gen=1 source=main index=1 ns=1767225600017901940\n\
-        sample gen=1 source=main index=2 ns=1767225600017911980\n\
-        sample gen=1 source=main index=3 ns=1767225600017922020\n\
-        sample gen=1 source=main index=4 ns=1767225600017932060\n\
-        sample gen=1 source=main index=5 ns=1767225600017942100\n\
-        sample gen=1 source=main index=6 ns=1767225600017952140\n\
-        sample gen=1 source=main index=7 ns=1767225600017962180\n\
-        work gen=1 index=0 iterations=0 before_ns=1767225600018026880 after_ns=1767225600018036930 checksum=27\n\
-        work gen=1 index=1 iterations=100000 before_ns=1767225600018050920 after_ns=1767225600020060970 checksum=4\n\
-        work gen=1 index=2 iterations=100000 before_ns=1767225600020075040 after_ns=1767225600022085090 checksum=4\n\
-        work gen=1 index=3 iterations=200000 before_ns=1767225600022099160 after_ns=1767225600026109210 checksum=2\n\
-        sample gen=1 source=thread index=0 thread=0 ns=1767225600026897050\n\
-        sample gen=1 source=thread index=1 thread=0 ns=1767225600026907090\n\
-        sample gen=1 source=thread index=2 thread=0 ns=1767225600026917130\n\
-        sample gen=1 source=thread index=3 thread=0 ns=1767225600026927170\n\
-        sample gen=1 source=thread index=0 thread=1 ns=1767225600029467270\n\
-        sample gen=1 source=thread index=1 thread=1 ns=1767225600029477310\n\
-        sample gen=1 source=thread index=2 thread=1 ns=1767225600029487350\n\
-        sample gen=1 source=thread index=3 thread=1 ns=1767225600029497390\n\
-        gen=1 first=1767225600017891900 last=1767225600029497390 min_delta=10040\n\
-        sample gen=2 source=main index=0 ns=1767225600033541375\n\
-        sample gen=2 source=main index=1 ns=1767225600033551415\n\
-        sample gen=2 source=main index=2 ns=1767225600033561455\n\
-        sample gen=2 source=main index=3 ns=1767225600033571495\n\
-        sample gen=2 source=main index=4 ns=1767225600033581535\n\
-        sample gen=2 source=main index=5 ns=1767225600033591575\n\
-        sample gen=2 source=main index=6 ns=1767225600033601615\n\
-        sample gen=2 source=main index=7 ns=1767225600033611655\n\
-        work gen=2 index=0 iterations=0 before_ns=1767225600033676355 after_ns=1767225600033686405 checksum=27\n\
-        work gen=2 index=1 iterations=100000 before_ns=1767225600033700395 after_ns=1767225600035710445 checksum=4\n\
-        work gen=2 index=2 iterations=100000 before_ns=1767225600035724515 after_ns=1767225600037734565 checksum=4\n\
-        work gen=2 index=3 iterations=200000 before_ns=1767225600037748635 after_ns=1767225600041758685 checksum=2\n\
-        sample gen=2 source=thread index=0 thread=0 ns=1767225600042546525\n\
-        sample gen=2 source=thread index=1 thread=0 ns=1767225600042556565\n\
-        sample gen=2 source=thread index=2 thread=0 ns=1767225600042566605\n\
-        sample gen=2 source=thread index=3 thread=0 ns=1767225600042576645\n\
-        sample gen=2 source=thread index=0 thread=1 ns=1767225600045116745\n\
-        sample gen=2 source=thread index=1 thread=1 ns=1767225600045126785\n\
-        sample gen=2 source=thread index=2 thread=1 ns=1767225600045136825\n\
-        sample gen=2 source=thread index=3 thread=1 ns=1767225600045146865\n\
-        gen=2 first=1767225600033541375 last=1767225600045146865 min_delta=10040\n\
+        sample gen=0 source=main index=0 ns=1767225600002243035\n\
+        sample gen=0 source=main index=1 ns=1767225600002253075\n\
+        sample gen=0 source=main index=2 ns=1767225600002263115\n\
+        sample gen=0 source=main index=3 ns=1767225600002273155\n\
+        sample gen=0 source=main index=4 ns=1767225600002283195\n\
+        sample gen=0 source=main index=5 ns=1767225600002293235\n\
+        sample gen=0 source=main index=6 ns=1767225600002303275\n\
+        sample gen=0 source=main index=7 ns=1767225600002313315\n\
+        realtime gen=0 phase=open ns=1767225600002377745\n\
+        work gen=0 index=0 iterations=0 before_ns=1767225600002389385 after_ns=1767225600002399435 checksum=27\n\
+        work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=4\n\
+        work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600006447535 checksum=4\n\
+        work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600010471625 checksum=2\n\
+        sample gen=0 source=thread index=0 thread=0 ns=1767225600011259435\n\
+        sample gen=0 source=thread index=1 thread=0 ns=1767225600011269475\n\
+        sample gen=0 source=thread index=2 thread=0 ns=1767225600011279515\n\
+        sample gen=0 source=thread index=3 thread=0 ns=1767225600011289555\n\
+        sample gen=0 source=thread index=0 thread=1 ns=1767225600013829535\n\
+        sample gen=0 source=thread index=1 thread=1 ns=1767225600013839575\n\
+        sample gen=0 source=thread index=2 thread=1 ns=1767225600013849615\n\
+        sample gen=0 source=thread index=3 thread=1 ns=1767225600013859655\n\
+        realtime gen=0 phase=close ns=1767225600015646925\n\
+        gen=0 first=1767225600002243035 last=1767225600013859655 min_delta=10040\n\
+        sample gen=1 source=main index=0 ns=1767225600017915150\n\
+        sample gen=1 source=main index=1 ns=1767225600017925190\n\
+        sample gen=1 source=main index=2 ns=1767225600017935230\n\
+        sample gen=1 source=main index=3 ns=1767225600017945270\n\
+        sample gen=1 source=main index=4 ns=1767225600017955310\n\
+        sample gen=1 source=main index=5 ns=1767225600017965350\n\
+        sample gen=1 source=main index=6 ns=1767225600017975390\n\
+        sample gen=1 source=main index=7 ns=1767225600017985430\n\
+        realtime gen=1 phase=open ns=1767225600018050120\n\
+        work gen=1 index=0 iterations=0 before_ns=1767225600018061790 after_ns=1767225600018071840 checksum=27\n\
+        work gen=1 index=1 iterations=100000 before_ns=1767225600018085830 after_ns=1767225600020095880 checksum=4\n\
+        work gen=1 index=2 iterations=100000 before_ns=1767225600020109950 after_ns=1767225600022120000 checksum=4\n\
+        work gen=1 index=3 iterations=200000 before_ns=1767225600022134070 after_ns=1767225600026144120 checksum=2\n\
+        sample gen=1 source=thread index=0 thread=0 ns=1767225600026931960\n\
+        sample gen=1 source=thread index=1 thread=0 ns=1767225600026942000\n\
+        sample gen=1 source=thread index=2 thread=0 ns=1767225600026952040\n\
+        sample gen=1 source=thread index=3 thread=0 ns=1767225600026962080\n\
+        sample gen=1 source=thread index=0 thread=1 ns=1767225600029502180\n\
+        sample gen=1 source=thread index=1 thread=1 ns=1767225600029512220\n\
+        sample gen=1 source=thread index=2 thread=1 ns=1767225600029522260\n\
+        sample gen=1 source=thread index=3 thread=1 ns=1767225600029532300\n\
+        realtime gen=1 phase=close ns=1767225600031319690\n\
+        gen=1 first=1767225600017915150 last=1767225600029532300 min_delta=10040\n\
+        sample gen=2 source=main index=0 ns=1767225600033587975\n\
+        sample gen=2 source=main index=1 ns=1767225600033598015\n\
+        sample gen=2 source=main index=2 ns=1767225600033608055\n\
+        sample gen=2 source=main index=3 ns=1767225600033618095\n\
+        sample gen=2 source=main index=4 ns=1767225600033628135\n\
+        sample gen=2 source=main index=5 ns=1767225600033638175\n\
+        sample gen=2 source=main index=6 ns=1767225600033648215\n\
+        sample gen=2 source=main index=7 ns=1767225600033658255\n\
+        realtime gen=2 phase=open ns=1767225600033722945\n\
+        work gen=2 index=0 iterations=0 before_ns=1767225600033734615 after_ns=1767225600033744665 checksum=27\n\
+        work gen=2 index=1 iterations=100000 before_ns=1767225600033758655 after_ns=1767225600035768705 checksum=4\n\
+        work gen=2 index=2 iterations=100000 before_ns=1767225600035782775 after_ns=1767225600037792825 checksum=4\n\
+        work gen=2 index=3 iterations=200000 before_ns=1767225600037806895 after_ns=1767225600041816945 checksum=2\n\
+        sample gen=2 source=thread index=0 thread=0 ns=1767225600042604785\n\
+        sample gen=2 source=thread index=1 thread=0 ns=1767225600042614825\n\
+        sample gen=2 source=thread index=2 thread=0 ns=1767225600042624865\n\
+        sample gen=2 source=thread index=3 thread=0 ns=1767225600042634905\n\
+        sample gen=2 source=thread index=0 thread=1 ns=1767225600045175005\n\
+        sample gen=2 source=thread index=1 thread=1 ns=1767225600045185045\n\
+        sample gen=2 source=thread index=2 thread=1 ns=1767225600045195085\n\
+        sample gen=2 source=thread index=3 thread=1 ns=1767225600045205125\n\
+        realtime gen=2 phase=close ns=1767225600046992515\n\
+        gen=2 first=1767225600033587975 last=1767225600045205125 min_delta=10040\n\
         clock exec continuity holds across 2 execs\n";
 
-    fn clock_runtime_report(virtual_nanoseconds: u64) -> Value {
+    const CAPTURED_REALTIME_LAST: u64 = 1_767_225_600_046_992_515;
+    const CAPTURED_MONOTONIC_SPAN: u64 = 45_205_125 - 2_243_035;
+    const CAPTURED_VIRTUAL_NS: u64 = 48_760_645;
+
+    fn clock_runtime_report_for(text: &str, virtual_nanoseconds: u64) -> Value {
         let mut report = canonical_report(true);
         for side in ["left", "right"] {
             let output = &mut report["compared_outputs"][side];
-            output["stdout_sha256"] = sha256_bytes(CAPTURED_CLOCK_TRAJECTORY.as_bytes())
-                .unwrap()
-                .into();
-            output["stdout_bytes"] = CAPTURED_CLOCK_TRAJECTORY.len().into();
+            output["stdout_sha256"] = sha256_bytes(text.as_bytes()).unwrap().into();
+            output["stdout_bytes"] = text.len().into();
         }
         let run = serde_json::json!({
-            "scheduler_turns": 36, "virtual_nanoseconds": virtual_nanoseconds, "syscalls": 250
+            "scheduler_turns": 36, "virtual_nanoseconds": virtual_nanoseconds, "syscalls": 256
         });
         report["runtime"] = serde_json::json!({"run1": run, "run2": run});
         report
     }
 
-    /// Adds `offset` to every timestamp, keeping order, costs and summaries.
-    fn shift_clock_trajectory(text: &str, offset: i64) -> String {
+    fn clock_runtime_report(virtual_nanoseconds: u64) -> Value {
+        clock_runtime_report_for(CAPTURED_CLOCK_TRAJECTORY, virtual_nanoseconds)
+    }
+
+    /// Adds `offset` to every timestamp on the lines `select` accepts, keeping
+    /// order, costs and summaries.
+    fn shift_clock_lines(text: &str, offset: i64, select: impl Fn(usize, &str) -> bool) -> String {
         let shift = |field: &str| match field.split_once('=') {
             Some((key, value)) if ["ns", "before_ns", "after_ns", "first", "last"].contains(&key) => {
                 format!("{key}={}", value.parse::<i64>().unwrap() + offset)
@@ -9031,8 +9091,27 @@ mod tests {
             _ => field.to_owned(),
         };
         text.lines()
-            .map(|line| line.split(' ').map(shift).collect::<Vec<_>>().join(" ") + "\n")
+            .enumerate()
+            .map(|(index, line)| match select(index, line) {
+                true => line.split(' ').map(shift).collect::<Vec<_>>().join(" ") + "\n",
+                false => format!("{line}\n"),
+            })
             .collect()
+    }
+
+    /// Adds `offset` to every timestamp of both clocks.
+    fn shift_clock_trajectory(text: &str, offset: i64) -> String {
+        shift_clock_lines(text, offset, |_, _| true)
+    }
+
+    /// Adds `offset` to the REALTIME anchors only.
+    fn shift_realtime(text: &str, offset: i64) -> String {
+        shift_clock_lines(text, offset, |_, line| line.starts_with("realtime "))
+    }
+
+    /// Adds `offset` to the MONOTONIC records only, from line `from` onward.
+    fn shift_monotonic_from(text: &str, offset: i64, from: usize) -> String {
+        shift_clock_lines(text, offset, |index, line| index >= from && !line.starts_with("realtime "))
     }
 
     /// Replaces the given 0-based lines of the captured trajectory.
@@ -9044,10 +9123,15 @@ mod tests {
         lines.join("\n") + "\n"
     }
 
+    const CAPTURED_TRAJECTORY: ClockTrajectory = ClockTrajectory {
+        realtime_last: CAPTURED_REALTIME_LAST,
+        monotonic_span: CAPTURED_MONOTONIC_SPAN,
+    };
+
     #[test]
     fn clock_trajectory_accepts_the_capture_and_refuses_each_violation() {
         let text = CAPTURED_CLOCK_TRAJECTORY;
-        assert_eq!(parse_clock_trajectory(text), Ok(1_767_225_600_045_146_865));
+        assert_eq!(parse_clock_trajectory(text), Ok(CAPTURED_TRAJECTORY));
         // A shift inside the startup bound is valid; only the cross-build
         // comparison can refuse it.
         parse_clock_trajectory(&shift_clock_trajectory(text, 10)).unwrap();
@@ -9058,56 +9142,107 @@ mod tests {
             kept.join("\n") + "\n"
         };
         let mut reordered = lines.clone();
-        reordered.swap(12, 16);
+        reordered.swap(13, 17);
         let advance = "does not advance past";
         let cost = "equal work must cost equal virtual time";
         let cases = [
-            ("freeze", edit_clock_trajectory(&[(1, "sample gen=0 source=main index=1 ns=1767225600002243075")]), advance),
+            ("freeze", edit_clock_trajectory(&[(1, "sample gen=0 source=main index=1 ns=1767225600002243035")]), advance),
             ("backwards", edit_clock_trajectory(&[(3, "sample gen=0 source=main index=3 ns=1767225600002253000")]), advance),
-            ("exec reset", edit_clock_trajectory(&[(21, "sample gen=1 source=main index=0 ns=1767225600002243075")]), advance),
-            ("thread reset", edit_clock_trajectory(&[(12, "sample gen=0 source=thread index=0 thread=0 ns=1767225600002243075")]), advance),
-            ("epoch too early", shift_clock_trajectory(text, -1_000_000_000), advance),
+            ("exec reset", edit_clock_trajectory(&[(23, "sample gen=1 source=main index=0 ns=1767225600002243035")]), advance),
+            ("thread reset", edit_clock_trajectory(&[(13, "sample gen=0 source=thread index=0 thread=0 ns=1767225600002243035")]), advance),
+            ("epoch too early", shift_clock_trajectory(text, -1_000_000_000), "CLOCK_REALTIME read"),
             ("epoch too late", shift_clock_trajectory(text, 86_400_000_000_000), "outside the startup bound"),
-            ("round origin", shift_clock_trajectory(text, 1_000_000_000 - 17_891_900), "opens on a whole second"),
+            ("round origin", shift_clock_trajectory(text, 1_000_000_000 - 17_915_150), "opens on a whole second"),
+            // REALTIME anchors are their own chain: each refusal below leaves
+            // every MONOTONIC record untouched.
+            ("REALTIME before the epoch", shift_realtime(text, -1_000_000_000), "CLOCK_REALTIME read"),
+            ("REALTIME past the startup bound", shift_realtime(text, 60_000_000_000), "outside the startup bound"),
+            ("REALTIME round origin", shift_realtime(text, 1_000_000_000 - 18_050_120), "REALTIME anchor opens on a whole second"),
+            ("REALTIME frozen", edit_clock_trajectory(&[(21, "realtime gen=0 phase=close ns=1767225600002377745")]), "CLOCK_REALTIME read"),
+            ("REALTIME exec reset", edit_clock_trajectory(&[(31, "realtime gen=1 phase=open ns=1767225600002377745")]), "CLOCK_REALTIME read"),
+            ("REALTIME anchor missing", without(8), "expected \"realtime gen=0 phase=open\""),
+            ("REALTIME close missing", without(21), "expected \"realtime gen=0 phase=close\""),
             // Work-cost controls keep every timestamp strictly increasing, so
             // only the work-cost relation can refuse them.
             // Double work still costs exactly its two halves here, so only the
             // equal-cost relation can refuse this one.
             ("equal work, unequal cost", edit_clock_trajectory(&[
-                (10, "work gen=0 index=2 iterations=100000 before_ns=1767225600004425895 after_ns=1767225600006435946 checksum=4"),
-                (11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600010460036 checksum=2"),
+                (11, "work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600006447536 checksum=4"),
+                (12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600010471626 checksum=2"),
             ]), cost),
-            ("double work, single cost", edit_clock_trajectory(&[(11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600008460035 checksum=2")]), cost),
+            ("double work, single cost", edit_clock_trajectory(&[(12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600008471625 checksum=2")]), cost),
             // Costs more than one unit of work, but not exactly two.
-            ("double work, non-additive cost", edit_clock_trajectory(&[(11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600009460035 checksum=2")]), cost),
+            ("double work, non-additive cost", edit_clock_trajectory(&[(12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600009471625 checksum=2")]), cost),
             // A clock that ignores work: every segment costs the empty one's
             // 10,050 ns, which is equal and additive, so only the grows-with-work
             // relation can refuse it.
             ("work costs nothing", edit_clock_trajectory(&[
-                (9, "work gen=0 index=1 iterations=100000 before_ns=1767225600002401805 after_ns=1767225600002411855 checksum=4"),
-                (10, "work gen=0 index=2 iterations=100000 before_ns=1767225600004425895 after_ns=1767225600004435945 checksum=4"),
-                (11, "work gen=0 index=3 iterations=200000 before_ns=1767225600006449985 after_ns=1767225600006460035 checksum=2"),
+                (10, "work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600002423445 checksum=4"),
+                (11, "work gen=0 index=2 iterations=100000 before_ns=1767225600004437485 after_ns=1767225600004447535 checksum=4"),
+                (12, "work gen=0 index=3 iterations=200000 before_ns=1767225600006461575 after_ns=1767225600006471625 checksum=2"),
             ]), cost),
-            ("wrong checksum", edit_clock_trajectory(&[(9, "work gen=0 index=1 iterations=100000 before_ns=1767225600002401805 after_ns=1767225600004411855 checksum=5")]), "checksum 5 is wrong"),
-            ("changed iterations", edit_clock_trajectory(&[(9, "work gen=0 index=1 iterations=100001 before_ns=1767225600002401805 after_ns=1767225600004411855 checksum=4")]), "expected \"work gen=0 index=1 iterations=100000\""),
+            ("wrong checksum", edit_clock_trajectory(&[(10, "work gen=0 index=1 iterations=100000 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=5")]), "checksum 5 is wrong"),
+            ("changed iterations", edit_clock_trajectory(&[(10, "work gen=0 index=1 iterations=100001 before_ns=1767225600002413395 after_ns=1767225600004423445 checksum=4")]), "expected \"work gen=0 index=1 iterations=100000\""),
             ("missing sample", without(4), "expected \"sample gen=0 source=main index=4\""),
-            ("extra sample", edit_clock_trajectory(&[(8, "sample gen=0 source=main index=8 ns=1767225600002323395")]), "expected \"work gen=0 index=0"),
+            ("extra sample", edit_clock_trajectory(&[(8, "sample gen=0 source=main index=8 ns=1767225600002323355")]), "expected \"realtime gen=0 phase=open\""),
             ("record after verdict", format!("{text}extra\n"), "extra record"),
             ("threads reordered", reordered.join("\n") + "\n", "expected \"sample gen=0 source=thread index=0 thread=0\""),
-            ("leading zero", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=01767225600002243075")]), "malformed ns"),
-            ("signed", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=+1767225600002243075")]), "malformed ns"),
+            ("leading zero", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=01767225600002243035")]), "malformed ns"),
+            ("signed", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=+1767225600002243035")]), "malformed ns"),
             ("empty", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=")]), "malformed ns"),
             ("overflow", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=99999999999999999999")]), "malformed ns"),
-            ("trailing space", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=1767225600002243075 ")]), "trailing text"),
+            ("trailing space", edit_clock_trajectory(&[(0, "sample gen=0 source=main index=0 ns=1767225600002243035 ")]), "trailing text"),
             ("carriage returns", text.replace('\n', "\r\n"), "trailing text"),
-            ("summary", edit_clock_trajectory(&[(20, "gen=0 first=1767225600002243075 last=1767225600013848065 min_delta=10041")]), "summary disagrees"),
+            ("summary", edit_clock_trajectory(&[(22, "gen=0 first=1767225600002243035 last=1767225600013859655 min_delta=10041")]), "summary disagrees"),
             ("no final newline", text[..text.len() - 1].to_owned(), "one newline"),
-            ("no verdict", without(63), "lacks \"clock exec continuity"),
+            ("no verdict", without(69), "lacks \"clock exec continuity"),
         ];
         for (name, mutated, expected) in cases {
             let error = parse_clock_trajectory(&mutated).expect_err(name);
             assert!(error.contains(expected), "{name}: expected {expected:?}, got {error:?}");
         }
+    }
+
+    /// Linux gives CLOCK_MONOTONIC an unspecified origin, so a trajectory whose
+    /// MONOTONIC reads are nowhere near the epoch, or jump across an exec, is
+    /// valid; only the REALTIME anchors are held to the epoch window.
+    #[test]
+    fn clock_trajectory_holds_only_realtime_to_the_epoch() {
+        let text = CAPTURED_CLOCK_TRAJECTORY;
+        // About 600 s after boot, as on a real host; whole seconds keep every
+        // fractional part, and so the round-origin legs, unchanged.
+        let boot_relative = shift_monotonic_from(text, -1_767_225_000_000_000_000, 0);
+        assert!(boot_relative.starts_with("sample gen=0 source=main index=0 ns=600002243035\n"));
+        assert_eq!(parse_clock_trajectory(&boot_relative), Ok(CAPTURED_TRAJECTORY));
+        // A MONOTONIC reading far past the epoch window is equally valid.
+        let far = shift_monotonic_from(text, 86_400_000_000_000, 0);
+        assert_eq!(parse_clock_trajectory(&far), Ok(CAPTURED_TRAJECTORY));
+        // MONOTONIC and REALTIME need not move together across exec.
+        let jump = shift_monotonic_from(text, 10_000_000_000, 23);
+        assert_eq!(
+            parse_clock_trajectory(&jump),
+            Ok(ClockTrajectory {
+                realtime_last: CAPTURED_REALTIME_LAST,
+                monotonic_span: CAPTURED_MONOTONIC_SPAN + 10_000_000_000,
+            })
+        );
+        // The same shifts applied to REALTIME are refused.
+        for (name, shifted, expected) in [
+            ("boot-relative REALTIME", shift_realtime(text, -1_767_225_000_000_000_000), "CLOCK_REALTIME read"),
+            ("far REALTIME", shift_realtime(text, 86_400_000_000_000), "outside the startup bound"),
+        ] {
+            let error = parse_clock_trajectory(&shifted).expect_err(name);
+            assert!(error.contains(expected), "{name}: expected {expected:?}, got {error:?}");
+        }
+        // Continuity stays mandatory for a boot-relative MONOTONIC clock.
+        let frozen = boot_relative.replacen(
+            "sample gen=0 source=main index=1 ns=600002253075",
+            "sample gen=0 source=main index=1 ns=600002243035",
+            1,
+        );
+        assert_ne!(frozen, boot_relative);
+        let error = parse_clock_trajectory(&frozen).unwrap_err();
+        assert!(error.contains("CLOCK_MONOTONIC read"), "{error}");
     }
 
     #[test]
@@ -9116,25 +9251,25 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let bytes = CAPTURED_CLOCK_TRAJECTORY.as_bytes();
         let report = |name: &str, value: Value| write_report(&root, name, &value);
-        let cargo = report("cargo.json", clock_runtime_report(48_690_715));
+        let cargo = report("cargo.json", clock_runtime_report(CAPTURED_VIRTUAL_NS));
         verify_clock_parity(bytes, bytes, &cargo, &cargo).unwrap();
         let shifted = shift_clock_trajectory(CAPTURED_CLOCK_TRAJECTORY, 10);
-        let mut bare = clock_runtime_report(48_690_715);
+        let mut bare = clock_runtime_report(CAPTURED_VIRTUAL_NS);
         bare.as_object_mut().unwrap().remove("runtime");
         let mut changed = Vec::new();
         for (field, value) in [
             // The value the old comparator zeroed before comparing.
             ("virtual_nanoseconds", 48_690_237),
             ("scheduler_turns", 37),
-            ("syscalls", 251),
+            ("syscalls", 257),
         ] {
-            let mut value_report = clock_runtime_report(48_690_715);
+            let mut value_report = clock_runtime_report(CAPTURED_VIRTUAL_NS);
             for run in ["run1", "run2"] {
                 value_report["runtime"][run][field] = value.into();
             }
             changed.push(value_report);
         }
-        let mut counts = clock_runtime_report(48_690_715);
+        let mut counts = clock_runtime_report(CAPTURED_VIRTUAL_NS);
         counts["compared_log_messages"] = serde_json::json!({"left": 13, "right": 13});
         changed.push(counts);
         for buck in changed {
@@ -9142,15 +9277,28 @@ mod tests {
             let error = verify_clock_parity(bytes, bytes, &cargo, &buck).unwrap_err();
             assert!(error.contains("strict reports differ"), "{error}");
         }
+        // A MONOTONIC trajectory that advanced 10 s more than the run's
+        // virtual time lasted, with the REALTIME anchors unchanged, is refused
+        // only by the span binding.
+        let jump = shift_monotonic_from(CAPTURED_CLOCK_TRAJECTORY, 10_000_000_000, 23);
+        let jump_report = report("jump.json", clock_runtime_report_for(&jump, CAPTURED_VIRTUAL_NS));
+        let boot = shift_monotonic_from(CAPTURED_CLOCK_TRAJECTORY, -1_767_225_000_000_000_000, 0);
+        let boot_report = report("boot.json", clock_runtime_report_for(&boot, CAPTURED_VIRTUAL_NS));
+        verify_clock_parity(boot.as_bytes(), boot.as_bytes(), &boot_report, &boot_report).unwrap();
+        let realtime_end = CAPTURED_REALTIME_LAST - CLOCK_PARITY_EPOCH_NS;
         for (cargo_bytes, buck_bytes, cargo, expected) in [
             (bytes, shifted.as_bytes(), &cargo, "clock trajectory"),
             (shifted.as_bytes(), shifted.as_bytes(), &cargo, "compared a different stdout"),
-            (bytes, bytes, &report("short.json", clock_runtime_report(45_146_865)), "ends before the last read"),
+            (bytes, bytes, &report("short.json", clock_runtime_report(realtime_end)), "ends before the last REALTIME anchor"),
+            (jump.as_bytes(), jump.as_bytes(), &jump_report, "shorter than the MONOTONIC span"),
             (bytes, bytes, &report("bare.json", bare), "lacks a runtime summary"),
         ] {
             let error = verify_clock_parity(cargo_bytes, buck_bytes, cargo, cargo).unwrap_err();
             assert!(error.contains(expected), "expected {expected:?}, got {error:?}");
         }
+        // The boundary is strict: one nanosecond past the anchor is enough.
+        let edge = report("edge.json", clock_runtime_report(realtime_end + 1));
+        verify_clock_parity(bytes, bytes, &edge, &edge).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9160,11 +9308,11 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let bytes = CAPTURED_CLOCK_TRAJECTORY.as_bytes();
         for (field, value) in [
-            ("virtual_nanoseconds", 48_690_725),
+            ("virtual_nanoseconds", CAPTURED_VIRTUAL_NS + 10),
             ("scheduler_turns", 37),
-            ("syscalls", 251),
+            ("syscalls", 257),
         ] {
-            let mut unequal = clock_runtime_report(48_690_715);
+            let mut unequal = clock_runtime_report(CAPTURED_VIRTUAL_NS);
             unequal["runtime"]["run2"][field] = serde_json::json!(value);
             let path = write_report(&root, &format!("{field}.json"), &unequal);
             let error = verify_report(&path, true).unwrap_err();
