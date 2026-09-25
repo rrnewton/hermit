@@ -965,6 +965,9 @@ fn generated_plan_populations_preserve_command_policy() {
     let select = crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
     // The 2026-10-03 SaBRe promotion adds 128 portable SaBRe verify cells.
     let sabre = crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
+    // One portable ptrace verify cell, system-utils/procfs-sanitized-paths,
+    // re-selected after the guest mount model excluded ephemeral host seed mounts.
+    let procfs = crate::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT;
     // https://github.com/rrnewton/reverie/issues/891 selects six more portable
     // KVM verify cells; keep the earlier populations as explicit baselines.
     // Three more socket KVM verify selections: https://github.com/rrnewton/reverie/issues/891.
@@ -973,7 +976,7 @@ fn generated_plan_populations_preserve_command_policy() {
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
     // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre;
+    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre + procfs;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1021,7 +1024,7 @@ fn generated_plan_populations_preserve_command_policy() {
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
         // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
         // The SaBRe cells are portable and not KVM, so hosted runs keep them.
-        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre
+        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre + procfs
             - (241 + 6 + 3 + 1 + 1 + 1 + 1 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
@@ -1074,7 +1077,7 @@ fn generated_plan_populations_preserve_command_policy() {
             // The ordinary syncfs KVM row adds one too: https://github.com/rrnewton/reverie/issues/838.
             // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
             // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre,
+            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 + 1 + sabre + procfs,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();

@@ -104,6 +104,8 @@ use crate::timeouts::MANIFEST_SCHEMA;
 #[cfg(test)]
 use crate::timeouts::NON_CI_CELL_COUNT;
 #[cfg(test)]
+use crate::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
@@ -8580,6 +8582,9 @@ mod tests {
                 // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
                 + 1
                 + SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
+                // One ptrace verify cell re-selected after the guest mount model
+                // excluded ephemeral host seed mounts.
+                + PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
         // and the ones that were enabled with ci:false are now required.
@@ -8631,7 +8636,9 @@ mod tests {
                 - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
                 + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len()
-                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(),
+                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len()
+                // The procfs verify cell was enabled with ci:false before.
+                - PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT,
             "the current manifest census records every enabled ci:false cell"
         );
 

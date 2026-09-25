@@ -77,6 +77,17 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// One ptrace verify cell re-selected after the guest mount model excluded
+/// ephemeral per-process host FUSE seed mounts (`fuse.squashfuse_ll` under
+/// `/mnt/xarfuse/`): `system-utils/procfs-sanitized-paths` passed twenty
+/// consecutive strict canonical repetitions at the evidence head under its
+/// manifest comparison profile (`compare_io_buffers: false, rcb_time: false`).
+/// The evidence SHA is the first commit of this change (the tree the
+/// qualification binary was built from).
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
+    "422f3f3a4e05353edd4f2449affc8df9241bdf51";
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:23:58Z";
+pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
 /// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
@@ -1968,6 +1979,15 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(
+            PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
+            "PENDING_FIRST_COMMIT"
+        );
+        assert_eq!(
+            PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-25T09:23:58Z"
+        );
+        assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             SELECT_REPLAY_2026_10_03_TESTS.len()
