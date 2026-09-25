@@ -113,6 +113,8 @@ use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
 #[cfg(test)]
 use crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
+#[cfg(test)]
+use crate::timeouts::VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::resolve_test_timeouts;
 use crate::timeouts::resolve_timeout_seconds;
 use crate::timeouts::timeout_multipliers_from_env;
@@ -8547,6 +8549,7 @@ mod tests {
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
+                + VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT
                 + 3 // the exact RNG identities asserted above
                 + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
                 + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
