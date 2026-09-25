@@ -105,6 +105,8 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
+#[cfg(test)]
+use crate::timeouts::SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
 #[cfg(test)]
 use crate::timeouts::VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT;
@@ -6468,6 +6470,7 @@ mod tests {
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
                 + VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT
+                + SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
