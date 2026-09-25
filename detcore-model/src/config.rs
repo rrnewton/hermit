@@ -180,10 +180,10 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_parked_write_signal_interruption: bool,
 
-    /// An injected `rt_sigprocmask` reads the guest thread's own signal mask, and every signal
-    /// delivered to a thread blocked in injected external IO makes that syscall return to the
-    /// tool, even when the guest ignores the signal. Only then can the scheduler send a timer
-    /// signal thread-directed to such a thread and await its report.
+    /// The host thread's blocked mask in `/proc/<tid>/status` is the guest thread's own signal
+    /// mask, and every signal delivered to a thread blocked in external IO makes that syscall
+    /// return to the tool, even when the guest ignores the signal. Only then can the scheduler
+    /// send a timer signal thread-directed to such a thread and await its report.
     #[serde(default = "default_true")]
     #[clap(skip = true)]
     pub backend_reports_signal_interrupted_external_io: bool,

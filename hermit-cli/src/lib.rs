@@ -2425,13 +2425,14 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // resuming through the kernel's ptrace syscall-restart frame.
     config.backend_supports_parked_write_signal_interruption =
         matches!(backend, Backend::Ptrace | Backend::E9patch);
-    // Under ptrace every delivered signal, even an ignored one, stops the
-    // thread for its tracer, so an injected blocking syscall returns to the
-    // tool. No other backend is known to give both guarantees: DynamoRIO
-    // emulates the guest's signal mask, so DBT's raw `rt_sigprocmask` need not
-    // read it; SaBRe drops an ignored signal; LiteInst and KVM re-invoke the
-    // Tool callback on ERESTARTSYS, as above. Their external-IO blockers stay
-    // in the scheduler's pool, as before.
+    // Under ptrace the tracer reads the stopped thread's own mask from procfs,
+    // and every delivered signal, even an ignored one, stops the thread for
+    // its tracer, so a blocking syscall returns to the tool. No other backend
+    // is known to give both guarantees: DynamoRIO emulates the guest's signal
+    // mask, so the host thread's mask is not the guest's; SaBRe drops an
+    // ignored signal; LiteInst and KVM re-invoke the Tool callback on
+    // ERESTARTSYS, as above. Their external-IO blockers stay in the
+    // scheduler's pool, as before.
     config.backend_reports_signal_interrupted_external_io =
         matches!(backend, Backend::Ptrace | Backend::E9patch);
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;

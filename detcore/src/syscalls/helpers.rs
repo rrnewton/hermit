@@ -33,7 +33,6 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
-use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::WaitSignalDisposition;
@@ -133,7 +132,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// change its mask, and while it is outside the runnable set it executes
     /// nothing but `call`. A call that installs a temporary mask gives `None`,
     /// as do record/replay modes, whose external-IO harvest this does not
-    /// change, and an unsequentialized run, where the scheduler is not asked.
+    /// change, an unsequentialized run, where the scheduler is not asked, and
+    /// a backend without the guarantee the scheduler relies on.
+    ///
+    /// The mask is read from procfs while the thread is stopped at the call's
+    /// entry, not with an injected `rt_sigprocmask`. An injection would use up
+    /// the pending syscall, and the call would then run as a second injection
+    /// from the tracer's private page. A signal the scheduler sends before the
+    /// thread re-enters the kernel then stops the thread before that
+    /// injection's `syscall` instruction runs, and Reverie reports
+    /// `ERESTARTSYS` for a call that never ran: under `SA_RESTART` the guest's
+    /// `select` would restart instead of failing with `EINTR`. Resuming the
+    /// pending syscall instead continues the call inside the kernel, which
+    /// sees the signal pending and picks the restart class itself, whether
+    /// the signal arrived before or during the wait.
     async fn external_io_signal_mask<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -142,16 +154,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !external_io_signal_mask_is_known(&self.cfg, call) {
             return Ok(None);
         }
-        let mut stack = guest.stack().await;
-        let mask_addr = stack.reserve::<KernelSigset>();
-        let _mask_guard = stack.commit()?;
-        let read_mask = syscalls::RtSigprocmask::new()
-            .with_how(libc::SIG_BLOCK)
-            .with_set(None)
-            .with_oldset(Some(mask_addr.cast()))
-            .with_sigsetsize(KERNEL_SIGSET_SIZE);
-        guest.inject_with_retry(read_mask).await?;
-        Ok(Some(guest.memory().read_value(mask_addr)?))
+        let tid = guest.tid();
+        let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw()));
+        let mask = status
+            .ok()
+            .as_deref()
+            .and_then(blocked_mask_from_proc_status);
+        if mask.is_none() {
+            // A stopped tracee's status is always readable; if it is not, keep
+            // the old harvest rather than guess, and say so in the compared log.
+            tracing::warn!(
+                "[dtid {}] could not read the signal mask of thread {}; its external IO keeps an unknown mask",
+                guest.thread_state().dettid,
+                tid
+            );
+        }
+        Ok(mask)
     }
 
     /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
@@ -823,6 +841,15 @@ pub fn ioaction_based_on_fd_status<
 /// and a backend that guarantees the report; record/replay keeps its recorded
 /// behavior; and a call that swaps in another mask makes the thread's own mask
 /// the wrong one.
+/// The `SigBlk` field of a `/proc/<tid>/status` file: the thread's blocked
+/// signal mask, as kernel sigset bits in hexadecimal.
+fn blocked_mask_from_proc_status(status: &str) -> Option<u64> {
+    let field = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigBlk:"))?;
+    u64::from_str_radix(field.trim(), 16).ok()
+}
+
 fn external_io_signal_mask_is_known(cfg: &Config, call: Syscall) -> bool {
     cfg.sequentialize_threads
         && !cfg.recordreplay_modes
@@ -1783,6 +1810,46 @@ mod tests {
         ] {
             assert!(!external_io_signal_mask_is_known(&config, select), "{case}");
         }
+    }
+
+    #[test]
+    fn blocked_mask_is_the_sigblk_field_of_proc_status() {
+        let status = "Name:\tf\nSigPnd:\t0000000000000001\nShdPnd:\t0000000000000000\n\
+                      SigBlk:\t0000000000002000\nSigIgn:\t0000000000001000\n";
+        assert_eq!(blocked_mask_from_proc_status(status), Some(0x2000));
+        assert_eq!(
+            blocked_mask_from_proc_status("SigBlk:\tfffffffe7ffbfeff\n"),
+            Some(0xfffffffe7ffbfeff)
+        );
+        assert_eq!(
+            blocked_mask_from_proc_status("SigPnd:\t0000000000002000\n"),
+            None
+        );
+        assert_eq!(blocked_mask_from_proc_status("SigBlk:\tzz\n"), None);
+    }
+
+    /// The live thread's own procfs entry reports the mask it set.
+    #[test]
+    fn blocked_mask_reads_this_threads_own_mask() {
+        std::thread::spawn(|| {
+            let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR2);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let tid = unsafe { libc::gettid() };
+            let status = std::fs::read_to_string(format!("/proc/{tid}/status")).unwrap();
+            assert_eq!(
+                blocked_mask_from_proc_status(&status),
+                Some(1 << (libc::SIGUSR2 - 1))
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     /// Bracket the millisecond-to-nanosecond timeout conversion in both
