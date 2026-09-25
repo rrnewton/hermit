@@ -4567,7 +4567,7 @@ impl RunOpts {
                 )));
             }
             eprintln!(
-                ":: SaBRe syscall DETLOG records logged: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
             );
         }
 
