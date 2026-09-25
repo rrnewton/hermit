@@ -3414,6 +3414,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "kvm"
@@ -10186,6 +10193,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -16818,6 +16832,13 @@
           "test": "c-programs/dbt-mmap-exec",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
