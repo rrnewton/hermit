@@ -201,9 +201,13 @@ that candidate's typed `version --json` and requires the exact metadata and
 `dbt`/`e9patch`/`sabre` feature facts. This rejects an executable decoy without
 making a guest-execution or behavioral-parity claim.
 Measured pinned-Buck logs serialize `CommandEnd.is_success=false` even for
-successful builds, so that field is retained and explicitly labeled
-`advisory-known-inconsistent`; it is neither hidden nor used to override the
-canonical Result/shell/output evidence. One portable Rust operation examines
+successful builds: 21 retained builds that completed with zero errors and 1
+that failed with one error all carried `false`. The field is retained and
+explicitly labeled `advisory-known-inconsistent`; it is neither hidden nor used
+to override the canonical Result/shell/output evidence. That reading is bound
+to the measured Buck2 descriptor (`bootstrap/buck2` SHA-256
+`40e4842f407f589acf80a40267764bea914dc4067b2faf330cc1c377080db35e`): under any
+other descriptor a `false` flag is refused until the flag is re-measured. One portable Rust operation examines
 every prospective regular artifact file through one stable read that returns
 the raw bytes, filesystem identity, and digest. Event logs are decompressed
 from those same captured raw bytes; the receipt and `SHA256SUMS` are derived
