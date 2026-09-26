@@ -11041,28 +11041,105 @@ fn self_test(root: &Path) -> Result<(), String> {
             "seeded repeated-green sampling lost its selected or eligible-cell count".into(),
         );
     }
-    let one_cell_mode_results = scratch.join("one-cell-mode-green-plan");
-    let one_cell_mode_selection = CellSelection {
+    let green_replay_results = scratch.join("green-replay-plan");
+    let green_replay_selection = CellSelection {
         green: true,
         mode: Some("replay".into()),
         repetitions: Some(2),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    let (one_cell_mode_metadata, _) = write_plan_after_scorecard_check(
+    let (green_replay_metadata, _) = write_plan_after_scorecard_check(
         &checked_scorecard,
-        &one_cell_mode_results,
-        &one_cell_mode_results.join("dag.json"),
-        &one_cell_mode_selection,
+        &green_replay_results,
+        &green_replay_results.join("dag.json"),
+        &green_replay_selection,
     )?;
+    let expected_green_replay_ids: BTreeSet<_> = tracked
+        .cells
+        .iter()
+        .filter(|tracked| {
+            tracked.is_applicable() && tracked.status == "green" && tracked.id.mode == "replay"
+        })
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    let selected_green_replay_ids: BTreeSet<_> =
+        green_replay_metadata.cells.iter().cloned().collect();
+    if selected_green_replay_ids != expected_green_replay_ids
+        || green_replay_metadata.cells.len() != expected_green_replay_ids.len()
+        || green_replay_metadata.eligible_cells != expected_green_replay_ids.len()
+    {
+        return Err(format!(
+            "green replay plan lost its complete population: selected {:?}, eligible {}, expected {:?}",
+            green_replay_metadata.cells,
+            green_replay_metadata.eligible_cells,
+            expected_green_replay_ids,
+        ));
+    }
+    if !green_replay_metadata.green
+        || green_replay_metadata.mode.as_deref() != Some("replay")
+        || green_replay_metadata.test.is_some()
+        || green_replay_metadata.backend.is_some()
+        || green_replay_metadata.sample.is_some()
+        || green_replay_metadata.seed.is_some()
+        || green_replay_metadata.cells_file.is_some()
+        || green_replay_metadata.repetitions != Some(2)
+        || green_replay_metadata.is_exact()
+    {
+        return Err(format!(
+            "green replay plan changed its unsampled mode-only selectors: {green_replay_metadata:?}"
+        ));
+    }
+    let green_replay_description =
+        top_level_repeated_result_description(&green_replay_metadata, 1, 1, 0, 0, 2);
+    if green_replay_description != "one or more repeated checks failed or required a retry" {
+        return Err(format!(
+            "mode-filtered green replay batch has an exact-cell description: {green_replay_description:?}"
+        ));
+    }
+
+    // The real replay inventory may grow. Keep the singleton labeling contract
+    // in an in-memory fixture, separate from the complete real plan above.
+    let one_cell_mode_metadata = RunMetadata {
+        run_id: "one-cell-mode-green-fixture".into(),
+        hermit_sha: "fixture".into(),
+        detcore_tree: "fixture".into(),
+        mode: Some("replay".into()),
+        test: None,
+        backend: None,
+        sample: None,
+        seed: None,
+        green: true,
+        repetitions: Some(2),
+        unavailable_cells: 0,
+        eligible_cells: 1,
+        cells_file: None,
+        cells_file_sha256: None,
+        selected_population_sha256: None,
+        cells: vec![CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: "fixture/one-cell-replay".into(),
+            mode: "replay".into(),
+            backend: "ptrace".into(),
+        }],
+        ..green_replay_metadata.clone()
+    };
     if !one_cell_mode_metadata.green
         || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 1, 0, 0, 2)
-            != "one or more repeated checks failed or required a retry"
+        || one_cell_mode_metadata.eligible_cells != 1
+        || one_cell_mode_metadata.is_exact()
     {
-        return Err(
-            "a one-cell mode-filtered green batch was described as an exact flaky cell".into(),
-        );
+        return Err(format!(
+            "one-cell mode-filtered green fixture lost its singleton batch shape: {one_cell_mode_metadata:?}"
+        ));
+    }
+    let one_cell_mode_description =
+        top_level_repeated_result_description(&one_cell_mode_metadata, 1, 1, 0, 0, 2);
+    if one_cell_mode_description != "one or more repeated checks failed or required a retry" {
+        return Err(format!(
+            "a one-cell mode-filtered green batch was described as an exact flaky cell: {one_cell_mode_description:?}"
+        ));
     }
     let one_cell_sample_results = scratch.join("one-cell-sample-green-plan");
     let one_cell_sample_selection = CellSelection {
