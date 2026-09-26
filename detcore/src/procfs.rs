@@ -2896,8 +2896,11 @@ fn sanitize_numa_maps(contents: &[u8]) -> Vec<u8> {
 /// Every `smaps`/`smaps_rollup` field that counts pages the host currently
 /// holds for the mapping: resident, dirty, swapped, huge-page backed, reclaim
 /// pending, or locked. Reclaim, writeback, khugepaged and swap change these
-/// without any guest action, so both sanitizers report each one as `0 kB`,
-/// which is consistent with the zero `Rss` that bounds all of them.
+/// without any guest action, so both sanitizers report each one as `0 kB`.
+/// The zero `Rss` bounds every field except `Swap` and `SwapPss`, which count
+/// swapped-out pages, and `Shared_Hugetlb` and `Private_Hugetlb`, which count
+/// hugetlb pages that the kernel keeps out of `Rss`. All zero is still a
+/// state Linux reports, for example for an untouched mapping.
 const SMAPS_ACCOUNTING_FIELDS: &[&str] = &[
     "Rss",
     "Pss",
