@@ -1142,6 +1142,21 @@ impl SeriesRow {
                                 .into(),
                         );
                     }
+                    // Declared, the declared ending is the one that passes; the
+                    // scorecard reader refuses it as a failed match too.
+                    if let Some(declared) = &self.series.declared_guest_exit {
+                        let expected = ExpectedGuestExit {
+                            code: declared.code,
+                            signal: declared.signal,
+                            reason: declared.reason.clone(),
+                        };
+                        if expected.hermit_status_matches(disposition.status, disposition.signal) {
+                            return Err(
+                                "failed_match evidence must not end as its declared guest exit"
+                                    .into(),
+                            );
+                        }
+                    }
                 }
                 SeriesNoVerdictKind::InfrastructureError => {
                     if disposition.attempt_outcome != "ERROR"
@@ -2063,6 +2078,68 @@ mod tests {
                 .validate_for_write()
                 .expect_err(&format!("{label}: admitted"));
             assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        // Declared, a failed match must not end as the declaration: that
+        // ending is the one the runner passes, and the reader refuses it.
+        let declared_failed_match = |code: Option<i32>, signal: Option<i32>, status, observed| {
+            let mut row = failed_match();
+            let mut declaration = declared_exit_row(code, signal, status, observed)
+                .series
+                .declared_guest_exit
+                .unwrap();
+            declaration.evidence_sha256 = row
+                .series
+                .no_verdict_evidence
+                .as_ref()
+                .unwrap()
+                .evidence_sha256
+                .clone();
+            declaration.attempts[0].outcome = "FAIL".into();
+            row.series.declared_guest_exit = Some(declaration);
+            let disposition = attempt(&mut row);
+            disposition.status = status;
+            disposition.signal = observed;
+            row
+        };
+        for (label, row) in [
+            (
+                "declared 7, exit 3",
+                declared_failed_match(Some(7), None, Some(3), None),
+            ),
+            (
+                "declared 7, exit 0",
+                declared_failed_match(Some(7), None, Some(0), None),
+            ),
+            (
+                "declared signal 11, exit 3",
+                declared_failed_match(None, Some(11), Some(3), None),
+            ),
+        ] {
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+        for (label, row) in [
+            (
+                "declared 7, exit 7",
+                declared_failed_match(Some(7), None, Some(7), None),
+            ),
+            (
+                "declared signal 11, signal 11",
+                declared_failed_match(None, Some(11), None, Some(11)),
+            ),
+            (
+                "declared signal 11, exit 139",
+                declared_failed_match(None, Some(11), Some(139), None),
+            ),
+        ] {
+            let error = row
+                .validate_for_write()
+                .expect_err(&format!("{label}: admitted"));
+            assert!(
+                error.contains("must not end as its declared guest exit"),
+                "{label}: {error}"
+            );
         }
     }
 
