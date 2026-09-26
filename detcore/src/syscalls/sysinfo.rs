@@ -59,6 +59,28 @@ fn logical_clock_ticks(
     clock_t_from_ticks(ticks)
 }
 
+/// Whole seconds of virtual uptime: the configured boot offset plus the logical time elapsed
+/// since the epoch. The elapsed duration is floored once, after subtraction. Flooring `now` and
+/// `boot` separately would make the result depend on the epoch's sub-second fraction, so two runs
+/// that differ only in their epoch would disagree about uptime by a second.
+fn uptime_seconds(
+    now: crate::types::LogicalTime,
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> u64 {
+    uptime_offset_seconds + (now - boot).as_secs()
+}
+
+/// Whole-second virtual boot time for `/proc/stat` `btime`: the epoch less the configured uptime
+/// offset. Linux reports a fixed boot instant, so this is derived from the epoch alone rather than
+/// as `now - uptime`, which would move by a second whenever the epoch's fraction and the elapsed
+/// fraction together cross a second boundary.
+fn boot_time_seconds(boot: crate::types::LogicalTime, uptime_offset_seconds: u64) -> Option<i64> {
+    i64::try_from(boot.as_secs())
+        .ok()?
+        .checked_sub(i64::try_from(uptime_offset_seconds).ok()?)
+}
+
 fn prlimit_targets_current_process(
     target_pid: i32,
     deterministic_pid: Option<i32>,
@@ -353,9 +375,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
     ) -> Result<u64, Error> {
-        let global_time = thread_observe_time(guest).await;
-        Ok(self.cfg.sysinfo_uptime_offset + global_time.as_secs()
-            - crate::types::DetTime::new(&self.cfg).as_nanos().as_secs())
+        let now = thread_observe_time(guest).await;
+        let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
+        Ok(uptime_seconds(now, boot, self.cfg.sysinfo_uptime_offset))
+    }
+
+    pub(super) fn virtual_boot_time_seconds(&self) -> Result<i64, Error> {
+        let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
+        boot_time_seconds(boot, self.cfg.sysinfo_uptime_offset)
+            .ok_or_else(|| Error::from(Errno::EOVERFLOW))
     }
 
     async fn collect_sysinfo<G: Guest<Self>>(
@@ -428,6 +456,41 @@ mod tests {
         let now = boot + LogicalTime::from_millis(25);
 
         assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+    }
+
+    #[test]
+    fn uptime_seconds_depend_on_elapsed_time_not_the_epoch_fraction() {
+        // The same 1.5 s of elapsed logical time from two epochs that differ only in their
+        // sub-second fraction. Flooring the absolute instants separately reported 121 for the
+        // first and 122 for the second.
+        let elapsed = LogicalTime::from_millis(1_500);
+        for boot in [
+            LogicalTime::from_nanos(1_790_389_350_000_000_000),
+            LogicalTime::from_nanos(1_790_389_350_900_000_000),
+        ] {
+            assert_eq!(uptime_seconds(boot + elapsed, boot, 120), 121);
+        }
+        let boot = LogicalTime::from_nanos(1_790_389_350_900_000_000);
+        assert_eq!(uptime_seconds(boot, boot, 120), 120);
+        // btime stays at the fixed boot instant while uptime crosses a second boundary.
+        assert_eq!(boot_time_seconds(boot, 120), Some(1_790_389_230));
+        assert_eq!(
+            boot_time_seconds(LogicalTime::from_nanos(1_790_389_350_000_000_000), 120),
+            Some(1_790_389_230)
+        );
+        assert_eq!(
+            boot_time_seconds(LogicalTime::from_secs(5), 120),
+            Some(-115)
+        );
+        assert_eq!(boot_time_seconds(boot, u64::MAX), None);
+        assert_eq!(
+            uptime_seconds(boot + LogicalTime::from_nanos(999_999_999), boot, 120),
+            120
+        );
+        assert_eq!(
+            uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
+            121
+        );
     }
 
     #[test]
