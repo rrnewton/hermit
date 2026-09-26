@@ -939,7 +939,7 @@ test:
     modes:
       verify:
         ci:
-          ptrace: false
+          ptrace: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -947,8 +947,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -8101,6 +8099,74 @@ test:
           liteinst: Chaos scheduling is unsupported by LiteInst
       custom:
         ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/sigsuspend-alarm-wake
+    description: Strict verification for tests/c/sigsuspend_alarm_wake.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/sigsuspend_alarm_wake.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -pthread
+    modes:
+      verify:
+        ci:
+          ptrace: true
+        backends_enabled:
+          - ptrace
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify DBT separately
+          kvm: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify KVM separately
+          sabre: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify SaBRe separately
+          liteinst: A scheduler timer signal waking an rt_sigsuspend waiter is qualified against the ptrace reference first; qualify LiteInst separately
+      naked:
+        ci: false
+        ci_disabled_reason: This fixture asserts interrupted-sigsuspend behavior under verification; it has no native nondeterminism oracle.
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts interrupted-sigsuspend semantics under strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: This scheduler-signal fixture is qualified for verify only; record/replay has not been measured.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: This fixture has no schedule-diversity oracle; verify owns its sigsuspend assertions.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: This fixture takes no arguments and has no additional custom argument case.
         backends_enabled: []
         backends_disabled:
           ptrace: No custom edge-case arguments have been calibrated for this C guest

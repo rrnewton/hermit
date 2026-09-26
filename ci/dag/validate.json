@@ -3416,6 +3416,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "kvm"
@@ -5384,6 +5391,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -10188,6 +10202,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -10938,6 +10959,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -16824,6 +16852,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-pid-virtualization",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
           "backend": "kvm"
@@ -18792,6 +18827,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
           "mode": "verify",
           "backend": "ptrace"
         },
