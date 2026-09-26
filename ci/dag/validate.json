@@ -2873,6 +2873,20 @@
         {
           "lane": "portable",
           "category": "backend-parity-c",
+          "test": "backend-parity-c/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
           "test": "backend-parity-c/umask-mode",
           "mode": "verify",
           "backend": "kvm"
@@ -10141,6 +10155,20 @@
         {
           "lane": "portable",
           "category": "backend-parity-c",
+          "test": "backend-parity-c/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
           "test": "backend-parity-c/umask-mode",
           "mode": "verify",
           "backend": "ptrace"
@@ -16407,6 +16435,20 @@
           "lane": "portable",
           "category": "backend-parity-c",
           "test": "backend-parity-c/thp-disable",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timerfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
         },
