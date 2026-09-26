@@ -440,6 +440,7 @@ impl StaticStepSpec {
             hint: self.hint.materialize(),
             networkonly: self.networkonly,
             engine_only: self.engine_only,
+            delegated_children: false,
             timeout: self.timeout,
             cpu_timeout: self.cpu_timeout,
             jobs_flag: self.jobs_flag.map(Into::into),
