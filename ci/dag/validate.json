@@ -5586,6 +5586,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "kvm"
@@ -7894,7 +7908,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "748",
+        "NEXTEST_EXPECTED_EXECUTED": "759",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -11008,6 +11022,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/socket-ioctl-timestamp",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -18988,6 +19009,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/socket-ioctl-timestamp",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -62242,7 +62277,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "748",
+        "NEXTEST_EXPECTED_EXECUTED": "759",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
