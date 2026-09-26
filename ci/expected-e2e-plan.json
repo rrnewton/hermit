@@ -6049,6 +6049,20 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/sigsuspend-sibling-signal-wake"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/timer-family-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/timerfd-semantics"
     }
   ],
   "schema": 1
