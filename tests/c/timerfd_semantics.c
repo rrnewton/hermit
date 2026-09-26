@@ -18,7 +18,8 @@
  * Cases:
  *   abstime_realtime / abstime_monotonic / abstime_past
  *       TFD_TIMER_ABSTIME deadlines are read in the same clock domain the guest
- *       sees from clock_gettime, for both clocks, including a past deadline.
+ *       sees from clock_gettime, for both clocks, including a past deadline
+ *       (which expires promptly, though not necessarily before settime returns).
  *   select_mixed / pselect_mixed / select_remaining
  *       A ready pipe plus an expired timerfd reports both bits and a count of
  *       2; a timerfd ending a select early leaves the remaining timeout.
@@ -44,6 +45,28 @@
  *   fork_shared
  *       A forked child shares the open file description: its read consumes the
  *       expiration the parent then no longer sees.
+ *   poll_cross_arm / poll_cross_rearm / epoll_cross_arm / epoll_cross_rearm
+ *       Another thread arming a disarmed timer, or re-arming a distant one to
+ *       fire soon, ends a blocked poll or epoll_wait when that timer fires,
+ *       with an infinite and with a finite timeout.
+ *   epoll_ctl_add_while_waiting
+ *       An armed timerfd added by another thread to an epoll that a thread is
+ *       already waiting on ends the wait when it fires.
+ *   readv_split / readv_short / preadv2_current / pread_espipe
+ *       readv and preadv2 at offset -1 read the count like read, across a
+ *       split iovec; a total length below 8 is EINVAL; a positioned read is
+ *       ESPIPE.
+ *   read_fault_consumes
+ *       A read into an unmapped buffer faults after taking the expirations,
+ *       so the next read finds none.
+ *   create_errors / gettime_errors / settime_errors
+ *       Linux's argument-checking order: bad flags or clock are EINVAL (even
+ *       for an alarm clock); gettime checks the descriptor before the output
+ *       pointer; settime checks the input pointer before the descriptor; a
+ *       disarmed timer reads back as zero.
+ *   periodic_sleep / close_armed_sleep
+ *       A fine-interval periodic timer, whether watched later or already
+ *       closed, does not stall an unrelated sleep.
  */
 
 #define _GNU_SOURCE
@@ -55,11 +78,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -128,10 +153,14 @@ static void check_abstime_past(void) {
     int fd = armed_tfd(CLOCK_REALTIME, TFD_NONBLOCK, now_ns(CLOCK_REALTIME) - 1000 * MS, 0,
                        TFD_TIMER_ABSTIME);
     if (fd < 0) { fail(name, "settime errno=%ld%ld", errno, 0); return; }
+    /* Linux expires a past deadline from its timer interrupt, not inside
+     * settime, so a read issued at once can still see EAGAIN natively. */
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int n = poll(&pfd, 1, 5000);
     uint64_t count = 0;
     ssize_t r = read(fd, &count, sizeof count);
     close(fd);
-    if (r != 8 || count != 1) fail(name, "r=%ld count=%ld", (long)r, (long)count);
+    if (n != 1 || r != 8 || count != 1) fail(name, "r=%ld count=%ld", (long)r, (long)count);
     else ok(name);
 }
 
@@ -435,6 +464,243 @@ static void check_fork_shared(void) {
     else ok(name);
 }
 
+/* Another thread's timerfd_settime while the main thread waits. */
+struct arm_job {
+    int tfd;
+    int epfd;          /* when >= 0, EPOLL_CTL_ADD tfd after arming */
+    int64_t delay_ns;  /* before arming */
+    int64_t value_ns;  /* relative expiry */
+};
+
+static void *arm_later(void *arg) {
+    struct arm_job *job = arg;
+    sleep_ns(job->delay_ns);
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value = ns_ts(job->value_ns);
+    timerfd_settime(job->tfd, 0, &its, NULL);
+    if (job->epfd >= 0) {
+        struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 77};
+        epoll_ctl(job->epfd, EPOLL_CTL_ADD, job->tfd, &ev);
+    }
+    return NULL;
+}
+
+/* use_epoll selects the waiter; initial_ns 0 starts disarmed, otherwise the
+ * timer starts armed far away and is re-armed; timeout_ms is the wait's. */
+static void check_cross_arm(const char *name, int use_epoll, int64_t initial_ns,
+                            int timeout_ms) {
+    int tfd = initial_ns ? armed_tfd(CLOCK_MONOTONIC, 0, initial_ns, 0, 0)
+                         : timerfd_create(CLOCK_MONOTONIC, 0);
+    int ep = use_epoll ? epoll_with(tfd, EPOLLIN, 5) : -1;
+    struct arm_job job = {tfd, -1, 20 * MS, 10 * MS};
+    pthread_t thread;
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    pthread_create(&thread, NULL, arm_later, &job);
+    int n;
+    uint64_t data = 0;
+    if (use_epoll) {
+        struct epoll_event ev;
+        n = epoll_wait(ep, &ev, 1, timeout_ms);
+        data = n == 1 ? ev.data.u64 : 0;
+    } else {
+        struct pollfd pfd = {.fd = tfd, .events = POLLIN};
+        n = poll(&pfd, 1, timeout_ms);
+        data = n == 1 && pfd.revents == POLLIN ? 5 : 0;
+    }
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    pthread_join(thread, NULL);
+    if (ep >= 0) close(ep);
+    close(tfd);
+    if (n != 1 || data != 5) fail(name, "n=%ld data=%ld", n, (long)data);
+    else if (elapsed < 30 * MS || elapsed > 2000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else ok(name);
+}
+
+static void check_epoll_ctl_add_while_waiting(void) {
+    const char *name = "epoll_ctl_add_while_waiting";
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    int ep = epoll_create1(0);
+    struct arm_job job = {tfd, ep, 20 * MS, 10 * MS};
+    pthread_t thread;
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    pthread_create(&thread, NULL, arm_later, &job);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    int n = epoll_wait(ep, &ev, 1, 10000);
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    pthread_join(thread, NULL);
+    close(ep);
+    close(tfd);
+    if (n != 1 || ev.data.u64 != 77) fail(name, "n=%ld data=%ld", n, (long)ev.data.u64);
+    else if (elapsed < 30 * MS || elapsed > 2000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else ok(name);
+}
+
+/* A nonblocking timer that has expired exactly once. */
+static int expired_tfd(void) {
+    int fd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 10 * MS, 0, 0);
+    sleep_ns(30 * MS);
+    return fd;
+}
+
+static void check_vectored_reads(void) {
+    int tfd = expired_tfd();
+    unsigned char bytes[8];
+    memset(bytes, 0, sizeof bytes);
+    struct iovec split[2] = {{bytes, 3}, {bytes + 3, 5}};
+    ssize_t r = readv(tfd, split, 2);
+    uint64_t count = 0;
+    memcpy(&count, bytes, sizeof count);
+    if (r != 8 || count != 1) fail("readv_split", "r=%ld count=%ld", (long)r, (long)count);
+    else ok("readv_split");
+    close(tfd);
+
+    tfd = expired_tfd();
+    struct iovec small[2] = {{bytes, 3}, {bytes + 3, 4}};
+    errno = 0;
+    r = readv(tfd, small, 2);
+    int err = errno;
+    /* The rejected read left the expiration in place. */
+    uint64_t left = 0;
+    ssize_t again = read(tfd, &left, sizeof left);
+    if (r != -1 || err != EINVAL) fail("readv_short", "r=%ld errno=%ld", (long)r, err);
+    else if (again != 8 || left != 1) fail("readv_short", "again=%ld left=%ld", (long)again, (long)left);
+    else ok("readv_short");
+    close(tfd);
+
+    tfd = expired_tfd();
+    count = 0;
+    struct iovec whole = {&count, sizeof count};
+    r = preadv2(tfd, &whole, 1, -1, 0);
+    if (r != 8 || count != 1) fail("preadv2_current", "r=%ld count=%ld", (long)r, (long)count);
+    else ok("preadv2_current");
+    close(tfd);
+
+    tfd = expired_tfd();
+    errno = 0;
+    r = pread(tfd, &count, sizeof count, 0);
+    err = errno;
+    if (r != -1 || err != ESPIPE) fail("pread_espipe", "r=%ld errno=%ld", (long)r, err);
+    else ok("pread_espipe");
+    close(tfd);
+}
+
+static void check_read_fault_consumes(void) {
+    const char *name = "read_fault_consumes";
+    int tfd = expired_tfd();
+    errno = 0;
+    ssize_t r = syscall(SYS_read, tfd, NULL, 8);
+    int err = errno;
+    uint64_t count = 0;
+    errno = 0;
+    ssize_t again = read(tfd, &count, sizeof count);
+    int again_err = errno;
+    close(tfd);
+    if (r != -1 || err != EFAULT) fail(name, "r=%ld errno=%ld", (long)r, err);
+    else if (again != -1 || again_err != EAGAIN)
+        fail(name, "again=%ld errno=%ld", (long)again, again_err);
+    else ok(name);
+}
+
+static void check_create_errors(void) {
+    const char *name = "create_errors";
+    struct { int clock; int flags; } cases[] = {
+        {12345, 0},
+        {CLOCK_PROCESS_CPUTIME_ID, 0},
+        {CLOCK_MONOTONIC, 0x1},
+        {CLOCK_REALTIME_ALARM, 0x1},
+        {CLOCK_BOOTTIME_ALARM, O_APPEND},
+    };
+    for (int i = 0; i < (int)(sizeof cases / sizeof cases[0]); i++) {
+        errno = 0;
+        int fd = timerfd_create(cases[i].clock, cases[i].flags);
+        if (fd != -1 || errno != EINVAL) {
+            fail(name, "case=%ld errno=%ld", i, errno);
+            if (fd >= 0) close(fd);
+            return;
+        }
+    }
+    ok(name);
+}
+
+static void check_gettime_errors(void) {
+    const char *name = "gettime_errors";
+    int p[2];
+    pipe(p);
+    struct itimerspec cur;
+    errno = 0;
+    long bad_null = syscall(SYS_timerfd_gettime, -1, NULL);
+    int bad_null_err = errno;
+    errno = 0;
+    long not_timer = syscall(SYS_timerfd_gettime, p[0], NULL);
+    int not_timer_err = errno;
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    errno = 0;
+    long null_out = syscall(SYS_timerfd_gettime, tfd, NULL);
+    int null_out_err = errno;
+    memset(&cur, 0xff, sizeof cur);
+    long disarmed = timerfd_gettime(tfd, &cur);
+    close(tfd);
+    close(p[0]);
+    close(p[1]);
+    if (bad_null != -1 || bad_null_err != EBADF)
+        fail(name, "bad_fd_null errno=%ld%ld", bad_null_err, 0);
+    else if (not_timer != -1 || not_timer_err != EINVAL)
+        fail(name, "pipe_null errno=%ld%ld", not_timer_err, 0);
+    else if (null_out != -1 || null_out_err != EFAULT)
+        fail(name, "timer_null errno=%ld%ld", null_out_err, 0);
+    else if (disarmed != 0 || cur.it_value.tv_sec || cur.it_value.tv_nsec ||
+             cur.it_interval.tv_sec || cur.it_interval.tv_nsec)
+        fail(name, "disarmed r=%ld sec=%ld", disarmed, (long)cur.it_value.tv_sec);
+    else ok(name);
+}
+
+static void check_settime_errors(void) {
+    const char *name = "settime_errors";
+    int p[2];
+    pipe(p);
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value.tv_sec = 1;
+    errno = 0;
+    long null_bad_fd = syscall(SYS_timerfd_settime, -1, 0, NULL, NULL);
+    int null_bad_fd_err = errno;
+    errno = 0;
+    long bad_fd = syscall(SYS_timerfd_settime, -1, 0, &its, NULL);
+    int bad_fd_err = errno;
+    errno = 0;
+    long not_timer = syscall(SYS_timerfd_settime, p[0], 0, &its, NULL);
+    int not_timer_err = errno;
+    close(p[0]);
+    close(p[1]);
+    if (null_bad_fd != -1 || null_bad_fd_err != EFAULT)
+        fail(name, "null_bad_fd errno=%ld%ld", null_bad_fd_err, 0);
+    else if (bad_fd != -1 || bad_fd_err != EBADF) fail(name, "bad_fd errno=%ld%ld", bad_fd_err, 0);
+    else if (not_timer != -1 || not_timer_err != EINVAL)
+        fail(name, "pipe errno=%ld%ld", not_timer_err, 0);
+    else ok(name);
+}
+
+static void check_fine_periodic_sleep(int close_first) {
+    const char *name = close_first ? "close_armed_sleep" : "periodic_sleep";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 1000, 1000, 0);
+    if (close_first) close(tfd);
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    sleep_ns(100 * MS);
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    uint64_t count = 0;
+    ssize_t r = close_first ? 8 : read(tfd, &count, sizeof count);
+    if (!close_first) close(tfd);
+    if (elapsed < 100 * MS || elapsed > 5000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else if (r != 8 || (!close_first && count < 1000))
+        fail(name, "r=%ld count_ge_1000=%ld", (long)r, (long)(count >= 1000));
+    else ok(name);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     check_abstime("abstime_realtime", CLOCK_REALTIME);
@@ -456,6 +722,18 @@ int main(void) {
     check_read_signal(1);
     check_read_signal(0);
     check_fork_shared();
+    check_cross_arm("poll_cross_arm", 0, 0, -1);
+    check_cross_arm("poll_cross_rearm", 0, 5000 * MS, 10000);
+    check_cross_arm("epoll_cross_arm", 1, 0, -1);
+    check_cross_arm("epoll_cross_rearm", 1, 5000 * MS, 10000);
+    check_epoll_ctl_add_while_waiting();
+    check_vectored_reads();
+    check_read_fault_consumes();
+    check_create_errors();
+    check_gettime_errors();
+    check_settime_errors();
+    check_fine_periodic_sleep(0);
+    check_fine_periodic_sleep(1);
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }
