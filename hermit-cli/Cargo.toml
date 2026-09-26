@@ -55,12 +55,12 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "efc671191bf5cc756c8703df6b5204cce63d0bbd" }
-reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "efc671191bf5cc756c8703df6b5204cce63d0bbd", default-features = false, optional = true }
-reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "efc671191bf5cc756c8703df6b5204cce63d0bbd" }
-reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "efc671191bf5cc756c8703df6b5204cce63d0bbd" }
-reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "efc671191bf5cc756c8703df6b5204cce63d0bbd", default-features = false }
-reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "efc671191bf5cc756c8703df6b5204cce63d0bbd" }
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "424e5424c97696b92c3aad61701e540e7e8b92ec" }
+reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "424e5424c97696b92c3aad61701e540e7e8b92ec", default-features = false, optional = true }
+reverie-kvm = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "424e5424c97696b92c3aad61701e540e7e8b92ec" }
+reverie-ptrace = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "424e5424c97696b92c3aad61701e540e7e8b92ec" }
+reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "424e5424c97696b92c3aad61701e540e7e8b92ec", default-features = false }
+reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "424e5424c97696b92c3aad61701e540e7e8b92ec" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
@@ -73,5 +73,9 @@ tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "
 uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 
 [dev-dependencies]
+# Exact token locations and digests bind the complete source inventory.
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+quote = "1.0.47"
+sha2 = "0.10.9"
 # Parse actual container call arguments, including conditional local labels.
 syn = { version = "2.0.119", features = ["full", "visit"] }
