@@ -106,6 +106,8 @@ use crate::timeouts::ResolvedTestTimeouts;
 use crate::timeouts::SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
 #[cfg(test)]
 use crate::timeouts::VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT;
@@ -5988,6 +5990,7 @@ mod tests {
                 + SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT
                 + EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT
                 + SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT
+                + TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),

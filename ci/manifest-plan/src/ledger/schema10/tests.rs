@@ -749,9 +749,9 @@ fn generated_plan_populations_preserve_command_policy() {
     // The frozen 856-cell population gains precisely these three portable RNG
     // cells, plus each cell promoted after them. Preserve raw cardinality as well
     // as the set: duplicates are not cells.
-    assert!(exact_rng_population(&raw_expected, 863));
+    assert!(exact_rng_population(&raw_expected, 865));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(expected_cells.len(), 863);
+    assert_eq!(expected_cells.len(), 865);
     let rng = raw_expected
         .iter()
         .enumerate()
@@ -761,19 +761,19 @@ fn generated_plan_populations_preserve_command_policy() {
     assert_eq!(rng.len(), 3);
     let mut renamed = raw_expected.clone();
     renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
-    assert!(!exact_rng_population(&renamed, 863));
+    assert!(!exact_rng_population(&renamed, 865));
     let mut duplicate = raw_expected.clone();
     duplicate[rng[0]] = duplicate[rng[1]].clone();
-    assert!(!exact_rng_population(&duplicate, 863));
+    assert!(!exact_rng_population(&duplicate, 865));
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
-    assert!(!exact_rng_population(&missing, 863));
+    assert!(!exact_rng_population(&missing, 865));
     for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 863),
+        ("full", "e2e.manifest_backend_parity_c", 865),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            859,
+            861,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();

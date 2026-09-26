@@ -255,7 +255,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Seventeen signal-wake scheduler and six signal-mask helper controls retain all 808 prior IDs.
-    ("test.detcore_unit", 831),
+    // Twelve virtual-timerfd controls retain all 831 prior identities.
+    ("test.detcore_unit", 843),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -292,7 +293,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 831),
+    ("test.detcore_unit_on_host", 843),
     // Host variants select the same proc regressions and the same two
     // signal_determinism tests, and retain prior identities.
     ("test.hermit_integration_on_host", 173),
