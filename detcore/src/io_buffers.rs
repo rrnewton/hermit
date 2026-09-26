@@ -479,6 +479,15 @@ fn direction(call: &Syscall) -> Direction {
 /// window is `max(CHUNK_MIN, ceil(len / CHUNK_CAP))`. A buffer that fits in one
 /// chunk emits no chunk list, because a single chunk repeats what the
 /// whole-extent digest already said.
+///
+/// A syscall can return an extent that the guest cannot read to its end:
+/// `getdents64` counts a record's padding, which Linux does not write and
+/// which may lie in a page the guest has made inaccessible. The syscall has
+/// already completed, so its result stands; only the readable start of the
+/// extent is hashed, and its length is returned. What is readable follows the
+/// guest's page protection, so it is the same in every run. RNG output keeps
+/// no such fallback: Detcore wrote those bytes itself, so failing to read them
+/// back stays an error, which the caller makes terminal.
 const CHUNK_CAP: usize = 8;
 const CHUNK_MIN: usize = 256;
 
@@ -487,7 +496,7 @@ fn extent_digests<G, T>(
     addr: u64,
     len: u64,
     rng_output: bool,
-) -> Result<(Digest, usize, Vec<String>), Error>
+) -> Result<(Digest, usize, Vec<String>, usize), Error>
 where
     G: Guest<T>,
     T: Tool,
@@ -501,12 +510,21 @@ where
         vec![0u8; size]
     };
     if size > 0 {
-        let start = Addr::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
-        guest.memory().read_values(start, buf.as_mut_slice())?;
+        let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+        let memory = guest.memory();
+        if rng_output {
+            memory.read_values(Addr::from(start), buf.as_mut_slice())?;
+        } else if memory
+            .read_values(Addr::from(start), buf.as_mut_slice())
+            .is_err()
+        {
+            let readable = crate::syscalls::read_guest_prefix(&memory, start, &mut buf);
+            buf.truncate(readable);
+        }
     }
     let whole = Digest::new(buf.as_slice());
     let (chunk, chunks) = chunk_digests(buf.as_slice());
-    Ok((whole, chunk, chunks))
+    Ok((whole, chunk, chunks, buf.len()))
 }
 
 /// The locating half, split out from the guest read so it can be bracketed.
@@ -588,7 +606,7 @@ where
         observed_extents(&memory, call, ret, rng_output)?
     };
     for extent in moved_extents {
-        let (whole, chunk, chunks) =
+        let (whole, chunk, chunks, readable) =
             extent_digests(guest, extent.addr, extent.len, rng_output.is_some()).map_err(
                 |error| {
                     if rng_output.is_some() {
@@ -606,8 +624,13 @@ where
         } else {
             format!(" chunks={}:{}", chunk, chunks.join(","))
         };
+        let truncated = if readable as u64 == extent.len {
+            String::new()
+        } else {
+            format!(" readable={readable}")
+        };
         crate::detlog!(
-            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}",
+            "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}{}",
             dettid,
             name,
             dir,
@@ -615,7 +638,8 @@ where
             extent.addr,
             extent.len,
             whole,
-            located
+            located,
+            truncated
         );
     }
     Ok(())

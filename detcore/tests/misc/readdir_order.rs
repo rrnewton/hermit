@@ -55,6 +55,23 @@ fn run_five_times_on<S: Sync>(
         virtualize_metadata: true,
         ..Default::default()
     };
+    run_five_times_under(setup, guest, config)
+}
+
+/// Like [`run_five_times`], also hashing the bytes each syscall returns into
+/// the log, as `hermit run` does by default.
+fn run_five_times_hashing_buffers(guest: fn()) {
+    let config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        virtualize_metadata: true,
+        detlog_io_buffers: true,
+        ..Default::default()
+    };
+    run_five_times_under(|| (), |()| guest(), config)
+}
+
+fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Sync, config: Config) {
     let mut expected = None;
 
     for run in 1..=RUNS {
@@ -1284,4 +1301,243 @@ fn count_above_int_max_guest() {
 #[test]
 fn count_above_int_max_matches_linux() {
     run_five_times(count_above_int_max_guest);
+}
+
+fn padding_in_inaccessible_page_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in (0..20).rev() {
+        File::create(root.path().join(format!("{index:02}"))).unwrap();
+    }
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend((0..20).map(|index| format!("{index:02}")));
+    let page = 4096;
+
+    // Four 24-byte records take 96 bytes, but Linux writes only the first 22
+    // of the fourth: it does not write the padding after the name. With 94 or
+    // 95 bytes before a page the guest cannot touch, all four fit and the
+    // call returns 96 without touching that page, and hashing the returned
+    // bytes into the log must not fail on the two it cannot read. The page is
+    // either inaccessible or not mapped at all; ptrace can read the first
+    // kind. On a fresh descriptor the records start at `.`; after reading `.`
+    // alone they start at `..`. A received descriptor, which Detcore does not
+    // track, gets each buffer sorted on its own instead.
+    let states = [(false, false), (false, true), (true, false), (true, true)];
+    for unmapped in [false, true] {
+        for writable in [94, 95] {
+            for (warm, received) in states {
+                let context = format!(
+                    "{writable} bytes writable, unmapped {unmapped}, warm {warm}, received {received}"
+                );
+                let map = guarded_pages(2, 1, libc::PROT_NONE);
+                let guard = unsafe { map.add(page) };
+                if unmapped {
+                    assert_eq!(unsafe { libc::munmap(guard.cast(), page) }, 0);
+                }
+                let buf = unsafe { guard.sub(writable) };
+                let dir = File::open(root.path()).unwrap();
+                let fd = if received {
+                    receive_descriptor(dir.as_raw_fd())
+                } else {
+                    dir.as_raw_fd()
+                };
+                let mut names = Vec::new();
+                if warm {
+                    let mut first = [0u8; 24];
+                    assert_eq!(getdents64(fd, &mut first), Ok(24), "{context}");
+                    names = record_names(&first, 19);
+                }
+                let returned = raw_getdents64(fd, buf, 256);
+                assert_eq!(returned, Ok(96), "{context}");
+                let mut bytes = [0u8; 96];
+                bytes[..writable]
+                    .copy_from_slice(unsafe { std::slice::from_raw_parts(buf, writable) });
+                let batch = record_names(&bytes, 19);
+                if received {
+                    assert!(batch.is_sorted(), "{context}: {batch:?}");
+                } else {
+                    assert_eq!(batch, expected[names.len()..names.len() + 4], "{context}");
+                }
+                names.extend(batch);
+                if unmapped {
+                    // Still nothing there to write.
+                    assert_eq!(
+                        unsafe { libc::msync(guard.cast(), page, libc::MS_ASYNC) },
+                        -1,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ENOMEM),
+                        "{context}"
+                    );
+                } else {
+                    assert_eq!(
+                        unsafe {
+                            libc::mprotect(guard.cast(), page, libc::PROT_READ | libc::PROT_WRITE)
+                        },
+                        0
+                    );
+                    let guard = unsafe { std::slice::from_raw_parts(guard, page) };
+                    assert!(
+                        guard.iter().all(|&byte| byte == 0xaa),
+                        "{context}: the inaccessible page was written"
+                    );
+                }
+                names.extend(drain_names(fd));
+                if received {
+                    assert_eq!(sorted(names), expected, "{context}");
+                    unsafe { libc::close(fd) };
+                } else {
+                    assert_eq!(names, expected, "{context}");
+                }
+                unsafe { libc::munmap(map.cast(), 2 * page) };
+            }
+        }
+    }
+
+    println!("padding in inaccessible page ok");
+}
+
+#[test]
+fn padding_in_inaccessible_page_is_returned() {
+    run_five_times_hashing_buffers(padding_in_inaccessible_page_guest);
+}
+
+fn write_only_prefix_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in (0..20).rev() {
+        File::create(root.path().join(format!("{index:02}"))).unwrap();
+    }
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend((0..20).map(|index| format!("{index:02}")));
+    let page = 4096;
+
+    // A page the guest can write but not read, then one it cannot touch.
+    // After `.` and `..`, each record is 24 bytes. With 8 bytes before the
+    // inaccessible page no record fits and the call fails; with 32, `00`
+    // fits and `01` does not. Either way the bytes after the result stay as
+    // the guest had them, although Detcore cannot read that page to save
+    // them. (Linux writes the leading fields of the record that does not
+    // fit.) The stream continues after the returned records.
+    for (call, name_offset) in [(libc::SYS_getdents64, 19), (libc::SYS_getdents, 18)] {
+        for (writable, returned) in [(8, Err(libc::EFAULT)), (32, Ok(24))] {
+            let context = format!("syscall {call}, {writable} bytes writable");
+            let map = guarded_pages(2, 1, libc::PROT_NONE);
+            assert_eq!(
+                unsafe { libc::mprotect(map.cast(), page, libc::PROT_WRITE) },
+                0
+            );
+            let buf = unsafe { map.add(page - writable) };
+            let dir = File::open(root.path()).unwrap();
+            let fd = dir.as_raw_fd();
+            let mut first = [0u8; 48];
+            assert_eq!(getdents64(fd, &mut first), Ok(48), "{context}");
+            let mut names = record_names(&first, 19);
+            let result = unsafe { libc::syscall(call, fd, buf, 256) };
+            let result = if result < 0 {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+            } else {
+                Ok(result as usize)
+            };
+            assert_eq!(result, returned, "{context}");
+            assert_eq!(
+                unsafe { libc::mprotect(map.cast(), 2 * page, libc::PROT_READ | libc::PROT_WRITE) },
+                0
+            );
+            let bytes = unsafe { std::slice::from_raw_parts(buf, writable) };
+            let n = result.unwrap_or(0);
+            names.extend(record_names(&bytes[..n], name_offset));
+            assert!(
+                bytes[n..].iter().all(|&byte| byte == 0xaa),
+                "{context}: {n} bytes returned, and bytes after them changed: {:02x?}",
+                &bytes[n..]
+            );
+            let guard = unsafe { std::slice::from_raw_parts(map.add(page), page) };
+            assert!(
+                guard.iter().all(|&byte| byte == 0xaa),
+                "{context}: the inaccessible page was written"
+            );
+            names.extend(drain_names(fd));
+            assert_eq!(names, expected, "{context}");
+            unsafe { libc::munmap(map.cast(), 2 * page) };
+        }
+    }
+
+    println!("write-only prefix ok");
+}
+
+#[test]
+fn write_only_prefix_left_untouched() {
+    run_five_times(write_only_prefix_guest);
+}
+
+fn count_above_int_max_after_rewind_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..20 {
+        File::create(root.path().join(name(index))).unwrap();
+    }
+    let expected = listing_of(20);
+
+    // A rewind drops what Detcore knows of the stream, and a seek after it
+    // sets a position the host directory has not been read to. A count that
+    // is negative as an `int` must still fail with EINVAL while entries
+    // remain after that position and return 0 at or past the end, moving
+    // nothing and writing nothing; the next call continues from the position.
+    // (On a descriptor never read, a position is a host cookie, as on Linux,
+    // so each descriptor first lists the whole directory.)
+    let mut buf = vec![0xaa_u8; 4096];
+    for count in [0x8000_0000_u32, 0xffff_ffff] {
+        for (call, name_offset) in [(libc::SYS_getdents64, 19), (libc::SYS_getdents, 18)] {
+            let getdents = |fd: i32, buf: &mut [u8], count: u32| {
+                let n = unsafe { libc::syscall(call, fd, buf.as_mut_ptr(), count) };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+                } else {
+                    Ok(n as usize)
+                }
+            };
+            for position in [5_i64, 22, 1_000_000] {
+                let context = format!("syscall {call}, count {count:#x}, position {position}");
+                let dir = File::open(root.path()).unwrap();
+                let fd = dir.as_raw_fd();
+                while getdents(fd, &mut buf, 4096).unwrap() > 0 {}
+                assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+                assert_eq!(
+                    unsafe { libc::lseek(fd, position, libc::SEEK_SET) },
+                    position,
+                    "{context}"
+                );
+                buf.fill(0xaa);
+                let rest = &expected[(position as usize).min(expected.len())..];
+                let answer = if rest.is_empty() {
+                    Ok(0)
+                } else {
+                    Err(libc::EINVAL)
+                };
+                assert_eq!(getdents(fd, &mut buf, count), answer, "{context}");
+                assert!(buf.iter().all(|&byte| byte == 0xaa), "{context}");
+                assert_eq!(
+                    unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) },
+                    position,
+                    "{context}"
+                );
+                let mut names = Vec::new();
+                loop {
+                    let n = getdents(fd, &mut buf, 4096).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    names.extend(record_names(&buf[..n], name_offset));
+                }
+                assert_eq!(names, rest, "{context}");
+            }
+        }
+    }
+
+    println!("count above int max after rewind ok");
+}
+
+#[test]
+fn count_above_int_max_after_rewind_matches_linux() {
+    run_five_times(count_above_int_max_after_rewind_guest);
 }
