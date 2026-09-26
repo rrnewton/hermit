@@ -3149,6 +3149,7 @@ fn run() -> Result<(), String> {
     }
     let root = repo_root()?;
     let _ledger_identity_scope = CommandLedgerIdentityScope::enter();
+    let _object_memo_scope = CommandObjectMemoScope::enter();
     if matches!(
         command.as_str(),
         "observe-results"
@@ -4624,6 +4625,88 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
     Ok(ledger)
 }
 
+/// Git object facts memoised for one command invocation.
+///
+/// Every entry is a pure function of immutable object content: it is read with
+/// `--no-replace-objects` and keyed by the canonical working directory plus a
+/// revision that starts with a full 40-hex object id, so repeating the lookup
+/// inside the same command cannot obtain a different answer from Git. Only
+/// successful reads are recorded; a failed read is probed again next time.
+/// Mutable state -- HEAD, refs, the index, the worktree and configuration -- is
+/// never memoised, so every transaction boundary still observes it afresh, and
+/// a memoised series is still compared byte for byte with the worktree on
+/// every capture. Commit counts additionally depend on shallow and graft
+/// boundaries, which nothing in this tool changes; an external process that
+/// deepens a shallow clone during one command could otherwise make two reads
+/// in that command disagree, and with the memo both report the first read.
+/// Calls outside a scope, including unit tests, read Git on every lookup.
+#[derive(Default)]
+struct CommandObjectMemo {
+    rev_parse: BTreeMap<(PathBuf, String), String>,
+    depths: BTreeMap<(PathBuf, String), SourceDepth>,
+    reverie_pins: BTreeMap<(PathBuf, String), Option<String>>,
+    series: BTreeMap<(PathBuf, String, String), std::rc::Rc<CommittedSeries>>,
+}
+
+/// The committed half of a series capture: the source tree and each JSONL
+/// shard's repository-relative path and committed bytes.
+struct CommittedSeries {
+    source_tree: String,
+    shards: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+thread_local! {
+    static COMMAND_OBJECT_MEMO: std::cell::RefCell<Option<CommandObjectMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct CommandObjectMemoScope;
+
+impl CommandObjectMemoScope {
+    fn enter() -> Self {
+        COMMAND_OBJECT_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            assert!(memo.is_none(), "object memo scopes do not nest");
+            *memo = Some(CommandObjectMemo::default());
+        });
+        Self
+    }
+}
+
+impl Drop for CommandObjectMemoScope {
+    fn drop(&mut self) {
+        COMMAND_OBJECT_MEMO.with(|memo| *memo.borrow_mut() = None);
+    }
+}
+
+/// True when `revision` names content fixed by its leading object id:
+/// `<oid>`, `<oid>^{commit}`, `<oid>^{tree}` or `<oid>:<path>`.
+fn object_addressed_revision(revision: &str) -> bool {
+    let Some((oid, rest)) = revision.split_at_checked(40) else {
+        return false;
+    };
+    is_object_id(oid)
+        && (rest.is_empty()
+            || rest == "^{commit}"
+            || rest == "^{tree}"
+            || rest.strip_prefix(':').is_some_and(|path| !path.is_empty()))
+}
+
+/// Memo key for an object-addressed lookup run with `root` as its working
+/// directory, or `None` when no scope is active or the key is not immutable.
+fn object_memo_key(root: &Path, revision: &str) -> Option<(PathBuf, String)> {
+    if !object_addressed_revision(revision)
+        || !COMMAND_OBJECT_MEMO.with(|memo| memo.borrow().is_some())
+    {
+        return None;
+    }
+    Some((fs::canonicalize(root).ok()?, revision.to_string()))
+}
+
+fn with_object_memo<T>(access: impl FnOnce(&mut CommandObjectMemo) -> T) -> Option<T> {
+    COMMAND_OBJECT_MEMO.with(|memo| memo.borrow_mut().as_mut().map(access))
+}
+
 fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     let path = ledger_root(root, false)?.join(LEDGER_CELLS);
     let cells = read_json(&path).map_err(|error| format!("history unavailable: {error}"))?;
@@ -5277,6 +5360,18 @@ fn check_observation_worktree(root: &Path) -> Result<(), String> {
     observation_worktree_state(root)?.ensure_clean()
 }
 
+/// One status observation supplies both the clean-worktree verdict and HEAD,
+/// as the combined write-back guard already does. A worktree without a HEAD
+/// commit keeps the refusal that a separate `git rev-parse HEAD` reported.
+fn clean_observation_head(root: &Path) -> Result<String, String> {
+    let state = observation_worktree_state(root)?;
+    state.ensure_clean()?;
+    if !is_object_id(&state.head) {
+        return Err("git rev-parse HEAD failed".into());
+    }
+    Ok(state.head)
+}
+
 #[derive(Clone, PartialEq)]
 struct GeneratedFiles {
     scorecard: Vec<u8>,
@@ -5411,6 +5506,78 @@ fn update_tracked(
 }
 
 fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
+    let key = object_memo_key(root, revision);
+    if let Some(depth) = key
+        .as_ref()
+        .and_then(|key| with_object_memo(|memo| memo.depths.get(key).copied()).flatten())
+    {
+        return Some(depth);
+    }
+    // A failed walk is final: the counting commands traverse the same commits
+    // and fail for the same reasons, so only unparsed output falls back.
+    let depth = repo_depth_from_parents(root, revision)?
+        .or_else(|| repo_depth_from_counts(root, revision))?;
+    if let Some(key) = key {
+        with_object_memo(|memo| memo.depths.insert(key, depth));
+    }
+    Some(depth)
+}
+
+/// Both depths from one `rev-list --parents` walk: every listed commit counts
+/// toward `commits`, and the first-parent chain from the start commit is the
+/// `--first-parent` count. Git applies the same shallow and graft rewriting to
+/// the printed parents that it applies to the two counting walks. A failed Git
+/// command yields `None`. Successful output that this parser does not fully
+/// understand yields `Some(None)`, and the caller then runs the two original
+/// counting commands instead.
+fn repo_depth_from_parents(root: &Path, revision: &str) -> Option<Option<SourceDepth>> {
+    let out = Command::new("git")
+        .args(["--no-replace-objects", "rev-list", "--parents", revision])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        std::str::from_utf8(&out.stdout)
+            .ok()
+            .and_then(depth_from_parent_listing),
+    )
+}
+
+fn depth_from_parent_listing(listing: &str) -> Option<SourceDepth> {
+    let mut first_parents = std::collections::HashMap::new();
+    let mut start = None;
+    for line in listing.lines() {
+        let mut ids = line.split(' ');
+        let commit = ids.next().filter(|id| is_object_id(id))?;
+        let first_parent = ids.next();
+        if first_parent.is_some_and(|id| !is_object_id(id)) || !ids.all(is_object_id) {
+            return None;
+        }
+        if first_parents.insert(commit, first_parent).is_some() {
+            return None;
+        }
+        start.get_or_insert(commit);
+    }
+    let mut first_parent = 0u64;
+    let mut current = start;
+    while let Some(commit) = current {
+        first_parent += 1;
+        if first_parent > first_parents.len() as u64 {
+            return None;
+        }
+        current = *first_parents.get(commit)?;
+    }
+    Some(SourceDepth {
+        commits: first_parents.len() as u64,
+        first_parent,
+    })
+    .filter(|depth| depth.commits > 0)
+}
+
+fn repo_depth_from_counts(root: &Path, revision: &str) -> Option<SourceDepth> {
     let count = |args: &[&str]| -> Option<u64> {
         let out = Command::new("git")
             .arg("--no-replace-objects")
@@ -5435,17 +5602,33 @@ fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
 
 /// Read the unique full Reverie pin from one recorded Hermit revision.
 fn reverie_pin_at(root: &Path, hermit_revision: &str) -> Option<String> {
+    let lockfile = format!("{hermit_revision}:Cargo.lock");
+    let key = object_memo_key(root, &lockfile);
+    if let Some(pin) = key
+        .as_ref()
+        .and_then(|key| with_object_memo(|memo| memo.reverie_pins.get(key).cloned()).flatten())
+    {
+        return pin;
+    }
     let output = Command::new("git")
         .arg("--no-replace-objects")
-        .args(["show", &format!("{hermit_revision}:Cargo.lock")])
+        .args(["show", &lockfile])
         .current_dir(root)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
+    let pin = reverie_pin_from_lockfile(output.stdout);
+    if let Some(key) = key {
+        with_object_memo(|memo| memo.reverie_pins.insert(key, pin.clone()));
+    }
+    pin
+}
+
+fn reverie_pin_from_lockfile(lockfile: Vec<u8>) -> Option<String> {
     let mut pins = BTreeSet::new();
-    for line in String::from_utf8(output.stdout).ok()?.lines() {
+    for line in String::from_utf8(lockfile).ok()?.lines() {
         if !line.contains("github.com/") || !line.contains("/reverie.git") {
             continue;
         }
@@ -6588,14 +6771,11 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let updated = generated_files(&derived, &tracked)?;
     let verify_inputs = || -> Result<(), String> {
         census.verify()?;
-        check_observation_worktree(root)?;
-        if git_head(root)? != head {
+        if clean_observation_head(root)? != head {
             return Err("HEAD moved during result write-back".into());
         }
-        let current = snapshot_series_source(&ledger_root(root, false)?.join("series"))?;
-        if current.source_commit != series.source_commit
-            || current.source_tree != series.source_tree
-        {
+        let (commit, tree) = series_source_identity(&ledger_root(root, false)?.join("series"))?;
+        if commit != series.source_commit || tree != series.source_tree {
             return Err("series snapshot moved during result write-back".into());
         }
         Ok(())
@@ -9201,17 +9381,14 @@ fn bind_retained_attempts(root: &Path, inputs: &[RetainedBindingInput]) -> Resul
         return Err("attempt-binding migration altered data outside projection metadata".into());
     }
     let verify = || -> Result<(), String> {
-        observation_worktree_state(root)?.ensure_clean()?;
-        if git_head(root)? != worktree.head {
+        if clean_observation_head(root)? != worktree.head {
             return Err("binding source HEAD moved".into());
         }
         for file in &held {
             file.verify()?;
         }
-        let current = snapshot_series_source(&ledger.join("series"))?;
-        if current.source_commit != source.source_commit
-            || current.source_tree != source.source_tree
-        {
+        let (commit, tree) = series_source_identity(&ledger.join("series"))?;
+        if commit != source.source_commit || tree != source.source_tree {
             return Err("binding series snapshot moved before publication".into());
         }
         Ok(())
@@ -11382,6 +11559,139 @@ fn write_scorecard_snapshot_fixture(path: &Path, value: &JsonValue) -> Result<St
 /// JSONL shards instead of silently projecting a different tree than the one
 /// visible to the caller.
 fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, String> {
+    capture_series_source(series_root, SeriesOrigin::Read)
+}
+
+/// The commit and tree of a fresh series capture, for publication guards that
+/// compare only those two identities. The capture performs every check that
+/// [`snapshot_series_source`] performs, including the exact comparison of the
+/// worktree with the commit; it only skips the origin lookup whose result such
+/// a guard never reads.
+fn series_source_identity(series_root: &Path) -> Result<(String, String), String> {
+    let snapshot = capture_series_source(series_root, SeriesOrigin::Skip)?;
+    Ok((snapshot.source_commit, snapshot.source_tree))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SeriesOrigin {
+    Read,
+    Skip,
+}
+
+/// Resolve the repository top level and its HEAD commit in one Git process.
+/// Returns `None` for any failure or output other than exactly the two lines
+/// `<top level>` and a 40-hex commit; the caller then runs the original
+/// separate commands, whose refusals remain the ones reported.
+fn series_repository_and_head(canonical: &Path) -> Option<(String, String)> {
+    let output = Command::new("git")
+        .args([
+            "--no-replace-objects",
+            "rev-parse",
+            "--show-toplevel",
+            "HEAD^{commit}",
+        ])
+        .current_dir(canonical)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let (top, commit) = text.strip_suffix('\n')?.rsplit_once('\n')?;
+    is_object_id(commit).then(|| (top.trim().to_string(), commit.to_string()))
+}
+
+/// Resolve the committed source tree and list its JSONL shards.
+fn read_committed_series_listing(
+    canonical: &Path,
+    repository: &Path,
+    relative_root: &Path,
+    source: &str,
+    source_commit: &str,
+) -> Result<(String, BTreeSet<PathBuf>), String> {
+    let source_revision = if source == "." {
+        format!("{source_commit}^{{tree}}")
+    } else {
+        format!("{source_commit}:{source}")
+    };
+    let source_tree = git_no_replace_rev_parse(repository, &source_revision)?;
+    if !is_object_id(&source_tree) {
+        return Err(format!(
+            "series source tree must be a lowercase 40-hex object id, got {source_tree:?}"
+        ));
+    }
+
+    let listed = Command::new("git")
+        .args([
+            "--no-replace-objects",
+            "ls-tree",
+            "-rz",
+            "--name-only",
+            source_commit,
+            "--",
+        ])
+        .arg(relative_root)
+        .current_dir(repository)
+        .output()
+        .map_err(|e| format!("cannot list series source at {source_commit}: {e}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "git ls-tree failed for series source {} at {source_commit}",
+            canonical.display()
+        ));
+    }
+    let committed_shards: BTreeSet<PathBuf> = listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(PathBuf::from)
+                .map_err(|e| format!("series source contains a non-UTF-8 path: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    Ok((source_tree, committed_shards))
+}
+
+/// Read one committed JSONL shard's bytes.
+fn read_committed_series_shard(
+    repository: &Path,
+    source_commit: &str,
+    relative_shard: &Path,
+) -> Result<Vec<u8>, String> {
+    let committed = Command::new("git")
+        .args([
+            "--no-replace-objects",
+            "show",
+            &format!("{source_commit}:{}", relative_shard.display()),
+        ])
+        .current_dir(repository)
+        .output()
+        .map_err(|e| {
+            format!(
+                "cannot read series shard {} from source commit {source_commit}: {e}",
+                relative_shard.display()
+            )
+        })?;
+    if !committed.status.success() {
+        return Err(format!(
+            "git show failed for series shard {} at source commit {source_commit}",
+            relative_shard.display()
+        ));
+    }
+    Ok(committed.stdout)
+}
+
+fn capture_series_source(
+    series_root: &Path,
+    origin: SeriesOrigin,
+) -> Result<SeriesSourceSnapshot, String> {
     let canonical = fs::canonicalize(series_root).map_err(|e| {
         format!(
             "series root {} does not exist or cannot be resolved: {e}. An unreachable source is \
@@ -11397,25 +11707,33 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
         ));
     }
 
-    let top = Command::new("git")
-        .args(["--no-replace-objects", "rev-parse", "--show-toplevel"])
-        .current_dir(&canonical)
-        .output()
-        .map_err(|e| {
-            format!(
-                "cannot locate Git repository for {}: {e}",
-                canonical.display()
-            )
-        })?;
-    if !top.status.success() {
-        return Err(format!(
-            "series root {} is not inside a Git repository; a projection without a source commit is refused",
-            canonical.display()
-        ));
-    }
-    let repository_text = std::str::from_utf8(&top.stdout)
-        .map_err(|e| format!("Git repository path is not UTF-8: {e}"))?
-        .trim();
+    let combined = series_repository_and_head(&canonical);
+    let separate_top;
+    let repository_text = match &combined {
+        Some((top, _)) => top.as_str(),
+        None => {
+            let top = Command::new("git")
+                .args(["--no-replace-objects", "rev-parse", "--show-toplevel"])
+                .current_dir(&canonical)
+                .output()
+                .map_err(|e| {
+                    format!(
+                        "cannot locate Git repository for {}: {e}",
+                        canonical.display()
+                    )
+                })?;
+            if !top.status.success() {
+                return Err(format!(
+                    "series root {} is not inside a Git repository; a projection without a source commit is refused",
+                    canonical.display()
+                ));
+            }
+            separate_top = top.stdout;
+            std::str::from_utf8(&separate_top)
+                .map_err(|e| format!("Git repository path is not UTF-8: {e}"))?
+                .trim()
+        }
+    };
     let repository = fs::canonicalize(repository_text).map_err(|e| {
         format!(
             "cannot resolve Git repository {} for series root {}: {e}",
@@ -11443,59 +11761,35 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
             })?
             .to_string()
     };
-    let source_commit = git_no_replace_rev_parse(&repository, "HEAD^{commit}")?;
+    let source_commit = match combined {
+        Some((_, commit)) => commit,
+        None => git_no_replace_rev_parse(&repository, "HEAD^{commit}")?,
+    };
     if !is_object_id(&source_commit) {
         return Err(format!(
             "series source commit must be a lowercase 40-hex object id, got {source_commit:?}"
         ));
     }
-    let source_revision = if source == "." {
-        format!("{source_commit}^{{tree}}")
-    } else {
-        format!("{source_commit}:{source}")
-    };
-    let source_tree = git_no_replace_rev_parse(&repository, &source_revision)?;
-    if !is_object_id(&source_tree) {
-        return Err(format!(
-            "series source tree must be a lowercase 40-hex object id, got {source_tree:?}"
-        ));
-    }
-
-    let listed = Command::new("git")
-        .args([
-            "--no-replace-objects",
-            "ls-tree",
-            "-rz",
-            "--name-only",
+    let memo_key = COMMAND_OBJECT_MEMO
+        .with(|memo| memo.borrow().is_some())
+        .then(|| (repository.clone(), source_commit.clone(), source.clone()));
+    let memoised = memo_key
+        .as_ref()
+        .and_then(|key| with_object_memo(|memo| memo.series.get(key).cloned()).flatten());
+    let mut committed_bytes = BTreeMap::new();
+    let (source_tree, committed_shards) = match &memoised {
+        Some(committed) => (
+            committed.source_tree.clone(),
+            committed.shards.keys().cloned().collect::<BTreeSet<_>>(),
+        ),
+        None => read_committed_series_listing(
+            &canonical,
+            &repository,
+            relative_root,
+            &source,
             &source_commit,
-            "--",
-        ])
-        .arg(relative_root)
-        .current_dir(&repository)
-        .output()
-        .map_err(|e| format!("cannot list series source at {source_commit}: {e}"))?;
-    if !listed.status.success() {
-        return Err(format!(
-            "git ls-tree failed for series source {} at {source_commit}",
-            canonical.display()
-        ));
-    }
-    let committed_shards: BTreeSet<PathBuf> = listed
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| {
-            std::str::from_utf8(path)
-                .map(PathBuf::from)
-                .map_err(|e| format!("series source contains a non-UTF-8 path: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "jsonl")
-        })
-        .collect();
+        )?,
+    };
 
     let mut worktree_paths = Vec::new();
     collect_shards(&canonical, &mut worktree_paths)?;
@@ -11528,30 +11822,20 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
 
     let mut shards = Vec::with_capacity(committed_shards.len());
     for relative_shard in committed_shards {
-        let committed = Command::new("git")
-            .args([
-                "--no-replace-objects",
-                "show",
-                &format!("{source_commit}:{}", relative_shard.display()),
-            ])
-            .current_dir(&repository)
-            .output()
-            .map_err(|e| {
-                format!(
-                    "cannot read series shard {} from source commit {source_commit}: {e}",
-                    relative_shard.display()
-                )
-            })?;
-        if !committed.status.success() {
-            return Err(format!(
-                "git show failed for series shard {} at source commit {source_commit}",
-                relative_shard.display()
-            ));
-        }
+        let committed = match &memoised {
+            // PANIC: unreachable; a memo entry is recorded only after every
+            // listed shard was read, so its listing and bytes share one key set.
+            Some(committed) => committed
+                .shards
+                .get(&relative_shard)
+                .expect("memoised listing and bytes share one key set")
+                .clone(),
+            None => read_committed_series_shard(&repository, &source_commit, &relative_shard)?,
+        };
         let worktree_path = repository.join(&relative_shard);
         let working = fs::read(&worktree_path)
             .map_err(|e| format!("cannot read series shard {}: {e}", worktree_path.display()))?;
-        if committed.stdout != working {
+        if committed != working {
             return Err(format!(
                 "series source is not represented exactly by commit {source_commit}; worktree shard {} differs from the committed snapshot",
                 relative_shard.display()
@@ -11564,22 +11848,33 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
                 relative_root.display()
             )
         })?;
+        if memoised.is_none() {
+            committed_bytes.insert(relative_shard.clone(), committed.clone());
+        }
         shards.push(SeriesSourceShard {
             display_path: series_root.join(within_source),
-            bytes: committed.stdout,
+            bytes: committed,
         });
     }
-    let origin = Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .current_dir(&repository)
-        .output()
-        .map_err(|error| error.to_string())?;
-    let source_repository = if origin.status.success()
-        && String::from_utf8_lossy(&origin.stdout).trim() == TEST_LEDGER_REPOSITORY
-    {
-        Some(TEST_LEDGER_REPOSITORY.into())
-    } else {
-        None
+    if let (Some(key), None) = (memo_key, &memoised) {
+        let committed = std::rc::Rc::new(CommittedSeries {
+            source_tree: source_tree.clone(),
+            shards: committed_bytes,
+        });
+        with_object_memo(|memo| memo.series.insert(key, committed));
+    }
+    let source_repository = match origin {
+        SeriesOrigin::Skip => None,
+        SeriesOrigin::Read => {
+            let origin = Command::new("git")
+                .args(["config", "--get", "remote.origin.url"])
+                .current_dir(&repository)
+                .output()
+                .map_err(|error| error.to_string())?;
+            (origin.status.success()
+                && String::from_utf8_lossy(&origin.stdout).trim() == TEST_LEDGER_REPOSITORY)
+                .then(|| TEST_LEDGER_REPOSITORY.into())
+        }
     };
     Ok(SeriesSourceSnapshot {
         source_repository,
@@ -11733,6 +12028,13 @@ fn git_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
 }
 
 fn git_no_replace_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
+    let key = object_memo_key(root, revision);
+    if let Some(resolved) = key
+        .as_ref()
+        .and_then(|key| with_object_memo(|memo| memo.rev_parse.get(key).cloned()).flatten())
+    {
+        return Ok(resolved);
+    }
     let output = Command::new("git")
         .args(["--no-replace-objects", "rev-parse", revision])
         .current_dir(root)
@@ -11743,7 +12045,11 @@ fn git_no_replace_rev_parse(root: &Path, revision: &str) -> Result<String, Strin
             "git --no-replace-objects rev-parse {revision} failed"
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if let Some(key) = key {
+        with_object_memo(|memo| memo.rev_parse.insert(key, resolved.clone()));
+    }
+    Ok(resolved)
 }
 
 fn read_result_candidates(
@@ -27681,5 +27987,349 @@ mod command_ledger_identity_scope_tests {
         fs::remove_dir(&ledger).unwrap();
         fs::rename(&held, &ledger).unwrap();
         assert!(verified(&ledger));
+    }
+}
+
+#[cfg(test)]
+mod command_object_memo_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Memo Fixture",
+                "-c",
+                "user.email=memo@example.invalid",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit_all(root: &Path, message: &str) -> String {
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "--quiet", "--allow-empty", "-m", message]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    fn repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet", "--initial-branch=main"]);
+        fs::create_dir_all(dir.path().join("series")).unwrap();
+        fs::write(dir.path().join("series/a.jsonl"), "{\"a\":1}\n").unwrap();
+        fs::write(dir.path().join("series/notes.txt"), "ignored\n").unwrap();
+        commit_all(dir.path(), "first");
+        dir
+    }
+
+    fn memo_len() -> (usize, usize, usize, usize) {
+        with_object_memo(|memo| {
+            (
+                memo.rev_parse.len(),
+                memo.depths.len(),
+                memo.reverie_pins.len(),
+                memo.series.len(),
+            )
+        })
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn only_object_addressed_revisions_are_memo_keys() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        for accepted in [
+            oid.to_string(),
+            format!("{oid}^{{commit}}"),
+            format!("{oid}^{{tree}}"),
+            format!("{oid}:detcore"),
+            format!("{oid}:Cargo.lock"),
+        ] {
+            assert!(object_addressed_revision(&accepted), "{accepted}");
+        }
+        for refused in [
+            "HEAD".to_string(),
+            "HEAD^{commit}".to_string(),
+            "HEAD:detcore".to_string(),
+            format!("{oid}:"),
+            format!("{oid}~1"),
+            format!("{oid}^"),
+            format!("{oid}^{{blob}}"),
+            oid.to_uppercase(),
+            oid[..39].to_string(),
+            format!("{oid}0"),
+        ] {
+            assert!(!object_addressed_revision(&refused), "{refused}");
+        }
+        let dir = repository();
+        let head = git(dir.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(object_memo_key(dir.path(), &head), None, "no scope");
+        let _scope = CommandObjectMemoScope::enter();
+        assert_eq!(object_memo_key(dir.path(), "HEAD"), None);
+        assert_eq!(
+            object_memo_key(dir.path(), &head),
+            Some((fs::canonicalize(dir.path()).unwrap(), head.clone()))
+        );
+    }
+
+    #[test]
+    fn one_parent_walk_matches_both_counting_walks() {
+        let dir = repository();
+        let root = dir.path();
+        let base = commit_all(root, "second");
+        git(root, &["checkout", "--quiet", "-b", "side"]);
+        commit_all(root, "side one");
+        commit_all(root, "side two");
+        git(root, &["checkout", "--quiet", "main"]);
+        commit_all(root, "main three");
+        git(
+            root,
+            &["merge", "--quiet", "--no-ff", "-m", "merge side", "side"],
+        );
+        commit_all(root, "after merge");
+        git(root, &["checkout", "--quiet", "-b", "other", &base]);
+        commit_all(root, "other");
+        git(root, &["checkout", "--quiet", "main"]);
+        git(
+            root,
+            &["merge", "--quiet", "--no-ff", "-m", "merge other", "other"],
+        );
+        let head = git(root, &["rev-parse", "HEAD"]);
+        for revision in [
+            head.clone(),
+            git(root, &["rev-parse", "HEAD^2"]),
+            git(root, &["rev-parse", "HEAD~1"]),
+            base.clone(),
+            "HEAD".to_string(),
+            "side".to_string(),
+        ] {
+            let walked = repo_depth_from_parents(root, &revision).unwrap().unwrap();
+            let counted = repo_depth_from_counts(root, &revision).unwrap();
+            assert_eq!(walked, counted, "{revision}");
+            assert_eq!(repo_depth_at(root, &revision), Some(counted), "{revision}");
+        }
+        let counted = repo_depth_from_counts(root, &head).unwrap();
+        assert!(counted.commits > counted.first_parent, "{counted:?}");
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(repo_depth_from_parents(root, missing), None);
+        assert_eq!(repo_depth_at(root, missing), None);
+    }
+
+    #[test]
+    fn unparsed_parent_listings_fall_back_instead_of_guessing() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(40);
+        assert_eq!(
+            depth_from_parent_listing(&format!("{a} {b}\n{b} {c}\n{c}\n")),
+            Some(SourceDepth {
+                commits: 3,
+                first_parent: 3
+            })
+        );
+        assert_eq!(
+            depth_from_parent_listing(&format!("{a} {b} {c}\n{b}\n{c}\n")),
+            Some(SourceDepth {
+                commits: 3,
+                first_parent: 2
+            })
+        );
+        for malformed in [
+            String::new(),
+            format!("{a} {b}\n"),
+            format!("{a} {b}\n{b} {a}\n"),
+            format!("{a}\n{a}\n"),
+            format!("{a} xyz\n"),
+            format!("{a} {b} xyz\n{b}\n"),
+            "HEAD\n".to_string(),
+        ] {
+            assert_eq!(depth_from_parent_listing(&malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn memoised_depths_pins_and_trees_still_follow_a_new_commit() {
+        let dir = repository();
+        let root = dir.path();
+        let pin_line = |pin: char| {
+            format!(
+                "source = \"git+https://github.com/facebookexperimental/reverie.git?rev={}#x\"\n",
+                pin.to_string().repeat(40)
+            )
+        };
+        fs::create_dir_all(root.join("detcore")).unwrap();
+        fs::write(root.join("detcore/lib.rs"), "one\n").unwrap();
+        fs::write(root.join("Cargo.lock"), pin_line('a')).unwrap();
+        let first = commit_all(root, "pinned a");
+        let _scope = CommandObjectMemoScope::enter();
+        let first_depth = repo_depth_at(root, &first).unwrap();
+        let first_pin = reverie_pin_at(root, &first);
+        let first_tree = git_no_replace_rev_parse(root, &format!("{first}:detcore")).unwrap();
+        assert_eq!(first_pin, Some("a".repeat(40)));
+        assert_eq!(memo_len(), (1, 1, 1, 0));
+        // Repeats are served from the memo and agree with Git.
+        assert_eq!(repo_depth_at(root, &first), Some(first_depth));
+        assert_eq!(reverie_pin_at(root, &first), first_pin);
+        assert_eq!(
+            git_no_replace_rev_parse(root, &format!("{first}:detcore")).unwrap(),
+            first_tree
+        );
+        assert_eq!(memo_len(), (1, 1, 1, 0));
+
+        fs::write(root.join("detcore/lib.rs"), "two\n").unwrap();
+        fs::write(root.join("Cargo.lock"), pin_line('b')).unwrap();
+        let second = commit_all(root, "pinned b");
+        // HEAD is mutable and never memoised: the new commit is observed.
+        assert_eq!(
+            git_no_replace_rev_parse(root, "HEAD^{commit}").unwrap(),
+            second
+        );
+        let second_depth = repo_depth_at(root, &second).unwrap();
+        assert_eq!(second_depth.commits, first_depth.commits + 1);
+        assert_eq!(reverie_pin_at(root, &second), Some("b".repeat(40)));
+        let second_tree = git_no_replace_rev_parse(root, &format!("{second}:detcore")).unwrap();
+        assert_ne!(second_tree, first_tree);
+        assert_eq!(memo_len(), (2, 2, 2, 0));
+        // A failed read is not recorded, so a later success is still seen.
+        fs::write(root.join("Cargo.lock"), "no pin\n").unwrap();
+        let unpinned = commit_all(root, "unpinned");
+        assert_eq!(reverie_pin_at(root, &unpinned), None);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(reverie_pin_at(root, missing), None);
+        assert!(git_no_replace_rev_parse(root, &format!("{missing}:detcore")).is_err());
+        assert_eq!(memo_len(), (2, 2, 3, 0));
+    }
+
+    #[test]
+    fn a_memoised_series_is_still_compared_with_the_worktree_every_capture() {
+        let dir = repository();
+        let root = dir.path();
+        let series = root.join("series");
+        let uncached = snapshot_series_source(&series).unwrap();
+        let _scope = CommandObjectMemoScope::enter();
+        let first = snapshot_series_source(&series).unwrap();
+        assert_eq!(memo_len().3, 1);
+        assert_eq!(first.source_commit, uncached.source_commit);
+        assert_eq!(first.source_tree, uncached.source_tree);
+        assert_eq!(first.source_repository, None);
+        assert_eq!(first.shards.len(), 1);
+        assert_eq!(first.shards[0].bytes, b"{\"a\":1}\n");
+        assert_eq!(first.shards[0].display_path, series.join("a.jsonl"));
+        let again = snapshot_series_source(&series).unwrap();
+        assert_eq!(again.source_tree, first.source_tree);
+        assert_eq!(again.shards[0].bytes, first.shards[0].bytes);
+        assert_eq!(
+            series_source_identity(&series).unwrap(),
+            (first.source_commit.clone(), first.source_tree.clone())
+        );
+        assert_eq!(memo_len().3, 1);
+
+        // Worktree changes at an unchanged commit are refused on a memo hit.
+        fs::write(series.join("a.jsonl"), "{\"a\":2}\n").unwrap();
+        for error in [
+            snapshot_series_source(&series).unwrap_err(),
+            series_source_identity(&series).unwrap_err(),
+        ] {
+            assert!(
+                error.contains("worktree shard") && error.contains("differs from the committed"),
+                "{error}"
+            );
+        }
+        fs::write(series.join("a.jsonl"), "{\"a\":1}\n").unwrap();
+        fs::write(series.join("b.jsonl"), "{\"b\":1}\n").unwrap();
+        let error = series_source_identity(&series).unwrap_err();
+        assert!(error.contains("worktree-only JSONL shard"), "{error}");
+        fs::remove_file(series.join("b.jsonl")).unwrap();
+        fs::remove_file(series.join("a.jsonl")).unwrap();
+        let error = snapshot_series_source(&series).unwrap_err();
+        assert!(error.contains("missing from the worktree"), "{error}");
+        fs::write(series.join("a.jsonl"), "{\"a\":1}\n").unwrap();
+
+        // A new commit is a new key: its bytes and tree are read from Git.
+        fs::write(series.join("a.jsonl"), "{\"a\":3}\n").unwrap();
+        let second_commit = commit_all(root, "changed series");
+        let second = snapshot_series_source(&series).unwrap();
+        assert_eq!(second.source_commit, second_commit);
+        assert_ne!(second.source_tree, first.source_tree);
+        assert_eq!(second.shards[0].bytes, b"{\"a\":3}\n");
+        assert_eq!(memo_len().3, 2);
+        git(root, &["remote", "add", "origin", TEST_LEDGER_REPOSITORY]);
+        assert_eq!(
+            snapshot_series_source(&series)
+                .unwrap()
+                .source_repository
+                .as_deref(),
+            Some(TEST_LEDGER_REPOSITORY),
+            "configuration is read on every capture"
+        );
+    }
+
+    #[test]
+    fn combined_resolution_keeps_the_original_refusals() {
+        let plain = tempfile::tempdir().unwrap();
+        fs::create_dir(plain.path().join("series")).unwrap();
+        let unborn = tempfile::tempdir().unwrap();
+        git(unborn.path(), &["init", "--quiet"]);
+        fs::create_dir(unborn.path().join("series")).unwrap();
+        for scoped in [false, true] {
+            let _scope = scoped.then(CommandObjectMemoScope::enter);
+            let error = snapshot_series_source(&plain.path().join("series")).unwrap_err();
+            assert!(error.contains("is not inside a Git repository"), "{error}");
+            assert_eq!(
+                snapshot_series_source(&unborn.path().join("series")).unwrap_err(),
+                "git --no-replace-objects rev-parse HEAD^{commit} failed"
+            );
+            assert_eq!(
+                series_source_identity(&unborn.path().join("series")).unwrap_err(),
+                "git --no-replace-objects rev-parse HEAD^{commit} failed"
+            );
+        }
+        let dir = repository();
+        let canonical = fs::canonicalize(dir.path().join("series")).unwrap();
+        let (top, commit) = series_repository_and_head(&canonical).unwrap();
+        assert_eq!(
+            fs::canonicalize(top).unwrap(),
+            fs::canonicalize(dir.path()).unwrap()
+        );
+        assert_eq!(commit, git(dir.path(), &["rev-parse", "HEAD"]));
+        assert_eq!(series_repository_and_head(plain.path()), None);
+        assert_eq!(series_repository_and_head(unborn.path()), None);
+    }
+
+    #[test]
+    fn one_status_observation_supplies_the_clean_verdict_and_head() {
+        let dir = repository();
+        let root = dir.path();
+        assert_eq!(
+            clean_observation_head(root).unwrap(),
+            git(root, &["rev-parse", "HEAD"])
+        );
+        let next = commit_all(root, "next");
+        assert_eq!(clean_observation_head(root).unwrap(), next);
+        fs::write(root.join("series/notes.txt"), "tracked change\n").unwrap();
+        assert_eq!(
+            clean_observation_head(root).unwrap_err(),
+            "observe-results refuses tracked changes outside the generated scorecard files"
+        );
+        git(root, &["add", "series/notes.txt"]);
+        assert_eq!(
+            clean_observation_head(root).unwrap_err(),
+            "observe-results refuses staged changes"
+        );
+        let unborn = tempfile::tempdir().unwrap();
+        git(unborn.path(), &["init", "--quiet"]);
+        assert_eq!(
+            clean_observation_head(unborn.path()).unwrap_err(),
+            "git rev-parse HEAD failed"
+        );
     }
 }
