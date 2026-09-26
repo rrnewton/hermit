@@ -3149,7 +3149,6 @@ fn run() -> Result<(), String> {
     }
     let root = repo_root()?;
     let _ledger_identity_scope = CommandLedgerIdentityScope::enter();
-    let _object_memo_scope = CommandObjectMemoScope::enter();
     if matches!(
         command.as_str(),
         "observe-results"
@@ -3163,6 +3162,22 @@ fn run() -> Result<(), String> {
     {
         return publish_history_command(&root, &command, args);
     }
+    // The ledger publisher above keeps the caller's Git configuration and makes
+    // no memoised read. Every Git process started from here on, and every
+    // program that starts one, inherits `COMMAND_GIT_CONFIG`; the memo exists
+    // only when it does. `run` has started no thread, so the environment is
+    // changed before anything else can read it.
+    let quiesced = match command_git_config_environment(|name| env::var_os(name)) {
+        Some(variables) => {
+            for (name, value) in variables {
+                // SAFETY: single-threaded here; see the comment above.
+                unsafe { env::set_var(name, value) };
+            }
+            true
+        }
+        None => false,
+    };
+    let _object_memo_scope = quiesced.then(CommandObjectMemoScope::enter);
     match command.as_str() {
         "export-legacy" => {
             no_more(&mut args)?;
@@ -4627,35 +4642,38 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
 
 /// Git object facts memoised for one command invocation.
 ///
-/// An entry records one successful read run with `--no-replace-objects`,
-/// keyed by the canonical working directory plus a revision that starts with a
-/// full 40-hex object id, together with a record of every other input Git
-/// consults for that read ([`RepositoryInputs`]). A lookup reuses the entry
-/// only when a fresh record, taken without running Git, is identical to the one
-/// taken before the entry's read and still names every object that record
-/// named; the read itself is recorded only when a second record taken after it
-/// shows those inputs held throughout. Whenever the inputs cannot be recorded
-/// exactly, nothing is memoised and Git runs as it always did. A failed read is
-/// never recorded and is probed again next time. Mutable state -- HEAD, refs,
-/// the index and the worktree -- is never memoised, so every transaction
-/// boundary still observes it afresh, and a memoised series is still compared
-/// byte for byte with the worktree on every capture. Calls outside a scope,
-/// including most unit tests, read Git on every lookup.
+/// Each command invocation reads an object-addressed Git fact at most once per
+/// repository. An entry is keyed by the canonical working directory of the read
+/// plus a revision that starts with a full 40-hex object id -- `<oid>`,
+/// `<oid>^{commit}`, `<oid>^{tree}` or `<oid>:<path>` -- and every read is run
+/// with `--no-replace-objects`, so its value is a function of immutable object
+/// content and, for commit counts, of the shallow and graft boundaries. Only
+/// successful reads are recorded; a failed read is probed again next time.
+/// Mutable state -- HEAD, refs, the index, the worktree and configuration -- is
+/// never memoised, so every transaction boundary still observes it afresh, and
+/// a memoised series is still compared byte for byte with the worktree on every
+/// capture.
+///
+/// Nothing in this tool removes an object, changes a shallow, graft or
+/// alternates boundary, or puts a different repository at a memoised path
+/// during a command. It runs no `gc`, `prune`, `repack` or `maintenance`; every
+/// Git process it starts receives [`COMMAND_GIT_CONFIG`], so neither a fixture
+/// commit nor the fetch behind a lazy partial-clone read starts Git's automatic
+/// maintenance or runs a hook; and its own writes -- self-test fixtures in fresh
+/// temporary directories -- only create repositories, add objects and move refs.
+/// A lazy fetch only adds objects, and adding objects cannot change a
+/// successful read of immutable content.
+///
+/// This caches a repository that nothing else is changing; it is not a guard
+/// against concurrent change. Concurrent external mutation of the repository
+/// during one command is out of scope. Calls outside a scope, including the
+/// unit tests, read Git on every lookup.
 #[derive(Default)]
 struct CommandObjectMemo {
-    rev_parse: BTreeMap<(PathBuf, String), Memoised<String>>,
-    depths: BTreeMap<(PathBuf, String), Memoised<SourceDepth>>,
-    reverie_pins: BTreeMap<(PathBuf, String), Memoised<Option<String>>>,
-    series: BTreeMap<(PathBuf, String, String), Memoised<std::rc::Rc<CommittedSeries>>>,
-    /// The latest inputs recorded per repository, shared by the entries
-    /// recorded under them so an unchanged repository is stored once.
-    latest_inputs: BTreeMap<PathBuf, std::rc::Rc<RepositoryInputs>>,
-}
-
-/// A memoised value and the repository inputs recorded before it was read.
-struct Memoised<T> {
-    inputs: std::rc::Rc<RepositoryInputs>,
-    value: T,
+    rev_parse: BTreeMap<(PathBuf, String), String>,
+    depths: BTreeMap<(PathBuf, String), SourceDepth>,
+    reverie_pins: BTreeMap<(PathBuf, String), Option<String>>,
+    series: BTreeMap<(PathBuf, String, String), std::rc::Rc<CommittedSeries>>,
 }
 
 /// The committed half of a series capture: the source tree and each JSONL
@@ -4702,19 +4720,6 @@ fn object_addressed_revision(revision: &str) -> bool {
             || rest.strip_prefix(':').is_some_and(|path| !path.is_empty()))
 }
 
-fn with_object_memo<T>(access: impl FnOnce(&mut CommandObjectMemo) -> T) -> Option<T> {
-    COMMAND_OBJECT_MEMO.with(|memo| memo.borrow_mut().as_mut().map(access))
-}
-
-/// One memo lookup: its key and the repository inputs recorded before Git
-/// would run. `None` when no scope is active, the revision is not immutable,
-/// or the inputs cannot be recorded exactly.
-struct MemoProbe<K> {
-    key: K,
-    root: PathBuf,
-    inputs: std::rc::Rc<RepositoryInputs>,
-}
-
 /// Memo key for an object-addressed lookup run with `root` as its working
 /// directory, or `None` when no scope is active or the key is not immutable.
 fn object_memo_key(root: &Path, revision: &str) -> Option<(PathBuf, String)> {
@@ -4726,692 +4731,134 @@ fn object_memo_key(root: &Path, revision: &str) -> Option<(PathBuf, String)> {
     Some((fs::canonicalize(root).ok()?, revision.to_string()))
 }
 
-fn memo_probe<K>(
-    root: &Path,
-    revision: &str,
-    key: impl FnOnce(PathBuf) -> K,
-) -> Option<MemoProbe<K>> {
-    let (root, _) = object_memo_key(root, revision)?;
-    let inputs = std::rc::Rc::new(RepositoryInputs::record(&root)?);
-    Some(MemoProbe {
-        key: key(root.clone()),
-        root,
-        inputs,
-    })
+fn with_object_memo<T>(access: impl FnOnce(&mut CommandObjectMemo) -> T) -> Option<T> {
+    COMMAND_OBJECT_MEMO.with(|memo| memo.borrow_mut().as_mut().map(access))
 }
 
-impl<K: Ord> MemoProbe<K> {
-    fn lookup<T: Clone>(
-        &self,
-        table: impl FnOnce(&CommandObjectMemo) -> &BTreeMap<K, Memoised<T>>,
-    ) -> Option<T> {
-        with_object_memo(|memo| {
-            table(memo)
-                .get(&self.key)
-                .filter(|entry| entry.inputs.admits(&self.inputs))
-                .map(|entry| entry.value.clone())
-        })
-        .flatten()
+/// Configuration that every Git process one command starts receives through
+/// the environment, directly or through another program such as
+/// `hermit-manifest-plan`, a submodule clone, or the fetch that Git itself runs
+/// for a lazy partial-clone read. Git 2.53 otherwise starts
+/// `git maintenance run --auto --detach` after a commit and after that lazy
+/// fetch; the background `gc` it can start deletes unreachable objects, so it
+/// could remove an object that a memoised read had found. The same lazy fetch
+/// runs the repository's `reference-transaction` hook, and `status` runs
+/// `post-index-change` and the `core.fsmonitor` program. Environment
+/// configuration outranks every configuration file, so none of these runs.
+const COMMAND_GIT_CONFIG: [(&str, &str); 3] = [
+    ("maintenance.auto", "false"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.fsmonitor", "false"),
+];
+
+/// The environment variables that append [`COMMAND_GIT_CONFIG`] to the
+/// configuration already given through `GIT_CONFIG_COUNT`, read with `lookup`.
+/// Empty when those entries are already the last ones, as in a scorecard
+/// started by a scorecard. `None` when the existing count is not a plain decimal
+/// number, or when `GIT_CONFIG_PARAMETERS` is set: Git reads that variable, which
+/// `git -c` passes to the programs Git starts, after these and lets it override
+/// them. The command then runs without the memo.
+fn command_git_config_environment(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<Vec<(String, String)>> {
+    if lookup("GIT_CONFIG_PARAMETERS").is_some() {
+        return None;
     }
-
-    /// Record `value`, read by Git after this probe's inputs were recorded,
-    /// when a second record shows those inputs held throughout the read.
-    fn record<T>(
-        self,
-        table: impl FnOnce(&mut CommandObjectMemo) -> &mut BTreeMap<K, Memoised<T>>,
-        value: T,
-    ) {
-        let Some(after) = RepositoryInputs::record(&self.root) else {
-            return;
-        };
-        if !self.inputs.admits(&after) {
-            return;
-        }
-        with_object_memo(|memo| {
-            let inputs = match memo.latest_inputs.get(&self.root) {
-                Some(latest) if **latest == *self.inputs => latest.clone(),
-                _ => {
-                    memo.latest_inputs
-                        .insert(self.root.clone(), self.inputs.clone());
-                    self.inputs.clone()
-                }
-            };
-            table(memo).insert(self.key, Memoised { inputs, value });
-        });
-    }
-}
-
-/// Everything other than object content that Git consults when it runs an
-/// object-addressed `--no-replace-objects` read with `root` as its working
-/// directory, recorded without running Git.
-///
-/// The record replays Git's repository discovery (the `.git` file or directory
-/// at each level, the bare-repository probe, `GIT_CEILING_DIRECTORIES` and the
-/// filesystem boundary), the gitfile and `commondir` of a linked worktree, the
-/// repository, worktree, global and system configuration files, `shallow`,
-/// `info/grafts`, each object directory reached through `info/alternates`, the
-/// `git` executable found on `PATH`, and the environment variables that steer
-/// any of these. Every file is recorded by its exact bytes and stat identity;
-/// every consulted directory by its identity and searchability; `HEAD` only by
-/// whether Git would accept it as a repository marker. Object names -- the
-/// loose objects and pack files of each object directory -- are listed so that
-/// a lookup can require that none recorded earlier has since been deleted;
-/// adding objects cannot change a successful read of immutable content.
-///
-/// Replacement refs need no record: `--no-replace-objects` ignores them.
-/// Anything this record does not model exactly -- a bare repository, a
-/// configuration `include`, an unfamiliar `GIT_*` variable, a symlinked
-/// `HEAD` or `.git`, quoted or deeply nested alternates, foreign ownership --
-/// makes [`RepositoryInputs::record`] return `None`, and the read is then not
-/// memoised at all.
-#[derive(PartialEq, Eq)]
-struct RepositoryInputs {
-    /// The directory whose `.git` discovery found.
-    discovered_at: PathBuf,
-    observations: Vec<RepositoryObservation>,
-    object_names: Vec<BTreeSet<std::ffi::OsString>>,
-}
-
-#[derive(PartialEq, Eq)]
-enum RepositoryObservation {
-    Environment(Vec<(std::ffi::OsString, std::ffi::OsString)>),
-    Missing(PathBuf),
-    File {
-        path: PathBuf,
-        identity: FileIdentity,
-        bytes: Vec<u8>,
-    },
-    Executable {
-        path: PathBuf,
-        identity: FileIdentity,
-    },
-    Directory {
-        path: PathBuf,
-        identity: DirectoryIdentity,
-        searchable: bool,
-    },
-    HeadMarker {
-        path: PathBuf,
-        valid: bool,
-    },
-    Resolved {
-        path: PathBuf,
-        canonical: Option<PathBuf>,
-    },
-}
-
-#[derive(PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    owner: u32,
-    group: u32,
-    size: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-impl FileIdentity {
-    fn of(metadata: &fs::Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            mode: metadata.mode(),
-            owner: metadata.uid(),
-            group: metadata.gid(),
-            size: metadata.size(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        }
-    }
-}
-
-#[derive(PartialEq, Eq)]
-struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    owner: u32,
-    group: u32,
-}
-
-/// A directory as Git's `access(path, X_OK)` probes see it.
-enum DirectoryState {
-    Missing,
-    Present {
-        owner: u32,
-        device: u64,
-        searchable: bool,
-    },
-}
-
-impl RepositoryInputs {
-    /// `admits` holds when `current` was recorded from the same inputs and
-    /// still lists every object name this record lists.
-    fn admits(&self, current: &RepositoryInputs) -> bool {
-        self.observations == current.observations
-            && self.object_names.len() == current.object_names.len()
-            && self
-                .object_names
+    let count = match lookup("GIT_CONFIG_COUNT") {
+        None => 0,
+        Some(text) => text.to_str()?.parse::<usize>().ok()?,
+    };
+    let already = count
+        .checked_sub(COMMAND_GIT_CONFIG.len())
+        .is_some_and(|first| {
+            COMMAND_GIT_CONFIG
                 .iter()
-                .zip(&current.object_names)
-                .all(|(recorded, now)| recorded.is_subset(now))
-    }
-
-    fn record(root: &Path) -> Option<Self> {
-        let mut recorder = RepositoryInputs {
-            discovered_at: PathBuf::new(),
-            observations: Vec::new(),
-            object_names: Vec::new(),
-        };
-        recorder.record_repository(root)?;
-        Some(recorder)
-    }
-
-    fn record_repository(&mut self, root: &Path) -> Option<()> {
-        let (ceilings, config_parameters) = self.environment()?;
-        // SAFETY: `geteuid` has no preconditions and cannot fail.
-        let euid = unsafe { libc::geteuid() };
-        let DirectoryState::Present {
-            device: start_device,
-            ..
-        } = self.directory(root)?
-        else {
-            return None;
-        };
-        let mut level = root.to_path_buf();
-        let (worktree_owner, gitdir) = loop {
-            let dot_git = level.join(".git");
-            let found = match fs::symlink_metadata(&dot_git) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.observations
-                        .push(RepositoryObservation::Missing(dot_git.clone()));
-                    None
-                }
-                Err(_) => return None,
-                Ok(metadata) if metadata.is_dir() => {
-                    let DirectoryState::Present { owner, .. } = self.directory(&dot_git)? else {
-                        return None;
-                    };
-                    self.git_directory(&dot_git)?
-                        .is_some()
-                        .then(|| (owner, dot_git.clone()))
-                }
-                Ok(metadata) if metadata.is_file() => {
-                    let target = self.gitfile(&dot_git, euid)?;
-                    let DirectoryState::Present { owner, .. } = self.directory(&target)? else {
-                        return None;
-                    };
-                    self.git_directory(&target)?;
-                    Some((owner, target))
-                }
-                Ok(_) => return None,
-            };
-            if let Some((gitdir_owner, gitdir)) = found {
-                if gitdir_owner != euid {
-                    return None;
-                }
-                self.discovered_at = level.clone();
-                break (self.directory_owner(&level)?, gitdir);
-            }
-            // A bare repository is not modelled; `safe.bareRepository` and
-            // `core.bare` would decide whether Git accepts it.
-            if self.git_directory(&level)?.is_some() {
-                return None;
-            }
-            let parent = level.parent()?.to_path_buf();
-            // Git never examines a ceiling that is a proper ancestor of the
-            // working directory, nor anything above it.
-            if ceilings.iter().any(|ceiling| {
-                root.starts_with(ceiling)
-                    && root != ceiling.as_path()
-                    && ceiling.starts_with(&parent)
-            }) {
-                return None;
-            }
-            match self.directory(&parent)? {
-                DirectoryState::Present { device, .. } if device == start_device => {}
-                _ => return None,
-            }
-            level = parent;
-        };
-        if worktree_owner != euid {
-            return None;
-        }
-        let common = self.common_dir(&gitdir)?;
-        let mut configs = vec![config_parameters];
-        configs.extend(self.file(&common.join("config"))?);
-        configs.extend(self.file(&gitdir.join("config.worktree"))?);
-        self.file(&common.join("shallow"))?;
-        self.file(&common.join("info").join("grafts"))?;
-        let home = env::var_os("HOME").map(PathBuf::from);
-        if let Some(home) = &home {
-            configs.extend(self.file(&home.join(".gitconfig"))?);
-        }
-        match env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-            Some(xdg) => configs.extend(self.file(&Path::new(&xdg).join("git").join("config"))?),
-            None => {
-                if let Some(home) = &home {
-                    configs.extend(self.file(&home.join(".config").join("git").join("config"))?);
-                }
-            }
-        }
-        let executable = self.git_executable()?;
-        configs.extend(self.file(Path::new("/etc/gitconfig"))?);
-        if let Some(prefix) = executable.parent().and_then(Path::parent) {
-            configs.extend(self.file(&prefix.join("etc").join("gitconfig"))?);
-        }
-        if configs.iter().any(|config| {
-            config
-                .to_ascii_lowercase()
-                .windows(7)
-                .any(|w| w == b"include")
-        }) {
-            return None;
-        }
-        let mut visited = BTreeSet::new();
-        self.objects(&common.join("objects"), 0, &mut visited)
-    }
-
-    /// Record the environment and return the canonical ceiling directories
-    /// and the text of any configuration passed through the environment.
-    fn environment(&mut self) -> Option<(Vec<PathBuf>, Vec<u8>)> {
-        const MODELLED: &[&str] = &[
-            "GIT_ALLOW_PROTOCOL",
-            "GIT_ASKPASS",
-            "GIT_AUTHOR_DATE",
-            "GIT_AUTHOR_EMAIL",
-            "GIT_AUTHOR_NAME",
-            "GIT_CEILING_DIRECTORIES",
-            "GIT_COMMITTER_DATE",
-            "GIT_COMMITTER_EMAIL",
-            "GIT_COMMITTER_NAME",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_EDITOR",
-            "GIT_PAGER",
-            "GIT_SSH",
-            "GIT_SSH_COMMAND",
-            "GIT_TERMINAL_PROMPT",
-        ];
-        let mut recorded = Vec::new();
-        let mut config_parameters = Vec::new();
-        for (name, value) in env::vars_os() {
-            let Some(text) = name.to_str() else {
-                if name.as_encoded_bytes().starts_with(b"GIT_") {
-                    return None;
-                }
-                continue;
-            };
-            if text.starts_with("GIT_") {
-                if text.starts_with("GIT_CONFIG_KEY_") || text == "GIT_CONFIG_PARAMETERS" {
-                    config_parameters.extend_from_slice(value.as_encoded_bytes());
-                    config_parameters.push(b'\n');
-                } else if !text.starts_with("GIT_CONFIG_VALUE_") && !MODELLED.contains(&text) {
-                    return None;
-                }
-            } else if !matches!(text, "HOME" | "XDG_CONFIG_HOME" | "PATH") {
-                continue;
-            }
-            recorded.push((name, value));
-        }
-        recorded.sort();
-        self.observations
-            .push(RepositoryObservation::Environment(recorded));
-        let mut ceilings = Vec::new();
-        if let Some(list) = env::var_os("GIT_CEILING_DIRECTORIES") {
-            for entry in std::env::split_paths(&list) {
-                // An empty entry changes how later entries are resolved and a
-                // relative one is ignored; neither is modelled.
-                if !entry.is_absolute() {
-                    return None;
-                }
-                let canonical = fs::canonicalize(&entry).ok();
-                self.observations.push(RepositoryObservation::Resolved {
-                    path: entry,
-                    canonical: canonical.clone(),
-                });
-                ceilings.extend(canonical);
-            }
-        }
-        Some((ceilings, config_parameters))
-    }
-
-    /// Bytes of `path`, `Some(None)` when it does not exist, or `None` when it
-    /// cannot be read as a regular file.
-    fn file(&mut self, path: &Path) -> Option<Option<Vec<u8>>> {
-        use std::io::Read;
-        // Non-blocking, so that a FIFO is refused below instead of waited on.
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.observations
-                    .push(RepositoryObservation::Missing(path.to_path_buf()));
-                return Some(None);
-            }
-            Err(_) => return None,
-        };
-        let metadata = file.metadata().ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).ok()?;
-        self.observations.push(RepositoryObservation::File {
-            path: path.to_path_buf(),
-            identity: FileIdentity::of(&metadata),
-            bytes: bytes.clone(),
-        });
-        Some(Some(bytes))
-    }
-
-    fn directory(&mut self, path: &Path) -> Option<DirectoryState> {
-        match fs::metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.observations
-                    .push(RepositoryObservation::Missing(path.to_path_buf()));
-                Some(DirectoryState::Missing)
-            }
-            Err(_) => None,
-            Ok(metadata) if metadata.is_dir() => {
-                use std::os::unix::ffi::OsStrExt;
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-                // SAFETY: `c_path` is a valid NUL-terminated path for the call.
-                let searchable = unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0;
-                self.observations.push(RepositoryObservation::Directory {
-                    path: path.to_path_buf(),
-                    identity: DirectoryIdentity {
-                        device: metadata.dev(),
-                        inode: metadata.ino(),
-                        mode: metadata.mode(),
-                        owner: metadata.uid(),
-                        group: metadata.gid(),
-                    },
-                    searchable,
-                });
-                Some(DirectoryState::Present {
-                    owner: metadata.uid(),
-                    device: metadata.dev(),
-                    searchable,
+                .enumerate()
+                .all(|(offset, (key, value))| {
+                    lookup(&format!("GIT_CONFIG_KEY_{}", first + offset)).as_deref()
+                        == Some(std::ffi::OsStr::new(key))
+                        && lookup(&format!("GIT_CONFIG_VALUE_{}", first + offset)).as_deref()
+                            == Some(std::ffi::OsStr::new(value))
                 })
-            }
-            // Git's `access(X_OK)` probes also accept an executable file; only
-            // directories are modelled.
-            Ok(_) => None,
-        }
-    }
-
-    fn directory_owner(&mut self, path: &Path) -> Option<u32> {
-        match self.directory(path)? {
-            DirectoryState::Present { owner, .. } => Some(owner),
-            DirectoryState::Missing => None,
-        }
-    }
-
-    fn resolve(&mut self, path: &Path) -> Option<PathBuf> {
-        let canonical = fs::canonicalize(path).ok();
-        self.observations.push(RepositoryObservation::Resolved {
-            path: path.to_path_buf(),
-            canonical: canonical.clone(),
         });
-        canonical
+    if already {
+        return Some(Vec::new());
     }
-
-    /// Git's `validate_headref`: `HEAD` marks a repository when it holds
-    /// `ref:` followed by `refs/`, or starts with a hex object id.
-    fn head_marker(&mut self, path: &Path) -> Option<bool> {
-        use std::io::Read;
-        // Git's `lstat` failure and a directory's read failure both reject
-        // `HEAD`; a symlinked or special `HEAD` is not modelled.
-        let valid = match fs::symlink_metadata(path) {
-            Err(_) => false,
-            Ok(metadata) if metadata.is_dir() => false,
-            Ok(metadata) if !metadata.is_file() => return None,
-            Ok(_) => {
-                let mut buffer = Vec::with_capacity(255);
-                match OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(path)
-                    .and_then(|file| file.take(255).read_to_end(&mut buffer))
-                {
-                    Err(_) => false,
-                    Ok(_) => head_marker_is_valid(&buffer)?,
-                }
-            }
-        };
-        self.observations.push(RepositoryObservation::HeadMarker {
-            path: path.to_path_buf(),
-            valid,
-        });
-        Some(valid)
+    let mut variables = Vec::with_capacity(2 * COMMAND_GIT_CONFIG.len() + 1);
+    for (offset, (key, value)) in COMMAND_GIT_CONFIG.iter().enumerate() {
+        variables.push((
+            format!("GIT_CONFIG_KEY_{}", count + offset),
+            key.to_string(),
+        ));
+        variables.push((
+            format!("GIT_CONFIG_VALUE_{}", count + offset),
+            value.to_string(),
+        ));
     }
-
-    /// Git's `is_git_directory`: `Some(Some(common dir))` for a repository
-    /// directory, `Some(None)` for anything else.
-    fn git_directory(&mut self, suspect: &Path) -> Option<Option<PathBuf>> {
-        if !self.head_marker(&suspect.join("HEAD"))? {
-            return Some(None);
-        }
-        let common = self.common_dir(suspect)?;
-        for marker in ["objects", "refs"] {
-            match self.directory(&common.join(marker))? {
-                DirectoryState::Present {
-                    searchable: true, ..
-                } => {}
-                _ => return Some(None),
-            }
-        }
-        Some(Some(common))
-    }
-
-    /// Git's `get_common_dir`: `<gitdir>/commondir`, resolved, or the gitdir.
-    fn common_dir(&mut self, gitdir: &Path) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
-        let Some(bytes) = self.file(&gitdir.join("commondir"))? else {
-            return Some(gitdir.to_path_buf());
-        };
-        let text = trim_line_ends(&bytes);
-        if text.is_empty() || text.contains(&0) {
-            return None;
-        }
-        let path = Path::new(std::ffi::OsStr::from_bytes(text));
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            gitdir.join(path)
-        };
-        self.resolve(&joined)
-    }
-
-    /// The repository named by a `.git` file, which must be owned by `euid`.
-    fn gitfile(&mut self, dot_git: &Path, euid: u32) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = self.file(dot_git)??;
-        if let Some(RepositoryObservation::File { identity, .. }) = self.observations.last() {
-            if identity.owner != euid {
-                return None;
-            }
-        }
-        let text = trim_line_ends(bytes.strip_prefix(b"gitdir: ")?);
-        if text.is_empty() || text.contains(&0) {
-            return None;
-        }
-        let path = Path::new(std::ffi::OsStr::from_bytes(text));
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            dot_git.parent()?.join(path)
-        };
-        self.resolve(&joined)
-    }
-
-    /// The `git` that `Command::new("git")` would execute, found on `PATH`.
-    fn git_executable(&mut self) -> Option<PathBuf> {
-        let program = git_program();
-        let candidates: Vec<PathBuf> = if program.as_encoded_bytes().contains(&b'/') {
-            vec![PathBuf::from(program)]
-        } else {
-            let path = env::var_os("PATH")?;
-            std::env::split_paths(&path)
-                .map(|directory| directory.join(&program))
-                .collect()
-        };
-        for candidate in candidates {
-            // A relative entry would be searched from the child's directory.
-            if !candidate.is_absolute() {
-                return None;
-            }
-            match fs::metadata(&candidate) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.observations
-                        .push(RepositoryObservation::Missing(candidate));
-                }
-                Err(_) => return None,
-                Ok(metadata) if metadata.is_file() && metadata.mode() & 0o111 != 0 => {
-                    self.observations.push(RepositoryObservation::Executable {
-                        path: candidate.clone(),
-                        identity: FileIdentity::of(&metadata),
-                    });
-                    return self.resolve(&candidate);
-                }
-                Ok(_) => return None,
-            }
-        }
-        None
-    }
-
-    /// Record one object directory, its object names and, recursively, its
-    /// alternates, as Git's `link_alt_odb_entries` reaches them.
-    fn objects(
-        &mut self,
-        objects: &Path,
-        depth: usize,
-        visited: &mut BTreeSet<PathBuf>,
-    ) -> Option<()> {
-        use std::os::unix::ffi::OsStrExt;
-        if !visited.insert(objects.to_path_buf()) {
-            return Some(());
-        }
-        match self.directory(objects)? {
-            DirectoryState::Present { .. } => {}
-            // A missing alternate is skipped by Git; a missing primary is not.
-            DirectoryState::Missing => return (depth > 0).then_some(()),
-        }
-        let mut names = BTreeSet::new();
-        for entry in fs::read_dir(objects).ok()? {
-            let entry = entry.ok()?;
-            let fanout = entry.file_name();
-            let bytes = fanout.as_bytes();
-            if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_hexdigit) {
-                continue;
-            }
-            let loose = match fs::read_dir(entry.path()) {
-                Ok(loose) => loose,
-                Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => continue,
-                Err(_) => return None,
-            };
-            for object in loose {
-                let object = object.ok()?;
-                let name = object.file_name();
-                if name.len() == 38 && name.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-                    let mut path = fanout.clone();
-                    path.push("/");
-                    path.push(&name);
-                    names.insert(path);
-                }
-            }
-        }
-        match fs::read_dir(objects.join("pack")) {
-            Ok(packs) => {
-                for pack in packs {
-                    let name = pack.ok()?.file_name();
-                    if name.as_bytes().ends_with(b".pack") || name.as_bytes().ends_with(b".idx") {
-                        let mut path = std::ffi::OsString::from("pack/");
-                        path.push(&name);
-                        names.insert(path);
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
-        }
-        self.object_names.push(names);
-        let Some(alternates) = self.file(&objects.join("info").join("alternates"))? else {
-            return Some(());
-        };
-        // Git ignores alternates nested more than five deep, with an error.
-        if depth >= 5 && !alternates.is_empty() {
-            return None;
-        }
-        let canonical_base = self.resolve(objects)?.as_path() == objects;
-        for line in alternates.split(|byte| *byte == b'\n') {
-            if line.is_empty() || line[0] == b'#' {
-                continue;
-            }
-            // C-quoted entries are not modelled.
-            if line[0] == b'"' || line.contains(&0) {
-                return None;
-            }
-            let entry = Path::new(std::ffi::OsStr::from_bytes(line));
-            // Git joins and normalises alternates lexically; that agrees with
-            // the kernel's resolution only for `..` that leads the entry, and
-            // only from a base without symlinks.
-            let mut leading = true;
-            for component in entry.components() {
-                match component {
-                    std::path::Component::ParentDir if leading && !entry.is_absolute() => {
-                        if !canonical_base {
-                            return None;
-                        }
-                    }
-                    std::path::Component::ParentDir => return None,
-                    std::path::Component::CurDir | std::path::Component::RootDir => {}
-                    _ => leading = false,
-                }
-            }
-            let path = if entry.is_absolute() {
-                entry.to_path_buf()
-            } else {
-                objects.join(entry)
-            };
-            self.objects(&path, depth + 1, visited)?;
-        }
-        Some(())
-    }
+    variables.push((
+        "GIT_CONFIG_COUNT".to_string(),
+        (count + COMMAND_GIT_CONFIG.len()).to_string(),
+    ));
+    Some(variables)
 }
 
-/// Git's `validate_headref` on the first 255 bytes of `HEAD`; `None` for
-/// whitespace that Git's own `isspace` classifies differently from ASCII.
-fn head_marker_is_valid(buffer: &[u8]) -> Option<bool> {
-    let text = buffer.split(|byte| *byte == 0).next().unwrap_or_default();
-    if let Some(reference) = text.strip_prefix(b"ref:") {
-        let start = reference
-            .iter()
-            .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-            .unwrap_or(reference.len());
-        let reference = &reference[start..];
-        if matches!(reference.first(), Some(0x0b | 0x0c)) {
-            return None;
-        }
-        if reference.starts_with(b"refs/") {
-            return Some(true);
-        }
-    }
-    Some(text.len() >= 40 && text[..40].iter().all(u8::is_ascii_hexdigit))
+/// `GIT_*` environment variables that cannot make Git's repository discovery
+/// depend on the directory it starts from. Configuration given through the
+/// environment applies alike from every directory, and Git resolves its
+/// relative paths against the repository. `GIT_CEILING_DIRECTORIES` is safe
+/// because of the argument in [`discovery_passes_through`]. Any other `GIT_*`
+/// variable -- `GIT_DIR`, `GIT_WORK_TREE` or `GIT_CONFIG_GLOBAL` with a relative
+/// path, say -- makes the caller run the separate commands.
+fn directory_independent_git_variable(name: &[u8]) -> bool {
+    const NAMES: [&str; 15] = [
+        "GIT_ALLOW_PROTOCOL",
+        "GIT_ASKPASS",
+        "GIT_AUTHOR_DATE",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_NAME",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMITTER_DATE",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EDITOR",
+        "GIT_PAGER",
+        "GIT_SSH_COMMAND",
+        "GIT_TERMINAL_PROMPT",
+    ];
+    let indexed = |prefix: &[u8]| {
+        name.strip_prefix(prefix)
+            .is_some_and(|index| !index.is_empty() && index.iter().all(u8::is_ascii_digit))
+    };
+    NAMES.iter().any(|allowed| allowed.as_bytes() == name)
+        || indexed(b"GIT_CONFIG_KEY_")
+        || indexed(b"GIT_CONFIG_VALUE_")
 }
 
-fn trim_line_ends(bytes: &[u8]) -> &[u8] {
-    let mut end = bytes.len();
-    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
-        end -= 1;
-    }
-    &bytes[..end]
+/// True when Git's repository discovery from `start` necessarily finds the
+/// repository that discovery from `top`, an ancestor of `start` or `start`
+/// itself, finds. Discovery examines each level from its starting directory
+/// upward and stops at the first level holding a `.git` entry or a `HEAD`
+/// that makes the level itself a repository. When no level from `start` up to
+/// but excluding `top` holds either, a discovery from `start` that succeeded
+/// found its repository at `top` or above, and so passed every level that a
+/// discovery from `top` examines, in the same order and under the same
+/// environment. The filesystem-boundary and ceiling rules agree as well:
+/// having walked from `start` to `top`, the first walk crossed no boundary it
+/// would have stopped at and met no ceiling at or below `top`, so both walks
+/// compare later levels with the same device and the same ceilings.
+fn discovery_passes_through(start: &Path, top: &Path) -> bool {
+    start.starts_with(top)
+        && start
+            .ancestors()
+            .take_while(|level| *level != top)
+            .all(|level| {
+                [".git", "HEAD"].iter().all(|marker| {
+                    fs::symlink_metadata(level.join(marker))
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                })
+            })
 }
 
 /// The program run for Git. Tests may substitute a stand-in per invocation
@@ -6243,10 +5690,10 @@ fn update_tracked(
 }
 
 fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
-    let probe = memo_probe(root, revision, |root| (root, revision.to_string()));
-    if let Some(depth) = probe
+    let key = object_memo_key(root, revision);
+    if let Some(depth) = key
         .as_ref()
-        .and_then(|probe| probe.lookup(|memo| &memo.depths))
+        .and_then(|key| with_object_memo(|memo| memo.depths.get(key).copied()).flatten())
     {
         return Some(depth);
     }
@@ -6255,8 +5702,8 @@ fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
     // result or refusal is then the one reported.
     let depth = repo_depth_from_parents(root, revision)
         .or_else(|| repo_depth_from_counts(root, revision))?;
-    if let Some(probe) = probe {
-        probe.record(|memo| &mut memo.depths, depth);
+    if let Some(key) = key {
+        with_object_memo(|memo| memo.depths.insert(key, depth));
     }
     Some(depth)
 }
@@ -6340,10 +5787,10 @@ fn repo_depth_from_counts(root: &Path, revision: &str) -> Option<SourceDepth> {
 /// Read the unique full Reverie pin from one recorded Hermit revision.
 fn reverie_pin_at(root: &Path, hermit_revision: &str) -> Option<String> {
     let lockfile = format!("{hermit_revision}:Cargo.lock");
-    let probe = memo_probe(root, &lockfile, |root| (root, lockfile.clone()));
-    if let Some(pin) = probe
+    let key = object_memo_key(root, &lockfile);
+    if let Some(pin) = key
         .as_ref()
-        .and_then(|probe| probe.lookup(|memo| &memo.reverie_pins))
+        .and_then(|key| with_object_memo(|memo| memo.reverie_pins.get(key).cloned()).flatten())
     {
         return pin;
     }
@@ -6358,8 +5805,8 @@ fn reverie_pin_at(root: &Path, hermit_revision: &str) -> Option<String> {
         return None;
     }
     let pin = reverie_pin_from_lockfile(output.stdout);
-    if let Some(probe) = probe {
-        probe.record(|memo| &mut memo.reverie_pins, pin.clone());
+    if let Some(key) = key {
+        with_object_memo(|memo| memo.reverie_pins.insert(key, pin.clone()));
     }
     pin
 }
@@ -12439,17 +11886,20 @@ fn capture_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, Str
     // The combined command reads HEAD through the repository discovered from
     // the series root, while the original separate command reads it from the
     // reported top level. The two name the same repository -- and so the same
-    // HEAD -- when discovery from the series root stopped at or above that top
-    // level, because discovery from the top level then examines a subset of
-    // the same unchanged levels. Otherwise the separate commands run.
-    let before = RepositoryInputs::record(&canonical);
-    let combined = before.as_ref().and_then(|before| {
-        let (top, commit) = series_repository_and_head(&canonical)?;
-        let repository = fs::canonicalize(&top).ok()?;
-        let after = RepositoryInputs::record(&canonical)?;
-        (repository.starts_with(&before.discovered_at) && after.observations == before.observations)
-            .then_some((repository, commit))
+    // HEAD -- when no environment variable can make discovery depend on its
+    // starting directory and discovery from the series root passed through the
+    // top level. Otherwise the separate commands run.
+    let directory_independent = env::vars_os().all(|(name, _)| {
+        let name = name.as_encoded_bytes();
+        !name.starts_with(b"GIT_") || directory_independent_git_variable(name)
     });
+    let combined = directory_independent
+        .then(|| series_repository_and_head(&canonical))
+        .flatten()
+        .and_then(|(top, commit)| {
+            let repository = fs::canonicalize(&top).ok()?;
+            discovery_passes_through(&canonical, &repository).then_some((repository, commit))
+        });
     let repository = match &combined {
         Some((repository, _)) => repository.clone(),
         None => {
@@ -12510,12 +11960,14 @@ fn capture_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, Str
             "series source commit must be a lowercase 40-hex object id, got {source_commit:?}"
         ));
     }
-    let probe = memo_probe(&repository, &source_commit, |root| {
-        (root, source_commit.clone(), source.clone())
-    });
-    let memoised = probe
+    // `repository` is canonical and `source_commit` a full object id, so the
+    // key names immutable content; see `CommandObjectMemo`.
+    let memo_key = COMMAND_OBJECT_MEMO
+        .with(|memo| memo.borrow().is_some())
+        .then(|| (repository.clone(), source_commit.clone(), source.clone()));
+    let memoised = memo_key
         .as_ref()
-        .and_then(|probe| probe.lookup(|memo| &memo.series));
+        .and_then(|key| with_object_memo(|memo| memo.series.get(key).cloned()).flatten());
     let mut committed_bytes = BTreeMap::new();
     let (source_tree, committed_shards) = match &memoised {
         Some(committed) => (
@@ -12596,12 +12048,12 @@ fn capture_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, Str
             bytes: committed,
         });
     }
-    if let (Some(probe), None) = (probe, &memoised) {
+    if let (Some(key), None) = (memo_key, &memoised) {
         let committed = std::rc::Rc::new(CommittedSeries {
             source_tree: source_tree.clone(),
             shards: committed_bytes,
         });
-        probe.record(|memo| &mut memo.series, committed);
+        with_object_memo(|memo| memo.series.insert(key, committed));
     }
     let origin = git_output(
         Command::new(git_program())
@@ -12764,10 +12216,10 @@ fn git_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
 }
 
 fn git_no_replace_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
-    let probe = memo_probe(root, revision, |root| (root, revision.to_string()));
-    if let Some(resolved) = probe
+    let key = object_memo_key(root, revision);
+    if let Some(resolved) = key
         .as_ref()
-        .and_then(|probe| probe.lookup(|memo| &memo.rev_parse))
+        .and_then(|key| with_object_memo(|memo| memo.rev_parse.get(key).cloned()).flatten())
     {
         return Ok(resolved);
     }
@@ -12783,8 +12235,8 @@ fn git_no_replace_rev_parse(root: &Path, revision: &str) -> Result<String, Strin
         ));
     }
     let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if let Some(probe) = probe {
-        probe.record(|memo| &mut memo.rev_parse, resolved.clone());
+    if let Some(key) = key {
+        with_object_memo(|memo| memo.rev_parse.insert(key, resolved.clone()));
     }
     Ok(resolved)
 }
@@ -29076,11 +28528,6 @@ mod command_object_memo_tests {
         std::thread::scope(|scope| scope.spawn(read).join().unwrap())
     }
 
-    fn loose_object(root: &Path, revision: &str) -> PathBuf {
-        let id = git(root, &["rev-parse", revision]);
-        root.join(".git/objects").join(&id[..2]).join(&id[2..])
-    }
-
     fn pinned_repository() -> tempfile::TempDir {
         let dir = repository();
         let root = dir.path();
@@ -29120,10 +28567,10 @@ mod command_object_memo_tests {
     }
 
     #[test]
-    fn memoised_depths_follow_shallow_and_graft_boundaries_like_git() {
+    fn memoised_depths_ignore_replacement_refs_like_git() {
         let dir = repository();
         let root = dir.path();
-        let second = commit_all(root, "second");
+        commit_all(root, "second");
         let third = commit_all(root, "third");
         let linked_parent = tempfile::tempdir().unwrap();
         let linked = linked_parent.path().join("linked");
@@ -29147,138 +28594,245 @@ mod command_object_memo_tests {
             assert_eq!(repo_depth_at(checkout, &third), Some(full));
         }
         assert_eq!(memo_len().1, 2);
-        let compare = |expected: SourceDepth| {
-            for checkout in [root, linked.as_path()] {
-                let git_says = uncached(|| repo_depth_at(checkout, &third));
-                assert_eq!(git_says, Some(expected), "{}", checkout.display());
-                assert_eq!(
-                    repo_depth_at(checkout, &third),
-                    git_says,
-                    "{}",
-                    checkout.display()
-                );
+        // A replacement ref is ignored by every `--no-replace-objects` read,
+        // so the memoised depth is still the one Git reports.
+        git(root, &["replace", "--graft", &third]);
+        for checkout in [root, linked.as_path()] {
+            let git_says = uncached(|| repo_depth_at(checkout, &third));
+            assert_eq!(git_says, Some(full), "{}", checkout.display());
+            assert_eq!(repo_depth_at(checkout, &third), git_says);
+        }
+    }
+
+    #[test]
+    fn command_git_config_is_appended_after_the_callers_entries() {
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
             }
         };
-
-        // A replacement ref is ignored by every `--no-replace-objects` read.
-        git(root, &["replace", "--graft", &third]);
-        compare(full);
-
-        // `shallow` lives in the common directory, shared by linked worktrees.
-        let shallow = root.join(".git/shallow");
-        fs::write(&shallow, format!("{second}\n")).unwrap();
-        compare(SourceDepth {
-            commits: 2,
-            first_parent: 2,
-        });
-        fs::remove_file(&shallow).unwrap();
-        compare(full);
-
-        let grafts = root.join(".git/info/grafts");
-        fs::write(&grafts, format!("{third}\n")).unwrap();
-        compare(SourceDepth {
-            commits: 1,
-            first_parent: 1,
-        });
-        fs::remove_file(&grafts).unwrap();
-        compare(full);
-    }
-
-    #[test]
-    fn memoised_reads_fail_like_git_once_their_objects_are_gone() {
-        let dir = pinned_repository();
-        let root = dir.path();
-        let head = git(root, &["rev-parse", "HEAD"]);
-        // Resolving a path inside `detcore` reads the `detcore` tree object.
-        let tree_revision = format!("{head}:detcore/lib.rs");
-        let series = root.join("series");
-        let lost = [
-            loose_object(root, "HEAD~1"),
-            loose_object(root, "HEAD:detcore"),
-            loose_object(root, "HEAD:Cargo.lock"),
-            loose_object(root, "HEAD:series/a.jsonl"),
-        ];
-        let _scope = CommandObjectMemoScope::enter();
-        assert!(repo_depth_at(root, &head).is_some());
-        assert!(reverie_pin_at(root, &head).is_some());
-        assert!(git_no_replace_rev_parse(root, &tree_revision).is_ok());
-        assert!(snapshot_series_source(&series).is_ok());
-        assert_eq!(memo_len(), (2, 1, 1, 1));
-
-        for object in &lost {
-            fs::remove_file(object).unwrap();
+        let expected = |first: usize| {
+            let mut variables = Vec::new();
+            for (offset, (key, value)) in COMMAND_GIT_CONFIG.iter().enumerate() {
+                variables.push((
+                    format!("GIT_CONFIG_KEY_{}", first + offset),
+                    key.to_string(),
+                ));
+                variables.push((
+                    format!("GIT_CONFIG_VALUE_{}", first + offset),
+                    value.to_string(),
+                ));
+            }
+            variables.push(("GIT_CONFIG_COUNT".to_string(), (first + 3).to_string()));
+            variables
+        };
+        assert_eq!(
+            command_git_config_environment(lookup(&[])),
+            Some(expected(0))
+        );
+        assert_eq!(
+            command_git_config_environment(lookup(&[
+                ("GIT_CONFIG_COUNT", "3"),
+                ("GIT_CONFIG_KEY_2", "core.hooksPath"),
+                ("GIT_CONFIG_VALUE_2", "/dev/null"),
+            ])),
+            Some(expected(3))
+        );
+        assert_eq!(
+            command_git_config_environment(lookup(&[(
+                "GIT_CONFIG_PARAMETERS",
+                "'core.hookspath'='hooks'"
+            )])),
+            None
+        );
+        for bogus in ["", "-1", "three", "3 "] {
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(Box::new([("GIT_CONFIG_COUNT", bogus)]));
+            assert_eq!(
+                command_git_config_environment(lookup(pairs)),
+                None,
+                "{bogus:?}"
+            );
         }
-        let depth = uncached(|| repo_depth_at(root, &head));
-        let pin = uncached(|| reverie_pin_at(root, &head));
-        let tree = uncached(|| git_no_replace_rev_parse(root, &tree_revision));
-        let snapshot = uncached(|| snapshot_series_source(&series).map(|_| ()));
-        assert_eq!(depth, None);
-        assert_eq!(pin, None);
         assert_eq!(
-            tree,
-            Err(format!(
-                "git --no-replace-objects rev-parse {tree_revision} failed"
-            ))
+            command_git_config_environment(lookup(&[
+                ("GIT_CONFIG_COUNT", "4"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+                ("GIT_CONFIG_KEY_1", "maintenance.auto"),
+                ("GIT_CONFIG_VALUE_1", "false"),
+                ("GIT_CONFIG_KEY_2", "core.hooksPath"),
+                ("GIT_CONFIG_VALUE_2", "/dev/null"),
+                ("GIT_CONFIG_KEY_3", "core.fsmonitor"),
+                ("GIT_CONFIG_VALUE_3", "false"),
+            ])),
+            Some(Vec::new())
         );
-        assert_eq!(
-            snapshot,
-            Err(format!(
-                "git show failed for series shard series/a.jsonl at source commit {head}"
-            ))
-        );
-        assert_eq!(repo_depth_at(root, &head), depth);
-        assert_eq!(reverie_pin_at(root, &head), pin);
-        assert_eq!(git_no_replace_rev_parse(root, &tree_revision), tree);
-        assert_eq!(snapshot_series_source(&series).map(|_| ()), snapshot);
+    }
+
+    /// A lazy partial-clone read and a fixture commit, each run once with the
+    /// caller's environment and once with `COMMAND_GIT_CONFIG` appended. The
+    /// repository enables automatic maintenance and its hooks in its own
+    /// configuration, so only the environment can turn them off.
+    #[test]
+    fn command_git_config_stops_maintenance_and_hooks_behind_lazy_reads() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = repository();
+        git(source.path(), &["config", "uploadpack.allowFilter", "true"]);
+        let head = git(source.path(), &["rev-parse", "HEAD"]);
+        let quiesced =
+            command_git_config_environment(|name| env::var_os(name)).expect("plain count");
+        for quiesce in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let clone = parent.path().join("clone");
+            git(
+                parent.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--no-checkout",
+                    "--filter=blob:none",
+                    &format!("file://{}", source.path().display()),
+                    clone.to_str().unwrap(),
+                ],
+            );
+            let hooks = clone.join(".git/hooks");
+            for (key, value) in [
+                ("maintenance.auto", "true"),
+                ("maintenance.autoDetach", "false"),
+                ("gc.autoDetach", "false"),
+                ("gc.auto", "1"),
+                ("gc.autoPackLimit", "1"),
+                ("core.hooksPath", hooks.to_str().unwrap()),
+                ("user.name", "Memo Fixture"),
+                ("user.email", "memo@example.invalid"),
+            ] {
+                git(&clone, &["config", key, value]);
+            }
+            let fired = parent.path().join("fired");
+            for hook in ["reference-transaction", "post-commit"] {
+                let script = hooks.join(hook);
+                fs::write(
+                    &script,
+                    format!("#!/bin/sh\necho {hook} >> '{}'\n", fired.display()),
+                )
+                .unwrap();
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let trace = parent.path().join("trace");
+            let run = |args: &[&str]| {
+                let mut command = Command::new("git");
+                command
+                    .args(args)
+                    .current_dir(&clone)
+                    .env("GIT_TRACE", &trace);
+                if quiesce {
+                    command.envs(quiesced.iter().map(|(name, value)| (name, value)));
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output.stdout
+            };
+            let blob = format!("{head}:series/a.jsonl");
+            assert_eq!(
+                run(&["--no-replace-objects", "show", &blob]),
+                b"{\"a\":1}\n",
+                "the lazy fetch still supplies the blob"
+            );
+            let traced = fs::read_to_string(&trace).unwrap();
+            assert!(
+                traced.contains("fetch origin"),
+                "the read must fetch lazily: {traced}"
+            );
+            run(&["commit", "--quiet", "--allow-empty", "-m", "fixture"]);
+            let traced = fs::read_to_string(&trace).unwrap();
+            let hooks_fired = fs::read_to_string(&fired).unwrap_or_default();
+            if quiesce {
+                assert!(!traced.contains("maintenance run"), "{traced}");
+                assert_eq!(hooks_fired, "");
+            } else {
+                assert!(traced.contains("maintenance run"), "{traced}");
+                assert!(
+                    hooks_fired.contains("reference-transaction"),
+                    "{hooks_fired}"
+                );
+                assert!(hooks_fired.contains("post-commit"), "{hooks_fired}");
+            }
+        }
     }
 
     #[test]
-    fn memoised_reads_fail_like_git_once_their_alternates_are_gone() {
-        let source = pinned_repository();
-        let borrowed_parent = tempfile::tempdir().unwrap();
-        let borrowed = borrowed_parent.path().join("borrowed");
-        git(
-            borrowed_parent.path(),
-            &[
-                "clone",
-                "--quiet",
-                "--shared",
-                source.path().to_str().unwrap(),
-                borrowed.to_str().unwrap(),
-            ],
-        );
-        let root = borrowed.as_path();
-        let head = git(root, &["rev-parse", "HEAD"]);
-        let tree_revision = format!("{head}:detcore");
-        let series = root.join("series");
-        let _scope = CommandObjectMemoScope::enter();
-        assert!(repo_depth_at(root, &head).is_some());
-        assert!(reverie_pin_at(root, &head).is_some());
-        assert!(git_no_replace_rev_parse(root, &tree_revision).is_ok());
-        assert!(snapshot_series_source(&series).is_ok());
-        assert_eq!(memo_len(), (2, 1, 1, 1));
+    fn only_directory_independent_git_variables_allow_the_combined_read() {
+        for accepted in [
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_12",
+            "GIT_ALLOW_PROTOCOL",
+            "GIT_EDITOR",
+        ] {
+            assert!(
+                directory_independent_git_variable(accepted.as_bytes()),
+                "{accepted}"
+            );
+        }
+        for refused in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_KEY_",
+            "GIT_CONFIG_KEY_x",
+            "GIT_CONFIG_VALUE_1a",
+            "GIT_OBJECT_DIRECTORY",
+        ] {
+            assert!(
+                !directory_independent_git_variable(refused.as_bytes()),
+                "{refused}"
+            );
+        }
+    }
 
-        fs::remove_file(root.join(".git/objects/info/alternates")).unwrap();
-        let depth = uncached(|| repo_depth_at(root, &head));
-        let pin = uncached(|| reverie_pin_at(root, &head));
-        let tree = uncached(|| git_no_replace_rev_parse(root, &tree_revision));
-        let snapshot = uncached(|| snapshot_series_source(&series).map(|_| ()));
-        assert_eq!(depth, None);
-        assert_eq!(pin, None);
-        assert_eq!(
-            tree,
-            Err(format!(
-                "git --no-replace-objects rev-parse {tree_revision} failed"
-            ))
+    /// A gitdir below its configured worktree: discovery from the series root
+    /// finds it, but discovery from the reported top level does not, so the
+    /// original separate HEAD read refuses and the combined read must too.
+    #[test]
+    fn combined_resolution_refuses_a_worktree_configured_above_its_gitdir() {
+        let top = tempfile::tempdir().unwrap();
+        let top_path = fs::canonicalize(top.path()).unwrap();
+        let gitdir_level = top_path.join("sub");
+        fs::create_dir_all(gitdir_level.join("series")).unwrap();
+        fs::write(gitdir_level.join("series/a.jsonl"), "{\"a\":1}\n").unwrap();
+        git(&gitdir_level, &["init", "--quiet"]);
+        git(
+            &gitdir_level,
+            &["config", "core.worktree", top_path.to_str().unwrap()],
         );
-        assert_eq!(
-            snapshot,
-            Err("git --no-replace-objects rev-parse HEAD^{commit} failed".to_string())
-        );
-        assert_eq!(repo_depth_at(root, &head), depth);
-        assert_eq!(reverie_pin_at(root, &head), pin);
-        assert_eq!(git_no_replace_rev_parse(root, &tree_revision), tree);
-        assert_eq!(snapshot_series_source(&series).map(|_| ()), snapshot);
+        commit_all(&gitdir_level, "first");
+        let series = gitdir_level.join("series");
+        let (reported, _) = series_repository_and_head(&series).unwrap();
+        assert_eq!(fs::canonicalize(reported).unwrap(), top_path);
+        assert!(!discovery_passes_through(&series, &top_path));
+        for scoped in [false, true] {
+            let _scope = scoped.then(CommandObjectMemoScope::enter);
+            assert_eq!(
+                snapshot_series_source(&series).map(|_| ()),
+                Err("git --no-replace-objects rev-parse HEAD^{commit} failed".to_string())
+            );
+        }
+        let dir = repository();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        assert!(discovery_passes_through(&root.join("series"), &root));
+        assert!(discovery_passes_through(&root, &root));
+        assert!(!discovery_passes_through(&root, &root.join("series")));
     }
 
     #[test]
@@ -29300,8 +28854,6 @@ mod command_object_memo_tests {
                 &head,
             ],
         );
-        let inputs = RepositoryInputs::record(&fs::canonicalize(&linked).unwrap()).unwrap();
-        assert_eq!(inputs.discovered_at, fs::canonicalize(&linked).unwrap());
         let scope = CommandObjectMemoScope::enter();
         let mut read = Vec::new();
         for checkout in [root, linked.as_path()] {
