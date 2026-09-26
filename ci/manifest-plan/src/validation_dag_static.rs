@@ -284,9 +284,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
     // Seventeen signal-wake scheduler and six signal-mask helper controls retain all 810 prior IDs:
     // 810 + 23 = 833.
-    // Twelve virtual-timerfd controls retain all 833 prior identities:
-    // 833 + 12 = 845.
-    ("test.detcore_unit", 845),
+    // Seven virtual-timerfd controls retain all 833 prior identities:
+    // 833 + 7 = 840.
+    ("test.detcore_unit", 840),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -335,7 +335,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 845),
+    ("test.detcore_unit_on_host", 840),
     // Host variants select the same proc regressions and the same two
     // signal_determinism tests, and retain prior identities.
     ("test.hermit_integration_on_host", 175),
