@@ -163,7 +163,7 @@ fn compressed_fixtures() -> &'static [PathBuf; 3] {
 }
 
 fn run_liteinst(program: &Path, args: &[&str], verify: bool) -> Output {
-    run_liteinst_with_input(program, args, verify, None)
+    run_liteinst_with_input(program, &[], args, verify, None)
 }
 
 fn liteinst_command(log_level: &str) -> Command {
@@ -204,6 +204,7 @@ fn liteinst_commands_use_minimal_environment_and_private_workdir() {
 
 fn run_liteinst_with_input(
     program: &Path,
+    hermit_args: &[&str],
     args: &[&str],
     verify: bool,
     input: Option<&[u8]>,
@@ -225,6 +226,7 @@ fn run_liteinst_with_input(
         .arg("--env=PYTHONDONTWRITEBYTECODE=1")
         .env("HOME", home.path())
         .env("PYTHONDONTWRITEBYTECODE", "1");
+    command.args(hermit_args);
     command.arg("--").arg(program).args(args);
     let Some(input) = input else {
         return command.output().expect("failed to run Hermit LiteInst");
@@ -253,13 +255,29 @@ fn assert_liteinst_strict_verify(program: &Path, args: &[&str], expected_stdout:
 }
 
 fn assert_liteinst_virtual_time_is_continuous() {
+    const EPOCH: &str = "2026-01-01T00:00:00Z";
     const EPOCH_SECONDS: u64 = 1_767_225_600;
     const MAX_STARTUP_SECONDS: u64 = 60;
 
     // Whole seconds remain stable across verified LiteInst runs. Do not assert
     // the old exact epoch: that encoded #1095's reset-on-exec behavior and
-    // rejects legitimate deterministic startup progress.
-    let output = run_liteinst_strict_verify(Path::new("/usr/bin/date"), &["-u", "+%s"]);
+    // rejects legitimate deterministic startup progress. The epoch is pinned:
+    // an unpinned run starts from the host clock, which bounds nothing.
+    let output = assert_liteinst_strict_verify_output(run_liteinst_with_input(
+        Path::new("/usr/bin/date"),
+        &[&format!("--epoch={EPOCH}")],
+        &["-u", "+%s"],
+        true,
+        None,
+    ));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "hermit: virtual-time epoch=2026-01-01T00:00:00+00:00 source=explicit; \
+             reproduce with --epoch=2026-01-01T00:00:00+00:00\n"
+        ),
+        "the run must use the pinned epoch: {stderr}"
+    );
     let timestamp = String::from_utf8(output.stdout).expect("date output should be UTF-8");
     let seconds = timestamp
         .trim()
@@ -297,7 +315,13 @@ fn run_liteinst_strict_verify(program: &Path, args: &[&str]) -> Output {
 }
 
 fn run_liteinst_strict_verify_with_stdin(program: &Path, args: &[&str], input: &[u8]) -> Output {
-    assert_liteinst_strict_verify_output(run_liteinst_with_input(program, args, true, Some(input)))
+    assert_liteinst_strict_verify_output(run_liteinst_with_input(
+        program,
+        &[],
+        args,
+        true,
+        Some(input),
+    ))
 }
 
 fn assert_liteinst_strict_verify_output(output: Output) -> Output {
