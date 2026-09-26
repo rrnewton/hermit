@@ -758,6 +758,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/timerfd_semantics.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml",
+      "why": "tests/backend-parity/fixtures/timerfd_semantics.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml: The centralized manifest declares its build, backend selection, timeout, and strict verification observation contract."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/umask_mode.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/umask_mode.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
