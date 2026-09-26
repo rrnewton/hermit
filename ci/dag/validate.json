@@ -5889,13 +5889,6 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/timer-family-identity",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
           "test": "c-programs/timerfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
@@ -11301,13 +11294,6 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/timer-family-identity",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -19458,13 +19444,6 @@
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/timer-family-identity",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",

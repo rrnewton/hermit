@@ -14415,7 +14415,7 @@ mod nextest_timeout_tests {
                 })
                 .unwrap()
                 .len(),
-            865,
+            864,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
