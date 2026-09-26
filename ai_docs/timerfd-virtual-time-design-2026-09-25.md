@@ -70,7 +70,10 @@ the timed-event queue non-empty forever, so a genuinely deadlocked program
 spun instead of being reported (rc 124 instead of 125). The empty-queue
 fast-forward also stepped one interval at a time, so a 1s sleep beside an
 unwatched 1ms periodic timerfd took 12s of wall time, and one beside a 1us
-timer did not finish. With no scheduler state there is also no lifecycle to
+timer did not finish. `hermit-cli/tests/signal_determinism.rs`
+(`sigsuspend_with_armed_periodic_timerfd_reports_terminal_deadlock`) guards
+the first regression, and the fixture's `periodic_sleep` and
+`close_armed_sleep` cases guard the second. With no scheduler state there is also no lifecycle to
 get wrong: close, dup, fork, exec and process exit need no cleanup beyond the
 open file description itself.
 
