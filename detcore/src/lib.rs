@@ -1597,7 +1597,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     thread_cpu_start_user_time: last_accounted_user_time,
                     thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
-                    returned_records: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
                     // Child RNG identity follows the deterministic creation
@@ -2849,8 +2848,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
-        // Taken whatever the outcome, so that it describes only this call.
-        let returned_records = guest.thread_state_mut().returned_records.take();
 
         // A copy may already have changed guest memory before reporting a
         // terminal backend error. Do not perform even the syscall-result
@@ -2907,14 +2904,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            io_buffers::detlog_io_buffers(
-                guest,
-                &call,
-                *ret,
-                dettid,
-                rng_readv_output.as_deref(),
-                returned_records.as_ref(),
-            )?;
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, rng_readv_output.as_deref())?;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
