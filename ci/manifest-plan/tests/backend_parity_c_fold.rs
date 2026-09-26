@@ -140,13 +140,6 @@ const PLAN_CELLS_ADDED_AFTER_FOLD: &[(&str, &str, &str, &str)] = &[
         "verify",
         "c-programs/sigsuspend-sibling-signal-wake",
     ),
-    // https://github.com/rrnewton/hermit/pull/3229 selects this folded test.
-    (
-        "portable",
-        "ptrace",
-        "verify",
-        "c-programs/timer-family-identity",
-    ),
     // https://github.com/rrnewton/hermit/pull/3229 adds this test.
     (
         "portable",
@@ -190,14 +183,6 @@ const CELL_STATUS_CHANGES_AFTER_FOLD: &[(&str, &str, &str, &str, &str)] = &[
     // https://github.com/rrnewton/hermit/pull/3224
     (
         "c-programs/dbt-pid-virtualization",
-        "ptrace",
-        "verify",
-        "red",
-        "green",
-    ),
-    // https://github.com/rrnewton/hermit/pull/3229
-    (
-        "c-programs/timer-family-identity",
         "ptrace",
         "verify",
         "red",
@@ -451,7 +436,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let lane = |name: &str| cells.iter().filter(|c| field(c, "lane") == name).count();
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
-        (865, 861, 4)
+        (864, 860, 4)
     );
     for &(added_lane, backend, mode, test) in PLAN_CELLS_ADDED_AFTER_FOLD {
         let selected = cells
