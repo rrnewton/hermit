@@ -692,10 +692,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seventeen signal-wake scheduler and six signal-mask helper controls
     // (https://github.com/rrnewton/hermit/pull/3224) retain all 876 prior
     // identities: 876 + 23 = 899.
-    // Twelve virtual-timerfd controls
+    // Seven virtual-timerfd controls
     // (https://github.com/rrnewton/hermit/pull/3229) retain all 899 prior
-    // identities: 899 + 12 = 911.
-    ("test.detcore_unit", 911),
+    // identities: 899 + 7 = 906.
+    ("test.detcore_unit", 906),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -909,9 +909,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_time_on_host", 2),
     // The host twin also selects the 23 signal-wake controls of
     // https://github.com/rrnewton/hermit/pull/3224
-    // and the 12 virtual-timerfd controls of
+    // and the 7 virtual-timerfd controls of
     // https://github.com/rrnewton/hermit/pull/3229.
-    ("test.detcore_unit_on_host", 911),
+    ("test.detcore_unit_on_host", 906),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

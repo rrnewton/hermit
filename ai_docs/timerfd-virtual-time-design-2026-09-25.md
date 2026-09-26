@@ -55,19 +55,24 @@ host, where a timer that is never armed in the kernel would never wake them.
   CANCEL_ON_SET is recorded only for REALTIME+ABSTIME, as Linux does, and
   ECANCELED is unreachable because nothing can set the clock.
 
-## Scheduler bookkeeping
+## Scheduler bookkeeping: none
 
-`TimedEvent::TimerFdExpiry(OpenFileId)`, with `timerfd_timers` keyed by the
-open file description (not by pid and fd number, which a dup or close/reopen
-would alias). The event is declared last, so at one deadline the canonical pop
-order is SignalEvt, ThreadEvt, TimerFdExpiry — Linux does not order
-same-instant events across families and this fixed order is the disclosed
-choice. Popping wakes no thread; the event exists so an otherwise empty queue
-fast-forwards to the deadline instead of reporting deadlock. A periodic entry
-that is several intervals behind re-arms once, to the first deadline after
-now. Entries are removed on disarm, on release of the open file
-(`ReleasePort` -> `release_timerfd`), and on process exit; a failed exec
-re-registers the process's timerfds.
+The scheduler holds no timerfd state. Every thread that waits on a timerfd
+(blocking read, poll, ppoll, epoll_wait, epoll_pwait, select, pselect6) is a
+polling thread: it keeps its place in the run queue, takes a scheduler turn
+per retry, and judges readiness from the timer state at the logical time of
+that retry. Such a thread never parks as a timed waiter, so a scheduler timer
+event could not wake it earlier. An earlier revision registered each armed
+timerfd as a scheduler timed event anyway. Measured on that revision (strict,
+ptrace, debug build), it bought no liveness: a one-hour timerfd read still did
+not finish within 30s. It cost two regressions. An armed periodic timerfd kept
+the timed-event queue non-empty forever, so a genuinely deadlocked program
+spun instead of being reported (rc 124 instead of 125). The empty-queue
+fast-forward also stepped one interval at a time, so a 1s sleep beside an
+unwatched 1ms periodic timerfd took 12s of wall time, and one beside a 1us
+timer did not finish. With no scheduler state there is also no lifecycle to
+get wrong: close, dup, fork, exec and process exit need no cleanup beyond the
+open file description itself.
 
 ## Syscalls
 
@@ -76,11 +81,19 @@ re-registers the process's timerfds.
   nanoseconds >= 1e9), then EBADF / EINVAL for the descriptor. An invalid
   request changes nothing. Re-arming resets the pending count; the old value
   is copied out last.
-- `timerfd_gettime`: zeros when disarmed or expired one-shot; otherwise time
-  to the next expiry and the armed interval.
-- `read`: len < 8 is EINVAL; pending > 0 returns the u64 count and consumes
-  it; empty + O_NONBLOCK is EAGAIN; otherwise it polls on scheduler turns. A
-  signal returns ERESTARTSYS, so SA_RESTART restarts the read as on Linux.
+- `timerfd_create`: unknown flags or clocks are EINVAL, checked before the
+  alarm clocks' EPERM, as in `fs/timerfd.c`.
+- `timerfd_gettime`: the descriptor is resolved first (EBADF, or EINVAL for
+  a non-timerfd), then the output pointer (EFAULT). Zeros when disarmed or an
+  expired one-shot; otherwise time to the next expiry and the armed interval.
+- `read`, `readv`, and `preadv2` with offset -1 and no flags: a total
+  length below 8 is EINVAL; pending > 0 takes the count, then copies the u64
+  across the iovecs, and a faulting copy is EFAULT with the count already
+  taken, as on Linux; empty + O_NONBLOCK is EAGAIN; otherwise it polls on
+  scheduler turns. A signal returns ERESTARTSYS, so SA_RESTART restarts the
+  read as on Linux. Positioned reads (`pread64`, `preadv`, `preadv2` with an
+  offset) reach the host vessel, which is an anonymous inode and returns
+  ESPIPE as Linux does.
 
 ## Readiness in waits (`detcore/src/syscalls/io.rs`)
 
@@ -92,13 +105,20 @@ re-registers the process's timerfds.
   an edge or a oneshot.
 - poll/ppoll: POLLIN on a ready timerfd is merged into the returned array.
 - select/pselect6: ready timerfds are set in the read bitmap and counted.
-- Blocking waits cap the host polling deadline at the earliest virtual
-  expiry and merge virtual readiness after every successful probe; if a
-  capped probe finds nothing (another thread consumed or re-armed the timer)
-  the wait continues toward the guest deadline. Each cap is strictly later,
-  so the loop advances. Remaining-time outputs are written as before.
+- Blocking waits (`wait_with_timerfds`) take a scheduler turn, probe the
+  host with a zero timeout, and rescan the virtual timers after EVERY probe,
+  the same way the select loops and the blocking read do. A timer that
+  another thread arms, re-arms, reads, or adds to the epoll with `epoll_ctl`
+  while this thread waits is therefore seen at the next retry. The loop keeps
+  no timer deadline of its own; it ends on readiness, the guest timeout, a
+  host error, or a signal. Every blocking epoll_wait and NULL-mask
+  epoll_pwait uses this loop, so an interest added mid-wait is found; poll
+  and ppoll use it when the array names a virtual timerfd. Remaining-time
+  outputs are written as before.
 - Clock reads are gated: a wait that watches no virtual timerfd sees no
   extra time observation, so unrelated programs keep their event streams.
+  poll/ppoll skip reading the pollfd array entirely when timerfds are not
+  virtual.
 
 ## Limitations (disclosed, not claimed)
 
@@ -112,9 +132,21 @@ re-registers the process's timerfds.
 - Timer events are appended after host events; relative order between a
   timerfd and an external host fd at one probe is Hermit's existing external
   I/O scope.
-- Process exit does not send `ReleasePort` (pre-existing); if the arming
-  process exits while a forked holder keeps the file, the fast-forward
-  target is lost. Readiness stays correct because it is computed from time.
+- A long blocking timerfd wait advances at the polling rate rather than
+  jumping to the deadline, as the existing poll and epoll timeouts already
+  do. Measured once each with the debug build (strict, ptrace, default
+  log), wall time for a 120s wait: timerfd read 11.0s, poll 31.3s, epoll
+  28.7s; with no timerfd, poll 34.7s and epoll 27.8s. A one-hour wait of
+  either kind does not finish within 30s.
+- `timerfd_gettime` and the settime old-value path forward a periodic timer
+  on Linux, which raises a fresh EPOLLET edge; the model raises edges only on
+  settime and consuming reads, so an EPOLLET waiter can miss that one extra
+  wakeup.
+- `preadv2` with offset -1 and nonzero flags, and reads through io_uring,
+  AIO or splice, reach the never-armed host vessel.
+- The link from an epoll interest to its timerfd file is not serialized
+  (`#[serde(skip)]` in `detcore/src/fd.rs`); only the ptrace backend, which
+  keeps thread state in process, was measured.
 - BOOTTIME does not model suspend.
 - Backends: the change is in shared detcore code, but only the ptrace cells
   are enabled and measured; no DBT, KVM, SaBRe or LiteInst claim is made.
@@ -127,3 +159,7 @@ Revisions 1-3 keyed scheduler and epoll state by (pid, fd); an OFD-level key
 replaced it because dup, fork and close/reopen alias descriptor numbers. The
 rescue commit armed virtual timerfds in every mode, which would hang record/
 replay and non-sequentialized waits; the mode gate above replaced that.
+Revision 4 (the first pull-request head) added the scheduler timer event and
+capped each blocking wait at the earliest expiry computed once per round; both
+were removed after review (see "Scheduler bookkeeping" and "Readiness in
+waits").
