@@ -17020,7 +17020,10 @@ mod nextest_timeout_tests {
                 // c-programs/dbt-pid-virtualization, c-programs/sigsuspend-alarm-wake,
                 // c-programs/external-io-signal-interrupt and
                 // c-programs/sigsuspend-sibling-signal-wake.
-                + 4,
+                + 4
+                // Two portable ptrace verify cells of https://github.com/rrnewton/hermit/pull/3229:
+                // c-programs/timer-family-identity and c-programs/timerfd-semantics.
+                + 2,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
