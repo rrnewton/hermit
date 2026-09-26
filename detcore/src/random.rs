@@ -47,7 +47,15 @@ impl RandomCopyFailure {
 
 impl std::fmt::Display for RandomCopyFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "random user-access copy failed: {}", self.errno)
+        write!(f, "random user-access copy failed: {}", self.errno)?;
+        if self.errno == Errno::EPERM {
+            f.write_str(
+                "; for a non-dumpable ptrace guest, retry with Hermit's default namespace \
+                 configuration (omit --no-namespace); embedders must check tracing permissions \
+                 in the guest's user namespace",
+            )?;
+        }
+        Ok(())
     }
 }
 

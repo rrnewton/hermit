@@ -230,7 +230,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
-    ("test.hermit_integration", 168),
+    ("test.hermit_integration", 170),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
@@ -255,7 +255,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 780),
     // The host variant selects the same two additional clock_determinism tests.
-    ("test.hermit_integration_on_host", 168),
+    ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 748),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),

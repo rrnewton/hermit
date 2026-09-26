@@ -30,6 +30,7 @@ struct Shared {
     stop: AtomicI32,
     drops: AtomicI32,
     retired_before_drop: AtomicI32,
+    monitor_self_exit_reason: AtomicI32,
 }
 struct WorkerObservation {
     receiver: std::os::unix::net::UnixDatagram,
@@ -155,7 +156,12 @@ pub(crate) fn ready(fd: &OwnedFd) -> bool {
     assert!(n >= 0, "poll refusal");
     n > 0
 }
-fn container_case(mode: String, deadline: Instant) -> i32 {
+// These are fixture worker exits, never guest/product completion receipts.
+const WORKER_SUPERVISOR_GONE: i32 = 38;
+const WORKER_ABSOLUTE_CEILING: i32 = 39;
+const WORKER_MONITOR_REFUSED: i32 = 40;
+
+fn container_case(mode: String, deadline: Instant, end: u64) -> i32 {
     let start = Instant::now();
     assert_eq!(
         std::fs::read_dir("/proc/self/task").unwrap().count(),
@@ -187,6 +193,7 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
             stop: AtomicI32::new(0),
             drops: AtomicI32::new(0),
             retired_before_drop: AtomicI32::new(-1),
+            monitor_self_exit_reason: AtomicI32::new(0),
         })
     };
     let s = unsafe { &*shared };
@@ -211,6 +218,10 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
         container.unshare(Namespace::PID).map_root();
     }
     let selected = mode.clone();
+    // Capture T while it is live, before P/G exist. P deliberately exits in
+    // these cases; a death signal tied to P would invalidate their live-G proof.
+    let supervisor = pidfd(unsafe { libc::getpid() });
+    let worker_ceiling = end.checked_add(2_000_000_000).unwrap();
     let result = super::owned_container::run(
         &mut container,
         guard,
@@ -233,8 +244,18 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
                     .parse::<i32>()
                     .unwrap();
                 s.pid.store(host_pid, Ordering::SeqCst);
+                // Close inherited workload descriptors except the original T
+                // pidfd. This descriptor cannot retarget after PID reuse.
+                let monitor = supervisor.as_raw_fd() as u32;
+                assert!(monitor >= 3);
+                if monitor > 3 {
+                    assert_eq!(
+                        unsafe { libc::syscall(libc::SYS_close_range, 3u32, monitor - 1, 0) },
+                        0
+                    );
+                }
                 assert_eq!(
-                    unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0) },
+                    unsafe { libc::syscall(libc::SYS_close_range, monitor + 1, u32::MAX, 0) },
                     0
                 );
                 s.ready.store(1, Ordering::SeqCst);
@@ -246,6 +267,37 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
                     if s.stop.load(Ordering::SeqCst) == 1 {
                         unsafe { libc::_exit(37) }
                     }
+                    let mut owner = libc::pollfd {
+                        fd: supervisor.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let polled = unsafe { libc::poll(&mut owner, 1, 0) };
+                    if polled < 0 || owner.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                        s.monitor_self_exit_reason
+                            .store(WORKER_MONITOR_REFUSED, Ordering::SeqCst);
+                        unsafe { libc::_exit(WORKER_MONITOR_REFUSED) }
+                    }
+                    if owner.revents & libc::POLLIN != 0 {
+                        s.monitor_self_exit_reason
+                            .store(WORKER_SUPERVISOR_GONE, Ordering::SeqCst);
+                        unsafe { libc::_exit(WORKER_SUPERVISOR_GONE) }
+                    }
+                    // Independent of T reaching its stop store. This is the
+                    // original 3s absolute budget plus the existing 2s rescue,
+                    // never extra time for the original product predicate.
+                    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+                        s.monitor_self_exit_reason
+                            .store(WORKER_MONITOR_REFUSED, Ordering::SeqCst);
+                        unsafe { libc::_exit(WORKER_MONITOR_REFUSED) }
+                    }
+                    let now = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+                    if now >= worker_ceiling {
+                        s.monitor_self_exit_reason
+                            .store(WORKER_ABSOLUTE_CEILING, Ordering::SeqCst);
+                        unsafe { libc::_exit(WORKER_ABSOLUTE_CEILING) }
+                    }
                     unsafe {
                         libc::sched_yield();
                     }
@@ -255,7 +307,10 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
             transfer_fd(sender.as_raw_fd(), original_worker.as_raw_fd());
             assert!(wait(deadline, || s.ready.load(Ordering::SeqCst) == 1));
             match selected.as_str() {
-                "abnormal" | "private-abnormal" => unsafe { libc::_exit(23) },
+                "abnormal"
+                | "private-abnormal"
+                | "containment-child-assertion"
+                | "containment-child-owner-death" => unsafe { libc::_exit(23) },
                 "reported" => Err(anyhow::anyhow!("ORIGINAL_REPORTED_FAILURE")),
                 "malformed" => {
                     BAD_WIRE.store(1, Ordering::SeqCst);
@@ -288,12 +343,55 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
     };
     let live = fd.as_ref().is_some_and(|fd| !ready(fd));
     let exists = path.exists();
+    if mode.starts_with("containment-child-") {
+        // The control may trigger failure only after this actual no-namespace
+        // outcome: P exited23, while original G and its backing remain live.
+        assert!(!private && live && exists && retained && typed_status);
+        let channel = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(libc::STDIN_FILENO) };
+        channel
+            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        transfer_fd(channel.as_raw_fd(), fd.as_ref().unwrap().as_raw_fd());
+        let proof = serde_json::to_vec(&serde_json::json!({
+            "worker":worker, "live":live, "guard_exists":exists,
+            "retained":retained, "typed_original_exit23":typed_status,
+            "phase":"before-stop-store"
+        }))
+        .unwrap();
+        assert_eq!(channel.send(&proof).unwrap(), proof.len());
+        let mut trigger = [0u8; 1];
+        channel
+            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        assert_eq!(channel.recv(&mut trigger).unwrap(), 1);
+        assert_eq!(trigger, [1]);
+        // Restrict observation of this private control process before induced
+        // failure. Only T's mm changes; G already exists. The assertion still
+        // unwinds to exit101; this precaution is not a core-dump mechanism.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        assert_eq!(channel.send(&[2]).unwrap(), 1);
+        if mode == "containment-child-assertion" {
+            assert_ne!(
+                trigger,
+                [1],
+                "intentional original CLI assertion before stop store"
+            );
+        }
+        assert_eq!(mode, "containment-child-owner-death");
+        // R owns the original T pidfd and kills it only after the live proof.
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
     if live {
         s.check.store(1, Ordering::SeqCst);
         assert!(wait(deadline, || s.observed.load(Ordering::SeqCst) != -1));
     }
     let observed = s.observed.load(Ordering::SeqCst);
     let before_deadline = Instant::now() < deadline;
+    let monitor_self_exit_reason = s.monitor_self_exit_reason.load(Ordering::SeqCst);
     let predicate = if success {
         result.as_ref().is_ok_and(|(v, _)| v.0 == 41)
             && exists
@@ -321,10 +419,11 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
             && (mode != "reported" || message.contains("ORIGINAL_REPORTED_FAILURE"))
             && (mode != "malformed"
                 || (message.contains("UnexpectedEnd") && message.contains("decode refused")))
-    } && before_deadline;
+    } && before_deadline
+        && monitor_self_exit_reason == 0;
     println!(
         "{}",
-        serde_json::json!({"mode":mode,"predicate":predicate,"before_deadline":before_deadline,"seconds":elapsed.as_secs_f64(),"worker_host_pid":worker,"worker_live_before_cleanup":live,"guard_exists":exists,"worker_observed_guard":observed,"parent_guard_drops":s.drops.load(Ordering::SeqCst),"worker_retired_before_guard_drop":s.retired_before_drop.load(Ordering::SeqCst),"retained_diagnostic":retained,"typed_original_exit23":typed_status,"class":classification,"message":message,"phase":"original predicate before separate cleanup"})
+        serde_json::json!({"mode":mode,"predicate":predicate,"before_deadline":before_deadline,"seconds":elapsed.as_secs_f64(),"worker_host_pid":worker,"worker_live_before_cleanup":live,"guard_exists":exists,"worker_observed_guard":observed,"parent_guard_drops":s.drops.load(Ordering::SeqCst),"worker_retired_before_guard_drop":s.retired_before_drop.load(Ordering::SeqCst),"retained_diagnostic":retained,"typed_original_exit23":typed_status,"class":classification,"message":message,"monitor_self_exit_reason":monitor_self_exit_reason,"phase":"original predicate before separate cleanup"})
     );
     // Separate two-second diagnostic teardown, never used to satisfy predicate.
     let rescue = Instant::now() + Duration::from_secs(2);
@@ -364,6 +463,187 @@ fn container_case(mode: String, deadline: Instant) -> i32 {
     if predicate { 0 } else { 1 }
 }
 
+fn containment_control(mode: &str, deadline: Instant, end: u64) -> i32 {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+    let selected = match mode {
+        "containment-early-assertion" => "containment-child-assertion",
+        "containment-cli-owner-death" => "containment-child-owner-death",
+        _ => panic!("unknown containment control"),
+    };
+    let (channel, child_channel) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    channel
+        .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+        .unwrap();
+    let parent = unsafe { libc::getpid() };
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .env("HERMIT_INTERNAL_CLI_LIFECYCLE", "1")
+        .args(["__hermit-cli-lifecycle", selected, &end.to_string()])
+        .stdin(std::process::Stdio::from(OwnedFd::from(child_channel)));
+    // T depends on its true supervisor R, unlike G's deliberately exiting P.
+    // If a control panics, R's death stops T and G observes its original pidfd.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let cli = pidfd(i32::try_from(child.id()).unwrap());
+    assert!(wait(deadline, || {
+        let mut socket = libc::pollfd {
+            fd: channel.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut socket, 1, 0) };
+        assert!(n >= 0);
+        n == 1 && socket.revents & libc::POLLIN != 0
+    }));
+    // The fd comes from P's original handle via T; no numeric-PID reacquisition.
+    let worker = receive_fd(channel.as_raw_fd());
+    let mut bytes = [0u8; 1024];
+    channel
+        .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+        .unwrap();
+    let n = channel.recv(&mut bytes).unwrap();
+    let proof: serde_json::Value = serde_json::from_slice(&bytes[..n]).unwrap();
+    assert_eq!(proof["phase"], "before-stop-store");
+    for field in ["live", "guard_exists", "retained", "typed_original_exit23"] {
+        assert_eq!(proof[field], true, "missing actual proof: {field}");
+    }
+    let pid = i32::try_from(proof["worker"].as_i64().unwrap()).unwrap();
+    assert!(pid > 0 && !ready(&worker) && !ready(&cli));
+    let proc_path = format!("/proc/{pid}");
+    let inode = std::fs::metadata(&proc_path).unwrap().ino();
+    let stat = std::fs::read_to_string(format!("{proc_path}/stat")).unwrap();
+    let start: u64 = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(start > 0);
+    println!(
+        "{}",
+        serde_json::json!({
+            "phase":"sealed original live worker before induced CLI failure",
+            "control":mode,"worker":pid,"start":start,"inode":inode,
+            "worker_pidfd_ready":false,"proof":proof
+        })
+    );
+    assert_eq!(channel.send(&[1]).unwrap(), 1);
+    let mut armed = [0u8; 1];
+    channel
+        .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+        .unwrap();
+    assert_eq!(channel.recv(&mut armed).unwrap(), 1);
+    assert_eq!(armed, [2], "specific pre-stop trigger was not armed");
+    if mode == "containment-cli-owner-death" {
+        assert!(!ready(&worker) && !ready(&cli));
+        assert_eq!(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    cli.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            },
+            0
+        );
+    }
+    let mut status = None;
+    assert!(wait(deadline, || {
+        status = child.try_wait().unwrap();
+        status.is_some()
+    }));
+    let status = status.unwrap();
+    if mode == "containment-early-assertion" {
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "the intentional assertion must remain failed"
+        );
+    } else {
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+    assert!(wait(deadline, || ready(&worker)));
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                worker.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { info.si_pid() }, pid);
+    assert_eq!(info.si_code, libc::CLD_EXITED);
+    // Exit39 (absolute ceiling),40 (monitor refusal),37 (ordinary stop), or
+    // any rescue signal must FAIL this supervisor-loss control.
+    assert_eq!(unsafe { info.si_status() }, WORKER_SUPERVISOR_GONE);
+    assert_eq!(std::fs::metadata(&proc_path).unwrap().ino(), inode);
+    let final_stat = std::fs::read_to_string(format!("{proc_path}/stat")).unwrap();
+    assert_eq!(
+        final_stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        start
+    );
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                worker.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { info.si_pid() }, pid);
+    assert_eq!(info.si_code, libc::CLD_EXITED);
+    assert_eq!(unsafe { info.si_status() }, WORKER_SUPERVISOR_GONE);
+    assert!(!std::path::Path::new(&proc_path).exists());
+    assert!(Instant::now() < deadline);
+    println!(
+        "{}",
+        serde_json::json!({
+            "phase":"containment control only; induced CLI failure remains failed",
+            "control":mode,"worker":pid,"start":start,"inode":inode,
+            "actual_worker_exit":WORKER_SUPERVISOR_GONE,"naturally_reaped":true,
+            "original_cli_status":status.to_string(),"rescue_used":false
+        })
+    );
+    0
+}
+
 fn monotonic_ns() -> u64 {
     let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
     assert_eq!(
@@ -401,7 +681,13 @@ pub(super) fn maybe_run() -> Option<i32> {
         .checked_sub(monotonic_ns())
         .expect("deadline expired before role start");
     let deadline = Instant::now() + Duration::from_nanos(remaining);
-    if args[2].starts_with("gdb-") {
+    if matches!(
+        args[2].as_str(),
+        "containment-early-assertion" | "containment-cli-owner-death"
+    ) {
+        assert_eq!(args.len(), 4);
+        Some(containment_control(&args[2], deadline, end))
+    } else if args[2].starts_with("gdb-") {
         Some(super::gdb_client::lifecycle::run(
             &args[2],
             deadline,
@@ -410,6 +696,6 @@ pub(super) fn maybe_run() -> Option<i32> {
         ))
     } else {
         assert_eq!(args.len(), 4);
-        Some(container_case(args[2].clone(), deadline))
+        Some(container_case(args[2].clone(), deadline, end))
     }
 }
