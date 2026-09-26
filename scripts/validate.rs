@@ -757,6 +757,84 @@ fn e2e_payload_identity(release_builder: &str) -> serde_json::Value {
         })
     }
 }
+
+/// The identity above is a constant per builder. These checks tie it to the
+/// sources that decide the real payload, so a change there fails here rather
+/// than leaving the ledger describing a binary nobody built.
+#[cfg(test)]
+mod e2e_payload_identity_tests {
+    use super::*;
+
+    fn read(root: &Path, relative: &str) -> String {
+        std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"))
+    }
+
+    #[test]
+    fn artifact_node_publishes_each_recorded_path() {
+        let root = test_source_root();
+        let dag: serde_json::Value = serde_json::from_str(&read(&root, "ci/dag/validate.json")).unwrap();
+        let nodes: Vec<&serde_json::Value> = dag["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| step["group"] == "build" && step["job"] == "e2e_artifact")
+            .collect();
+        assert_eq!(nodes.len(), 1, "exactly one build.e2e_artifact node");
+        let cmd = nodes[0]["cmd"].as_str().unwrap();
+        for builder in [RELEASE_BUILDER_CARGO, RELEASE_BUILDER_BUCK] {
+            let path = e2e_payload_identity(builder)["path"].as_str().unwrap().to_string();
+            let arm = format!("{builder}) hermit_payload={path} ;;");
+            assert!(cmd.contains(&arm), "build.e2e_artifact must publish {path} for {builder}: {cmd}");
+        }
+    }
+
+    #[test]
+    fn buck_identity_matches_the_release_rustc_flags() {
+        let buck = e2e_payload_identity(RELEASE_BUILDER_BUCK);
+        assert_eq!(buck["profile"], "release");
+        let shim = read(&test_source_root(), "shim/BUCK");
+        let start = shim.find("HERMIT_RELEASE_RUSTC_FLAGS = [").expect("release flag list");
+        let flags = &shim[start..start + shim[start..].find(']').unwrap()];
+        for (field, on, off) in [
+            ("debug_assertions", "\"-Cdebug-assertions=yes\"", "\"-Cdebug-assertions=no\""),
+            ("overflow_checks", "\"-Coverflow-checks=yes\"", "\"-Coverflow-checks=no\""),
+        ] {
+            let recorded = buck[field].as_bool().unwrap();
+            assert!(flags.contains(if recorded { on } else { off }), "{field}={recorded} vs {flags}");
+            assert!(!flags.contains(if recorded { off } else { on }), "{field} contradicted by {flags}");
+        }
+    }
+
+    #[test]
+    fn cargo_identity_is_the_unmodified_dev_profile() {
+        let cargo = e2e_payload_identity(RELEASE_BUILDER_CARGO);
+        assert_eq!(cargo["profile"], "debug");
+        assert_eq!(cargo["debug_assertions"], true);
+        assert_eq!(cargo["overflow_checks"], true);
+        // Cargo's dev profile enables both classes unless something overrides
+        // them. Refuse every place that could.
+        let root = test_source_root();
+        let manifest = read(&root, "Cargo.toml");
+        for line in manifest.lines().map(str::trim) {
+            assert!(
+                !(line.starts_with("[profile.dev]") || line.starts_with("[profile.dev.package.\"*\"]")),
+                "Cargo.toml overrides the whole dev profile: {line}"
+            );
+            assert!(
+                !(line.starts_with("debug-assertions") || line.starts_with("overflow-checks")),
+                "Cargo.toml sets a check class: {line}"
+            );
+        }
+        for config in [".cargo/config.toml", ".cargo/config"] {
+            assert!(!root.join(config).exists(), "{config} could override the dev profile or RUSTFLAGS");
+        }
+        let dag = read(&root, "ci/dag/validate.json");
+        for token in ["RUSTFLAGS", "CARGO_PROFILE_", "debug-assertions", "overflow-checks"] {
+            assert!(!dag.contains(token), "ci/dag/validate.json mentions {token}");
+        }
+    }
+}
 const BUCK_DOTSLASH_ENV: &str = "HERMIT_VALIDATE_BUCK_DOTSLASH";
 
 fn establish_release_build_environment(args: &Args) -> Result<(), String> {
