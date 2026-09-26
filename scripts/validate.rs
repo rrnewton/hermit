@@ -6646,8 +6646,27 @@ fn append_validate_series(
 /// Merge one top-level validate's completed per-cell rows into the tracked
 /// scorecard files. Nested and off-the-record validates leave the tracked view
 /// untouched; only a receipt-producing top-level run owns that projection.
-fn should_write_scorecard(nested: bool, off_the_record: bool) -> bool {
-    !nested && !off_the_record
+/// The same gate decides the parent series append. A Buck run is excluded from
+/// both: neither parent projection records the builder, so its release-payload
+/// cells would read as Cargo debug-payload results. Its ledger row still does.
+fn should_write_scorecard(nested: bool, off_the_record: bool, release_builder: &str) -> bool {
+    !nested && !off_the_record && release_builder == RELEASE_BUILDER_CARGO
+}
+
+/// Summary line for a run whose cells stay out of the parent projections only
+/// because Buck built the payload.
+fn buck_projection_detail(
+    nested: bool,
+    off_the_record: bool,
+    release_builder: &str,
+) -> Option<String> {
+    (should_write_scorecard(nested, off_the_record, RELEASE_BUILDER_CARGO)
+        && !should_write_scorecard(nested, off_the_record, release_builder))
+    .then(|| {
+        "Buck release payload: cell results stay in this run's ledger row and retained artifacts; \
+         they were not added to the parent series or scorecard, which record no builder"
+            .into()
+    })
 }
 
 struct ScorecardPublication<'a> {
@@ -6656,6 +6675,7 @@ struct ScorecardPublication<'a> {
     expected_head: &'a str,
     finalized_row: Option<&'a serde_json::Value>,
     delegated: bool,
+    release_builder: &'a str,
 }
 
 fn local_scorecard_writeback(
@@ -6665,7 +6685,9 @@ fn local_scorecard_writeback(
     off_the_record: bool,
     publication: &ScorecardPublication<'_>,
 ) -> Option<Result<(), String>> {
-    if !should_write_scorecard(nested, off_the_record) || publication.delegated {
+    if !should_write_scorecard(nested, off_the_record, publication.release_builder)
+        || publication.delegated
+    {
         return None;
     }
     Some(project_local_scorecard(root, result_root, publication))
@@ -12793,18 +12815,29 @@ fn pin_gate_receipt_bracket() -> Result<(), String> {
 }
 
 fn scorecard_writeback_scope_bracket() -> Result<(), String> {
-    if !should_write_scorecard(false, false)
-        || should_write_scorecard(true, false)
-        || should_write_scorecard(false, true)
-        || should_write_scorecard(true, true)
+    if !should_write_scorecard(false, false, RELEASE_BUILDER_CARGO)
+        || should_write_scorecard(true, false, RELEASE_BUILDER_CARGO)
+        || should_write_scorecard(false, true, RELEASE_BUILDER_CARGO)
+        || should_write_scorecard(true, true, RELEASE_BUILDER_CARGO)
     {
         return Err(
             "scorecard write-back: only a receipt-producing top-level run may update the tracked projection"
                 .into(),
         );
     }
+    if should_write_scorecard(false, false, RELEASE_BUILDER_BUCK)
+        || should_write_scorecard(false, false, "")
+        || buck_projection_detail(false, false, RELEASE_BUILDER_BUCK).is_none()
+        || buck_projection_detail(false, false, RELEASE_BUILDER_CARGO).is_some()
+        || buck_projection_detail(true, false, RELEASE_BUILDER_BUCK).is_some()
+    {
+        return Err(
+            "scorecard write-back: a Buck release-payload run must stay out of the builder-blind parent projections"
+                .into(),
+        );
+    }
     println!(
-        "  scorecard write-back: receipt-producing top-level run only; nested and off-the-record runs inert"
+        "  scorecard write-back: receipt-producing top-level Cargo run only; nested, off-the-record and Buck runs inert"
     );
     Ok(())
 }
@@ -23264,7 +23297,11 @@ fn run(
     // One original byte population feeds series, both retention contracts and
     // the final summary. Final authority checks never replace this snapshot.
     let raw_snapshot = validate_cell_results::CapturedResults::capture(&e2e_result_root);
-    let series_error = if nesting.nested || args.allow_local_off_the_record_run {
+    let series_error = if !should_write_scorecard(
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+        release_builder,
+    ) {
         None
     } else {
         match append_validate_series(
@@ -23499,7 +23536,7 @@ fn run(
             &ScorecardPublication {
                 parent: parent.as_deref(), tool_root: tool_root.as_deref(),
                 expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
-                delegated: scorecard_delegated,
+                delegated: scorecard_delegated, release_builder,
             },
         );
         drop(run_record);
@@ -23513,6 +23550,11 @@ fn run(
                 "completed cell results could not be added to the series: {error}"
             ));
         }
+        detail.extend(buck_projection_detail(
+            nesting.nested,
+            args.allow_local_off_the_record_run,
+            release_builder,
+        ));
         let mut s = RunSummary::new(
             Verdict::Interrupted,
             130,
@@ -23935,6 +23977,7 @@ fn run(
             parent: parent.as_deref(), tool_root: tool_root.as_deref(),
             expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
             delegated: scorecard_delegated,
+            release_builder,
         },
     );
 
@@ -24107,6 +24150,11 @@ fn run(
     if !nesting.nested && !args.allow_local_off_the_record_run {
         s.ledger = Some(ledger);
     }
+    s.detail.extend(buck_projection_detail(
+        nesting.nested,
+        args.allow_local_off_the_record_run,
+        release_builder,
+    ));
     record_scorecard_writeback(&mut s, scorecard_writeback);
     s
 }
@@ -25806,6 +25854,7 @@ mod refusal_detail_tests {
             expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             finalized_row: Some(&row),
             delegated: false,
+            release_builder: RELEASE_BUILDER_CARGO,
         };
 
         let error = local_scorecard_writeback(&root, &root, false, false, &publication)
@@ -25832,6 +25881,13 @@ mod refusal_detail_tests {
         // invoke the tool at all.
         assert!(local_scorecard_writeback(&root, &root, true, false, &publication).is_none());
         assert!(local_scorecard_writeback(&root, &root, false, true, &publication).is_none());
+
+        // Nor does a Buck run, even though the same tool would succeed for Cargo.
+        let buck = ScorecardPublication {
+            release_builder: RELEASE_BUILDER_BUCK,
+            ..publication
+        };
+        assert!(local_scorecard_writeback(&root, &root, false, false, &buck).is_none());
     }
 
     #[test]
@@ -26092,6 +26148,7 @@ with (root/'calls.jsonl').open('a') as out:
                 expected_head: HEAD,
                 finalized_row: Some(&row),
                 delegated: parent_owns_scorecard_writeback(owner, managed),
+                release_builder: RELEASE_BUILDER_CARGO,
             };
             assert_eq!(publication.delegated, delegated);
             let result = local_scorecard_writeback(root, root, false, false, &publication);
@@ -26120,6 +26177,7 @@ with (root/'calls.jsonl').open('a') as out:
             expected_head: HEAD,
             finalized_row: None,
             delegated: false,
+            release_builder: RELEASE_BUILDER_CARGO,
         };
         let error = local_scorecard_writeback(root, root, false, false, &publication)
             .unwrap()
