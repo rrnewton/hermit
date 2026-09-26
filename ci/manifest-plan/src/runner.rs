@@ -105,6 +105,8 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
+#[cfg(test)]
+use crate::timeouts::TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::TimeoutMultipliers;
 use crate::timeouts::resolve_test_timeouts;
 use crate::timeouts::resolve_timeout_seconds;
@@ -6465,6 +6467,7 @@ mod tests {
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
+                + TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),

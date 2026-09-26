@@ -224,13 +224,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.hermit_unit", 723),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
-    ("test.detcore_unit", 748),
+    // Seven virtual-timerfd controls retain all 748 prior identities.
+    ("test.detcore_unit", 755),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
-    ("test.hermit_integration", 160),
+    // PR 3229 adds signal_determinism's
+    // sigsuspend_with_armed_periodic_timerfd_reports_terminal_deadlock.
+    ("test.hermit_integration", 161),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
@@ -253,9 +256,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 748),
-    // The host variant selects the same two additional clock_determinism tests.
-    ("test.hermit_integration_on_host", 160),
+    ("test.detcore_unit_on_host", 755),
+    // The host variant selects the same two additional clock_determinism tests
+    // and the same signal_determinism test.
+    ("test.hermit_integration_on_host", 161),
     ("test.hermit_unit_on_host", 723),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),

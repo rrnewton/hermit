@@ -71,6 +71,16 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// The timerfd ptrace verify cell selected after timerfds moved onto the
+/// virtual clock: the new `backend-parity-c/timerfd-semantics`, which passed
+/// twenty consecutive first-attempt strict verify runs on the ptrace backend at
+/// the evidence SHA with `bitwise_parity: true`; the ordinary 22/57 bounds are
+/// unchanged. `backend-parity-c/timer-family-identity` stays unselected: its
+/// order now matches Linux, but 6 of 36 runs ended in a skid-overshoot
+/// infrastructure error, and its manifest entry records why.
+pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "9a60fca92a303ff6198b7e7539d6ed5dd3b7452c";
+pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T03:39:42Z";
+pub const TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1877,6 +1887,15 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(
+            TIMERFD_2026_09_25_EVIDENCE_SHA,
+            "9a60fca92a303ff6198b7e7539d6ed5dd3b7452c"
+        );
+        assert_eq!(
+            TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-26T03:39:42Z"
+        );
+        assert_eq!(TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 173);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()

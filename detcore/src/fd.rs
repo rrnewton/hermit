@@ -166,6 +166,17 @@ struct OpenFileDescription {
     /// after entering the guest can already carry a lock.
     #[serde(default)]
     flock_mode_known: bool,
+    /// Virtual timerfd state (FdType::Timerfd only). The host timerfd is a
+    /// never-armed poll vessel; all guest-visible semantics derive from this.
+    /// Shared with epoll interests through [`TimerFdLink`].
+    #[serde(default)]
+    timerfd: Option<Arc<Mutex<TimerFdState>>>,
+    /// Detcore shadow of epoll interests in virtual timerfds (FdType::Epoll
+    /// only), keyed like Linux's epitem: (target guest fd, target open file).
+    /// Host epoll cannot see virtual readiness, so waits merge this shadow
+    /// with host probe results.
+    #[serde(default)]
+    epoll_timerfds: std::collections::BTreeMap<(i32, OpenFileId), EpollTimerInterest>,
     /// Whether Detcore has EVER known this description's lock state.
     ///
     /// This separates two different unknowns that `flock_mode_known == false`
@@ -176,6 +187,142 @@ struct OpenFileDescription {
     /// wrong. Only the second is a reason to refuse `vfork`.
     #[serde(default)]
     flock_mode_ever_known: bool,
+}
+
+/// Link from an epoll interest to a virtual timerfd.
+///
+/// Linux removes an epoll interest when the watched file's last reference is
+/// closed, even if that reference lived in another process. `file` observes
+/// exactly that condition without ever keeping the file alive, and liveness is
+/// read with `Weak::strong_count`, never `upgrade`, so checking it cannot
+/// perturb the alias count that decides when an open file is released.
+#[derive(Debug, Clone)]
+pub(crate) struct TimerFdLink {
+    file: std::sync::Weak<Mutex<OpenFileDescription>>,
+    state: Arc<Mutex<TimerFdState>>,
+}
+
+impl Default for TimerFdLink {
+    /// A dead link. Deserialized epoll shadows carry these, and a dead link
+    /// is an interest Linux would already have removed.
+    fn default() -> Self {
+        Self {
+            file: std::sync::Weak::new(),
+            state: Arc::new(Mutex::new(TimerFdState::new(libc::CLOCK_MONOTONIC))),
+        }
+    }
+}
+
+impl TimerFdLink {
+    /// Whether any descriptor, in any process, still refers to the timerfd.
+    pub(crate) fn is_live(&self) -> bool {
+        self.file.strong_count() > 0
+    }
+
+    /// Snapshot of the timer state, or None once the timerfd was released.
+    pub(crate) fn state(&self) -> Option<TimerFdState> {
+        self.is_live()
+            .then(|| *self.state.lock().expect("timerfd state mutex poisoned"))
+    }
+}
+
+/// One epoll interest in a virtual timerfd, mirrored from epoll_ctl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EpollTimerInterest {
+    /// Guest-requested event mask (EPOLLIN etc).
+    pub events: u32,
+    /// Guest data.u64 echoed back on readiness.
+    pub data: u64,
+    /// EPOLLET: the timer arming generation whose single expiry edge this
+    /// interest already delivered. Linux raises one wakeup per arming (a
+    /// periodic timer is forwarded only by a read), so a new generation is
+    /// exactly a new edge.
+    pub edge_reported: Option<u64>,
+    /// EPOLLONESHOT: disabled by a delivered event until EPOLL_CTL_MOD.
+    pub oneshot_disarmed: bool,
+    /// The watched timerfd.
+    #[serde(skip)]
+    pub target: TimerFdLink,
+}
+
+/// Virtual timerfd state, in detcore's single logical-time domain.
+///
+/// Every guest clock (REALTIME, MONOTONIC, BOOTTIME) reads the same logical
+/// instant, because detcore's global time starts at the configured epoch and
+/// clock_gettime reports it unchanged for every clockid. An ABSTIME
+/// deadline in guest-clock nanoseconds is therefore already a logical
+/// instant and needs no conversion. clock_settime is not virtualized, so the
+/// guest cannot move one clock relative to another.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TimerFdState {
+    /// clockid passed to timerfd_create.
+    pub clockid: i32,
+    /// Next expiry instant, or None when disarmed.
+    pub deadline: Option<LogicalTime>,
+    /// Reload interval; zero means one-shot.
+    pub interval: LogicalTime,
+    /// Expirations already consumed by guest reads.
+    pub consumed: u64,
+    /// TFD_TIMER_CANCEL_ON_SET is in effect: Linux honors it only for an
+    /// ABSTIME CLOCK_REALTIME arming. Nothing can set the virtual realtime
+    /// clock, so cancellation is unreachable today.
+    pub cancel_on_set: bool,
+    /// Arming generation: bumped by every settime and every consuming read,
+    /// the two events after which Linux's hrtimer raises a fresh wakeup.
+    #[serde(default)]
+    pub generation: u64,
+}
+
+impl TimerFdState {
+    pub fn new(clockid: i32) -> Self {
+        Self {
+            clockid,
+            deadline: None,
+            interval: LogicalTime::ZERO,
+            consumed: 0,
+            cancel_on_set: false,
+            generation: 0,
+        }
+    }
+
+    /// Total expirations that have occurred by `now` (pure function).
+    pub fn expirations(&self, now: LogicalTime) -> u64 {
+        let Some(deadline) = self.deadline else {
+            return 0;
+        };
+        if now < deadline {
+            return 0;
+        }
+        if self.interval == LogicalTime::ZERO {
+            return 1;
+        }
+        1 + (now.as_nanos() - deadline.as_nanos()) / self.interval.as_nanos()
+    }
+
+    /// Expirations available to read/poll at `now`.
+    pub fn pending(&self, now: LogicalTime) -> u64 {
+        self.expirations(now).saturating_sub(self.consumed)
+    }
+
+    /// Next expiry instant strictly after `now`, for gettime reporting.
+    pub fn next_expiry(&self, now: LogicalTime) -> Option<LogicalTime> {
+        let deadline = self.deadline?;
+        if self.interval == LogicalTime::ZERO {
+            return (now < deadline).then_some(deadline);
+        }
+        if now < deadline {
+            return Some(deadline);
+        }
+        // Saturate like the rest of logical time: a guest-chosen deadline and
+        // interval near the top of the range must not overflow here.
+        let elapsed = now.as_nanos() - deadline.as_nanos();
+        let k = elapsed / self.interval.as_nanos() + 1;
+        Some(LogicalTime::from_nanos(
+            deadline
+                .as_nanos()
+                .saturating_add(k.saturating_mul(self.interval.as_nanos())),
+        ))
+    }
 }
 
 impl PartialEq for DetFd {
@@ -225,6 +372,8 @@ impl DetFd {
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
+                timerfd: None,
+                epoll_timerfds: Default::default(),
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -553,6 +702,83 @@ impl DetFd {
         self.description().socket_receive_timestamp
     }
 
+    /// Initialize virtual timerfd state on this open file description.
+    pub(crate) fn init_timerfd(&self, clockid: i32) {
+        self.description().timerfd = Some(Arc::new(Mutex::new(TimerFdState::new(clockid))));
+    }
+
+    /// Whether this fd is a managed virtual timerfd.
+    pub(crate) fn is_timerfd(&self) -> bool {
+        self.description().timerfd.is_some()
+    }
+
+    /// Snapshot of the virtual timerfd state, if this fd is a managed timerfd.
+    pub(crate) fn timerfd_state(&self) -> Option<TimerFdState> {
+        let state = self.description().timerfd.clone()?;
+        Some(*state.lock().expect("timerfd state mutex poisoned"))
+    }
+
+    /// Mutate the virtual timerfd state; returns None for non-timerfds.
+    pub(crate) fn with_timerfd_mut<R>(&self, f: impl FnOnce(&mut TimerFdState) -> R) -> Option<R> {
+        let state = self.description().timerfd.clone()?;
+        let mut state = state.lock().expect("timerfd state mutex poisoned");
+        Some(f(&mut state))
+    }
+
+    /// A link an epoll interest can hold without keeping this timerfd alive.
+    pub(crate) fn timerfd_link(&self) -> Option<TimerFdLink> {
+        let state = self.description().timerfd.clone()?;
+        Some(TimerFdLink {
+            file: Arc::downgrade(&self.open_file),
+            state,
+        })
+    }
+
+    /// Record/replace an epoll interest in a virtual timerfd (ADD/MOD).
+    pub(crate) fn epoll_timer_add(
+        &self,
+        fd: i32,
+        target: OpenFileId,
+        interest: EpollTimerInterest,
+    ) {
+        self.description()
+            .epoll_timerfds
+            .insert((fd, target), interest);
+    }
+
+    /// Drop an epoll interest in a virtual timerfd (DEL).
+    pub(crate) fn epoll_timer_remove(&self, fd: i32, target: OpenFileId) {
+        self.description().epoll_timerfds.remove(&(fd, target));
+    }
+
+    /// This epoll instance's live virtual timerfd interests, in key order.
+    /// Interests whose timerfd was released are dropped first, as Linux does
+    /// when the watched file's last reference closes.
+    pub(crate) fn epoll_timer_interests(&self) -> Vec<((i32, OpenFileId), EpollTimerInterest)> {
+        let mut description = self.description();
+        description
+            .epoll_timerfds
+            .retain(|_, interest| interest.target.is_live());
+        description
+            .epoll_timerfds
+            .iter()
+            .map(|(key, interest)| (*key, interest.clone()))
+            .collect()
+    }
+
+    /// Commit the consequence of delivering one timerfd event to the guest:
+    /// EPOLLET consumes this arming's edge, EPOLLONESHOT disables the interest.
+    pub(crate) fn epoll_timer_delivered(&self, key: (i32, OpenFileId), generation: u64) {
+        if let Some(interest) = self.description().epoll_timerfds.get_mut(&key) {
+            if interest.events & libc::EPOLLET as u32 != 0 {
+                interest.edge_reported = Some(generation);
+            }
+            if interest.events & libc::EPOLLONESHOT as u32 != 0 {
+                interest.oneshot_disarmed = true;
+            }
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1064)
     /// Mark this open file as a `NETLINK_SOCK_DIAG` socket. Shared across every
@@ -875,5 +1101,153 @@ mod tests {
         );
 
         assert_ne!(first.open_file_id(), second.open_file_id());
+    }
+
+    #[test]
+    fn timerfd_state_counts_periodic_expirations() {
+        let mut s = TimerFdState::new(libc::CLOCK_MONOTONIC);
+        assert_eq!(s.pending(LogicalTime::from_nanos(1000)), 0);
+        s.deadline = Some(LogicalTime::from_nanos(100));
+        s.interval = LogicalTime::from_nanos(50);
+        assert_eq!(s.expirations(LogicalTime::from_nanos(99)), 0);
+        assert_eq!(s.expirations(LogicalTime::from_nanos(100)), 1);
+        assert_eq!(s.expirations(LogicalTime::from_nanos(430)), 7);
+        s.consumed = 7;
+        assert_eq!(s.pending(LogicalTime::from_nanos(430)), 0);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(430)),
+            Some(LogicalTime::from_nanos(450))
+        );
+        // One-shot: exactly one expiration, no next expiry after it.
+        s.interval = LogicalTime::ZERO;
+        s.consumed = 0;
+        assert_eq!(s.expirations(LogicalTime::from_nanos(10_000)), 1);
+        assert_eq!(s.next_expiry(LogicalTime::from_nanos(10_000)), None);
+        // Disarmed: nothing.
+        s.deadline = None;
+        assert_eq!(s.expirations(LogicalTime::from_nanos(10_000)), 0);
+        // A deadline and interval at the top of the range saturate rather
+        // than overflow.
+        s.deadline = Some(LogicalTime::from_nanos(u64::MAX - 10));
+        s.interval = LogicalTime::from_nanos(u64::MAX / 2);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(u64::MAX - 5)),
+            Some(LogicalTime::from_nanos(u64::MAX))
+        );
+        s.deadline = Some(LogicalTime::from_nanos(1_000));
+        s.interval = LogicalTime::from_nanos(i64::MAX as u64);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(6_000_000)),
+            Some(LogicalTime::from_nanos(1_000 + i64::MAX as u64))
+        );
+    }
+
+    fn timer_interest(events: u32, target: TimerFdLink) -> EpollTimerInterest {
+        EpollTimerInterest {
+            events,
+            data: 7,
+            edge_reported: None,
+            oneshot_disarmed: false,
+            target,
+        }
+    }
+
+    /// Linux removes an epoll interest when the watched file's LAST reference
+    /// closes: closing one of two descriptors keeps it, closing both drops it.
+    #[test]
+    fn epoll_timer_interest_lives_exactly_as_long_as_the_timerfd_file() {
+        let owner = DetTid::from_raw(10);
+        let timer_id = OpenFileId::new(owner, 1);
+        let timer = DetFd::new(5, OFlag::empty(), FdType::Timerfd, timer_id);
+        timer.init_timerfd(libc::CLOCK_MONOTONIC);
+        let alias = timer.clone().with_fd(9);
+        let epoll = DetFd::new(6, OFlag::empty(), FdType::Epoll, OpenFileId::new(owner, 2));
+        let link = timer.timerfd_link().expect("a timerfd has a link");
+        epoll.epoll_timer_add(
+            5,
+            timer_id,
+            timer_interest(libc::EPOLLIN as u32, link.clone()),
+        );
+
+        drop(timer);
+        assert!(link.is_live(), "a dup keeps the timerfd file open");
+        assert_eq!(epoll.epoll_timer_interests().len(), 1);
+
+        drop(alias);
+        assert!(!link.is_live());
+        assert_eq!(link.state().map(|s| s.clockid), None);
+        assert!(
+            epoll.epoll_timer_interests().is_empty(),
+            "the interest dies with the last reference"
+        );
+    }
+
+    /// A non-timerfd has no link to give an epoll interest.
+    #[test]
+    fn only_a_virtual_timerfd_has_a_link() {
+        let fd = DetFd::new(
+            3,
+            OFlag::empty(),
+            FdType::Pipe,
+            OpenFileId::new(DetTid::from_raw(1), 0),
+        );
+        assert!(fd.timerfd_link().is_none());
+        assert!(fd.timerfd_state().is_none());
+    }
+
+    /// Delivery commits EPOLLET against the arming generation and disables an
+    /// EPOLLONESHOT interest; a level-triggered interest is left untouched.
+    #[test]
+    fn epoll_timer_delivery_consumes_edges_and_oneshots_only() {
+        let owner = DetTid::from_raw(10);
+        let timer_id = OpenFileId::new(owner, 1);
+        let timer = DetFd::new(5, OFlag::empty(), FdType::Timerfd, timer_id);
+        timer.init_timerfd(libc::CLOCK_MONOTONIC);
+        let link = timer.timerfd_link().unwrap();
+        let epoll = DetFd::new(6, OFlag::empty(), FdType::Epoll, OpenFileId::new(owner, 2));
+        let level = (5, timer_id);
+        let edge = (8, timer_id);
+        let oneshot = (11, timer_id);
+        let events = libc::EPOLLIN as u32;
+        epoll.epoll_timer_add(level.0, timer_id, timer_interest(events, link.clone()));
+        epoll.epoll_timer_add(
+            edge.0,
+            timer_id,
+            timer_interest(events | libc::EPOLLET as u32, link.clone()),
+        );
+        epoll.epoll_timer_add(
+            oneshot.0,
+            timer_id,
+            timer_interest(events | libc::EPOLLONESHOT as u32, link),
+        );
+        for key in [level, edge, oneshot] {
+            epoll.epoll_timer_delivered(key, 3);
+        }
+        let interests: std::collections::BTreeMap<_, _> =
+            epoll.epoll_timer_interests().into_iter().collect();
+        assert_eq!(interests[&level].edge_reported, None);
+        assert!(!interests[&level].oneshot_disarmed);
+        assert_eq!(interests[&edge].edge_reported, Some(3));
+        assert!(!interests[&edge].oneshot_disarmed);
+        assert!(interests[&oneshot].oneshot_disarmed);
+    }
+
+    /// Settime and a consuming read both bump the arming generation; the
+    /// shared state is visible through every alias and through the link.
+    #[test]
+    fn timerfd_generation_is_shared_by_aliases_and_links() {
+        let timer = DetFd::new(
+            5,
+            OFlag::empty(),
+            FdType::Timerfd,
+            OpenFileId::new(DetTid::from_raw(10), 1),
+        );
+        timer.init_timerfd(libc::CLOCK_REALTIME);
+        let alias = timer.clone().with_fd(9);
+        let link = timer.timerfd_link().unwrap();
+        timer.with_timerfd_mut(|s| s.generation += 1);
+        alias.with_timerfd_mut(|s| s.generation += 1);
+        assert_eq!(timer.timerfd_state().unwrap().generation, 2);
+        assert_eq!(link.state().unwrap().generation, 2);
     }
 }
