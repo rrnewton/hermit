@@ -208,9 +208,28 @@ static bool check_stable(const char *root, const char *label,
 
 static bool is_zero_kb_field(const char *name) {
   static const char *fields[] = {
-      "Rss",           "Pss",        "Pss_Dirty",    "Pss_Anon",
-      "Pss_File",      "Pss_Shmem",  "Shared_Clean", "Shared_Dirty",
-      "Private_Clean", "Referenced", "KSM",          "SwapPss",
+      "Rss",
+      "Pss",
+      "Pss_Dirty",
+      "Pss_Anon",
+      "Pss_File",
+      "Pss_Shmem",
+      "Shared_Clean",
+      "Shared_Dirty",
+      "Private_Clean",
+      "Private_Dirty",
+      "Referenced",
+      "Anonymous",
+      "KSM",
+      "LazyFree",
+      "AnonHugePages",
+      "ShmemPmdMapped",
+      "FilePmdMapped",
+      "Shared_Hugetlb",
+      "Private_Hugetlb",
+      "Swap",
+      "SwapPss",
+      "Locked",
   };
   for (size_t index = 0; index < sizeof(fields) / sizeof(fields[0]); ++index) {
     if (strcmp(name, fields[index]) == 0) {
@@ -229,6 +248,7 @@ static bool check_smaps(const char *root) {
   }
   size_t mappings = 0;
   size_t normalized = 0;
+  bool saw_private_dirty = false;
   char *save = NULL;
   for (char *line = strtok_r(contents, "\n", &save); line != NULL;
        line = strtok_r(NULL, "\n", &save)) {
@@ -248,11 +268,16 @@ static bool check_smaps(const char *root) {
         return failf("self-smaps left %s unnormalized", name);
       }
       ++normalized;
+      saw_private_dirty |= strcmp(name, "Private_Dirty") == 0;
     }
   }
   free(contents);
-  return (mappings != 0 && normalized != 0) ||
-         failf("self-smaps contained no mapping/accounting evidence");
+  if (mappings == 0 || normalized == 0) {
+    return failf("self-smaps contained no mapping/accounting evidence");
+  }
+  // The field that leaked page-cache writeback state; its absence would let
+  // the check above pass without observing it.
+  return saw_private_dirty || failf("self-smaps omitted Private_Dirty");
 }
 
 static bool check_statm(const char *root) {
