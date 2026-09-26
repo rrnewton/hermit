@@ -194,8 +194,13 @@ pub struct CacheKey<'a> {
 }
 
 /// Builder that produced the E2E payload a row executed; absent means Cargo.
+/// A present value that is not a string names no builder, so it matches
+/// neither `cargo` nor `buck`.
 fn row_release_builder(row: &serde_json::Value) -> &str {
-    row.get("release_builder").and_then(|v| v.as_str()).unwrap_or("cargo")
+    match row.get("release_builder") {
+        None => "cargo",
+        Some(v) => v.as_str().unwrap_or("<not a string>"),
+    }
 }
 
 /// The gate-coverage half of the predicate, shared by both producers.
@@ -542,7 +547,7 @@ pub fn history_estimate(
 /// (`resolve_selective_baseline`, validate.sh:4364).
 ///
 /// Precedence: explicit `--baseline`, then `$HERMIT_LAST_GREEN_SHA`, then the
-/// most recent passing ledger row (preferring this slot). Only a commit that
+/// most recent passing Cargo ledger row (preferring this slot). Only a commit that
 /// EXISTS locally is returned; anything else yields `None` so selection fails
 /// safe to the full lane. Never fail-open on a stale or missing baseline.
 pub fn selective_baseline(
@@ -563,7 +568,10 @@ pub fn selective_baseline(
             rows.iter()
                 .rev()
                 .find(|r| {
+                    // A Buck green ran the release payload without debug
+                    // invariants, so it is not a last-known-green for Cargo.
                     s(r, "result") == "pass"
+                        && row_release_builder(r) == "cargo"
                         && s(r, "commit") != "unknown"
                         && !s(r, "commit").is_empty()
                         && want_slot.map(|w| s(r, "slot") == w).unwrap_or(true)
@@ -632,6 +640,7 @@ pub fn self_test() -> Result<String, String> {
         // A Buck run executed the release payload, without debug assertions or
         // overflow checks: it is not the run a Cargo request asks for.
         ("Buck release payload", base(serde_json::json!({"release_builder": "buck", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("non-string release builder", base(serde_json::json!({"release_builder": null, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("selective run", base(serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("not commit-anchored", base(serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("dirty tree", base(serde_json::json!({"tree_dirty": true, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
@@ -874,11 +883,22 @@ pub fn self_test() -> Result<String, String> {
     if selective_baseline(&ledger_rows, Some("cafe"), "mine", &exists_none).is_some() {
         return Err("selective: a baseline absent from this checkout must be REFUSED".into());
     }
-    refused += 1;
-    accepted += 2;
+    let mut with_buck = ledger_rows.clone();
+    with_buck.push(base(serde_json::json!({"slot": "mine", "commit": "ccc", "producer": "validate.rs", "release_builder": "buck"})));
+    with_buck.push(base(serde_json::json!({"slot": "mine", "commit": "ddd", "producer": "validate.rs", "release_builder": 7})));
+    if selective_baseline(&with_buck, None, "mine", &exists_all).as_deref() != Some("bbb") {
+        return Err("selective: a newer Buck or non-string-builder green must not become the Cargo baseline".into());
+    }
+    let mut named_cargo = ledger_rows.clone();
+    named_cargo.push(base(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo"})));
+    if selective_baseline(&named_cargo, None, "mine", &exists_all).as_deref() != Some("eee") {
+        return Err("selective: an explicitly Cargo green must remain a baseline".into());
+    }
+    refused += 2;
+    accepted += 3;
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
          cross-producer counter traps), estimate bracketed thin/median/no-ledger/fail-poison, \
-         selective baseline bracketed slot-preference/explicit/missing-commit"
+         selective baseline bracketed slot-preference/explicit/missing-commit/builder"
     ))
 }
