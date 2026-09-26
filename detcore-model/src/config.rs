@@ -1361,7 +1361,7 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 ///
 /// # What it measures
 ///
-/// Two encodings of `Config::default()` and the source definitions for the
+/// Two encodings of the default `Config` and the source definitions for the
 /// configuration and clock RPC fields are fingerprinted with separate domains:
 ///
 /// - the exact legacy-bincode bytes used by Reverie RPC, which detect changes
@@ -1377,13 +1377,47 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 /// strictly requires. A documentation-only edit in one of these files can
 /// require rebuilding the plugin; missing a wire-incompatible hidden variant
 /// can make it decode the handshake or a subsequent request at the wrong offsets.
+///
+/// # What it must NOT measure
+///
+/// The process environment. `Config::default()` parses an empty command line,
+/// and clap then fills every `env = "..."` argument (`HERMIT_EPOCH`,
+/// `HERMIT_PRNG`, `HERMIT_SCHED_SEED`) from the environment. The coordinator
+/// computes this value in the `hermit` process, but the plugin computes it
+/// inside the guest, whose environment Hermit rebuilds (`--base-env=minimal`
+/// drops those variables). Fingerprinting an environment-derived default made
+/// the two sides disagree whenever the host set any of them -- for example
+/// `HERMIT_EPOCH=<now>`, which the e2e runner passes to every cell -- and the
+/// plugin then refused a matched build and aborted the guest before its first
+/// Detcore request. The real values still reach the plugin: the coordinator
+/// sends its resolved `Config` in the RPC handshake. See
+/// [`wire_fingerprint_config`].
 pub fn config_wire_fingerprint() -> String {
-    let config = Config::default();
+    let config = wire_fingerprint_config();
     let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
         .expect("Config::default() must encode with the Reverie RPC bincode configuration");
     let named_shape = serde_json::to_string(&config)
         .expect("Config::default() must encode as JSON for field-name checking");
     fingerprint_of_config_material(&wire, &named_shape, CONFIG_DEFINITION_SOURCES)
+}
+
+/// The default `Config` with every environment-variable fallback disabled.
+///
+/// This is a pure function of the build's `Config` definition, so the
+/// coordinator and a plugin built from the same source compute the same value
+/// regardless of the environment each one runs in. Disabling the fallback on
+/// every argument, rather than naming today's three variables, keeps a future
+/// `env = "..."` field from reintroducing the same split.
+fn wire_fingerprint_config() -> Config {
+    use clap::CommandFactory;
+    use clap::FromArgMatches;
+
+    let matches = Config::command()
+        .mut_args(|arg| arg.env(None::<&str>))
+        .try_get_matches_from(["detcore-config-fingerprint"])
+        .expect("an empty command line must parse with environment fallbacks disabled");
+    Config::from_arg_matches(&matches)
+        .expect("the environment-free default Config must be constructible")
 }
 
 /// Domain-separated FNV-1a over wire bytes, named JSON, and defining source.
@@ -1668,7 +1702,7 @@ mod tests {
 
     #[test]
     fn config_fingerprint_includes_clock_rpc_definitions() {
-        let config = Config::default();
+        let config = wire_fingerprint_config();
         let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
         let named_shape = serde_json::to_string(&config).unwrap();
         let current = config_wire_fingerprint();
@@ -1711,6 +1745,96 @@ mod tests {
         );
     }
 
+    /// The coordinator and the SaBRe plugin compute the fingerprint in
+    /// different environments: `hermit` sees the host's variables, the plugin
+    /// sees the guest's rebuilt one. Both must still agree for one build.
+    ///
+    /// Regression: `HERMIT_EPOCH=<now>` on the host (the e2e runner sets it for
+    /// every cell) changed only the coordinator's value, so the plugin refused
+    /// a matched build and every `verify/sabre` cell aborted before Detcore
+    /// engaged. The variables are set in a child process so no other test in
+    /// this binary observes them through `Config::default()`.
+    ///
+    /// The child is a separately named, ignored probe selected by exact name,
+    /// so no ambient variable can divert this test into printing and passing
+    /// without running the comparison.
+    #[test]
+    fn config_fingerprint_ignores_config_environment_variables() {
+        const ENV_VARS: [(&str, &str); 3] = [
+            ("HERMIT_EPOCH", "2026-09-26T02:17:28.559573693+00:00"),
+            ("HERMIT_PRNG", "71"),
+            ("HERMIT_SCHED_SEED", "7"),
+        ];
+
+        let child_fingerprint = |set: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                CONFIG_FINGERPRINT_PROBE,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            for (name, value) in ENV_VARS {
+                if set {
+                    command.env(name, value);
+                } else {
+                    command.env_remove(name);
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let fingerprints: Vec<_> = stdout
+                .lines()
+                // libtest prints `test <name> ... ` before the captured-free
+                // output on the same line, so search rather than strip.
+                .filter_map(|line| line.split_once(CONFIG_FINGERPRINT_MARKER))
+                .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("").to_owned())
+                .collect();
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "the child must run exactly the probe: {stdout}"
+            );
+            assert_eq!(
+                fingerprints.len(),
+                1,
+                "the probe must report exactly one fingerprint: {stdout}"
+            );
+            fingerprints.into_iter().next().unwrap()
+        };
+
+        let without = child_fingerprint(false);
+        let with = child_fingerprint(true);
+        assert_eq!(
+            with, without,
+            "HERMIT_EPOCH/HERMIT_PRNG/HERMIT_SCHED_SEED must not change the config wire fingerprint"
+        );
+        // The unset child is also the value this process must publish.
+        assert_eq!(without, config_wire_fingerprint());
+
+        // The fingerprinted value is the environment-free definition default.
+        let config = wire_fingerprint_config();
+        assert_eq!(
+            config.epoch,
+            DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(config.seed, 0);
+        assert_eq!(config.sched_seed, None);
+    }
+
+    const CONFIG_FINGERPRINT_PROBE: &str = "config::tests::config_fingerprint_env_probe";
+    const CONFIG_FINGERPRINT_MARKER: &str = "config-fingerprint=";
+
+    /// Child half of `config_fingerprint_ignores_config_environment_variables`:
+    /// reports the fingerprint under whatever environment the parent chose.
+    /// It asserts nothing itself, so it only runs when selected explicitly.
+    #[test]
+    #[ignore = "child probe; run by config_fingerprint_ignores_config_environment_variables"]
+    fn config_fingerprint_env_probe() {
+        println!("{CONFIG_FINGERPRINT_MARKER}{}", config_wire_fingerprint());
+    }
+
     #[test]
     fn config_fingerprint_is_stable_and_shape_sensitive() {
         // STABLE: a build must agree with itself, or the guard would reject a
@@ -1718,7 +1842,7 @@ mod tests {
         assert_eq!(config_wire_fingerprint(), config_wire_fingerprint());
         assert_eq!(config_wire_fingerprint().len(), 16);
 
-        let config = Config::default();
+        let config = wire_fingerprint_config();
         let base = serde_json::to_string(&config).unwrap();
         let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
         assert_eq!(

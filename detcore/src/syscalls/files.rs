@@ -1232,6 +1232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
+        let virtual_boot_time_seconds = self.virtual_boot_time_seconds()?;
         // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
         let virtual_memory_kb = guest.config().memory / 1024;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
@@ -1483,6 +1484,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     mountinfo: mountinfo.clone(),
                     virtual_uptime_seconds,
                     virtual_realtime_seconds,
+                    virtual_boot_time_seconds,
                     virtual_memory_kb,
                     virtual_pid,
                     virtual_ppid,
