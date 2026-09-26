@@ -4624,65 +4624,6 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
     Ok(ledger)
 }
 
-/// `GIT_*` environment variables that cannot make Git's repository discovery
-/// depend on the directory it starts from. Configuration given through the
-/// environment applies alike from every directory, and Git resolves its
-/// relative paths against the repository. `GIT_CEILING_DIRECTORIES` is safe
-/// because of the argument in [`discovery_passes_through`]. Any other `GIT_*`
-/// variable -- `GIT_DIR`, `GIT_WORK_TREE` or `GIT_CONFIG_GLOBAL` with a relative
-/// path, say -- makes the caller run the separate commands.
-fn directory_independent_git_variable(name: &[u8]) -> bool {
-    const NAMES: [&str; 15] = [
-        "GIT_ALLOW_PROTOCOL",
-        "GIT_ASKPASS",
-        "GIT_AUTHOR_DATE",
-        "GIT_AUTHOR_EMAIL",
-        "GIT_AUTHOR_NAME",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_COMMITTER_DATE",
-        "GIT_COMMITTER_EMAIL",
-        "GIT_COMMITTER_NAME",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_EDITOR",
-        "GIT_PAGER",
-        "GIT_SSH_COMMAND",
-        "GIT_TERMINAL_PROMPT",
-    ];
-    let indexed = |prefix: &[u8]| {
-        name.strip_prefix(prefix)
-            .is_some_and(|index| !index.is_empty() && index.iter().all(u8::is_ascii_digit))
-    };
-    NAMES.iter().any(|allowed| allowed.as_bytes() == name)
-        || indexed(b"GIT_CONFIG_KEY_")
-        || indexed(b"GIT_CONFIG_VALUE_")
-}
-
-/// True when Git's repository discovery from `start` necessarily finds the
-/// repository that discovery from `top`, an ancestor of `start` or `start`
-/// itself, finds. Discovery examines each level from its starting directory
-/// upward and stops at the first level holding a `.git` entry or a `HEAD`
-/// that makes the level itself a repository. When no level from `start` up to
-/// but excluding `top` holds either, a discovery from `start` that succeeded
-/// found its repository at `top` or above, and so passed every level that a
-/// discovery from `top` examines, in the same order and under the same
-/// environment. The filesystem-boundary and ceiling rules agree as well:
-/// having walked from `start` to `top`, the first walk crossed no boundary it
-/// would have stopped at and met no ceiling at or below `top`, so both walks
-/// compare later levels with the same device and the same ceilings.
-fn discovery_passes_through(start: &Path, top: &Path) -> bool {
-    start.starts_with(top)
-        && start
-            .ancestors()
-            .take_while(|level| *level != top)
-            .all(|level| {
-                [".git", "HEAD"].iter().all(|marker| {
-                    fs::symlink_metadata(level.join(marker))
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                })
-            })
-}
-
 /// The program run for Git. Tests may substitute a stand-in per invocation
 /// through [`git_output`]; production always runs `git` from `PATH`.
 fn git_program() -> std::ffi::OsString {
@@ -4710,6 +4651,12 @@ fn git_output(command: &mut Command) -> std::io::Result<std::process::Output> {
             replacement.args(&arguments);
             if let Some(directory) = command.get_current_dir() {
                 replacement.current_dir(directory);
+            }
+            for (name, value) in command.get_envs() {
+                match value {
+                    Some(value) => replacement.env(name, value),
+                    None => replacement.env_remove(name),
+                };
             }
             return replacement.output();
         }
@@ -5514,8 +5461,23 @@ fn update_tracked(
 fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
     // The single walk is only a shortcut: any failure of it -- to start, to
     // succeed or to parse -- runs the two original counting commands, whose
-    // result or refusal is then the one reported.
+    // result or refusal is then the one reported. The walk cannot fetch, so a
+    // failed walk leaves nothing behind and the counting commands are exactly
+    // the first attempt the original code makes.
     repo_depth_from_parents(root, revision).or_else(|| repo_depth_from_counts(root, revision))
+}
+
+/// The speculative walk. `GIT_NO_LAZY_FETCH=1`, set on this process only,
+/// stops a partial clone from fetching a missing object from its promisor
+/// remote; the walk then fails and the counting commands, which inherit the
+/// caller's environment unchanged, make the original attempt, fetch included.
+fn parent_walk_command(root: &Path, revision: &str) -> Command {
+    let mut command = Command::new(git_program());
+    command
+        .args(["--no-replace-objects", "rev-list", "--parents", revision])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .current_dir(root);
+    command
 }
 
 /// Both depths from one `rev-list --parents` walk: every listed commit counts
@@ -5525,12 +5487,7 @@ fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
 /// the command cannot start, fails, or prints output that this parser does not
 /// fully understand; the caller then runs the two original counting commands.
 fn repo_depth_from_parents(root: &Path, revision: &str) -> Option<SourceDepth> {
-    let out = git_output(
-        Command::new(git_program())
-            .args(["--no-replace-objects", "rev-list", "--parents", revision])
-            .current_dir(root),
-    )
-    .ok()?;
+    let out = git_output(&mut parent_walk_command(root, revision)).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -11551,54 +11508,32 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
         ));
     }
 
-    // The combined command reads HEAD through the repository discovered from
-    // the series root, while the original separate command reads it from the
-    // reported top level. The two name the same repository -- and so the same
-    // HEAD -- when no environment variable can make discovery depend on its
-    // starting directory and discovery from the series root passed through the
-    // top level. Otherwise the separate commands run.
-    let directory_independent = env::vars_os().all(|(name, _)| {
-        let name = name.as_encoded_bytes();
-        !name.starts_with(b"GIT_") || directory_independent_git_variable(name)
-    });
-    let combined = directory_independent
-        .then(|| series_repository_and_head(&canonical))
-        .flatten()
-        .and_then(|(top, commit)| {
-            let repository = fs::canonicalize(&top).ok()?;
-            discovery_passes_through(&canonical, &repository).then_some((repository, commit))
-        });
-    let repository = match &combined {
-        Some((repository, _)) => repository.clone(),
-        None => {
-            let top = Command::new("git")
-                .args(["--no-replace-objects", "rev-parse", "--show-toplevel"])
-                .current_dir(&canonical)
-                .output()
-                .map_err(|e| {
-                    format!(
-                        "cannot locate Git repository for {}: {e}",
-                        canonical.display()
-                    )
-                })?;
-            if !top.status.success() {
-                return Err(format!(
-                    "series root {} is not inside a Git repository; a projection without a source commit is refused",
-                    canonical.display()
-                ));
-            }
-            let repository_text = std::str::from_utf8(&top.stdout)
-                .map_err(|e| format!("Git repository path is not UTF-8: {e}"))?
-                .trim();
-            fs::canonicalize(repository_text).map_err(|e| {
-                format!(
-                    "cannot resolve Git repository {} for series root {}: {e}",
-                    repository_text,
-                    canonical.display()
-                )
-            })?
-        }
-    };
+    let top = Command::new("git")
+        .args(["--no-replace-objects", "rev-parse", "--show-toplevel"])
+        .current_dir(&canonical)
+        .output()
+        .map_err(|e| {
+            format!(
+                "cannot locate Git repository for {}: {e}",
+                canonical.display()
+            )
+        })?;
+    if !top.status.success() {
+        return Err(format!(
+            "series root {} is not inside a Git repository; a projection without a source commit is refused",
+            canonical.display()
+        ));
+    }
+    let repository_text = std::str::from_utf8(&top.stdout)
+        .map_err(|e| format!("Git repository path is not UTF-8: {e}"))?
+        .trim();
+    let repository = fs::canonicalize(repository_text).map_err(|e| {
+        format!(
+            "cannot resolve Git repository {} for series root {}: {e}",
+            repository_text,
+            canonical.display()
+        )
+    })?;
     let relative_root = canonical.strip_prefix(&repository).map_err(|_| {
         format!(
             "series root {} is outside its reported Git repository {}",
@@ -11619,10 +11554,7 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
             })?
             .to_string()
     };
-    let source_commit = match combined {
-        Some((_, commit)) => commit,
-        None => git_no_replace_rev_parse(&repository, "HEAD^{commit}")?,
-    };
+    let source_commit = git_no_replace_rev_parse(&repository, "HEAD^{commit}")?;
     if !is_object_id(&source_commit) {
         return Err(format!(
             "series source commit must be a lowercase 40-hex object id, got {source_commit:?}"
@@ -11778,29 +11710,6 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
 fn series_source_identity(series_root: &Path) -> Result<(String, String), String> {
     let snapshot = snapshot_series_source(series_root)?;
     Ok((snapshot.source_commit, snapshot.source_tree))
-}
-
-/// Resolve the repository top level and its HEAD commit in one Git process.
-/// Returns `None` for any failure or output other than exactly the two lines
-/// `<top level>` and a 40-hex commit; the caller then runs the original
-/// separate commands, whose refusals remain the ones reported.
-fn series_repository_and_head(canonical: &Path) -> Option<(String, String)> {
-    let output = Command::new("git")
-        .args([
-            "--no-replace-objects",
-            "rev-parse",
-            "--show-toplevel",
-            "HEAD^{commit}",
-        ])
-        .current_dir(canonical)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = std::str::from_utf8(&output.stdout).ok()?;
-    let (top, commit) = text.strip_suffix('\n')?.rsplit_once('\n')?;
-    is_object_id(commit).then(|| (top.trim().to_string(), commit.to_string()))
 }
 
 /// Parse the captured commit bytes into one canonical row per `event_id`.
@@ -28074,7 +27983,7 @@ mod git_read_batching_tests {
     }
 
     #[test]
-    fn combined_resolution_keeps_the_original_refusals() {
+    fn series_snapshots_keep_the_original_refusals() {
         let plain = tempfile::tempdir().unwrap();
         fs::create_dir(plain.path().join("series")).unwrap();
         let unborn = tempfile::tempdir().unwrap();
@@ -28091,15 +28000,12 @@ mod git_read_batching_tests {
             "git --no-replace-objects rev-parse HEAD^{commit} failed"
         );
         let dir = repository();
-        let canonical = fs::canonicalize(dir.path().join("series")).unwrap();
-        let (top, commit) = series_repository_and_head(&canonical).unwrap();
         assert_eq!(
-            fs::canonicalize(top).unwrap(),
-            fs::canonicalize(dir.path()).unwrap()
+            snapshot_series_source(&dir.path().join("series"))
+                .unwrap()
+                .source_commit,
+            git(dir.path(), &["rev-parse", "HEAD"])
         );
-        assert_eq!(commit, git(dir.path(), &["rev-parse", "HEAD"]));
-        assert_eq!(series_repository_and_head(plain.path()), None);
-        assert_eq!(series_repository_and_head(unborn.path()), None);
     }
 
     #[test]
@@ -28205,44 +28111,11 @@ mod git_read_batching_tests {
         }
     }
 
-    #[test]
-    fn only_directory_independent_git_variables_allow_the_combined_read() {
-        for accepted in [
-            "GIT_CEILING_DIRECTORIES",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_12",
-            "GIT_ALLOW_PROTOCOL",
-            "GIT_EDITOR",
-        ] {
-            assert!(
-                directory_independent_git_variable(accepted.as_bytes()),
-                "{accepted}"
-            );
-        }
-        for refused in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-            "GIT_CONFIG_GLOBAL",
-            "GIT_CONFIG_KEY_",
-            "GIT_CONFIG_KEY_x",
-            "GIT_CONFIG_VALUE_1a",
-            "GIT_OBJECT_DIRECTORY",
-        ] {
-            assert!(
-                !directory_independent_git_variable(refused.as_bytes()),
-                "{refused}"
-            );
-        }
-    }
-
     /// A gitdir below its configured worktree: discovery from the series root
     /// finds it, but discovery from the reported top level does not, so the
-    /// original separate HEAD read refuses and the combined read must too.
+    /// separate HEAD read from the top level refuses.
     #[test]
-    fn combined_resolution_refuses_a_worktree_configured_above_its_gitdir() {
+    fn a_worktree_configured_above_its_gitdir_is_refused() {
         let top = tempfile::tempdir().unwrap();
         let top_path = fs::canonicalize(top.path()).unwrap();
         let gitdir_level = top_path.join("sub");
@@ -28255,18 +28128,107 @@ mod git_read_batching_tests {
         );
         commit_all(&gitdir_level, "first");
         let series = gitdir_level.join("series");
-        let (reported, _) = series_repository_and_head(&series).unwrap();
+        let reported = git(&series, &["rev-parse", "--show-toplevel"]);
         assert_eq!(fs::canonicalize(reported).unwrap(), top_path);
-        assert!(!discovery_passes_through(&series, &top_path));
         assert_eq!(
             snapshot_series_source(&series).map(|_| ()),
             Err("git --no-replace-objects rev-parse HEAD^{commit} failed".to_string())
         );
-        let dir = repository();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        assert!(discovery_passes_through(&root.join("series"), &root));
-        assert!(discovery_passes_through(&root, &root));
-        assert!(!discovery_passes_through(&root, &root.join("series")));
+    }
+
+    /// Whether `object` is in `root`'s object store, asked without letting a
+    /// partial clone fetch it.
+    fn present(root: &Path, object: &str) -> bool {
+        Command::new("git")
+            .args(["cat-file", "-e", object])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    /// A promisor source, two `--filter=tree:0` clones of its `main`, and a
+    /// commit on `side` that neither clone has.
+    fn partial_clones() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--quiet", "--initial-branch=main"]);
+        commit_all(&source, "first");
+        commit_all(&source, "second");
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        git(
+            &source,
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        git(&source, &["checkout", "--quiet", "-b", "side"]);
+        let side = commit_all(&source, "side");
+        git(&source, &["checkout", "--quiet", "main"]);
+        let url = format!("file://{}", source.display());
+        let clones = ["counted", "walked"].map(|name| {
+            let clone = dir.path().join(name);
+            git(
+                dir.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--filter=tree:0",
+                    "--single-branch",
+                    "--branch",
+                    "main",
+                    &url,
+                    clone.to_str().unwrap(),
+                ],
+            );
+            assert_eq!(git(&clone, &["config", "remote.origin.promisor"]), "true");
+            assert!(
+                !present(&clone, &side),
+                "{name} already has the side commit"
+            );
+            clone
+        });
+        let [counted, walked] = clones;
+        (dir, counted, walked, side)
+    }
+
+    #[test]
+    fn only_the_parent_walk_is_denied_lazy_fetches() {
+        let command = parent_walk_command(Path::new("/"), "HEAD");
+        let environment: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            environment,
+            [(
+                std::ffi::OsStr::new("GIT_NO_LAZY_FETCH"),
+                Some(std::ffi::OsStr::new("1"))
+            )]
+        );
+    }
+
+    /// In a partial clone the walk must fail without fetching, and the
+    /// fallback must then be the original counting code's first attempt: it
+    /// fetches the missing commit, as the counting code does in a clone the
+    /// walk never touched, and reports the same depth.
+    #[test]
+    fn a_partial_clone_walk_never_fetches_and_the_fallback_fetches_like_the_counts() {
+        let (_dir, counted, walked, side) = partial_clones();
+        let expected = repo_depth_from_counts(&counted, &side);
+        assert_eq!(
+            expected,
+            Some(SourceDepth {
+                commits: 3,
+                first_parent: 3,
+            })
+        );
+        assert!(present(&counted, &side), "the counting walks fetch");
+
+        assert_eq!(repo_depth_from_parents(&walked, &side), None);
+        assert!(!present(&walked, &side), "the parent walk fetched");
+        assert_eq!(repo_depth_at(&walked, &side), expected);
+        assert!(present(&walked, &side), "the fallback did not fetch");
+        // Once the commit is local the walk itself answers.
+        assert_eq!(repo_depth_from_parents(&walked, &side), expected);
     }
 
     #[test]
