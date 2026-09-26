@@ -26116,7 +26116,25 @@ mod scorecard_cutover_tests {
                 cargo_reusable,
                 "{builder} green as a full-suite receipt"
             );
+            // The written builder and payload read back as that same builder.
+            let own_key = validate_history::CacheKey { release_builder: builder, ..key };
+            assert!(
+                validate_history::cache_lookup(std::slice::from_ref(&green), "pass", &own_key).is_some(),
+                "{builder} green against its own builder's cache key"
+            );
+            let mut spoiled = green.clone();
+            spoiled["e2e_payload"]["overflow_checks"] = serde_json::json!(release);
+            assert!(
+                validate_history::cache_lookup(std::slice::from_ref(&spoiled), "pass", &own_key).is_none(),
+                "{builder} green whose payload no longer matches its builder"
+            );
         }
+    }
+
+    #[test]
+    fn history_brackets_read_the_builder_and_payload_together() {
+        let summary = validate_history::self_test().unwrap();
+        assert!(summary.starts_with("history: cache bracketed"), "{summary}");
     }
 
     #[test]

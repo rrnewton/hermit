@@ -327,12 +327,16 @@ built with `-Cdebug-assertions=no -Coverflow-checks=no -Copt-level=3`. The
 ledger row records this as `release_builder` (`cargo` or `buck`) and
 `e2e_payload`, which gives the path, profile, and both check settings.
 
-`release_builder` is what separates the evidence. `e2e_payload` is a label,
-not a measurement of the binary: it is a constant per builder, and unit tests
-tie it to the checked-in sources that select the payload (the release flag
-list in `shim/BUCK`, no check-class setting in `hermit-cli/BUCK` or anywhere
-in the root `Cargo.toml`, no repository `.cargo/config`, and no `RUSTFLAGS`
-or `CARGO_PROFILE_` in the validate DAG). It cannot see `RUSTFLAGS`,
+Every consumer reads `release_builder` and `e2e_payload` together. A row
+names a builder only when both fields are present, the builder is `cargo` or
+`buck`, and `e2e_payload` equals exactly that builder's identity. A row with
+neither field predates both and is a Cargo run. Any other combination names no
+builder, so it counts as neither Cargo nor Buck evidence. `e2e_payload` is
+still a label, not a measurement of the binary: it is a constant per builder,
+and unit tests tie it to the checked-in sources that select the payload (the
+release flag list in `shim/BUCK`, no check-class setting in `hermit-cli/BUCK`
+or anywhere in the root `Cargo.toml`, no repository `.cargo/config`, and no
+`RUSTFLAGS` or `CARGO_PROFILE_` in the validate DAG). It cannot see `RUSTFLAGS`,
 `CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_DEV_*` set in the environment, or
 a Cargo config in an ancestor directory or `CARGO_HOME`.
 
@@ -348,7 +352,8 @@ A Buck row is supplemental evidence only:
   scorecard either. They remain in the run's ledger row and retained
   artifacts.
 - The parent reads the shared ledger through builder-aware consumers: the
-  qualifying-receipt predicate requires `release_builder` to be `cargo`;
+  qualifying-receipt predicate requires the row to read as `cargo` under that
+  same rule;
   failure obligations let a Buck red latch but never let Buck clean runs
   discharge one; the compatibility website excludes Buck rows under a named
   reason; timing baselines skip them. A parent without these would count a
