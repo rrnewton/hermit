@@ -311,8 +311,15 @@ row is supplemental evidence only:
 
 - It is never a cache hit for a Cargo request.
 - A Buck request is never answered from the cache.
-- It never makes a run eligible for the full-suite receipt label.
-- The parent's local-validation status does not count it as a full green.
+- Hermit's own receipt publication refuses it.
+- Its cells are not added to the parent's compatibility series or scorecard,
+  which record no builder. They remain in the run's ledger row and retained
+  artifacts.
+- The parent's local-validation status and label read the ledger through the
+  parent's qualifying-receipt predicate. That predicate must require
+  `release_builder` to be `cargo`; a parent without that clause would count a
+  Buck `full` row as a full green. The parent change therefore lands before
+  this one.
 
 A red Buck row on the same tree still blocks Cargo cache reuse, because a
 failure is a failure whichever builder produced the binary.
