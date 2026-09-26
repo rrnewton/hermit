@@ -1754,31 +1754,27 @@ mod tests {
     /// a matched build and every `verify/sabre` cell aborted before Detcore
     /// engaged. The variables are set in a child process so no other test in
     /// this binary observes them through `Config::default()`.
+    ///
+    /// The child is a separately named, ignored probe selected by exact name,
+    /// so no ambient variable can divert this test into printing and passing
+    /// without running the comparison.
     #[test]
     fn config_fingerprint_ignores_config_environment_variables() {
-        const CHILD: &str = "DETCORE_CONFIG_FINGERPRINT_ENV_TEST_CHILD";
         const ENV_VARS: [(&str, &str); 3] = [
             ("HERMIT_EPOCH", "2026-09-26T02:17:28.559573693+00:00"),
             ("HERMIT_PRNG", "71"),
             ("HERMIT_SCHED_SEED", "7"),
         ];
-        const MARKER: &str = "config-fingerprint=";
-
-        if std::env::var_os(CHILD).is_some() {
-            println!("{MARKER}{}", config_wire_fingerprint());
-            return;
-        }
 
         let child_fingerprint = |set: bool| {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "config::tests::config_fingerprint_ignores_config_environment_variables",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1");
+            command.args([
+                "--exact",
+                CONFIG_FINGERPRINT_PROBE,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
             for (name, value) in ENV_VARS {
                 if set {
                     command.env(name, value);
@@ -1793,13 +1789,17 @@ mod tests {
                 .lines()
                 // libtest prints `test <name> ... ` before the captured-free
                 // output on the same line, so search rather than strip.
-                .filter_map(|line| line.split_once(MARKER))
+                .filter_map(|line| line.split_once(CONFIG_FINGERPRINT_MARKER))
                 .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("").to_owned())
                 .collect();
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "the child must run exactly the probe: {stdout}"
+            );
             assert_eq!(
                 fingerprints.len(),
                 1,
-                "the child must run exactly this test and report one fingerprint: {stdout}"
+                "the probe must report exactly one fingerprint: {stdout}"
             );
             fingerprints.into_iter().next().unwrap()
         };
@@ -1821,6 +1821,18 @@ mod tests {
         );
         assert_eq!(config.seed, 0);
         assert_eq!(config.sched_seed, None);
+    }
+
+    const CONFIG_FINGERPRINT_PROBE: &str = "config::tests::config_fingerprint_env_probe";
+    const CONFIG_FINGERPRINT_MARKER: &str = "config-fingerprint=";
+
+    /// Child half of `config_fingerprint_ignores_config_environment_variables`:
+    /// reports the fingerprint under whatever environment the parent chose.
+    /// It asserts nothing itself, so it only runs when selected explicitly.
+    #[test]
+    #[ignore = "child probe; run by config_fingerprint_ignores_config_environment_variables"]
+    fn config_fingerprint_env_probe() {
+        println!("{CONFIG_FINGERPRINT_MARKER}{}", config_wire_fingerprint());
     }
 
     #[test]
