@@ -5007,7 +5007,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// read, is read in host order, or is not tracked). Then the guest's
     /// position is the kernel's, so the kernel's answer is Linux's. So it is
     /// for a stream rewound to 0, whose kernel position is the start. A
-    /// stream that has a snapshot decides between `EINVAL` and 0 itself. A
+    /// stream that has a snapshot decides between `EINVAL` and 0 itself. The
+    /// kernel position of a stream without a snapshot is moved to the start
+    /// first, and then to where the snapshot, if made, puts it. A descriptor
+    /// Detcore does not track that shares the open file, and had moved that
+    /// position, reads on from there, where on Linux the call moves nothing. A
     /// stream rewound and then seeked past 0 needs to know how many entries
     /// the directory has, so a snapshot is taken (see
     /// [`Self::snapshot_directory_privately`]). If the directory must be
@@ -5169,16 +5173,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (see [`Self::snapshot_directory`]), and return its entries in host
     /// order.
     ///
-    /// Linux writes nothing into guest memory but the records a call returns,
-    /// so the reads do not go to the guest's buffer, which may be too small
+    /// Linux writes into guest memory only the records a call returns and the
+    /// fields it stored of one it could not finish, so the reads do not go to
+    /// the guest's buffer, which may be too small
     /// for any entry, unreadable, or partly unmapped, nor to its stack. They
     /// go to an anonymous mapping injected for the purpose and unmapped
     /// before the guest runs again, as the atomic `writev` does for its
     /// iovecs. The mapping is fresh, so the reads leave nothing that the
     /// guest could see in memory. On the kvm backend, whose guest allocator
-    /// never hands out an address twice, it does move every later mapping's
-    /// address by its length: that follows from the guest's own calls, so it
-    /// is the same on every run, but Linux would reuse the range.
+    /// fills the lowest hole below a cursor first and moves the cursor past
+    /// each mapping it makes, the mapping moves that cursor, so a later
+    /// mapping that fits no hole below it lands elsewhere than on Linux. That
+    /// follows from the guest's own calls, so it is the same on every run.
     ///
     /// If a mapping of [`DIRECTORY_DRAIN_COUNT`] bytes cannot be made, one
     /// page is used, which still holds any entry. If that cannot be made
@@ -5492,14 +5498,16 @@ fn dirent_stores(
 /// are. A single store that crosses into another page, a field of a buffer
 /// not aligned to 8 bytes, the CPU writes whole or not at all, so its two
 /// parts are written one after the other and the first is put back if the
-/// second cannot be written. The part written first is the one whose bytes
-/// Detcore can read to put back: the part in the second page, unless only
-/// the part in the first page can be read. Where neither can be read, the
-/// part in the second page is written first, so that a write-only buffer
-/// ending at a page the guest cannot touch is left as Linux leaves it. Only
-/// a store from a page the guest can neither read nor write into a
-/// write-only page leaves bytes Linux does not write: up to 7, in the
-/// write-only page.
+/// second cannot be written. What is put back is read just before the first
+/// part is written, after every store before it, which may have changed those
+/// bytes through another mapping of the same memory. The part written first
+/// is the one whose bytes Detcore can read to put back: the part in the
+/// second page, unless only the part in the first page can be read. Where
+/// neither can be read, the part in the second page is written first, so that
+/// a write-only buffer ending at a page the guest cannot touch is left as
+/// Linux leaves it. While no other thread writes the buffer, only a store
+/// from a page the guest can neither read nor write into a write-only page
+/// leaves bytes Linux does not write: up to 7, in the write-only page.
 fn copy_records(
     memory: &mut impl MemoryAccess,
     buf: AddrMut<u8>,
@@ -5519,26 +5527,24 @@ fn copy_records(
     // in `owner`, its store.
     let mut pieces: Vec<(usize, &[u8])> = Vec::with_capacity(stores.len());
     let mut owner = Vec::with_capacity(stores.len());
-    // For each single store that crosses pages: the store, where its part
-    // written first is, and what the guest had there, if it can be read.
+    // For each single store that crosses pages: its part written first, as an
+    // index into `pieces`, and whether the guest can read that part's bytes.
     let mut crossing = Vec::new();
     for (index, store) in stores.iter().enumerate() {
         let mut split = guest_pages(buf.as_raw() + store.at, store.from.len());
         if store.single && split.len() > 1 {
-            let mut saved: Vec<Option<Vec<u8>>> = split
+            let mut readable: Vec<bool> = split
                 .iter()
                 .map(|&(at, len)| {
-                    let mut before = vec![0; len];
-                    let read =
-                        read_guest_prefix(memory, unsafe { buf.add(store.at + at) }, &mut before);
-                    (read == len).then_some(before)
+                    let mut bytes = vec![0; len];
+                    read_guest_prefix(memory, unsafe { buf.add(store.at + at) }, &mut bytes) == len
                 })
                 .collect();
-            if saved[1].is_some() || saved[0].is_none() {
+            if readable[1] || !readable[0] {
                 split.reverse();
-                saved.reverse();
+                readable.reverse();
             }
-            crossing.push((index, store.at + split[0].0, saved.swap_remove(0)));
+            crossing.push((pieces.len(), readable[0]));
         }
         for (at, len) in split {
             let from = store.from.start + at;
@@ -5546,20 +5552,44 @@ fn copy_records(
             owner.push(index);
         }
     }
-    let written = write_guest_pieces(memory, buf, &pieces);
-    let mut end = 0;
-    let Some(failed) = pieces.iter().position(|(_, bytes)| {
-        end += bytes.len();
-        end > written
-    }) else {
+    // Write the pieces in order, stopping before the first part of each
+    // crossing store to save what the guest has there. The stores before it
+    // can have changed those bytes through another mapping of the same memory,
+    // so they are read only once those stores are made.
+    let mut next = 0;
+    let mut saved: Option<(usize, Vec<u8>)> = None;
+    let mut failed = None;
+    for &(stop, readable) in crossing.iter().chain([(pieces.len(), false)].iter()) {
+        let segment = &pieces[next..stop];
+        let written = write_guest_pieces(memory, buf, segment);
+        let mut end = 0;
+        if let Some(at) = segment.iter().position(|(_, bytes)| {
+            end += bytes.len();
+            end > written
+        }) {
+            failed = Some(next + at);
+            break;
+        }
+        if stop == pieces.len() {
+            break;
+        }
+        let (at, bytes) = pieces[stop];
+        let mut before = vec![0; bytes.len()];
+        saved = (readable
+            && read_guest_prefix(memory, unsafe { buf.add(at) }, &mut before) == before.len())
+        .then_some((stop, before));
+        next = stop;
+    }
+    let Some(failed) = failed else {
         return (names.len(), Ok(records.len()));
     };
     let store = owner[failed];
     if failed > 0
         && owner[failed - 1] == store
-        && let Some((_, at, Some(before))) = crossing.iter().find(|&&(index, ..)| index == store)
+        && let Some((first, before)) = &saved
+        && *first == failed - 1
     {
-        write_guest_pieces(memory, buf, &[(*at, before.as_slice())]);
+        write_guest_pieces(memory, buf, &[(pieces[*first].0, before.as_slice())]);
     }
     // The entry whose `filldir` made the store, or all of them for the call's
     // last store, and the first store of that `filldir`.
@@ -6353,8 +6383,11 @@ mod test {
             expected.extend_from_slice(&records[4128..4136]);
             assert_eq!(&contents[start..start + 4136], &expected[..], "{format:?}");
             assert!(
-                contents[..start].iter().all(|&byte| byte == Pages::FILL),
-                "{format:?}: bytes before the buffer changed"
+                contents[..start]
+                    .iter()
+                    .chain(&contents[start + 4136..])
+                    .all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes outside what Linux writes changed"
             );
         }
     }
