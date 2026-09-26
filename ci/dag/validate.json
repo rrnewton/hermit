@@ -5586,6 +5586,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "kvm"
@@ -11008,6 +11015,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/socket-ioctl-timestamp",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -18988,6 +19002,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/socket-ioctl-timestamp",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-edge-cases",
           "mode": "verify",
           "backend": "ptrace"
         },

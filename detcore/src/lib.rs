@@ -1926,6 +1926,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             resource_request(guest, request).await;
         }
 
+        // Snapshot message-syscall iovecs before dispatch: a receive may
+        // overwrite its own `msghdr` with control data (msg_control aliasing
+        // the header), which would make the post-call extent computation in
+        // io_buffers read control bytes as pointers and fail a successful
+        // syscall with EFAULT. Gated on the same config as the post-call use.
+        // A snapshot read failure yields `None` and the legacy post-call
+        // computation runs, mirroring handle_recvmsg's precedent: in that
+        // case the syscall itself is already operating on an unreadable
+        // header and will surface its own error.
+        let pre_io_extents = if self.cfg.detlog_io_buffers && crate::detlog_observed!() {
+            io_buffers::capture_pre_call_msg_extents(&guest.memory(), &call)
+        } else {
+            None
+        };
+
         let res = match classify_syscall(call.number()) {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
@@ -2805,7 +2820,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, pre_io_extents.as_ref())?;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
