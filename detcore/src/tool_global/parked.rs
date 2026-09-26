@@ -156,9 +156,11 @@ where
     };
     // This is consuming notification, not an ordinary request that can be
     // replaced by ThreadExited/tail injection after irreversible removal.
-    let (_, response) = guest
-        .send_rpc((state.thread_logical_time.clone(), state.mm_id, request))
-        .await;
+    let (_, response) = super::send_global(
+        guest,
+        (state.thread_logical_time.clone(), state.mm_id, request),
+    )
+    .await;
     match response {
         GlobalResponse::SignalDequeued {
             ack: Ok(DequeueAck::Applied { sequence } | DequeueAck::Retired { sequence }),
@@ -174,13 +176,15 @@ where
     T: RecordOrReplay,
 {
     let state = guest.thread_state();
-    let _ = guest
-        .send_rpc((
+    let _ = super::send_global(
+        guest,
+        (
             state.thread_logical_time.clone(),
             state.mm_id,
             GlobalRequest::ParkedProtocolFailure(failure),
-        ))
-        .await;
+        ),
+    )
+    .await;
     if let Some(context) = guest.parked_signal_failure_context() {
         let _ = guest.cancel_parked_signal(context).await;
     }

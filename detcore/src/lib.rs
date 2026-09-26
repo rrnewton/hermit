@@ -271,6 +271,7 @@ use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::syscalls::time::guest_clock_time;
+use crate::tool_global::flush_records;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -746,6 +747,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.regs().await.display(),
             );
         }
+        Self::flush_records(guest).await;
+    }
+
+    /// Send the coordinator the records this handler emitted; see
+    /// [`tool_global::flush_records`].
+    async fn flush_records<G: Guest<Self>>(guest: &mut G) {
+        let time = guest.thread_state().thread_logical_time.clone();
+        let mm = guest.thread_state().mm_id;
+        flush_records(guest, time, mm).await;
     }
 
     /// End this logical timeslice and talk to the scheduler before continuing.
@@ -1522,6 +1532,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     pedigree: child_pedigree.clone(),
                     initialized_random_auxv: None,
+                    initial_random_records: Vec::new(),
                     stats: ThreadStats::new(),
                     file_metadata: {
                         debug!(
@@ -1708,9 +1719,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // ^ precise_branch=true: There should have been ZERO prior instructions before this,
         // because the thread hasn't done anything yet.
 
-        self.record_or_replay
+        let started = self
+            .record_or_replay
             .handle_thread_start(&mut guest.into_guest())
-            .await?;
+            .await;
+        if started.is_err() {
+            // This handler ends here, without the post hook's flush.
+            Self::flush_records(guest).await;
+        }
+        started?;
 
         self.post_handler_hook(guest).await;
         Ok(())
@@ -1732,28 +1749,44 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .thread_state_mut()
             .complete_initial_random_auxv(auxv.at_random().map(|p| p.as_raw()))
             .expect("authenticated initial random handoff no longer matches this image");
-        // The successful early write already emitted the ordinary auxv INFO
-        // record. Consume only its fact here: no second draw, write or event.
-        if !initialized && let Some(ptr) = auxv.at_random() {
+        if let Some(records) = initialized {
+            // The early write and requests already drew and wrote. Emit the
+            // records they deferred here, where the ordinary auxv record is
+            // emitted: no second draw or write.
+            let dettid = guest.thread_state().dettid;
+            for record in &records {
+                random::emit_deferred(record, dettid);
+            }
+        } else if let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
             let memory = guest.memory();
             let dettid = guest.thread_state().dettid;
             let ptr = unsafe { ptr.into_mut() };
-            random::initialize_auxv(
+            let initialized = random::initialize_auxv(
                 guest.thread_state_mut().thread_prng(),
                 memory,
                 ptr.cast(),
                 dettid,
-            )?;
+            );
+            if initialized.is_err() {
+                // This handler ends here, without the post hook's flush.
+                Self::flush_records(guest).await;
+            }
+            initialized?;
         }
 
         // Successful exec never returns through handle_syscall_event, so the
         // nested recorder/replayer needs this callback to commit or retire its
         // pending exec state before the replacement image issues another exec.
-        self.record_or_replay
+        let committed = self
+            .record_or_replay
             .handle_post_exec(&mut guest.into_guest())
-            .await?;
+            .await;
+        if committed.is_err() {
+            Self::flush_records(guest).await;
+        }
+        committed?;
 
         self.post_handler_hook(guest).await;
         Ok(())
@@ -2796,16 +2829,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .observe_brk(brk as u64);
         }
 
-        self.detlog_memory_maps(guest)?;
-        // Same control point again, for the bytes this syscall moved through a guest buffer.
-        // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
-        // arguments, so it does not matter whether the buffer lives on the stack, in the brk
-        // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
-        // can see. Only successful calls moved anything.
-        if let Ok(ret) = &res
-            && self.cfg.detlog_io_buffers
-        {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+        let logged = self.detlog_memory_maps(guest).and_then(|()| {
+            // Same control point again, for the bytes this syscall moved through a guest buffer.
+            // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
+            // arguments, so it does not matter whether the buffer lives on the stack, in the brk
+            // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
+            // can see. Only successful calls moved anything.
+            match &res {
+                Ok(ret) if self.cfg.detlog_io_buffers => {
+                    io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)
+                }
+                _ => Ok(()),
+            }
+        });
+        if let Err(error) = logged {
+            // This handler ends here, without the post hook's flush.
+            Self::flush_records(guest).await;
+            return Err(error);
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
@@ -2827,6 +2867,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // deterministic values before returning to the guest.
         if !self.cfg.syscall_clobbers_virtualized_by_backend {
             self.canonicalize_syscall_clobbers(guest).await;
+            // It may log after the hook's flush.
+            Self::flush_records(guest).await;
         }
 
         res
@@ -2935,6 +2977,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
         }
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
+        let exit_time = thread_state.thread_logical_time.clone();
         deregister_thread(
             thread_state.thread_logical_time.clone(),
             &self.cfg,
@@ -2951,15 +2994,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         )
         .await;
 
-        self.record_or_replay
+        let exited = self
+            .record_or_replay
             .on_exit_thread(
                 tid,
                 global_state,
                 thread_state.record_or_replay,
                 exit_status,
             )
-            .await?;
-
+            .await;
+        // No handler runs for this thread again. With threads sequentialized,
+        // deregister_thread's request already sent everything logged before it
+        // within the thread's turn, so this sends only what the exit hook above
+        // logged. Without sequentialization there is no such request, and this
+        // is the only send for the thread's last records.
+        flush_records(global_state, exit_time, mm_id).await;
+        exited?;
         Ok(())
     }
 }

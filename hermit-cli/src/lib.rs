@@ -1363,6 +1363,54 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW: Review SaBRe Detcore record forwarding into the run log.
+/// The most verbose level at which the run logs the `detcore` target, which
+/// the SaBRe guest's local tool captures and forwards. The coordinator filters
+/// what it receives again by each record's own target, so this only bounds
+/// what is sent; a more verbose directive for a `detcore::` submodule alone is
+/// not forwarded beyond this level.
+fn sabre_forwarded_level() -> Option<detcore::detlog::ForwardedLevel> {
+    use detcore::detlog::ForwardedLevel;
+    if tracing::enabled!(target: "detcore", tracing::Level::TRACE) {
+        Some(ForwardedLevel::Trace)
+    } else if tracing::enabled!(target: "detcore", tracing::Level::DEBUG) {
+        Some(ForwardedLevel::Debug)
+    } else if tracing::enabled!(target: "detcore", tracing::Level::INFO) {
+        Some(ForwardedLevel::Info)
+    } else if tracing::enabled!(target: "detcore", tracing::Level::WARN) {
+        Some(ForwardedLevel::Warn)
+    } else if tracing::enabled!(target: "detcore", tracing::Level::ERROR) {
+        Some(ForwardedLevel::Error)
+    } else {
+        None
+    }
+}
+
+/// Log a record the SaBRe guest's local tool captured as the ptrace backend's
+/// in-coordinator local tool would have logged it: same level and target,
+/// through the run's own subscriber, formatter and per-target filter.
+fn log_forwarded_record(record: &detcore::detlog::ForwardedRecord) {
+    use detcore::detlog::ForwardedLevel;
+    use tracing_log::log::Level;
+    let level = match record.level {
+        ForwardedLevel::Error => Level::Error,
+        ForwardedLevel::Warn => Level::Warn,
+        ForwardedLevel::Info => Level::Info,
+        ForwardedLevel::Debug => Level::Debug,
+        ForwardedLevel::Trace => Level::Trace,
+    };
+    // tracing-log checks the run's filter against the original target and
+    // emits an event that the formatter reports under that target.
+    let _ = tracing_log::format_trace(
+        &tracing_log::log::Record::builder()
+            .level(level)
+            .target(&record.target)
+            .args(format_args!("{}", record.fields))
+            .build(),
+    );
+}
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
 struct StagedSabreProgram {
@@ -1623,8 +1671,11 @@ async fn run_sabre(
     );
     command.env_remove(SABRE_PATH_EVIDENCE_ENV);
     command.env_remove(SABRE_DETLOG_FORWARD_ENV);
-    if tracing::enabled!(target: "detcore", tracing::Level::INFO) {
-        command.env(SABRE_DETLOG_FORWARD_ENV, "1");
+    if let Some(level) = sabre_forwarded_level() {
+        // Only the first sink installed in this process is kept, and every
+        // SaBRe launch installs this one.
+        let _ = detcore::detlog::set_record_sink(log_forwarded_record);
+        command.env(SABRE_DETLOG_FORWARD_ENV, level.as_str());
     }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
@@ -5070,5 +5121,117 @@ mod tests {
             );
             assert_eq!(parse_reverie_pin(&text), None);
         }
+    }
+
+    /// A record the SaBRe guest captures and the coordinator re-logs must be
+    /// byte-identical to the line the ptrace backend's in-coordinator local
+    /// tool logs for the same event; the parity comparison reads those bytes.
+    #[test]
+    fn forwarded_detcore_records_log_byte_identically_to_direct_emission() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use detcore::detlog::ForwardedRecord;
+        use detcore::detlog::RecordCapture;
+
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct FixedTime;
+
+        impl tracing_subscriber::fmt::time::FormatTime for FixedTime {
+            fn format_time(
+                &self,
+                w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+            ) -> std::fmt::Result {
+                w.write_str("T")
+            }
+        }
+
+        // The shape of Hermit's run subscriber (bin/hermit/tracing.rs): a
+        // public log layer under the run's per-target filter, and an evidence
+        // layer at INFO, each filtering on its own. The public filter here
+        // drops one Detcore submodule's INFO record that the evidence keeps.
+        fn run_log(
+            public: &Output,
+            evidence: &Output,
+        ) -> impl tracing::Subscriber + Send + Sync + use<> {
+            use tracing_subscriber::Layer;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let (public, evidence) = (public.clone(), evidence.clone());
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(FixedTime)
+                        .with_ansi(false)
+                        .with_writer(move || public.clone())
+                        .with_filter(tracing_subscriber::EnvFilter::new(
+                            "warn,detcore=info,detcore::random=warn",
+                        )),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(FixedTime)
+                        .with_ansi(false)
+                        .with_writer(move || evidence.clone())
+                        .with_filter(tracing::level_filters::LevelFilter::INFO),
+                )
+        }
+
+        fn emit() {
+            tracing::info!(
+                target: "detcore",
+                "DETLOG SCHEDRAND: seeding scheduler runqueue with seed {}",
+                0
+            );
+            tracing::info!(
+                target: "detcore::random",
+                dtid = 3,
+                name = "a b",
+                shown = %"c d",
+                "DETLOG [post_exec, dtid {}] init auxv AT_RANDOM value to {:?}",
+                3,
+                [162u8, 205]
+            );
+            tracing::warn!(target: "detcore::tool_global", r#type = ?Some("x"), "a \"quoted\" warning");
+            tracing::info!(target: "detcore", count = 7u64, flag = true);
+            tracing::debug!(target: "detcore", "below the forwarded level");
+        }
+
+        static CAPTURED: Mutex<Vec<ForwardedRecord>> = Mutex::new(Vec::new());
+        fn push(record: ForwardedRecord) {
+            CAPTURED.lock().unwrap().push(record);
+        }
+
+        let (direct, direct_evidence) = (Output::default(), Output::default());
+        tracing::subscriber::with_default(run_log(&direct, &direct_evidence), emit);
+        tracing::subscriber::with_default(RecordCapture::new(tracing::Level::INFO, push), emit);
+        let records = std::mem::take(&mut *CAPTURED.lock().unwrap());
+        assert_eq!(records.len(), 4, "{records:?}");
+        let (forwarded, forwarded_evidence) = (Output::default(), Output::default());
+        tracing::subscriber::with_default(run_log(&forwarded, &forwarded_evidence), || {
+            records.iter().for_each(log_forwarded_record)
+        });
+
+        let text = |output: Output| String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let (direct, forwarded) = (text(direct), text(forwarded));
+        assert_eq!(direct.lines().count(), 3, "{direct}");
+        assert!(!direct.contains("AT_RANDOM"), "{direct}");
+        assert_eq!(forwarded, direct);
+        let (direct, forwarded) = (text(direct_evidence), text(forwarded_evidence));
+        assert_eq!(direct.lines().count(), 4, "{direct}");
+        assert!(direct.contains(r#"name="a b" shown=c d"#), "{direct}");
+        assert_eq!(forwarded, direct);
     }
 }
