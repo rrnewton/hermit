@@ -15,6 +15,7 @@ use nix::sys::signal::Signal;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
+use crate::types::OpenFileId;
 
 /// Encapsulate the set of threads that are waiting for a specific time in the future.
 ///
@@ -27,8 +28,9 @@ pub struct TimedEvents {
 
     // Keep one alarm(2)/setitimer(2) event per process and one event per POSIX timer id.
     signal_timers: BTreeMap<SignalTimerId, SignalTimerState>,
-    // One pending expiry event per virtual timerfd, keyed (process, guest fd).
-    timerfd_timers: BTreeMap<(DetPid, i32), SignalTimerState>,
+    // One pending expiry event per virtual timerfd, keyed by the open file
+    // description, never by a descriptor number that close and dup can reuse.
+    timerfd_timers: BTreeMap<OpenFileId, TimerFdTimerState>,
     // KVM real timers recur only after an actual shared SIGALRM dequeue.
     kvm_real_deadlines: BTreeMap<DetPid, LogicalTime>,
 }
@@ -70,6 +72,15 @@ struct SignalTimerState {
     interval: LogicalTime,
 }
 
+/// Scheduler bookkeeping for one armed virtual timerfd. `owner` is the process
+/// that last armed it; its exit removes the fast-forward target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimerFdTimerState {
+    owner: DetPid,
+    deadline: LogicalTime,
+    interval: LogicalTime,
+}
+
 /// An event that occurs at a particular time in the execution, typically at an offset in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimedEvent {
@@ -79,12 +90,12 @@ pub enum TimedEvent {
     /// A timed event on a particular thread (sleep, timeout, etc)
     ThreadEvt(DetTid),
 
-    /// A virtual timerfd expiry for (process, guest fd). Declared last so the
-    /// canonical same-deadline pop order is SignalEvt, ThreadEvt, TimerFdEvt.
+    /// A virtual timerfd expiry for one open file description. Declared last so the
+    /// canonical same-deadline pop order is SignalEvt, ThreadEvt, TimerFdExpiry.
     /// Popping wakes no thread: guest-visible readiness is a pure function of
     /// virtual time computed by detcore; this event exists so the deadline is
     /// a fast-forward target and periodic re-arm has a scheduler owner.
-    TimerFdEvt(DetPid, i32),
+    TimerFdExpiry(OpenFileId),
 }
 
 impl fmt::Display for TimedEvent {
@@ -94,7 +105,7 @@ impl fmt::Display for TimedEvent {
             TimedEvent::SignalEvt(id, dt, sig) => {
                 write!(f, "SignalEvt({:?},{},{})", id, dt, sig)
             }
-            TimedEvent::TimerFdEvt(dp, fd) => write!(f, "TimerFdEvt({},{})", dp, fd),
+            TimedEvent::TimerFdExpiry(id) => write!(f, "TimerFdExpiry({:?})", id),
         }
     }
 }
@@ -286,37 +297,39 @@ impl TimedEvents {
     pub fn insert_timerfd(
         &mut self,
         ns: LogicalTime,
-        dp: DetPid,
-        fd: i32,
+        owner: DetPid,
+        id: OpenFileId,
         interval: LogicalTime,
     ) -> Option<(LogicalTime, LogicalTime)> {
         let old = self.timerfd_timers.insert(
-            (dp, fd),
-            SignalTimerState {
+            id,
+            TimerFdTimerState {
+                owner,
                 deadline: ns,
                 interval,
             },
         );
-        self.clear_old_timerfd((dp, fd), old);
+        self.clear_old_timerfd(id, old);
         self.map
             .entry(ns)
             .or_default()
-            .insert(TimedEvent::TimerFdEvt(dp, fd));
+            .insert(TimedEvent::TimerFdExpiry(id));
         old.map(|state| (state.deadline, state.interval))
     }
 
-    pub fn remove_timerfd(&mut self, dp: DetPid, fd: i32) -> Option<(LogicalTime, LogicalTime)> {
-        let old = self.timerfd_timers.remove(&(dp, fd));
-        self.clear_old_timerfd((dp, fd), old);
+    /// Disarm a virtual timerfd, or drop it when its open file is released.
+    pub fn remove_timerfd(&mut self, id: OpenFileId) -> Option<(LogicalTime, LogicalTime)> {
+        let old = self.timerfd_timers.remove(&id);
+        self.clear_old_timerfd(id, old);
         old.map(|state| (state.deadline, state.interval))
     }
 
-    fn clear_old_timerfd(&mut self, key: (DetPid, i32), old: Option<SignalTimerState>) {
+    fn clear_old_timerfd(&mut self, id: OpenFileId, old: Option<TimerFdTimerState>) {
         if let Some(state) = old {
             let Some(set) = self.map.get_mut(&state.deadline) else {
                 return;
             };
-            if set.remove(&TimedEvent::TimerFdEvt(key.0, key.1)) && set.is_empty() {
+            if set.remove(&TimedEvent::TimerFdExpiry(id)) && set.is_empty() {
                 self.map.remove(&state.deadline);
             }
         }
@@ -356,14 +369,14 @@ impl TimedEvents {
         for id in ids {
             self.remove_signal_timer(id);
         }
-        let fd_keys: Vec<_> = self
+        let timerfd_ids: Vec<_> = self
             .timerfd_timers
-            .keys()
-            .copied()
-            .filter(|(pid, _)| *pid == dp)
+            .iter()
+            .filter(|(_, state)| state.owner == dp)
+            .map(|(id, _)| *id)
             .collect();
-        for (pid, fd) in fd_keys {
-            self.remove_timerfd(pid, fd);
+        for id in timerfd_ids {
+            self.remove_timerfd(id);
         }
     }
 
@@ -416,13 +429,12 @@ impl TimedEvents {
                 self.map.entry(next_deadline).or_default().insert(evt);
             }
         }
-        if let TimedEvent::TimerFdEvt(dp, fd) = evt
+        if let TimedEvent::TimerFdExpiry(key) = evt
             && self
                 .timerfd_timers
-                .get(&(dp, fd))
+                .get(&key)
                 .is_some_and(|state| state.deadline == time_ns)
         {
-            let key = (dp, fd);
             let interval = self.timerfd_timers[&key].interval;
             if interval == LogicalTime::ZERO {
                 self.timerfd_timers.remove(&key);
@@ -437,7 +449,8 @@ impl TimedEvents {
                 if next <= current_time && !current_time.is_indefinite() {
                     let missed = (current_time.as_nanos() - next.as_nanos()) / interval.as_nanos();
                     next = LogicalTime::from_nanos(
-                        (next.as_nanos() as u128 + (missed as u128 + 1) * interval.as_nanos() as u128)
+                        (next.as_nanos() as u128
+                            + (missed as u128 + 1) * interval.as_nanos() as u128)
                             .min(u64::MAX as u128) as u64,
                     );
                 }
@@ -514,6 +527,9 @@ mod test {
     }
     fn at(ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(ns)
+    }
+    fn tfd(sequence: u64) -> OpenFileId {
+        OpenFileId::new(tid(100), sequence)
     }
 
     /// `next_deadline` must report the earliest pending deadline without
@@ -758,12 +774,12 @@ mod test {
             )));
     }
 
-    /// Same-deadline canonical order: SignalEvt, ThreadEvt, TimerFdEvt.
+    /// Same-deadline canonical order: SignalEvt, ThreadEvt, TimerFdExpiry.
     #[test]
     fn timerfd_sorts_after_signal_and_thread_at_same_deadline() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        ev.insert_timerfd(at(500), p, 9, LogicalTime::ZERO);
+        ev.insert_timerfd(at(500), p, tfd(9), LogicalTime::ZERO);
         ev.insert(at(500), tid(100));
         ev.insert_alarm(at(500), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO);
         assert_eq!(
@@ -774,7 +790,7 @@ mod test {
             ))
         );
         assert_eq!(ev.pop(), Some((at(500), TimedEvent::ThreadEvt(tid(100)))));
-        assert_eq!(ev.pop(), Some((at(500), TimedEvent::TimerFdEvt(p, 9))));
+        assert_eq!(ev.pop(), Some((at(500), TimedEvent::TimerFdExpiry(tfd(9)))));
         assert!(ev.is_empty());
     }
 
@@ -783,15 +799,18 @@ mod test {
     fn timerfd_rearm_disarm_and_process_cleanup() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        ev.insert_timerfd(at(500), p, 9, LogicalTime::ZERO);
+        ev.insert_timerfd(at(500), p, tfd(9), LogicalTime::ZERO);
         assert_eq!(
-            ev.insert_timerfd(at(900), p, 9, LogicalTime::ZERO),
+            ev.insert_timerfd(at(900), p, tfd(9), LogicalTime::ZERO),
             Some((at(500), LogicalTime::ZERO))
         );
         assert_eq!(ev.next_deadline(), Some(at(900)));
-        assert_eq!(ev.remove_timerfd(p, 9), Some((at(900), LogicalTime::ZERO)));
+        assert_eq!(
+            ev.remove_timerfd(tfd(9)),
+            Some((at(900), LogicalTime::ZERO))
+        );
         assert!(ev.is_empty());
-        ev.insert_timerfd(at(700), p, 9, LogicalTime::ZERO);
+        ev.insert_timerfd(at(700), p, tfd(9), LogicalTime::ZERO);
         ev.remove_process_timers(p);
         assert!(ev.is_empty());
     }
@@ -802,9 +821,9 @@ mod test {
     fn timerfd_periodic_rearm_coalesces() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        ev.insert_timerfd(at(100), p, 9, at(50));
+        ev.insert_timerfd(at(100), p, tfd(9), at(50));
         let (t, evt) = ev.pop_if_before(at(430)).expect("pops");
-        assert_eq!((t, evt), (at(100), TimedEvent::TimerFdEvt(p, 9)));
+        assert_eq!((t, evt), (at(100), TimedEvent::TimerFdExpiry(tfd(9))));
         // Next deadline is 450 (first > 430), not 150/200/.../400.
         assert_eq!(ev.next_deadline(), Some(at(450)));
         assert_eq!(ev.iter().count(), 1);
@@ -820,12 +839,37 @@ mod test {
     fn timerfd_periodic_pop_unconditional_rearms_one_interval() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        ev.insert_timerfd(at(100), p, 9, at(50));
-        assert_eq!(ev.pop(), Some((at(100), TimedEvent::TimerFdEvt(p, 9))));
+        ev.insert_timerfd(at(100), p, tfd(9), at(50));
+        assert_eq!(ev.pop(), Some((at(100), TimedEvent::TimerFdExpiry(tfd(9)))));
         assert_eq!(ev.next_deadline(), Some(at(150)));
         assert_eq!(ev.iter().count(), 1);
-        assert_eq!(ev.pop(), Some((at(150), TimedEvent::TimerFdEvt(p, 9))));
+        assert_eq!(ev.pop(), Some((at(150), TimedEvent::TimerFdExpiry(tfd(9)))));
         assert_eq!(ev.next_deadline(), Some(at(200)));
+    }
+
+    /// Keying by open file description: two timerfds of one process that
+    /// happen to reuse a descriptor number stay distinct, and removing one
+    /// (its open file was released) never disturbs the other or another
+    /// process's timer.
+    #[test]
+    fn timerfd_keyed_by_open_file_not_descriptor_number() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        let q = pid(200);
+        ev.insert_timerfd(at(500), p, tfd(1), LogicalTime::ZERO);
+        ev.insert_timerfd(at(600), p, tfd(2), LogicalTime::ZERO);
+        ev.insert_timerfd(at(700), q, tfd(3), at(10));
+        assert_eq!(
+            ev.remove_timerfd(tfd(1)),
+            Some((at(500), LogicalTime::ZERO))
+        );
+        assert_eq!(ev.next_deadline(), Some(at(600)));
+        assert_eq!(ev.remove_timerfd(tfd(1)), None);
+        ev.remove_process_timers(p);
+        assert_eq!(ev.next_deadline(), Some(at(700)));
+        assert_eq!(ev.iter().count(), 1);
+        ev.remove_process_timers(q);
+        assert!(ev.is_empty());
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

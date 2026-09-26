@@ -95,6 +95,7 @@ use crate::types::FutexID;
 use crate::types::GlobalTime;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::OpenFileId;
 use crate::types::SchedEvent;
 use crate::types::SigWrapper;
 use crate::types::SyscallPhase;
@@ -2787,7 +2788,7 @@ impl Scheduler {
                 }
                 // Virtual timerfd expiry: no thread wake, no signal. Readiness
                 // is recomputed by detcore from virtual time on the next probe.
-                TimedEvent::TimerFdEvt(_, _) => {}
+                TimedEvent::TimerFdExpiry(_) => {}
             }
             true
         } else {
@@ -3851,7 +3852,7 @@ impl Scheduler {
                     }
                     // Virtual timerfd expiry: time already advanced above;
                     // readiness is recomputed by detcore from virtual time.
-                    TimedEvent::TimerFdEvt(_, _) => {}
+                    TimedEvent::TimerFdExpiry(_) => {}
                 }
                 return Err(SkipTurn);
             }
@@ -5106,7 +5107,7 @@ impl Scheduler {
                         }
                     }
                     TimedEvent::SignalEvt(_, _, _) => {}
-                    TimedEvent::TimerFdEvt(_, _) => {}
+                    TimedEvent::TimerFdExpiry(_) => {}
                 }
             }
             if self.blocked.external_io_blockers.contains_key(&dtid) {
@@ -5455,17 +5456,24 @@ impl Scheduler {
     pub fn register_timerfd(
         &mut self,
         detpid: DetPid,
-        fd: i32,
+        open_file: OpenFileId,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
     ) {
         if let Some(deadline) = deadline {
             self.blocked
                 .timed_waiters
-                .insert_timerfd(deadline, detpid, fd, interval);
+                .insert_timerfd(deadline, detpid, open_file, interval);
         } else {
-            self.blocked.timed_waiters.remove_timerfd(detpid, fd);
+            self.blocked.timed_waiters.remove_timerfd(open_file);
         }
+    }
+
+    /// Drop the virtual timerfd deadline of an open file description whose
+    /// last descriptor was released, so a dead timer is never a fast-forward
+    /// target and a periodic one stops re-arming.
+    pub fn release_timerfd(&mut self, open_file: OpenFileId) -> Option<(LogicalTime, LogicalTime)> {
+        self.blocked.timed_waiters.remove_timerfd(open_file)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
