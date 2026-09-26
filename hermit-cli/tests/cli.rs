@@ -3533,6 +3533,13 @@ fn run_kvm_preserves_closed_standard_input() {
     assert!(native.status.success(), "native {mode} control: {native:?}");
     assert_eq!(stdout(&native), expected);
     assert_eq!(stderr(&native), "");
+    // Hermit announces the virtual-time epoch on stderr when no --log-file is
+    // given. Pin it so that announcement is the exact, and only, stderr line:
+    // the guest itself must still write nothing there.
+    const EPOCH: &str = "2026-01-01T00:00:00Z";
+    let epoch_arg = format!("--epoch={EPOCH}");
+    let expected_stderr = "hermit: virtual-time epoch=2026-01-01T00:00:00+00:00 source=explicit; \
+         reproduce with --epoch=2026-01-01T00:00:00+00:00\n";
     for backend in ["ptrace", "kvm"] {
         let args = [
             "run",
@@ -3540,6 +3547,7 @@ fn run_kvm_preserves_closed_standard_input() {
             backend,
             "--strict",
             "--base-env=minimal",
+            &epoch_arg,
             "--",
         ];
         let output = hermit_command(&args)
@@ -3551,7 +3559,7 @@ fn run_kvm_preserves_closed_standard_input() {
             .expect("failed to run stdio-inode identity fixture");
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");
-        assert_eq!(stderr(&output), "", "{backend} {mode}");
+        assert_eq!(stderr(&output), expected_stderr, "{backend} {mode}");
     }
 }
 
