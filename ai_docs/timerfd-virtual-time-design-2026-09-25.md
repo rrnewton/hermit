@@ -73,9 +73,9 @@ unwatched 1ms periodic timerfd took 12s of wall time, and one beside a 1us
 timer did not finish. `hermit-cli/tests/signal_determinism.rs`
 (`sigsuspend_with_armed_periodic_timerfd_reports_terminal_deadlock`) guards
 the first regression, and the fixture's `periodic_sleep` and
-`close_armed_sleep` cases guard the second. With no scheduler state there is also no lifecycle to
-get wrong: close, dup, fork, exec and process exit need no cleanup beyond the
-open file description itself.
+`close_armed_sleep` cases guard the second. With no scheduler state there is
+also no lifecycle to get wrong: close, dup, fork, exec and process exit need
+no cleanup beyond the open file description itself.
 
 ## Syscalls
 
@@ -174,7 +174,8 @@ open file description itself.
 - Backends: the change is in shared detcore code, but only the ptrace cells
   are enabled and measured; no DBT, KVM, SaBRe or LiteInst claim is made.
 - Full validation selects `timerfd-semantics` (20 of 20 strict ptrace verify
-  runs matched at ec9fdf63) but not `timer-family-identity`. Its order now
+  runs matched at ec9fdf63, and 20 of 20 again at 9a60fca9 after the fixture
+  grew to 42 cases) but not `timer-family-identity`. Its order now
   matches Linux, yet 6 of 36 strict ptrace verify runs at dbf27d2618 and
   ec9fdf63 ended in a HERMIT_SKID_OVERSHOOT infrastructure error (AMD EPYC
   9D85, load average 57-150), against 0 of 48 for three neighbouring cells
