@@ -210,37 +210,50 @@ where
     Ok(())
 }
 
-/// Set the given descriptors' bits in a guest select read set of `len` bytes.
+/// Read the byte of a guest select bitmap that holds `fd`'s bit.
+fn read_select_byte<T, G>(
+    guest: &mut G,
+    fds: usize,
+    fd: i32,
+) -> Result<(AddrMut<'static, u8>, u8), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let address = fds
+        .checked_add((fd / 8) as usize)
+        .and_then(AddrMut::<u8>::from_raw)
+        .ok_or(Errno::EFAULT)?;
+    let mut byte = [0u8];
+    guest
+        .memory()
+        .read_exact(Addr::from(address), &mut byte)
+        .map_err(|_| Errno::EFAULT)?;
+    Ok((address, byte[0]))
+}
+
+/// Set the given descriptors' bits in a guest select read set. Only the
+/// bytes holding those bits are touched; each lies below the fd-table size
+/// that bounds Linux's own copy, because the descriptor is open.
 fn set_select_read_bits<T, G>(
     guest: &mut G,
     readfds: Option<usize>,
-    len: usize,
     fds: &[i32],
 ) -> Result<(), Error>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let Some(address) = readfds.and_then(AddrMut::<u8>::from_raw) else {
+    let Some(readfds) = readfds else {
         return Ok(());
     };
-    if fds.is_empty() || len == 0 {
-        return Ok(());
+    for &fd in fds {
+        let (address, byte) = read_select_byte(guest, readfds, fd)?;
+        guest
+            .memory()
+            .write_exact(address, &[byte | (1u8 << (fd % 8))])
+            .map_err(|_| Errno::EFAULT)?;
     }
-    let mut bytes = vec![0u8; len];
-    guest
-        .memory()
-        .read_exact(address, &mut bytes)
-        .map_err(|_| Errno::EFAULT)?;
-    for fd in fds {
-        if let Some(byte) = bytes.get_mut((fd / 8) as usize) {
-            *byte |= 1u8 << (fd % 8);
-        }
-    }
-    guest
-        .memory()
-        .write_exact(address, &bytes)
-        .map_err(|_| Errno::EFAULT)?;
     Ok(())
 }
 
@@ -591,8 +604,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux clamps raw fd-set copies to the process fd table's current max_fds.
         // Its initial table holds one machine word; larger nfds values can therefore
         // require fewer bytes than a userspace calculation predicts. Keep those calls
-        // under kernel ownership rather than over-reading the guest bitmap.
-        if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+        // under kernel ownership rather than over-reading the guest bitmap, unless
+        // the read set names a virtual timerfd the kernel could never report.
+        if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS
+            && !self.wide_select_needs_detcore(
+                guest,
+                call.nfds(),
+                call.readfds().map(|addr| addr.as_raw()),
+                "pselect6",
+            )?
+        {
             return self
                 .record_or_replay_blocking(guest, Syscall::Pselect6(call))
                 .await;
@@ -738,7 +759,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                             set_select_read_bits(
                                 guest,
                                 call.readfds().map(|addr| addr.as_raw()),
-                                len,
                                 &timer_ready,
                             )
                         })
@@ -844,7 +864,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // Mirror pselect6: keep large fd tables under kernel ownership rather than
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
-        if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+        if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS
+            && !self.wide_select_needs_detcore(
+                guest,
+                call.nfds(),
+                call.readfds().map(|addr| addr.as_raw()),
+                "select",
+            )?
+        {
             return self
                 .record_or_replay_blocking(guest, Syscall::Select(call))
                 .await;
@@ -947,7 +974,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                             set_select_read_bits(
                                 guest,
                                 call.readfds().map(|addr| addr.as_raw()),
-                                len,
                                 &timer_ready,
                             )
                         })
@@ -1575,12 +1601,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return self.handle_internal_epoll_pwait(guest, call).await;
             }
             // A wait that need not block is one timeout-0 probe under the
-            // caller's mask, which is atomic exactly as on Linux.
+            // caller's mask, which is atomic exactly as on Linux. Probe the
+            // host first, so a ready host fd returns at once, as it does on
+            // Linux, instead of the refusal below.
             let ready = self.epoll_timer_scan(guest, call.epfd()).await?;
-            if !ready.is_empty() || call.timeout() == 0 {
-                let dettid = guest.thread_state().dettid;
-                resource_request(guest, Resources::new(dettid)).await; // empty request
-                let host = guest.inject(call.with_timeout(0)).await?;
+            let dettid = guest.thread_state().dettid;
+            resource_request(guest, Resources::new(dettid)).await; // empty request
+            let host = guest.inject(call.with_timeout(0)).await?;
+            if !ready.is_empty() || call.timeout() == 0 || host != 0 {
                 return self.merge_timer_wait_set(guest, call.into(), host).await;
             }
             // Blocking with a temporary mask cannot be reproduced by a polling
@@ -1828,6 +1856,56 @@ impl<T: RecordOrReplay> Detcore<T> {
             .collect())
     }
 
+    /// Virtual timerfds whose bits are set in a guest select read set,
+    /// read before the kernel overwrites it. Only the bytes holding an open
+    /// timerfd's bit are read, and Linux reads those too; an unreadable byte
+    /// is left to the kernel, which reports its own error.
+    fn select_read_timerfds<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        nfds: i32,
+        readfds: Option<usize>,
+    ) -> Vec<i32> {
+        let Some(readfds) = readfds.filter(|_| self.virtual_timerfds()) else {
+            return Vec::new();
+        };
+        guest
+            .thread_state()
+            .timerfds_below(nfds)
+            .into_iter()
+            .filter(|&fd| {
+                read_select_byte(guest, readfds, fd)
+                    .is_ok_and(|(_, byte)| byte & (1u8 << (fd % 8)) != 0)
+            })
+            .collect()
+    }
+
+    /// Whether a blocking select or pselect6 wider than one word must stay
+    /// with Detcore: its read set names a virtual timerfd, whose never-armed
+    /// host vessel the kernel would never report ready. Up to FD_SETSIZE the
+    /// scratch sets used by the retry loop hold it; beyond that the call is
+    /// refused rather than left to block on the vessel.
+    fn wide_select_needs_detcore<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        nfds: i32,
+        readfds: Option<usize>,
+        name: &str,
+    ) -> Result<bool, Error> {
+        if self.select_read_timerfds(guest, nfds, readfds).is_empty() {
+            return Ok(false);
+        }
+        if nfds > libc::FD_SETSIZE as i32 {
+            tracing::warn!(
+                "{} with nfds {} > FD_SETSIZE and a virtual timerfd in its read set is not supported",
+                name,
+                nfds
+            );
+            return Err(Errno::ENOSYS.into());
+        }
+        Ok(true)
+    }
+
     /// A zero-timeout select or pselect6: one host poll, plus ready virtual
     /// timerfds from the read set.
     async fn select_poll_with_timerfds<G: Guest<Self>, C: SyscallInfo + Into<Syscall> + Copy>(
@@ -1837,28 +1915,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         readfds: Option<usize>,
         call: C,
     ) -> Result<i64, Error> {
-        // Snapshot the read set before the kernel overwrites it. An unreadable
-        // or oversized set is left to the kernel, which reports its own error.
-        let original_readfds = if (0..=PSELECT6_INTERNAL_MAX_NFDS).contains(&nfds) {
-            readfds
-                .and_then(AddrMut::<libc::fd_set>::from_raw)
-                .and_then(|addr| {
-                    read_pselect6_fd_set(guest, Some(addr), pselect6_fd_set_len(nfds).ok()?)
-                        .ok()
-                        .flatten()
-                })
-        } else {
-            None
-        };
+        let named = self.select_read_timerfds(guest, nfds, readfds);
         let host = guest.inject(call).await?;
-        let ready = self
-            .select_timerfd_scan(guest, nfds, &original_readfds)
-            .await?;
-        if ready.is_empty() {
+        if named.is_empty() {
             return Ok(host);
         }
-        let len = original_readfds.as_ref().map_or(0, Vec::len);
-        set_select_read_bits(guest, readfds, len, &ready)?;
+        let now = thread_observe_time(guest).await;
+        let ready: Vec<i32> = named
+            .into_iter()
+            .filter(|&fd| {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.timerfd_state())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|state| state.pending(now) > 0)
+            })
+            .collect();
+        set_select_read_bits(guest, readfds, &ready)?;
         Ok(host + ready.len() as i64)
     }
 
