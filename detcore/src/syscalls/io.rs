@@ -1310,7 +1310,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// earliest future expiry among the others). Only POLLIN interest can
     /// observe a timerfd, as on Linux. Time is observed only when the array
     /// names a virtual timerfd.
-    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd poll readiness.
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd poll readiness.
     pub(crate) async fn poll_timerfd_scan<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1716,7 +1716,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// wakeup per settime or consuming read, even for a periodic timer, because
     /// its hrtimer is forwarded only by a read. Nothing is committed here; see
     /// `merge_epoll_timer_events`.
-    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd epoll readiness, ET and
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd epoll readiness, ET and
     // ONESHOT semantics.
     async fn epoll_timer_scan<G: Guest<Self>>(
         &self,
@@ -1767,7 +1767,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Time is observed only when the set holds a virtual timerfd, so a
     /// select without one sees no extra clock read.
-    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd select readiness.
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd select readiness.
     pub(crate) async fn select_timerfd_scan<G: Guest<Self>>(
         &self,
         guest: &mut G,
