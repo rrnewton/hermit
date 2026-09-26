@@ -363,6 +363,7 @@ mod real_random {
                 .unwrap();
             let primary = copy_failure(failure.failure());
             assert_eq!(primary.errno(), reverie::Errno::EPERM);
+            assert!(primary.to_string().contains("omit --no-namespace"));
             assert_eq!(primary as *const _ as usize, facts.primary_address);
             assert_eq!(failure.failure().origin().pid.as_raw(), facts.root);
             assert_eq!(failure.failure().origin().phase, "ptrace syscall callback");

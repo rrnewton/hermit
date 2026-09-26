@@ -34,6 +34,9 @@ use serde::de::DeserializeOwned;
 use serde::de::Error as _;
 
 const FINALIZE_BUDGET: Duration = Duration::from_secs(2);
+const RETAINED_OWNER_REMEDY: &str = "Stop the affected run through its process supervisor, \
+    confirm its entire child tree has stopped, then start a fresh Hermit process; \
+    retrying in this process cannot release the retained owner.";
 static RETAINED: AtomicBool = AtomicBool::new(false);
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 thread_local! {
@@ -51,13 +54,27 @@ pub(super) struct ParentCleanupUnconfirmed {
     cause: Option<OwnedRunFailure>,
     reported_kind: Option<hermit::FailureKind>,
     resources: String,
+    primary_display: Option<String>,
+}
+
+impl ParentCleanupUnconfirmed {
+    fn context(mut self, primary: Error) -> Error {
+        // The copied headline is display-only. Keep the original typed error
+        // underneath this typed retention context for classification/downcasts.
+        self.primary_display = Some(primary.to_string());
+        eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {self}");
+        primary.context(self)
+    }
 }
 
 impl std::fmt::Display for ParentCleanupUnconfirmed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(primary) = &self.primary_display {
+            write!(f, "{primary}; ")?;
+        }
         write!(
             f,
-            "container cleanup unconfirmed (retained owner {}, child {}, observation {:?}, original owner failure {:?}, reported primary {:?}); keep backing resources: {}",
+            "container cleanup unconfirmed (retained owner {}, child {}, observation {:?}, original owner failure {:?}, reported primary {:?}); keep backing resources: {}; {RETAINED_OWNER_REMEDY}",
             self.key, self.pid, self.observation, self.cause, self.reported_kind, self.resources
         )
     }
@@ -133,6 +150,7 @@ fn retain_owned<T: 'static, F: 'static>(
         cause,
         reported_kind,
         resources,
+        primary_display: None,
     };
     RETAINED.store(true, Ordering::Release);
     OWNERS.with(|owners| owners.borrow_mut().push(Box::new((owner, factory))));
@@ -159,7 +177,7 @@ where
 {
     if RETAINED.load(Ordering::Acquire) {
         anyhow::bail!(
-            "a prior CLI container owner is unresolved; backing resources remain retained"
+            "a prior CLI container owner is unresolved; backing resources remain retained; {RETAINED_OWNER_REMEDY}"
         );
     }
     let state = Rc::new(RefCell::new((guards, work)));
@@ -258,8 +276,7 @@ where
                             Some(cause),
                             None,
                         );
-                        eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {retained}");
-                        return Err(primary.context(retained));
+                        return Err(retained.context(primary));
                     }
                     return Err(primary);
                 }
@@ -284,8 +301,7 @@ where
                             None,
                             Some(kind),
                         );
-                        eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {retained}");
-                        return Err(primary.context(retained));
+                        return Err(retained.context(primary));
                     }
                     return Err(primary);
                 }
@@ -346,10 +362,9 @@ where
             };
             if must_retain {
                 let retained = retain(cleanup, factory, resources, cause);
-                eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {retained}");
                 // The original primary remains downcastable; the retained-owner
                 // context cannot rename a timeout, signal, or child exit.
-                Err(primary.context(retained))
+                Err(retained.context(primary))
             } else {
                 drop(cleanup);
                 drop(factory);
@@ -402,6 +417,19 @@ mod tests {
 
     #[test]
     fn fallback_error_reapplies_primary_cli_class_and_exit() {
+        fn diagnostic(kind: Option<hermit::FailureKind>) -> ParentCleanupUnconfirmed {
+            // Formatting/classification seam only: no fabricated cleanup result
+            // is passed to a production owner or admitted as tree retirement.
+            ParentCleanupUnconfirmed {
+                key: 7,
+                pid: 123,
+                observation: ChildCleanupObservation::Reaped(ExitStatus::Exited(0)),
+                cause: None,
+                reported_kind: kind,
+                resources: "test backing".to_owned(),
+                primary_display: None,
+            }
+        }
         for (kind, code, marker) in [
             (
                 hermit::FailureKind::Error,
@@ -440,7 +468,32 @@ mod tests {
             assert_eq!(crate::failure_exit_code(&error), code);
             assert_eq!(crate::classify_failure(&error), marker);
             assert!(format!("{error:#}").contains("original diagnostic"));
+            let primary_display = error.to_string();
+            let error = diagnostic(Some(kind)).context(error);
+            assert_eq!(crate::failure_exit_code(&error), code);
+            assert_eq!(crate::classify_failure(&error), marker);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("{primary_display}; "))
+            );
+            assert!(error.to_string().contains(RETAINED_OWNER_REMEDY));
+            assert!(format!("{error:#}").contains("original diagnostic"));
+            assert_eq!(
+                error
+                    .downcast_ref::<ParentCleanupUnconfirmed>()
+                    .unwrap()
+                    .reported_kind,
+                Some(kind)
+            );
         }
+        assert!(diagnostic(None).to_string().contains(RETAINED_OWNER_REMEDY));
+        let original = Error::new(std::io::Error::from_raw_os_error(libc::EIO));
+        let address = original.downcast_ref::<std::io::Error>().unwrap() as *const _;
+        let error = diagnostic(None).context(original);
+        let preserved = error.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(preserved as *const _, address);
+        assert_eq!(preserved.raw_os_error(), Some(libc::EIO));
     }
 
     #[test]

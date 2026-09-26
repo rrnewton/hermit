@@ -74,3 +74,15 @@ fn original_gdb_parent_death_stops_probes_despite_inherited_socket_alias() {
 fn gdb_creator_thread_exit_does_not_end_process_supervision() {
     lifecycle("gdb-creator-thread-exit");
 }
+
+// Each control enters an isolated pre-thread CLI natural reaper. The shared
+// libtest process never becomes a subreaper or assumes ownership of descendants.
+#[test]
+fn fixture_worker_exits_when_lifecycle_cli_asserts_before_stop() {
+    lifecycle("containment-early-assertion");
+}
+
+#[test]
+fn fixture_worker_exits_when_lifecycle_cli_is_killed() {
+    lifecycle("containment-cli-owner-death");
+}
