@@ -210,7 +210,7 @@ hit can serve an output whose cached entry records it as produced remotely
 (`was_produced_locally = false`). "Built locally" therefore rests on
 `--no-remote-cache` and on the absence of any remote-execution configuration.
 The event census confirms that nothing it can see contradicts this.
-Measured at the phase-two head with the pinned Buck2, every build passing
+Measured at Hermit commit 10906a288 with the pinned Buck2, every build passing
 `--no-remote-cache`:
 
 | Build | Actions executed | Wall time |
@@ -325,20 +325,35 @@ the debug `target/debug/hermit`, which has debug assertions and overflow
 checks. In Buck mode the cells run the release `target/ci/hermit-strict`,
 built with `-Cdebug-assertions=no -Coverflow-checks=no -Copt-level=3`. The
 ledger row records this as `release_builder` (`cargo` or `buck`) and
-`e2e_payload`, which gives the path, profile, and both check settings. A Buck
-row is supplemental evidence only:
+`e2e_payload`, which gives the path, profile, and both check settings.
+
+`release_builder` is what separates the evidence. `e2e_payload` is a label,
+not a measurement of the binary: it is a constant per builder, and unit tests
+tie it to the checked-in sources that select the payload (the release flag
+list in `shim/BUCK`, no check-class setting in `hermit-cli/BUCK` or anywhere
+in the root `Cargo.toml`, no repository `.cargo/config`, and no `RUSTFLAGS`
+or `CARGO_PROFILE_` in the validate DAG). It cannot see `RUSTFLAGS`,
+`CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_DEV_*` set in the environment, or
+a Cargo config in an ancestor directory or `CARGO_HOME`.
+
+A Buck row is supplemental evidence only:
 
 - It is never a cache hit for a Cargo request.
 - A Buck request is never answered from the cache.
 - Hermit's own receipt publication refuses it.
-- Its cells are not added to the parent's compatibility series or scorecard,
-  which record no builder. They remain in the run's ledger row and retained
+- Hermit neither appends its cells to the parent's compatibility series nor
+  writes them back to the scorecard locally. When `ci-hub` launched the run,
+  the parent's cell-ledger mirror refuses the finalized publication before
+  any scorecard work, so the cells are not projected into the published
+  scorecard either. They remain in the run's ledger row and retained
   artifacts.
-- The parent's local-validation status and label read the ledger through the
-  parent's qualifying-receipt predicate. That predicate must require
-  `release_builder` to be `cargo`; a parent without that clause would count a
-  Buck `full` row as a full green. The parent change therefore lands before
-  this one.
+- The parent reads the shared ledger through builder-aware consumers: the
+  qualifying-receipt predicate requires `release_builder` to be `cargo`;
+  failure obligations let a Buck red latch but never let Buck clean runs
+  discharge one; the compatibility website excludes Buck rows under a named
+  reason; timing baselines skip them. A parent without these would count a
+  Buck `full` row as a full green, so the parent change lands before this
+  one.
 
 A red Buck row on the same tree still blocks Cargo cache reuse, because a
 failure is a failure whichever builder produced the binary.
