@@ -23,6 +23,10 @@
  *   select_mixed / pselect_mixed / select_remaining
  *       A ready pipe plus an expired timerfd reports both bits and a count of
  *       2; a timerfd ending a select early leaves the remaining timeout.
+ *   wide_select / wide_pselect / wide_select_poll
+ *       The same with the timerfd above descriptor 64, beyond one fd_set word:
+ *       a finite select and an infinite pselect end when the timer fires, and
+ *       a zero-timeout select reports it beside a ready pipe.
  *   poll_mixed
  *       The same for poll.
  *   epoll_mask / epoll_close / epoll_reuse / epoll_dup_alive
@@ -56,6 +60,10 @@
  *       readv and preadv2 at offset -1 read the count like read, across a
  *       split iovec; a total length below 8 is EINVAL; a positioned read is
  *       ESPIPE.
+ *   readv_partial / readv_fault
+ *       A readv whose second iovec faults returns the bytes copied into the
+ *       first; one whose first iovec faults is EFAULT. Both take the
+ *       expiration, so the next read finds none.
  *   read_fault_consumes
  *       A read into an unmapped buffer faults after taking the expirations,
  *       so the next read finds none.
@@ -210,6 +218,54 @@ static void check_select_remaining(void) {
     if (n != 1 || !FD_ISSET(tfd, &rfds)) fail(name, "n=%ld isset=%ld", n, FD_ISSET(tfd, &rfds));
     else if (left_ms < 500 || left_ms > 960) fail(name, "left_ms=%ld%ld", left_ms, 0);
     else ok(name);
+}
+
+/* Move a descriptor above one fd_set word. */
+static int wide_fd(int fd) {
+    int wide = fcntl(fd, F_DUPFD, 100);
+    close(fd);
+    return wide;
+}
+
+static void check_wide_select(int use_pselect) {
+    const char *name = use_pselect ? "wide_pselect" : "wide_select";
+    int tfd = wide_fd(armed_tfd(CLOCK_MONOTONIC, 0, 20 * MS, 0, 0));
+    if (tfd < 64) { fail(name, "fd=%ld errno=%ld", tfd, errno); return; }
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(tfd, &rfds);
+    int n;
+    if (use_pselect) {
+        n = pselect(tfd + 1, &rfds, NULL, NULL, NULL, NULL);
+    } else {
+        struct timeval tv = {1, 0};
+        n = select(tfd + 1, &rfds, NULL, NULL, &tv);
+    }
+    int isset = FD_ISSET(tfd, &rfds) ? 1 : 0;
+    close(tfd);
+    if (n != 1 || !isset) fail(name, "n=%ld isset=%ld", n, isset);
+    else ok(name);
+}
+
+static void check_wide_select_poll(void) {
+    const char *name = "wide_select_poll";
+    int p[2];
+    if (ready_pipe(p) != 0) { fail(name, "pipe errno=%ld%ld", errno, 0); return; }
+    int tfd = wide_fd(armed_tfd(CLOCK_MONOTONIC, 0, 1 * MS, 0, 0));
+    if (tfd < 64) { fail(name, "fd=%ld errno=%ld", tfd, errno); return; }
+    sleep_ns(10 * MS);
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(p[0], &rfds);
+    FD_SET(tfd, &rfds);
+    struct timeval tv = {0, 0};
+    int n = select(tfd + 1, &rfds, NULL, NULL, &tv);
+    int bits = (FD_ISSET(p[0], &rfds) ? 1 : 0) + (FD_ISSET(tfd, &rfds) ? 2 : 0);
+    if (n != 2 || bits != 3) fail(name, "n=%ld bits=%ld", n, bits);
+    else ok(name);
+    close(p[0]);
+    close(p[1]);
+    close(tfd);
 }
 
 static void check_poll_mixed(void) {
@@ -588,6 +644,40 @@ static void check_vectored_reads(void) {
     close(tfd);
 }
 
+static void check_readv_faults(void) {
+    int tfd = expired_tfd();
+    unsigned char bytes[4] = {0xff, 0xff, 0xff, 0xff};
+    struct iovec partial[2] = {{bytes, 4}, {(void *)1, 4}};
+    errno = 0;
+    ssize_t r = readv(tfd, partial, 2);
+    int err = errno;
+    uint64_t count = 0;
+    errno = 0;
+    ssize_t again = read(tfd, &count, sizeof count);
+    int again_err = errno;
+    close(tfd);
+    uint32_t low;
+    memcpy(&low, bytes, sizeof low);
+    if (r != 4 || low != 1) fail("readv_partial", "r=%ld errno=%ld", (long)r, r == 4 ? (long)low : err);
+    else if (again != -1 || again_err != EAGAIN)
+        fail("readv_partial", "again=%ld errno=%ld", (long)again, again_err);
+    else ok("readv_partial");
+
+    tfd = expired_tfd();
+    struct iovec bad = {(void *)1, 8};
+    errno = 0;
+    r = readv(tfd, &bad, 1);
+    err = errno;
+    errno = 0;
+    again = read(tfd, &count, sizeof count);
+    again_err = errno;
+    close(tfd);
+    if (r != -1 || err != EFAULT) fail("readv_fault", "r=%ld errno=%ld", (long)r, err);
+    else if (again != -1 || again_err != EAGAIN)
+        fail("readv_fault", "again=%ld errno=%ld", (long)again, again_err);
+    else ok("readv_fault");
+}
+
 static void check_read_fault_consumes(void) {
     const char *name = "read_fault_consumes";
     int tfd = expired_tfd();
@@ -709,6 +799,9 @@ int main(void) {
     check_select_mixed(0);
     check_select_mixed(1);
     check_select_remaining();
+    check_wide_select(0);
+    check_wide_select(1);
+    check_wide_select_poll();
     check_poll_mixed();
     check_epoll_mask();
     check_epoll_close();
@@ -728,6 +821,7 @@ int main(void) {
     check_cross_arm("epoll_cross_rearm", 1, 5000 * MS, 10000);
     check_epoll_ctl_add_while_waiting();
     check_vectored_reads();
+    check_readv_faults();
     check_read_fault_consumes();
     check_create_errors();
     check_gettime_errors();
