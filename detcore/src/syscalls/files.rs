@@ -3967,7 +3967,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (EBADF, or EINVAL for a non-timerfd). An invalid request changes
     /// nothing. The old value is copied out after the new arming, so a bad
     /// `old_value` pointer reports EFAULT with the new arming in effect.
-    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd arming, validation order,
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd arming, validation order,
     // and CANCEL_ON_SET handling.
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
         &self,
@@ -4036,7 +4036,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// virtual time. Blocking reads poll on scheduler turns (which advance
     /// virtual time); a signal interrupts without consuming, as on Linux,
     /// and the read restarts under SA_RESTART (the kernel's -ERESTARTSYS).
-    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd read counts, EAGAIN, and
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd read counts, EAGAIN, and
     // blocking restart.
     pub async fn read_timerfd<G: Guest<Self>>(
         &self,
@@ -4084,7 +4084,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// timerfd_gettime: remaining time and interval from the virtual clock.
-    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd remaining-time report.
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd remaining-time report.
     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
