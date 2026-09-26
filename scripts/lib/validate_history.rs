@@ -193,13 +193,21 @@ pub struct CacheKey<'a> {
     pub release_builder: &'a str,
 }
 
-/// Builder that produced the E2E payload a row executed; absent means Cargo.
-/// A present value that is not a string names no builder, so it matches
-/// neither `cargo` nor `buck`.
-fn row_release_builder(row: &serde_json::Value) -> &str {
-    match row.get("release_builder") {
-        None => "cargo",
-        Some(v) => v.as_str().unwrap_or("<not a string>"),
+/// Builder that produced the E2E payload a row executed, read together with
+/// the payload it records. A row carrying neither field predates both and was
+/// a Cargo run. Otherwise both must be present, the builder must be `cargo` or
+/// `buck`, and `e2e_payload` must equal exactly that builder's
+/// `e2e_payload_identity`; anything else names no builder and matches neither.
+fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
+    match (row.get("release_builder"), row.get("e2e_payload")) {
+        (None, None) => Some(crate::RELEASE_BUILDER_CARGO),
+        (Some(builder), Some(payload)) => {
+            let builder = builder.as_str()?;
+            let known = builder == crate::RELEASE_BUILDER_CARGO
+                || builder == crate::RELEASE_BUILDER_BUCK;
+            (known && *payload == crate::e2e_payload_identity(builder)).then_some(builder)
+        }
+        _ => None,
     }
 }
 
@@ -416,7 +424,7 @@ pub fn cache_lookup(
             continue;
         }
         if want_result == "pass"
-            && (row_release_builder(row) != key.release_builder || !pass_row_qualifies(row))
+            && (row_release_builder(row) != Some(key.release_builder) || !pass_row_qualifies(row))
         {
             continue;
         }
@@ -571,7 +579,7 @@ pub fn selective_baseline(
                     // A Buck green ran the release payload without debug
                     // invariants, so it is not a last-known-green for Cargo.
                     s(r, "result") == "pass"
-                        && row_release_builder(r) == "cargo"
+                        && row_release_builder(r) == Some("cargo")
                         && s(r, "commit") != "unknown"
                         && !s(r, "commit").is_empty()
                         && want_slot.map(|w| s(r, "slot") == w).unwrap_or(true)
@@ -639,7 +647,7 @@ pub fn self_test() -> Result<String, String> {
         ("different toolchain", base(serde_json::json!({"toolchain": "rustc 2.0", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         // A Buck run executed the release payload, without debug assertions or
         // overflow checks: it is not the run a Cargo request asks for.
-        ("Buck release payload", base(serde_json::json!({"release_builder": "buck", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
+        ("Buck release payload", base(serde_json::json!({"release_builder": "buck", "e2e_payload": crate::e2e_payload_identity("buck"), "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("non-string release builder", base(serde_json::json!({"release_builder": null, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("selective run", base(serde_json::json!({"selection_mode": "selective", "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
         ("not commit-anchored", base(serde_json::json!({"commit_anchored": false, "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 1, "coverage": {"executed_test_nodes": 1, "absent_nodes": []}}))),
@@ -670,10 +678,17 @@ pub fn self_test() -> Result<String, String> {
     // Builder identity, in both directions. A row that names cargo is the
     // same run as a legacy row; a Buck key must refuse either, and a Buck red
     // must still latch the Cargo key for its tree.
-    let mut cargo_named = rs_pass.clone();
-    cargo_named["release_builder"] = serde_json::json!("cargo");
+    let with_identity = |row: &serde_json::Value, builder: serde_json::Value, payload: serde_json::Value| {
+        let mut row = row.clone();
+        row["release_builder"] = builder;
+        row["e2e_payload"] = payload;
+        row
+    };
+    let cargo_identity = crate::e2e_payload_identity("cargo");
+    let buck_identity = crate::e2e_payload_identity("buck");
+    let cargo_named = with_identity(&rs_pass, serde_json::json!("cargo"), cargo_identity.clone());
     if cache_lookup(std::slice::from_ref(&cargo_named), "pass", &key).is_none() {
-        return Err("cache: a row naming the cargo builder must be a Cargo HIT".into());
+        return Err("cache: a row naming the cargo builder and payload must be a Cargo HIT".into());
     }
     accepted += 1;
     let buck_key = CacheKey { release_builder: "buck", ..key };
@@ -682,6 +697,45 @@ pub fn self_test() -> Result<String, String> {
             return Err(format!("cache: a {why} Cargo green answered a Buck request"));
         }
         refused += 1;
+    }
+    let buck_named = with_identity(&rs_pass, serde_json::json!("buck"), buck_identity.clone());
+    if cache_lookup(std::slice::from_ref(&buck_named), "pass", &buck_key).is_none() {
+        return Err("cache: a row naming the buck builder and payload must be a Buck HIT".into());
+    }
+    accepted += 1;
+
+    // The builder and payload are read together: a row whose payload does not
+    // exactly match its builder's identity names no builder, so it answers
+    // neither request. Each row spoils exactly one part of a consistent pair.
+    let mut extra_field = cargo_identity.clone();
+    extra_field["strip"] = serde_json::json!(true);
+    let mut flipped_assertions = cargo_identity.clone();
+    flipped_assertions["debug_assertions"] = serde_json::json!(false);
+    let mut missing_payload = rs_pass.clone();
+    missing_payload["release_builder"] = serde_json::json!("cargo");
+    let mut missing_builder = rs_pass.clone();
+    missing_builder["e2e_payload"] = cargo_identity.clone();
+    let inconsistent: Vec<(&str, serde_json::Value)> = vec![
+        ("cargo builder without a payload", missing_payload),
+        ("cargo payload without a builder", missing_builder),
+        ("cargo builder with the Buck payload", with_identity(&rs_pass, serde_json::json!("cargo"), buck_identity.clone())),
+        ("buck builder with the Cargo payload", with_identity(&rs_pass, serde_json::json!("buck"), cargo_identity.clone())),
+        ("cargo payload with an extra field", with_identity(&rs_pass, serde_json::json!("cargo"), extra_field)),
+        ("cargo payload without debug assertions", with_identity(&rs_pass, serde_json::json!("cargo"), flipped_assertions)),
+        ("unknown builder with the Cargo payload", with_identity(&rs_pass, serde_json::json!("bazel"), cargo_identity.clone())),
+        ("non-string builder with the Cargo payload", with_identity(&rs_pass, serde_json::json!(7), cargo_identity.clone())),
+        ("cargo builder with a null payload", with_identity(&rs_pass, serde_json::json!("cargo"), serde_json::Value::Null)),
+    ];
+    for (why, row) in &inconsistent {
+        for k in [&key, &buck_key] {
+            if cache_lookup(std::slice::from_ref(row), "pass", k).is_some() {
+                return Err(format!(
+                    "cache: a row with {why} answered a {} request",
+                    k.release_builder
+                ));
+            }
+            refused += 1;
+        }
     }
 
     // The reused count must never be relabelled: a node count must print as
@@ -751,6 +805,7 @@ pub fn self_test() -> Result<String, String> {
     }
     let mut buck_failing = failing.clone();
     buck_failing["release_builder"] = serde_json::json!("buck");
+    buck_failing["e2e_payload"] = crate::e2e_payload_identity("buck");
     if cache_lookup(&[buck_failing, rs_pass.clone()], "pass", &key).is_some() {
         return Err("cache: a Buck red on the same tree must latch over a Cargo PASS".into());
     }
@@ -890,11 +945,17 @@ pub fn self_test() -> Result<String, String> {
         return Err("selective: a newer Buck or non-string-builder green must not become the Cargo baseline".into());
     }
     let mut named_cargo = ledger_rows.clone();
-    named_cargo.push(base(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo"})));
+    named_cargo.push(base(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")})));
     if selective_baseline(&named_cargo, None, "mine", &exists_all).as_deref() != Some("eee") {
         return Err("selective: an explicitly Cargo green must remain a baseline".into());
     }
-    refused += 2;
+    let mut mismatched = ledger_rows.clone();
+    mismatched.push(base(serde_json::json!({"slot": "mine", "commit": "fff", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("buck")})));
+    mismatched.push(base(serde_json::json!({"slot": "mine", "commit": "ggg", "producer": "validate.rs", "release_builder": "cargo"})));
+    if selective_baseline(&mismatched, None, "mine", &exists_all).as_deref() != Some("bbb") {
+        return Err("selective: a green whose payload is not the Cargo identity must not become the Cargo baseline".into());
+    }
+    refused += 4;
     accepted += 3;
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
