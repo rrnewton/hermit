@@ -1762,6 +1762,13 @@ pub struct ThreadState<T> {
     /// Stated differently, this is just for message-passing communication.
     pub clone_flags: Option<CloneFlags>,
 
+    /// The guest address and bytes of the directory records that the current
+    /// `getdents` or `getdents64` call copied into the guest's buffer, for
+    /// the bytes of that buffer Detcore cannot read back (see
+    /// [`crate::io_buffers`]). Taken after every syscall.
+    #[serde(skip)]
+    pub(crate) returned_records: Option<(usize, Vec<u8>)>,
+
     /// Registration metadata for a child whose parent cannot resume until the
     /// backend finishes the child. The child consumes this in
     /// `handle_thread_start`; the parent clears its copy when injection returns.
@@ -2190,6 +2197,7 @@ impl<T> ThreadState<T> {
             thread_cpu_start_user_time: last_accounted_user_time,
             thread_cpu_start_system_time: last_accounted_system_time,
             clone_flags: None,
+            returned_records: None,
             pending_vfork: None,
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),

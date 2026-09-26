@@ -32,6 +32,7 @@ use reverie::syscalls::FcntlCmd::*;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
@@ -4240,7 +4241,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             GetdentsCall {
                 call: Syscall::from(call),
-                drain: Syscall::from(call.with_count(call.count().min(DIRECTORY_DRAIN_COUNT))),
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
                 buf,
@@ -4265,7 +4265,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             GetdentsCall {
                 call: Syscall::from(call),
-                drain: Syscall::from(call.with_count(call.count().min(DIRECTORY_DRAIN_COUNT))),
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
                 buf,
@@ -4289,6 +4288,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
+        let negative = i32::try_from(call.capacity).is_err();
         let lock = match guest
             .thread_state()
             .with_detfd(call.fd, |detfd| detfd.directory_lock())
@@ -4299,42 +4299,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             // to keep a stream. Sort the one kernel buffer instead, as before
             // directory streams existed; the kernel reports a descriptor that
             // is not open at all.
+            Err(Errno::EBADF) if negative => {
+                return self.serve_negative_count(guest, call, None).await;
+            }
             Err(Errno::EBADF) => return self.sort_one_buffer(guest, call).await,
             Err(errno) => return Err(errno.into()),
         };
         let _serving = lock.lock().await;
-        let (host_order, needs_snapshot) = guest.thread_state().with_detfd(call.fd, |detfd| {
-            (
-                detfd.directory_in_host_order(),
-                detfd.directory_needs_snapshot(),
-            )
-        })?;
+        let (host_order, needs_snapshot, position) =
+            guest.thread_state().with_detfd(call.fd, |detfd| {
+                (
+                    detfd.directory_in_host_order(),
+                    detfd.directory_needs_snapshot(),
+                    detfd.with_directory_stream(|stream| stream.position()).ok(),
+                )
+            })?;
+        if negative {
+            let stream = if host_order {
+                None
+            } else {
+                position.map(|position| (position, needs_snapshot))
+            };
+            return self.serve_negative_count(guest, call, stream).await;
+        }
         if host_order {
             return self.sort_one_buffer(guest, call).await;
         }
-        if i32::try_from(call.capacity).is_err() {
-            return self.serve_negative_count(guest, call, needs_snapshot).await;
-        }
         if !needs_snapshot {
-            return self.serve_next_batch(guest, call, &[]).await;
+            return self.serve_next_batch(guest, call).await;
         }
-
-        // Reading the host directory writes host-ordered records into the
-        // guest's buffer, but Linux leaves every byte after the returned
-        // records as it was. Keep the bytes a read can overwrite to put back.
-        let mut original = vec![0; call.capacity.min(DIRECTORY_DRAIN_COUNT as usize)];
-        let saved = read_guest_prefix(&guest.memory(), call.buf, &mut original);
-        original.truncate(saved);
-
-        let mut overwritten = 0;
-        let served = match self.snapshot_directory(guest, call, &mut overwritten).await {
+        match self.snapshot_directory_privately(guest, call).await {
             Ok(Some(entries)) => {
                 let mut entries = Some(entries);
                 guest.thread_state().with_detfd(call.fd, |detfd| {
                     detfd.install_directory_snapshot(entries.take().unwrap_or_default())
                 })?;
-                let pristine = &original[..overwritten.min(original.len())];
-                self.serve_next_batch(guest, call, pristine).await
+                self.serve_next_batch(guest, call).await
             }
             Ok(None) => {
                 guest
@@ -4343,19 +4343,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.sort_one_buffer(guest, call).await
             }
             Err(error) => Err(error),
-        };
-        let returned = served.as_ref().map_or(0, |&len| len as usize);
-        let end = overwritten.min(original.len());
-        if returned < end {
-            // Up to the first page the guest cannot write. A failure keeps the
-            // call's own result: the stream has already moved.
-            write_guest_prefix(
-                &mut guest.memory(),
-                unsafe { call.buf.add(returned) },
-                &original[returned..end],
-            );
         }
-        served
     }
 
     /// Answer a `getdents` whose count does not fit in an `int`. Linux keeps
@@ -4367,37 +4355,36 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// truncate the guest's count to an `int` would copy host records into
     /// the guest's buffer.
     ///
-    /// Between `EINVAL` and 0, the stream decides, since the kernel position
-    /// only follows it. Without a snapshot, the stream position may still be
-    /// past the start (a seek after a rewind), so a snapshot is taken first,
-    /// reading the directory into scratch space on the guest's stack rather
-    /// than into a buffer that Linux does not touch. If that fails -- a record
-    /// does not fit in the space -- the kernel's answer, from the start of the
-    /// directory where the attempt leaves it, is returned.
+    /// `stream` is the directory stream's position and whether it needs a
+    /// snapshot, or `None` when the open file has no stream (it has not been
+    /// read, is read in host order, or is not tracked). Then the guest's
+    /// position is the kernel's, so the kernel's answer is Linux's. So it is
+    /// for a stream rewound to 0, whose kernel position is the start. A
+    /// stream that has a snapshot decides between `EINVAL` and 0 itself. A
+    /// stream rewound and then seeked past 0 needs to know how many entries
+    /// the directory has, so a snapshot is taken (see
+    /// [`Self::snapshot_directory_privately`]); if that fails, the kernel's
+    /// answer from the start is returned, which is `EINVAL` even at or past
+    /// the end.
     async fn serve_negative_count<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
-        needs_snapshot: bool,
+        stream: Option<(u64, bool)>,
     ) -> Result<i64, Error> {
+        if let Some((_, true)) = stream {
+            // Without a snapshot, the kernel position of a stream is the
+            // start; a descriptor Detcore does not track may have moved it.
+            self.move_directory_kernel_position(guest, call.fd, 0).await;
+        }
         let kernel = self.record_or_replay(guest, call.empty).await;
         match kernel {
             Ok(_) | Err(Errno::EINVAL) => {}
             Err(errno) => return Err(errno.into()),
         }
-        if needs_snapshot {
-            let mut stack = guest.stack().await;
-            if stack.capacity() < DIRECTORY_SCRATCH_COUNT as usize {
-                return Ok(kernel.map(|_| 0)?);
-            }
-            let scratch: AddrMut<[u8; DIRECTORY_SCRATCH_COUNT as usize]> = stack.reserve();
-            let _scratch = stack.commit()?;
-            let mut overwritten = 0;
-            let scratch = call.into_scratch(scratch.cast(), DIRECTORY_SCRATCH_COUNT);
-            match self
-                .snapshot_directory(guest, scratch, &mut overwritten)
-                .await
-            {
+        match stream {
+            None | Some((0, true)) => return Ok(kernel.map(|_| 0)?),
+            Some((_, true)) => match self.snapshot_directory_privately(guest, call).await {
                 Ok(Some(entries)) => {
                     let mut entries = Some(entries);
                     let target = guest.thread_state().with_detfd(call.fd, |detfd| {
@@ -4408,7 +4395,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .await;
                 }
                 Ok(None) | Err(_) => return Ok(kernel.map(|_| 0)?),
-            }
+            },
+            Some((_, false)) => {}
         }
         let batch = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| stream.next_batch(call.format, 0))
@@ -4419,8 +4407,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Return the entries at the stream's position that fit in the guest's
     /// buffer, with determinized inodes and each `d_off` naming the position
-    /// after its entry, counting from 1. `pristine` is what the guest had in
-    /// the first bytes of its buffer, where this call has already written.
+    /// after its entry, counting from 1.
     ///
     /// Whatever the outcome, the kernel position then follows the stream (see
     /// [`DirectoryStream::kernel_target`]).
@@ -4428,7 +4415,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
-        pristine: &[u8],
     ) -> Result<i64, Error> {
         let (start, batch) = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| {
@@ -4452,8 +4438,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
                     ends.push((written, records.len()));
                 }
-                copy_records(&mut guest.memory(), call.buf, &records, &ends, pristine)
-                    .map(|count| (count, count.checked_sub(1).map_or(0, |last| ends[last].1)))
+                let copied = copy_records(&mut guest.memory(), call.buf, &records, &ends)
+                    .map(|count| (count, count.checked_sub(1).map_or(0, |last| ends[last].1)));
+                if let Ok((_, len)) = copied {
+                    records.truncate(len);
+                    guest.thread_state_mut().returned_records = Some((call.buf.as_raw(), records));
+                }
+                copied
             }
             Err(errno) => Err(errno),
         };
@@ -4524,33 +4515,88 @@ impl<T: RecordOrReplay> Detcore<T> {
             });
             guest.memory().write_exact(call.buf, &records[..written])?;
         }
-        Ok(records.len() as i64)
+        let len = records.len() as i64;
+        guest.thread_state_mut().returned_records = Some((call.buf.as_raw(), records));
+        Ok(len)
     }
 
-    /// Read the whole host directory by issuing `call.drain` until it returns
-    /// 0, and return its entries in host order. Once a read is issued,
-    /// `overwritten` is set to its count, which bounds what any read may have
-    /// written into the guest's buffer.
+    /// Read the whole host directory behind `call.fd` into a private mapping
+    /// (see [`Self::snapshot_directory`]), and return its entries in host
+    /// order.
+    ///
+    /// Linux writes nothing into guest memory but the records a call returns,
+    /// so the reads do not go to the guest's buffer, which may be too small
+    /// for any entry, unreadable, or partly unmapped, nor to its stack. They
+    /// go to an anonymous mapping injected for the purpose and unmapped
+    /// before the guest runs again, as the atomic `writev` does for its
+    /// iovecs. The mapping is fresh, so the reads leave nothing that the
+    /// guest could see.
+    ///
+    /// Returns `None`, with the kernel position where the guest left it, when
+    /// the mapping cannot be made (the guest's address space is at its
+    /// limit): the open file is then read in host order.
+    async fn snapshot_directory_privately<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: GetdentsCall<'_>,
+    ) -> Result<Option<Vec<DirEntry>>, Error> {
+        let len = DIRECTORY_DRAIN_COUNT as usize;
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        let Some(scratch) = mapped
+            .ok()
+            .and_then(|addr| usize::try_from(addr).ok())
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            return Ok(None);
+        };
+        let snapshot = self
+            .snapshot_directory(guest, call.into_scratch(scratch, DIRECTORY_DRAIN_COUNT))
+            .await;
+        let unmapped = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(Addr::from(scratch).cast()))
+                    .with_len(len),
+            ))
+            .await;
+        // A mapping left behind would be visible to the guest.
+        unmapped?;
+        snapshot
+    }
+
+    /// Read the whole host directory by issuing `call.call` until it returns
+    /// 0, and return its entries in host order. `call` reads into a private
+    /// mapping that holds any entry.
     ///
     /// Every step goes through `record_or_replay`, so a replay reads the same
     /// entries from the log. The reads must start at the beginning of the
     /// directory: a known directory is rewound there, and before the first
     /// snapshot the kernel position must already be 0.
     ///
+    /// The first read fails as the guest's call would at any position: the
+    /// descriptor is not a directory, or the directory has been removed.
+    ///
     /// Returns `None` when this open file must be read in host order instead,
     /// with the kernel position where the guest left it. Either the position
     /// was moved before the first `getdents`, to a host cookie that no entry
-    /// index stands for, or a read after the first failed -- an entry does not
-    /// fit in the guest's buffer, or the buffer stops being writable before
-    /// it -- so the directory cannot be read to its end with it. A
-    /// regular file, pipe or `O_PATH` descriptor whose position is not 0 also
-    /// lands here, and reading it in host order reports the kernel's error
-    /// without moving its offset.
+    /// index stands for, or a read after the first failed, so the directory
+    /// cannot be read to its end. A regular file, pipe or `O_PATH` descriptor
+    /// whose position is not 0 also lands here, and reading it in host order
+    /// reports the kernel's error without moving its offset.
     async fn snapshot_directory<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
-        overwritten: &mut usize,
     ) -> Result<Option<Vec<DirEntry>>, Error> {
         let known_directory = guest
             .thread_state()
@@ -4572,53 +4618,34 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         }
 
-        // A read that stops at a record it cannot copy may already have
-        // written part of that record, which can be longer than `NAME_MAX`
-        // allows (FUSE names reach 1024 bytes); only the count bounds it.
-        let drain_count = call.capacity.min(DIRECTORY_DRAIN_COUNT as usize);
         let mut entries = Vec::new();
         let mut read_any = false;
         let error: Error = loop {
-            let len = match self.record_or_replay(guest, call.drain).await {
+            let len = match self.record_or_replay(guest, call.call).await {
                 Ok(0) => return Ok(Some(entries)),
                 Ok(len) => len as usize,
-                Err(error) => {
-                    *overwritten = drain_count;
-                    break error.into();
-                }
+                Err(error) => break error.into(),
             };
             read_any = true;
-            *overwritten = drain_count;
             match read_records(&guest.memory(), call.buf, len, call.format) {
                 Ok(parsed) => entries.extend(parsed),
                 Err(error) => break error.into(),
             }
         };
         if !read_any {
-            // The guest's own call starts at the same position, so it would
-            // have failed the same way.
             return Err(error);
         }
         // The earlier reads moved the position, which the guest's call must
-        // find where the guest left it. The directory cannot be read to its
-        // end with this buffer -- a later entry does not fit, or the buffer
-        // stops being writable before it -- but the guest's call from the
-        // start returns what Linux returns: the entries that fit, or an error.
+        // find where the guest left it: at the start.
         self.record_or_replay(guest, lseek(0, Whence::SEEK_SET))
             .await?;
         Ok(None)
     }
 }
 
-/// The most bytes one read of the host directory asks for. Reading it writes
-/// into the guest's buffer, whose original contents are kept to be put back.
+/// The size of the private mapping that a snapshot reads the host directory
+/// into, and so the most bytes one read of it asks for. It holds any entry.
 const DIRECTORY_DRAIN_COUNT: u32 = 64 * 1024;
-
-/// The size of the scratch space on the guest's stack that a snapshot for a
-/// `getdents` with a negative count reads the directory into. It holds any
-/// record with a name of up to `NAME_MAX` bytes, and fits in the smallest
-/// stack a backend offers (896 bytes on ptrace).
-const DIRECTORY_SCRATCH_COUNT: u32 = 512;
 
 /// The granularity at which the guest's buffer can stop being writable.
 const DIRECTORY_PAGE: usize = 4096;
@@ -4659,16 +4686,12 @@ fn read_records(
 /// Read the start of the guest's buffer into `bytes`, up to the first page the
 /// guest cannot read, and return how many bytes were read.
 ///
-/// This and [`write_guest_prefix`] use only vectored copies, one page per
+/// This and [`write_guest_pieces`] use only vectored copies, one page per
 /// piece, which respect the guest's page protection. Reverie's `read` and
 /// `write` do not always: on the ptrace backend, a copy of at most 8 bytes goes
 /// through `PTRACE_PEEKDATA` or `PTRACE_POKEDATA`, which reach a page the guest
 /// has made inaccessible.
-pub(crate) fn read_guest_prefix(
-    memory: &impl MemoryAccess,
-    buf: AddrMut<u8>,
-    bytes: &mut [u8],
-) -> usize {
+fn read_guest_prefix(memory: &impl MemoryAccess, buf: AddrMut<u8>, bytes: &mut [u8]) -> usize {
     let mut done = 0;
     for pages in guest_pages(buf.as_raw(), bytes.len()).chunks(PAGES_PER_COPY) {
         let from = pages[0].0;
@@ -4689,13 +4712,6 @@ pub(crate) fn read_guest_prefix(
         }
     }
     done
-}
-
-/// Write `bytes` to the start of the guest's buffer, up to the first page the
-/// guest cannot write, and return how many bytes were written. See
-/// [`read_guest_prefix`].
-fn write_guest_prefix(memory: &mut impl MemoryAccess, buf: AddrMut<u8>, bytes: &[u8]) -> usize {
-    write_guest_pieces(memory, buf, bytes, &guest_pages(buf.as_raw(), bytes.len()))
 }
 
 /// Write the `pieces` of `bytes`, each an offset and a length within one page,
@@ -4732,17 +4748,47 @@ fn write_guest_pieces(
     done
 }
 
+/// Read what the guest has in the `bytes.len()` bytes at `buf` into `bytes`,
+/// page by page, and return the pages (see [`guest_pages`]) that could be
+/// read. A page that cannot be read does not stop the pages after it.
+pub(crate) fn read_guest_pages(
+    memory: &impl MemoryAccess,
+    buf: AddrMut<u8>,
+    bytes: &mut [u8],
+) -> Vec<(usize, usize)> {
+    let pages = guest_pages(buf.as_raw(), bytes.len());
+    let mut readable = Vec::with_capacity(pages.len());
+    let mut next = 0;
+    while next < pages.len() {
+        let from = pages[next].0;
+        let read = read_guest_prefix(memory, unsafe { buf.add(from) }, &mut bytes[from..]);
+        while next < pages.len() && pages[next].0 + pages[next].1 <= from + read {
+            readable.push(pages[next]);
+            next += 1;
+        }
+        // The page that stopped the read.
+        next += 1;
+    }
+    readable
+}
+
 /// The order in which [`copy_records`] writes records whose `ends` are given,
-/// into a guest buffer at `addr`: the pieces, each within one page, and for
-/// each record, how many bytes of the pieces, in order, must be written for
-/// Linux's writes to it to be complete.
+/// into a guest buffer at `addr` whose pages `saved(offset)` could be read:
+/// the pieces, each within one page, and for each record, how many bytes of
+/// the pieces, in order, must be written for Linux's writes to it to be
+/// complete.
 ///
-/// The pieces follow the buffer, except that the part of a record that Linux
-/// writes is written from its last page to its first when it crosses pages.
-/// A record that ends in a page the guest cannot write then leaves nothing in
-/// the pages before it, which is what Linux leaves when that page cannot be
-/// written either.
-fn record_pieces(addr: usize, ends: &[(usize, usize)]) -> (Vec<(usize, usize)>, Vec<usize>) {
+/// The pieces follow the buffer, except where the part of a record that
+/// Linux writes crosses pages. Then the pieces in pages that could be read
+/// come first, so that they can be put back if a later piece of the record
+/// cannot be written. The others follow in the order of Linux's writes: from
+/// `d_ino`, or from `d_off` for the first record of a call, whose first write
+/// is the `d_off` of the record before it.
+fn record_pieces(
+    addr: usize,
+    ends: &[(usize, usize)],
+    saved: impl Fn(usize) -> bool,
+) -> (Vec<(usize, usize)>, Vec<usize>) {
     let page = |offset: usize| (addr + offset) / DIRECTORY_PAGE;
     let pages = |from: usize, to: usize| {
         guest_pages(addr + from, to - from)
@@ -4760,7 +4806,17 @@ fn record_pieces(addr: usize, ends: &[(usize, usize)]) -> (Vec<(usize, usize)>, 
         if written > start && page(start) != page(written - 1) {
             pieces.extend(pages(run, start));
             placed += start - run;
-            pieces.extend(pages(start, written).collect::<Vec<_>>().into_iter().rev());
+            let (kept, mut lost): (Vec<_>, Vec<_>) =
+                pages(start, written).partition(|&(at, _)| saved(at));
+            // Where Linux first writes to the record.
+            let first = if start == 0 { start + 8 } else { start };
+            let first = lost
+                .iter()
+                .position(|&(at, len)| first < at + len)
+                .unwrap_or(0);
+            lost.rotate_left(first);
+            pieces.extend(kept);
+            pieces.extend(lost);
             placed += written - start;
             run = written;
         }
@@ -4778,50 +4834,57 @@ fn record_pieces(addr: usize, ends: &[(usize, usize)]) -> (Vec<(usize, usize)>, 
 /// Linux does not write the padding after a name, so a record whose padding
 /// the guest cannot write is still copied.
 ///
-/// Every byte after the records copied is left as the guest had it: a record
-/// that is not copied is not written (see [`record_pieces`]). `pristine` is
-/// what the guest had in the first bytes of the buffer, which this call has
-/// already overwritten.
+/// Every byte after the records copied that the guest can read is left as
+/// the guest had it (see [`record_pieces`]): a record that is not copied is
+/// put back. Bytes the guest can write but not read cannot be put back. Only
+/// a record lying in two such pages, or in one such page before one it
+/// cannot write, can leave some there, and Linux leaves them too: it writes
+/// such a record from its start until the first byte it cannot write.
 fn copy_records(
     memory: &mut impl MemoryAccess,
     buf: AddrMut<u8>,
     records: &[u8],
     ends: &[(usize, usize)],
-    pristine: &[u8],
 ) -> Result<usize, Errno> {
     if records.is_empty() {
         return Ok(0);
     }
-    let kept = pristine.len().min(records.len());
     let mut before = vec![0; records.len()];
-    before[..kept].copy_from_slice(&pristine[..kept]);
-    let readable = kept + read_guest_prefix(memory, unsafe { buf.add(kept) }, &mut before[kept..]);
-    let (pieces, complete) = record_pieces(buf.as_raw(), ends);
+    let readable = read_guest_pages(memory, buf, &mut before);
+    let saved = |offset: usize| {
+        readable
+            .binary_search_by(|&(at, len)| {
+                if at + len <= offset {
+                    std::cmp::Ordering::Less
+                } else if at > offset {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    };
+    let (pieces, complete) = record_pieces(buf.as_raw(), ends, saved);
     let written = write_guest_pieces(memory, buf, records, &pieces);
     let count = complete
         .iter()
         .take_while(|&&needed| needed <= written)
         .count();
     let returned = count.checked_sub(1).map_or(0, |last| ends[last].1);
-    // Only a page the guest can write after one it cannot leaves bytes past
-    // the records copied: the end of a record, written before its start.
+    // Put back what was written past the records copied, where it can be.
     let mut placed = 0;
-    let mut dirty = 0;
+    let mut restore = Vec::new();
     for &(at, len) in &pieces {
         if placed + len > written {
             break;
         }
         placed += len;
-        dirty = dirty.max(at + len);
+        if at + len > returned && saved(at) {
+            let from = at.max(returned);
+            restore.push((from, at + len - from));
+        }
     }
-    if dirty > returned {
-        let restore = dirty.min(readable).max(returned);
-        write_guest_prefix(
-            memory,
-            unsafe { buf.add(returned) },
-            &before[returned..restore],
-        );
-    }
+    write_guest_pieces(memory, buf, &before, &restore);
     if count == 0 {
         Err(Errno::EFAULT)
     } else {
@@ -4834,8 +4897,6 @@ fn copy_records(
 struct GetdentsCall<'a> {
     /// The call as the guest made it.
     call: Syscall,
-    /// The same call asking for at most [`DIRECTORY_DRAIN_COUNT`] bytes.
-    drain: Syscall,
     /// The same call asking for no bytes.
     empty: Syscall,
     fd: RawFd,
@@ -4848,7 +4909,7 @@ struct GetdentsCall<'a> {
 impl<'a> GetdentsCall<'a> {
     /// The same call reading at most `count` bytes into `buf` instead.
     fn into_scratch<'b>(self, buf: AddrMut<'b, u8>, count: u32) -> GetdentsCall<'b> {
-        let drain = match self.call {
+        let call = match self.call {
             Syscall::Getdents(call) => {
                 Syscall::from(call.with_dirent(Some(buf.cast())).with_count(count))
             }
@@ -4858,8 +4919,7 @@ impl<'a> GetdentsCall<'a> {
             other => other,
         };
         GetdentsCall {
-            call: drain,
-            drain,
+            call,
             empty: self.empty,
             fd: self.fd,
             buf,
@@ -5002,10 +5062,13 @@ mod procfs_wiring_guard {
 mod test {
     use nix::fcntl::OFlag;
     use reverie::syscalls::FromToRaw;
+    use reverie::syscalls::LocalMemory;
     use reverie::syscalls::Whence;
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
     use super::pipe_capacity_request_exceeds_ceiling;
+    use crate::test_pages::PAGE;
+    use crate::test_pages::Pages;
     /// The ceiling is inclusive. A guest that reads the advertised
     /// `pipe-max-size` and asks for exactly that must be allowed to have it;
     /// refusing at the boundary would advertise a size that cannot be set.
@@ -5304,6 +5367,182 @@ mod test {
 
         for len in 0..8 {
             canonicalize_tcp_info(&mut [0xff; 8][..len]);
+        }
+    }
+
+    /// Records of names `names` (a byte each), as `serve_next_batch` encodes
+    /// them, with where Linux's writes to each end and where each ends.
+    fn directory_records(
+        format: super::DirentFormat,
+        names: impl IntoIterator<Item = u8>,
+    ) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let mut records = Vec::new();
+        let mut ends = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let entry = super::DirEntry {
+                name: vec![name],
+                ino: 0x1111_1111_1111_1111,
+                off: 0,
+                ty: 4,
+            };
+            let written = records.len() + format.written_len(1);
+            format.encode(&entry, entry.ino, index as i64 + 1, &mut records);
+            ends.push((written, records.len()));
+        }
+        (records, ends)
+    }
+
+    const FORMATS: [super::DirentFormat; 2] =
+        [super::DirentFormat::Dirent64, super::DirentFormat::Legacy];
+
+    /// A buffer starting 16 bytes before a writable page, in a page the guest
+    /// cannot write: Linux's first write, to the first record's `d_off`,
+    /// fails, so the call fails and the writable page is left as it was.
+    #[test]
+    fn a_first_record_that_cannot_be_written_leaves_the_next_page_untouched() {
+        for protection in [libc::PROT_NONE, libc::PROT_READ] {
+            for format in FORMATS {
+                let pages = Pages::new(&[protection, libc::PROT_READ | libc::PROT_WRITE]);
+                let (records, ends) = directory_records(format, *b"abcdefghij");
+                let copied = super::copy_records(
+                    &mut LocalMemory::new(),
+                    pages.address(PAGE - 16),
+                    &records,
+                    &ends,
+                );
+                assert_eq!(copied, Err(Errno::EFAULT), "{format:?} {protection}");
+                assert!(
+                    pages.contents().iter().all(|&byte| byte == Pages::FILL),
+                    "{format:?} after a page with protection {protection}: bytes changed"
+                );
+            }
+        }
+    }
+
+    /// Records of 24 bytes starting 100 bytes before a page the guest cannot
+    /// write: four fit, the fifth's written part crosses into that page, so
+    /// four are copied and the four bytes of the fifth before the page are
+    /// left as they were.
+    #[test]
+    fn a_record_crossing_into_an_inaccessible_page_leaves_nothing_before_it() {
+        for format in FORMATS {
+            let pages = Pages::new(&[libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE]);
+            let (records, ends) = directory_records(format, *b"abcdefghij");
+            assert_eq!(ends[3].1, 96);
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(PAGE - 100),
+                &records,
+                &ends,
+            );
+            assert_eq!(copied, Ok(4), "{format:?}");
+            let contents = pages.contents();
+            assert_eq!(
+                &contents[PAGE - 100..PAGE - 4],
+                &records[..96],
+                "{format:?}"
+            );
+            assert!(
+                contents[..PAGE - 100]
+                    .iter()
+                    .chain(&contents[PAGE - 4..])
+                    .all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes outside the records copied changed"
+            );
+        }
+    }
+
+    /// A buffer starting 4 bytes before a page the guest cannot write, in a
+    /// page it can write but not read. Linux first writes the first record's
+    /// `d_off`, 8 bytes in, which fails; it never writes the 4 bytes before
+    /// the page. Those bytes could not be put back, so they must not be
+    /// written.
+    #[test]
+    fn a_first_record_is_written_from_its_d_off() {
+        for format in FORMATS {
+            let pages = Pages::new(&[libc::PROT_WRITE, libc::PROT_NONE]);
+            let (records, ends) = directory_records(format, *b"abc");
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(PAGE - 4),
+                &records,
+                &ends,
+            );
+            assert_eq!(copied, Err(Errno::EFAULT), "{format:?}");
+            assert!(
+                pages.contents().iter().all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes before the inaccessible page changed"
+            );
+        }
+    }
+
+    /// Records across two writable pages and into a third the guest cannot
+    /// write. Every record before the one crossing into the third page is
+    /// copied; what was written of that one is put back.
+    #[test]
+    fn a_record_not_copied_is_put_back() {
+        for format in FORMATS {
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+            let pages = Pages::new(&[rw, rw, libc::PROT_NONE]);
+            let start = PAGE - 40;
+            let (records, ends) = directory_records(format, (0..200).map(|i| b'a' + i % 26));
+            // The first record whose written part crosses into the third page.
+            let crossing = ends
+                .iter()
+                .position(|&(written, _)| start + written > 2 * PAGE)
+                .unwrap();
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(start),
+                &records,
+                &ends,
+            );
+            assert_eq!(copied, Ok(crossing), "{format:?}");
+            let returned = ends[crossing - 1].1;
+            let contents = pages.contents();
+            assert_eq!(
+                &contents[start..start + returned],
+                &records[..returned],
+                "{format:?}"
+            );
+            assert!(
+                contents[..start]
+                    .iter()
+                    .chain(&contents[start + returned..])
+                    .all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes outside the records copied changed"
+            );
+        }
+    }
+
+    /// Records that all fit are all copied, and the bytes after them are left
+    /// as they were.
+    #[test]
+    fn records_that_fit_are_copied_whole() {
+        for format in FORMATS {
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+            let pages = Pages::new(&[rw, rw]);
+            let (records, ends) = directory_records(format, *b"abcdefghij");
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(PAGE - 50),
+                &records,
+                &ends,
+            );
+            assert_eq!(copied, Ok(10), "{format:?}");
+            let contents = pages.contents();
+            assert_eq!(
+                &contents[PAGE - 50..PAGE - 50 + records.len()],
+                &records[..],
+                "{format:?}"
+            );
+            assert!(
+                contents[..PAGE - 50]
+                    .iter()
+                    .chain(&contents[PAGE - 50 + records.len()..])
+                    .all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes outside the records changed"
+            );
         }
     }
 }

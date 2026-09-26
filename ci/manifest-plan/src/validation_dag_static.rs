@@ -224,10 +224,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.hermit_unit", 723),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
-    // Ten directory-stream controls retain all 748 prior identities.
-    ("test.detcore_unit", 758),
-    // Twenty-one whole-stream readdir_order tests retain all 27 prior identities.
-    ("test.detcore_misc", 48),
+    // Sixteen directory-stream controls retain all 748 prior identities.
+    ("test.detcore_unit", 764),
+    // Twenty-six whole-stream readdir_order tests retain all 27 prior identities.
+    ("test.detcore_misc", 53),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -253,9 +253,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 48),
+    ("test.detcore_misc_on_host", 53),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 758),
+    ("test.detcore_unit_on_host", 764),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 160),
     ("test.hermit_unit_on_host", 723),
