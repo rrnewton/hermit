@@ -6102,27 +6102,45 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         .expect("failed to spawn the sigint-instakill run");
     let stdin = child.stdin.take().expect("piped stdin");
 
-    // hermit -> container init -> guest. Poll: the two forks must both have
-    // happened before there is a guest to signal.
+    // hermit -> container init -> guest. Poll: the two forks and the guest's
+    // exec must all have happened before there is a guest to signal. Between
+    // the fork and the exec the grandchild still runs Hermit's image, with comm
+    // "hermit"; signalling it then would test a pre-exec Hermit process, not
+    // the guest.
+    let comm_of = |pid: i32| {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last_seen = None;
     let guest = loop {
-        let found = children_of(child.id() as i32)
+        let grandchildren: Vec<i32> = children_of(child.id() as i32)
             .into_iter()
             .flat_map(children_of)
-            .next();
-        if let Some(pid) = found {
+            .collect();
+        if let Some(&pid) = grandchildren.iter().find(|&&pid| comm_of(pid) == "cat") {
             break Some(pid);
+        }
+        if let Some(&pid) = grandchildren.first() {
+            last_seen = Some((pid, comm_of(pid)));
         }
         if std::time::Instant::now() >= deadline {
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    let guest = guest.expect("the guest never appeared under the container within 30s");
+    let guest = guest.unwrap_or_else(|| match last_seen {
+        None => panic!("the guest never appeared under the container within 30s"),
+        Some((pid, comm)) => panic!(
+            "walked to the wrong process: no grandchild became cat within 30s; last seen pid {pid} comm {comm:?}"
+        ),
+    });
 
     // Verify WHICH process is being signalled rather than trusting the walk.
-    let comm = std::fs::read_to_string(format!("/proc/{guest}/comm")).unwrap_or_default();
-    assert_eq!(comm.trim(), "cat", "walked to the wrong process: {comm:?}");
+    let comm = comm_of(guest);
+    assert_eq!(comm, "cat", "walked to the wrong process: {comm:?}");
 
     std::thread::sleep(std::time::Duration::from_millis(500));
     // SAFETY: `kill` on a pid in this process's own tree, verified above.
