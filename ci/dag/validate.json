@@ -2837,6 +2837,20 @@
         {
           "lane": "portable",
           "category": "backend-parity-c",
+          "test": "backend-parity-c/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timerfd-semantics",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
           "test": "backend-parity-c/umask-mode",
           "mode": "verify",
           "backend": "kvm"
@@ -7894,7 +7908,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "748",
+        "NEXTEST_EXPECTED_EXECUTED": "760",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -10049,6 +10063,20 @@
           "lane": "portable",
           "category": "backend-parity-c",
           "test": "backend-parity-c/thp-disable",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timerfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -16286,6 +16314,20 @@
           "lane": "portable",
           "category": "backend-parity-c",
           "test": "backend-parity-c/thp-disable",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timer-family-identity",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/timerfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -62242,7 +62284,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "748",
+        "NEXTEST_EXPECTED_EXECUTED": "760",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
