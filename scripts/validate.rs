@@ -804,6 +804,12 @@ mod e2e_payload_identity_tests {
             assert!(flags.contains(if recorded { on } else { off }), "{field}={recorded} vs {flags}");
             assert!(!flags.contains(if recorded { off } else { on }), "{field} contradicted by {flags}");
         }
+        // The release target's own rustc_flags come after the toolchain's and
+        // would override them, in either the one- or two-token spelling.
+        let target = read(&test_source_root(), "hermit-cli/BUCK");
+        for class in ["debug-assertions", "overflow-checks"] {
+            assert!(!target.contains(class), "hermit-cli/BUCK sets {class}");
+        }
     }
 
     #[test]
@@ -821,8 +827,12 @@ mod e2e_payload_identity_tests {
                 !(line.starts_with("[profile.dev]") || line.starts_with("[profile.dev.package.\"*\"]")),
                 "Cargo.toml overrides the whole dev profile: {line}"
             );
+            // Anywhere on the line, not only as a leading key: a dotted
+            // `profile.dev.debug-assertions` key or an inline package table
+            // sets the class just as well.
+            let setting = line.split('#').next().unwrap_or_default();
             assert!(
-                !(line.starts_with("debug-assertions") || line.starts_with("overflow-checks")),
+                !(setting.contains("debug-assertions") || setting.contains("overflow-checks")),
                 "Cargo.toml sets a check class: {line}"
             );
         }
