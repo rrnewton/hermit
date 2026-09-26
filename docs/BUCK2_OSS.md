@@ -204,6 +204,25 @@ action's `execution_kind` from the event log. It accepts only the local kinds
 `local_action_cache`) and refuses any remote, remote-cache, or unknown kind.
 The per-kind counts are recorded in the receipt, so a daemon that reused
 every result (no actions) is distinguishable from a local rebuild.
+The census is corroboration, not the guarantee. A result the daemon reuses from
+memory emits no action event at all. A `local_dep_file` or `local_action_cache`
+hit can serve an output whose cached entry records it as produced remotely
+(`was_produced_locally = false`). "Built locally" therefore rests on
+`--no-remote-cache` and on the absence of any remote-execution configuration.
+The event census confirms that nothing it can see contradicts this.
+Measured at the phase-two head with the pinned Buck2, every build passing
+`--no-remote-cache`:
+
+| Build | Actions executed | Wall time |
+| --- | --- | --- |
+| Slot checkout, first build at a new stamp value | 2,213 (535 `local`, 373 `local_action_cache`, 1,305 `simple`) | 202 s |
+| Same checkout, repeated twice | 0 each | about 0.1 s each |
+| Same checkout, two concurrent builds after a stamp change | 12 and 0 | 68 s each |
+| Fresh second checkout of the same tree | 2,220 (909 `local`, 1,311 `simple`) | 229 s |
+
+No remote kind appeared in any build. Local reuse works within one checkout,
+including between concurrent builds. Nothing is reused across checkouts,
+because each checkout has its own `buck-out/` and daemon.
 Before upload, a separate 10-second process-group-bounded CLI-only probe decodes
 that candidate's typed `version --json` and requires the exact metadata and
 `dbt`/`e9patch`/`sabre` feature facts. This rejects an executable decoy without
