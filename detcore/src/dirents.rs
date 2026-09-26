@@ -284,7 +284,8 @@ impl DirentFormat {
     /// Decode records as [`parse`](Self::parse) does when only the first
     /// `readable` bytes of them could be read; the rest are zeroed. Linux does
     /// not write the padding after the last record's name, which can lie in a
-    /// page the guest cannot read, so only that padding may be missing: any
+    /// page the guest cannot read, so only that padding may be missing, and
+    /// only as long as Linux makes it for that name, at most 7 bytes: any
     /// other missing byte is `EFAULT`.
     pub(crate) fn parse_written(
         self,
@@ -302,8 +303,17 @@ impl DirentFormat {
         for _ in 1..entries.len() {
             last += usize::from(u16::from_ne_bytes([bytes[last + 16], bytes[last + 17]]));
         }
+        let reclen = len - last;
         match entries.last() {
-            Some(entry) if last + self.written_len(entry.name.len()) <= readable => Ok(entries),
+            // Only a record as long as Linux makes it for its name ends in
+            // padding alone; any other length would count bytes of the record
+            // as padding.
+            Some(entry)
+                if reclen == self.record_len(entry.name.len())
+                    && last + self.written_len(entry.name.len()) <= readable =>
+            {
+                Ok(entries)
+            }
             _ => Err(Errno::EFAULT),
         }
     }
@@ -1095,6 +1105,28 @@ mod test {
                         "{format:?}, {readable} readable"
                     );
                 }
+            }
+        }
+    }
+
+    /// A record whose `d_reclen` is longer than Linux makes it for its name,
+    /// as another mapping of the same memory can make it. Only the bytes after
+    /// the name's NUL could be read, so they cannot all be padding.
+    #[test]
+    fn a_record_longer_than_its_name_needs_is_not_padding() {
+        let mut bytes = Vec::new();
+        DirentFormat::Dirent64.encode(&entry("a"), 5, 1, &mut bytes);
+        bytes.resize(64, 0x5a);
+        bytes[16..18].copy_from_slice(&64u16.to_ne_bytes());
+        let whole = DirentFormat::Dirent64.parse(&bytes).unwrap();
+        assert_eq!(whole.len(), 1);
+        for readable in 0..=bytes.len() {
+            let mut read = bytes.clone();
+            let parsed = DirentFormat::Dirent64.parse_written(&mut read, readable);
+            if readable == bytes.len() {
+                assert_eq!(parsed, Ok(whole.clone()), "{readable} readable");
+            } else {
+                assert_eq!(parsed, Err(Errno::EFAULT), "{readable} readable");
             }
         }
     }
