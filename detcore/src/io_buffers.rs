@@ -54,6 +54,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
 use crate::digest::Digest;
+use crate::dirents::DirentFormat;
 use crate::types::DetTid;
 
 /// One contiguous run of guest bytes a completed syscall moved.
@@ -425,36 +426,33 @@ fn extent_digests<G, T>(
     guest: &mut G,
     addr: u64,
     len: u64,
-    copied: Option<&[u8]>,
+    records: bool,
 ) -> Result<(Digest, usize, Vec<String>, usize), Error>
 where
     G: Guest<T>,
     T: Tool,
 {
-    let (buf, unreadable) = read_extent(&guest.memory(), addr, len, copied)?;
+    let (buf, unread) = read_extent(&guest.memory(), addr, len, records)?;
     let whole = Digest::new(buf.as_slice());
     let (chunk, chunks) = chunk_digests(buf.as_slice());
-    Ok((whole, chunk, chunks, unreadable))
+    Ok((whole, chunk, chunks, unread))
 }
 
 /// Read the `len` bytes at `addr` that a completed syscall moved, and return
-/// them with how many of them the guest cannot read.
+/// them with how many bytes at their end were not read.
 ///
 /// An extent that the guest cannot read is an error, which replaces the
-/// syscall's result. The one exception is the directory records that Detcore
-/// itself copied into the guest's buffer for `getdents64`, given as `copied`.
-/// The guest's buffer may be writable but not readable, and Linux does not
-/// write the padding after the last record's name, which may lie in a page
-/// the guest cannot access at all. The syscall has already completed, so its
-/// result stands: every page the guest can read is taken from the guest, and
-/// every other page from `copied`, which is what was written there, but for
-/// that padding. Which pages can be read follows the guest's page
-/// protection, so it is the same in every run.
+/// syscall's result. The one exception is `getdents64` records, when
+/// `records` is set: Linux does not write the padding after the last
+/// record's name, which may lie in a page the guest cannot access. When every
+/// byte before that padding can be read, the padding the guest cannot read is
+/// hashed as zeros, and how long it is is reported. Which pages can be read
+/// follows the guest's page protection, so it is the same in every run.
 fn read_extent<M: MemoryAccess>(
     memory: &M,
     addr: u64,
     len: u64,
-    copied: Option<&[u8]>,
+    records: bool,
 ) -> Result<(Vec<u8>, usize), Error> {
     let size = len as usize;
     let mut buf = vec![0u8; size];
@@ -465,18 +463,18 @@ fn read_extent<M: MemoryAccess>(
     let Err(error) = memory.read_values(Addr::from(start), buf.as_mut_slice()) else {
         return Ok((buf, 0));
     };
-    let Some(copied) = copied.filter(|copied| copied.len() == size) else {
+    if !records {
         return Err(error.into());
-    };
-    let mut guest = vec![0u8; size];
-    let readable = crate::syscalls::read_guest_pages(memory, start, &mut guest);
-    buf.copy_from_slice(copied);
-    let mut unreadable = size;
-    for (at, len) in readable {
-        buf[at..at + len].copy_from_slice(&guest[at..at + len]);
-        unreadable -= len;
     }
-    Ok((buf, unreadable))
+    let readable = crate::syscalls::read_guest_prefix(memory, start, &mut buf);
+    // Zeroes what was not read, and checks that it is only that padding.
+    if DirentFormat::Dirent64
+        .parse_written(&mut buf, readable)
+        .is_err()
+    {
+        return Err(error.into());
+    }
+    Ok((buf, size - readable))
 }
 
 /// The locating half, split out from the guest read so it can be bracketed.
@@ -523,7 +521,6 @@ pub(crate) fn detlog_io_buffers<G, T>(
     call: &Syscall,
     ret: i64,
     dettid: DetTid,
-    returned_records: Option<&(usize, Vec<u8>)>,
 ) -> Result<(), Error>
 where
     G: Guest<T>,
@@ -557,26 +554,19 @@ where
         let memory = guest.memory();
         extents(&memory, call, ret)?
     };
-    // Only `getdents64` has records Detcore copied (see [`read_extent`]).
-    let copied = match (call, returned_records) {
-        (Syscall::Getdents64(_), Some((addr, records))) => Some((*addr as u64, records.as_slice())),
-        _ => None,
-    };
+    let records = matches!(call, Syscall::Getdents64(_));
     for extent in moved_extents {
-        let copied = copied
-            .filter(|&(addr, _)| addr == extent.addr)
-            .map(|(_, records)| records);
-        let (whole, chunk, chunks, unreadable) =
-            extent_digests(guest, extent.addr, extent.len, copied)?;
+        let (whole, chunk, chunks, unread) =
+            extent_digests(guest, extent.addr, extent.len, records)?;
         let located = if chunks.is_empty() {
             String::new()
         } else {
             format!(" chunks={}:{}", chunk, chunks.join(","))
         };
-        let unread = if unreadable == 0 {
+        let unread = if unread == 0 {
             String::new()
         } else {
-            format!(" unreadable={unreadable}")
+            format!(" unread_padding={unread}")
         };
         crate::detlog!(
             "[iobuf][dtid {}] {} {} fd={} {:#x}+{}->{}{}{}",
@@ -945,15 +935,12 @@ mod tests {
         assert_eq!(completed_mmsghdr_count(1, 2), 1);
     }
 
-    /// Read the 48-byte extent at `offset` into pages protected as `prot`,
-    /// whose readable and writable bytes the guest filled with `guest`,
-    /// giving `read_extent` the records Detcore copied as `copied`.
-    fn read_extent_in(
-        prot: &[i32],
-        offset: usize,
-        guest: &[u8],
-        copied: Option<&[u8]>,
-    ) -> Result<(Vec<u8>, usize), super::Error> {
+    /// What the observer read from an extent, and the bytes actually there.
+    type ReadAndContents = (Result<(Vec<u8>, usize), super::Error>, Vec<u8>);
+
+    /// Write `bytes` at `offset` into pages protected as `prot`, where the
+    /// guest can write them, and read the extent back as the observer does.
+    fn read_extent_in(prot: &[i32], offset: usize, bytes: &[u8], records: bool) -> ReadAndContents {
         use reverie::syscalls::MemoryAccess;
 
         use crate::test_pages::PAGE;
@@ -962,60 +949,71 @@ mod tests {
         let pages = Pages::new(prot);
         let mut memory = LocalMemory::new();
         let mut at = 0;
-        while at < guest.len() {
-            let len = (PAGE - (offset + at) % PAGE).min(guest.len() - at);
+        while at < bytes.len() {
+            let len = (PAGE - (offset + at) % PAGE).min(bytes.len() - at);
             // A page the guest cannot write keeps its fill.
-            let _ = memory.write_exact(pages.address(offset + at), &guest[at..at + len]);
+            let _ = memory.write_exact(pages.address(offset + at), &bytes[at..at + len]);
             at += len;
         }
         let addr = pages.address(offset).as_raw() as u64;
-        super::read_extent(&memory, addr, guest.len() as u64, copied)
+        let read = super::read_extent(&memory, addr, bytes.len() as u64, records);
+        let contents = pages.contents();
+        (read, contents[offset..offset + bytes.len()].to_vec())
     }
 
-    /// Where the guest cannot read the records Detcore copied for
-    /// `getdents64`, those pages are taken from the copy; every page it can
-    /// read is taken from the guest. Without the copy, or with one of another
-    /// length, an unreadable extent is an error.
+    /// Two `getdents64` records of one-byte names: 24 bytes each, of which
+    /// Linux writes the first 21.
+    fn two_records() -> Vec<u8> {
+        let mut records = Vec::new();
+        for (name, off) in [(b'a', 1), (b'b', 2)] {
+            let entry = crate::dirents::DirEntry {
+                name: vec![name],
+                ino: 0x1111_1111_1111_1111,
+                off: 0,
+                ty: 8,
+            };
+            DirentFormat::Dirent64.encode(&entry, entry.ino, off, &mut records);
+        }
+        records
+    }
+
+    /// An extent the guest can read is hashed from what it holds. Of
+    /// `getdents64` records, only the padding after the last name, which
+    /// Linux does not write, may be unreadable; it is hashed as zeros and
+    /// reported. Every other byte hashed is what the guest holds. Any other
+    /// unreadable byte, or any unreadable byte of another syscall's extent,
+    /// is an error, whatever the guest's buffer holds.
     #[test]
-    fn unreadable_directory_records_are_taken_from_the_copy() {
+    fn only_unwritten_directory_padding_may_be_unread() {
         use crate::test_pages::PAGE;
 
         const RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
-        let copied: Vec<u8> = (0..48).collect();
-        // What the guest holds differs from the copy where it can be read,
-        // so the result shows which one each byte came from.
-        let guest: Vec<u8> = copied.iter().map(|byte| byte ^ 0x80).collect();
+        let records = two_records();
+        assert_eq!(records.len(), 48);
 
-        // A buffer the guest can write but not read.
-        let (bytes, unreadable) =
-            read_extent_in(&[libc::PROT_WRITE], 0, &guest, Some(&copied)).unwrap();
-        assert_eq!((bytes, unreadable), (copied.clone(), 48));
+        for flag in [false, true] {
+            let (read, held) = read_extent_in(&[RW, RW], PAGE - 45, &records, flag);
+            assert_eq!(read.unwrap(), (held, 0), "records {flag}");
+        }
 
-        // The last 3 bytes in a page the guest cannot access.
-        let offset = PAGE - 45;
-        let (bytes, unreadable) =
-            read_extent_in(&[RW, libc::PROT_NONE], offset, &guest, Some(&copied)).unwrap();
-        assert_eq!(unreadable, 3);
-        assert_eq!(bytes[..45], guest[..45]);
-        assert_eq!(bytes[45..], copied[45..]);
-        // Across a write-only page into a readable one.
-        let (bytes, unreadable) =
-            read_extent_in(&[libc::PROT_WRITE, RW], offset, &guest, Some(&copied)).unwrap();
-        assert_eq!(unreadable, 45);
-        assert_eq!(bytes[..45], copied[..45]);
-        assert_eq!(bytes[45..], guest[45..]);
+        // The last three bytes, padding, in a page the guest cannot access.
+        let (read, held) = read_extent_in(&[RW, libc::PROT_NONE], PAGE - 45, &records, true);
+        let (bytes, unread) = read.unwrap();
+        assert_eq!(unread, 3);
+        assert_eq!(bytes[..45], held[..45]);
+        assert_eq!(bytes[..45], records[..45]);
+        assert_eq!(bytes[45..], [0; 3]);
 
-        // A readable extent is the guest's, whatever the copy says.
-        let (bytes, unreadable) = read_extent_in(&[RW, RW], offset, &guest, Some(&copied)).unwrap();
-        assert_eq!((bytes, unreadable), (guest.clone(), 0));
-
-        for prot in [
-            [libc::PROT_WRITE, RW],
-            [RW, libc::PROT_NONE],
-            [RW, libc::PROT_WRITE],
+        // Not records; the last name; a write-only buffer; a write-only page
+        // before a readable one.
+        for (prot, offset, flag) in [
+            ([RW, libc::PROT_NONE], PAGE - 45, false),
+            ([RW, libc::PROT_NONE], PAGE - 44, true),
+            ([libc::PROT_WRITE, libc::PROT_WRITE], 0, true),
+            ([libc::PROT_WRITE, RW], PAGE - 24, true),
         ] {
-            assert!(read_extent_in(&prot, offset, &guest, None).is_err());
-            assert!(read_extent_in(&prot, offset, &guest, Some(&copied[..47])).is_err());
+            let (read, _) = read_extent_in(&prot, offset, &records, flag);
+            assert!(read.is_err(), "{prot:?} at {offset}, records {flag}");
         }
     }
 }

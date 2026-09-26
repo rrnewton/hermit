@@ -4363,9 +4363,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// stream that has a snapshot decides between `EINVAL` and 0 itself. A
     /// stream rewound and then seeked past 0 needs to know how many entries
     /// the directory has, so a snapshot is taken (see
-    /// [`Self::snapshot_directory_privately`]); if that fails, the kernel's
-    /// answer from the start is returned, which is `EINVAL` even at or past
-    /// the end.
+    /// [`Self::snapshot_directory_privately`]). If the directory must be
+    /// read in host order instead, the kernel's answer from the start is
+    /// returned, which is `EINVAL` even at or past the end; if no mapping can
+    /// be made for the snapshot, the call fails with `ENOMEM`.
     async fn serve_negative_count<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4394,7 +4395,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.move_directory_kernel_position(guest, call.fd, target)
                         .await;
                 }
-                Ok(None) | Err(_) => return Ok(kernel.map(|_| 0)?),
+                Ok(None) => return Ok(kernel.map(|_| 0)?),
+                Err(error) => return Err(error),
             },
             Some((_, false)) => {}
         }
@@ -4424,35 +4426,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             })
         })??;
-        let copied = match batch {
+        let (passed, copied) = match batch {
             Ok(batch) => {
                 let mut records = Vec::new();
-                // Where Linux's writes to each record end in `records`, and
-                // where the record ends.
-                let mut ends = Vec::with_capacity(batch.len());
+                let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (d_ino, _) = determinize_inode(guest, entry.ino).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
-                    let written = records.len() + call.format.written_len(entry.name.len());
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
-                    ends.push((written, records.len()));
+                    names.push(entry.name.len());
                 }
-                let copied = copy_records(&mut guest.memory(), call.buf, &records, &ends)
-                    .map(|count| (count, count.checked_sub(1).map_or(0, |last| ends[last].1)));
-                if let Ok((_, len)) = copied {
-                    records.truncate(len);
-                    guest.thread_state_mut().returned_records = Some((call.buf.as_raw(), records));
-                }
-                copied
+                copy_records(
+                    &mut guest.memory(),
+                    call.buf,
+                    call.format,
+                    &records,
+                    &names,
+                    start,
+                )
             }
-            Err(errno) => Err(errno),
+            Err(errno) => (0, Err(errno)),
         };
         // With --no-sequentialize-threads another thread can close the
         // descriptor during the copy; like Linux, the call's result stands.
         let target = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| {
-                stream.advance(copied.as_ref().map_or(0, |&(count, _)| count));
+                stream.advance(passed);
                 stream.kernel_target()
             })
         });
@@ -4460,7 +4460,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.move_directory_kernel_position(guest, call.fd, target)
                 .await;
         }
-        Ok(copied.map(|(_, len)| len as i64)?)
+        Ok(copied.map(|len| len as i64)?)
     }
 
     /// Move the kernel position of the open file behind `fd` to `target`, a
@@ -4515,9 +4515,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             });
             guest.memory().write_exact(call.buf, &records[..written])?;
         }
-        let len = records.len() as i64;
-        guest.thread_state_mut().returned_records = Some((call.buf.as_raw(), records));
-        Ok(len)
+        Ok(records.len() as i64)
     }
 
     /// Read the whole host directory behind `call.fd` into a private mapping
@@ -4530,37 +4528,50 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// go to an anonymous mapping injected for the purpose and unmapped
     /// before the guest runs again, as the atomic `writev` does for its
     /// iovecs. The mapping is fresh, so the reads leave nothing that the
-    /// guest could see.
+    /// guest could see in memory. On the kvm backend, whose guest allocator
+    /// never hands out an address twice, it does move every later mapping's
+    /// address by its length: that follows from the guest's own calls, so it
+    /// is the same on every run, but Linux would reuse the range.
     ///
-    /// Returns `None`, with the kernel position where the guest left it, when
-    /// the mapping cannot be made (the guest's address space is at its
-    /// limit): the open file is then read in host order.
+    /// If a mapping of [`DIRECTORY_DRAIN_COUNT`] bytes cannot be made, one
+    /// page is used, which still holds any entry. If that cannot be made
+    /// either (the guest's address space is at its limit), the call fails
+    /// with `ENOMEM` before anything is read, and the stream stays without a
+    /// snapshot, so a later call tries again. Linux's `getdents` does not
+    /// fail so; serving the directory in host order would make the order
+    /// depend on the host.
     async fn snapshot_directory_privately<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<Option<Vec<DirEntry>>, Error> {
-        let len = DIRECTORY_DRAIN_COUNT as usize;
-        let mapped = guest
-            .inject_with_retry(Syscall::Mmap(
-                syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(len)
-                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
-                    .with_fd(-1)
-                    .with_offset(0),
-            ))
-            .await;
-        let Some(scratch) = mapped
-            .ok()
-            .and_then(|addr| usize::try_from(addr).ok())
-            .and_then(AddrMut::<u8>::from_raw)
-        else {
-            return Ok(None);
+        let mut mapping = None;
+        for len in [DIRECTORY_DRAIN_COUNT as usize, DIRECTORY_PAGE] {
+            let mapped = guest
+                .inject_with_retry(Syscall::Mmap(
+                    syscalls::Mmap::new()
+                        .with_addr(None)
+                        .with_len(len)
+                        .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                        .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                        .with_fd(-1)
+                        .with_offset(0),
+                ))
+                .await;
+            if let Some(scratch) = mapped
+                .ok()
+                .and_then(|addr| usize::try_from(addr).ok())
+                .and_then(AddrMut::<u8>::from_raw)
+            {
+                mapping = Some((scratch, len));
+                break;
+            }
+        }
+        let Some((scratch, len)) = mapping else {
+            return Err(Errno::ENOMEM.into());
         };
         let snapshot = self
-            .snapshot_directory(guest, call.into_scratch(scratch, DIRECTORY_DRAIN_COUNT))
+            .snapshot_directory(guest, call.into_scratch(scratch, len as u32))
             .await;
         let unmapped = guest
             .inject_with_retry(Syscall::Munmap(
@@ -4691,7 +4702,11 @@ fn read_records(
 /// `write` do not always: on the ptrace backend, a copy of at most 8 bytes goes
 /// through `PTRACE_PEEKDATA` or `PTRACE_POKEDATA`, which reach a page the guest
 /// has made inaccessible.
-fn read_guest_prefix(memory: &impl MemoryAccess, buf: AddrMut<u8>, bytes: &mut [u8]) -> usize {
+pub(crate) fn read_guest_prefix(
+    memory: &impl MemoryAccess,
+    buf: AddrMut<u8>,
+    bytes: &mut [u8],
+) -> usize {
     let mut done = 0;
     for pages in guest_pages(buf.as_raw(), bytes.len()).chunks(PAGES_PER_COPY) {
         let from = pages[0].0;
@@ -4714,22 +4729,21 @@ fn read_guest_prefix(memory: &impl MemoryAccess, buf: AddrMut<u8>, bytes: &mut [
     done
 }
 
-/// Write the `pieces` of `bytes`, each an offset and a length within one page,
-/// to the same offsets in the guest's buffer, in the order given, up to the
-/// first the guest cannot write. Return how many bytes of the pieces were
-/// written, counted in that order.
+/// Write each of `pieces`, an offset in the guest's buffer and the bytes to
+/// store there, within one page, in the order given, up to the first the
+/// guest cannot write. Return how many bytes of the pieces were written,
+/// counted in that order.
 fn write_guest_pieces(
     memory: &mut impl MemoryAccess,
     buf: AddrMut<u8>,
-    bytes: &[u8],
-    pieces: &[(usize, usize)],
+    pieces: &[(usize, &[u8])],
 ) -> usize {
     let mut done = 0;
     for pieces in pieces.chunks(PAGES_PER_COPY) {
-        let len: usize = pieces.iter().map(|&(_, len)| len).sum();
+        let len: usize = pieces.iter().map(|(_, bytes)| bytes.len()).sum();
         let mut remote: Vec<AddrSliceMut<u8>> = pieces
             .iter()
-            .map(|&(at, len)| unsafe { AddrSliceMut::from_raw_parts(buf.add(at), len) })
+            .map(|&(at, bytes)| unsafe { AddrSliceMut::from_raw_parts(buf.add(at), bytes.len()) })
             .collect();
         let mut remote: Vec<std::io::IoSliceMut> = remote
             .iter_mut()
@@ -4737,7 +4751,7 @@ fn write_guest_pieces(
             .collect();
         let local: Vec<std::io::IoSlice> = pieces
             .iter()
-            .map(|&(at, len)| std::io::IoSlice::new(&bytes[at..at + len]))
+            .map(|&(_, bytes)| std::io::IoSlice::new(bytes))
             .collect();
         let copied = memory.write_vectored(&local, &mut remote).unwrap_or(0);
         done += copied;
@@ -4748,148 +4762,171 @@ fn write_guest_pieces(
     done
 }
 
-/// Read what the guest has in the `bytes.len()` bytes at `buf` into `bytes`,
-/// page by page, and return the pages (see [`guest_pages`]) that could be
-/// read. A page that cannot be read does not stop the pages after it.
-pub(crate) fn read_guest_pages(
-    memory: &impl MemoryAccess,
-    buf: AddrMut<u8>,
-    bytes: &mut [u8],
-) -> Vec<(usize, usize)> {
-    let pages = guest_pages(buf.as_raw(), bytes.len());
-    let mut readable = Vec::with_capacity(pages.len());
-    let mut next = 0;
-    while next < pages.len() {
-        let from = pages[next].0;
-        let read = read_guest_prefix(memory, unsafe { buf.add(from) }, &mut bytes[from..]);
-        while next < pages.len() && pages[next].0 + pages[next].1 <= from + read {
-            readable.push(pages[next]);
-            next += 1;
-        }
-        // The page that stopped the read.
-        next += 1;
-    }
-    readable
+/// One store that Linux makes into the guest's buffer to copy directory
+/// records: where in the buffer, the bytes stored (a range of the records,
+/// or of the first record's placeholder `d_off` after them), and whether the
+/// CPU makes it as one store, which writes nothing if any byte of it faults.
+struct DirentStore {
+    at: usize,
+    from: std::ops::Range<usize>,
+    single: bool,
 }
 
-/// The order in which [`copy_records`] writes records whose `ends` are given,
-/// into a guest buffer at `addr` whose pages `saved(offset)` could be read:
-/// the pieces, each within one page, and for each record, how many bytes of
-/// the pieces, in order, must be written for Linux's writes to it to be
-/// complete.
+/// The stores Linux makes, in its order, to copy records whose names are
+/// `names` bytes long, and for each record, how many of the stores precede
+/// the end of its `filldir`. `placeholder` is where the first record's
+/// placeholder `d_off` follows the records.
 ///
-/// The pieces follow the buffer, except where the part of a record that
-/// Linux writes crosses pages. Then the pieces in pages that could be read
-/// come first, so that they can be put back if a later piece of the record
-/// cannot be written. The others follow in the order of Linux's writes: from
-/// `d_ino`, or from `d_off` for the first record of a call, whose first write
-/// is the `d_off` of the record before it.
-fn record_pieces(
-    addr: usize,
-    ends: &[(usize, usize)],
-    saved: impl Fn(usize) -> bool,
-) -> (Vec<(usize, usize)>, Vec<usize>) {
-    let page = |offset: usize| (addr + offset) / DIRECTORY_PAGE;
-    let pages = |from: usize, to: usize| {
-        guest_pages(addr + from, to - from)
-            .into_iter()
-            .map(move |(at, len)| (from + at, len))
+/// For each record, `filldir` (fs/readdir.c) first stores the `d_off` of the
+/// record before it, which is its own entry's position. The first record of
+/// a call has none before it, so its own `d_off` gets that position, to be
+/// overwritten. Then come `d_ino`, `d_reclen`, `d_type`, the NUL after the
+/// name, and the name. Once no more records are copied, the call stores the
+/// last one's `d_off`. No padding is written.
+///
+/// Linux copies a name in words from its start, after the NUL that follows
+/// it. A name spans at most two pages, and the NUL's page could be written,
+/// so if a word of the name faults, the first does, and none of the name is
+/// written. So it is here, where the name is written page by page.
+fn dirent_stores(
+    format: DirentFormat,
+    names: &[usize],
+    placeholder: usize,
+) -> (Vec<DirentStore>, Vec<usize>) {
+    let field = |at: usize, len: usize| DirentStore {
+        at,
+        from: at..at + len,
+        single: true,
     };
-    let mut pieces = Vec::new();
-    let mut complete = Vec::with_capacity(ends.len());
-    // The start of the buffer not yet in a piece, and how many bytes the
-    // pieces hold so far.
-    let mut run = 0;
-    let mut placed = 0;
-    let mut start = 0;
-    for &(written, end) in ends {
-        if written > start && page(start) != page(written - 1) {
-            pieces.extend(pages(run, start));
-            placed += start - run;
-            let (kept, mut lost): (Vec<_>, Vec<_>) =
-                pages(start, written).partition(|&(at, _)| saved(at));
-            // Where Linux first writes to the record.
-            let first = if start == 0 { start + 8 } else { start };
-            let first = lost
-                .iter()
-                .position(|&(at, len)| first < at + len)
-                .unwrap_or(0);
-            lost.rotate_left(first);
-            pieces.extend(kept);
-            pieces.extend(lost);
-            placed += written - start;
-            run = written;
-        }
-        complete.push(placed + written.saturating_sub(run));
-        start = end;
+    let mut stores = Vec::with_capacity(names.len() * 6 + 1);
+    let mut filled = Vec::with_capacity(names.len());
+    let mut previous = None;
+    let mut at = 0;
+    for &name_len in names {
+        let reclen = format.record_len(name_len);
+        let name = at + format.name_offset();
+        stores.push(match previous {
+            Some(previous) => field(previous + 8, 8),
+            None => DirentStore {
+                at: at + 8,
+                from: placeholder..placeholder + 8,
+                single: true,
+            },
+        });
+        stores.push(field(at, 8));
+        stores.push(field(at + 16, 2));
+        stores.push(field(at + format.type_offset(reclen), 1));
+        stores.push(field(name + name_len, 1));
+        stores.push(DirentStore {
+            at: name,
+            from: name..name + name_len,
+            single: false,
+        });
+        filled.push(stores.len());
+        previous = Some(at);
+        at += reclen;
     }
-    pieces.extend(pages(run, start));
-    (pieces, complete)
+    if let Some(previous) = previous {
+        stores.push(field(previous + 8, 8));
+    }
+    (stores, filled)
 }
 
-/// Copy directory records into the guest's buffer as Linux does: whole
-/// records, up to the first that the guest cannot write, failing with
-/// `EFAULT` only if that is the first. Return how many were copied. `ends`
-/// holds, for each record, where Linux's writes to it end and where it ends:
-/// Linux does not write the padding after a name, so a record whose padding
-/// the guest cannot write is still copied.
+/// Copy directory records into the guest's buffer as Linux does: store by
+/// store (see [`dirent_stores`]), up to the first store the guest cannot
+/// write. `records` holds the records of entries whose names are `names`
+/// bytes long, the first at position `start`.
 ///
-/// Every byte after the records copied that the guest can read is left as
-/// the guest had it (see [`record_pieces`]): a record that is not copied is
-/// put back. Bytes the guest can write but not read cannot be put back. Only
-/// a record lying in two such pages, or in one such page before one it
-/// cannot write, can leave some there, and Linux leaves them too: it writes
-/// such a record from its start until the first byte it cannot write.
+/// Return how many entries the call passes, and its result: the bytes of the
+/// records whose `filldir` completed. It is `EFAULT` if none did, or if the
+/// fault hit a `d_off`, which the call's last store would then write again.
+///
+/// Each store within one page is written whole or not at all, as Linux's
+/// are. A single store that crosses into another page, a field of a buffer
+/// not aligned to 8 bytes, the CPU writes whole or not at all, so its two
+/// parts are written one after the other and the first is put back if the
+/// second cannot be written. The part written first is the one whose bytes
+/// Detcore can read to put back: the part in the second page, unless only
+/// the part in the first page can be read. Where neither can be read, the
+/// part in the second page is written first, so that a write-only buffer
+/// ending at a page the guest cannot touch is left as Linux leaves it. Only
+/// a store from a page the guest can neither read nor write into a
+/// write-only page leaves bytes Linux does not write: up to 7, in the
+/// write-only page.
 fn copy_records(
     memory: &mut impl MemoryAccess,
     buf: AddrMut<u8>,
+    format: DirentFormat,
     records: &[u8],
-    ends: &[(usize, usize)],
-) -> Result<usize, Errno> {
-    if records.is_empty() {
-        return Ok(0);
+    names: &[usize],
+    start: u64,
+) -> (usize, Result<usize, Errno>) {
+    if names.is_empty() {
+        return (0, Ok(0));
     }
-    let mut before = vec![0; records.len()];
-    let readable = read_guest_pages(memory, buf, &mut before);
-    let saved = |offset: usize| {
-        readable
-            .binary_search_by(|&(at, len)| {
-                if at + len <= offset {
-                    std::cmp::Ordering::Less
-                } else if at > offset {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .is_ok()
+    let mut source = records.to_vec();
+    let placeholder = source.len();
+    source.extend_from_slice(&i64::try_from(start).unwrap_or(i64::MAX).to_ne_bytes());
+    let (stores, filled) = dirent_stores(format, names, placeholder);
+    // Each piece, within one page: where in the buffer and its bytes, and,
+    // in `owner`, its store.
+    let mut pieces: Vec<(usize, &[u8])> = Vec::with_capacity(stores.len());
+    let mut owner = Vec::with_capacity(stores.len());
+    // For each single store that crosses pages: the store, where its part
+    // written first is, and what the guest had there, if it can be read.
+    let mut crossing = Vec::new();
+    for (index, store) in stores.iter().enumerate() {
+        let mut split = guest_pages(buf.as_raw() + store.at, store.from.len());
+        if store.single && split.len() > 1 {
+            let mut saved: Vec<Option<Vec<u8>>> = split
+                .iter()
+                .map(|&(at, len)| {
+                    let mut before = vec![0; len];
+                    let read =
+                        read_guest_prefix(memory, unsafe { buf.add(store.at + at) }, &mut before);
+                    (read == len).then_some(before)
+                })
+                .collect();
+            if saved[1].is_some() || saved[0].is_none() {
+                split.reverse();
+                saved.reverse();
+            }
+            crossing.push((index, store.at + split[0].0, saved.swap_remove(0)));
+        }
+        for (at, len) in split {
+            let from = store.from.start + at;
+            pieces.push((store.at + at, &source[from..from + len]));
+            owner.push(index);
+        }
+    }
+    let written = write_guest_pieces(memory, buf, &pieces);
+    let mut end = 0;
+    let Some(failed) = pieces.iter().position(|(_, bytes)| {
+        end += bytes.len();
+        end > written
+    }) else {
+        return (names.len(), Ok(records.len()));
     };
-    let (pieces, complete) = record_pieces(buf.as_raw(), ends, saved);
-    let written = write_guest_pieces(memory, buf, records, &pieces);
-    let count = complete
-        .iter()
-        .take_while(|&&needed| needed <= written)
-        .count();
-    let returned = count.checked_sub(1).map_or(0, |last| ends[last].1);
-    // Put back what was written past the records copied, where it can be.
-    let mut placed = 0;
-    let mut restore = Vec::new();
-    for &(at, len) in &pieces {
-        if placed + len > written {
-            break;
-        }
-        placed += len;
-        if at + len > returned && saved(at) {
-            let from = at.max(returned);
-            restore.push((from, at + len - from));
-        }
+    let store = owner[failed];
+    if failed > 0
+        && owner[failed - 1] == store
+        && let Some((_, at, Some(before))) = crossing.iter().find(|&&(index, ..)| index == store)
+    {
+        write_guest_pieces(memory, buf, &[(*at, before.as_slice())]);
     }
-    write_guest_pieces(memory, buf, &before, &restore);
-    if count == 0 {
+    // The entry whose `filldir` made the store, or all of them for the call's
+    // last store, and the first store of that `filldir`.
+    let entry = filled.partition_point(|&end| end <= store);
+    let first = entry.checked_sub(1).map_or(0, |before| filled[before]);
+    let result = if entry == 0 || store == first {
         Err(Errno::EFAULT)
     } else {
-        Ok(count)
-    }
+        Ok(names[..entry]
+            .iter()
+            .map(|&name_len| format.record_len(name_len))
+            .sum())
+    };
+    (entry, result)
 }
 
 /// A guest `getdents` or `getdents64` call.
@@ -5370,47 +5407,63 @@ mod test {
         }
     }
 
-    /// Records of names `names` (a byte each), as `serve_next_batch` encodes
-    /// them, with where Linux's writes to each end and where each ends.
-    fn directory_records(
-        format: super::DirentFormat,
-        names: impl IntoIterator<Item = u8>,
-    ) -> (Vec<u8>, Vec<(usize, usize)>) {
+    /// Records with the names `names`, as `serve_next_batch` encodes them
+    /// from position 0, and the length of each name.
+    fn directory_records(format: super::DirentFormat, names: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
         let mut records = Vec::new();
-        let mut ends = Vec::new();
-        for (index, name) in names.into_iter().enumerate() {
+        for (index, name) in names.iter().enumerate() {
             let entry = super::DirEntry {
-                name: vec![name],
+                name: name.to_vec(),
                 ino: 0x1111_1111_1111_1111,
                 off: 0,
                 ty: 4,
             };
-            let written = records.len() + format.written_len(1);
             format.encode(&entry, entry.ino, index as i64 + 1, &mut records);
-            ends.push((written, records.len()));
         }
-        (records, ends)
+        (records, names.iter().map(|name| name.len()).collect())
+    }
+
+    /// `records` as Linux leaves them in a buffer that held `Pages::FILL`:
+    /// the padding after each name is not written.
+    fn as_linux_writes(format: super::DirentFormat, records: &[u8], names: &[usize]) -> Vec<u8> {
+        let mut bytes = records.to_vec();
+        let mut at = 0;
+        for &name_len in names {
+            let reclen = format.record_len(name_len);
+            let padding = at + format.name_offset() + name_len + 1;
+            let end = match format {
+                super::DirentFormat::Dirent64 => at + reclen,
+                super::DirentFormat::Legacy => at + reclen - 1,
+            };
+            bytes[padding..end].fill(Pages::FILL);
+            at += reclen;
+        }
+        bytes
     }
 
     const FORMATS: [super::DirentFormat; 2] =
         [super::DirentFormat::Dirent64, super::DirentFormat::Legacy];
 
+    const TEN: [&[u8]; 10] = [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j"];
+
     /// A buffer starting 16 bytes before a writable page, in a page the guest
-    /// cannot write: Linux's first write, to the first record's `d_off`,
+    /// cannot write: Linux's first store, to the first record's `d_off`,
     /// fails, so the call fails and the writable page is left as it was.
     #[test]
     fn a_first_record_that_cannot_be_written_leaves_the_next_page_untouched() {
         for protection in [libc::PROT_NONE, libc::PROT_READ] {
             for format in FORMATS {
                 let pages = Pages::new(&[protection, libc::PROT_READ | libc::PROT_WRITE]);
-                let (records, ends) = directory_records(format, *b"abcdefghij");
+                let (records, names) = directory_records(format, &TEN);
                 let copied = super::copy_records(
                     &mut LocalMemory::new(),
                     pages.address(PAGE - 16),
+                    format,
                     &records,
-                    &ends,
+                    &names,
+                    0,
                 );
-                assert_eq!(copied, Err(Errno::EFAULT), "{format:?} {protection}");
+                assert_eq!(copied, (0, Err(Errno::EFAULT)), "{format:?} {protection}");
                 assert!(
                     pages.contents().iter().all(|&byte| byte == Pages::FILL),
                     "{format:?} after a page with protection {protection}: bytes changed"
@@ -5419,27 +5472,124 @@ mod test {
         }
     }
 
+    /// A buffer starting 8 bytes before a writable page, in a page the guest
+    /// cannot write. Linux's first store, the first record's position into
+    /// its own `d_off`, lands in the writable page; its next, `d_ino`, fails.
+    /// The call fails and leaves the position there.
+    #[test]
+    fn a_first_record_leaves_its_position_in_its_d_off() {
+        for format in FORMATS {
+            let pages = Pages::new(&[libc::PROT_READ, libc::PROT_READ | libc::PROT_WRITE]);
+            let (records, names) = directory_records(format, &TEN);
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(PAGE - 8),
+                format,
+                &records,
+                &names,
+                7,
+            );
+            assert_eq!(copied, (0, Err(Errno::EFAULT)), "{format:?}");
+            let contents = pages.contents();
+            assert_eq!(&contents[PAGE..PAGE + 8], &7i64.to_ne_bytes(), "{format:?}");
+            assert!(
+                contents[..PAGE]
+                    .iter()
+                    .chain(&contents[PAGE + 8..])
+                    .all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes other than the first d_off changed"
+            );
+        }
+    }
+
+    /// A buffer starting 12 bytes before a writable page, in a page the guest
+    /// can read but not write. The first record's `d_off` crosses into the
+    /// writable page, and the CPU stores it at once, so Linux writes none of
+    /// it: the part written in the writable page is put back.
+    #[test]
+    fn a_store_crossing_out_of_an_unwritable_page_writes_nothing() {
+        for format in FORMATS {
+            let pages = Pages::new(&[libc::PROT_READ, libc::PROT_READ | libc::PROT_WRITE]);
+            let (records, names) = directory_records(format, &TEN);
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(PAGE - 12),
+                format,
+                &records,
+                &names,
+                0,
+            );
+            assert_eq!(copied, (0, Err(Errno::EFAULT)), "{format:?}");
+            assert!(
+                pages.contents().iter().all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes changed"
+            );
+        }
+    }
+
+    /// The same store between two pages one of which the guest cannot write,
+    /// for each other pair Detcore can leave as Linux does: one page it can
+    /// read, or a write-only page before one it cannot touch. Whichever part
+    /// is written first must be one Detcore can put back.
+    #[test]
+    fn a_store_crossing_pages_is_put_back_from_the_page_that_can_be_read() {
+        let (none, read, write) = (libc::PROT_NONE, libc::PROT_READ, libc::PROT_WRITE);
+        let both = read | write;
+        for protections in [
+            [read, write],
+            [write, read],
+            [write, none],
+            [both, none],
+            [both, read],
+            [none, both],
+        ] {
+            for format in FORMATS {
+                let pages = Pages::new(&protections);
+                let (records, names) = directory_records(format, &TEN);
+                let copied = super::copy_records(
+                    &mut LocalMemory::new(),
+                    pages.address(PAGE - 12),
+                    format,
+                    &records,
+                    &names,
+                    0,
+                );
+                assert_eq!(
+                    copied,
+                    (0, Err(Errno::EFAULT)),
+                    "{protections:?} {format:?}"
+                );
+                assert!(
+                    pages.contents().iter().all(|&byte| byte == Pages::FILL),
+                    "{protections:?} {format:?}: bytes changed"
+                );
+            }
+        }
+    }
+
     /// Records of 24 bytes starting 100 bytes before a page the guest cannot
-    /// write: four fit, the fifth's written part crosses into that page, so
-    /// four are copied and the four bytes of the fifth before the page are
-    /// left as they were.
+    /// write. Four fit. The fifth's `d_ino` crosses into that page, so Linux
+    /// writes none of it: four records are returned, the fifth's position
+    /// (the fourth's `d_off`) is written, and the four bytes before the page
+    /// are left as they were.
     #[test]
     fn a_record_crossing_into_an_inaccessible_page_leaves_nothing_before_it() {
         for format in FORMATS {
             let pages = Pages::new(&[libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE]);
-            let (records, ends) = directory_records(format, *b"abcdefghij");
-            assert_eq!(ends[3].1, 96);
+            let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
                 pages.address(PAGE - 100),
+                format,
                 &records,
-                &ends,
+                &names,
+                0,
             );
-            assert_eq!(copied, Ok(4), "{format:?}");
+            assert_eq!(copied, (4, Ok(96)), "{format:?}");
             let contents = pages.contents();
             assert_eq!(
                 &contents[PAGE - 100..PAGE - 4],
-                &records[..96],
+                &as_linux_writes(format, &records[..96], &names[..4])[..],
                 "{format:?}"
             );
             assert!(
@@ -5455,20 +5605,21 @@ mod test {
     /// A buffer starting 4 bytes before a page the guest cannot write, in a
     /// page it can write but not read. Linux first writes the first record's
     /// `d_off`, 8 bytes in, which fails; it never writes the 4 bytes before
-    /// the page. Those bytes could not be put back, so they must not be
-    /// written.
+    /// the page.
     #[test]
     fn a_first_record_is_written_from_its_d_off() {
         for format in FORMATS {
             let pages = Pages::new(&[libc::PROT_WRITE, libc::PROT_NONE]);
-            let (records, ends) = directory_records(format, *b"abc");
+            let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
                 pages.address(PAGE - 4),
+                format,
                 &records,
-                &ends,
+                &names,
+                0,
             );
-            assert_eq!(copied, Err(Errno::EFAULT), "{format:?}");
+            assert_eq!(copied, (0, Err(Errno::EFAULT)), "{format:?}");
             assert!(
                 pages.contents().iter().all(|&byte| byte == Pages::FILL),
                 "{format:?}: bytes before the inaccessible page changed"
@@ -5477,63 +5628,96 @@ mod test {
     }
 
     /// Records across two writable pages and into a third the guest cannot
-    /// write. Every record before the one crossing into the third page is
-    /// copied; what was written of that one is put back.
+    /// write, starting 40 bytes before the second page, so the third starts
+    /// 4136 bytes in. Record 172 starts at 4128: Linux stores its position
+    /// into record 171's `d_off` and its `d_ino`, which ends at the third
+    /// page, and then fails at its `d_reclen`. The call returns 172 records
+    /// and leaves that `d_ino` written.
     #[test]
-    fn a_record_not_copied_is_put_back() {
+    fn a_record_not_copied_is_left_as_linux_leaves_it() {
+        let names: Vec<[u8; 1]> = (0..200u8).map(|i| [b'a' + i % 26]).collect();
+        let names: Vec<&[u8]> = names.iter().map(|name| &name[..]).collect();
         for format in FORMATS {
             let rw = libc::PROT_READ | libc::PROT_WRITE;
             let pages = Pages::new(&[rw, rw, libc::PROT_NONE]);
             let start = PAGE - 40;
-            let (records, ends) = directory_records(format, (0..200).map(|i| b'a' + i % 26));
-            // The first record whose written part crosses into the third page.
-            let crossing = ends
-                .iter()
-                .position(|&(written, _)| start + written > 2 * PAGE)
-                .unwrap();
+            let (records, lens) = directory_records(format, &names);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
                 pages.address(start),
+                format,
                 &records,
-                &ends,
+                &lens,
+                0,
             );
-            assert_eq!(copied, Ok(crossing), "{format:?}");
-            let returned = ends[crossing - 1].1;
+            assert_eq!(copied, (172, Ok(172 * 24)), "{format:?}");
             let contents = pages.contents();
-            assert_eq!(
-                &contents[start..start + returned],
-                &records[..returned],
-                "{format:?}"
-            );
+            let mut expected = as_linux_writes(format, &records[..4128], &lens[..172]);
+            expected.extend_from_slice(&records[4128..4136]);
+            assert_eq!(&contents[start..start + 4136], &expected[..], "{format:?}");
             assert!(
-                contents[..start]
-                    .iter()
-                    .chain(&contents[start + returned..])
-                    .all(|&byte| byte == Pages::FILL),
-                "{format:?}: bytes outside the records copied changed"
+                contents[..start].iter().all(|&byte| byte == Pages::FILL),
+                "{format:?}: bytes before the buffer changed"
             );
         }
     }
 
-    /// Records that all fit are all copied, and the bytes after them are left
-    /// as they were.
+    /// A second record with a 20-byte name, whose record ends past the end of
+    /// what the guest can write. For `getdents64`, the NUL after the name is
+    /// stored before the name and fails, so none of the name is written; for
+    /// `getdents`, `d_type`, at the record's end, is stored before the name
+    /// and fails. Either way the record's own `d_off` is not written: Linux
+    /// stores it only with the next record or at the end of the call.
+    #[test]
+    fn a_name_is_stored_after_the_bytes_that_follow_it() {
+        for format in FORMATS {
+            let pages = Pages::new(&[libc::PROT_READ | libc::PROT_WRITE, libc::PROT_NONE]);
+            let (records, names) = directory_records(format, &[b"a", b"abcdefghijklmnopqrst"]);
+            let copied = super::copy_records(
+                &mut LocalMemory::new(),
+                pages.address(PAGE - 50),
+                format,
+                &records,
+                &names,
+                0,
+            );
+            assert_eq!(copied, (1, Ok(24)), "{format:?}");
+            let contents = &pages.contents()[PAGE - 50..PAGE];
+            let mut expected = as_linux_writes(format, &records[..24], &names[..1]);
+            expected.extend_from_slice(&records[24..32]);
+            expected.extend_from_slice(&[Pages::FILL; 8]);
+            expected.extend_from_slice(&records[40..42]);
+            match format {
+                super::DirentFormat::Dirent64 => expected.push(records[42]),
+                super::DirentFormat::Legacy => expected.push(Pages::FILL),
+            }
+            expected.resize(50, Pages::FILL);
+            assert_eq!(contents, &expected[..], "{format:?}");
+        }
+    }
+
+    /// Records that all fit are all copied, apart from the padding after each
+    /// name, which Linux does not write, and the bytes after them are left as
+    /// they were.
     #[test]
     fn records_that_fit_are_copied_whole() {
         for format in FORMATS {
             let rw = libc::PROT_READ | libc::PROT_WRITE;
             let pages = Pages::new(&[rw, rw]);
-            let (records, ends) = directory_records(format, *b"abcdefghij");
+            let (records, names) = directory_records(format, &TEN);
             let copied = super::copy_records(
                 &mut LocalMemory::new(),
                 pages.address(PAGE - 50),
+                format,
                 &records,
-                &ends,
+                &names,
+                0,
             );
-            assert_eq!(copied, Ok(10), "{format:?}");
+            assert_eq!(copied, (10, Ok(240)), "{format:?}");
             let contents = pages.contents();
             assert_eq!(
                 &contents[PAGE - 50..PAGE - 50 + records.len()],
-                &records[..],
+                &as_linux_writes(format, &records, &names)[..],
                 "{format:?}"
             );
             assert!(
