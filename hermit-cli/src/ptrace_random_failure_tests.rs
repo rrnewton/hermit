@@ -10,6 +10,8 @@ mod real_random {
 
     use super::*;
 
+    include!("ptrace_random_permissions.rs");
+
     #[derive(Clone, Default)]
     struct Log(Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>);
     impl Write for Log {
@@ -120,46 +122,32 @@ mod real_random {
             isolated(name, || exercise(fatal, trace_diagnostics));
             return;
         }
-        if let Some(binary) = std::env::var_os("HERMIT_RANDOM_FAILURE_GUEST") {
-            let binary = PathBuf::from(binary);
-            assert!(binary.is_absolute() && binary.is_file());
-            isolated_with_env(
-                name,
-                &[("HERMIT_RANDOM_FAILURE_GUEST", &binary)],
-                || unreachable!(),
-            );
-            return;
-        }
-        // Build preparation is separate from the original pre-reexec 3s run
-        // deadline. The runner also bounds compilation and captures its status.
+        let parent_tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let _parent = credentials(&format!("/proc/self/task/{parent_tid}"), "outer-before-isolation");
         let fixture = tempfile::tempdir().unwrap();
-        let source = fixture.path().join("guest.c");
-        let binary = fixture.path().join("guest");
-        std::fs::write(
-            &source,
-            include_bytes!("../tests/fixtures/random_copy_fatal.c"),
-        )
-        .unwrap();
-        let status = Command::new("timeout")
-            .args([
-                "--kill-after=1s",
-                "10s",
-                "cc",
-                "-O2",
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-            ])
-            .arg(&source)
-            .arg("-o")
-            .arg(&binary)
-            .status()
-            .unwrap();
-        assert!(status.success(), "guest fixture compile failed: {status}");
-        isolated_with_env(
+        let compile = |name: &str, bytes: &[u8]| {
+            let source = fixture.path().join(format!("{name}.c"));
+            let binary = fixture.path().join(name);
+            std::fs::write(&source, bytes).unwrap();
+            let status = Command::new("timeout")
+                .args(["--kill-after=1s", "10s", "cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+                .arg(&source).arg("-o").arg(&binary).status().unwrap();
+            assert!(status.success(), "{name} fixture compile failed: {status}");
+            binary
+        };
+        let binary = match std::env::var_os("HERMIT_RANDOM_FAILURE_GUEST") {
+            Some(binary) => {
+                let binary = PathBuf::from(binary);
+                assert!(binary.is_absolute() && binary.is_file());
+                binary
+            }
+            None => compile("guest", include_bytes!("../tests/fixtures/random_copy_fatal.c")),
+        };
+        let probe = compile("permission-probe", include_bytes!("../tests/fixtures/ptrace_copy_permission.c"));
+        isolated_with_child_setup(
             name,
-            &[("HERMIT_RANDOM_FAILURE_GUEST", &binary)],
+            &[("HERMIT_RANDOM_FAILURE_GUEST", &binary), ("HERMIT_RANDOM_PERMISSION_PROBE", &probe)],
+            restrict_ptrace_copy,
             || unreachable!(),
         );
     }
@@ -169,6 +157,11 @@ mod real_random {
             .unwrap()
             .parse()
             .unwrap();
+        let (original_tid, original_credentials) = restricted_thread_credentials("before-runtime");
+        let probe = Command::new(std::env::var_os("HERMIT_RANDOM_PERMISSION_PROBE").unwrap())
+            .status().unwrap();
+        assert!(probe.success(), "native copy-permission discriminator failed: {probe}");
+        assert!(monotonic_ns() < deadline, "native discriminator exceeded original deadline");
         // This isolated process owns natural-parent waits after product facts
         // are sealed. It never creates a second ptrace waiter.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
@@ -270,6 +263,11 @@ mod real_random {
                             let event =
                                 format!("[detcore, dtid {child}] inbound timer preemption event");
                             if text.contains(&event) {
+                                let (tid, observed) = restricted_thread_credentials("actual-tracer-before-gate");
+                                assert_eq!(tid, original_tid);
+                                assert_eq!(observed, original_credentials);
+                                assert_tracee_credentials(root, tid, &observed);
+                                assert_tracee_credentials(child, tid, &observed);
                                 let mut facts = future_facts.borrow_mut();
                                 facts.child = child;
                                 facts.child_fd = Some(pidfd(child));
