@@ -497,6 +497,17 @@ impl FileMetadata {
         self.file_handles.values().any(DetFd::is_loopback_peer)
     }
 
+    fn timerfds_below(&self, nfds: i32) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .file_handles
+            .iter()
+            .filter(|(fd, detfd)| **fd < nfds && detfd.is_timerfd())
+            .map(|(fd, _)| *fd)
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
     // TODO-HUMAN-REVIEW(#2373)
     /// True when `vfork` must be refused because some open file description
     /// either holds a lock or carries a cached claim that may now be wrong.
@@ -2509,6 +2520,11 @@ impl<T> ThreadState<T> {
     /// Whether this task owns a socket that attempted a loopback connection.
     pub(crate) fn has_loopback_peer(&self) -> bool {
         self.metadata().has_loopback_peer()
+    }
+
+    /// Open virtual timerfd descriptors below `nfds`, in ascending order.
+    pub(crate) fn timerfds_below(&self, nfds: i32) -> Vec<RawFd> {
+        self.metadata().timerfds_below(nfds)
     }
 
     /// Whether any open file description is held or not proven unlocked.

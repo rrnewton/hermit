@@ -79,8 +79,10 @@ open file description itself.
 - `timerfd_settime`: error order follows `fs/timerfd.c` — EFAULT for
   `new_value`, then EINVAL for flags or an invalid timespec (negative, or
   nanoseconds >= 1e9), then EBADF / EINVAL for the descriptor. An invalid
-  request changes nothing. Re-arming resets the pending count; the old value
-  is copied out last.
+  request changes nothing. A valid value at or above `KTIME_MAX / NSEC_PER_SEC`
+  seconds clamps to `KTIME_MAX`, as `timespec64_to_ktime` does, and the next
+  periodic expiry saturates rather than overflowing. Re-arming resets the
+  pending count; the old value is copied out last.
 - `timerfd_create`: unknown flags or clocks are EINVAL, checked before the
   alarm clocks' EPERM, as in `fs/timerfd.c`.
 - `timerfd_gettime`: the descriptor is resolved first (EBADF, or EINVAL for
@@ -88,8 +90,9 @@ open file description itself.
   expired one-shot; otherwise time to the next expiry and the armed interval.
 - `read`, `readv`, and `preadv2` with offset -1 and no flags: a total
   length below 8 is EINVAL; pending > 0 takes the count, then copies the u64
-  across the iovecs, and a faulting copy is EFAULT with the count already
-  taken, as on Linux; empty + O_NONBLOCK is EAGAIN; otherwise it polls on
+  across the iovecs. As on Linux the count is taken before the copy, a copy
+  that faults part-way returns the bytes already copied, and one that copies
+  nothing is EFAULT; empty + O_NONBLOCK is EAGAIN; otherwise it polls on
   scheduler turns. A signal returns ERESTARTSYS, so SA_RESTART restarts the
   read as on Linux. Positioned reads (`pread64`, `preadv`, `preadv2` with an
   offset) reach the host vessel, which is an anonymous inode and returns
@@ -105,6 +108,12 @@ open file description itself.
   an edge or a oneshot.
 - poll/ppoll: POLLIN on a ready timerfd is merged into the returned array.
 - select/pselect6: ready timerfds are set in the read bitmap and counted.
+  Only the bitmap bytes that hold an open timerfd's bit are read to find
+  them, and only those bytes are written; each lies below the fd-table size
+  that bounds Linux's own copy. A zero-timeout call does this around one host
+  probe for any nfds. A blocking call wider than one word (nfds > 64), which
+  otherwise goes to the kernel whole, stays in Detcore's retry loop when its
+  read set names a virtual timerfd, up to FD_SETSIZE (1024).
 - Blocking waits (`wait_with_timerfds`) take a scheduler turn, probe the
   host with a zero timeout, and rescan the virtual timers after EVERY probe,
   the same way the select loops and the blocking read do. A timer that
@@ -125,10 +134,21 @@ open file description itself.
 - epoll_pwait with a signal mask that must actually block, and epoll_pwait2
   on an instance watching a virtual timerfd, return ENOSYS rather than
   giving up the mask's atomicity. ppoll with a mask that must block was
-  already ENOSYS.
+  already ENOSYS. A masked epoll_pwait still returns what is ready at entry
+  (a timerfd or a host descriptor) and refuses only when it would block.
 - Nested epoll (an epoll fd inside an epoll set) does not see timerfd
   readiness through the inner instance.
-- select with nfds > 64 on a zero-timeout probe is not merged.
+- A blocking select or pselect6 with nfds above FD_SETSIZE (1024) whose
+  read set names a virtual timerfd returns ENOSYS; Detcore's scratch sets
+  hold 1024 bits, and the kernel would block on the never-armed vessel.
+- A blocking select or pselect6 with nfds between 65 and 1024 that names a
+  virtual timerfd copies all three sets for nfds bits. Linux copies only up
+  to the process's fd-table size, so a guest whose set buffers are shorter
+  than nfds bits can see EFAULT where Linux would not.
+- A timerfd received over SCM_RIGHTS is not tracked by Detcore: settime,
+  gettime and read on it return EBADF (read did already before this change).
+  Forwarding settime would arm the host vessel on host time, unseen by the
+  sender's descriptor for the same file, so it is refused instead.
 - Timer events are appended after host events; relative order between a
   timerfd and an external host fd at one probe is Hermit's existing external
   I/O scope.

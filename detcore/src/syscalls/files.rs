@@ -71,11 +71,19 @@ pub(crate) fn timespec_valid(ts: &libc::timespec) -> bool {
     ts.tv_sec >= 0 && (0..1_000_000_000).contains(&ts.tv_nsec)
 }
 
-/// Flatten a guest timespec to nanoseconds (negative fields clamp to zero).
+/// Linux `KTIME_MAX`: the largest time a timer can hold, in nanoseconds.
+const KTIME_MAX_NS: u64 = i64::MAX as u64;
+
+/// Flatten a guest timespec to nanoseconds as Linux `timespec64_to_ktime`
+/// does: negative fields clamp to zero, and a second count at or above
+/// `KTIME_MAX / NSEC_PER_SEC` clamps the whole value to `KTIME_MAX`.
 pub(crate) fn timespec_ns(ts: libc::timespec) -> u64 {
     let secs = ts.tv_sec.max(0) as u64;
     let nsec = ts.tv_nsec.max(0) as u64;
-    secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+    if secs >= KTIME_MAX_NS / 1_000_000_000 {
+        return KTIME_MAX_NS;
+    }
+    secs * 1_000_000_000 + nsec
 }
 
 pub(crate) fn ns_timespec(ns: u64) -> libc::timespec {
@@ -4022,6 +4030,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EINVAL.into());
         }
+        // A descriptor Detcore did not see created, such as one received over
+        // SCM_RIGHTS, reports EBADF, like every other Detcore operation on it.
+        // Forwarding it would arm the host vessel on the host clock, invisible
+        // to aliases that read the virtual state.
         let state = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.timerfd_state())?
@@ -4112,10 +4124,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         break;
                     }
                 }
-                return if bytes.is_empty() {
-                    Ok(8)
-                } else {
+                // fs/timerfd.c returns what copy_to_iter transferred and
+                // reports EFAULT only when nothing was copied.
+                let copied = 8 - bytes.len();
+                return if copied == 0 {
                     Err(Errno::EFAULT.into())
+                } else {
+                    Ok(copied as i64)
                 };
             }
             if nonblocking {
@@ -4652,6 +4667,7 @@ mod test {
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
     use super::pipe_capacity_request_exceeds_ceiling;
     use super::timerfd_gettime_spec;
+    use super::timespec_ns;
     use super::timespec_valid;
     use crate::types::LogicalTime;
 
@@ -4667,6 +4683,16 @@ mod test {
         assert!(!timespec_valid(&ts(0, 1_000_000_000)));
         assert!(!timespec_valid(&ts(0, -1)));
         assert!(!timespec_valid(&ts(-1, 0)));
+        // Valid but huge values clamp to KTIME_MAX, as timespec64_to_ktime
+        // does, so gettime reports 9223372036.854775807 s as Linux does.
+        assert_eq!(timespec_ns(ts(1, 5)), 1_000_000_005);
+        assert_eq!(
+            timespec_ns(ts(9_223_372_035, 999_999_999)),
+            9_223_372_035_999_999_999
+        );
+        assert_eq!(timespec_ns(ts(9_223_372_036, 0)), i64::MAX as u64);
+        assert_eq!(timespec_ns(ts(17_000_000_000, 0)), i64::MAX as u64);
+        assert_eq!(timespec_ns(ts(i64::MAX, 999_999_999)), i64::MAX as u64);
     }
     /// The ceiling is inclusive. A guest that reads the advertised
     /// `pipe-max-size` and asks for exactly that must be allowed to have it;

@@ -313,10 +313,14 @@ impl TimerFdState {
         if now < deadline {
             return Some(deadline);
         }
+        // Saturate like the rest of logical time: a guest-chosen deadline and
+        // interval near the top of the range must not overflow here.
         let elapsed = now.as_nanos() - deadline.as_nanos();
         let k = elapsed / self.interval.as_nanos() + 1;
         Some(LogicalTime::from_nanos(
-            deadline.as_nanos() + k * self.interval.as_nanos(),
+            deadline
+                .as_nanos()
+                .saturating_add(k.saturating_mul(self.interval.as_nanos())),
         ))
     }
 }
@@ -701,6 +705,11 @@ impl DetFd {
     /// Initialize virtual timerfd state on this open file description.
     pub(crate) fn init_timerfd(&self, clockid: i32) {
         self.description().timerfd = Some(Arc::new(Mutex::new(TimerFdState::new(clockid))));
+    }
+
+    /// Whether this fd is a managed virtual timerfd.
+    pub(crate) fn is_timerfd(&self) -> bool {
+        self.description().timerfd.is_some()
     }
 
     /// Snapshot of the virtual timerfd state, if this fd is a managed timerfd.
@@ -1117,6 +1126,20 @@ mod tests {
         // Disarmed: nothing.
         s.deadline = None;
         assert_eq!(s.expirations(LogicalTime::from_nanos(10_000)), 0);
+        // A deadline and interval at the top of the range saturate rather
+        // than overflow.
+        s.deadline = Some(LogicalTime::from_nanos(u64::MAX - 10));
+        s.interval = LogicalTime::from_nanos(u64::MAX / 2);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(u64::MAX - 5)),
+            Some(LogicalTime::from_nanos(u64::MAX))
+        );
+        s.deadline = Some(LogicalTime::from_nanos(1_000));
+        s.interval = LogicalTime::from_nanos(i64::MAX as u64);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(6_000_000)),
+            Some(LogicalTime::from_nanos(1_000 + i64::MAX as u64))
+        );
     }
 
     fn timer_interest(events: u32, target: TimerFdLink) -> EpollTimerInterest {
