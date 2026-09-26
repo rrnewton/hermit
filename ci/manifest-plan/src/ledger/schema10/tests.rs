@@ -702,6 +702,31 @@ fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
 // Use the real generated graph and label selection, including the pinned-root
 // wrapper additions. The small report fixture above intentionally remains a
 // synthetic single-cell input; it does not cover generated command bytes.
+fn exact_rng_population(cells: &[CellIdentity], count: usize) -> bool {
+    let expected = [
+        ("verify", "ptrace"),
+        ("verify", "kvm"),
+        ("replay", "ptrace"),
+    ]
+    .map(|(mode, backend)| CellIdentity {
+        lane: "portable".into(),
+        category: "c-programs".into(),
+        test: "c-programs/random-readv-stream".into(),
+        mode: mode.into(),
+        backend: backend.into(),
+    })
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let unique = cells.iter().cloned().collect::<BTreeSet<_>>();
+    cells.len() == count
+        && unique.len() == count
+        && unique
+            .into_iter()
+            .filter(|cell| cell.test == "c-programs/random-readv-stream")
+            .collect::<BTreeSet<_>>()
+            == expected
+}
+
 fn generated_plan_populations_preserve_command_policy() {
     let root = crate::validation_dag::repo_root().unwrap();
     let generated = crate::validation_dag::generate(&root).unwrap();
@@ -710,19 +735,39 @@ fn generated_plan_populations_preserve_command_policy() {
         std::fs::read_to_string(root.join("ci/dag/validate.json")).unwrap()
     );
     let expected_json = std::fs::read_to_string(root.join("ci/expected-e2e-plan.json")).unwrap();
-    let expected_cells = crate::validation_dag::expected_cells_from_json(&expected_json)
+    let raw_expected = crate::validation_dag::expected_cells_from_json(&expected_json)
         .unwrap()
         .iter()
         .map(exact_identity)
-        .collect::<Result<BTreeSet<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(expected_cells.len(), 856);
+    // The frozen 856-cell population gains precisely these three portable RNG
+    // cells. Preserve raw cardinality as well as the set: duplicates are not cells.
+    assert!(exact_rng_population(&raw_expected, 859));
+    let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(expected_cells.len(), 859);
+    let rng = raw_expected
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.test == "c-programs/random-readv-stream")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(rng.len(), 3);
+    let mut renamed = raw_expected.clone();
+    renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
+    assert!(!exact_rng_population(&renamed, 859));
+    let mut duplicate = raw_expected.clone();
+    duplicate[rng[0]] = duplicate[rng[1]].clone();
+    assert!(!exact_rng_population(&duplicate, 859));
+    let mut missing = raw_expected.clone();
+    missing.remove(rng[0]);
+    assert!(!exact_rng_population(&missing, 859));
     for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 856),
+        ("full", "e2e.manifest_backend_parity_c", 859),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            852,
+            855,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -732,6 +777,7 @@ fn generated_plan_populations_preserve_command_policy() {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(expected_selected.len(), cell_count);
+        assert!(exact_rng_population(&expected_selected, cell_count));
         for active in [false, true] {
             let mut cfg = selected.clone();
             let index = cfg.steps.iter().position(|step| step.tag() == tag).unwrap();

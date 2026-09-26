@@ -32,6 +32,17 @@ fn isolated(name: &str, body: impl FnOnce()) {
 }
 
 fn isolated_with_env(name: &str, environment: &[(&str, &std::path::Path)], body: impl FnOnce()) {
+    isolated_with_child_setup(name, environment, || Ok(()), body)
+}
+
+// `child_setup` runs after fork and before exec: it must use only async-signal-safe
+// operations. Opt-in credential changes must never affect the outer libtest process.
+fn isolated_with_child_setup(
+    name: &str,
+    environment: &[(&str, &std::path::Path)],
+    child_setup: fn() -> std::io::Result<()>,
+    body: impl FnOnce(),
+) {
     if std::env::var("HERMIT_OWNER_TEST_ROLE").as_deref() == Ok(name) {
         let deadline: u64 = std::env::var("HERMIT_OWNER_TEST_DEADLINE")
             .unwrap()
@@ -56,11 +67,11 @@ fn isolated_with_env(name: &str, environment: &[(&str, &std::path::Path)], body:
         command.env(key, value);
     }
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            Ok(())
+            child_setup()
         });
     }
     let mut child = command.spawn().unwrap();

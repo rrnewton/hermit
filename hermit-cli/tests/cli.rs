@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/fault_sites.rs"]
+mod fault_sites;
+
 #[path = "common/kvm_cancellation.rs"]
 mod kvm_cancellation;
 
@@ -5786,7 +5789,7 @@ fn a_fault_aimed_at_no_existing_site_fires_nowhere() {
     );
 }
 
-/// One row per `run_guarded_at` site in `record_start.rs`, with a spelling that
+/// One row per container fault label in `record_start.rs`, with a spelling that
 /// reaches it. Kept at module scope so
 /// `no_container_site_is_unreachable_by_the_fault_injector` can hold the source
 /// to it.
@@ -5821,77 +5824,266 @@ const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 1] = [(
 /// mode is not that a test broke, it is that no test could ever have existed, and
 /// silence is indistinguishable from coverage.
 ///
-/// So: every `run_guarded_at("...")` label in the sources is extracted here and
+/// So: every actual container-call label in the sources is parsed here and
 /// must appear either in [`RECORD_FAULT_SITES`] or in
 /// [`FAULT_SITES_DRIVEN_ELSEWHERE`] with a reason. A site added without a row
 /// fails THIS test by name, at the moment it is added, rather than being
 /// untestable by default and noticed years later.
 #[test]
 fn no_container_site_is_unreachable_by_the_fault_injector() {
-    const SOURCES: [(&str, &str); 2] = [
-        (
-            "record_start.rs",
-            include_str!("../src/bin/hermit/record_start.rs"),
-        ),
-        (
-            "container.rs",
-            include_str!("../src/bin/hermit/container.rs"),
-        ),
-    ];
-
-    let mut declared: Vec<(String, String)> = Vec::new();
-    for (file, text) in SOURCES {
-        for (needle, close) in [("run_guarded_at(\"", '"'), ("inject_test_fault(\"", '"')] {
-            let mut rest = text;
-            while let Some(at) = rest.find(needle) {
-                rest = &rest[at + needle.len()..];
-                if let Some(end) = rest.find(close) {
-                    declared.push((file.to_string(), rest[..end].to_string()));
-                }
-            }
-        }
-    }
-    assert!(
-        !declared.is_empty(),
-        "extracted zero site labels from the sources; this test would pass \
-         vacuously and prove nothing about coverage"
-    );
-
-    let covered: Vec<&str> = RECORD_FAULT_SITES
+    const RECORD: &str = include_str!("../src/bin/hermit/record_start.rs");
+    const CONTAINER: &str = include_str!("../src/bin/hermit/container.rs");
+    const OWNER: &str = include_str!("../src/bin/hermit/owned_container.rs");
+    const RUN: &str = include_str!("../src/bin/hermit/run.rs");
+    const REPLAY: &str = include_str!("../src/bin/hermit/replay.rs");
+    assert!(fault_sites::forwards_parameter(
+        OWNER,
+        "run",
+        4,
+        "super::container::catch_child_panic_at"
+    ));
+    assert!(fault_sites::forwards_parameter(
+        CONTAINER,
+        "catch_child_panic_at",
+        0,
+        "inject_test_fault"
+    ));
+    let covered = RECORD_FAULT_SITES
         .iter()
         .map(|(site, _)| *site)
         .chain(FAULT_SITES_DRIVEN_ELSEWHERE.iter().map(|(site, _)| *site))
-        .collect();
+        .collect::<Vec<_>>();
+    let check = |record: &str| {
+        fault_sites::coverage(
+            [
+                ("record_start.rs", record),
+                ("container.rs", CONTAINER),
+                ("run.rs", RUN),
+                ("replay.rs", REPLAY),
+            ],
+            &covered,
+        )
+    };
+    check(RECORD).unwrap_or_else(|error| panic!("fault-site coverage: {error}"));
 
-    let mut unreachable: Vec<String> = declared
-        .iter()
-        .filter(|(_, site)| !covered.contains(&site.as_str()))
-        .map(|(file, site)| format!("{file}: {site}"))
-        .collect();
-    unreachable.sort();
-    unreachable.dedup();
+    // Mutate the actual included source, not a second hand-written inventory.
+    // Both a conditional label and a direct call label must be discovered.
+    for label in ["record.main.deadline", "record_verify.record"] {
+        let needle = format!("\"{label}\"");
+        assert_eq!(RECORD.matches(&needle).count(), 1);
+        let mutant = RECORD.replace(&needle, "\"renamed.uncovered.site\"");
+        let error = check(&mutant).unwrap_err();
+        assert!(
+            error.contains("renamed.uncovered.site") && error.contains(label),
+            "{error}"
+        );
+    }
+    let missing_call = RECORD.replacen(
+        "super::owned_container::run(",
+        "super::owned_container::removed_call(",
+        1,
+    );
+    let error = check(&missing_call).unwrap_err();
     assert!(
-        unreachable.is_empty(),
-        "these container sites can be faulted but no test aims at them, so their \
-         classification would be asserted rather than measured -- add a row to \
-         RECORD_FAULT_SITES, or to FAULT_SITES_DRIVEN_ELSEWHERE with the test that \
-         covers it:\n  {}",
-        unreachable.join("\n  ")
+        error.contains("record.main.deadline") && error.contains("record.main"),
+        "{error}"
+    );
+    let added_call = format!(
+        "{RECORD}\nfn uncovered_fixture() {{ super::owned_container::run((), (), (), true, \"added.uncovered.site\", None, ()); }}"
+    );
+    assert!(
+        check(&added_call)
+            .unwrap_err()
+            .contains("added.uncovered.site")
+    );
+    let decoys = format!(
+        "{RECORD}\n// super::owned_container::run((), (), (), true, \"comment.decoy\");\nconst DECOY: &str = r#\"inject_test_fault(\"string.decoy\")\"#;"
+    );
+    check(&decoys).unwrap();
+    // A test-only literal must not conceal deletion of every production use.
+    let missing_run = RUN.replace("\"with_container\"", "\"renamed.run.site\"");
+    let missing_replay = REPLAY.replace("\"with_container\"", "\"renamed.replay.site\"");
+    assert!(
+        fault_sites::coverage(
+            [
+                ("record_start.rs", RECORD),
+                ("container.rs", CONTAINER),
+                ("run.rs", missing_run.as_str()),
+                ("replay.rs", missing_replay.as_str()),
+            ],
+            &covered
+        )
+        .unwrap_err()
+        .contains("with_container")
     );
 
-    // And the other direction: a row naming a site that no longer exists is a test
-    // aimed at nothing, which passes while covering less than it claims.
-    let existing: Vec<&str> = declared.iter().map(|(_, s)| s.as_str()).collect();
-    let stale: Vec<&str> = covered
-        .iter()
-        .copied()
-        .filter(|site| !existing.contains(site))
-        .collect();
+    let unknown = RECORD.replace("\"record_verify.record\"", "unsupported_label()");
     assert!(
-        stale.is_empty(),
-        "these rows name a site that no longer exists in the sources, so they aim \
-         at nothing: {stale:?}"
+        check(&unknown)
+            .unwrap_err()
+            .contains("unsupported site expression")
     );
+    let shadowed_owner = OWNER.replace(
+        "let state = Rc::new(RefCell::new((guards, work)));",
+        "let site = \"wrong.forwarding\"; let state = Rc::new(RefCell::new((guards, work)));",
+    );
+    assert_ne!(shadowed_owner, OWNER);
+    assert!(!fault_sites::forwards_parameter(
+        &shadowed_owner,
+        "run",
+        4,
+        "super::container::catch_child_panic_at"
+    ));
+    let shadowed_boundary = CONTAINER.replace(
+        "inject_test_fault(site);",
+        "let site = \"wrong.forwarding\"; inject_test_fault(site);",
+    );
+    assert_ne!(shadowed_boundary, CONTAINER);
+    assert!(!fault_sites::forwards_parameter(
+        &shadowed_boundary,
+        "catch_child_panic_at",
+        0,
+        "inject_test_fault"
+    ));
+    let alias_shadow = RECORD.replace(
+        "let site = if record_timeout.is_some() {",
+        "let source = \"new.uncovered.alias\"; let site = source; let source = \"with_container\"; let unused_original_site = if record_timeout.is_some() {",
+    );
+    assert_ne!(alias_shadow, RECORD);
+    let actual_labels = fault_sites::labels(&alias_shadow).unwrap();
+    assert!(
+        actual_labels
+            .iter()
+            .any(|label| label == "new.uncovered.alias")
+    );
+    assert!(!actual_labels.iter().any(|label| label == "with_container"));
+    assert!(
+        check(&alias_shadow)
+            .unwrap_err()
+            .contains("new.uncovered.alias")
+    );
+    // Reuse the real conditional initializer and the complete actual call for
+    // unsupported-binding mutants; no second label inventory or fake call body.
+    let initializer_start = RECORD
+        .find("let site = if record_timeout.is_some() {")
+        .unwrap();
+    let call_start = initializer_start
+        + RECORD[initializer_start..]
+            .find("super::owned_container::run(")
+            .unwrap();
+    let initializer_end = initializer_start
+        + RECORD[initializer_start..]
+            .find("            };\n")
+            .unwrap()
+        + "            };\n".len();
+    let call_end = call_start
+        + RECORD[call_start..].find("            )?;").unwrap()
+        + "            )?;".len();
+    let initializer = &RECORD[initializer_start..initializer_end];
+    let call = &RECORD[call_start..call_end];
+    for condition in [
+        "if let Some(source) = Some(\"new.uncovered.if_initializer\") { source } else { \"record.main\" }",
+        "if true && let Some(source) = Some(\"new.uncovered.if_chain\") { source } else { \"record.main\" }",
+        "if opaque_condition!() { source } else { \"record.main\" }",
+    ] {
+        let replacement =
+            format!("let source = \"record.main.deadline\"; let site = {condition};\n");
+        let mutant = RECORD.replacen(initializer, &replacement, 1);
+        assert_ne!(mutant, RECORD);
+        assert!(
+            check(&mutant)
+                .unwrap_err()
+                .contains("binding-bearing or opaque site condition"),
+            "{condition}"
+        );
+    }
+    let associated_constant =
+        call.replace("                site,", "                <Labels>::site,");
+    assert_ne!(associated_constant, call);
+    assert!(
+        check(&RECORD.replacen(call, &associated_constant, 1))
+            .unwrap_err()
+            .contains("unsupported site expression")
+    );
+    for (before, expected) in [
+        (
+            "let binder!(site) = ();",
+            "unsupported opaque pattern-bound site",
+        ),
+        (
+            "let ref site = \"new.uncovered.ref\";",
+            "only plain immutable site bindings",
+        ),
+        (
+            "let site @ _ = \"new.uncovered.subpattern\";",
+            "only plain immutable site bindings",
+        ),
+    ] {
+        let mutant = format!("{RECORD}\nfn binding_mutant() {{ {initializer} {before} {call} }}");
+        assert!(check(&mutant).unwrap_err().contains(expected), "{before}");
+    }
+    for (before, after) in [
+        ("let (site,) = (\"new.uncovered.tuple\",);", ""),
+        ("let site: &str = \"new.uncovered.typed\";", ""),
+        ("(|site| {", "})(\"new.uncovered.closure\");"),
+        ("for site in [\"new.uncovered.for\"] {", "}"),
+        ("if let Some(site) = Some(\"new.uncovered.if\") {", "}"),
+        (
+            "while let Some(site) = Some(\"new.uncovered.while\") {",
+            "break; }",
+        ),
+        (
+            "match Some(\"new.uncovered.match\") { Some(site) => {",
+            "}, None => {} }",
+        ),
+        ("fn nested(site: &str) {", "}"),
+    ] {
+        let mutant =
+            format!("{RECORD}\nfn binding_mutant() {{ {initializer} {before} {call} {after} }}");
+        assert!(
+            check(&mutant)
+                .unwrap_err()
+                .contains("unsupported pattern-bound site"),
+            "{before}"
+        );
+    }
+    let broken_owner = OWNER.replace(
+        "catch_child_panic_at(site,",
+        "catch_child_panic_at(\"wrong.forwarding\",",
+    );
+    assert!(!fault_sites::forwards_parameter(
+        &broken_owner,
+        "run",
+        4,
+        "super::container::catch_child_panic_at"
+    ));
+    let broken_boundary = CONTAINER.replace(
+        "inject_test_fault(site);",
+        "inject_test_fault(\"wrong.forwarding\");",
+    );
+    assert!(!fault_sites::forwards_parameter(
+        &broken_boundary,
+        "catch_child_panic_at",
+        0,
+        "inject_test_fault"
+    ));
+    for replacement in [
+        "let binder!(site) = (); inject_test_fault(site);",
+        "inject_test_fault(<Labels>::site);",
+        "<Labels>::inject_test_fault(site);",
+    ] {
+        let mutant = CONTAINER.replace("inject_test_fault(site);", replacement);
+        assert_ne!(mutant, CONTAINER);
+        assert!(
+            !fault_sites::forwards_parameter(
+                &mutant,
+                "catch_child_panic_at",
+                0,
+                "inject_test_fault"
+            ),
+            "{replacement}"
+        );
+    }
 }
 
 /// A guest that exits with one of hermit's own reserved statuses must still be
