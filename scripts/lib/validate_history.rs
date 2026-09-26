@@ -564,9 +564,22 @@ pub fn selective_baseline(
     slot: &str,
     commit_exists: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
+    let env = std::env::var("HERMIT_LAST_GREEN_SHA").ok();
+    selective_baseline_from(rows, explicit, env.as_deref(), slot, commit_exists)
+}
+
+/// `selective_baseline` with the `HERMIT_LAST_GREEN_SHA` value passed in, so
+/// the self-test brackets do not depend on the caller's environment.
+fn selective_baseline_from(
+    rows: &[serde_json::Value],
+    explicit: Option<&str>,
+    env_sha: Option<&str>,
+    slot: &str,
+    commit_exists: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     let mut sha: Option<String> = explicit.map(|s| s.to_string());
     if sha.is_none() {
-        sha = std::env::var("HERMIT_LAST_GREEN_SHA").ok().filter(|v| !v.is_empty());
+        sha = env_sha.filter(|v| !v.is_empty()).map(str::to_owned);
     }
     if sha.is_none() {
         // `tail -n 1` in the bash: LAST matching line, i.e. append order, not
@@ -925,6 +938,12 @@ pub fn self_test() -> Result<String, String> {
     ];
     let exists_all = |_: &str| true;
     let exists_none = |_: &str| false;
+    let selective_baseline = |rows: &[serde_json::Value],
+                              explicit: Option<&str>,
+                              slot: &str,
+                              exists: &dyn Fn(&str) -> bool| {
+        selective_baseline_from(rows, explicit, None, slot, exists)
+    };
     let seen: BTreeSet<String> = ledger_rows.iter().map(|r| s(r, "commit").to_string()).collect();
     if seen.len() != 2 {
         return Err("selective: fixture rows must carry distinct commits".into());
@@ -938,11 +957,34 @@ pub fn self_test() -> Result<String, String> {
     if selective_baseline(&ledger_rows, Some("cafe"), "mine", &exists_none).is_some() {
         return Err("selective: a baseline absent from this checkout must be REFUSED".into());
     }
-    let mut with_buck = ledger_rows.clone();
-    with_buck.push(base(serde_json::json!({"slot": "mine", "commit": "ccc", "producer": "validate.rs", "release_builder": "buck"})));
-    with_buck.push(base(serde_json::json!({"slot": "mine", "commit": "ddd", "producer": "validate.rs", "release_builder": 7})));
-    if selective_baseline(&with_buck, None, "mine", &exists_all).as_deref() != Some("bbb") {
-        return Err("selective: a newer Buck or non-string-builder green must not become the Cargo baseline".into());
+    // Each newer green is checked alone, so every refusal is proved by its own
+    // row: a consistent Buck green, a non-string builder carrying the Cargo
+    // payload, and the two builder-only rows that no writer emits.
+    for (commit, builder, payload) in [
+        (
+            "ccc",
+            serde_json::json!("buck"),
+            Some(crate::e2e_payload_identity("buck")),
+        ),
+        (
+            "ddd",
+            serde_json::json!(7),
+            Some(crate::e2e_payload_identity("cargo")),
+        ),
+        ("hhh", serde_json::json!("buck"), None),
+        ("iii", serde_json::json!(7), None),
+    ] {
+        let mut row = serde_json::json!({"slot": "mine", "commit": commit, "producer": "validate.rs", "release_builder": builder});
+        if let Some(payload) = payload {
+            row["e2e_payload"] = payload;
+        }
+        let mut with_buck = ledger_rows.clone();
+        with_buck.push(base(row));
+        if selective_baseline(&with_buck, None, "mine", &exists_all).as_deref() != Some("bbb") {
+            return Err(format!(
+                "selective: newer green {commit} (Buck or non-string builder) must not become the Cargo baseline"
+            ));
+        }
     }
     let mut named_cargo = ledger_rows.clone();
     named_cargo.push(base(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")})));
