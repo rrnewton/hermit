@@ -3162,22 +3162,7 @@ fn run() -> Result<(), String> {
     {
         return publish_history_command(&root, &command, args);
     }
-    // The ledger publisher above keeps the caller's Git configuration and makes
-    // no memoised read. Every Git process started from here on, and every
-    // program that starts one, inherits `COMMAND_GIT_CONFIG`; the memo exists
-    // only when it does. `run` has started no thread, so the environment is
-    // changed before anything else can read it.
-    let quiesced = match command_git_config_environment(|name| env::var_os(name)) {
-        Some(variables) => {
-            for (name, value) in variables {
-                // SAFETY: single-threaded here; see the comment above.
-                unsafe { env::set_var(name, value) };
-            }
-            true
-        }
-        None => false,
-    };
-    let _object_memo_scope = quiesced.then(CommandObjectMemoScope::enter);
+    let _object_memo_scope = CommandObjectMemoScope::enter();
     match command.as_str() {
         "export-legacy" => {
             no_more(&mut args)?;
@@ -4654,26 +4639,33 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
 /// a memoised series is still compared byte for byte with the worktree on every
 /// capture.
 ///
-/// Nothing in this tool removes an object, changes a shallow, graft or
-/// alternates boundary, or puts a different repository at a memoised path
-/// during a command. It runs no `gc`, `prune`, `repack` or `maintenance`; every
-/// Git process it starts receives [`COMMAND_GIT_CONFIG`], so neither a fixture
-/// commit nor the fetch behind a lazy partial-clone read starts Git's automatic
-/// maintenance or runs a hook; and its own writes -- self-test fixtures in fresh
-/// temporary directories -- only create repositories, add objects and move refs.
-/// A lazy fetch only adds objects, and adding objects cannot change a
-/// successful read of immutable content.
+/// Every Git process runs with the caller's configuration, hooks and
+/// maintenance policy. A read in a partial clone can fetch a missing object
+/// lazily, and that fetch starts Git's automatic maintenance and runs the
+/// repository's hooks under the caller's policy; maintenance may delete
+/// unreachable objects. Reads in such a repository, or in one that borrows
+/// objects from another store through alternates, are therefore never
+/// memoised: see [`memo_eligible`]. In every other repository no read can
+/// fetch, and nothing in this tool removes an object, changes a shallow, graft
+/// or alternates boundary, or puts a different repository at a memoised path
+/// during a command: it runs no `gc`, `prune`, `repack`, `maintenance` or
+/// `fetch`, and its own writes -- self-test fixtures in fresh temporary
+/// directories -- only create repositories, add objects and move refs.
 ///
 /// This caches a repository that nothing else is changing; it is not a guard
 /// against concurrent change. Concurrent external mutation of the repository
-/// during one command is out of scope. Calls outside a scope, including the
-/// unit tests, read Git on every lookup.
+/// during one command is out of scope, and so are the effects of the caller's
+/// own hook programs and maintenance policy. Calls outside a scope, including
+/// the unit tests, read Git on every lookup.
 #[derive(Default)]
 struct CommandObjectMemo {
     rev_parse: BTreeMap<(PathBuf, String), String>,
     depths: BTreeMap<(PathBuf, String), SourceDepth>,
     reverie_pins: BTreeMap<(PathBuf, String), Option<String>>,
     series: BTreeMap<(PathBuf, String, String), std::rc::Rc<CommittedSeries>>,
+    /// Whether reads run from a canonical directory may be memoised; see
+    /// [`memo_eligible`].
+    eligible: BTreeMap<PathBuf, bool>,
 }
 
 /// The committed half of a series capture: the source tree and each JSONL
@@ -4721,85 +4713,88 @@ fn object_addressed_revision(revision: &str) -> bool {
 }
 
 /// Memo key for an object-addressed lookup run with `root` as its working
-/// directory, or `None` when no scope is active or the key is not immutable.
+/// directory, or `None` when no scope is active, the key is not immutable, or
+/// reads from `root` may not be memoised.
 fn object_memo_key(root: &Path, revision: &str) -> Option<(PathBuf, String)> {
     if !object_addressed_revision(revision)
         || !COMMAND_OBJECT_MEMO.with(|memo| memo.borrow().is_some())
     {
         return None;
     }
-    Some((fs::canonicalize(root).ok()?, revision.to_string()))
+    let canonical = fs::canonicalize(root).ok()?;
+    memo_eligible(&canonical).then(|| (canonical, revision.to_string()))
 }
 
 fn with_object_memo<T>(access: impl FnOnce(&mut CommandObjectMemo) -> T) -> Option<T> {
     COMMAND_OBJECT_MEMO.with(|memo| memo.borrow_mut().as_mut().map(access))
 }
 
-/// Configuration that every Git process one command starts receives through
-/// the environment, directly or through another program such as
-/// `hermit-manifest-plan`, a submodule clone, or the fetch that Git itself runs
-/// for a lazy partial-clone read. Git 2.53 otherwise starts
-/// `git maintenance run --auto --detach` after a commit and after that lazy
-/// fetch; the background `gc` it can start deletes unreachable objects, so it
-/// could remove an object that a memoised read had found. The same lazy fetch
-/// runs the repository's `reference-transaction` hook, and `status` runs
-/// `post-index-change` and the `core.fsmonitor` program. Environment
-/// configuration outranks every configuration file, so none of these runs.
-const COMMAND_GIT_CONFIG: [(&str, &str); 3] = [
-    ("maintenance.auto", "false"),
-    ("core.hooksPath", "/dev/null"),
-    ("core.fsmonitor", "false"),
-];
-
-/// The environment variables that append [`COMMAND_GIT_CONFIG`] to the
-/// configuration already given through `GIT_CONFIG_COUNT`, read with `lookup`.
-/// Empty when those entries are already the last ones, as in a scorecard
-/// started by a scorecard. `None` when the existing count is not a plain decimal
-/// number, or when `GIT_CONFIG_PARAMETERS` is set: Git reads that variable, which
-/// `git -c` passes to the programs Git starts, after these and lets it override
-/// them. The command then runs without the memo.
-fn command_git_config_environment(
-    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<Vec<(String, String)>> {
-    if lookup("GIT_CONFIG_PARAMETERS").is_some() {
-        return None;
+/// Whether reads run from the canonical directory `canonical` may be memoised,
+/// decided once per directory and command. They may not when the repository
+/// found from there is a partial clone -- `extensions.partialClone` is set or
+/// some `remote.<name>.promisor` is -- because a read may then fetch lazily,
+/// and that fetch starts the caller's automatic maintenance, which can delete
+/// objects. They may not when it borrows objects through
+/// `objects/info/alternates` or `GIT_ALTERNATE_OBJECT_DIRECTORIES` either,
+/// because the borrowed store may be such a clone. Any promisor entry counts,
+/// even one set to false. When either probe cannot give an answer, as outside
+/// a repository, the reads are not memoised and nothing is recorded, so the
+/// probes run again next time.
+///
+/// Recording the answer is sound because nothing in this tool makes a
+/// repository partial or adds alternates to it after a read: it runs no
+/// `fetch` or `clone` with a filter and writes neither setting; `git init`
+/// creates neither; and its one `clone --shared` writes its alternates before
+/// anything reads the clone.
+fn memo_eligible(canonical: &Path) -> bool {
+    if let Some(Some(known)) = with_object_memo(|memo| memo.eligible.get(canonical).copied()) {
+        return known;
     }
-    let count = match lookup("GIT_CONFIG_COUNT") {
-        None => 0,
-        Some(text) => text.to_str()?.parse::<usize>().ok()?,
+    let Some(eligible) = probe_memo_eligible(canonical) else {
+        return false;
     };
-    let already = count
-        .checked_sub(COMMAND_GIT_CONFIG.len())
-        .is_some_and(|first| {
-            COMMAND_GIT_CONFIG
-                .iter()
-                .enumerate()
-                .all(|(offset, (key, value))| {
-                    lookup(&format!("GIT_CONFIG_KEY_{}", first + offset)).as_deref()
-                        == Some(std::ffi::OsStr::new(key))
-                        && lookup(&format!("GIT_CONFIG_VALUE_{}", first + offset)).as_deref()
-                            == Some(std::ffi::OsStr::new(value))
-                })
-        });
-    if already {
-        return Some(Vec::new());
+    with_object_memo(|memo| memo.eligible.insert(canonical.to_path_buf(), eligible));
+    eligible
+}
+
+/// The two probes behind [`memo_eligible`], or `None` when either cannot
+/// answer.
+fn probe_memo_eligible(root: &Path) -> Option<bool> {
+    if env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES").is_some() {
+        return Some(false);
     }
-    let mut variables = Vec::with_capacity(2 * COMMAND_GIT_CONFIG.len() + 1);
-    for (offset, (key, value)) in COMMAND_GIT_CONFIG.iter().enumerate() {
-        variables.push((
-            format!("GIT_CONFIG_KEY_{}", count + offset),
-            key.to_string(),
-        ));
-        variables.push((
-            format!("GIT_CONFIG_VALUE_{}", count + offset),
-            value.to_string(),
-        ));
+    let alternates = git_output(
+        Command::new(git_program())
+            .args(["rev-parse", "--git-path", "objects/info/alternates"])
+            .current_dir(root),
+    )
+    .ok()
+    .filter(|output| output.status.success())?;
+    let alternates = root.join(
+        String::from_utf8(alternates.stdout)
+            .ok()?
+            .trim_end_matches('\n'),
+    );
+    match fs::symlink_metadata(&alternates) {
+        Ok(_) => return Some(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
     }
-    variables.push((
-        "GIT_CONFIG_COUNT".to_string(),
-        (count + COMMAND_GIT_CONFIG.len()).to_string(),
-    ));
-    Some(variables)
+    let promisor = git_output(
+        Command::new(git_program())
+            .args([
+                "config",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            ])
+            .current_dir(root),
+    )
+    .ok()?;
+    match promisor.status.code() {
+        Some(0) => Some(false),
+        Some(1) if promisor.stdout.is_empty() => Some(true),
+        _ => None,
+    }
 }
 
 /// `GIT_*` environment variables that cannot make Git's repository discovery
@@ -11962,9 +11957,9 @@ fn capture_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, Str
     }
     // `repository` is canonical and `source_commit` a full object id, so the
     // key names immutable content; see `CommandObjectMemo`.
-    let memo_key = COMMAND_OBJECT_MEMO
-        .with(|memo| memo.borrow().is_some())
-        .then(|| (repository.clone(), source_commit.clone(), source.clone()));
+    let memo_key = (COMMAND_OBJECT_MEMO.with(|memo| memo.borrow().is_some())
+        && memo_eligible(&repository))
+    .then(|| (repository.clone(), source_commit.clone(), source.clone()));
     let memoised = memo_key
         .as_ref()
         .and_then(|key| with_object_memo(|memo| memo.series.get(key).cloned()).flatten());
@@ -28604,88 +28599,30 @@ mod command_object_memo_tests {
         }
     }
 
+    /// A read that fetches lazily in a partial clone runs the caller's hooks and
+    /// automatic maintenance exactly as it does outside a memo scope, and it is
+    /// not memoised there or in a clone that borrows the partial clone's objects
+    /// through alternates: each scoped lookup runs Git again. The same lookup in
+    /// the ordinary source repository is served from the memo.
     #[test]
-    fn command_git_config_is_appended_after_the_callers_entries() {
-        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| std::ffi::OsString::from(value))
-            }
-        };
-        let expected = |first: usize| {
-            let mut variables = Vec::new();
-            for (offset, (key, value)) in COMMAND_GIT_CONFIG.iter().enumerate() {
-                variables.push((
-                    format!("GIT_CONFIG_KEY_{}", first + offset),
-                    key.to_string(),
-                ));
-                variables.push((
-                    format!("GIT_CONFIG_VALUE_{}", first + offset),
-                    value.to_string(),
-                ));
-            }
-            variables.push(("GIT_CONFIG_COUNT".to_string(), (first + 3).to_string()));
-            variables
-        };
-        assert_eq!(
-            command_git_config_environment(lookup(&[])),
-            Some(expected(0))
-        );
-        assert_eq!(
-            command_git_config_environment(lookup(&[
-                ("GIT_CONFIG_COUNT", "3"),
-                ("GIT_CONFIG_KEY_2", "core.hooksPath"),
-                ("GIT_CONFIG_VALUE_2", "/dev/null"),
-            ])),
-            Some(expected(3))
-        );
-        assert_eq!(
-            command_git_config_environment(lookup(&[(
-                "GIT_CONFIG_PARAMETERS",
-                "'core.hookspath'='hooks'"
-            )])),
-            None
-        );
-        for bogus in ["", "-1", "three", "3 "] {
-            let pairs: &'static [(&'static str, &'static str)] =
-                Box::leak(Box::new([("GIT_CONFIG_COUNT", bogus)]));
-            assert_eq!(
-                command_git_config_environment(lookup(pairs)),
-                None,
-                "{bogus:?}"
-            );
-        }
-        assert_eq!(
-            command_git_config_environment(lookup(&[
-                ("GIT_CONFIG_COUNT", "4"),
-                ("GIT_CONFIG_KEY_0", "safe.directory"),
-                ("GIT_CONFIG_VALUE_0", "*"),
-                ("GIT_CONFIG_KEY_1", "maintenance.auto"),
-                ("GIT_CONFIG_VALUE_1", "false"),
-                ("GIT_CONFIG_KEY_2", "core.hooksPath"),
-                ("GIT_CONFIG_VALUE_2", "/dev/null"),
-                ("GIT_CONFIG_KEY_3", "core.fsmonitor"),
-                ("GIT_CONFIG_VALUE_3", "false"),
-            ])),
-            Some(Vec::new())
-        );
-    }
-
-    /// A lazy partial-clone read and a fixture commit, each run once with the
-    /// caller's environment and once with `COMMAND_GIT_CONFIG` appended. The
-    /// repository enables automatic maintenance and its hooks in its own
-    /// configuration, so only the environment can turn them off.
-    #[test]
-    fn command_git_config_stops_maintenance_and_hooks_behind_lazy_reads() {
+    fn partial_clone_reads_keep_the_callers_hooks_and_are_not_memoised() {
         use std::os::unix::fs::PermissionsExt;
-        let source = repository();
+        let source = pinned_repository();
         git(source.path(), &["config", "uploadpack.allowFilter", "true"]);
         let head = git(source.path(), &["rev-parse", "HEAD"]);
-        let quiesced =
-            command_git_config_environment(|name| env::var_os(name)).expect("plain count");
-        for quiesce in [false, true] {
+        let pin = Some("a".repeat(40));
+        let shows = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _counter = SubstituteGit::install({
+            let shows = shows.clone();
+            move |arguments| {
+                if arguments.iter().any(|argument| *argument == "show") {
+                    shows.set(shows.get() + 1);
+                }
+                None
+            }
+        });
+        let mut fired_by_scope = Vec::new();
+        for scoped in [false, true] {
             let parent = tempfile::tempdir().unwrap();
             let clone = parent.path().join("clone");
             git(
@@ -28699,7 +28636,8 @@ mod command_object_memo_tests {
                     clone.to_str().unwrap(),
                 ],
             );
-            let hooks = clone.join(".git/hooks");
+            let hooks = parent.path().join("hooks");
+            fs::create_dir(&hooks).unwrap();
             for (key, value) in [
                 ("maintenance.auto", "true"),
                 ("maintenance.autoDetach", "false"),
@@ -28707,13 +28645,11 @@ mod command_object_memo_tests {
                 ("gc.auto", "1"),
                 ("gc.autoPackLimit", "1"),
                 ("core.hooksPath", hooks.to_str().unwrap()),
-                ("user.name", "Memo Fixture"),
-                ("user.email", "memo@example.invalid"),
             ] {
                 git(&clone, &["config", key, value]);
             }
             let fired = parent.path().join("fired");
-            for hook in ["reference-transaction", "post-commit"] {
+            for hook in ["reference-transaction", "pre-auto-gc"] {
                 let script = hooks.join(hook);
                 fs::write(
                     &script,
@@ -28722,50 +28658,58 @@ mod command_object_memo_tests {
                 .unwrap();
                 fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
             }
-            let trace = parent.path().join("trace");
-            let run = |args: &[&str]| {
-                let mut command = Command::new("git");
-                command
-                    .args(args)
-                    .current_dir(&clone)
-                    .env("GIT_TRACE", &trace);
-                if quiesce {
-                    command.envs(quiesced.iter().map(|(name, value)| (name, value)));
-                }
-                let output = command.output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "git {args:?}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                output.stdout
-            };
-            let blob = format!("{head}:series/a.jsonl");
+            let scope = scoped.then(CommandObjectMemoScope::enter);
+            shows.set(0);
             assert_eq!(
-                run(&["--no-replace-objects", "show", &blob]),
-                b"{\"a\":1}\n",
-                "the lazy fetch still supplies the blob"
+                reverie_pin_at(&clone, &head),
+                pin,
+                "the lazy fetch supplies Cargo.lock"
             );
-            let traced = fs::read_to_string(&trace).unwrap();
-            assert!(
-                traced.contains("fetch origin"),
-                "the read must fetch lazily: {traced}"
-            );
-            run(&["commit", "--quiet", "--allow-empty", "-m", "fixture"]);
-            let traced = fs::read_to_string(&trace).unwrap();
             let hooks_fired = fs::read_to_string(&fired).unwrap_or_default();
-            if quiesce {
-                assert!(!traced.contains("maintenance run"), "{traced}");
-                assert_eq!(hooks_fired, "");
-            } else {
-                assert!(traced.contains("maintenance run"), "{traced}");
-                assert!(
-                    hooks_fired.contains("reference-transaction"),
-                    "{hooks_fired}"
+            assert!(
+                hooks_fired.contains("reference-transaction"),
+                "{hooks_fired}"
+            );
+            assert!(hooks_fired.contains("pre-auto-gc"), "{hooks_fired}");
+            fired_by_scope.push(hooks_fired);
+            assert_eq!(reverie_pin_at(&clone, &head), pin);
+            assert_eq!(shows.get(), 2, "each lookup in the partial clone runs Git");
+            assert_eq!(memo_len(), (0, 0, 0, 0));
+            if scoped {
+                let borrower = parent.path().join("borrower");
+                git(
+                    parent.path(),
+                    &[
+                        "clone",
+                        "--quiet",
+                        "--no-checkout",
+                        "--shared",
+                        clone.to_str().unwrap(),
+                        borrower.to_str().unwrap(),
+                    ],
                 );
-                assert!(hooks_fired.contains("post-commit"), "{hooks_fired}");
+                shows.set(0);
+                assert_eq!(reverie_pin_at(&borrower, &head), pin);
+                assert_eq!(reverie_pin_at(&borrower, &head), pin);
+                assert_eq!(
+                    shows.get(),
+                    2,
+                    "each lookup in the borrowing clone runs Git"
+                );
+                assert_eq!(memo_len(), (0, 0, 0, 0));
+                shows.set(0);
+                assert_eq!(reverie_pin_at(source.path(), &head), pin);
+                assert_eq!(reverie_pin_at(source.path(), &head), pin);
+                assert_eq!(
+                    shows.get(),
+                    1,
+                    "the ordinary repository is served from the memo"
+                );
+                assert_eq!(memo_len(), (0, 0, 1, 0));
             }
+            drop(scope);
         }
+        assert_eq!(fired_by_scope[0], fired_by_scope[1]);
     }
 
     #[test]
