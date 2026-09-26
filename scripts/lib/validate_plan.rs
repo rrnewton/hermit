@@ -290,6 +290,7 @@ pub fn node(
         },
         networkonly: false,
         engine_only: false,
+        delegated_children: false,
         timeout,
         cpu_timeout,
         jobs_flag: None,
