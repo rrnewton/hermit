@@ -2445,11 +2445,15 @@ impl ResultRow {
                                     || report.first_divergent_virtual_nanoseconds.is_some()
                                     || report.first_divergent_record.is_some()
                                     || report.first_divergent_syscall.is_some()
+                                    || report.first_divergent_left_message.is_some()
+                                    || report.first_divergent_right_message.is_some()
                                     || [
                                         "first_divergent_scheduler_turn",
                                         "first_divergent_virtual_nanoseconds",
                                         "first_divergent_record",
                                         "first_divergent_syscall",
+                                        "first_divergent_left_message",
+                                        "first_divergent_right_message",
                                     ]
                                     .iter()
                                     .any(|field| {
@@ -27335,7 +27339,8 @@ mod post_verdict_transaction_tests {
 
     /// Retention is only for the red the runner actually writes. A retained
     /// failed match whose row or attempt or embedded report carries a
-    /// divergence coordinate, whose row records a comparison failure or an
+    /// divergence coordinate, or whose attempt or report carries a
+    /// first-divergent message, whose row records a comparison failure or an
     /// unproven timeout, or whose FAIL ended as its row allows, is a
     /// contradiction and aborts the fold rather than being kept as red.
     #[test]
@@ -27367,6 +27372,21 @@ mod post_verdict_transaction_tests {
         report_coordinate["attempts"][0]["verification_report_sha256"] =
             format!("{:x}", Sha256::digest(report.as_bytes())).into();
         report_coordinate["attempts"][0]["verification_report"] = report.into();
+        let mut attempt_message = failed.clone();
+        attempt_message["attempts"][0]["first_divergent_right_message"] =
+            "INFO detcore: result=2".into();
+        let mut report_message = failed.clone();
+        let mut report: JsonValue = serde_json::from_str(
+            report_message["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        report["first_divergent_left_message"] = "INFO detcore: result=1".into();
+        let report = serde_json::to_string(&report).unwrap();
+        report_message["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        report_message["attempts"][0]["verification_report"] = report.into();
         let mut comparison_failure = failed.clone();
         comparison_failure["result"] = "determinism-failure".into();
         let mut unproven_timeout = failed.clone();
@@ -27395,6 +27415,16 @@ mod post_verdict_transaction_tests {
             (
                 "report coordinate",
                 report_coordinate,
+                "matched report the runner did not pass carries a divergence coordinate",
+            ),
+            (
+                "attempt message",
+                attempt_message,
+                "matched report the runner did not pass carries a divergence coordinate",
+            ),
+            (
+                "report message",
+                report_message,
                 "matched report the runner did not pass carries a divergence coordinate",
             ),
             (
