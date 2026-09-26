@@ -25,7 +25,7 @@
 /* Periodic virtual timerfd across a nanosleep: the guest sleeps 100ms of
  * virtual time with a 30ms periodic timerfd armed, so exactly three
  * expirations (30/60/90ms) must be pending at the read. This exercises the
- * scheduler empty-queue fast-forward over periodic TimerFdEvt re-arms; a
+ * scheduler empty-queue fast-forward over periodic TimerFdExpiry re-arms; a
  * regression there hung this guest (scheduler panic on re-arm overflow). */
 int main(void) {
   int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);

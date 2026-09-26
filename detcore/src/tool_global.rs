@@ -1499,24 +1499,22 @@ impl GlobalTool for GlobalState {
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
-            GlobalRequest::RegisterTimerFd(dpid, dtid, fd, deadline, interval) => {
-                match self
-                    .recv_register_timerfd(
-                        dpid,
-                        RpcIncarnation {
-                            dettid: dtid,
-                            mm: request_mm,
-                        },
-                        fd,
-                        deadline,
-                        interval,
-                    )
-                    .await
-                {
-                    SchedulerRpcResult::Continue(()) => R::RegisterTimerFd(()),
-                    SchedulerRpcResult::ThreadExited => R::ThreadExited,
-                }
-            }
+            GlobalRequest::RegisterTimerFd(dpid, dtid, open_file, deadline, interval) => match self
+                .recv_register_timerfd(
+                    dpid,
+                    RpcIncarnation {
+                        dettid: dtid,
+                        mm: request_mm,
+                    },
+                    open_file,
+                    deadline,
+                    interval,
+                )
+                .await
+            {
+                SchedulerRpcResult::Continue(()) => R::RegisterTimerFd(()),
+                SchedulerRpcResult::ThreadExited => R::ThreadExited,
+            },
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
             GlobalRequest::ResolveKillTargets(dpid) => R::ResolveKillTargets(
@@ -1611,7 +1609,11 @@ impl GlobalTool for GlobalState {
                 R::AddUsedPort
             }
             GlobalRequest::ReleasePort(open_file_id) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                // Every last-descriptor release funnels through here (close,
+                // close_range, dup replacement, pidfd_getfd, exec close-on-exec),
+                // so this is the single place a released timerfd's deadline dies.
+                sched.release_timerfd(open_file_id);
                 let mut used_ports = self.used_ports.lock().unwrap();
                 let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
                 let port = open_file_to_port.remove(&open_file_id);
@@ -2681,7 +2683,7 @@ impl GlobalState {
         &self,
         detpid: DetPid,
         caller: RpcIncarnation,
-        fd: i32,
+        open_file: OpenFileId,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
     ) -> SchedulerRpcResult<()> {
@@ -2690,7 +2692,7 @@ impl GlobalState {
         if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
             return SchedulerRpcResult::ThreadExited;
         }
-        sched.register_timerfd(detpid, fd, deadline, interval);
+        sched.register_timerfd(detpid, open_file, deadline, interval);
         SchedulerRpcResult::Continue(())
     }
 }
@@ -2857,7 +2859,7 @@ pub enum GlobalRequest {
     ),
 
     /// Register, re-arm, or disarm one virtual timerfd deadline.
-    RegisterTimerFd(DetPid, DetTid, i32, Option<LogicalTime>, LogicalTime),
+    RegisterTimerFd(DetPid, DetTid, OpenFileId, Option<LogicalTime>, LogicalTime),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
@@ -3835,7 +3837,7 @@ pub async fn register_posix_timer<G, T>(
 /// Register, re-arm, or disarm a virtual timerfd with the global scheduler.
 pub async fn register_timerfd<G, T>(
     guest: &mut G,
-    fd: i32,
+    open_file: OpenFileId,
     deadline: Option<LogicalTime>,
     interval: LogicalTime,
 ) where
@@ -3846,7 +3848,7 @@ pub async fn register_timerfd<G, T>(
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::RegisterTimerFd(detpid, dettid, fd, deadline, interval),
+        GlobalRequest::RegisterTimerFd(detpid, dettid, open_file, deadline, interval),
     )
     .await;
     match resp.1 {

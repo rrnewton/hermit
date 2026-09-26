@@ -65,7 +65,12 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
-/// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
+/// Linux `timespec64_valid`: a non-negative second count and a nanosecond
+/// field in `[0, 1e9)`. timerfd_settime rejects anything else with EINVAL.
+pub(crate) fn timespec_valid(ts: &libc::timespec) -> bool {
+    ts.tv_sec >= 0 && (0..1_000_000_000).contains(&ts.tv_nsec)
+}
+
 /// Flatten a guest timespec to nanoseconds (negative fields clamp to zero).
 pub(crate) fn timespec_ns(ts: libc::timespec) -> u64 {
     let secs = ts.tv_sec.max(0) as u64;
@@ -96,6 +101,7 @@ pub(crate) fn timerfd_gettime_spec(
     }
 }
 
+/// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     // An otherwise unsafe "cast" which leans on the `linux_flags_assumptions` below.
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
@@ -922,20 +928,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Close,
     ) -> Result<i64, Error> {
         let fd = call.fd();
-        let was_timerfd = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.timerfd_state().is_some())
-            .unwrap_or(false);
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
         if fd_was_released {
             if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
                 self.release_port_for_open_file(guest, open_file_id).await;
-                if was_timerfd {
-                    // Last alias gone: drop the scheduler deadline so a
-                    // reused fd number never inherits a stale expiry event.
-                    register_timerfd(guest, fd, None, LogicalTime::ZERO).await;
-                }
             }
             trace!("Closed {}", fd);
         }
@@ -1619,8 +1616,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Timerfd => self.read_timerfd(guest, call).await,
-            FdType::Signalfd | FdType::Eventfd | FdType::Inotify => {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            FdType::Timerfd if self.virtual_timerfds() => self.read_timerfd(guest, call).await,
+            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -3895,22 +3893,31 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Create and register a timer notification descriptor.
     ///
-    /// Determinism: the host timerfd is only a poll/epoll vessel and is NEVER
-    /// armed; every guest-visible timerfd semantic derives from the virtual
-    /// clock state in the DetFd (see ai_docs/timerfd-virtual-time-design).
+    /// Determinism: when timerfds are virtual (`virtual_timerfds`), the host
+    /// timerfd is only a poll/epoll vessel and is NEVER armed; every
+    /// guest-visible timerfd semantic derives from the virtual clock state on
+    /// the open file description (design:
+    /// ai_docs/timerfd-virtual-time-design-2026-09-25.md).
     pub async fn handle_timerfd_create<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdCreate,
     ) -> Result<i64, Error> {
-        let clockid = match call.clockid() {
-            syscalls::ClockId::CLOCK_REALTIME => libc::CLOCK_REALTIME,
-            syscalls::ClockId::CLOCK_MONOTONIC => libc::CLOCK_MONOTONIC,
-            syscalls::ClockId::CLOCK_BOOTTIME => libc::CLOCK_BOOTTIME,
-            // Alarm clocks require CAP_WAKE_ALARM; guests run unprivileged.
-            syscalls::ClockId::CLOCK_REALTIME_ALARM
-            | syscalls::ClockId::CLOCK_BOOTTIME_ALARM => return Err(Errno::EPERM.into()),
-            _ => return Err(Errno::EINVAL.into()),
+        // Host-passthrough modes let the kernel validate the clock, as before.
+        let clockid = if self.virtual_timerfds() {
+            Some(match call.clockid() {
+                syscalls::ClockId::CLOCK_REALTIME => libc::CLOCK_REALTIME,
+                syscalls::ClockId::CLOCK_MONOTONIC => libc::CLOCK_MONOTONIC,
+                syscalls::ClockId::CLOCK_BOOTTIME => libc::CLOCK_BOOTTIME,
+                // Alarm clocks require CAP_WAKE_ALARM; guests run unprivileged.
+                syscalls::ClockId::CLOCK_REALTIME_ALARM
+                | syscalls::ClockId::CLOCK_BOOTTIME_ALARM => {
+                    return Err(Errno::EPERM.into());
+                }
+                _ => return Err(Errno::EINVAL.into()),
+            })
+        } else {
+            None
         };
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         self.add_fd(
@@ -3922,10 +3929,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Timerfd,
         )
         .await?;
-        guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.init_timerfd(clockid))?;
+        if let Some(clockid) = clockid {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.init_timerfd(clockid))?;
+        }
         Ok(fd as i64)
+    }
+
+    /// Whether timerfds are virtual (driven by logical time) in this run.
+    ///
+    /// Only sequentialized, non-record/replay runs merge virtual readiness
+    /// into poll, select and epoll waits; every other mode keeps the host
+    /// timerfd, which is armed and read by the kernel as before.
+    pub(crate) fn virtual_timerfds(&self) -> bool {
+        self.cfg.sequentialize_threads && !self.cfg.recordreplay_modes
     }
 
     /// Serialize a notification descriptor control operation.
@@ -3943,55 +3961,83 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// is never armed; the deadline is registered with the scheduler so it is
     /// a fast-forward target, and readiness/counts are computed from virtual
     /// time. Re-arming resets the pending expiration count, as Linux does.
+    ///
+    /// Error order follows fs/timerfd.c: copying in `new_value` (EFAULT),
+    /// then flags and `itimerspec64_valid` (EINVAL), then the descriptor
+    /// (EBADF, or EINVAL for a non-timerfd). An invalid request changes
+    /// nothing. The old value is copied out after the new arming, so a bad
+    /// `old_value` pointer reports EFAULT with the new arming in effect.
+    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd arming, validation order,
+    // and CANCEL_ON_SET handling.
     pub async fn handle_timerfd_settime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdSettime,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if !self.virtual_timerfds() {
+            return self.notification_fd_control(guest, call.into()).await;
+        }
         let fd = call.fd();
         let flags = call.flags();
-        if flags & !(libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET) != 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        let new_ptr = call.new_value().ok_or(Errno::EINVAL)?;
+        let new_ptr = call.new_value().ok_or(Errno::EFAULT)?;
         let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
-        let state = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.timerfd_state())?
-            .ok_or(Errno::EINVAL)?;
-        if flags & libc::TFD_TIMER_CANCEL_ON_SET != 0 && state.clockid != libc::CLOCK_REALTIME {
+        if flags & !(libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET) != 0
+            || !timespec_valid(&new.it_value)
+            || !timespec_valid(&new.it_interval)
+        {
             return Err(Errno::EINVAL.into());
         }
+        let (state, open_file_id) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| (detfd.timerfd_state(), detfd.open_file_id()))?;
+        let state = state.ok_or(Errno::EINVAL)?;
         let now = thread_observe_time(guest).await;
-        // Report the previous arming before replacing it.
-        if let Some(old_ptr) = call.old_value() {
-            let old_spec = timerfd_gettime_spec(&state, now);
-            guest.memory().write_value(old_ptr, &old_spec)?;
-        }
+        let old_spec = timerfd_gettime_spec(&state, now);
         let value_ns = timespec_ns(new.it_value);
         let interval_ns = timespec_ns(new.it_interval);
+        let abstime = flags & libc::TFD_TIMER_ABSTIME != 0;
         let deadline = if value_ns == 0 {
             None
-        } else if flags & libc::TFD_TIMER_ABSTIME != 0 {
+        } else if abstime {
+            // Guest clocks and logical time share one domain; see TimerFdState.
             Some(LogicalTime::from_nanos(value_ns))
         } else {
             Some(now + std::time::Duration::from_nanos(value_ns))
         };
+        // Linux silently ignores CANCEL_ON_SET unless the arming is an ABSTIME
+        // CLOCK_REALTIME one (timerfd_setup_cancel); it is never an error.
+        let cancel_on_set = flags & libc::TFD_TIMER_CANCEL_ON_SET != 0
+            && abstime
+            && state.clockid == libc::CLOCK_REALTIME;
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.with_timerfd_mut(|s| {
                 s.deadline = deadline;
                 s.interval = LogicalTime::from_nanos(interval_ns);
                 s.consumed = 0;
-                s.cancel_on_set = flags & libc::TFD_TIMER_CANCEL_ON_SET != 0;
+                s.cancel_on_set = cancel_on_set;
+                s.generation += 1;
             })
         })?;
-        register_timerfd(guest, fd, deadline, LogicalTime::from_nanos(interval_ns)).await;
+        register_timerfd(
+            guest,
+            open_file_id,
+            deadline,
+            LogicalTime::from_nanos(interval_ns),
+        )
+        .await;
+        if let Some(old_ptr) = call.old_value() {
+            guest.memory().write_value(old_ptr, &old_spec)?;
+        }
         Ok(0)
     }
 
     /// Virtual timerfd read: pending expirations as a u64 count, computed from
     /// virtual time. Blocking reads poll on scheduler turns (which advance
-    /// virtual time); a signal interrupts without consuming, as on Linux.
+    /// virtual time); a signal interrupts without consuming, as on Linux,
+    /// and the read restarts under SA_RESTART (the kernel's -ERESTARTSYS).
+    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd read counts, EAGAIN, and
+    // blocking restart.
     pub async fn read_timerfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4009,13 +4055,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             let now = thread_observe_time(guest).await;
             let pending = guest
                 .thread_state()
-                .with_detfd(fd, |detfd| {
-                    detfd.timerfd_state().map(|s| s.pending(now))
-                })?
+                .with_detfd(fd, |detfd| detfd.timerfd_state().map(|s| s.pending(now)))?
                 .ok_or(Errno::EINVAL)?;
             if pending > 0 {
                 guest.thread_state().with_detfd(fd, |detfd| {
-                    detfd.with_timerfd_mut(|s| s.consumed += pending)
+                    detfd.with_timerfd_mut(|s| {
+                        s.consumed += pending;
+                        s.generation += 1;
+                    })
                 })?;
                 guest.memory().write_value(buf.cast::<u64>(), &pending)?;
                 return Ok(8);
@@ -4026,36 +4073,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi("timerfd_read");
+            rsrc.set_signal_interrupt_errno(Errno::ERESTARTSYS);
             if matches!(
                 resource_request(guest, rsrc).await,
                 ResumeStatus::Signaled(_)
             ) {
-                return Err(Errno::EINTR.into());
+                return Err(Errno::ERESTARTSYS.into());
             }
         }
     }
 
-    /// Timerfds whose virtual deadline has passed at `now`, for wait merging.
-    pub(crate) async fn timerfd_pending<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        fd: i32,
-    ) -> Result<u64, Error> {
-        let now = thread_observe_time(guest).await;
-        Ok(guest
-            .thread_state()
-            .with_detfd(fd, |detfd| {
-                detfd.timerfd_state().map(|s| s.pending(now))
-            })?
-            .unwrap_or(0))
-    }
-
     /// timerfd_gettime: remaining time and interval from the virtual clock.
+    // TODO-HUMAN-REVIEW(PR-id): virtual timerfd remaining-time report.
     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::TimerfdGettime,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if !self.virtual_timerfds() {
+            return self.notification_fd_control(guest, call.into()).await;
+        }
         let fd = call.fd();
         let value_ptr = call.value().ok_or(Errno::EFAULT)?;
         let state = guest
@@ -4559,10 +4597,25 @@ mod test {
     use reverie::syscalls::FromToRaw;
     use reverie::syscalls::Whence;
 
-    use super::timerfd_gettime_spec;
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
-    use crate::types::LogicalTime;
     use super::pipe_capacity_request_exceeds_ceiling;
+    use super::timerfd_gettime_spec;
+    use super::timespec_valid;
+    use crate::types::LogicalTime;
+
+    /// Linux `timespec64_valid`, which timerfd_settime applies to both the
+    /// value and the interval: EINVAL for a negative second count or a
+    /// nanosecond field outside `[0, 1e9)`, before the timer is touched.
+    #[test]
+    fn timerfd_settime_rejects_exactly_the_invalid_timespecs() {
+        let ts = |tv_sec, tv_nsec| libc::timespec { tv_sec, tv_nsec };
+        assert!(timespec_valid(&ts(0, 0)));
+        assert!(timespec_valid(&ts(0, 999_999_999)));
+        assert!(timespec_valid(&ts(i64::MAX, 0)));
+        assert!(!timespec_valid(&ts(0, 1_000_000_000)));
+        assert!(!timespec_valid(&ts(0, -1)));
+        assert!(!timespec_valid(&ts(-1, 0)));
+    }
     /// The ceiling is inclusive. A guest that reads the advertised
     /// `pipe-max-size` and asks for exactly that must be allowed to have it;
     /// refusing at the boundary would advertise a size that cannot be set.

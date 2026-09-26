@@ -637,6 +637,18 @@ impl FileMetadata {
         closed
     }
 
+    /// Virtual timer state of the open file description `id`, if this table
+    /// holds a descriptor for it and it is a timerfd.
+    pub(crate) fn timerfd_state_for_open_file(
+        &self,
+        id: OpenFileId,
+    ) -> Option<crate::fd::TimerFdState> {
+        self.file_handles
+            .values()
+            .find(|detfd| detfd.open_file_id() == id)
+            .and_then(|detfd| detfd.timerfd_state())
+    }
+
     /// set default fds
     fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
         // guest stdio can be a pipe, which make things difficult
@@ -2521,6 +2533,14 @@ impl<T> ThreadState<T> {
     /// cached flock mode as authoritative after fork.
     pub fn forget_flock_modes(&self) {
         self.metadata().forget_flock_modes();
+    }
+
+    /// Virtual timer state of an open file description in this table.
+    pub(crate) fn timerfd_state_for_open_file(
+        &self,
+        id: OpenFileId,
+    ) -> Option<crate::fd::TimerFdState> {
+        self.metadata().timerfd_state_for_open_file(id)
     }
 
     /// remove a rawfd
