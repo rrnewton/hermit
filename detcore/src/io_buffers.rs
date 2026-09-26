@@ -2276,7 +2276,8 @@ mod tests {
 
     /// An extent the guest can read is hashed from what it holds. Of
     /// `getdents64` records, only the padding after the last name, which
-    /// Linux does not write, may be unreadable; it is hashed as zeros and
+    /// Linux does not write and which is at most 7 bytes, may be unreadable;
+    /// it is hashed as zeros and
     /// reported. Every other byte hashed is what the guest holds. Any other
     /// unreadable byte, or any unreadable byte of another syscall's extent,
     /// is an error, whatever the guest's buffer holds.
