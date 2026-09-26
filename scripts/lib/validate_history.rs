@@ -187,20 +187,68 @@ pub struct CacheKey<'a> {
     pub profile: &'a str,
     pub host: &'a str,
     pub toolchain: &'a str,
-    /// `cargo` or `buck`. A row written before this field existed was a Cargo
-    /// run. Only a PASS must share it: a red on the same tree is a red under
+    /// `cargo` or `buck`. A Hermit row finished before `LEGACY_PAIRLESS_BEFORE`
+    /// without this field was a Cargo run. Only a PASS must share it: a red on the same tree is a red under
     /// either builder.
     pub release_builder: &'a str,
 }
 
+/// Author time of the first Hermit commit that writes `release_builder` and
+/// `e2e_payload`. It must equal the parent predicate's
+/// `release_builder_required_from_finished_at` in
+/// `ci-hub/validate/qualifying-receipt.json`, which applies the same rule.
+const LEGACY_PAIRLESS_BEFORE: &str = "2026-09-25T20:42:29Z";
+
+/// A real `YYYY-MM-DDTHH:MM:SSZ` instant: fixed width, a calendar date that
+/// exists (leap years included), hour below 24, minute and second below 60,
+/// and a year after 0000. Fixed width makes string order time order.
+fn is_utc_timestamp(ts: &str) -> bool {
+    let b = ts.as_bytes();
+    let digits = |r: std::ops::Range<usize>| -> Option<u32> {
+        b[r].iter().try_fold(0u32, |n, &c| c.is_ascii_digit().then(|| n * 10 + u32::from(c - b'0')))
+    };
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+        return false;
+    }
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(sec)) =
+        (digits(0..4), digits(5..7), digits(8..10), digits(11..13), digits(14..16), digits(17..19))
+    else {
+        return false;
+    };
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    y > 0 && (1..=days).contains(&d) && h < 24 && mi < 60 && sec < 60
+}
+
 /// Builder that produced the E2E payload a row executed, read together with
-/// the payload it records. A row carrying neither field predates both and was
-/// a Cargo run. Otherwise both must be present, the builder must be `cargo` or
-/// `buck`, and `e2e_payload` must equal exactly that builder's
+/// the payload it records. A row carrying neither field is a Cargo run only
+/// when it predates the writer: a Reverie row, or a Hermit row (or one naming
+/// no repo) whose `finished_at` is a real instant before
+/// `LEGACY_PAIRLESS_BEFORE`. A contemporary, undated or malformed pairless row
+/// names no builder. Otherwise both fields must be present, the builder must
+/// be `cargo` or `buck`, and `e2e_payload` must equal exactly that builder's
 /// `e2e_payload_identity`; anything else names no builder and matches neither.
 fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
     match (row.get("release_builder"), row.get("e2e_payload")) {
-        (None, None) => Some(crate::RELEASE_BUILDER_CARGO),
+        (None, None) => {
+            let finished = row.get("finished_at").and_then(|v| v.as_str());
+            // A null `repo` is an absent one, as in the parent's typed row.
+            let legacy = match row.get("repo").filter(|v| !v.is_null()) {
+                Some(serde_json::Value::String(r)) if r == "reverie" || r == "rrnewton/reverie" => true,
+                None => finished.is_some_and(|t| is_utc_timestamp(t) && t < LEGACY_PAIRLESS_BEFORE),
+                Some(serde_json::Value::String(r)) if r == "hermit" || r == "rrnewton/hermit" => {
+                    finished.is_some_and(|t| is_utc_timestamp(t) && t < LEGACY_PAIRLESS_BEFORE)
+                }
+                _ => false,
+            };
+            legacy.then_some(crate::RELEASE_BUILDER_CARGO)
+        }
         (Some(builder), Some(payload)) => {
             let builder = builder.as_str()?;
             let known = builder == crate::RELEASE_BUILDER_CARGO
@@ -717,6 +765,74 @@ pub fn self_test() -> Result<String, String> {
     }
     accepted += 1;
 
+    // A pairless row is Cargo evidence only while it predates the writer.
+    // Each row is the legacy positive with only `finished_at` or `repo`
+    // changed; the cutoff is bracketed from one second below.
+    let pairless = |finished: Option<&str>, repo: Option<serde_json::Value>| {
+        let mut row = rs_pass.clone();
+        match finished {
+            Some(ts) => row["finished_at"] = serde_json::json!(ts),
+            None => {
+                row.as_object_mut().unwrap().remove("finished_at");
+            }
+        }
+        if let Some(repo) = repo {
+            row["repo"] = repo;
+        }
+        row
+    };
+    let before = "2026-09-25T20:42:28Z";
+    let legacy: Vec<(&str, serde_json::Value)> = vec![
+        ("one second before the cutoff", pairless(Some(before), None)),
+        ("repo hermit before the cutoff", pairless(Some(before), Some(serde_json::json!("hermit")))),
+        ("repo rrnewton/hermit before the cutoff", pairless(Some(before), Some(serde_json::json!("rrnewton/hermit")))),
+        ("null repo before the cutoff", pairless(Some(before), Some(serde_json::Value::Null))),
+        ("a real Feb 29 before the cutoff", pairless(Some("2024-02-29T12:00:00Z"), None)),
+        ("a contemporary Reverie row", pairless(Some("2026-09-26T00:00:00Z"), Some(serde_json::json!("reverie")))),
+        ("an undated rrnewton/reverie row", pairless(None, Some(serde_json::json!("rrnewton/reverie")))),
+    ];
+    for (why, row) in &legacy {
+        if cache_lookup(std::slice::from_ref(row), "pass", &key).is_none() {
+            return Err(format!("cache: a pairless row, {why}, must be a Cargo HIT"));
+        }
+        accepted += 1;
+    }
+    let contemporary: Vec<(&str, serde_json::Value)> = vec![
+        ("at the cutoff", pairless(Some(LEGACY_PAIRLESS_BEFORE), None)),
+        ("repo hermit at the cutoff", pairless(Some(LEGACY_PAIRLESS_BEFORE), Some(serde_json::json!("hermit")))),
+        ("after the cutoff", pairless(Some("2026-09-26T00:00:00Z"), None)),
+        ("without finished_at", pairless(None, None)),
+        ("with a null finished_at", {
+            let mut row = rs_pass.clone();
+            row["finished_at"] = serde_json::Value::Null;
+            row
+        }),
+        ("with a space separator", pairless(Some("2026-08-07 00:00:00Z"), None)),
+        ("with fractional seconds", pairless(Some("2026-08-07T00:00:00.5Z"), None)),
+        ("with an offset", pairless(Some("2026-08-07T00:00:00+00:00"), None)),
+        ("on Feb 29 of a common year", pairless(Some("2026-02-29T00:00:00Z"), None)),
+        ("in month 00", pairless(Some("2026-00-07T00:00:00Z"), None)),
+        ("in month 13", pairless(Some("2026-13-07T00:00:00Z"), None)),
+        ("on day 00", pairless(Some("2026-08-00T00:00:00Z"), None)),
+        ("in hour 24", pairless(Some("2026-08-07T24:00:00Z"), None)),
+        ("in minute 60", pairless(Some("2026-08-07T00:60:00Z"), None)),
+        ("on a leap second", pairless(Some("2026-08-07T23:59:60Z"), None)),
+        ("in year zero", pairless(Some("0000-08-07T00:00:00Z"), None)),
+        ("naming another repository", pairless(Some(before), Some(serde_json::json!("facebookexperimental/hermit")))),
+        ("with a non-string repo", pairless(Some(before), Some(serde_json::json!(7)))),
+    ];
+    for (why, row) in &contemporary {
+        for k in [&key, &buck_key] {
+            if cache_lookup(std::slice::from_ref(row), "pass", k).is_some() {
+                return Err(format!(
+                    "cache: a pairless row {why} answered a {} request",
+                    k.release_builder
+                ));
+            }
+            refused += 1;
+        }
+    }
+
     // The builder and payload are read together: a row whose payload does not
     // exactly match its builder's identity names no builder, so it answers
     // neither request. Each row spoils exactly one part of a consistent pair.
@@ -997,7 +1113,13 @@ pub fn self_test() -> Result<String, String> {
     if selective_baseline(&mismatched, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err("selective: a green whose payload is not the Cargo identity must not become the Cargo baseline".into());
     }
-    refused += 4;
+    // A contemporary pairless green is not a Cargo baseline either.
+    let mut pairless_green = ledger_rows.clone();
+    pairless_green.push(base(serde_json::json!({"slot": "mine", "commit": "hhh", "producer": "validate.rs", "finished_at": "2026-09-26T00:00:00Z"})));
+    if selective_baseline(&pairless_green, None, "mine", &exists_all).as_deref() != Some("bbb") {
+        return Err("selective: a pairless green after the writer must not become the Cargo baseline".into());
+    }
+    refused += 5;
     accepted += 3;
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
