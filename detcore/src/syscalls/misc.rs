@@ -200,6 +200,62 @@ fn canonical_random_device_byte(seed: u64, index: u64) -> u8 {
         ^ seed_byte
 }
 
+/// Scatter one stream through an already-imported array. Scratch space is
+/// independent of request size; only EFAULT becomes a successful copied prefix.
+fn fill_canonical_random_iovecs(
+    memory: &mut impl MemoryAccess,
+    iovecs: &[crate::iovecs::ImportedIovec],
+    seed: u64,
+    stream_offset: u64,
+    hasher: &mut DefaultHasher,
+) -> Result<usize, Error> {
+    let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
+    let mut written = 0_usize;
+    for iov in iovecs {
+        let mut segment_written = 0;
+        while segment_written < iov.len {
+            let remote_chunk = match iov
+                .base
+                .checked_add(segment_written)
+                .and_then(AddrMut::<u8>::from_raw)
+            {
+                Some(address) => address,
+                None if written == 0 => return Err(Errno::EFAULT.into()),
+                None => return Ok(written),
+            };
+            let chunk_len = (iov.len - segment_written).min(RANDOM_FILL_CHUNK_BYTES);
+            let local_buf = unsafe {
+                std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
+            };
+            for (index, byte) in local_buf.iter_mut().enumerate() {
+                *byte = canonical_random_device_byte(
+                    seed,
+                    stream_offset
+                        .saturating_add(written as u64)
+                        .saturating_add(index as u64),
+                );
+            }
+            let n = match write_random_chunk(memory, remote_chunk, local_buf) {
+                Ok(n) => n,
+                Err(Errno::EFAULT) if written > 0 => return Ok(written),
+                Err(error) => return Err(crate::random::copy_error(error)),
+            };
+            if n == 0 && written == 0 {
+                return Err(Errno::EFAULT.into());
+            }
+            if cfg!(debug_assertions) {
+                Hash::hash_slice(&local_buf[..n], hasher);
+            }
+            written += n;
+            segment_written += n;
+            if n < chunk_len {
+                return Ok(written);
+            }
+        }
+    }
+    Ok(written)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Validates seccomp capability probes without installing guest filters.
     // TODO-HUMAN-REVIEW(PR-874): Review deterministic seccomp probe validation.
@@ -426,53 +482,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         len: usize,
         stream_offset: u64,
     ) -> Result<usize, Error> {
+        self.fill_random_device_iovecs(
+            guest,
+            &[crate::iovecs::ImportedIovec {
+                base: remote_buf.as_raw(),
+                len,
+            }],
+            stream_offset,
+        )
+    }
+
+    pub(super) fn fill_random_device_iovecs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        iovecs: &[crate::iovecs::ImportedIovec],
+        stream_offset: u64,
+    ) -> Result<usize, Error> {
         let seed = guest.config().rng_seed();
-        let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
         let mut hasher = DefaultHasher::new();
-        let mut written = 0;
-
-        while written < len {
-            let remote_chunk = match remote_buf
-                .as_raw()
-                .checked_add(written)
-                .and_then(AddrMut::<u8>::from_raw)
-            {
-                Some(address) => address,
-                None if written == 0 => return Err(Errno::EFAULT.into()),
-                None => break,
-            };
-            let chunk_len = (len - written).min(RANDOM_FILL_CHUNK_BYTES);
-            let local_buf = unsafe {
-                std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
-            };
-            for (index, byte) in local_buf.iter_mut().enumerate() {
-                *byte = canonical_random_device_byte(
-                    seed,
-                    stream_offset
-                        .saturating_add(written as u64)
-                        .saturating_add(index as u64),
-                );
-            }
-            let n = match write_random_chunk(&mut guest.memory(), remote_chunk, local_buf) {
-                Ok(n) => n,
-                Err(_) if written > 0 => break,
-                Err(error) => return Err(error.into()),
-            };
-            if n == 0 {
-                if written == 0 {
-                    return Err(Errno::EFAULT.into());
-                }
-                break;
-            }
-            if cfg!(debug_assertions) {
-                Hash::hash_slice(&local_buf[..n], &mut hasher);
-            }
-            written += n;
-            if n < chunk_len {
-                break;
-            }
-        }
-
+        let written = fill_canonical_random_iovecs(
+            &mut guest.memory(),
+            iovecs,
+            seed,
+            stream_offset,
+            &mut hasher,
+        )?;
         if cfg!(debug_assertions) {
             detlog!(
                 "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes at offset {}, hash of bytes: {}",
@@ -524,7 +558,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let memory = guest.memory();
         let dettid = guest.thread_state().dettid;
         crate::random::getrandom(guest.thread_state_mut().thread_prng(), memory, dettid, call)
-            .map_err(Into::into)
     }
 
     /// setsid system call
@@ -730,6 +763,187 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod tests {
     use super::*;
 
+    struct ScatterMemory {
+        bytes: Vec<u8>,
+        outcomes: std::collections::VecDeque<Result<usize, Errno>>,
+        writes: usize,
+    }
+
+    impl ScatterMemory {
+        fn new(size: usize, outcomes: impl IntoIterator<Item = Result<usize, Errno>>) -> Self {
+            Self {
+                bytes: vec![0xa5; size],
+                outcomes: outcomes.into_iter().collect(),
+                writes: 0,
+            }
+        }
+    }
+
+    impl MemoryAccess for ScatterMemory {
+        fn read_vectored(
+            &self,
+            _: &[std::io::IoSlice],
+            _: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("canonical scatter must not read guest bytes")
+        }
+        fn write_vectored(
+            &mut self,
+            _: &[std::io::IoSlice],
+            _: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("canonical scatter must use the user-access capability")
+        }
+        fn write_with_user_access(
+            &mut self,
+            address: AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, Errno> {
+            self.writes += 1;
+            let count = self.outcomes.pop_front().unwrap_or(Ok(bytes.len()))?;
+            assert!(count <= bytes.len());
+            let offset = address.as_raw() - 0x1000;
+            self.bytes[offset..offset + count].copy_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+    }
+
+    fn assert_copy_failure(error: Error, expected: Errno) {
+        let Error::Tool(error) = error else {
+            panic!("copy failure became a guest errno: {error:?}")
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<crate::random::RandomCopyFailure>()
+                .expect("typed copy failure")
+                .errno(),
+            expected
+        );
+    }
+
+    fn scatter(memory: &mut ScatterMemory, lengths: &[usize], offset: u64) -> Result<usize, Error> {
+        let mut base = 0x1000;
+        let vectors: Vec<_> = lengths
+            .iter()
+            .map(|&len| {
+                let vector = crate::iovecs::ImportedIovec { base, len };
+                base += len;
+                vector
+            })
+            .collect();
+        fill_canonical_random_iovecs(memory, &vectors, 0, offset, &mut DefaultHasher::new())
+    }
+
+    #[test]
+    fn random_scatter_distinguishes_fault_prefixes_from_backend_errors() {
+        // Exercise both an earlier complete iovec and an earlier complete chunk.
+        for lengths in [vec![3, 5], vec![RANDOM_FILL_CHUNK_BYTES + 5]] {
+            let prefix = if lengths.len() == 2 {
+                3
+            } else {
+                RANDOM_FILL_CHUNK_BYTES
+            };
+            for error in [Errno::EFAULT, Errno::EIO, Errno::ENOMEM] {
+                let mut memory = ScatterMemory::new(prefix + 5, [Ok(prefix), Err(error)]);
+                let result = scatter(&mut memory, &lengths, 7);
+                match error {
+                    Errno::EFAULT => assert_eq!(result.unwrap(), prefix),
+                    _ => assert_copy_failure(result.unwrap_err(), error),
+                }
+                let expected: Vec<_> = (7..7 + prefix as u64)
+                    .map(|index| canonical_random_device_byte(0, index))
+                    .collect();
+                assert_eq!(&memory.bytes[..prefix], expected);
+                assert_eq!(&memory.bytes[prefix..], &[0xa5; 5]);
+                assert_eq!(memory.writes, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn random_scatter_short_or_zero_copy_stops_without_touching_later_segments() {
+        for first in [0, 2] {
+            let mut memory = ScatterMemory::new(10, [Ok(first)]);
+            let result = scatter(&mut memory, &[5, 5], 0);
+            if first == 0 {
+                assert!(matches!(result, Err(Error::Errno(Errno::EFAULT))));
+            } else {
+                assert_eq!(result.unwrap(), first);
+                assert_eq!(&memory.bytes[..2], &[41, 114]);
+            }
+            assert!(memory.bytes[first..].iter().all(|&byte| byte == 0xa5));
+            assert_eq!(memory.writes, 1);
+        }
+        let mut memory = ScatterMemory::new(10, [Ok(5), Ok(0)]);
+        assert_eq!(scatter(&mut memory, &[5, 5], 0).unwrap(), 5);
+        assert!(memory.bytes[5..].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(memory.writes, 2);
+    }
+
+    #[test]
+    fn random_scatter_saturated_bytes_match_partitioned_calls() {
+        for (offset, expected) in [(u64::MAX - 2, [78, 151, 224, 224]), (u64::MAX, [224; 4])] {
+            let mut single = ScatterMemory::new(4, []);
+            assert_eq!(scatter(&mut single, &[4], offset).unwrap(), 4);
+            let mut partitioned = ScatterMemory::new(4, []);
+            let mut hash = DefaultHasher::new();
+            assert_eq!(
+                fill_canonical_random_iovecs(
+                    &mut partitioned,
+                    &[crate::iovecs::ImportedIovec {
+                        base: 0x1000,
+                        len: 1
+                    }],
+                    0,
+                    offset,
+                    &mut hash
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                fill_canonical_random_iovecs(
+                    &mut partitioned,
+                    &[crate::iovecs::ImportedIovec {
+                        base: 0x1001,
+                        len: 3
+                    }],
+                    0,
+                    offset.saturating_add(1),
+                    &mut hash
+                )
+                .unwrap(),
+                3
+            );
+            assert_eq!(single.bytes, expected);
+            assert_eq!(partitioned.bytes, expected);
+        }
+    }
+
+    #[test]
+    fn random_scatter_backend_error_rolls_back_shared_cursor_after_eight_byte_prefix() {
+        let fd = crate::fd::DetFd::new(
+            3,
+            nix::fcntl::OFlag::O_RDONLY,
+            crate::fd::FdType::Rng,
+            crate::types::OpenFileId::new(crate::types::DetTid::from_raw(1), 0),
+        );
+        for error in [Errno::EFAULT, Errno::EIO] {
+            let mut memory = ScatterMemory::new(8, [Ok(4), Err(error)]);
+            let result = fd.with_random_device_stream(|offset| scatter(&mut memory, &[8], offset));
+            if error == Errno::EFAULT {
+                assert_eq!(result.unwrap(), 4);
+            } else {
+                assert_copy_failure(result.unwrap_err(), Errno::EIO);
+            }
+            // First iteration commits four; the EIO iteration must not commit
+            // its physically copied prefix or fabricate a successful result.
+            assert_eq!(fd.random_device_offset(), 4);
+            assert_eq!(&memory.bytes[4..], &[0xa5; 4]);
+            assert_eq!(memory.writes, 2);
+        }
+    }
+
     #[test]
     fn prctl_support_covers_deterministic_controls() {
         for option in [
@@ -815,6 +1029,12 @@ mod tests {
         let seeded: Vec<_> = (0..16)
             .map(|index| canonical_random_device_byte(17, index))
             .collect();
+        assert_eq!(
+            seeded,
+            [
+                56, 114, 187, 4, 77, 150, 223, 40, 96, 186, 3, 76, 149, 222, 39, 112
+            ]
+        );
         assert_ne!(seeded, [first, continued].concat());
     }
 

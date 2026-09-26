@@ -6454,6 +6454,29 @@ mod tests {
             regular_sink,
             BTreeSet::from([("verify", Some("ptrace")), ("verify", Some("sabre"))])
         );
+        // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
+        // cells without revising the frozen calibration or any timeout override.
+        for population in [&required, &enabled] {
+            let rng = population
+                .iter()
+                .filter(|cell| cell.id.test == "c-programs/random-readv-stream")
+                .collect::<Vec<_>>();
+            assert_eq!(rng.len(), 3);
+            assert_eq!(
+                rng.iter()
+                    .map(|cell| (cell.id.mode.as_str(), cell.id.backend.as_deref()))
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    ("verify", Some("ptrace")),
+                    ("verify", Some("kvm")),
+                    ("replay", Some("ptrace")),
+                ])
+            );
+            for cell in rng {
+                assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+                assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+            }
+        }
         assert_eq!(
             required.len(),
             CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
@@ -6465,6 +6488,7 @@ mod tests {
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
+                + 3 // the exact RNG identities asserted above
         );
         assert_eq!(
             enabled.len() - required.len(),

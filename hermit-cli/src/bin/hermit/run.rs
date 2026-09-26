@@ -60,7 +60,6 @@ use super::container::apply_affinity;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
-use super::container::with_container;
 use super::global_opts::GlobalOpts;
 use super::guest_capture::GuestRunCapturePaths;
 use super::guest_capture::GuestRunCaptureSession;
@@ -4167,12 +4166,12 @@ impl RunOpts {
         write_backend_engagement(path, engagement)
     }
 
-    fn tmpfs(&self) -> Result<Tmpfs<'_>, Error> {
+    fn tmpfs(&self) -> Result<Tmpfs, Error> {
         match self.tmp.as_ref() {
             Some(path) => {
                 let path = path.as_path();
                 fs::create_dir_all(path)?;
-                Ok(Tmpfs::Path(path))
+                Ok(Tmpfs::Path(path.to_path_buf()))
             }
             None => Ok(Tmpfs::Temp(tempfile::TempDir::new()?)),
         }
@@ -4202,33 +4201,58 @@ impl RunOpts {
         } else {
             None
         };
+        let options = self.clone();
+        let global = global.clone();
+        let guest_capture = guest_capture
+            .map(GuestRunCaptureSession::try_clone_for_child)
+            .transpose()?;
+        let timeout = self.run_timeout();
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
-            return with_container(&mut process, || {
-                self.run_in_container(
-                    global,
-                    capture_output,
-                    guest_capture,
-                    summary_output.as_ref(),
-                    None,
-                )
-            });
-        }
-
-        let tmpfs = self.tmpfs()?;
-
-        let (mut container, identity_sources) = self.container(tmpfs.path())?;
-
-        with_container(&mut container, || {
-            self.run_in_container(
-                global,
-                capture_output,
-                guest_capture,
-                summary_output.as_ref(),
-                Some(&identity_sources),
+            return super::owned_container::run(
+                &mut process,
+                summary_output,
+                "held summary/output descriptors; no PID namespace".into(),
+                false,
+                "with_container",
+                timeout,
+                move |summary| {
+                    options.run_in_container(
+                        &global,
+                        capture_output,
+                        guest_capture.as_ref(),
+                        summary.as_ref(),
+                        None,
+                    )
+                },
             )
-        })
+            .map(|(value, _guards)| value);
+        }
+        let tmpfs = self.tmpfs()?;
+        let (mut container, identity) = self.container(tmpfs.path())?;
+        let resources = format!(
+            "private tmp {}, identity mounts and summary/output descriptors",
+            tmpfs.path().display()
+        );
+        super::owned_container::run(
+            &mut container,
+            (tmpfs, identity, summary_output),
+            resources,
+            true,
+            "with_container",
+            timeout,
+            move |(_, identity, summary)| {
+                options.run_in_container(
+                    &global,
+                    capture_output,
+                    guest_capture.as_ref(),
+                    summary.as_ref(),
+                    Some(identity),
+                )
+            },
+        )
+        .map(|(value, _guards)| value)
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -4821,25 +4845,38 @@ impl RunOpts {
         log_file: fs::File,
         global: &GlobalOpts,
     ) -> Result<(Output, u64), Error> {
+        let options = self.clone();
+        let global = global.clone();
         if self.no_namespace {
-            // Verify initializes a process-global tracing subscriber for each run. Keep a plain
-            // child-process boundary between runs, but do not configure any namespaces or mounts.
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
-            let mut log_file = Some(log_file);
-            return with_container(&mut process, || {
-                self.run_verify_in_container(&mut log_file, global, None)
-            });
+            return super::owned_container::run(
+                &mut process,
+                Some(log_file),
+                "verification log descriptor; no PID namespace".into(),
+                false,
+                "with_container",
+                None,
+                move |log| options.run_verify_in_container(log, &global, None),
+            )
+            .map(|(value, _guards)| value);
         }
-
         let tmpfs = self.tmpfs()?;
-
-        let (mut container, identity_sources) = self.container(tmpfs.path())?;
-
-        let mut log_file = Some(log_file);
-        with_container(&mut container, || {
-            self.run_verify_in_container(&mut log_file, global, Some(&identity_sources))
-        })
+        let (mut container, identity) = self.container(tmpfs.path())?;
+        let resources = format!(
+            "private tmp {}, identity mounts and verification log",
+            tmpfs.path().display()
+        );
+        super::owned_container::run(
+            &mut container,
+            (tmpfs, identity, Some(log_file)),
+            resources,
+            true,
+            "with_container",
+            None,
+            move |(_, identity, log)| options.run_verify_in_container(log, &global, Some(identity)),
+        )
+        .map(|(value, _guards)| value)
     }
 
     fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
@@ -5171,15 +5208,15 @@ impl RunOpts {
 
 /// Represents a tmpfs location. There are different ways to construct `/tmp` for
 /// the container and this encapsulates all of them.
-enum Tmpfs<'a> {
+enum Tmpfs {
     /// Use an existing path as `/tmp`.
-    Path(&'a Path),
+    Path(PathBuf),
 
     /// Use a new temporary directory as `/tmp`.
     Temp(tempfile::TempDir),
 }
 
-impl<'a> Tmpfs<'a> {
+impl Tmpfs {
     /// Returns the path to `/tmp`.
     pub fn path(&self) -> &Path {
         match self {

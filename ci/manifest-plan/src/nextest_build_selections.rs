@@ -62,6 +62,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "chown_virtual_root_identity",
             "--test",
+            "cli_owned_lifecycle",
+            "--test",
             "clock_determinism",
             "--test",
             "clock_discipline_determinism",
@@ -555,7 +557,7 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "160");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "170");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])

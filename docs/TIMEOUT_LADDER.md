@@ -30,8 +30,8 @@ agreeing with each other.
 
 | Rung | Bounds | Value comes from | How it stops the run | Reports |
 | --- | --- | --- | --- | --- |
-| `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
-| hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
+| `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | ptrace publishes termination and polls the retained original operation; unresolved cleanup retains its owner and guards. LiteInst keeps its existing timeout/unwind path. | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
+| hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/bin/hermit/run_timeout.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
 | nextest per-test CPU limit | one cargo test process and its descendants | 22s base, scaled by the machine CPU multiplier | owned attempt cgroup: `SIGTERM`, 2s grace, then `cgroup.kill`; retain typed `cpu_timeout` | nextest fails the named test; CPU report identifies the inner limit |
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 57s base, scaled by the machine wall multiplier | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |

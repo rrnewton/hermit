@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use detcore_model::config::MountInfoRootRewrite;
 use reverie::ExitStatus;
@@ -21,6 +22,8 @@ use crate::error::Context;
 use crate::error::Error;
 use crate::metadata::Metadata;
 use crate::metadata::record_or_replay_config;
+use crate::ptrace_completion::Control;
+use crate::ptrace_completion::{self};
 use crate::recorder::Recorder;
 
 type RecordTool = detcore::Detcore<Recorder>;
@@ -81,15 +84,12 @@ impl Record {
     fn persist_mount_identity_provenance(
         metadata: &mut Metadata,
         metadata_path: &Path,
-        global_state: &detcore::GlobalState,
+        provenance: Option<(Vec<u64>, Vec<u64>)>,
     ) -> Result<(), Error> {
-        if let Some(provenance) = global_state
-            .mount_identity_provenance()
-            .map_err(Error::msg)?
-        {
-            metadata.mountinfo_mount_ids = provenance.mountinfo_order;
+        if let Some((mountinfo_order, unlisted_order)) = provenance {
+            metadata.mountinfo_mount_ids = mountinfo_order;
             metadata.mountinfo_mount_ids_captured = true;
-            metadata.fdinfo_unlisted_mount_ids = provenance.unlisted_order;
+            metadata.fdinfo_unlisted_mount_ids = unlisted_order;
             let directory = metadata_path
                 .parent()
                 .ok_or_else(|| Error::msg("recording metadata path has no parent"))?;
@@ -105,32 +105,38 @@ impl Record {
     }
 
     /// Waits for the recording to finish and returns its exit status.
-    pub async fn wait(self) -> Result<ExitStatus, Error> {
+    pub async fn wait(self, control: Rc<Control>) -> Result<ExitStatus, Error> {
         let Self {
             tracer,
             mut metadata,
             metadata_path,
         } = self;
-        let (exit_status, global_state) = tracer.wait().await?;
-        let persist =
-            Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, &global_state);
+        let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+        let provenance = global_state
+            .mount_identity_provenance()
+            .map(|value| value.map(|p| (p.mountinfo_order, p.unlisted_order)))
+            .map_err(Error::msg);
         global_state.clean_up(false, &None).await;
-        persist?;
+        // Publish final metadata only after the original successful state joined.
+        Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, provenance?)?;
         Ok(exit_status)
     }
 
     /// Waits for the recording to finish and collects its output.
-    pub async fn wait_with_output(self) -> Result<Output, Error> {
+    pub async fn wait_with_output(self, control: Rc<Control>) -> Result<Output, Error> {
         let Self {
             tracer,
             mut metadata,
             metadata_path,
         } = self;
-        let (output, global_state) = tracer.wait_with_output().await?;
-        let persist =
-            Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, &global_state);
+        let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+        let provenance = global_state
+            .mount_identity_provenance()
+            .map(|value| value.map(|p| (p.mountinfo_order, p.unlisted_order)))
+            .map_err(Error::msg);
         global_state.clean_up(false, &None).await;
-        persist?;
+        // Publish final metadata only after the original successful state joined.
+        Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, provenance?)?;
         Ok(output)
     }
 }

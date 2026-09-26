@@ -126,7 +126,12 @@ impl RecordVersion {
 // 0x115 -> 0x116: event stream filenames are fixed-size SHA-256 names and each
 // data/debug stream begins with its complete process-tree identity. Older
 // readers cannot skip or validate these headers.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x116);
+// 0x116 -> 0x119: nonpositioned random-device readv now uses Detcore's
+// shared canonical cursor and no longer emits or consumes recorder ReadvV2
+// events. Old event streams cannot be replayed under this routing.
+// 0x117 and 0x118 identify incompatible retained RNG, clock, and network
+// recordings from parallel development; do not reinterpret those identities.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x119);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -151,7 +156,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x116);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x116;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x119;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/fault_sites.rs"]
+mod fault_sites;
+
 #[path = "common/kvm_cancellation.rs"]
 mod kvm_cancellation;
 
@@ -5786,7 +5789,7 @@ fn a_fault_aimed_at_no_existing_site_fires_nowhere() {
     );
 }
 
-/// One row per `run_guarded_at` site in `record_start.rs`, with a spelling that
+/// One row per container fault label in `record_start.rs`, with a spelling that
 /// reaches it. Kept at module scope so
 /// `no_container_site_is_unreachable_by_the_fault_injector` can hold the source
 /// to it.
@@ -5807,11 +5810,17 @@ const RECORD_FAULT_SITES: [(&str, &[&str]); 6] = [
 
 /// Sites that exist but are deliberately not driven by the `record` table above,
 /// each with the reason. An entry here is a DECLARATION, not an exemption from
-/// thought: it says a different test already reaches this site.
-const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 1] = [(
-    "with_container",
-    "the `run` path; covered by the existing run-mode fault-injection tests",
-)];
+/// thought: each reason states what the named test actually exercises.
+const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 2] = [
+    (
+        "with_container",
+        "the `run` path; covered by the existing run-mode fault-injection tests",
+    ),
+    (
+        "owned-container-lifecycle",
+        "private __hermit-cli-lifecycle success role; cli_owned_lifecycle::successful_completion_returns_original_guard reaches this label, without a panic/segv injection matrix",
+    ),
+];
 
 /// ⚠️ A CLASSIFICATION SITE CANNOT SILENTLY OPT OUT OF BEING ADDRESSABLE.
 ///
@@ -5821,76 +5830,575 @@ const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 1] = [(
 /// mode is not that a test broke, it is that no test could ever have existed, and
 /// silence is indistinguishable from coverage.
 ///
-/// So: every `run_guarded_at("...")` label in the sources is extracted here and
+/// So: every actual container-call label in the sources is parsed here and
 /// must appear either in [`RECORD_FAULT_SITES`] or in
 /// [`FAULT_SITES_DRIVEN_ELSEWHERE`] with a reason. A site added without a row
 /// fails THIS test by name, at the moment it is added, rather than being
 /// untestable by default and noticed years later.
 #[test]
 fn no_container_site_is_unreachable_by_the_fault_injector() {
-    const SOURCES: [(&str, &str); 2] = [
-        (
-            "record_start.rs",
-            include_str!("../src/bin/hermit/record_start.rs"),
-        ),
-        (
-            "container.rs",
-            include_str!("../src/bin/hermit/container.rs"),
-        ),
-    ];
-
-    let mut declared: Vec<(String, String)> = Vec::new();
-    for (file, text) in SOURCES {
-        for (needle, close) in [("run_guarded_at(\"", '"'), ("inject_test_fault(\"", '"')] {
-            let mut rest = text;
-            while let Some(at) = rest.find(needle) {
-                rest = &rest[at + needle.len()..];
-                if let Some(end) = rest.find(close) {
-                    declared.push((file.to_string(), rest[..end].to_string()));
-                }
-            }
-        }
+    use sha2::Digest;
+    const RECORD: &str = include_str!("../src/bin/hermit/record_start.rs");
+    const CONTAINER: &str = include_str!("../src/bin/hermit/container.rs");
+    const OWNER: &str = include_str!("../src/bin/hermit/owned_container.rs");
+    const RUN: &str = include_str!("../src/bin/hermit/run.rs");
+    const REPLAY: &str = include_str!("../src/bin/hermit/replay.rs");
+    const LIFECYCLE: &str = include_str!("../src/bin/hermit/cli_owned_lifecycle.rs");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/hermit");
+    let sources = fault_sites::source_inventory(&root).expect("complete binary source inventory");
+    for (name, compiled) in [
+        ("record_start.rs", RECORD),
+        ("container.rs", CONTAINER),
+        ("owned_container.rs", OWNER),
+        ("run.rs", RUN),
+        ("replay.rs", REPLAY),
+        ("cli_owned_lifecycle.rs", LIFECYCLE),
+    ] {
+        assert_eq!(
+            sources.get(name).map(String::as_str),
+            Some(compiled),
+            "source changed since compilation: {name}"
+        );
     }
-    assert!(
-        !declared.is_empty(),
-        "extracted zero site labels from the sources; this test would pass \
-         vacuously and prove nothing about coverage"
-    );
-
-    let covered: Vec<&str> = RECORD_FAULT_SITES
+    assert!(fault_sites::forwards_parameter(
+        OWNER,
+        "run",
+        4,
+        "super::container::catch_child_panic_at"
+    ));
+    assert!(fault_sites::forwards_parameter(
+        CONTAINER,
+        "catch_child_panic_at",
+        0,
+        "inject_test_fault"
+    ));
+    let covered = RECORD_FAULT_SITES
         .iter()
         .map(|(site, _)| *site)
         .chain(FAULT_SITES_DRIVEN_ELSEWHERE.iter().map(|(site, _)| *site))
-        .collect();
-
-    let mut unreachable: Vec<String> = declared
-        .iter()
-        .filter(|(_, site)| !covered.contains(&site.as_str()))
-        .map(|(file, site)| format!("{file}: {site}"))
-        .collect();
-    unreachable.sort();
-    unreachable.dedup();
+        .collect::<Vec<_>>();
+    let audit = std::cell::RefCell::new(fault_sites::SourceAudit::default());
+    let check_sources = |sources: &std::collections::BTreeMap<String, String>| {
+        audit.borrow_mut().coverage(
+            sources
+                .iter()
+                .map(|(name, source)| (name.as_str(), source.as_str())),
+            &covered,
+        )
+    };
+    let check = |record: &str| {
+        let mut changed = sources.clone();
+        changed.insert("record_start.rs".into(), record.into());
+        check_sources(&changed)
+    };
+    check(RECORD).unwrap_or_else(|error| panic!("fault-site coverage: {error}"));
+    assert_eq!(audit.borrow().inspected_sources(), sources.len());
+    check(RECORD).unwrap();
+    assert_eq!(
+        audit.borrow().inspected_sources(),
+        sources.len(),
+        "byte-identical inputs must reuse only their pure inspections"
+    );
+    // These digests bind the exact in-memory bytes parsed above, not a later read.
+    for (name, source) in &sources {
+        eprintln!(
+            "FAULT_SITE_SOURCE {}",
+            serde_json::json!({"path": name, "bytes": source.len(), "sha256": format!("{:x}", sha2::Sha256::digest(source.as_bytes()))})
+        );
+    }
+    let lifecycle_mutant = LIFECYCLE.replace(
+        "\"owned-container-lifecycle\"",
+        "\"new.uncovered.lifecycle\"",
+    );
+    assert_ne!(lifecycle_mutant, LIFECYCLE);
+    let mut changed = sources.clone();
+    changed.insert("cli_owned_lifecycle.rs".into(), lifecycle_mutant.clone());
+    let inspected = audit.borrow().inspected_sources();
+    let error = check_sources(&changed).unwrap_err();
+    assert_eq!(
+        audit.borrow().inspected_sources(),
+        inspected + 1,
+        "changed complete source bytes must miss"
+    );
     assert!(
-        unreachable.is_empty(),
-        "these container sites can be faulted but no test aims at them, so their \
-         classification would be asserted rather than measured -- add a row to \
-         RECORD_FAULT_SITES, or to FAULT_SITES_DRIVEN_ELSEWHERE with the test that \
-         covers it:\n  {}",
-        unreachable.join("\n  ")
+        error.contains("new.uncovered.lifecycle") && error.contains("owned-container-lifecycle"),
+        "{error}"
+    );
+    // A newly created nested source is part of the filesystem universe too.
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("main.rs"), &sources["main.rs"]).unwrap();
+    std::fs::create_dir(fixture.path().join("new_module")).unwrap();
+    std::fs::write(
+        fixture.path().join("new_module/new_caller.rs"),
+        &lifecycle_mutant,
+    )
+    .unwrap();
+    let discovered = fault_sites::source_inventory(fixture.path()).unwrap();
+    assert_eq!(discovered["new_module/new_caller.rs"], lifecycle_mutant);
+    let mut added = sources.clone();
+    added.insert(
+        "new_module/new_caller.rs".into(),
+        discovered["new_module/new_caller.rs"].clone(),
+    );
+    let inspected = audit.borrow().inspected_sources();
+    assert!(
+        check_sources(&added)
+            .unwrap_err()
+            .contains("new.uncovered.lifecycle")
+    );
+    assert_eq!(
+        audit.borrow().inspected_sources(),
+        inspected + 1,
+        "the same bytes under a new filename must miss"
+    );
+    std::os::unix::fs::symlink(
+        root.join("record_start.rs"),
+        fixture.path().join("outside.rs"),
+    )
+    .unwrap();
+    assert!(
+        fault_sites::source_inventory(fixture.path())
+            .unwrap_err()
+            .contains("symlink")
+    );
+    assert!(fault_sites::source_inventory(&fixture.path().join("absent")).is_err());
+    // Direct boundary calls must contribute labels, including in the owner file.
+    for file in ["cli_owned_lifecycle.rs", "owned_container.rs"] {
+        let mut changed = sources.clone();
+        changed.get_mut(file).unwrap().push_str("\nfn direct_boundary_mutant() { super::container::catch_child_panic_at(\"new.uncovered.boundary\", || Ok(())); }\n");
+        assert!(
+            check_sources(&changed)
+                .unwrap_err()
+                .contains("new.uncovered.boundary")
+        );
+    }
+    let callee = "super::owned_container::run";
+    for replacement in [
+        format!("({callee})"),
+        "<Owner>::run_guarded_at".into(),
+        "container.run_guarded_at".into(),
+        "opaque_call!".into(),
+    ] {
+        let mut changed = sources.clone();
+        let mutant = LIFECYCLE.replacen(callee, &replacement, 1);
+        assert_ne!(mutant, LIFECYCLE);
+        // Removing a real call always retains the stale lifecycle row, even if
+        // the new syntax contains no critical identifier (the macro case).
+        changed.insert("cli_owned_lifecycle.rs".into(), mutant);
+        assert!(
+            check_sources(&changed)
+                .unwrap_err()
+                .contains("owned-container-lifecycle")
+        );
+    }
+    for body in [
+        "opaque! { super::owned_container::run((), (), (), true, \"with_container\", None, ()); }",
+        "use super::owned_container::run as alias; alias((), (), (), true, \"with_container\", None, ());",
+        "use super::owned_container::*; run((), (), (), true, \"with_container\", None, ());",
+        "let alias = super::owned_container::run; alias((), (), (), true, \"with_container\", None, ());",
+        "container.run_guarded_at(\"with_container\");",
+        "(super::container::catch_child_panic_at)(\"with_container\", || Ok(()));",
+    ] {
+        let mut changed = sources.clone();
+        changed
+            .get_mut("cli_owned_lifecycle.rs")
+            .unwrap()
+            .push_str(&format!("\nfn opaque_callee_mutant() {{ {body} }}\n"));
+        assert!(
+            check_sources(&changed)
+                .unwrap_err()
+                .contains("unaccounted critical tokens"),
+            "{body}"
+        );
+    }
+    for (name, body) in [
+        (
+            "unproven.rs",
+            "fn catch_child_panic_at(site: &str) { inject_test_fault(site); }",
+        ),
+        ("unproven.rs", "include!(\"other.rs\");"),
+        ("unproven.rs", "std::include!(\"other.rs\");"),
+        ("unproven.rs", "std::r#include!(\"other.rs\");"),
+        ("unproven.rs", "#[path=\"../outside.rs\"] mod other;"),
+        ("unproven.rs", "#[r#path=\"../outside.rs\"] mod other;"),
+        (
+            "unproven.rs",
+            "#[cfg_attr(unix, path=\"../outside.rs\")] mod other;",
+        ),
+        (
+            "unproven.rs",
+            "#[cfg_attr(unix, r#path=\"../outside.rs\")] mod other;",
+        ),
+        (
+            "unproven.rs",
+            "#[r#cfg_attr(unix, path=\"../outside.rs\")] mod other;",
+        ),
+    ] {
+        let mut changed = sources.clone();
+        changed.insert(name.into(), body.into());
+        assert!(check_sources(&changed).is_err(), "{body}");
+    }
+    for (file, extra) in [
+        (
+            "owned_container.rs",
+            "fn run(a: (), b: (), c: (), d: (), site: &str) { super::container::catch_child_panic_at(site, || Ok(())); }",
+        ),
+        (
+            "container.rs",
+            "fn catch_child_panic_at(site: &str) { inject_test_fault(site); }",
+        ),
+        ("container.rs", "fn inject_test_fault(site: &str) {}"),
+        ("main.rs", "mod owned_container;"),
+    ] {
+        let mut changed = sources.clone();
+        changed
+            .get_mut(file)
+            .unwrap()
+            .push_str(&format!("\n{extra}\n"));
+        assert!(
+            check_sources(&changed).is_err(),
+            "duplicate declaration: {file}: {extra}"
+        );
+    }
+
+    // Mutate the actual included source, not a second hand-written inventory.
+    // Both a conditional label and a direct call label must be discovered.
+    for label in ["record.main.deadline", "record_verify.record"] {
+        let needle = format!("\"{label}\"");
+        assert_eq!(RECORD.matches(&needle).count(), 1);
+        let mutant = RECORD.replace(&needle, "\"renamed.uncovered.site\"");
+        let error = check(&mutant).unwrap_err();
+        assert!(
+            error.contains("renamed.uncovered.site") && error.contains(label),
+            "{error}"
+        );
+    }
+    let missing_call = RECORD.replacen(
+        "super::owned_container::run(",
+        "super::owned_container::removed_call(",
+        1,
+    );
+    let error = check(&missing_call).unwrap_err();
+    assert!(
+        error.contains("record.main.deadline") && error.contains("record.main"),
+        "{error}"
+    );
+    let added_call = format!(
+        "{RECORD}\nfn uncovered_fixture() {{ super::owned_container::run((), (), (), true, \"added.uncovered.site\", None, ()); }}"
+    );
+    assert!(
+        check(&added_call)
+            .unwrap_err()
+            .contains("added.uncovered.site")
+    );
+    let decoys = format!(
+        "{RECORD}\n// super::owned_container::run((), (), (), true, \"comment.decoy\");\nconst DECOY: &str = r#\"inject_test_fault(\"string.decoy\")\"#;"
+    );
+    check(&decoys).unwrap();
+    // A test-only literal must not conceal deletion of every production use.
+    let missing_run = RUN.replace("\"with_container\"", "\"renamed.run.site\"");
+    let missing_replay = REPLAY.replace("\"with_container\"", "\"renamed.replay.site\"");
+    let mut missing = sources.clone();
+    missing.insert("run.rs".into(), missing_run);
+    missing.insert("replay.rs".into(), missing_replay);
+    assert!(
+        check_sources(&missing)
+            .unwrap_err()
+            .contains("with_container")
     );
 
-    // And the other direction: a row naming a site that no longer exists is a test
-    // aimed at nothing, which passes while covering less than it claims.
-    let existing: Vec<&str> = declared.iter().map(|(_, s)| s.as_str()).collect();
-    let stale: Vec<&str> = covered
-        .iter()
-        .copied()
-        .filter(|site| !existing.contains(site))
-        .collect();
+    let unknown = RECORD.replace("\"record_verify.record\"", "unsupported_label()");
     assert!(
-        stale.is_empty(),
-        "these rows name a site that no longer exists in the sources, so they aim \
-         at nothing: {stale:?}"
+        check(&unknown)
+            .unwrap_err()
+            .contains("unsupported site expression")
+    );
+    let shadowed_owner = OWNER.replace(
+        "let state = Rc::new(RefCell::new((guards, work)));",
+        "let site = \"wrong.forwarding\"; let state = Rc::new(RefCell::new((guards, work)));",
+    );
+    assert_ne!(shadowed_owner, OWNER);
+    assert!(!fault_sites::forwards_parameter(
+        &shadowed_owner,
+        "run",
+        4,
+        "super::container::catch_child_panic_at"
+    ));
+    let shadowed_boundary = CONTAINER.replace(
+        "inject_test_fault(site);",
+        "let site = \"wrong.forwarding\"; inject_test_fault(site);",
+    );
+    assert_ne!(shadowed_boundary, CONTAINER);
+    assert!(!fault_sites::forwards_parameter(
+        &shadowed_boundary,
+        "catch_child_panic_at",
+        0,
+        "inject_test_fault"
+    ));
+    for (file, mutant, function, index, callee) in [
+        (
+            "owned_container.rs",
+            shadowed_owner.replace(
+                "let site = \"wrong.forwarding\"",
+                "let r#site = \"wrong.forwarding\"",
+            ),
+            "run",
+            4,
+            "super::container::catch_child_panic_at",
+        ),
+        (
+            "container.rs",
+            shadowed_boundary.replace(
+                "let site = \"wrong.forwarding\"",
+                "let r#site = \"wrong.forwarding\"",
+            ),
+            "catch_child_panic_at",
+            0,
+            "inject_test_fault",
+        ),
+    ] {
+        assert!(mutant.contains("let r#site ="));
+        assert!(!fault_sites::forwards_parameter(
+            &mutant, function, index, callee
+        ));
+        let mut changed = sources.clone();
+        changed.insert(file.into(), mutant);
+        assert!(check_sources(&changed).is_err());
+    }
+    // Raw spelling is the same Rust name. Recognize it consistently while the
+    // token ledger still retains exact source spelling and position.
+    let mut raw_sources = sources.clone();
+    for source in raw_sources.values_mut() {
+        *source = source
+            .replace("owned_container", "r#owned_container")
+            .replace("catch_child_panic_at", "r#catch_child_panic_at")
+            .replace("inject_test_fault", "r#inject_test_fault")
+            .replace("run_guarded_at", "r#run_guarded_at");
+    }
+    check_sources(&raw_sources).unwrap();
+    let raw_renamed = raw_sources["record_start.rs"]
+        .replace("\"record_verify.record\"", "\"new.uncovered.raw_callee\"");
+    raw_sources.insert("record_start.rs".into(), raw_renamed);
+    assert!(
+        check_sources(&raw_sources)
+            .unwrap_err()
+            .contains("new.uncovered.raw_callee")
+    );
+    // The sole computed production label is now directly at argument four.
+    // Preserve both literal branches; local bindings of every shape are outside
+    // this deliberately finite grammar, including the historical alias mutants.
+    let conditional = "if record_timeout.is_some() {\n                    \"record.main.deadline\"\n                } else {\n                    \"record.main\"\n                }";
+    assert_eq!(RECORD.matches(conditional).count(), 1);
+    let call_start = RECORD.find("super::owned_container::run(").unwrap();
+    let call_end = call_start
+        + RECORD[call_start..].find("            )?;").unwrap()
+        + "            )?;".len();
+    let call = &RECORD[call_start..call_end];
+    assert!(call.contains(conditional));
+    let local_call = call.replace(conditional, "site");
+    let initializer = format!("let site = {conditional};");
+    let original_local = RECORD.replacen(
+        call,
+        &format!(
+            "{{ {initializer} {} }}?;",
+            local_call.strip_suffix("?;").unwrap()
+        ),
+        1,
+    );
+    assert_ne!(original_local, RECORD);
+    assert!(
+        check(&original_local)
+            .unwrap_err()
+            .contains("unsupported site expression")
+    );
+    for (before, after) in [
+        (
+            "let source = \"new.uncovered.alias\"; let site = source; let source = \"with_container\";",
+            "",
+        ),
+        ("let r#site = \"new.uncovered.raw\";", ""),
+        (
+            "let é = \"with_container\"; let e\u{301} = \"new.uncovered.nfc\"; let site = é;",
+            "",
+        ),
+        (
+            "let source = site; let site = \"new.uncovered.cfg\"; #[cfg(any())] let site = source;",
+            "",
+        ),
+        ("let binder!(site) = ();", ""),
+        ("let ref site = \"new.uncovered.ref\";", ""),
+        ("let site @ _ = \"new.uncovered.subpattern\";", ""),
+        ("let (site,) = (\"new.uncovered.tuple\",);", ""),
+        ("let site: &str = \"new.uncovered.typed\";", ""),
+        ("let mut site = \"new.uncovered.mutable\";", ""),
+        ("let site; site = \"new.uncovered.uninitialized\";", ""),
+        ("(|site| {", "})(\"new.uncovered.closure\");"),
+        ("for site in [\"new.uncovered.for\"] {", "}"),
+        ("if let Some(site) = Some(\"new.uncovered.if\") {", "}"),
+        (
+            "while let Some(site) = Some(\"new.uncovered.while\") {",
+            "break; }",
+        ),
+        (
+            "match Some(\"new.uncovered.match\") { Some(site) => {",
+            "}, None => {} }",
+        ),
+        ("fn nested(site: &str) {", "}"),
+        (
+            "macro_rules! replace_site { ($name:ident) => { let $name = \"new.uncovered.macro\"; } } replace_site!(site);",
+            "",
+        ),
+        ("opaque_binding!(site);", ""),
+        ("", "opaque_binding!(site);"),
+        ("{ const site: &str = \"new.uncovered.item\";", "}"),
+        ("{", "const site: &str = \"new.uncovered.item\"; }"),
+        ("opaque_binding!(\u{212a});", ""),
+    ] {
+        // The appended mutant uses the complete real call, with only its label
+        // expression replaced by an unsupported local. No label list is copied.
+        let mutant = format!(
+            "{RECORD}\nfn binding_mutant() {{ {initializer} {before} {local_call} {after} }}"
+        );
+        assert!(
+            check(&mutant)
+                .unwrap_err()
+                .contains("unsupported site expression"),
+            "{before} {after}"
+        );
+    }
+    for condition in [
+        "if let Some(source) = Some(\"new.uncovered.if_initializer\") { \"record.main.deadline\" } else { \"record.main\" }",
+        "if true && let Some(source) = Some(\"new.uncovered.if_chain\") { \"record.main.deadline\" } else { \"record.main\" }",
+        "if opaque_condition!() { \"record.main.deadline\" } else { \"record.main\" }",
+    ] {
+        let mutant = RECORD.replacen(conditional, condition, 1);
+        assert_ne!(mutant, RECORD);
+        assert!(
+            check(&mutant)
+                .unwrap_err()
+                .contains("binding-bearing or opaque site condition"),
+            "{condition}"
+        );
+    }
+    let associated_constant = RECORD.replacen(conditional, "<Labels>::site", 1);
+    assert!(
+        check(&associated_constant)
+            .unwrap_err()
+            .contains("unsupported site expression")
+    );
+    for (text, function, index, callee, needle) in [
+        (
+            OWNER,
+            "run",
+            4,
+            "super::container::catch_child_panic_at",
+            "let state = Rc::new(RefCell::new((guards, work)));",
+        ),
+        (
+            CONTAINER,
+            "catch_child_panic_at",
+            0,
+            "inject_test_fault",
+            "inject_test_fault(site);",
+        ),
+    ] {
+        for prefix in [
+            "opaque_binding!(site);",
+            "opaque_binding!(r#site);",
+            "const site: &str = \"wrong.forwarding\";",
+            "let e\u{301} = \"wrong.forwarding\";",
+        ] {
+            let mutant = text.replacen(needle, &format!("{prefix} {needle}"), 1);
+            assert_ne!(mutant, text);
+            assert!(!fault_sites::forwards_parameter(
+                &mutant, function, index, callee
+            ));
+        }
+    }
+    let broken_owner = OWNER.replace(
+        "catch_child_panic_at(site,",
+        "catch_child_panic_at(\"wrong.forwarding\",",
+    );
+    assert!(!fault_sites::forwards_parameter(
+        &broken_owner,
+        "run",
+        4,
+        "super::container::catch_child_panic_at"
+    ));
+    let broken_boundary = CONTAINER.replace(
+        "inject_test_fault(site);",
+        "inject_test_fault(\"wrong.forwarding\");",
+    );
+    assert!(!fault_sites::forwards_parameter(
+        &broken_boundary,
+        "catch_child_panic_at",
+        0,
+        "inject_test_fault"
+    ));
+    for (file, original, function, index, callee, mutant) in [
+        (
+            "owned_container.rs",
+            OWNER,
+            "run",
+            4,
+            "super::container::catch_child_panic_at",
+            OWNER.replacen(
+                "    site: &'static str,",
+                "    #[cfg(any())] site: &'static str, _unused_label: &'static str,",
+                1,
+            ),
+        ),
+        // A conservative nested callable-scope refusal, not a claim that this
+        // isolated mutation is a compiled runtime misforwarding demonstration.
+        (
+            "container.rs",
+            CONTAINER,
+            "catch_child_panic_at",
+            0,
+            "inject_test_fault",
+            CONTAINER.replacen(
+                "inject_test_fault(site);",
+                "struct Inner; impl Inner { fn hidden() { inject_test_fault(site); } }",
+                1,
+            ),
+        ),
+    ] {
+        assert_ne!(mutant, original);
+        let mutant = format!("{mutant}\nconst site: &str = \"wrong.forwarding\";\n");
+        assert!(!fault_sites::forwards_parameter(
+            &mutant, function, index, callee
+        ));
+        let mut changed = sources.clone();
+        changed.insert(file.into(), mutant);
+        assert!(check_sources(&changed).is_err());
+    }
+    for replacement in [
+        "let binder!(site) = (); inject_test_fault(site);",
+        "inject_test_fault(<Labels>::site);",
+        "<Labels>::inject_test_fault(site);",
+    ] {
+        let mutant = CONTAINER.replace("inject_test_fault(site);", replacement);
+        assert_ne!(mutant, CONTAINER);
+        assert!(
+            !fault_sites::forwards_parameter(
+                &mutant,
+                "catch_child_panic_at",
+                0,
+                "inject_test_fault"
+            ),
+            "{replacement}"
+        );
+    }
+    assert_eq!(
+        fault_sites::source_inventory(&root).unwrap(),
+        sources,
+        "source inventory changed during guard execution"
+    );
+    let audit = audit.borrow();
+    assert!(audit.requests() > audit.inspected_sources());
+    eprintln!(
+        "FAULT_SITE_PARSE_CACHE {}",
+        serde_json::json!({"requests": audit.requests(), "inspected_exact_inputs": audit.inspected_sources()})
     );
 }
 

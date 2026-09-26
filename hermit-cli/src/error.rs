@@ -95,12 +95,20 @@ pub struct SerializableError {
     /// What CLASS of failure this was. See [`FailureKind`].
     #[serde(default)]
     kind: FailureKind,
+    /// An unresolved owner is separate from the primary failure class. This
+    /// same-image container field is not a cross-version wire compatibility promise.
+    cleanup_stage: Option<crate::HermitCleanupStage>,
 }
 
 impl SerializableError {
     /// The class this failure was reported as.
     pub fn kind(&self) -> FailureKind {
         self.kind
+    }
+
+    /// The unresolved owner phase, if cleanup has not actually completed.
+    pub fn cleanup_stage(&self) -> Option<crate::HermitCleanupStage> {
+        self.cleanup_stage
     }
 
     /// Re-tag an error as a caught panic. Called at the catch site, which is the
@@ -152,6 +160,29 @@ fn is_policy_refusal(err: &Error) -> bool {
     })
 }
 
+/// Classify only the backend's primary cause. Its secondary errors and failed
+/// cleanup observations are deliberately unreachable from this function.
+pub(crate) fn classify_ptrace_primary(error: &reverie::Error) -> FailureKind {
+    match error {
+        reverie::Error::Tool(inner) => classify_unwrapped(inner),
+        _ => FailureKind::Error,
+    }
+}
+
+fn classify_unwrapped(error: &Error) -> FailureKind {
+    if let Some(error) = error.downcast_ref::<crate::SkidOvershootError>() {
+        FailureKind::SkidOvershoot {
+            count: error.count(),
+        }
+    } else if is_policy_refusal(error) {
+        FailureKind::PolicyRefusal
+    } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
+        FailureKind::RunTimeout
+    } else {
+        FailureKind::Error
+    }
+}
+
 impl From<Error> for SerializableError {
     fn from(err: Error) -> Self {
         let error = err.to_string();
@@ -162,21 +193,19 @@ impl From<Error> for SerializableError {
         // side can only ever fail. Detecting the refusal after the boundary
         // would mean matching on English, which is the thing `kind` exists to
         // avoid.
-        let kind = if let Some(error) = err.downcast_ref::<crate::SkidOvershootError>() {
-            FailureKind::SkidOvershoot {
-                count: error.count(),
-            }
-        } else if is_policy_refusal(&err) {
-            FailureKind::PolicyRefusal
-        } else if err.downcast_ref::<crate::GuestTimedOut>().is_some() {
-            FailureKind::RunTimeout
-        } else {
-            FailureKind::Error
-        };
+        let (kind, cleanup_stage) =
+            if let Some(error) = err.downcast_ref::<crate::HermitCleanupUnconfirmed>() {
+                (error.primary_kind(), Some(error.stage()))
+            } else if let Some(error) = err.downcast_ref::<crate::HermitPtraceFailure>() {
+                (error.kind(), None)
+            } else {
+                (classify_unwrapped(&err), None)
+            };
         Self {
             error,
             context,
             kind,
+            cleanup_stage,
         }
     }
 }
@@ -214,6 +243,7 @@ mod tests {
                 error: "c".into(),
                 context: vec!["b".into(), "a".into(), "root cause".into(),],
                 kind: FailureKind::Error,
+                cleanup_stage: None,
             }
         );
     }
@@ -224,6 +254,7 @@ mod tests {
             error: "c".into(),
             context: vec!["b".into(), "a".into(), "root cause".into()],
             kind: FailureKind::Error,
+            cleanup_stage: None,
         });
 
         assert_eq!(

@@ -284,6 +284,24 @@ impl GuestRunCaptureSession {
         })
     }
 
+    /// Retain the same opened identities in an owned CLI factory. This does not
+    /// reopen paths or publish another result; the parent remains the publisher.
+    pub(crate) fn try_clone_for_child(&self) -> Result<Self, Error> {
+        Ok(Self {
+            parent_path: self.parent_path.clone(),
+            parent: self.parent.try_clone()?,
+            parent_identity: self.parent_identity,
+            result_name: self.result_name.clone(),
+            stdout_name: self.stdout_name.clone(),
+            stderr_name: self.stderr_name.clone(),
+            stdout: self.stdout.try_clone()?,
+            stderr: self.stderr.try_clone()?,
+            stdout_identity: self.stdout_identity,
+            stderr_identity: self.stderr_identity,
+            result: self.result.as_ref().map(File::try_clone).transpose()?,
+        })
+    }
+
     pub(crate) fn stdout_for_guest(&self) -> Result<File, Error> {
         self.stdout
             .try_clone()

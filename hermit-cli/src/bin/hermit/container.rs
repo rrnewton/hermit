@@ -834,6 +834,7 @@ fn inject_test_fault(site: &str) {
 /// Returns a [`SerializableError`] rather than a bare [`Error`] so the CLASS
 /// survives: a caught panic is tagged HERE, at the only point that still knows
 /// one happened, and the tag then crosses the process boundary with the message.
+#[cfg(test)]
 fn catch_child_panic<F, T>(f: &mut F) -> Result<T, SerializableError>
 where
     F: FnMut() -> Result<T, Error>,
@@ -855,62 +856,26 @@ where
     }
 }
 
-/// Runs a container-child closure with panics converted to errors.
-///
-/// Every `Container::run` call site in Hermit should use this instead of
-/// `run`, so that no Hermit closure can reach the nounwind child entry point
-/// while unwinding. `with_container` uses it; so do the direct call sites in
-/// `record_start`, which is the path the partial-revents-copyout replay
-/// divergence takes.
-pub trait RunGuarded {
-    /// Runs a container-child closure with panics converted to errors, carrying
-    /// the CALL SITE'S IDENTITY into the child.
-    ///
-    /// ⚠️ THE LABEL IS NOT OPTIONAL, AND THAT IS DELIBERATE. An unlabelled form was
-    /// tried and removed: every site would have compiled while silently opting out
-    /// of being addressable, which is exactly the state that left two sites
-    /// untestable. Requiring the argument makes a new call site declare what it is,
-    /// and `cargo` asks the question at the moment the site is added.
-    ///
-    /// The label is inert in production. It is read only by `inject_test_fault`,
-    /// which is itself inert unless the test environment variables are set.
-    fn run_guarded_at<F, T>(
-        &mut self,
-        site: &'static str,
-        f: F,
-    ) -> Result<Result<T, SerializableError>, RunError>
-    where
-        F: FnMut() -> Result<T, SerializableError>,
-        T: serde::Serialize + serde::de::DeserializeOwned;
-}
-
-impl RunGuarded for Container {
-    fn run_guarded_at<F, T>(
-        &mut self,
-        site: &'static str,
-        mut f: F,
-    ) -> Result<Result<T, SerializableError>, RunError>
-    where
-        F: FnMut() -> Result<T, SerializableError>,
-        T: serde::Serialize + serde::de::DeserializeOwned,
-    {
-        self.run(move || {
-            install_panic_location_hook();
-            match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                inject_test_fault(site);
-                f()
-            })) {
-                Ok(result) => result,
-                // Tagged AT THE CATCH SITE, the only place that still knows a
-                // panic is what happened. Everything downstream sees prose.
-                Err(payload) => Err(SerializableError::from(anyhow!(
-                    "panic in container child at {}: {}",
-                    take_panic_location(),
-                    panic_message(&*payload)
-                ))
-                .into_panic()),
-            }
-        })
+/// Same child panic boundary with the original explicit call-site fault label.
+pub(super) fn catch_child_panic_at<F, T>(
+    site: &'static str,
+    mut f: F,
+) -> Result<T, SerializableError>
+where
+    F: FnMut() -> Result<T, Error>,
+{
+    install_panic_location_hook();
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        inject_test_fault(site);
+        f()
+    })) {
+        Ok(result) => result.map_err(SerializableError::from),
+        Err(payload) => Err(SerializableError::from(anyhow!(
+            "panic in container child at {}: {}",
+            take_panic_location(),
+            panic_message(&*payload)
+        ))
+        .into_panic()),
     }
 }
 
@@ -1053,6 +1018,7 @@ impl std::error::Error for ContainerChildPanic {}
 
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
+#[cfg(test)]
 pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
 where
     F: FnMut() -> Result<T, Error>,
@@ -1065,13 +1031,8 @@ where
     }))
 }
 
-/// Turn a `Container::run` / [`RunGuarded::run_guarded`] outcome into an error
-/// whose CLASS is still readable by `classify_failure`.
-///
-/// ⚠️ SHARED BECAUSE `with_container` IS NOT THE ONLY BOUNDARY. `hermit record`
-/// -- every spelling -- calls [`RunGuarded::run_guarded`] directly at six sites
-/// in `record_start.rs`, so a discard there loses exactly what this change
-/// exists to preserve and the failure surfaces as `class=cli-error`.
+/// Preserve the primary class from a settled container result. The owned CLI
+/// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(
     ran: Result<Result<T, SerializableError>, RunError>,
 ) -> Result<T, Error> {
@@ -1157,18 +1118,6 @@ pub fn classify_container_result<T>(
         Err(error @ RunError::Spawn(_)) => {
             Err(Error::new(error).context("Sandbox container failed to spawn"))
         }
-    }
-}
-
-/// Postfix spelling of [`classify_container_result`], so a direct
-/// `run_guarded` call site reads the same way `with_container` does.
-pub trait Classified<T> {
-    fn classified(self) -> Result<T, Error>;
-}
-
-impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
-    fn classified(self) -> Result<T, Error> {
-        classify_container_result(self)
     }
 }
 
