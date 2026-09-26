@@ -103,6 +103,22 @@ mod user_access_tests {
 
     #[test]
     fn unexpected_copy_errors_after_effects_preserve_error_and_attempted_draws() {
+        // Diagnostic classification only; the existing cases below still prove
+        // real copied prefixes and exact PRNG advancement after failures.
+        for errno in [Errno::EPERM, Errno::EIO, Errno::ESRCH, Errno::ENOSYS] {
+            let error = copy_error(errno);
+            let message = error.to_string();
+            assert!(message.contains(&errno.to_string()));
+            if errno == Errno::EPERM {
+                assert!(message.contains("for a non-dumpable ptrace guest"));
+                assert!(message.contains("default namespace configuration"));
+                assert!(message.contains("omit --no-namespace"));
+            } else {
+                assert!(!message.contains("--no-namespace"));
+                assert!(!message.contains("EPERM"));
+            }
+            terminal(error, errno);
+        }
         let cases = [
             (7, vec![7], vec![Copy::FailAfter(3, Errno::EIO)], 3, vec![7]),
             (7, vec![7], vec![Copy::FailAfter(7, Errno::EIO)], 7, vec![7]),
