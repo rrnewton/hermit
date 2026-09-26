@@ -752,7 +752,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3224) retain all 193 prior IDs:
     // sigsuspend_mask_fallback_warns_in_the_compared_log and
     // ptrace_sigsuspend_runs_without_probe_injections.
-    ("test.hermit_integration", 195),
+    // https://github.com/rrnewton/hermit/pull/3229 adds signal_determinism's
+    // sigsuspend_with_armed_periodic_timerfd_reports_terminal_deadlock; it
+    // retains all 195 prior identities.
+    ("test.hermit_integration", 196),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -923,8 +926,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin also selects the two first_seen_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3639).
     // The host twin also selects the two signal_determinism tests
-    // (https://github.com/rrnewton/hermit/pull/3224).
-    ("test.hermit_integration_on_host", 195),
+    // (https://github.com/rrnewton/hermit/pull/3224) and the armed-timerfd
+    // deadlock test (https://github.com/rrnewton/hermit/pull/3229).
+    ("test.hermit_integration_on_host", 196),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
