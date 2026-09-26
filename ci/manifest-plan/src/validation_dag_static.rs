@@ -224,8 +224,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.hermit_unit", 723),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
-    // Twelve virtual-timerfd controls retain all 748 prior identities.
-    ("test.detcore_unit", 760),
+    // Seven virtual-timerfd controls retain all 748 prior identities.
+    ("test.detcore_unit", 755),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -254,7 +254,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 760),
+    ("test.detcore_unit_on_host", 755),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 160),
     ("test.hermit_unit_on_host", 723),

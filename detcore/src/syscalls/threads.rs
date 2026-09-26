@@ -56,7 +56,6 @@ use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
 use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
-use crate::tool_global::register_timerfd;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_child_tid_address;
 use crate::tool_global::thread_is_live;
@@ -1481,7 +1480,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await;
 
         let mut released_ports = Vec::new();
-        for &open_file_id in &closed_open_files {
+        for open_file_id in closed_open_files {
             if let Some(port) = self.release_port_for_open_file(guest, open_file_id).await {
                 released_ports.push((open_file_id, port));
             }
@@ -1514,17 +1513,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         for (open_file_id, port) in released_ports {
             self.restore_port_for_open_file(guest, open_file_id, port)
                 .await;
-        }
-        // Releasing a close-on-exec timerfd also dropped its scheduler
-        // deadline; the exec failed, so the timer is alive again.
-        let now = thread_observe_time(guest).await;
-        for open_file_id in closed_open_files {
-            if let Some(state) = guest
-                .thread_state()
-                .timerfd_state_for_open_file(open_file_id)
-            {
-                register_timerfd(guest, open_file_id, state.next_expiry(now), state.interval).await;
-            }
         }
 
         Err(errno.into())

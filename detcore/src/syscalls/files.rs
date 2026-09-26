@@ -1617,7 +1617,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            FdType::Timerfd if self.virtual_timerfds() => self.read_timerfd(guest, call).await,
+            FdType::Timerfd if self.virtual_timerfds() => {
+                let iovec = TimerSlackIovec {
+                    base: call.buf().map_or(0, |buf| buf.as_raw()),
+                    len: call.len(),
+                };
+                self.read_timerfd(guest, call.fd(), &[iovec]).await
+            }
             FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
@@ -2324,7 +2330,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let res = if physically_nonblocking
+        let res = if fd_type == FdType::Timerfd && self.virtual_timerfds() {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            match read_iovecs(&guest.memory(), call.iov(), call.len()) {
+                Ok(iovecs) => self.read_timerfd(guest, call.fd(), &iovecs).await,
+                Err(errno) => Err(errno.into()),
+            }
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
@@ -2407,6 +2419,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.readv_timer_slack(guest, call.fd(), iovecs, Some(offset), call.flags())
                     .await
             };
+        }
+
+        // preadv2 at offset -1 is readv (fs/read_write.c do_preadv2). A
+        // virtual timerfd is never armed on the host, so route the flag-free
+        // form through the virtual read; other flags keep the host path.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if vectored_offset(call.pos_l(), call.pos_h()) == -1
+            && call.flags() == 0
+            && self.virtual_timerfds()
+            && guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.ty())?
+                == FdType::Timerfd
+        {
+            let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
+            let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
+            return self.read_timerfd(guest, call.fd(), &iovecs).await;
         }
 
         let is_procfs = guest
@@ -3905,6 +3934,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Host-passthrough modes let the kernel validate the clock, as before.
         let clockid = if self.virtual_timerfds() {
+            // fs/timerfd.c rejects unknown flags and unknown clocks with
+            // EINVAL before it checks CAP_WAKE_ALARM for the alarm clocks.
+            if call.flags().bits() & !(libc::TFD_CLOEXEC | libc::TFD_NONBLOCK) != 0 {
+                return Err(Errno::EINVAL.into());
+            }
             Some(match call.clockid() {
                 syscalls::ClockId::CLOCK_REALTIME => libc::CLOCK_REALTIME,
                 syscalls::ClockId::CLOCK_MONOTONIC => libc::CLOCK_MONOTONIC,
@@ -3958,9 +3992,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// timerfd_settime: arm/disarm against the virtual clock. The host vessel
-    /// is never armed; the deadline is registered with the scheduler so it is
-    /// a fast-forward target, and readiness/counts are computed from virtual
-    /// time. Re-arming resets the pending expiration count, as Linux does.
+    /// is never armed and the scheduler holds no timerfd state: readiness and
+    /// counts are computed from virtual time by whichever syscall observes
+    /// them. Re-arming resets the pending expiration count, as Linux does.
     ///
     /// Error order follows fs/timerfd.c: copying in `new_value` (EFAULT),
     /// then flags and `itimerspec64_valid` (EINVAL), then the descriptor
@@ -3988,10 +4022,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EINVAL.into());
         }
-        let (state, open_file_id) = guest
+        let state = guest
             .thread_state()
-            .with_detfd(fd, |detfd| (detfd.timerfd_state(), detfd.open_file_id()))?;
-        let state = state.ok_or(Errno::EINVAL)?;
+            .with_detfd(fd, |detfd| detfd.timerfd_state())?
+            .ok_or(Errno::EINVAL)?;
         let now = thread_observe_time(guest).await;
         let old_spec = timerfd_gettime_spec(&state, now);
         let value_ns = timespec_ns(new.it_value);
@@ -4019,13 +4053,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 s.generation += 1;
             })
         })?;
-        register_timerfd(
-            guest,
-            open_file_id,
-            deadline,
-            LogicalTime::from_nanos(interval_ns),
-        )
-        .await;
         if let Some(old_ptr) = call.old_value() {
             guest.memory().write_value(old_ptr, &old_spec)?;
         }
@@ -4033,21 +4060,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Virtual timerfd read: pending expirations as a u64 count, computed from
-    /// virtual time. Blocking reads poll on scheduler turns (which advance
-    /// virtual time); a signal interrupts without consuming, as on Linux,
-    /// and the read restarts under SA_RESTART (the kernel's -ERESTARTSYS).
+    /// virtual time, delivered into `iovecs` (one buffer for `read`, the
+    /// guest's vector for `readv`). Blocking reads poll on scheduler turns
+    /// (which advance virtual time); a signal interrupts without consuming, as
+    /// on Linux, and the read restarts under SA_RESTART (the kernel's
+    /// -ERESTARTSYS). As in fs/timerfd.c, a total length below 8 is EINVAL
+    /// before anything else, and the count is consumed before it is copied
+    /// out, so a faulting buffer loses the expirations and reports EFAULT.
     // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd read counts, EAGAIN, and
     // blocking restart.
-    pub async fn read_timerfd<G: Guest<Self>>(
+    async fn read_timerfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Read,
+        fd: RawFd,
+        iovecs: &[TimerSlackIovec],
     ) -> Result<i64, Error> {
-        let fd = call.fd();
-        if call.len() < 8 {
+        if iovecs.iter().map(|iovec| iovec.len).sum::<usize>() < 8 {
             return Err(Errno::EINVAL.into());
         }
-        let buf = call.buf().ok_or(Errno::EFAULT)?;
         let nonblocking = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
@@ -4064,8 +4094,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                         s.generation += 1;
                     })
                 })?;
-                guest.memory().write_value(buf.cast::<u64>(), &pending)?;
-                return Ok(8);
+                let mut bytes: &[u8] = &pending.to_ne_bytes();
+                for iovec in iovecs {
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    if iovec.len == 0 {
+                        continue;
+                    }
+                    let chunk = iovec.len.min(bytes.len());
+                    let copied = AddrMut::from_raw(iovec.base)
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|addr| guest.memory().write(addr, &bytes[..chunk]))
+                        .unwrap_or(0);
+                    bytes = &bytes[copied..];
+                    if copied < chunk {
+                        break;
+                    }
+                }
+                return if bytes.is_empty() {
+                    Ok(8)
+                } else {
+                    Err(Errno::EFAULT.into())
+                };
             }
             if nonblocking {
                 return Err(Errno::EAGAIN.into());
@@ -4094,14 +4145,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.virtual_timerfds() {
             return self.notification_fd_control(guest, call.into()).await;
         }
-        let fd = call.fd();
-        let value_ptr = call.value().ok_or(Errno::EFAULT)?;
+        // fs/timerfd.c resolves the descriptor (EBADF, or EINVAL for a
+        // non-timerfd) before it copies the result out (EFAULT).
         let state = guest
             .thread_state()
-            .with_detfd(fd, |detfd| detfd.timerfd_state())?
+            .with_detfd(call.fd(), |detfd| detfd.timerfd_state())?
             .ok_or(Errno::EINVAL)?;
         let now = thread_observe_time(guest).await;
         let spec = timerfd_gettime_spec(&state, now);
+        let value_ptr = call.value().ok_or(Errno::EFAULT)?;
         guest.memory().write_value(value_ptr, &spec)?;
         Ok(0)
     }
