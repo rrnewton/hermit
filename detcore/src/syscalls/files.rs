@@ -1228,7 +1228,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
-        let contents = self.snapshot_procfs(guest, call).await?;
+        let raw_contents = self.snapshot_procfs(guest, call).await?;
+        // The guest mount view is the launch namespace (guest mount/unshare/
+        // setns are refused under Detcore). Ephemeral per-process host FUSE
+        // seed rows are other tenants' propagated runtime state, not part of
+        // that namespace; exclude the class at capture so snapshot identity
+        // assignment and every later read agree on the same membership.
+        let contents = if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())
+            .unwrap_or(false)
+        {
+            crate::procfs::exclude_ephemeral_host_seed_mounts(&raw_contents)
+        } else {
+            raw_contents
+        };
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
@@ -1290,6 +1304,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
                     ))
                 })?;
+                // Same guest mount model as the mountinfo capture path:
+                // ephemeral host seed rows are not guest namespace members
+                // and must not shift run-global mount-ID assignment.
+                let mountinfo_contents =
+                    crate::procfs::exclude_ephemeral_host_seed_mounts(&mountinfo_contents);
                 let mountinfo_rows =
                     crate::procfs::parse_mountinfo(&mountinfo_contents).ok_or_else(|| {
                         Error::Tool(anyhow::anyhow!(

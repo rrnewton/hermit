@@ -3252,7 +3252,21 @@ impl HermitData {
 /// Capture the current mount namespace's raw IDs in the exact row/parent order
 /// used by Detcore's canonical mountinfo mapping.
 pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
-    mountinfo_identity_order_from(&fs::read("/proc/self/mountinfo")?)
+    let raw = fs::read("/proc/self/mountinfo")?;
+    // Producer provenance follows the guest mount model: ephemeral host
+    // seed rows (other processes' squashfuse mounts) are not namespace
+    // members and must not enter the captured identity order.
+    let filtered: Vec<u8> = raw
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| {
+            !detcore_model::procfs::is_ephemeral_host_seed_mount(
+                line.strip_suffix(b"\n").unwrap_or(line),
+            )
+        })
+        .flatten()
+        .copied()
+        .collect();
+    mountinfo_identity_order_from(&filtered)
 }
 
 fn mountinfo_identity_order_from(contents: &[u8]) -> Result<Vec<u64>, Error> {

@@ -6465,6 +6465,7 @@ mod tests {
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
+                + crate::timeouts::PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
