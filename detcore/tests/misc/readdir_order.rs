@@ -71,6 +71,19 @@ fn run_five_times_hashing_buffers(guest: fn()) {
     run_five_times_under(|| (), |()| guest(), config)
 }
 
+/// Like [`run_five_times`], without hashing the bytes each syscall returns
+/// into the log.
+fn run_five_times_without_hashing_buffers(guest: fn()) {
+    let config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        virtualize_metadata: true,
+        detlog_io_buffers: false,
+        ..Default::default()
+    };
+    run_five_times_under(|| (), |()| guest(), config)
+}
+
 fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Sync, config: Config) {
     let mut expected = None;
 
@@ -1064,6 +1077,37 @@ fn raw_getdents64(fd: i32, buf: *mut u8, count: libc::c_uint) -> Result<usize, i
     }
 }
 
+/// The `room` bytes Linux leaves where it began to store `record`, a
+/// `getdents64` record that it could not finish, into a buffer that held
+/// `0xaa`, for a `call` of `SYS_getdents64` or `SYS_getdents`. The two
+/// formats' records of a name have the same length. `filldir64`
+/// (fs/readdir.c) stores the record's `d_ino`, `d_reclen` and `d_type`, each
+/// at once, so only if it fits whole, then the NUL after the name, then the
+/// name. `filldir` stores `d_type` in the record's last byte, so if it fits,
+/// so does the whole record. Neither stores the record's own `d_off` before
+/// the next record or the end of the call.
+fn left_by_linux(record: &[u8], room: usize, call: libc::c_long) -> Vec<u8> {
+    let name_len = record[19..].iter().position(|&byte| byte == 0).unwrap();
+    let reclen = usize::from(u16::from_ne_bytes([record[16], record[17]]));
+    let type_at = if call == libc::SYS_getdents {
+        assert!(room < reclen, "the record fits in {room} bytes");
+        reclen - 1
+    } else {
+        assert!(
+            19 + name_len >= room,
+            "the record's NUL fits in {room} bytes"
+        );
+        18
+    };
+    let mut left = vec![0xaa; room];
+    for (at, field) in [(0, 0..8), (16, 16..18), (type_at, 18..19)] {
+        if at + field.len() <= room {
+            left[at..at + field.len()].copy_from_slice(&record[field]);
+        }
+    }
+    left
+}
+
 fn first_record_short_of_writable_end_guest() {
     // Two-character names take 24-byte records, of which Linux writes the
     // first 22: it does not write the padding after the name.
@@ -1077,13 +1121,14 @@ fn first_record_short_of_writable_end_guest() {
 
     // With 22 bytes writable before a read-only page, `.` still fits
     // (it needs 21), and the call returns its whole 24-byte record without
-    // touching the two read-only bytes. With 20, nothing fits and the call
-    // fails; Linux writes the first 20 bytes of `.` before failing, but
-    // Detcore leaves every byte after its result as the guest had it, as
-    // everywhere else. Either way a descriptor the open file is passed on to then finds
-    // every entry not yet returned; without one, the stream continues. (After
-    // the passed-on descriptor reads to the end, Linux gives the first
-    // descriptor nothing more, so each is checked on its own open file.)
+    // touching its padding or the two read-only bytes. With 20, nothing fits
+    // and the call fails. Linux first stores the entry's position, 0, into
+    // `.`'s `d_off`, then its `d_ino`, `d_reclen` and `d_type`, and fails at
+    // the NUL after the name, byte 20, leaving the first 19 bytes written.
+    // Either way a descriptor the open file is passed on to then finds every
+    // entry not yet returned; without one, the stream continues. (After the
+    // passed-on descriptor reads to the end, Linux gives the first descriptor
+    // nothing more, so each is checked on its own open file.)
     for (writable, returned) in [(22, Ok(24)), (20, Err(libc::EFAULT))] {
         for pass_on in [true, false] {
             let context = format!("{writable} bytes writable, passed on {pass_on}");
@@ -1099,16 +1144,26 @@ fn first_record_short_of_writable_end_guest() {
                 Err(_) => Vec::new(),
             };
             assert_eq!(first, expected[..first.len()], "{context}");
-            assert_eq!(&bytes[writable..], &[0xaa; 24][writable..], "{context}");
+            assert_eq!(&bytes[21..], &[0xaa; 24][21..], "{context}");
             if result.is_err() {
-                assert!(bytes.iter().all(|&byte| byte == 0xaa), "{context}");
+                assert_eq!(&bytes[8..16], &0i64.to_ne_bytes(), "{context}");
+                assert_eq!(&bytes[16..18], &24u16.to_ne_bytes(), "{context}");
+                assert_eq!(bytes[18], libc::DT_DIR, "{context}");
+                assert_eq!(bytes[19..21], [0xaa; 2], "{context}");
             }
             if pass_on {
                 let received = receive_descriptor(fd);
                 assert_contains_rest(&drain_names(received), &expected, &first, &context);
                 unsafe { libc::close(received) };
             } else {
+                let mut next = [0u8; 4096];
+                let len = getdents64(fd, &mut next).unwrap();
+                if result.is_err() {
+                    // `.` comes first again, with the `d_ino` stored before.
+                    assert_eq!(bytes[..8], next[..8], "{context}");
+                }
                 let mut names = first;
+                names.extend(record_names(&next[..len], 19));
                 names.extend(drain_names(fd));
                 assert_eq!(names, expected, "{context}");
             }
@@ -1135,25 +1190,30 @@ fn record_into_inaccessible_page_guest() {
 
     // 88 bytes before a page the guest cannot touch: three 24-byte records
     // fit, and the fourth would end 8 bytes inside that page. Linux returns
-    // the three and never writes the inaccessible page. (It does write the
-    // fourth record's `d_ino` before failing on its length; Detcore leaves
-    // the 16 bytes after the three records as the guest had them.) The first call reads a fresh descriptor, the second
+    // the three and never writes the inaccessible page. It does store the
+    // fourth record's `d_ino` before failing on its length, so the 16 bytes
+    // after the three records hold the `d_ino` of the entry the next call
+    // returns first. The first call reads a fresh descriptor, the second
     // continues the stream.
     let map = guarded_pages(2, 1, libc::PROT_NONE);
     let buf = unsafe { map.add(page - 88) };
     let dir = File::open(root.path()).unwrap();
     let fd = dir.as_raw_fd();
     let mut names = Vec::new();
+    let mut left: Option<Vec<u8>> = None;
     for call in 0..2 {
         let n = raw_getdents64(fd, buf, 256).unwrap();
         assert_eq!(n, 72, "call {call}");
         let bytes = unsafe { std::slice::from_raw_parts(buf, 88) };
         names.extend(record_names(&bytes[..n], 19));
-        assert!(
-            bytes[n..].iter().all(|&byte| byte == 0xaa),
-            "call {call} changed bytes after its records: {:02x?}",
-            &bytes[n..]
-        );
+        if let Some(left) = left {
+            assert_eq!(
+                left,
+                left_by_linux(&bytes[..24], 16, libc::SYS_getdents64),
+                "call {call}"
+            );
+        }
+        left = Some(bytes[n..].to_vec());
         assert_eq!(
             unsafe {
                 libc::mprotect(
@@ -1175,6 +1235,14 @@ fn record_into_inaccessible_page_guest() {
         );
         unsafe { std::ptr::write_bytes(buf, 0xaa, 88) };
     }
+    let mut next = [0u8; 4096];
+    let len = getdents64(fd, &mut next).unwrap();
+    assert_eq!(
+        left.unwrap(),
+        left_by_linux(&next[..24], 16, libc::SYS_getdents64),
+        "after call 1"
+    );
+    names.extend(record_names(&next[..len], 19));
     names.extend(drain_names(fd));
     assert_eq!(names, expected);
     unsafe { libc::munmap(map.cast(), 2 * page) };
@@ -1196,9 +1264,10 @@ fn large_buffer_tail_guest() {
     // A count of 100000 whose first 70001 bytes are writable, above the
     // 64KiB Detcore reads the host directory with. The records, `.` and
     // `..` at 24 bytes and the rest at 32, fill exactly 70000 bytes on a
-    // fresh descriptor, and fewer after a first read of 4096; either way
-    // every writable byte after them is left as the guest had it. (Linux
-    // writes the leading fields of the record that does not fit.)
+    // fresh descriptor, and fewer after a first read of 4096. After them,
+    // Linux leaves what it stored of the record that does not fit (see
+    // [`left_by_linux`]): on a fresh descriptor nothing, because its `d_ino`
+    // crosses into the inaccessible page and is stored at once.
     let writable: usize = 70001;
     let pages = (writable + 100000) / page + 2;
     let usable = writable.div_ceil(page);
@@ -1219,12 +1288,18 @@ fn large_buffer_tail_guest() {
             assert_eq!(n, 70000);
         }
         assert!(n > 60000 && n <= writable, "{n} bytes returned");
-        let first_changed = bytes[n..].iter().position(|&byte| byte != 0xaa);
-        assert_eq!(
-            first_changed, None,
-            "warm {warm}: {n} bytes returned, and a byte after them changed"
-        );
         names.extend(record_names(&bytes[..n], 19));
+        let mut next = [0u8; 4096];
+        let len = getdents64(fd, &mut next).unwrap();
+        assert_eq!(
+            bytes[n..],
+            left_by_linux(&next[..32], writable - n, libc::SYS_getdents64)[..],
+            "warm {warm}: {n} bytes returned, and the bytes after them"
+        );
+        if !warm {
+            assert!(bytes[n..].iter().all(|&byte| byte == 0xaa));
+        }
+        names.extend(record_names(&next[..len], 19));
         names.extend(drain_names(fd));
         assert_eq!(names, expected, "warm {warm}");
         unsafe { libc::munmap(map.cast(), pages * page) };
@@ -1416,12 +1491,20 @@ fn write_only_prefix_guest() {
     // After `.` and `..`, each record is 24 bytes. With 8 bytes before the
     // inaccessible page no record fits and the call fails, writing nothing:
     // Linux's first write to the first record of a call is its `d_off`, 8
-    // bytes in. With 32, `00` fits and `01` does not. Linux writes a record
-    // from its `d_ino` until the first byte it cannot write, so the 8 bytes
-    // after `00` hold the `d_ino` of `01`, and Detcore cannot read that page
-    // to put them back. The stream continues after the returned records.
+    // bytes in. With 32, `00` fits and `01` does not. Linux stores `01`'s
+    // `d_ino` and fails at its `d_reclen`, so the 8 bytes after `00` hold
+    // the `d_ino` of `01` (see [`left_by_linux`]). With 40, `01`'s own
+    // `d_off` is still not written. With 45, `getdents64` also stores `01`'s
+    // `d_reclen` and `d_type` and fails at the NUL after its name, while
+    // `getdents` fails at `d_type`, in the record's last byte, after
+    // `d_reclen`. The stream continues after the returned records.
     for (call, name_offset) in [(libc::SYS_getdents64, 19), (libc::SYS_getdents, 18)] {
-        for (writable, returned) in [(8, Err(libc::EFAULT)), (32, Ok(24))] {
+        for (writable, returned) in [
+            (8, Err(libc::EFAULT)),
+            (32, Ok(24)),
+            (40, Ok(24)),
+            (45, Ok(24)),
+        ] {
             let context = format!("syscall {call}, {writable} bytes writable");
             let map = guarded_pages(2, 1, libc::PROT_NONE);
             assert_eq!(
@@ -1450,11 +1533,11 @@ fn write_only_prefix_guest() {
             names.extend(record_names(&bytes[..n], name_offset));
             let mut next = [0u8; 4096];
             let len = getdents64(fd, &mut next).unwrap();
-            let mut left = vec![0xaa; writable - n];
-            if n > 0 {
-                // `d_ino` is the first 8 bytes of a record in both layouts.
-                left.copy_from_slice(&next[..8]);
-            }
+            let left = if n > 0 {
+                left_by_linux(&next[..24], writable - n, call)
+            } else {
+                vec![0xaa; writable]
+            };
             assert_eq!(
                 bytes[n..],
                 left[..],
@@ -1475,9 +1558,14 @@ fn write_only_prefix_guest() {
     println!("write-only prefix ok");
 }
 
+/// Detcore cannot read back a buffer the guest can write but not read, so
+/// with the bytes each syscall returns hashed into the log, as `hermit run`
+/// does by default, it cannot log what the call returned; it fails the call
+/// instead (see `write_only_buffer_is_refused_while_hashing_buffers`). So
+/// the write-only tests run without that hashing.
 #[test]
 fn write_only_prefix_matches_linux() {
-    run_five_times(write_only_prefix_guest);
+    run_five_times_without_hashing_buffers(write_only_prefix_guest);
 }
 
 /// Rewind, seek, then call `getdents` and `getdents64` with each of `counts`,
@@ -1788,7 +1876,144 @@ fn fresh_write_only_buffer_guest() {
 
 #[test]
 fn fresh_write_only_buffer_is_filled() {
-    run_five_times(fresh_write_only_buffer_guest);
+    run_five_times_without_hashing_buffers(fresh_write_only_buffer_guest);
+}
+
+fn write_only_buffer_refused_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..20 {
+        File::create(root.path().join(name(index))).unwrap();
+    }
+
+    // Hashing the bytes a call returns needs them read back from the
+    // guest's buffer, which cannot be read here, so the call fails rather
+    // than log bytes other than those the guest holds. Main does the same.
+    // (The legacy `getdents` is not among the calls whose bytes are hashed.)
+    let map = guarded_pages(1, 0, libc::PROT_WRITE);
+    let dir = File::open(root.path()).unwrap();
+    let result = unsafe { libc::syscall(libc::SYS_getdents64, dir.as_raw_fd(), map, 256) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!((result, errno), (-1, Some(libc::EFAULT)));
+    unsafe { libc::munmap(map.cast(), 4096) };
+
+    println!("write-only buffer refused ok");
+}
+
+#[test]
+fn write_only_buffer_is_refused_while_hashing_buffers() {
+    run_five_times_hashing_buffers(write_only_buffer_refused_guest);
+}
+
+/// Map every free range of the address space, largest first, so that Detcore
+/// can map nothing in the guest to read a directory into. Nothing may
+/// allocate until the ranges are unmapped again.
+fn occupy_address_space() -> Vec<(*mut libc::c_void, usize)> {
+    let mut maps = Vec::with_capacity(4096);
+    let mut len = 1usize << 46;
+    while len >= 4096 {
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            len /= 2;
+        } else {
+            assert!(maps.len() < maps.capacity());
+            maps.push((map, len));
+        }
+    }
+    maps
+}
+
+/// Unmap the smallest of `maps`, returning its length. That leaves room for
+/// less than the 64KiB Detcore would map, but for the one page it maps
+/// instead, which the whole directory is read through.
+fn free_smallest(maps: &mut Vec<(*mut libc::c_void, usize)>) -> usize {
+    let smallest = (0..maps.len()).min_by_key(|&index| maps[index].1).unwrap();
+    let (map, freed) = maps.swap_remove(smallest);
+    unsafe { libc::munmap(map, freed) };
+    freed
+}
+
+fn release(maps: Vec<(*mut libc::c_void, usize)>) {
+    for &(map, len) in &maps {
+        unsafe { libc::munmap(map, len) };
+    }
+}
+
+fn address_space_full_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in (0..20).rev() {
+        File::create(root.path().join(name(index))).unwrap();
+    }
+    let expected = listing_of(20);
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let mut buf = vec![0u8; 4096];
+
+    // With the address space full, a count that is negative as an `int`
+    // still gets Linux's answer on a stream never read, which needs no
+    // snapshot: EINVAL, as entries remain. The first read then fails with
+    // `ENOMEM` and reads nothing.
+    let mut maps = occupy_address_space();
+    let negative = raw_getdents64(fd, buf.as_mut_ptr(), 0x8000_0000);
+    let full = raw_getdents64(fd, buf.as_mut_ptr(), 4096);
+    let freed = free_smallest(&mut maps);
+    let first = raw_getdents64(fd, buf.as_mut_ptr(), 4096);
+    release(maps);
+
+    assert_eq!(negative, Err(libc::EINVAL));
+    assert_eq!(full, Err(libc::ENOMEM));
+    assert!(freed < 64 * 1024, "{freed} bytes freed");
+    let n = first.unwrap();
+    let mut names = record_names(&buf[..n], 19);
+    names.extend(drain_names(fd));
+    assert_eq!(names, expected);
+
+    // Rewound and then seeked past the start, the stream needs a snapshot
+    // again, to know how many entries the directory has even for a negative
+    // count. With none possible, both calls fail with `ENOMEM`, writing and
+    // moving nothing; with a page free, the stream goes on from where it was
+    // seeked to.
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+    assert_eq!(unsafe { libc::lseek(fd, 3, libc::SEEK_SET) }, 3);
+    buf.fill(0xaa);
+    let mut maps = occupy_address_space();
+    let negative = raw_getdents64(fd, buf.as_mut_ptr(), 0x8000_0000);
+    let full = raw_getdents64(fd, buf.as_mut_ptr(), 4096);
+    let position = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    let untouched = buf.iter().all(|&byte| byte == 0xaa);
+    free_smallest(&mut maps);
+    let first = raw_getdents64(fd, buf.as_mut_ptr(), 4096);
+    release(maps);
+
+    assert_eq!(negative, Err(libc::ENOMEM));
+    assert_eq!(full, Err(libc::ENOMEM));
+    assert_eq!(position, 3);
+    assert!(untouched);
+    let n = first.unwrap();
+    let mut names = record_names(&buf[..n], 19);
+    names.extend(drain_names(fd));
+    assert_eq!(names, expected[3..]);
+
+    println!("address space full ok");
+}
+
+/// Detcore reads the whole directory into a mapping it makes in the guest
+/// before returning the first entries. When no mapping can be made, the call
+/// fails with `ENOMEM` (Linux needs no memory here) and leaves the stream
+/// where it was, rather than return entries in the host's order; a later
+/// call with a page free lists the directory in order. So does a count that
+/// is negative as an `int` on a stream that needs a snapshot to answer it.
+#[test]
+fn full_address_space_fails_without_losing_order() {
+    run_five_times(address_space_full_guest);
 }
 
 fn negative_count_untracked_guest() {
