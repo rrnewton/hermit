@@ -75,6 +75,12 @@
  *   periodic_sleep / close_armed_sleep
  *       A fine-interval periodic timer, whether watched later or already
  *       closed, does not stall an unrelated sleep.
+ *   huge_interval / max_interval
+ *       An interval beyond KTIME_MAX reads back clamped to KTIME_MAX, and the
+ *       next expiry after the first one neither wraps nor crashes.
+ *   epoll_pwait_masked_ready
+ *       epoll_pwait with a signal mask returns a ready pipe beside a distant
+ *       timerfd, and an expired timerfd, without blocking.
  */
 
 #define _GNU_SOURCE
@@ -774,6 +780,72 @@ static void check_settime_errors(void) {
     else ok(name);
 }
 
+static void check_huge_interval(const char *name, long interval_sec) {
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value.tv_nsec = 1000;
+    its.it_interval.tv_sec = interval_sec;
+    long set = timerfd_settime(tfd, 0, &its, NULL);
+    sleep_ns(5 * MS);
+    struct itimerspec cur;
+    memset(&cur, 0, sizeof cur);
+    long got = timerfd_gettime(tfd, &cur);
+    uint64_t count = 0;
+    ssize_t r = read(tfd, &count, sizeof count);
+    struct itimerspec after;
+    memset(&after, 0, sizeof after);
+    long got_after = timerfd_gettime(tfd, &after);
+    close(tfd);
+    /* timespec64_to_ktime clamps to KTIME_MAX; the next expiry must not wrap. */
+    if (set != 0 || got != 0 || got_after != 0)
+        fail(name, "settime=%ld gettime=%ld", set, got != 0 ? got : got_after);
+    else if (cur.it_interval.tv_sec != 9223372036L || cur.it_interval.tv_nsec != 854775807L)
+        fail(name, "interval_sec=%ld nsec=%ld", (long)cur.it_interval.tv_sec,
+             (long)cur.it_interval.tv_nsec);
+    else if (r != 8 || count != 1) fail(name, "r=%ld count=%ld", (long)r, (long)count);
+    else if (cur.it_value.tv_sec < 1000000000L || after.it_value.tv_sec < 1000000000L)
+        fail(name, "value_sec=%ld after_sec=%ld", (long)cur.it_value.tv_sec,
+             (long)after.it_value.tv_sec);
+    else ok(name);
+}
+
+static void check_epoll_pwait_masked_ready(void) {
+    const char *name = "epoll_pwait_masked_ready";
+    int p[2];
+    ready_pipe(p);
+    int far = armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0);
+    int ep = epoll_with(far, EPOLLIN, 1);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.u64 = 2;
+    epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev);
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    struct epoll_event out[4];
+    memset(out, 0, sizeof out);
+    int host = epoll_pwait(ep, out, 4, 1000, &mask);
+    long host_data = host > 0 ? (long)out[0].data.u64 : 0;
+    close(ep);
+    close(far);
+    close(p[0]);
+    close(p[1]);
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 1 * MS, 0, 0);
+    ep = epoll_with(tfd, EPOLLIN, 3);
+    sleep_ns(10 * MS);
+    memset(out, 0, sizeof out);
+    int timer = epoll_pwait(ep, out, 4, 1000, &mask);
+    long timer_data = timer > 0 ? (long)out[0].data.u64 : 0;
+    close(ep);
+    close(tfd);
+    /* A signal mask does not stop a wait from returning what is ready at entry. */
+    if (host != 1 || host_data != 2) fail(name, "pipe n=%ld data=%ld", host, host_data);
+    else if (timer != 1 || timer_data != 3) fail(name, "timer n=%ld data=%ld", timer, timer_data);
+    else ok(name);
+}
+
 static void check_fine_periodic_sleep(int close_first) {
     const char *name = close_first ? "close_armed_sleep" : "periodic_sleep";
     int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 1000, 1000, 0);
@@ -828,6 +900,9 @@ int main(void) {
     check_settime_errors();
     check_fine_periodic_sleep(0);
     check_fine_periodic_sleep(1);
+    check_huge_interval("huge_interval", 17000000000L);
+    check_huge_interval("max_interval", 0x7fffffffffffffffL);
+    check_epoll_pwait_masked_ready();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }

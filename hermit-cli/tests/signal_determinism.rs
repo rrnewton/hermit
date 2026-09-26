@@ -314,6 +314,20 @@ fn pending_signal_completes_sigsuspend_and_restores_mask() {
 
 #[test]
 fn sigsuspend_without_signal_reports_terminal_deadlock() {
+    assert_sigsuspend_reports_terminal_deadlock("blocking-sigsuspend-no-signal", "no-signal");
+}
+
+#[test]
+fn sigsuspend_with_armed_periodic_timerfd_reports_terminal_deadlock() {
+    // A virtual timerfd holds no scheduler state, so an armed 1ms periodic timer
+    // must neither keep the run spinning nor change the deadlock verdict.
+    assert_sigsuspend_reports_terminal_deadlock(
+        "blocking-sigsuspend-armed-timerfd",
+        "armed-timerfd",
+    );
+}
+
+fn assert_sigsuspend_reports_terminal_deadlock(scenario: &str, description: &str) {
     let _guard = hermit_signal_lock();
     let mut baseline_stderr = None;
 
@@ -331,10 +345,11 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
             "--base-env=minimal",
             "--",
         ]);
-        command
-            .arg(signal_guest())
-            .arg("blocking-sigsuspend-no-signal");
-        let label = format!("no-signal sigsuspend scenario, iteration {}", iteration + 1);
+        command.arg(signal_guest()).arg(scenario);
+        let label = format!(
+            "{description} sigsuspend scenario, iteration {}",
+            iteration + 1
+        );
         let (output, timed_out, elapsed) = bounded_command_output(command, &label);
         assert!(
             !timed_out,
@@ -371,7 +386,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
             assert_eq!(
                 output.stderr,
                 *first,
-                "no-signal sigsuspend diagnostic changed on iteration {}",
+                "{description} sigsuspend diagnostic changed on iteration {}",
                 iteration + 1
             );
         } else {
