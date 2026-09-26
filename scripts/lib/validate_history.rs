@@ -199,6 +199,13 @@ pub struct CacheKey<'a> {
 /// `ci-hub/validate/qualifying-receipt.json`, which applies the same rule.
 const LEGACY_PAIRLESS_BEFORE: &str = "2026-09-25T20:42:29Z";
 
+/// Every ledger row schema a writer emitted before the pair existed: the
+/// historical validate.sh and cell-results schemas 1 through 7 and the
+/// retained-evidence schema 10 (8 and 9 were never ledger row schemas). It
+/// must equal the parent predicate's `release_builder_pairless_schema_versions`
+/// in `ci-hub/validate/qualifying-receipt.json`.
+const LEGACY_PAIRLESS_SCHEMAS: [i64; 8] = [1, 2, 3, 4, 5, 6, 7, 10];
+
 /// A real `YYYY-MM-DDTHH:MM:SSZ` instant: fixed width, a calendar date that
 /// exists (leap years included), hour below 24, minute and second below 60,
 /// and a year after 0000. Fixed width makes string order time order.
@@ -228,15 +235,20 @@ fn is_utc_timestamp(ts: &str) -> bool {
 
 /// Builder that produced the E2E payload a row executed, read together with
 /// the payload it records. A row carrying neither field is a Cargo run only
-/// when it predates the writer: a Reverie row, or a Hermit row (or one naming
-/// no repo) whose `finished_at` is a real instant before
-/// `LEGACY_PAIRLESS_BEFORE`. A contemporary, undated or malformed pairless row
-/// names no builder. Otherwise both fields must be present, the builder must
+/// when it predates the writer: its `schema_version` is an integer in
+/// `LEGACY_PAIRLESS_SCHEMAS`, and it is a Reverie row or a Hermit row (or one
+/// naming no repo) whose `finished_at` is a real instant before
+/// `LEGACY_PAIRLESS_BEFORE`. A contemporary, undated, unversioned, future-schema
+/// or malformed pairless row names no builder. Otherwise both fields must be present, the builder must
 /// be `cargo` or `buck`, and `e2e_payload` must equal exactly that builder's
 /// `e2e_payload_identity`; anything else names no builder and matches neither.
 fn row_release_builder(row: &serde_json::Value) -> Option<&str> {
     match (row.get("release_builder"), row.get("e2e_payload")) {
         (None, None) => {
+            let schema = row.get("schema_version").and_then(|v| v.as_i64());
+            if !schema.is_some_and(|v| LEGACY_PAIRLESS_SCHEMAS.contains(&v)) {
+                return None;
+            }
             let finished = row.get("finished_at").and_then(|v| v.as_str());
             // A null `repo` is an absent one, as in the parent's typed row.
             let legacy = match row.get("repo").filter(|v| !v.is_null()) {
@@ -664,6 +676,7 @@ pub fn self_test() -> Result<String, String> {
             "selection_mode": "full", "result": "pass", "commit_anchored": true,
             "tree_dirty": false, "failures": 0, "commit": "c0ffee",
             "finished_at": "2026-08-07T00:00:00Z", "real_seconds": 100,
+            "schema_version": 5,
         });
         if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
             for (k, val) in e {
@@ -821,6 +834,57 @@ pub fn self_test() -> Result<String, String> {
         ("naming another repository", pairless(Some(before), Some(serde_json::json!("facebookexperimental/hermit")))),
         ("with a non-string repo", pairless(Some(before), Some(serde_json::json!(7)))),
     ];
+    // The schema bounds the inference too: every row below is an otherwise
+    // legacy positive (dated before the cutoff, or a Reverie row) whose
+    // `schema_version` is missing, mistyped, or never a historical row schema.
+    let with_schema = |row: serde_json::Value, schema: Option<serde_json::Value>| {
+        let mut row = row;
+        match schema {
+            Some(schema) => row["schema_version"] = schema,
+            None => {
+                row.as_object_mut().unwrap().remove("schema_version");
+            }
+        }
+        row
+    };
+    let reverie = pairless(Some(before), Some(serde_json::json!("rrnewton/reverie")));
+    let unhistorical: Vec<(&str, serde_json::Value)> = vec![
+        ("without schema_version", with_schema(pairless(Some(before), None), None)),
+        ("with a null schema_version", with_schema(pairless(Some(before), None), Some(serde_json::Value::Null))),
+        ("with a string schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!("5")))),
+        ("with a float schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!(5.0)))),
+        ("with a boolean schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!(true)))),
+        ("with an array schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!([5])))),
+        ("with an object schema_version", with_schema(pairless(Some(before), None), Some(serde_json::json!({"v": 5})))),
+        ("with schema_version 0", with_schema(pairless(Some(before), None), Some(serde_json::json!(0)))),
+        ("with schema_version -1", with_schema(pairless(Some(before), None), Some(serde_json::json!(-1)))),
+        ("with schema_version 8", with_schema(pairless(Some(before), None), Some(serde_json::json!(8)))),
+        ("with schema_version 9", with_schema(pairless(Some(before), None), Some(serde_json::json!(9)))),
+        ("with future schema_version 11", with_schema(pairless(Some(before), None), Some(serde_json::json!(11)))),
+        ("with future schema_version 999", with_schema(pairless(Some(before), None), Some(serde_json::json!(999)))),
+        ("from Reverie without schema_version", with_schema(reverie.clone(), None)),
+        ("from Reverie with future schema_version 999", with_schema(reverie.clone(), Some(serde_json::json!(999)))),
+    ];
+    for (why, row) in &unhistorical {
+        for k in [&key, &buck_key] {
+            if cache_lookup(std::slice::from_ref(row), "pass", k).is_some() {
+                return Err(format!(
+                    "cache: a pairless row {why} answered a {} request",
+                    k.release_builder
+                ));
+            }
+            refused += 1;
+        }
+    }
+    // Every historical schema is still a Cargo HIT, bracketing the set from
+    // inside as the rows above bracket it from outside.
+    for schema in LEGACY_PAIRLESS_SCHEMAS {
+        let row = with_schema(pairless(Some(before), None), Some(serde_json::json!(schema)));
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_none() {
+            return Err(format!("cache: a pairless schema-{schema} row before the cutoff must be a Cargo HIT"));
+        }
+        accepted += 1;
+    }
     for (why, row) in &contemporary {
         for k in [&key, &buck_key] {
             if cache_lookup(std::slice::from_ref(row), "pass", k).is_some() {
@@ -1119,8 +1183,42 @@ pub fn self_test() -> Result<String, String> {
     if selective_baseline(&pairless_green, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err("selective: a pairless green after the writer must not become the Cargo baseline".into());
     }
+    // The same schema bound governs the baseline: each newer pairless green
+    // below is dated before the cutoff and differs from a legacy baseline only
+    // in its `schema_version`, so only the historical one may be picked.
+    for (label, schema) in [
+        ("missing", None),
+        ("null", Some(serde_json::Value::Null)),
+        ("string", Some(serde_json::json!("5"))),
+        ("float", Some(serde_json::json!(5.0))),
+        ("array", Some(serde_json::json!([5]))),
+        ("schema 8", Some(serde_json::json!(8))),
+        ("future 11", Some(serde_json::json!(11))),
+        ("future 999", Some(serde_json::json!(999))),
+    ] {
+        let mut row = base(serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}));
+        match schema {
+            Some(schema) => row["schema_version"] = schema,
+            None => {
+                row.as_object_mut().unwrap().remove("schema_version");
+            }
+        }
+        let mut rows = ledger_rows.clone();
+        rows.push(row);
+        if selective_baseline(&rows, None, "mine", &exists_all).as_deref() != Some("bbb") {
+            return Err(format!(
+                "selective: a newer pairless green with a {label} schema_version must not become the Cargo baseline"
+            ));
+        }
+        refused += 1;
+    }
+    let mut historical = ledger_rows.clone();
+    historical.push(base(serde_json::json!({"slot": "mine", "commit": "kkk", "producer": "validate.rs", "schema_version": 10})));
+    if selective_baseline(&historical, None, "mine", &exists_all).as_deref() != Some("kkk") {
+        return Err("selective: a newer pairless schema-10 green before the cutoff must remain a Cargo baseline".into());
+    }
     refused += 5;
-    accepted += 3;
+    accepted += 4;
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
          cross-producer counter traps), estimate bracketed thin/median/no-ledger/fail-poison, \
