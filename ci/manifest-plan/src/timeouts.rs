@@ -78,8 +78,8 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// unchanged. `backend-parity-c/timer-family-identity` stays unselected: its
 /// order now matches Linux, but 6 of 36 runs ended in a skid-overshoot
 /// infrastructure error, and its manifest entry records why.
-pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "ec9fdf63a0dbfeecadc25dd6de331bae39221887";
-pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T03:14:54Z";
+pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "9a60fca92a303ff6198b7e7539d6ed5dd3b7452c";
+pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T03:39:42Z";
 pub const TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
@@ -1889,11 +1889,11 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             TIMERFD_2026_09_25_EVIDENCE_SHA,
-            "ec9fdf63a0dbfeecadc25dd6de331bae39221887"
+            "9a60fca92a303ff6198b7e7539d6ed5dd3b7452c"
         );
         assert_eq!(
             TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-26T03:14:54Z"
+            "2026-09-26T03:39:42Z"
         );
         assert_eq!(TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(NON_CI_CELL_COUNT, 173);
