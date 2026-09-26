@@ -1142,21 +1142,14 @@ impl SeriesRow {
                                 .into(),
                         );
                     }
-                    // Declared, the declared ending is the one that passes; the
-                    // scorecard reader refuses it as a failed match too.
-                    if let Some(declared) = &self.series.declared_guest_exit {
-                        let expected = ExpectedGuestExit {
-                            code: declared.code,
-                            signal: declared.signal,
-                            reason: declared.reason.clone(),
-                        };
-                        if expected.hermit_status_matches(disposition.status, disposition.signal) {
-                            return Err(
-                                "failed_match evidence must not end as its declared guest exit"
-                                    .into(),
-                            );
-                        }
-                    }
+                    // Declared, Hermit's status alone does not decide a pass:
+                    // the runner also requires the report's guest disposition
+                    // to equal the declaration (ExpectedGuestExit::check). A
+                    // status that matches can still be a runner FAIL, for
+                    // example declared signal 11 with status 139 but a report
+                    // that says the guest exited with code 139. The row does
+                    // not carry the report's disposition, so this writer
+                    // cannot tell the two apart and retains the red.
                 }
                 SeriesNoVerdictKind::InfrastructureError => {
                     if disposition.attempt_outcome != "ERROR"
@@ -2080,8 +2073,11 @@ mod tests {
             assert!(error.contains(expected), "{label}: {error}");
         }
 
-        // Declared, a failed match must not end as the declaration: that
-        // ending is the one the runner passes, and the reader refuses it.
+        // Declared, a failed match is retained whatever its Hermit status:
+        // the runner also fails a declared cell whose report disposition
+        // differs from the declaration, and the row does not record that
+        // disposition. A status equal to the declaration is therefore not
+        // proof of a pass, and refusing it would drop real red evidence.
         let declared_failed_match = |code: Option<i32>, signal: Option<i32>, status, observed| {
             let mut row = failed_match();
             let mut declaration = declared_exit_row(code, signal, status, observed)
@@ -2115,11 +2111,7 @@ mod tests {
                 "declared signal 11, exit 3",
                 declared_failed_match(None, Some(11), Some(3), None),
             ),
-        ] {
-            row.validate_for_write()
-                .unwrap_or_else(|error| panic!("{label}: {error}"));
-        }
-        for (label, row) in [
+            // Status matches the declaration; the report may still disagree.
             (
                 "declared 7, exit 7",
                 declared_failed_match(Some(7), None, Some(7), None),
@@ -2133,13 +2125,10 @@ mod tests {
                 declared_failed_match(None, Some(11), Some(139), None),
             ),
         ] {
-            let error = row
-                .validate_for_write()
-                .expect_err(&format!("{label}: admitted"));
-            assert!(
-                error.contains("must not end as its declared guest exit"),
-                "{label}: {error}"
-            );
+            row.validate_for_write()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            row.validate_for_read()
+                .unwrap_or_else(|error| panic!("{label}: read: {error}"));
         }
     }
 
