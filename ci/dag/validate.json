@@ -727,6 +727,42 @@
     },
     {
       "group": "build",
+      "job": "recorded_clocks",
+      "desc": "Prepare focused ptrace recorder and version-gate tests",
+      "description": "Prepare the recorder-clock-focused selection: only the default-feature record_replay and flock_exclusion harnesses, their Cargo runtime files, the existing CPU wrapper, and all 43 source-bound record_replay workloads. The flock fixture keeps its existing runtime cc compilation of tests/c/flock_exclusion.c inside the unchanged per-test bounds; it is not one of those prepared aliases. This producer executes no Hermit guest. It precedes build.workspace so full/portable preparation replaces the focused metadata before any broad consumer runs; the focused test also depends directly on this producer so an explicit producer-plus-test selection needs no unrelated backend build. The scheduling preference is four CPU slots, with a 4-GiB memory baseline, an 8-GiB hard memory cap, 1200 seconds wall and 4800 seconds CPU. The existing preparation helper supplies eight Cargo jobs, so the scheduling preference is not a compiler-job cap; the actual admitted CPU cgroup bounds execution. These are provisional cold-build bounds, not measured costs.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare recorder-clock-focused",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.nextest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 4800,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 120.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.recorded_clocks"
+    },
+    {
+      "group": "build",
       "job": "workspace",
       "desc": "Prepare DBT native resources, then build all debug workspace targets",
       "description": "CLEAN-TARGET PREPARATION 2026-08-28: hermit-install reads the DynamoRIO installation produced by reverie-dbt, but Cargo may run their unrelated build scripts concurrently inside the combined workspace build. A clean hosted target therefore reached hermit-install before drrun existed while warm local targets passed. The first detcore-dbt build establishes that resource through the same pinned budget wrapper; the following combined build still owns the complete debug workspace graph, including test targets and the flaky harness. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
@@ -737,6 +773,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare full",
       "result_manifests": [],
       "deps": [
+        "build.recorded_clocks",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -7845,7 +7882,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "723",
+        "NEXTEST_EXPECTED_EXECUTED": "730",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -7894,7 +7931,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "748",
+        "NEXTEST_EXPECTED_EXECUTED": "751",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -8109,6 +8146,61 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "test.hermit_integration"
+    },
+    {
+      "group": "test",
+      "job": "recorded_clocks",
+      "desc": "Ptrace captured clocks and recording-version refusals",
+      "description": "Six exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, current/pre-flock version admission, exec continuity, and thread clock ordering. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The aggregate 180-second CPU bound covers six 22-second attempts plus 48 seconds of provisional cleanup and orchestration headroom; failed historical attempts reached 24.011 CPU seconds during teardown. The 420-second wall bound covers six 57-second attempts, six 2-second grace periods, six 5-second hard-reap allowances, and 36 seconds of provisional orchestration headroom. These aggregate bounds and the unchanged 1-GiB scheduling baseline/2-GiB hard memory cap remain provisional, not measured six-case peaks. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions.",
+      "labels": [
+        "full",
+        "portable",
+        "recorder-clock-focused"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E '\\''test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate) | test(=record_c_clock_exec_continuity) | test(=record_rs_clock_total_order)'\\'''",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.recorded_clocks"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay",
+        "flock_exclusion"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.recorded_clocks_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--test\",\"record_replay\",\"--test\",\"flock_exclusion\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 420,
+      "cpu_timeout": 180,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.recorded_clocks"
     },
     {
       "group": "test",
@@ -61881,6 +61973,41 @@
     },
     {
       "group": "build",
+      "job": "recorded_clocks_on_host",
+      "desc": "Prepare focused ptrace recorder and version-gate tests",
+      "description": "Prepare the recorder-clock-focused selection: only the default-feature record_replay and flock_exclusion harnesses, their Cargo runtime files, the existing CPU wrapper, and all 43 source-bound record_replay workloads. The flock fixture keeps its existing runtime cc compilation of tests/c/flock_exclusion.c inside the unchanged per-test bounds; it is not one of those prepared aliases. This producer executes no Hermit guest. It precedes build.workspace so full/portable preparation replaces the focused metadata before any broad consumer runs; the focused test also depends directly on this producer so an explicit producer-plus-test selection needs no unrelated backend build. The scheduling preference is four CPU slots, with a 4-GiB memory baseline, an 8-GiB hard memory cap, 1200 seconds wall and 4800 seconds CPU. The existing preparation helper supplies eight Cargo jobs, so the scheduling preference is not a compiler-job cap; the actual admitted CPU cgroup bounds execution. These are provisional cold-build bounds, not measured costs.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare recorder-clock-focused",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.nextest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 4800,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 120.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.recorded_clocks_on_host"
+    },
+    {
+      "group": "build",
       "job": "workspace_on_host",
       "desc": "Prepare DBT native resources, then build all debug workspace targets",
       "description": "CLEAN-TARGET PREPARATION 2026-08-28: hermit-install reads the DynamoRIO installation produced by reverie-dbt, but Cargo may run their unrelated build scripts concurrently inside the combined workspace build. A clean hosted target therefore reached hermit-install before drrun existed while warm local targets passed. The first detcore-dbt build establishes that resource through the same pinned budget wrapper; the following combined build still owns the complete debug workspace graph, including test targets and the flaky harness. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
@@ -61890,6 +62017,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare hosted-portable",
       "result_manifests": [],
       "deps": [
+        "build.recorded_clocks_on_host",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.nextest"
@@ -62196,7 +62324,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "723",
+        "NEXTEST_EXPECTED_EXECUTED": "730",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -62242,7 +62370,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "748",
+        "NEXTEST_EXPECTED_EXECUTED": "751",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -62448,6 +62576,57 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "test.hermit_integration_on_host"
+    },
+    {
+      "group": "test",
+      "job": "recorded_clocks_on_host",
+      "desc": "Ptrace captured clocks and recording-version refusals",
+      "description": "Six exact maintained cases cover canonical captured-clock output/errno replay, uncaptured clock refusal, old clock-format refusal before guest launch, current/pre-flock version admission, exec continuity, and thread clock ordering. The recorder-clock-focused label permits source-bound preparation of only the two default-feature harnesses; the focused producer prepares all 43 declared record_replay workloads and binds their source and executable identities. The flock fixture still invokes cc during its test and requires a compiler in the selected execution environment. Serial nextest execution preserves the existing per-test 22-second CPU and 57-second wall limits with zero retries. The aggregate 180-second CPU bound covers six 22-second attempts plus 48 seconds of provisional cleanup and orchestration headroom; failed historical attempts reached 24.011 CPU seconds during teardown. The 420-second wall bound covers six 57-second attempts, six 2-second grace periods, six 5-second hard-reap allowances, and 36 seconds of provisional orchestration headroom. These aggregate bounds and the unchanged 1-GiB scheduling baseline/2-GiB hard memory cap remain provisional, not measured six-case peaks. Record/replay clock evidence uses INFO and the unchanged canonical comparator; the version/refusal controls keep their existing logging and assertions.",
+      "labels": [
+        "hosted-portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --test record_replay --test flock_exclusion -j 1 -E 'test(=recorded_clocks_preserve_values_and_errno_event_order) | test(=uncaptured_clock_calls_remain_refused) | test(=replay_refuses_previous_clock_format_before_starting_guest) | test(=pre_flock_recordings_are_refused_by_the_version_gate) | test(=record_c_clock_exec_continuity) | test(=record_rs_clock_total_order)'",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.recorded_clocks_on_host"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay",
+        "flock_exclusion"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.recorded_clocks_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--test\",\"record_replay\",\"--test\",\"flock_exclusion\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 420,
+      "cpu_timeout": 180,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.recorded_clocks_on_host"
     },
     {
       "group": "test",
@@ -69448,6 +69627,44 @@
     },
     {
       "group": "build",
+      "job": "recorded_clocks_in_pinned_root",
+      "desc": "Prepare focused ptrace recorder and version-gate tests",
+      "description": "Prepare the recorder-clock-focused selection: only the default-feature record_replay and flock_exclusion harnesses, their Cargo runtime files, the existing CPU wrapper, and all 43 source-bound record_replay workloads. The flock fixture keeps its existing runtime cc compilation of tests/c/flock_exclusion.c inside the unchanged per-test bounds; it is not one of those prepared aliases. This producer executes no Hermit guest. It precedes build.workspace so full/portable preparation replaces the focused metadata before any broad consumer runs; the focused test also depends directly on this producer so an explicit producer-plus-test selection needs no unrelated backend build. The scheduling preference is four CPU slots, with a 4-GiB memory baseline, an 8-GiB hard memory cap, 1200 seconds wall and 4800 seconds CPU. The existing preparation helper supplies eight Cargo jobs, so the scheduling preference is not a compiler-job cap; the actual admitted CPU cgroup bounds execution. These are provisional cold-build bounds, not measured costs.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/nextest-binaries.rs prepare recorder-clock-focused'",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 4800,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 120.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 4,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.recorded_clocks_in_pinned_root"
+    },
+    {
+      "group": "build",
       "job": "workspace_in_pinned_root",
       "desc": "Prepare DBT native resources, then build all debug workspace targets",
       "description": "CLEAN-TARGET PREPARATION 2026-08-28: hermit-install reads the DynamoRIO installation produced by reverie-dbt, but Cargo may run their unrelated build scripts concurrently inside the combined workspace build. A clean hosted target therefore reached hermit-install before drrun existed while warm local targets passed. The first detcore-dbt build establishes that resource through the same pinned budget wrapper; the following combined build still owns the complete debug workspace graph, including test targets and the flaky harness. The explicit bin build completes target/debug/hermit for the later verified E2E artifact publisher. preferred_inner_jobs=32 is measured on a cold empty target at hermit@846baeca: 130.35s, cgroup-recorded peak=11663998976 bytes. The generous 64GiB cap deliberately prioritizes throughput over cap tightness. Release artifacts remain a separate profile because Cargo cannot emit dev and release profiles in one invocation; the privileged lane is a separate DAG and is unchanged.",
@@ -69458,6 +69675,7 @@
       "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare full'",
       "result_manifests": [],
       "deps": [
+        "build.recorded_clocks_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"

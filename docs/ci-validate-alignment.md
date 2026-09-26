@@ -77,6 +77,42 @@ configuration is never read.
 
 ## DAG wiring
 
+The focused `test.recorded_clocks` node runs six maintained ptrace cases:
+captured clock output/errno replay, uncaptured clock refusal, previous-clock
+format refusal, the existing pre-flock format refusal, exec continuity, and
+thread clock ordering. Its hosted twin is
+assigned to the portable workflow's integration shard; both require exactly
+six executed tests. The `recorder-clock-focused` label prepares only the two
+default-feature harnesses and the 43 source-bound `record_replay` workloads.
+The flock fixture retains its existing runtime `cc` compilation inside the
+unchanged per-test bounds; it is not part of that prepared workload population.
+`build.recorded_clocks` runs before `build.workspace`, so full preparation is
+the last metadata publisher in broad profiles. An explicit focused selection
+must include the focused producer and test, in the same filesystem root;
+selecting only the test does not supply its prepared artifacts. The new
+producer adds a provisional 1200-second cold-build bound to the hosted debug
+job's existing 1800-second critical path. The selected path is now
+`setup.nextest` (600 seconds), focused preparation (1200 seconds), then
+`build.workspace` (1200 seconds). Its 55-minute outer budget covers those 3000
+seconds plus 300 seconds of setup and artifact overhead. The CI audit derives
+this path from the actual selected DAG nodes and compares it with the workflow
+bound; these are declared budgets, not a measured cold-build duration. The
+six tests retain their existing 22-second CPU and 57-second wall limits and
+zero retries. The original exec/thread cases now use the same strict INFO
+comparator as the captured-output replay case, retaining their existing guests
+and success assertions while also requiring canonical parity and nonempty logs.
+
+The serial consumer has a provisional 180-second CPU / 420-second wall bound.
+Six test CPU allowances total 132 seconds; the remaining 48 seconds account for
+cleanup and orchestration outside those allowances. Earlier failed attempts
+reached 24.011 CPU seconds during teardown, so 132 seconds alone would not bound
+the node. The wall allocation is six times (57 seconds plus 2 seconds of grace
+plus 5 seconds for hard reaping), plus 36 seconds for orchestration. These are
+finite aggregate budgets, not a measured six-test maximum or an increase to any
+test's allowance. The unchanged memory bounds are a 1-GiB scheduling baseline
+and 2-GiB hard cap. The separate manifest gate retains its 600-second CPU and
+900-second wall limits.
+
 `ci/dag/validate.json` is the single committed validation graph. Its `portable`
 label selects one metadata node and one resource-serialized E2E node per
 category, plus their dependency closure. Its `privileged` label selects:

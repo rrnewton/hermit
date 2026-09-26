@@ -1208,6 +1208,96 @@ fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
 }
 
 #[test]
+fn recorded_clocks_preserve_values_and_errno_event_order() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "captured clocks with errors followed by valid reads",
+        &workload("c_record_replay_clocks").path,
+        &[],
+    );
+}
+
+#[test]
+fn uncaptured_clock_calls_remain_refused() {
+    let _guard = hermit_record_lock();
+    let guest = workload("c_record_replay_clocks");
+    for (record, mode, syscall) in [
+        (false, "clock", "clock_gettime"),
+        (false, "timeofday", "gettimeofday"),
+        (false, "time", "time"),
+        (true, "resolution", "clock_getres"),
+    ] {
+        let data = tempfile::tempdir().expect("create clock refusal recording directory");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "30s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"));
+        if record {
+            command
+                .args(["record", "start", "--data-dir"])
+                .arg(data.path());
+        } else {
+            command.args(["run", "--no-virtualize-time", "--no-virtualize-metadata"]);
+        }
+        let output = command
+            .arg("--")
+            .arg(&guest.path)
+            .arg(mode)
+            .output()
+            .expect("run uncaptured clock control");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "uncaptured {syscall} was accepted"
+        );
+        assert_ne!(output.status.code(), Some(124), "uncaptured {syscall} hung");
+        assert!(
+            stderr.contains(&format!("unsupported syscall: {syscall}")),
+            "uncaptured {syscall} did not name the refused operation: {stderr}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("uncaptured-clock-completed"));
+    }
+}
+
+#[test]
+fn replay_refuses_previous_clock_format_before_starting_guest() {
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create recording directory");
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "--data-dir"])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_clocks").path)
+        .arg("clock");
+    command_output(record, "current-format clock recording");
+    let id = fs::read_to_string(data.path().join("last")).expect("recording published ID");
+    let metadata_path = data.path().join(id.trim()).join("metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata["version"], 0x117);
+    metadata["version"] = serde_json::json!(0x116);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["replay", "--autopilot", "--data-dir"])
+        .arg(data.path())
+        .output()
+        .expect("run old-format admission control");
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "old-format replay started the guest"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Version mismatch"), "{stderr}");
+    assert!(
+        stderr.contains("recording version RecordVersion(278)")
+            && stderr.contains("replayer version RecordVersion(279)"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn recording_rejects_an_unsupported_syscall_by_name() {
     let _guard = hermit_record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
@@ -2129,6 +2219,20 @@ fn record_timer_slack_proc_read_write() {
     );
 }
 
+#[test]
+fn record_c_clock_exec_continuity() {
+    let _guard = hermit_record_lock();
+    let guest = workload("c_clock_exec_continuity");
+    canonical_record_replay_command(guest.name, &guest.path, &[]);
+}
+
+#[test]
+fn record_rs_clock_total_order() {
+    let _guard = hermit_record_lock();
+    let guest = workload("rustbin_clock_total_order");
+    canonical_record_replay_command(guest.name, &guest.path, &[]);
+}
+
 macro_rules! record_replay_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(
@@ -2146,8 +2250,6 @@ record_replay_tests! {
     record_c_fd_reuse_after_close => "c_record_replay_fd_close",
     record_c_execveat_paths => "c_record_replay_execveat_paths",
     record_c_sigpipe_siginfo => "c_sigpipe_siginfo",
-    record_c_clock_exec_continuity => "c_clock_exec_continuity",
-    record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",
     record_rs_futex_timeout => "rustbin_futex_timeout",

@@ -1628,6 +1628,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_clocks.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "Owned by the record/replay integration suite: captures clock values and errno, partial outputs at protected-page boundaries, write-only destinations, and overlapping gettimeofday outputs; nearby uncaptured operations must remain refused."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_deep_fork_chain.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_deep_fork_chain.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and asserts recording-stream behavior across a deep fork chain, including lifecycle setup not represented by a generic manifest row."

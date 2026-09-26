@@ -44,6 +44,14 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_parallelism"])
         }
+        "test.recorded_clocks" => Some(&[
+            "-p",
+            "hermit",
+            "--test",
+            "record_replay",
+            "--test",
+            "flock_exclusion",
+        ]),
         "test.hermit_integration" => Some(&[
             "-p",
             "hermit",
@@ -649,6 +657,183 @@ mod tests {
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }
+        // The focused preparation remains an ordinary committed producer.
+        // Full preparation must publish last because both use current.json.
+        let focused =
+            crate::nextest_binaries::config_selections(&graph, "recorder-clock-focused").unwrap();
+        let clock_args = for_step("test.recorded_clocks")
+            .unwrap()
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(focused.len(), 1);
+        assert_eq!(focused.values().next(), Some(&clock_args));
+        assert!(!clock_args.iter().any(|arg| arg == "--features"));
+        for suffix in ["", "_in_pinned_root", "_on_host"] {
+            let producer_tag = format!("build.recorded_clocks{suffix}");
+            let producer = graph
+                .steps
+                .iter()
+                .find(|step| step.tag() == producer_tag)
+                .unwrap();
+            for width in [1, 4] {
+                let rendered = dagrun::model::command_with_inner_jobs(
+                    producer,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(rendered, producer.cmd, "{producer_tag}, width {width}");
+                assert_eq!(
+                    dagrun::model::env_with_inner_jobs(
+                        producer,
+                        &graph.default_jobs_env,
+                        Some(width),
+                    ),
+                    Some(("CARGO_BUILD_JOBS".into(), width.to_string())),
+                );
+                let mut rendered_producer = producer.clone();
+                rendered_producer.cmd = rendered;
+                assert_eq!(
+                    command_arguments(
+                        &execution_command(&rendered_producer).unwrap(),
+                        "./ci/nextest-binaries.rs ",
+                    )
+                    .unwrap(),
+                    ["prepare", "recorder-clock-focused"],
+                );
+
+                // RUN1900 appended the inherited -j flag to the strict
+                // prepare PROFILE interface. Keep that regression observable
+                // and refused for both host and pinned-root commands.
+                let mut inherited = graph.clone();
+                let changed = inherited
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == producer_tag)
+                    .unwrap();
+                changed.jobs_flag = None;
+                changed.cmd = dagrun::model::command_with_inner_jobs(
+                    changed,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(changed.cmd, format!("{} -j {width}", producer.cmd));
+                let error = assert_preparation_dependencies(&inherited).unwrap_err();
+                let reason = if suffix == "_in_pinned_root" {
+                    "has an unrecognized pinned-root command"
+                } else {
+                    "has an ambiguous prepared profile"
+                };
+                assert_eq!(error, format!("{producer_tag} {reason}"));
+            }
+            let workspace = graph
+                .steps
+                .iter()
+                .find(|step| step.tag() == format!("build.workspace{suffix}"))
+                .unwrap();
+            assert!(
+                workspace
+                    .deps
+                    .contains(&format!("build.recorded_clocks{suffix}"))
+            );
+        }
+        for (consumer, producer) in [
+            (
+                "test.recorded_clocks",
+                "build.recorded_clocks_in_pinned_root",
+            ),
+            (
+                "test.recorded_clocks_on_host",
+                "build.recorded_clocks_on_host",
+            ),
+        ] {
+            let step = graph
+                .steps
+                .iter()
+                .find(|step| step.tag() == consumer)
+                .unwrap();
+            assert_command_selection(step).unwrap();
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6");
+            assert!(step.deps.iter().any(|dependency| dependency == producer));
+            let args: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
+            assert_eq!(args, clock_args);
+            assert!(!dagrun::model::step_width_is_resizable(
+                step,
+                &graph.default_jobs_flag,
+                &graph.default_jobs_env,
+            ));
+            for width in [1, 4] {
+                let mut rendered = step.clone();
+                rendered.cmd = dagrun::model::command_with_inner_jobs(
+                    step,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(rendered.cmd, step.cmd, "{consumer}, width {width}");
+                assert_eq!(
+                    dagrun::model::env_with_inner_jobs(step, &graph.default_jobs_env, Some(width)),
+                    None,
+                );
+                let arguments = command_arguments(
+                    &execution_command(&rendered).unwrap(),
+                    "./ci/run-nextest-counted.sh ",
+                )
+                .unwrap();
+                let parsed = crate::nextest_binaries::split_arguments(&arguments).unwrap();
+                assert_eq!(parsed.build, clock_args);
+                let jobs = parsed
+                    .runtime
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-j")
+                    .map(|pair| pair[1].as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(jobs, ["1"], "{consumer} must remain serial");
+
+                // The command already supplies -j 1. Restoring inheritance
+                // adds a second flag, which Nextest refuses even at width 1.
+                rendered.jobs_flag = None;
+                rendered.cmd = dagrun::model::command_with_inner_jobs(
+                    &rendered,
+                    &graph.default_jobs_flag,
+                    Some(width),
+                );
+                assert_eq!(rendered.cmd, format!("{} -j {width}", step.cmd));
+                if consumer == "test.recorded_clocks" {
+                    assert_eq!(
+                        execution_command(&rendered).unwrap_err(),
+                        format!("{consumer} has an unrecognized pinned-root command"),
+                    );
+                } else {
+                    let arguments = command_arguments(
+                        &execution_command(&rendered).unwrap(),
+                        "./ci/run-nextest-counted.sh ",
+                    )
+                    .unwrap();
+                    let mutated = crate::nextest_binaries::split_arguments(&arguments).unwrap();
+                    assert_eq!(mutated.build, parsed.build);
+                    let mut duplicate = parsed.runtime;
+                    duplicate.extend(["-j".into(), width.to_string()]);
+                    assert_eq!(mutated.runtime, duplicate);
+                }
+            }
+        }
+        // A consumer with only the focused producer must be covered. Removing
+        // that edge refuses even while broad producers exist elsewhere.
+        // Keep the committed graph here: preparation resolves its label there,
+        // independently of the execution-time --only subgraph.
+        let mut focused_only = graph.clone();
+        focused_only
+            .steps
+            .sort_by_key(|step| step.tag() != "test.recorded_clocks_on_host");
+        focused_only.steps[0].deps = vec!["build.recorded_clocks_on_host".into()];
+        assert_preparation_dependencies(&focused_only).unwrap();
+        focused_only.steps[0].deps.clear();
+        let error = assert_preparation_dependencies(&focused_only).unwrap_err();
+        assert!(
+            error.starts_with("test.recorded_clocks_on_host")
+                && error.contains("same filesystem root"),
+            "{error}"
+        );
         for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
             let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
             let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();

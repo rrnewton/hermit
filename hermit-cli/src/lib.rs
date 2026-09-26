@@ -18,6 +18,7 @@ mod consts;
 mod desync;
 pub mod logdiff_report;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
+mod clock_output;
 pub mod e9patch;
 mod error;
 mod event;
