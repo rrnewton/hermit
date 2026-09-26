@@ -451,17 +451,16 @@ impl StartOpts {
             let resources = format!("recording {} and identity mounts", data.path().display());
             let options = self.clone();
             let global = global.clone();
-            let site = if record_timeout.is_some() {
-                "record.main.deadline"
-            } else {
-                "record.main"
-            };
             let (exit_status, (data, _identity)) = super::owned_container::run(
                 &mut container,
                 (data, identity_guard),
                 resources,
                 true,
-                site,
+                if record_timeout.is_some() {
+                    "record.main.deadline"
+                } else {
+                    "record.main"
+                },
                 None,
                 move |(data, identity)| {
                     let _guard = global.init_tracing();
