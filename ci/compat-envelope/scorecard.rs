@@ -3148,6 +3148,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let root = repo_root()?;
+    let _ledger_identity_scope = CommandLedgerIdentityScope::enter();
     if matches!(
         command.as_str(),
         "observe-results"
@@ -4506,6 +4507,67 @@ fn load_catalogue(root: &Path) -> Result<Option<TrackedCells>, String> {
     decode_catalogue(&bytes).map(Some)
 }
 
+/// Each command invocation verifies a ledger checkout's Git identity once.
+/// Nothing in this tool changes a ledger's top level or `remote.origin.url`
+/// after creating it. The key is the canonical path plus the device and inode
+/// of the ledger directory itself, read before and after the Git probes and
+/// recorded only when both reads agree. This caches a checkout that nothing
+/// else is changing; it is not a guard against concurrent change. A later
+/// lookup after that directory was replaced by one with a different inode is
+/// verified again, but the probes run by pathname, so a replacement racing
+/// with them, a reused inode, or a change inside the checkout (its `.git` or
+/// configuration) made by another process during the command is not
+/// detected. An uncached lookup has the same exposure between its probes and
+/// the caller's use of the returned path. Calls outside a scope, including the
+/// unit tests that change an identity in place, verify on every lookup.
+type VerifiedLedgerKey = (PathBuf, u64, u64);
+
+thread_local! {
+    static COMMAND_VERIFIED_LEDGERS: std::cell::RefCell<Option<BTreeSet<VerifiedLedgerKey>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct CommandLedgerIdentityScope;
+
+impl CommandLedgerIdentityScope {
+    fn enter() -> Self {
+        COMMAND_VERIFIED_LEDGERS.with(|verified| {
+            let mut verified = verified.borrow_mut();
+            assert!(verified.is_none(), "ledger identity scopes do not nest");
+            *verified = Some(BTreeSet::new());
+        });
+        Self
+    }
+}
+
+impl Drop for CommandLedgerIdentityScope {
+    fn drop(&mut self) {
+        COMMAND_VERIFIED_LEDGERS.with(|verified| *verified.borrow_mut() = None);
+    }
+}
+
+fn verified_ledger_key(ledger: &Path) -> Option<VerifiedLedgerKey> {
+    let metadata = fs::metadata(ledger).ok()?;
+    Some((ledger.to_path_buf(), metadata.dev(), metadata.ino()))
+}
+
+fn ledger_identity_verified_in_command(key: &VerifiedLedgerKey) -> bool {
+    COMMAND_VERIFIED_LEDGERS.with(|verified| {
+        verified
+            .borrow()
+            .as_ref()
+            .is_some_and(|verified| verified.contains(key))
+    })
+}
+
+fn record_ledger_identity_verified_in_command(key: VerifiedLedgerKey) {
+    COMMAND_VERIFIED_LEDGERS.with(|verified| {
+        if let Some(verified) = verified.borrow_mut().as_mut() {
+            verified.insert(key);
+        }
+    });
+}
+
 fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
     let explicit = env::var_os("DEV_HERMIT_TEST_LEDGER_ROOT");
     if writing && explicit.is_none() {
@@ -4525,6 +4587,13 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
         .ok_or("history unavailable: the existing hermit_test_ledger checkout was not found")?;
     let ledger = fs::canonicalize(&candidate)
         .map_err(|error| format!("history unavailable at {}: {error}", candidate.display()))?;
+    let verified_key = verified_ledger_key(&ledger);
+    if verified_key
+        .as_ref()
+        .is_some_and(ledger_identity_verified_in_command)
+    {
+        return Ok(ledger);
+    }
     let git = |args: &[&str]| -> Result<String, String> {
         let output = Command::new("git")
             .args(args)
@@ -4546,6 +4615,11 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
         || git(&["config", "--get", "remote.origin.url"])? != TEST_LEDGER_REPOSITORY
     {
         return Err("history repository is not the expected hermit_test_ledger checkout".into());
+    }
+    if let Some(key) = verified_key {
+        if verified_ledger_key(&ledger).as_ref() == Some(&key) {
+            record_ledger_identity_verified_in_command(key);
+        }
     }
     Ok(ledger)
 }
@@ -27554,5 +27628,58 @@ mod evidence_identity_tests {
             "{error}"
         );
         assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod command_ledger_identity_scope_tests {
+    use super::*;
+
+    fn verified(ledger: &Path) -> bool {
+        verified_ledger_key(ledger).is_some_and(|key| ledger_identity_verified_in_command(&key))
+    }
+
+    fn record(ledger: &Path) {
+        record_ledger_identity_verified_in_command(verified_ledger_key(ledger).unwrap());
+    }
+
+    #[test]
+    fn verification_is_retained_only_inside_one_command_scope() {
+        let parent = tempfile::tempdir().unwrap();
+        let ledger = parent.path().join("ledger-a");
+        let other = parent.path().join("ledger-b");
+        fs::create_dir(&ledger).unwrap();
+        fs::create_dir(&other).unwrap();
+        record(&ledger);
+        assert!(!verified(&ledger));
+        {
+            let _scope = CommandLedgerIdentityScope::enter();
+            assert!(!verified(&ledger));
+            record(&ledger);
+            assert!(verified(&ledger));
+            assert!(!verified(&other));
+        }
+        assert!(!verified(&ledger));
+        let _scope = CommandLedgerIdentityScope::enter();
+        assert!(!verified(&ledger));
+    }
+
+    #[test]
+    fn a_replacement_ledger_directory_with_a_new_inode_misses_the_cache() {
+        let parent = tempfile::tempdir().unwrap();
+        let ledger = parent.path().join("ledger");
+        fs::create_dir(&ledger).unwrap();
+        let _scope = CommandLedgerIdentityScope::enter();
+        record(&ledger);
+        assert!(verified(&ledger));
+        // Holding the original keeps its inode live, so the replacement's differs.
+        let held = parent.path().join("held");
+        fs::rename(&ledger, &held).unwrap();
+        assert!(!verified(&ledger));
+        fs::create_dir(&ledger).unwrap();
+        assert!(!verified(&ledger));
+        fs::remove_dir(&ledger).unwrap();
+        fs::rename(&held, &ledger).unwrap();
+        assert!(verified(&ledger));
     }
 }
