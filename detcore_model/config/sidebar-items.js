@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CONFIG_FINGERPRINT_ENV"],"enum":["BlockingMode","RunsPostFork","SchedHeuristic"],"fn":["config_wire_fingerprint","epoch_from_host_time"],"static":["DEFAULT_EPOCH_STR"],"struct":["Config","MountInfoRootRewrite"],"type":["MaybePreemptionTimeout","MaybeTimeslice"]};
