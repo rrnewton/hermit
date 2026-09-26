@@ -2095,6 +2095,12 @@
       "why": "tests/c/timer_family_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: The centralized manifest declares its build, backend selection, timeout, and strict verification observation contract."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/timerfd_semantics.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/timerfd_semantics.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: The centralized manifest declares its build, backend selection, timeout, and strict verification observation contract."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/timerslack_proc_record_replay.c",
       "runner": "hermit-cli/tests/record_replay.rs",
