@@ -6580,10 +6580,13 @@ test:
         guest_args:
           ptrace:
             - --require-small-determinized
+            - --require-large-determinized
           kvm:
             - --require-small-determinized
+            - --require-large-determinized
           liteinst:
             - --require-small-determinized
+            - --require-large-determinized
         backends_disabled:
           dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
