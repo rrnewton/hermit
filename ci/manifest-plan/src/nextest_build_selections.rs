@@ -603,7 +603,7 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "193");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "194");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "reopened_pipe_progress"])
