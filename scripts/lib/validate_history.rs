@@ -558,12 +558,17 @@ fn emit(mut v: Vec<f64>, scope: &str) -> String {
 /// Port of `history_estimate` (validate.sh:936).
 ///
 /// Only successful runs of the SAME profile count — a fast-failing or timed-out
-/// run is not a representative completion time. Buckets degrade from
+/// run is not a representative completion time. They must also have run under
+/// the SAME release builder, read with `row_release_builder`: a Buck run does
+/// not time a Cargo run or the reverse, and a row naming no builder -- a
+/// contemporary, future-schema or malformed pairless row, or a mismatched
+/// payload -- times neither. Buckets degrade from
 /// (cache, host) to (cache, any host) to (any cache, any host) and, when even
 /// the broadest is too thin, SAY SO rather than fabricating a number.
 pub fn history_estimate(
     rows: &[serde_json::Value],
     profile: &str,
+    release_builder: &str,
     cache_state: &str,
     host: &str,
     have_ledger: bool,
@@ -573,7 +578,10 @@ pub fn history_estimate(
     }
     let (mut t1, mut t2, mut t3) = (Vec::new(), Vec::new(), Vec::new());
     for row in rows {
-        if s(row, "profile") != profile || s(row, "result") != "pass" {
+        if s(row, "profile") != profile
+            || s(row, "result") != "pass"
+            || row_release_builder(row) != Some(release_builder)
+        {
             continue;
         }
         let w = f(row, "real_seconds");
@@ -602,8 +610,9 @@ pub fn history_estimate(
         )
     } else {
         format!(
-            "insufficient history to estimate (only {} prior successful {profile} run(s); need \
-             >={MIN_SAMPLES}). Current cache: {cache_state}. This run seeds the estimate.",
+            "insufficient history to estimate (only {} prior successful {release_builder} {profile} \
+             run(s); need >={MIN_SAMPLES}). Current cache: {cache_state}. This run seeds the \
+             estimate.",
             t3.len()
         )
     }
@@ -1088,16 +1097,16 @@ pub fn self_test() -> Result<String, String> {
     // it must produce a median. A silently-fabricated number is the failure mode.
     let sample = |secs: i64| base(serde_json::json!({"cache_state": "warm", "real_seconds": secs, "producer": "validate.rs"}));
     let thin: Vec<serde_json::Value> = (0..MIN_SAMPLES - 1).map(|i| sample(100 + i as i64)).collect();
-    let est = history_estimate(&thin, "full", "warm", "h1", true);
+    let est = history_estimate(&thin, "full", "cargo", "warm", "h1", true);
     if !est.contains("insufficient history") {
         return Err(format!("estimate: {} samples must be reported as insufficient", thin.len()));
     }
     let enough: Vec<serde_json::Value> = vec![sample(60), sample(120), sample(180)];
-    let est = history_estimate(&enough, "full", "warm", "h1", true);
+    let est = history_estimate(&enough, "full", "cargo", "warm", "h1", true);
     if !est.starts_with("~2m00s") || !est.contains("n=3") {
         return Err(format!("estimate: median of 60/120/180 must be ~2m00s, got {est}"));
     }
-    if !history_estimate(&enough, "full", "warm", "h1", false).contains("no run-history ledger") {
+    if !history_estimate(&enough, "full", "cargo", "warm", "h1", false).contains("no run-history ledger") {
         return Err("estimate: a missing ledger must say so".into());
     }
     // A failing run must never contribute to a completion-time estimate.
@@ -1106,8 +1115,73 @@ pub fn self_test() -> Result<String, String> {
         sample(120),
         base(serde_json::json!({"cache_state": "warm", "real_seconds": 5, "result": "fail", "producer": "validate.rs"})),
     ];
-    if !history_estimate(&poisoned, "full", "warm", "h1", true).contains("insufficient history") {
+    if !history_estimate(&poisoned, "full", "cargo", "warm", "h1", true).contains("insufficient history") {
         return Err("estimate: a failing run must not count as a completion sample".into());
+    }
+    // Only a run under the current release builder times it. Each row below
+    // is a fast pass that would pull the median down if it were admitted.
+    let buck_payload = crate::e2e_payload_identity(crate::RELEASE_BUILDER_BUCK);
+    let cargo_payload = crate::e2e_payload_identity(crate::RELEASE_BUILDER_CARGO);
+    let fast = |extra: serde_json::Value| {
+        let mut row = sample(1);
+        for (k, v) in extra.as_object().unwrap() {
+            if v.is_null() {
+                row.as_object_mut().unwrap().remove(k);
+            } else {
+                row[k] = v.clone();
+            }
+        }
+        row
+    };
+    let foreign = [
+        ("buck run", fast(serde_json::json!({"release_builder": "buck", "e2e_payload": buck_payload}))),
+        ("buck builder, cargo payload", fast(serde_json::json!({"release_builder": "buck", "e2e_payload": cargo_payload}))),
+        ("cargo builder, buck payload", fast(serde_json::json!({"release_builder": "cargo", "e2e_payload": buck_payload}))),
+        ("builder without payload", fast(serde_json::json!({"release_builder": "cargo"}))),
+        ("unknown builder", fast(serde_json::json!({"release_builder": "bazel", "e2e_payload": cargo_payload}))),
+        ("contemporary pairless hermit", fast(serde_json::json!({"repo": "hermit", "finished_at": "2026-09-25T20:42:29Z"}))),
+        ("pairless schema 8", fast(serde_json::json!({"schema_version": 8}))),
+        ("pairless schema 9", fast(serde_json::json!({"schema_version": 9}))),
+        ("pairless future schema 11", fast(serde_json::json!({"schema_version": 11}))),
+        ("pairless string schema", fast(serde_json::json!({"schema_version": "5"}))),
+        ("pairless unversioned", fast(serde_json::json!({"schema_version": null}))),
+        ("pairless undated", fast(serde_json::json!({"finished_at": null}))),
+        ("pairless malformed date", fast(serde_json::json!({"finished_at": "2026-02-30T00:00:00Z"}))),
+    ];
+    for (name, row) in &foreign {
+        let mut rows = enough.clone();
+        rows.push(row.clone());
+        let est = history_estimate(&rows, "full", "cargo", "warm", "h1", true);
+        if !est.starts_with("~2m00s") || !est.contains("n=3") {
+            return Err(format!("estimate: {name} must not time a cargo run, got {est}"));
+        }
+    }
+    // The paired Cargo form and the dated legacy pairless form both time Cargo.
+    let mut rows = enough.clone();
+    rows.push(fast(serde_json::json!({"release_builder": "cargo", "e2e_payload": cargo_payload})));
+    rows.push(fast(serde_json::json!({"repo": "reverie", "finished_at": "2026-09-26T00:00:00Z"})));
+    let est = history_estimate(&rows, "full", "cargo", "warm", "h1", true);
+    if !est.contains("n=5") {
+        return Err(format!("estimate: paired and legacy Cargo passes must both count, got {est}"));
+    }
+    // A Buck run is timed only by Buck history: the legacy Cargo samples above
+    // do not count, and the paired Buck passes do.
+    let est = history_estimate(&enough, "full", "buck", "warm", "h1", true);
+    if !est.contains("insufficient history") || !est.contains("only 0 prior successful buck") {
+        return Err(format!("estimate: cargo history must not time a buck run, got {est}"));
+    }
+    let buck_rows: Vec<serde_json::Value> = [60, 120, 180]
+        .iter()
+        .map(|secs| {
+            let mut row = sample(*secs);
+            row["release_builder"] = serde_json::json!("buck");
+            row["e2e_payload"] = buck_payload.clone();
+            row
+        })
+        .collect();
+    let est = history_estimate(&buck_rows, "full", "buck", "warm", "h1", true);
+    if !est.starts_with("~2m00s") || !est.contains("n=3") {
+        return Err(format!("estimate: buck passes must time a buck run, got {est}"));
     }
 
     // Selective-baseline brackets: a nonexistent commit must be REFUSED (so the

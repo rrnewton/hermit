@@ -23287,7 +23287,14 @@ fn run(
     // established so the receipt carries the prediction next to the outcome.
     println!(
         "Estimated time: {}",
-        validate_history::history_estimate(&ledger_rows, &plan.profile, cache, &host, ledger.exists())
+        validate_history::history_estimate(
+            &ledger_rows,
+            &plan.profile,
+            release_builder,
+            cache,
+            &host,
+            ledger.exists()
+        )
     );
     if plan.super_mode {
         println!(
