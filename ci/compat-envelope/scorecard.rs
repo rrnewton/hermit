@@ -3148,6 +3148,8 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let root = repo_root()?;
+    let _ledger_identity_scope =
+        command_verifies_ledger_identity_once(&command).then(CommandLedgerIdentityScope::enter);
     if matches!(
         command.as_str(),
         "observe-results"
@@ -4506,6 +4508,66 @@ fn load_catalogue(root: &Path) -> Result<Option<TrackedCells>, String> {
     decode_catalogue(&bytes).map(Some)
 }
 
+/// One-shot commands verify each ledger's Git identity once per invocation.
+/// The self-test commands never open this scope: they change the fixture
+/// ledger identity in-process and require the next lookup to refuse.
+fn command_verifies_ledger_identity_once(command: &str) -> bool {
+    matches!(
+        command,
+        "export-legacy"
+            | "show"
+            | "check"
+            | "update"
+            | "update-observations"
+            | "project-observations"
+            | "project-and-observe-results"
+            | "verify-results"
+            | "observe-results"
+            | "import-results"
+    )
+}
+
+thread_local! {
+    static COMMAND_VERIFIED_LEDGERS: std::cell::RefCell<Option<BTreeSet<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct CommandLedgerIdentityScope;
+
+impl CommandLedgerIdentityScope {
+    fn enter() -> Self {
+        COMMAND_VERIFIED_LEDGERS.with(|verified| {
+            let mut verified = verified.borrow_mut();
+            assert!(verified.is_none(), "ledger identity scopes do not nest");
+            *verified = Some(BTreeSet::new());
+        });
+        Self
+    }
+}
+
+impl Drop for CommandLedgerIdentityScope {
+    fn drop(&mut self) {
+        COMMAND_VERIFIED_LEDGERS.with(|verified| *verified.borrow_mut() = None);
+    }
+}
+
+fn ledger_identity_verified_in_command(ledger: &Path) -> bool {
+    COMMAND_VERIFIED_LEDGERS.with(|verified| {
+        verified
+            .borrow()
+            .as_ref()
+            .is_some_and(|verified| verified.contains(ledger))
+    })
+}
+
+fn record_ledger_identity_verified_in_command(ledger: &Path) {
+    COMMAND_VERIFIED_LEDGERS.with(|verified| {
+        if let Some(verified) = verified.borrow_mut().as_mut() {
+            verified.insert(ledger.to_path_buf());
+        }
+    });
+}
+
 fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
     let explicit = env::var_os("DEV_HERMIT_TEST_LEDGER_ROOT");
     if writing && explicit.is_none() {
@@ -4525,6 +4587,9 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
         .ok_or("history unavailable: the existing hermit_test_ledger checkout was not found")?;
     let ledger = fs::canonicalize(&candidate)
         .map_err(|error| format!("history unavailable at {}: {error}", candidate.display()))?;
+    if ledger_identity_verified_in_command(&ledger) {
+        return Ok(ledger);
+    }
     let git = |args: &[&str]| -> Result<String, String> {
         let output = Command::new("git")
             .args(args)
@@ -4547,6 +4612,7 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
     {
         return Err("history repository is not the expected hermit_test_ledger checkout".into());
     }
+    record_ledger_identity_verified_in_command(&ledger);
     Ok(ledger)
 }
 
@@ -27554,5 +27620,49 @@ mod evidence_identity_tests {
             "{error}"
         );
         assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod command_ledger_identity_scope_tests {
+    use super::*;
+
+    #[test]
+    fn self_test_commands_reverify_every_ledger_lookup() {
+        assert!(!command_verifies_ledger_identity_once("self-test"));
+        assert!(!command_verifies_ledger_identity_once(
+            "self-test-and-check"
+        ));
+        for command in [
+            "export-legacy",
+            "show",
+            "check",
+            "update",
+            "update-observations",
+            "project-observations",
+            "project-and-observe-results",
+            "verify-results",
+            "observe-results",
+            "import-results",
+        ] {
+            assert!(command_verifies_ledger_identity_once(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn verification_is_retained_only_inside_one_command_scope() {
+        let ledger = Path::new("/ledger-a");
+        record_ledger_identity_verified_in_command(ledger);
+        assert!(!ledger_identity_verified_in_command(ledger));
+        {
+            let _scope = CommandLedgerIdentityScope::enter();
+            assert!(!ledger_identity_verified_in_command(ledger));
+            record_ledger_identity_verified_in_command(ledger);
+            assert!(ledger_identity_verified_in_command(ledger));
+            assert!(!ledger_identity_verified_in_command(Path::new("/ledger-b")));
+        }
+        assert!(!ledger_identity_verified_in_command(ledger));
+        let _scope = CommandLedgerIdentityScope::enter();
+        assert!(!ledger_identity_verified_in_command(ledger));
     }
 }
