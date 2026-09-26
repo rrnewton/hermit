@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 172;
+pub const NON_CI_CELL_COUNT: usize = 173;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -71,15 +71,16 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
-/// Two timerfd ptrace verify cells selected after timerfds moved onto the
-/// virtual clock: `backend-parity-c/timer-family-identity` (previously ci:false
-/// because its timerfd line raced host time) and the new
-/// `backend-parity-c/timerfd-semantics`. Each cell passed five consecutive
-/// first-attempt strict verify runs on the ptrace backend at the evidence SHA
-/// with `bitwise_parity: true`; the ordinary 22/57 bounds are unchanged.
-pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "6733ab1ef1461593a2ed2339359adaf418a238f3";
-pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T00:40:59Z";
-pub const TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 2;
+/// The timerfd ptrace verify cell selected after timerfds moved onto the
+/// virtual clock: the new `backend-parity-c/timerfd-semantics`, which passed
+/// twenty consecutive first-attempt strict verify runs on the ptrace backend at
+/// the evidence SHA with `bitwise_parity: true`; the ordinary 22/57 bounds are
+/// unchanged. `backend-parity-c/timer-family-identity` stays unselected: its
+/// order now matches Linux, but 6 of 36 runs ended in a skid-overshoot
+/// infrastructure error, and its manifest entry records why.
+pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "ec9fdf63a0dbfeecadc25dd6de331bae39221887";
+pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T03:14:54Z";
+pub const TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1888,14 +1889,14 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             TIMERFD_2026_09_25_EVIDENCE_SHA,
-            "6733ab1ef1461593a2ed2339359adaf418a238f3"
+            "ec9fdf63a0dbfeecadc25dd6de331bae39221887"
         );
         assert_eq!(
             TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-26T00:40:59Z"
+            "2026-09-26T03:14:54Z"
         );
-        assert_eq!(TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT, 2);
-        assert_eq!(NON_CI_CELL_COUNT, 172);
+        assert_eq!(TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(NON_CI_CELL_COUNT, 173);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

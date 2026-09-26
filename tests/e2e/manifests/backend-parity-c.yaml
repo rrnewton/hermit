@@ -6708,7 +6708,8 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci: false
+        ci_disabled_reason: 'The timerfd order now matches Linux, but strict ptrace verify of this fixture ended in a HERMIT_SKID_OVERSHOOT infrastructure error in 6 of 36 runs (2026-09-25, AMD EPYC 9D85, load average 57-150); one such error fails the whole validation node, so the cell stays unselected until preemption overshoot is retried or bounded.'
         backends_enabled:
           - ptrace
         backends_disabled:

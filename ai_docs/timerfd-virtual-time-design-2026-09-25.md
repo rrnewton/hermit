@@ -170,6 +170,15 @@ open file description itself.
 - BOOTTIME does not model suspend.
 - Backends: the change is in shared detcore code, but only the ptrace cells
   are enabled and measured; no DBT, KVM, SaBRe or LiteInst claim is made.
+- Full validation selects `timerfd-semantics` (20 of 20 strict ptrace verify
+  runs matched at ec9fdf63) but not `timer-family-identity`. Its order now
+  matches Linux, yet 6 of 36 strict ptrace verify runs at dbf27d2618 and
+  ec9fdf63 ended in a HERMIT_SKID_OVERSHOOT infrastructure error (AMD EPYC
+  9D85, load average 57-150), against 0 of 48 for three neighbouring cells
+  run alongside it; none of the 36 diverged. The
+  fixture's 40-million-iteration ITIMER_VIRTUAL spin, unchanged by this work,
+  gives the preemption counter many chances to overshoot, and one such error
+  fails the whole validation node.
 
 ## History
 

@@ -6006,13 +6006,6 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
-      "test": "backend-parity-c/timer-family-identity"
-    },
-    {
-      "backend": "ptrace",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
       "test": "backend-parity-c/timerfd-semantics"
     }
   ],
