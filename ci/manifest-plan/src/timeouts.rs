@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 172;
+pub const NON_CI_CELL_COUNT: usize = 171;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -135,6 +135,15 @@ pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
     "d56f0263f92a6131a52dfac6232444726ee5898f";
 pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:03:06Z";
 pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// Two timerfd ptrace verify cells selected after timerfds moved onto the
+/// virtual clock: `c-programs/timer-family-identity` (previously ci:false
+/// because its timerfd line raced host time) and the new
+/// `c-programs/timerfd-semantics`. Each cell passed five consecutive
+/// first-attempt strict verify runs on the ptrace backend at the evidence SHA
+/// with `bitwise_parity: true`; the ordinary 22/57 bounds are unchanged.
+pub const TIMERFD_2026_09_25_EVIDENCE_SHA: &str = "6733ab1ef1461593a2ed2339359adaf418a238f3";
+pub const TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-26T00:40:59Z";
+pub const TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 2;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
 /// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
@@ -2033,6 +2042,15 @@ mod tests {
         );
         assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
+            TIMERFD_2026_09_25_EVIDENCE_SHA,
+            "6733ab1ef1461593a2ed2339359adaf418a238f3"
+        );
+        assert_eq!(
+            TIMERFD_2026_09_25_EVIDENCE_COMPLETED_UTC,
+            "2026-09-26T00:40:59Z"
+        );
+        assert_eq!(TIMERFD_2026_09_25_SELECTED_CI_CELL_COUNT, 2);
+        assert_eq!(
             SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             SELECT_REPLAY_2026_10_03_TESTS.len()
         );
@@ -2055,7 +2073,7 @@ mod tests {
                     < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
             );
         }
-        assert_eq!(NON_CI_CELL_COUNT, 172);
+        assert_eq!(NON_CI_CELL_COUNT, 171);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

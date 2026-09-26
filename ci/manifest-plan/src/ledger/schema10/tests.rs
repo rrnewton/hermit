@@ -963,7 +963,10 @@ fn generated_plan_populations_preserve_command_policy() {
     // the c-programs/dbt-pid-virtualization promotion and the new
     // c-programs/sigsuspend-alarm-wake, c-programs/external-io-signal-interrupt
     // and c-programs/sigsuspend-sibling-signal-wake.
-    let total = 900 + compat + select + 6 + 3 + 1 + 4;
+    // Portable ptrace verify cells from https://github.com/rrnewton/hermit/pull/3229:
+    // the c-programs/timer-family-identity promotion and the new
+    // c-programs/timerfd-semantics.
+    let total = 900 + compat + select + 6 + 3 + 1 + 4 + 2;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1005,9 +1008,10 @@ fn generated_plan_populations_preserve_command_policy() {
     // The six earlier and three socket KVM cells are also excluded, so the hosted total is unchanged.
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
     // The portable ptrace cells of https://github.com/rrnewton/hermit/pull/3224 are hosted.
+    // So are those of https://github.com/rrnewton/hermit/pull/3229.
     assert_eq!(
         hosted_cells.len(),
-        893 + compat + select + 6 + 3 + 1 + 4 - (241 + 6 + 3 + 1)
+        893 + compat + select + 6 + 3 + 1 + 4 + 2 - (241 + 6 + 3 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1055,7 +1059,7 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat + select + 6 + 3 + 1 + 4,
+            893 + compat + select + 6 + 3 + 1 + 4 + 2,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
