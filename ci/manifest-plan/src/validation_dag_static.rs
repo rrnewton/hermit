@@ -252,7 +252,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
-    ("test.detcore_unit", 808),
+    // Two smaps page-accounting controls retain all 808 prior identities.
+    ("test.detcore_unit", 810),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -286,7 +287,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 808),
+    ("test.detcore_unit_on_host", 810),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 757),
