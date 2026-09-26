@@ -272,7 +272,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two signal_determinism rt_sigsuspend tests retain all 171 prior IDs:
     // sigsuspend_mask_fallback_warns_in_the_compared_log and
     // ptrace_sigsuspend_runs_without_probe_injections.
-    ("test.hermit_integration", 173),
+    // PR 3229 adds signal_determinism's
+    // sigsuspend_with_armed_periodic_timerfd_reports_terminal_deadlock.
+    ("test.hermit_integration", 174),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -302,7 +304,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 840),
     // Host variants select the same proc regressions and the same two
     // signal_determinism tests, and retain prior identities.
-    ("test.hermit_integration_on_host", 173),
+    // The host variant also selects the same PR 3229 signal_determinism test.
+    ("test.hermit_integration_on_host", 174),
     ("test.hermit_unit_on_host", 758),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),

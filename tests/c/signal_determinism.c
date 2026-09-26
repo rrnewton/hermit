@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -618,6 +619,18 @@ static int test_blocking_sigsuspend_without_signal(void) {
   return 2;
 }
 
+static int test_blocking_sigsuspend_with_armed_timerfd(void) {
+  // A periodic timerfd raises no signal, so it must not keep the scheduler
+  // from reporting this wait as a deadlock.
+  const int timer = timerfd_create(CLOCK_MONOTONIC, 0);
+  struct itimerspec period = {{0, 1000000}, {0, 1000000}};
+  if (timer < 0 || timerfd_settime(timer, 0, &period, NULL) != 0) {
+    perror("timerfd");
+    return 3;
+  }
+  return test_blocking_sigsuspend_without_signal();
+}
+
 static void* check_clone_mask(void* argument) {
   (void)argument;
   const int blocked = signal_is_blocked(SIGUSR1);
@@ -922,6 +935,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "blocking-sigsuspend-no-signal") == 0) {
     return test_blocking_sigsuspend_without_signal();
+  }
+  if (strcmp(argv[1], "blocking-sigsuspend-armed-timerfd") == 0) {
+    return test_blocking_sigsuspend_with_armed_timerfd();
   }
   if (strcmp(argv[1], "masks-fork-clone") == 0) {
     return test_masks_across_fork_and_clone();
