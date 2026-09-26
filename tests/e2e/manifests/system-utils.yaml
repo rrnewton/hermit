@@ -1756,7 +1756,7 @@ test:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: Main blocks in join while each sampler runs and prints only after it, so no schedule changes the observable output
+          ptrace: Not enabled. Main joins each sampler before printing, so the assertions and record order are schedule-independent, but the printed virtual timestamps vary with the chaos schedule
           dbt: Chaos scheduling is unsupported by DBI
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
