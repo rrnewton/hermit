@@ -62,6 +62,8 @@ mod stat;
 mod syscall_classification;
 mod syscall_time;
 mod syscalls;
+#[cfg(test)]
+mod test_pages;
 mod tool_global;
 mod tool_local;
 pub mod util;
@@ -1582,6 +1584,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     thread_cpu_start_user_time: last_accounted_user_time,
                     thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
+                    returned_records: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
                     // Child RNG identity follows the deterministic creation
@@ -2759,6 +2762,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
+        // Taken whatever the outcome, so that it describes only this call.
+        let returned_records = guest.thread_state_mut().returned_records.take();
 
         detlog!(
             event = crate::detlog::DetLogEvent::SyscallResult {
@@ -2805,7 +2810,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, returned_records.as_ref())?;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {

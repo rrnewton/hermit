@@ -276,18 +276,20 @@ impl DirentFormat {
     /// Decode records as [`parse`](Self::parse) does when only the first
     /// `readable` bytes of them could be read; the rest are zeroed. Linux does
     /// not write the padding after the last record's name, which can lie in a
-    /// page the guest cannot read, so only that padding may be missing.
+    /// page the guest cannot read, so only that padding may be missing: any
+    /// other missing byte is `EFAULT`.
     pub(crate) fn parse_written(
         self,
         bytes: &mut [u8],
         readable: usize,
     ) -> Result<Vec<DirEntry>, Errno> {
         let len = bytes.len();
-        bytes[readable.min(len)..].fill(0);
-        let entries = self.parse(bytes)?;
         if readable >= len {
-            return Ok(entries);
+            return self.parse(bytes);
         }
+        // A record the zeroes cut short was not readable.
+        bytes[readable..].fill(0);
+        let entries = self.parse(bytes).map_err(|_| Errno::EFAULT)?;
         let mut last = 0;
         for _ in 1..entries.len() {
             last += usize::from(u16::from_ne_bytes([bytes[last + 16], bytes[last + 17]]));
@@ -1082,9 +1084,10 @@ mod test {
                 if readable >= written {
                     assert_eq!(parsed, Ok(whole.clone()), "{format:?}, {readable} readable");
                 } else {
-                    assert!(
-                        parsed.is_err(),
-                        "{format:?}, {readable} readable: {parsed:?}"
+                    assert_eq!(
+                        parsed,
+                        Err(Errno::EFAULT),
+                        "{format:?}, {readable} readable"
                     );
                 }
             }
