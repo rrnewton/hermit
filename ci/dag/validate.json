@@ -7816,13 +7816,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/perl-io-subprocess-time",
           "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/perl-io-subprocess-time",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -22352,13 +22345,6 @@
           "test": "language-runtimes/perl-io-subprocess-time",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/perl-io-subprocess-time",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",

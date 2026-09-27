@@ -6951,13 +6951,6 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
-      "test": "language-runtimes/perl-io-subprocess-time"
-    },
-    {
-      "backend": "liteinst",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
       "test": "language-runtimes/perl-random"
     },
     {

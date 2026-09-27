@@ -1197,7 +1197,7 @@ mod tests {
                 count.selected_selectable,
             )
         };
-        assert_eq!(row(&counts.all), (1444, 767, 664, 192, 175));
+        assert_eq!(row(&counts.all), (1444, 766, 663, 192, 175));
         let by_backend: Vec<_> = counts
             .by_backend
             .iter()
@@ -1208,7 +1208,7 @@ mod tests {
             [
                 ("dbt", (361, 61, 0, 14, 0)),
                 ("kvm", (361, 250, 243, 77, 76)),
-                ("liteinst", (361, 312, 309, 99, 98)),
+                ("liteinst", (361, 311, 308, 99, 98)),
                 ("sabre", (361, 144, 112, 2, 1)),
             ]
         );

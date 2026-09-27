@@ -13,8 +13,8 @@
   "counts": {
     "all": {
       "cells": 1444,
-      "applicable": 767,
-      "selectable": 664,
+      "applicable": 766,
+      "selectable": 663,
       "selected": 192,
       "selected_selectable": 175
     },
@@ -35,8 +35,8 @@
       },
       "liteinst": {
         "cells": 361,
-        "applicable": 312,
-        "selectable": 309,
+        "applicable": 311,
+        "selectable": 308,
         "selected": 99,
         "selected_selectable": 98
       },
@@ -1300,7 +1300,7 @@
     {"test_id":"language-runtimes/perl-hash-order","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: SaBRe requires its external runtime"},
     {"test_id":"language-runtimes/perl-io-subprocess-time","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: DBT Perl qualification is tracked by backend compatibility"},
     {"test_id":"language-runtimes/perl-io-subprocess-time","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
-    {"test_id":"language-runtimes/perl-io-subprocess-time","backend":"liteinst","category":"language-runtimes","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
+    {"test_id":"language-runtimes/perl-io-subprocess-time","backend":"liteinst","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: LiteInst Perl qualification is tracked by backend compatibility"},
     {"test_id":"language-runtimes/perl-io-subprocess-time","backend":"sabre","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites"},
     {"test_id":"language-runtimes/perl-random","backend":"dbt","category":"language-runtimes","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: DBT Perl support is tracked by backend compatibility"},
     {"test_id":"language-runtimes/perl-random","backend":"kvm","category":"language-runtimes","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},

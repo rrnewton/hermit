@@ -2,7 +2,7 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-The count table includes all **5776** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **1019** are selected by full, **150** are not selected by full, and **4607** are **Not applicable**.
+The count table includes all **5776** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **1018** are selected by full, **150** are not selected by full, and **4608** are **Not applicable**.
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
@@ -12,20 +12,20 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `dbt` | 0 | 61 | 1022 | 1083 |
 | `kvm` | 244 | 8 | 831 | 1083 |
 | `sabre` | 112 | 32 | 939 | 1083 |
-| `liteinst` | 309 | 3 | 771 | 1083 |
+| `liteinst` | 308 | 3 | 772 | 1083 |
 | `native` | 0 | 33 | 328 | 361 |
-| **Total** | **1019** | **150** | **4607** | **5776** |
+| **Total** | **1018** | **150** | **4608** | **5776** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Selected by full is **1019 of 5776**, which is **17.64%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Selected by full is **1018 of 5776**, which is **17.62%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **4607 of those 5776 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 1169 cells that CAN run, selected by full is **87.17%**.
+⚠️ **4608 of those 5776 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 1168 cells that CAN run, selected by full is **87.16%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 1019 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 1018 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly not selected RAISES the reported figure; adding manifest cells that are not selected LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -33,11 +33,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 346 / 361 | 0 / 361 | 244 / 361 | 112 / 361 | 309 / 361 | — | 1011 | 116 | 678 | 1805 |
+| `verify` | 346 / 361 | 0 / 361 | 244 / 361 | 112 / 361 | 308 / 361 | — | 1010 | 116 | 679 | 1805 |
 | `replay` | 2 / 361 | 0 / 361 | 0 / 361 | 0 / 361 | 0 / 361 | — | 2 | 0 | 1803 | 1805 |
 | `chaos` | 6 / 361 | 0 / 361 | 0 / 361 | 0 / 361 | 0 / 361 | — | 6 | 1 | 1798 | 1805 |
 | `naked` | — | — | — | — | — | 0 / 361 | 0 | 33 | 328 | 361 |
-| **Total** | | | | | | | **1019** | **150** | **4607** | **5776** |
+| **Total** | | | | | | | **1018** | **150** | **4608** | **5776** |
 
 ## Ptrace by manifest category
 
@@ -59,7 +59,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 33 / 34 | 1 / 34 | 0 / 34 | 34 | 102 |
 | `util-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
 
-Ordinary full validation executes 1022 cells: the 1019 comparable compatibility cells selected by full above (including 6 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing selected cell is a regression, not permission to remove it from the plan.
+Ordinary full validation executes 1021 cells: the 1018 comparable compatibility cells selected by full above (including 6 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing selected cell is a regression, not permission to remove it from the plan.
 
 ### Selected custom commands outside the comparable denominator
 
