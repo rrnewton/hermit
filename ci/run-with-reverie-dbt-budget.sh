@@ -447,7 +447,16 @@ fi
 # 117d54d744df23921c531d0fe08537249f5a510a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds remain unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-expected_pin=424e5424c97696b92c3aad61701e540e7e8b92ec
+# CARRY TO b0ede531e00dd1e068d0e0b1f220edddcf96d4b5 (2026-09-27): from
+# 424e5424c97696b92c3aad61701e540e7e8b92ec, the stdin terminal-read work and
+# child-future storage repair leave the complete reverie-dbt tree unchanged at
+# a62d15302ee5e907667d1c02f6e629177ad87f61. build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0; DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
+# This is source-identity carry, not a new timing sample or runtime qualification.
+expected_pin=b0ede531e00dd1e068d0e0b1f220edddcf96d4b5
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

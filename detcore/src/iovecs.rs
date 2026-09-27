@@ -128,7 +128,9 @@ pub(crate) fn import_read_iovecs(
             .and_then(Addr::<u8>::from_raw)
             .ok_or(Errno::EFAULT)?;
         let mut bytes = [0_u8; std::mem::size_of::<libc::iovec>()];
-        memory.read_exact_with_user_access(pointer, &mut bytes)?;
+        memory
+            .read_exact_with_user_access(pointer, &mut bytes)
+            .map_err(crate::random::copy_error)?;
         let word = std::mem::size_of::<usize>();
         let base = usize::from_ne_bytes(bytes[..word].try_into().unwrap());
         let len = usize::from_ne_bytes(bytes[word..].try_into().unwrap());
@@ -153,6 +155,7 @@ mod tests {
     struct ArrayMemory {
         vectors: Vec<ImportedIovec>,
         reads: Cell<usize>,
+        read_error: Option<(usize, Errno)>,
     }
 
     impl ArrayMemory {
@@ -160,6 +163,7 @@ mod tests {
             Self {
                 vectors,
                 reads: Cell::new(0),
+                read_error: None,
             }
         }
     }
@@ -182,6 +186,11 @@ mod tests {
             A: Into<Addr<'a, u8>>,
         {
             self.reads.set(self.reads.get() + 1);
+            if let Some((attempt, error)) = self.read_error
+                && self.reads.get() == attempt
+            {
+                return Err(error);
+            }
             let index = (address.into().as_raw() - 0x1000) / 16;
             let vector = self.vectors.get(index).ok_or(Errno::EFAULT)?;
             bytes[..8].copy_from_slice(&vector.base.to_ne_bytes());
@@ -348,6 +357,51 @@ mod tests {
         cap_lengths(&mut vectors);
         assert_eq!(vectors[0].len, MAX_RW_COUNT);
         assert!(vectors[1..].iter().all(|iov| iov.len == 0));
+    }
+
+    #[test]
+    fn rng_iovecs_import_errors_preserve_guest_fault_and_backend_failure_identity() {
+        for error in [
+            Errno::EFAULT,
+            Errno::EPERM,
+            Errno::EIO,
+            Errno::ENOMEM,
+            Errno::ENOSYS,
+        ] {
+            for attempt in [1, 2] {
+                let mut memory = ArrayMemory::new(vec![
+                    ImportedIovec {
+                        base: 0x2000,
+                        len: 3,
+                    },
+                    ImportedIovec {
+                        base: 0x3000,
+                        len: 5,
+                    },
+                ]);
+                memory.read_error = Some((attempt, error));
+                let result = import_read_iovecs(&memory, 0x1000, 2, UserAddressPolicy::Kvm);
+                assert_eq!(
+                    memory.reads.get(),
+                    attempt,
+                    "import continued after {error:?}"
+                );
+                if error == Errno::EFAULT {
+                    assert_eq!(errno(result), Errno::EFAULT);
+                } else {
+                    let Err(Error::Tool(failure)) = result else {
+                        panic!("backend import failure became a guest result: {result:?}");
+                    };
+                    assert_eq!(
+                        failure
+                            .downcast_ref::<crate::random::RandomCopyFailure>()
+                            .unwrap()
+                            .errno(),
+                        error
+                    );
+                }
+            }
+        }
     }
 
     #[test]

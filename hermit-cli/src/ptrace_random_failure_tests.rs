@@ -117,9 +117,23 @@ mod real_random {
         inner.downcast_ref().expect("original RandomCopyFailure")
     }
 
-    pub(super) fn case(name: &str, fatal: bool, trace_diagnostics: bool) {
+    #[derive(Clone, Copy)]
+    pub(super) enum Operation {
+        Getrandom,
+        Readv,
+    }
+    impl Operation {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Getrandom => "getrandom",
+                Self::Readv => "readv",
+            }
+        }
+    }
+
+    pub(super) fn case(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
         if std::env::var("HERMIT_OWNER_TEST_ROLE").as_deref() == Ok(name) {
-            isolated(name, || exercise(fatal, trace_diagnostics));
+            isolated(name, || exercise(fatal, trace_diagnostics, operation));
             return;
         }
         let parent_tid = unsafe { libc::syscall(libc::SYS_gettid) };
@@ -152,7 +166,7 @@ mod real_random {
         );
     }
 
-    fn exercise(fatal: bool, trace_diagnostics: bool) {
+    fn exercise(fatal: bool, trace_diagnostics: bool, operation: Operation) {
         let deadline: u64 = std::env::var("HERMIT_OWNER_TEST_DEADLINE")
             .unwrap()
             .parse()
@@ -219,6 +233,7 @@ mod real_random {
                     .arg(shared_path)
                     .arg(if fatal { "0" } else { "1" })
                     .arg(gate_path)
+                    .arg(operation.name())
                     .stdout(reverie::process::Stdio::piped())
                     .stderr(reverie::process::Stdio::piped());
                 let mut config = detcore::Config {
@@ -395,18 +410,29 @@ mod real_random {
             );
             assert_eq!(mapping.field(4).load(Ordering::SeqCst), 0);
             assert!(!summary.exists());
-            let tail = text.rsplit_once("inbound syscall: getrandom(").unwrap().1;
-            assert!(tail.contains(", 7, 0)"));
+            let inbound = format!("inbound syscall: {}(", operation.name());
+            let tail = text.rsplit_once(&inbound).unwrap().1;
+            let arguments = tail.lines().next().unwrap().split_once(" DETLOG_RECORD=").unwrap().0;
+            match operation {
+                Operation::Getrandom => assert!(arguments.contains(", 7, 0)")),
+                Operation::Readv => {
+                    let (fd, vector_and_count) = arguments.split_once(", ").unwrap();
+                    assert!(fd.parse::<i32>().unwrap() >= 0);
+                    let (vector, count) = vector_and_count.split_once(", ").unwrap();
+                    assert!(usize::from_str_radix(vector.strip_prefix("0x").unwrap(), 16).unwrap() > 0);
+                    assert_eq!(count, "1) = ?");
+                }
+            }
             assert!(tail.contains("backend failure"));
             assert!(
                 !tail
                     .lines()
-                    .any(|line| line.contains("finish syscall #") && line.contains("getrandom("))
+                    .any(|line| line.contains("finish syscall #") && line.contains(&format!("{}(", operation.name())))
             );
             assert!(
                 !tail
                     .lines()
-                    .any(|line| line.contains("[iobuf]") && line.contains("getrandom"))
+                    .any(|line| line.contains("[iobuf]") && line.contains(operation.name()))
             );
             for pid in [facts.root, facts.child] {
                 assert!(tail.contains(&format!(
@@ -490,6 +516,7 @@ fn real_random_copy_failure_retires_initialized_sibling_and_timer() {
         "real_random_copy_failure_retires_initialized_sibling_and_timer",
         true,
         false,
+        real_random::Operation::Getrandom,
     );
 }
 #[test]
@@ -498,6 +525,7 @@ fn real_random_live_copy_preserves_sibling_and_timer_success() {
         "real_random_live_copy_preserves_sibling_and_timer_success",
         false,
         false,
+        real_random::Operation::Getrandom,
     );
 }
 
@@ -507,5 +535,26 @@ fn real_random_copy_failure_with_trace_diagnostics() {
         "real_random_copy_failure_with_trace_diagnostics",
         true,
         true,
+        real_random::Operation::Getrandom,
+    );
+}
+
+#[test]
+fn real_random_readv_import_failure_retires_initialized_sibling_and_timer() {
+    real_random::case(
+        "real_random_readv_import_failure_retires_initialized_sibling_and_timer",
+        true,
+        false,
+        real_random::Operation::Readv,
+    );
+}
+
+#[test]
+fn real_random_readv_live_import_preserves_sibling_and_timer_success() {
+    real_random::case(
+        "real_random_readv_live_import_preserves_sibling_and_timer_success",
+        false,
+        false,
+        real_random::Operation::Readv,
     );
 }
