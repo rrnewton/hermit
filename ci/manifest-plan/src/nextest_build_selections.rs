@@ -134,6 +134,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "swaps_determinism",
             "--test",
+            "sysfs_rtc_determinism",
+            "--test",
             "thp_stats_determinism",
             "--test",
             "verification_report_cli",
@@ -261,7 +263,12 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "pselect6_simulation",
         ]),
-        "super.record_replay_matrix_diagnostic" => Some(&[
+        "test.network_tcp"
+        | "test.network_poll"
+        | "test.network_recv"
+        | "test.network_identity"
+        | "test.network_unix"
+        | "super.record_replay_matrix_diagnostic" => Some(&[
             "-p",
             "hermit",
             "--features",
@@ -557,7 +564,7 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "170");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "172");
             assert!(
                 args.windows(2)
                     .any(|pair| pair == ["--test", "clock_determinism"])
@@ -647,7 +654,15 @@ mod tests {
         let hardware_key = crate::nextest_binaries::selection_key(&hardware);
         assert_eq!(full.get(&hardware_key), Some(&hardware));
         assert!(!portable.contains_key(&hardware_key));
-        assert_eq!(full.len(), portable.len() + 1);
+        let network = for_step("test.network_tcp")
+            .unwrap()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
+        let network_key = crate::nextest_binaries::selection_key(&network);
+        assert_eq!(full.get(&network_key), Some(&network));
+        assert!(!portable.contains_key(&network_key));
+        assert_eq!(full.len(), portable.len() + 2);
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }

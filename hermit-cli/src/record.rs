@@ -44,9 +44,32 @@ type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 pub struct PreparedFullRecordTrace {
     data: PathBuf,
     publication: NetworkTracePublication,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 }
 
 impl PreparedFullRecordTrace {
+    /// Attach the authenticated resources received by this owned controller.
+    /// This does not create provider, file-table, or replay-topology authority.
+    #[doc(hidden)]
+    pub fn with_network_runtime_resources(
+        mut self,
+        resource: detcore::network_runtime::NetworkRuntimeResources,
+    ) -> Result<Self, Error> {
+        if self.network_runtime.is_some() {
+            return Err(Error::msg("full trace network runtime was supplied twice"));
+        }
+        self.network_runtime = Some(resource);
+        Ok(self)
+    }
+
+    pub(crate) fn controller_disposal_owner(
+        &self,
+    ) -> Option<detcore::network_runtime::NetworkRuntimeOwner> {
+        self.network_runtime
+            .as_ref()
+            .map(|resource| resource.controller_disposal_owner())
+    }
+
     /// Reserve the full-record sidecar in the caller's current namespace.
     pub fn reserve(data: &Path) -> Result<Self, Error> {
         prepare_network_trace_recording(data)?;
@@ -57,6 +80,7 @@ impl PreparedFullRecordTrace {
         Ok(Self {
             data: data.to_path_buf(),
             publication,
+            network_runtime: None,
         })
     }
 }
@@ -83,6 +107,7 @@ impl Record {
         let PreparedFullRecordTrace {
             data,
             publication: network_publication,
+            network_runtime,
         } = prepared_trace;
         let dir = data.as_path();
         let mut metadata = Metadata::new(&command, epoch)?;
@@ -102,17 +127,26 @@ impl Record {
         serde_json::to_writer_pretty(fs::File::create(&metadata_path)?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let mut config = record_or_replay_config(dir, FullReplayPhase::Record, metadata.epoch);
+        let mut config = crate::prepare_backend_config(
+            record_or_replay_config(dir, FullReplayPhase::Record, metadata.epoch),
+            crate::Backend::Ptrace,
+        );
         config.network_trace_output_fd = Some(network_publication.writer_fd());
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
         config.fdinfo_unlisted_mount_ids = metadata.fdinfo_unlisted_mount_ids.clone();
 
-        let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
-            .config(config)
-            .spawn()
-            .await?;
+        let builder = reverie_ptrace::TracerBuilder::<RecordTool>::new(command).config(config);
+        let tracer = match network_runtime {
+            Some(resource) => {
+                detcore::network_runtime::with_network_runtime_resources(resource, async {
+                    builder.spawn().await.map_err(Error::from)
+                })
+                .await?
+            }
+            None => builder.spawn().await?,
+        };
 
         Ok(Self {
             tracer,

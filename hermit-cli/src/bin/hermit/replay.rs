@@ -22,6 +22,8 @@ use super::container::deterministic_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
 use super::global_opts::GlobalOpts;
+use super::network_run;
+use super::network_run::RunValue;
 
 /// Command-line options for the "replay" subcommand.
 #[derive(Debug, Parser, Clone)]
@@ -35,6 +37,9 @@ pub struct ReplayOpts {
     /// Directory where recorded syscall data is stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
     data_dir: Option<PathBuf>,
+
+    #[clap(flatten)]
+    network_deployment: network_run::DeploymentOpts,
 
     /// The port to use for the gdb server.
     #[clap(long, default_value = "1234")]
@@ -65,27 +70,44 @@ impl ReplayOpts {
                 .context("Failed to find last recording ID")?,
         };
         let mut prepared_replay = Some(hermit.prepare_replay(id)?);
+        let gdb_listener = if self.autopilot {
+            None
+        } else {
+            Some(std::net::TcpListener::bind((
+                std::net::Ipv4Addr::LOCALHOST,
+                self.gdbserver_port,
+            ))?)
+        };
 
         if self.autopilot || self.serve_only {
-            let (mut container, identity) = deterministic_container()?;
+            let (mut container, identity_guard) = deterministic_container()?;
             let options = self.clone();
-            let global = global.clone();
-            let resources = format!("replay {} and identity mounts", hermit.data_dir().display());
-            super::owned_container::run(
+            let replay_global = global.clone();
+            let (value, _guards) = network_run::run_replay_at_owned(
                 &mut container,
-                (identity, hermit, prepared_replay),
-                resources,
-                true,
+                (identity_guard, hermit, prepared_replay),
+                self.network_deployment.roots()?,
+                self.network_deployment.accepted_root(),
                 "with_container",
-                None,
-                move |(_, _, prepared)| {
-                    let prepared = prepared
+                gdb_listener,
+                move |(_, _, prepared), resource, listener| {
+                    let prepared_replay = prepared
                         .take()
                         .ok_or_else(|| Error::msg("replay trace reservation was consumed twice"))?;
-                    options.container_main(&global, options.autopilot, prepared)
+                    let prepared_replay =
+                        prepared_replay.with_network_runtime_resources(resource.ok_or_else(
+                            || Error::msg("full replay lost authenticated network startup"),
+                        )?)?;
+                    let prepared_replay = match listener {
+                        Some(listener) => prepared_replay.with_controller_gdb_listener(listener)?,
+                        None => prepared_replay,
+                    };
+                    options
+                        .container_main(&replay_global, options.autopilot, prepared_replay)
+                        .map(|status| RunValue::Run(status, None))
                 },
-            )
-            .map(|(value, _guards)| value)
+            )?;
+            value.into_status()
         } else {
             // Find the path to the executable so that GDB can use it to resolve
             // symbols.
@@ -125,40 +147,41 @@ impl ReplayOpts {
             // Recorded rather than quietly deleted, because the claim is in a
             // landed commit message where it cannot be edited.
             let gdb_watch = GdbClientWatch::spawn(gdb_command, self.gdbserver_port)?;
-            let (mut container, identity) = deterministic_container()?;
-            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch, prepared_replay)));
-            let resources = format!(
-                "replay {}, identity mounts and GDB watcher",
-                guards.borrow().1.data_dir().display()
-            );
+            let (mut container, identity_guard) = deterministic_container()?;
             let options = self.clone();
-            let global = global.clone();
-            let result = super::owned_container::run(
-                &mut container,
-                Rc::clone(&guards),
-                resources,
-                true,
-                "with_container",
-                None,
-                move |guards| {
-                    let prepared =
-                        guards.borrow_mut().3.take().ok_or_else(|| {
+            let replay_global = global.clone();
+            let (value, (_identity, _hermit, mut gdb_watch, _prepared)) =
+                network_run::run_replay_at_owned(
+                    &mut container,
+                    (identity_guard, hermit, gdb_watch, prepared_replay),
+                    self.network_deployment.roots()?,
+                    self.network_deployment.accepted_root(),
+                    "with_container",
+                    gdb_listener,
+                    move |(_, _, _, prepared), resource, listener| {
+                        let prepared_replay = prepared.take().ok_or_else(|| {
                             Error::msg("replay trace reservation was consumed twice")
                         })?;
-                    options.container_main(&global, options.autopilot, prepared)
-                },
-            );
-            // On unresolved cleanup the factory retains the SAME guard scope.
-            // Do not signal watcher completion while its container still owns it.
-            if result.as_ref().is_err_and(|e| {
-                e.downcast_ref::<super::owned_container::ParentCleanupUnconfirmed>()
-                    .is_some()
-            }) {
-                return result.map(|(status, _)| status);
-            }
-            let finished = guards.borrow_mut().2.finish();
+                        let prepared_replay = prepared_replay.with_network_runtime_resources(
+                            resource.ok_or_else(|| {
+                                Error::msg("full replay lost authenticated network startup")
+                            })?,
+                        )?;
+                        let prepared_replay = match listener {
+                            Some(listener) => {
+                                prepared_replay.with_controller_gdb_listener(listener)?
+                            }
+                            None => prepared_replay,
+                        };
+                        options
+                            .container_main(&replay_global, options.autopilot, prepared_replay)
+                            .map(|status| RunValue::Run(status, None))
+                    },
+                )?;
+            let result = value.into_status();
+            let finished = gdb_watch.finish();
             match (result, finished) {
-                (Ok((status, _)), Ok(_)) => Ok(status),
+                (Ok(status), Ok(_)) => Ok(status),
                 (Ok(_), Err(watcher)) => Err(watcher),
                 (Err(primary), Err(watcher)) => {
                     Err(primary.context(format!("GDB watcher also failed: {watcher:#}")))
@@ -176,7 +199,7 @@ impl ReplayOpts {
         prepared_replay: hermit::PreparedFullReplayTrace,
     ) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
-        // Both callers enter through deterministic_container/with_container.
+        // Both callers enter through the offline container and owned network startup.
         let prepared_replay = prepared_replay.with_owned_controller_shutdown();
 
         if autopilot {

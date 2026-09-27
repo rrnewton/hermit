@@ -51,6 +51,12 @@ use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 #[path = "../nextest_attempt.rs"]
 mod nextest_attempt;
 
+#[path = "../../../network-test-boundary.rs"]
+mod network_test_boundary;
+
+#[path = "../../../network-unix-provision.rs"]
+mod network_unix_provision;
+
 const ATTEMPT_ENV: &str = "NEXTEST_ATTEMPT";
 // cargo-nextest 0.9.116 replaced this private variable with the public one
 // above. The pinned validation image deliberately retains the declared 0.9.100
@@ -564,6 +570,20 @@ struct OwnedAttemptCgroup {
 
 impl OwnedAttemptCgroup {
     fn create(identity: &AttemptIdentity) -> Result<Self, String> {
+        let required = [
+            dagrun::cgroup_delegation::Controller::Memory,
+            dagrun::cgroup_delegation::Controller::Pids,
+        ];
+        // SAFETY: this standalone wrapper and its synchronous self-test callers
+        // create no threads or CLONE_FILES sharers. Child commands have separate
+        // descriptor tables. Signal handlers update atomics/write a held FD;
+        // none closes/reuses an FD or mutates the environment during this call.
+        if let Some((parent, path)) =
+            unsafe { dagrun::cgroup_delegation::inherited_root_at_exclusive_entry(&required) }
+                .map_err(|error| format!("runner cgroup delegation: {error}"))?
+        {
+            return Self::create_under(parent, &path, identity);
+        }
         let parent_path = current_cgroup_directory()?;
         Self::create_in(&parent_path, identity)
     }
@@ -579,6 +599,14 @@ impl OwnedAttemptCgroup {
                     parent_path.display()
                 )
             })?;
+        Self::create_under(parent, parent_path, identity)
+    }
+
+    fn create_under(
+        parent: File,
+        parent_path: &Path,
+        identity: &AttemptIdentity,
+    ) -> Result<Self, String> {
         let mut filesystem = unsafe { std::mem::zeroed::<libc::statfs>() };
         if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut filesystem) } != 0 {
             return Err(format!(
@@ -1427,6 +1455,43 @@ fn wait_for_direct_child(
 }
 
 fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
+    let mut unix_owner = None;
+    let primary = run_wrapper_owned(args, &mut unix_owner);
+    let cleanup = unix_owner
+        .as_mut()
+        .map(|owner: &mut network_unix_provision::Owner| {
+            let deadline = *owner
+                .cleanup_deadline
+                .get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
+            owner.finish(deadline).map_err(|error| error.to_string())
+        })
+        .transpose();
+    let outcome = match (primary, cleanup) {
+        (primary, Ok(_)) => primary,
+        (Ok(_), Err(error)) => Err(format!("Unix provisioning cleanup UNKNOWN: {error}")),
+        (Err(primary), Err(error)) => Err(format!(
+            "{primary}; Unix provisioning cleanup UNKNOWN: {error}"
+        )),
+    };
+    if unix_owner
+        .as_ref()
+        .is_some_and(|owner| !owner.child_launched)
+    {
+        let signal = RECEIVED_SIGNAL.load(Ordering::SeqCst);
+        if signal > 0 {
+            if let Err(error) = &outcome {
+                eprintln!("nextest-cpu-wrapper: {error}");
+            }
+            propagate_signal(signal);
+        }
+    }
+    outcome
+}
+
+fn run_wrapper_owned(
+    args: Vec<OsString>,
+    unix_owner: &mut Option<network_unix_provision::Owner>,
+) -> Result<WrapperOutcome, String> {
     let mut invocation = parse_wrapper_invocation(args)?;
     let entry_control = ReapEntryControl::from_env()?;
     if entry_control.is_some() && invocation.cpu_budget_usec.is_none() {
@@ -1450,11 +1515,91 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         invocation.cpu_budget_usec =
             Some(ResolvedBudgets::read_bound(path, digest)?.cpu_budget_usec(&identity)?);
     }
+    let network_case = env::var(network_test_boundary::REQUEST_ENV)
+        .map(Some)
+        .or_else(|error| match error {
+            env::VarError::NotPresent => Ok(None),
+            error => Err(format!("invalid network boundary request: {error}")),
+        })?;
+    if let Some(case) = &network_case {
+        if invocation.cpu_budget_usec.is_none()
+            || invocation.termination_grace > Duration::from_secs(2)
+            || !network_test_boundary::authorize(
+                case,
+                &identity.package,
+                &identity.binary,
+                &identity.test,
+            )
+        {
+            return Err(
+                "network boundary requires an exact declared test and owned CPU-budget cgroup"
+                    .into(),
+            );
+        }
+    }
+    if network_case.is_some() {
+        let cli = PathBuf::from(required_env(network_test_boundary::CLI_ENV)?);
+        if !cli.is_absolute() || !cli.is_file() {
+            return Err("official network grant requires the verified prepared CLI path".into());
+        }
+    }
+    let network_terminal_path = if network_case.is_some() {
+        let counts = PathBuf::from(required_env("DAGRUN_TEST_COUNTS_PATH")?);
+        if !counts.is_absolute() || !counts.parent().is_some_and(Path::is_dir) {
+            return Err("official network boundary requires the actual absolute declared count-receipt path".into());
+        }
+        let mut name = counts.as_os_str().to_os_string();
+        name.push(format!(".{}.network-terminal.json", identity.key()));
+        let path = PathBuf::from(name);
+        if path.exists() {
+            return Err("network terminal receipt already exists".into());
+        }
+        Some(path)
+    } else {
+        None
+    };
+    let network_notifications = if network_case.is_some() {
+        let mut pipe = [-1; 2];
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(format!(
+                "network cause pipe: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Some(unsafe { (File::from_raw_fd(pipe[0]), File::from_raw_fd(pipe[1])) })
+    } else {
+        None
+    };
+    let network_cause_fd = network_notifications
+        .as_ref()
+        .map(|(_, write)| write.as_raw_fd());
     let started = Instant::now();
     RECEIVED_SIGNAL.store(0, Ordering::SeqCst);
     install_signal_handlers()?;
     if invocation.cpu_budget_usec.is_some() {
         install_subreaper()?;
+    }
+
+    if network_case.as_deref() == Some("unix") {
+        *unix_owner = Some(
+            network_unix_provision::Owner::new(
+                network_terminal_path
+                    .as_deref()
+                    .expect("authorized Unix terminal path"),
+            )
+            .map_err(|error| format!("Unix provisioning owner: {error}"))?,
+        );
+        unix_owner
+            .as_mut()
+            .expect("retained Unix owner")
+            .prepare(
+                &PathBuf::from(required_env(network_test_boundary::CLI_ENV)?),
+                started + Duration::from_secs(15),
+            )
+            .map_err(|error| format!("Unix provisioning: {error}"))?;
+        if RECEIVED_SIGNAL.load(Ordering::SeqCst) > 0 {
+            return Err("Unix provisioning interrupted before test admission".into());
+        }
     }
 
     let mut attempt_cgroup = invocation
@@ -1479,8 +1624,76 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         }
     }
 
+    // Only these declared network tests receive an actual owned directory
+    // capability. Unrelated test commands and their accounting are unchanged.
+    let network_directory = if network_case.is_some() {
+        let cgroup = attempt_cgroup
+            .as_mut()
+            .expect("network request requires cgroup");
+        let preparation = (|| {
+            cgroup.verify_identity()?;
+            for (name, value) in [
+                (
+                    "memory.max",
+                    network_test_boundary::MEMORY_BYTES.to_string(),
+                ),
+                ("memory.swap.max", "0".to_string()),
+            ] {
+                let mut control = openat_file(
+                    &cgroup.child,
+                    name,
+                    libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    name,
+                )?;
+                std::io::Write::write_all(&mut control, value.as_bytes())
+                    .map_err(|error| format!("set {name}: {error}"))?;
+                let mut actual = [0u8; 64];
+                let count = control
+                    .read_at(&mut actual, 0)
+                    .map_err(|error| format!("read {name}: {error}"))?;
+                if std::str::from_utf8(&actual[..count])
+                    .map_err(|e| e.to_string())?
+                    .trim()
+                    != value
+                {
+                    return Err(format!("{name} did not retain the requested network bound"));
+                }
+            }
+            cgroup.child.try_clone().map_err(|error| error.to_string())
+        })();
+        match preparation {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                let cleanup = cgroup.remove_empty();
+                return Err(format!(
+                    "network capability preparation: {error}; empty cgroup cleanup: {cleanup:?}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let network_fd = network_directory.as_ref().map(AsRawFd::as_raw_fd);
     let mut command = Command::new(program);
     command.args(child_args);
+    command.env_remove(network_test_boundary::REQUEST_ENV);
+    command.env_remove(network_test_boundary::FD_ENV);
+    command.env_remove(network_test_boundary::CASE_ENV);
+    command.env_remove(network_test_boundary::CAUSE_FD_ENV);
+    command.env_remove(network_unix_provision::BPFFS_ENV);
+    command.env_remove(network_unix_provision::RECOVERY_ENV);
+    command.env_remove(network_unix_provision::EVIDENCE_ENV);
+    if let Some(owner) = unix_owner.as_ref() {
+        owner.configure(&mut command);
+    }
+    if let (Some(fd), Some(case)) = (network_fd, &network_case) {
+        command.env(network_test_boundary::FD_ENV, fd.to_string());
+        command.env(network_test_boundary::CASE_ENV, case);
+        command.env(
+            network_test_boundary::CAUSE_FD_ENV,
+            network_cause_fd.unwrap().to_string(),
+        );
+    }
     command.env_remove(CPU_BINARY_MAP_ENV);
     command.env_remove(CPU_RECORD_DIR_ENV);
     command.env_remove(CPU_REPORT_PATH_ENV);
@@ -1515,6 +1728,12 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             .enrollment_fd();
         unsafe {
             command.pre_exec(move || {
+                for fd in [network_fd, network_cause_fd].into_iter().flatten() {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 loop {
                     let written = libc::write(enrollment_fd, b"0\n".as_ptr().cast(), 2);
                     if written == 2 {
@@ -1547,6 +1766,15 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             });
         }
     };
+    if let Some(owner) = unix_owner.as_mut() {
+        owner.child_launched = true;
+    }
+    // The outside owner keeps only the read end. EOF after cleanup proves
+    // that no inherited writer escaped the completed attempt.
+    let network_read = network_notifications.map(|(read, write)| {
+        drop(write);
+        read
+    });
     let child_pid = child.id();
     let direct_pidfd = match PidFd::open(child_pid) {
         Ok(pidfd) => pidfd,
@@ -1799,6 +2027,10 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let cgroup = attempt_cgroup
         .as_mut()
         .expect("budgeted path created an attempt cgroup");
+    let cleanup_started = Instant::now();
+    if let Some(owner) = unix_owner.as_mut() {
+        owner.cleanup_deadline = Some(cleanup_started + Duration::from_secs(15));
+    }
     let cleanup = match terminate_owned_cgroup(
         &direct_pidfd,
         cgroup,
@@ -1873,6 +2105,17 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     }
     if let Err(error) = cgroup.remove_empty() {
         finalization_errors.push(format!("owned empty cgroup removal failed: {error}"));
+    } else if let Some(owner) = unix_owner.as_mut() {
+        owner.test_drained = true;
+    }
+    if let Some(owner) = unix_owner.as_mut() {
+        if let Err(error) = owner.finish(cleanup_started + Duration::from_secs(15)) {
+            finalization_errors.push(format!("Unix provisioning cleanup UNKNOWN: {error}"));
+        }
+    }
+    if network_case.is_some() && cleanup_started.elapsed() > Duration::from_secs(15) {
+        finalization_errors
+            .push("network attempt cleanup exceeded the original 15-second join bound".into());
     }
     if !finalization_errors.is_empty() {
         return Err(format!(
@@ -1909,6 +2152,65 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     )
     .with_wait4(wait4);
     write_attempt_atomic(&record_dir, &record)?;
+    if let (Some(case), Some(read)) = (network_case, network_read) {
+        let mut buffer = [0u8; 9];
+        let mut used = 0;
+        loop {
+            let got = unsafe {
+                libc::read(
+                    read.as_raw_fd(),
+                    buffer[used..].as_mut_ptr().cast(),
+                    buffer.len() - used,
+                )
+            };
+            if got == 0 {
+                break;
+            }
+            if got < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!(
+                    "network terminal pipe did not reach EOF: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            used += got as usize;
+            if used == buffer.len() {
+                return Err("network terminal cause pipe exceeded its exact message bound".into());
+            }
+        }
+        let causes = network_test_boundary::decode_causes(&buffer[..used])
+            .ok_or_else(|| "malformed network terminal cause".to_string())?;
+        let cleanup_seconds = cleanup_started.elapsed().as_secs_f64();
+        if cleanup_seconds > 15.0 {
+            return Err("network terminal observation exceeded cleanup bound".into());
+        }
+        let terminal = serde_json::json!({
+            "schema": "hermit-official-network-terminal-v1", "case": case,
+            "attempt": record, "raw_cause_bytes": &buffer[..used], "causes": causes,
+            "cgroup_device": cgroup.identity.device, "cgroup_inode": cgroup.identity.inode,
+            "cgroup_empty_and_removed": true, "cause_pipe_eof": true,
+            "cleanup_seconds": cleanup_seconds, "cleanup_limit_seconds": 15,
+        });
+        let path = network_terminal_path.expect("network grant retained terminal path");
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("create network terminal receipt: {error}"))?;
+        serde_json::to_writer_pretty(file, &terminal).map_err(|error| error.to_string())?;
+        eprintln!("network-boundary-terminal: {}", path.display());
+        if cleanup_started.elapsed() > Duration::from_secs(15) {
+            return Err("network terminal receipt exceeded cleanup bound".into());
+        }
+        if !causes.is_empty() {
+            return Err(format!(
+                "network cell bound failed; raw completion retained in {}; causes: {causes:?}",
+                path.display()
+            ));
+        }
+    }
 
     match completion {
         AttemptCompletion::Exit { .. } => direct_status

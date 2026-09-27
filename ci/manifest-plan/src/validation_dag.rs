@@ -160,8 +160,8 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 269,
-        selected_steps: 270,
+        direct_steps: 275,
+        selected_steps: 276,
     },
     Profile {
         label: "portable",
@@ -1220,9 +1220,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 106 {
+    if expected.len() != 111 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 106",
+            "structured result producer registry has {} entries, expected 111",
             expected.len()
         ));
     }
@@ -1231,9 +1231,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 38 {
+    if expected_counts.len() != 43 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 38",
+            "Nextest expected-count registry has {} entries, expected 43",
             expected_counts.len()
         ));
     }
@@ -1357,7 +1357,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [67, 33, 2, 2, 2] {
+    if actual_group_counts != [72, 33, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1653,9 +1653,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1605 {
+    if cfg.steps.len() != 1611 {
         return Err(format!(
-            "superset has {} steps, expected 1605",
+            "superset has {} steps, expected 1611",
             cfg.steps.len()
         ));
     }
@@ -3432,6 +3432,52 @@ sys.exit(37)
             error.contains("no-result classification wrapper"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn only_normal_network_steps_request_nested_memory_and_pids() {
+        let configured = generate(&repo_root().unwrap()).expect("generate complete graph");
+        let graph = dag_from_json(&dag_to_json(&configured)).expect("round-trip complete graph");
+        let requested: Vec<_> = graph
+            .steps
+            .iter()
+            .filter_map(|step| {
+                step.env
+                    .get("DAGRUN_CGROUP_DELEGATE")
+                    .map(|value| (step.tag(), value.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            requested,
+            [
+                ("test.network_tcp".into(), "memory,pids"),
+                ("test.network_poll".into(), "memory,pids"),
+                ("test.network_recv".into(), "memory,pids"),
+                ("test.network_identity".into(), "memory,pids"),
+                ("test.network_unix".into(), "memory,pids"),
+            ]
+        );
+        // These commands already own their one-worker Nextest flag before the
+        // literal test-argument separator. Exercise the real DAG renderer:
+        // inheriting its default would append another flag after `-- --exact`.
+        for step in graph
+            .steps
+            .iter()
+            .filter(|step| step.env.contains_key("DAGRUN_CGROUP_DELEGATE"))
+        {
+            assert_eq!(step.hint.preferred_inner_jobs, Some(1));
+            assert!(step.cmd.ends_with(" -j 1 -- --exact"));
+            assert_eq!(
+                dagrun::command_with_inner_jobs(
+                    step,
+                    &graph.default_jobs_flag,
+                    step.hint.preferred_inner_jobs,
+                ),
+                step.cmd,
+                "the runner must preserve the exact filter tail for {}",
+                step.tag(),
+            );
+        }
     }
 
     #[test]

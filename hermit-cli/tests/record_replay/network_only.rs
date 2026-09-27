@@ -6,12 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Tests-first acceptance bracket for schedule-independent network replay.
-//!
-//! The native fixture test is active now. The Hermit acceptance test remains
-//! ignored until the three network policies and run-mode trace flags exist; an
-//! explicit ignored run then exercises the real CLI and fails at the first
-//! missing behavior without weakening any assertion below.
+//! Normal acceptance for schedule-independent network replay.
+//! Official validation supplies an owned nextest cgroup capability. Explicit
+//! ad-hoc execution continues to require the bounded safehermit wrapper.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -208,13 +205,19 @@ fn assert_controller_report(report: &str) {
     );
 }
 
-fn safehermit_command(
+pub(super) fn safehermit_command(
     evidence: &Path,
     label: &str,
     hermit_arguments: &[String],
     guest: &Path,
     guest_arguments: &[&str],
 ) -> Output {
+    if super::network_boundary::active() {
+        let output =
+            super::network_boundary::run(evidence, label, hermit_arguments, guest, guest_arguments);
+        super::network_boundary::assert_receipt(evidence, label, None);
+        return output;
+    }
     let safehermit = std::env::var_os("HERMIT_SAFEHERMIT").unwrap_or_else(|| {
         panic!(
             "set HERMIT_SAFEHERMIT=/home/newton/work/dev-hermit/bin/safehermit; \
@@ -253,7 +256,7 @@ fn safehermit_command(
     output
 }
 
-fn common_run_arguments(seed: u64, max_timeslice: u64) -> Vec<String> {
+pub(super) fn common_run_arguments(seed: u64, max_timeslice: u64) -> Vec<String> {
     vec![
         "--log=info".into(),
         "run".into(),
@@ -269,7 +272,7 @@ fn common_run_arguments(seed: u64, max_timeslice: u64) -> Vec<String> {
     ]
 }
 
-fn assert_success(output: &Output, label: &str) {
+pub(super) fn assert_success(output: &Output, label: &str) {
     assert!(
         output.status.success(),
         "{label} failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -279,7 +282,7 @@ fn assert_success(output: &Output, label: &str) {
     );
 }
 
-fn assert_l2_report(path: &Path, label: &str) {
+pub(super) fn assert_l2_report(path: &Path, label: &str) {
     let report: serde_json::Value = serde_json::from_slice(
         &fs::read(path).unwrap_or_else(|error| panic!("{label} omitted verify JSON: {error}")),
     )
@@ -387,8 +390,8 @@ fn acceptance_evidence_directory() -> (Option<tempfile::TempDir>, PathBuf) {
 }
 
 #[test]
-#[ignore = "run explicitly after the shared network runtime reaches a green boundary"]
 fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
+    super::network_boundary::initialize("tcp");
     let _guard = super::hermit_record_lock();
     let fixture = &super::workload("c_network_replay_tcp_bracket").path;
     let (_temporary_evidence, evidence) = acceptance_evidence_directory();
@@ -500,10 +503,23 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
         &["client", &port, "match"],
     );
     assert_fail_closed(&missing, "missing network trace", &["network", "trace"]);
-
-    // Additive current-LOWAT regression; all original acceptance gates above remain.
-    lowat::assert_record_replay_lowat(&evidence.join("lowat"));
 }
 
 #[path = "network_lowat.rs"]
 mod lowat;
+
+#[test]
+fn blocked_poll_replays_current_lowat_across_schedules() {
+    super::network_boundary::initialize("poll");
+    let _guard = super::hermit_record_lock();
+    let (_temporary_evidence, evidence) = acceptance_evidence_directory();
+    lowat::assert_record_replay_lowat(&evidence.join("lowat"), lowat::Case::Poll);
+}
+
+#[test]
+fn blocked_receive_replays_saved_target_across_schedules() {
+    super::network_boundary::initialize("recv");
+    let _guard = super::hermit_record_lock();
+    let (_temporary_evidence, evidence) = acceptance_evidence_directory();
+    lowat::assert_record_replay_lowat(&evidence.join("lowat"), lowat::Case::Recv);
+}

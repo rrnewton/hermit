@@ -78,7 +78,6 @@ stress_suite	measured-green-pending-registration	Measured 2026-08-26 on hermit@a
 syscall_file_io	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 syscall_file_metadata	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 syscall_quick_wins	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-sysfs_rtc_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 sysv_legacy_fallbacks	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 tcp_info_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 terminal_child_selectors	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 2 tests, 2 pass, 0.5s. Green; belongs in the DAG pending a memory sample for its hint block.

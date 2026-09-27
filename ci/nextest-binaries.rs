@@ -22,6 +22,11 @@ fn run() -> Result<i32, String> {
             println!("{}", std::env::current_exe().map_err(|e| e.to_string())?.display());
             Ok(0)
         }
+        Some("network-cli") => {
+            if args.next().is_some() { return Err("unexpected network CLI query argument".into()); }
+            println!("{}", hermit_manifest_plan::nextest_binaries::network_cli(&root)?.display());
+            Ok(0)
+        }
         Some("prepare") => {
             let profile = args.next().ok_or("prepare requires a committed graph profile")?;
             if args.next().is_some() { return Err("unexpected prepare argument".into()); }

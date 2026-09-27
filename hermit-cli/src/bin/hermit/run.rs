@@ -494,6 +494,20 @@ pub struct RunOpts {
     )]
     network: NetworkingMode,
 
+    /// Administrator-provisioned private bpffs directory for the default Unix
+    /// network guard. Must be supplied together with --network-guard-recovery.
+    #[clap(long, value_name = "DIRECTORY", requires = "network_guard_recovery")]
+    network_guard_bpffs: Option<PathBuf>,
+
+    /// Existing private recovery directory for the default Unix network guard.
+    /// Terminal receipts and bounded helper diagnostics are retained here.
+    #[clap(long, value_name = "DIRECTORY", requires = "network_guard_bpffs")]
+    network_guard_recovery: Option<PathBuf>,
+
+    /// Existing separate private directory for accepted-provider recovery receipts.
+    #[clap(long, value_name = "DIRECTORY")]
+    network_accepted_recovery: Option<PathBuf>,
+
     /// Expose the live host network to the guest without recording it. This admits uncontrolled
     /// external input and therefore forfeits Hermit's deterministic-execution guarantee. The old
     /// `--network=host` spelling remains accepted for compatibility.
@@ -982,6 +996,7 @@ fn trace_epoch(trace: &NetworkTrace) -> Epoch {
         NetworkTrace::V1(trace) => trace.epoch,
         NetworkTrace::V2(trace) => trace.epoch,
         NetworkTrace::V3(trace) => trace.history.epoch,
+        NetworkTrace::V4(trace) => trace.epoch,
     }
 }
 
@@ -1150,6 +1165,27 @@ impl fmt::Display for RunOpts {
                 NetworkingMode::Local => write!(f, " --network=local")?,
                 NetworkingMode::UnsafeHost => write!(f, " --unsafe-live-network")?,
             }
+        }
+        if let Some(path) = &self.network_guard_bpffs {
+            write!(
+                f,
+                " --network-guard-bpffs={}",
+                shell_words::quote(&path.display().to_string())
+            )?;
+        }
+        if let Some(path) = &self.network_guard_recovery {
+            write!(
+                f,
+                " --network-guard-recovery={}",
+                shell_words::quote(&path.display().to_string())
+            )?;
+        }
+        if let Some(path) = &self.network_accepted_recovery {
+            write!(
+                f,
+                " --network-accepted-recovery={}",
+                shell_words::quote(&path.display().to_string())
+            )?;
         }
         if let Some(path) = &self.record_networking {
             write!(
@@ -3674,7 +3710,12 @@ impl RunOpts {
                     explicit_backend.as_str()
                 );
             }
-        } else if backend != Backend::Kvm {
+        }
+        // Refuse an unsupported bound before probing backend availability. The
+        // policy is independent of optional build features. Keep this in main:
+        // the DBT launch arm returns directly without reaching RunOpts::run.
+        self.ensure_timeout_supported()?;
+        if !self.namespace_only && backend != Backend::Kvm {
             // E9patch's own availability check covers both its ptrace runtime and
             // the `e9patch` cargo feature (it reports "not included in this build"
             // when the feature is disabled), so it no longer needs a special case.
@@ -3687,14 +3728,6 @@ impl RunOpts {
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
         self.validate_program()?;
-        // ⚠️ HERE, NOT IN `run()`. The DBT arm below RETURNS `run_dbt(..)` and
-        // never reaches `RunOpts::run`, so a check placed there covers every
-        // backend except the one measured furthest from working. Same shape as
-        // the `--namespace-only` second launch path documented in `run()`: the
-        // first placement worked and was not yet complete. Measured: with the
-        // check in `run()`, `--backend dbt --timeout 3` still accepted the flag
-        // and ran unbounded.
-        self.ensure_timeout_supported()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
         }
@@ -4760,7 +4793,7 @@ impl RunOpts {
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
-        let mut network_publication = match self.det_opts.det_config.network_trace.policy {
+        let network_publication = match self.det_opts.det_config.network_trace.policy {
             detcore_model::network_trace::NetworkPolicy::Record => {
                 let path = self
                     .det_opts
@@ -4797,60 +4830,74 @@ impl RunOpts {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
-            let (value, (_summary, publication)) = super::owned_container::run(
+            let (value, (_summary, publication)) = self.with_network_container_owned(
                 &mut process,
                 (summary_output, network_publication),
                 "held summary/output and network publication descriptors; no PID namespace".into(),
                 false,
-                "with_container",
                 timeout,
-                move |(summary, publication)| {
-                    options.run_in_container(
-                        &global,
-                        capture_output,
-                        guest_capture.as_ref(),
-                        summary.as_ref(),
-                        None,
-                        publication.as_ref().map(NetworkTracePublication::writer_fd),
-                    )
+                move |(summary, publication), resource| {
+                    options
+                        .run_in_container(
+                            &global,
+                            capture_output,
+                            guest_capture.as_ref(),
+                            summary.as_ref(),
+                            None,
+                            publication.as_ref().map(NetworkTracePublication::writer_fd),
+                            resource,
+                        )
+                        .map(|(status, output)| super::network_run::RunValue::Run(status, output))
                 },
             )?;
             if let Some(publication) = publication {
                 publication.commit().map_err(Error::msg)?;
             }
-            return Ok(value);
+            return Self::run_value(value);
         }
         let tmpfs = self.tmpfs()?;
-        let (mut container, identity) = self.container(tmpfs.path())?;
+
+        let (mut container, identity_sources) = self.container(tmpfs.path())?;
+
         let resources = format!(
             "private tmp {}, identity mounts, summary/output and network publication descriptors",
             tmpfs.path().display()
         );
-        let (value, (_tmpfs, _identity, _summary, publication)) = super::owned_container::run(
-            &mut container,
-            (tmpfs, identity, summary_output, network_publication),
-            resources,
-            true,
-            "with_container",
-            timeout,
-            move |(_, identity, summary, publication)| {
-                options.run_in_container(
-                    &global,
-                    capture_output,
-                    guest_capture.as_ref(),
-                    summary.as_ref(),
-                    Some(identity),
-                    publication.as_ref().map(NetworkTracePublication::writer_fd),
-                )
-            },
-        )?;
+        let (value, (_tmpfs, _identity, _summary, publication)) = self
+            .with_network_container_owned(
+                &mut container,
+                (tmpfs, identity_sources, summary_output, network_publication),
+                resources,
+                true,
+                timeout,
+                move |(_, identity, summary, publication), resource| {
+                    options
+                        .run_in_container(
+                            &global,
+                            capture_output,
+                            guest_capture.as_ref(),
+                            summary.as_ref(),
+                            Some(identity),
+                            publication.as_ref().map(NetworkTracePublication::writer_fd),
+                            resource,
+                        )
+                        .map(|(status, output)| super::network_run::RunValue::Run(status, output))
+                },
+            )?;
         if let Some(publication) = publication {
             publication.commit().map_err(Error::msg)?;
         }
-        Ok(value)
+        Self::run_value(value)
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        if self.det_opts.det_config.network_trace.policy
+            == detcore_model::network_trace::NetworkPolicy::Deny
+        {
+            return Err(network_policy_refusal(
+                "network disabled: --namespace-only has no authenticated initial-task guard enrollment",
+            ));
+        }
         // TODO: Make this use detcore instead after detcore is capable of being
         // "lightweight".
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
@@ -5421,33 +5468,41 @@ impl RunOpts {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
-            return super::owned_container::run(
+            let (value, _guards) = self.with_network_container_owned(
                 &mut process,
                 Some(log_file),
                 "verification log descriptor; no PID namespace".into(),
                 false,
-                "with_container",
                 None,
-                move |log| options.run_verify_in_container(log, &global, None),
-            )
-            .map(|(value, _guards)| value);
+                move |log, resource| {
+                    options
+                        .run_verify_in_container(log, &global, None, resource)
+                        .map(|(output, count)| super::network_run::RunValue::Verify(output, count))
+                },
+            )?;
+            return Self::verify_value(value);
         }
         let tmpfs = self.tmpfs()?;
-        let (mut container, identity) = self.container(tmpfs.path())?;
+
+        let (mut container, identity_sources) = self.container(tmpfs.path())?;
+
         let resources = format!(
             "private tmp {}, identity mounts and verification log",
             tmpfs.path().display()
         );
-        super::owned_container::run(
+        let (value, _guards) = self.with_network_container_owned(
             &mut container,
-            (tmpfs, identity, Some(log_file)),
+            (tmpfs, identity_sources, Some(log_file)),
             resources,
             true,
-            "with_container",
             None,
-            move |(_, identity, log)| options.run_verify_in_container(log, &global, Some(identity)),
-        )
-        .map(|(value, _guards)| value)
+            move |(_, identity, log), resource| {
+                options
+                    .run_verify_in_container(log, &global, Some(identity), resource)
+                    .map(|(output, count)| super::network_run::RunValue::Verify(output, count))
+            },
+        )?;
+        Self::verify_value(value)
     }
 
     fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
@@ -5637,6 +5692,112 @@ impl RunOpts {
         )))
     }
 
+    fn with_network_container_owned<G, F>(
+        &self,
+        container: &mut Container,
+        guards: G,
+        resources: String,
+        private_pid_namespace: bool,
+        timeout: Option<Duration>,
+        mut execute: F,
+    ) -> Result<(super::network_run::RunValue, G), Error>
+    where
+        G: 'static,
+        F: FnMut(
+                &mut G,
+                Option<detcore::network_runtime::NetworkRuntimeResources>,
+            ) -> Result<super::network_run::RunValue, Error>
+            + 'static,
+    {
+        let roots = super::network_run::deployment_roots(
+            self.network_guard_bpffs.as_deref(),
+            self.network_guard_recovery.as_deref(),
+        )?;
+        if self.det_opts.det_config.network_trace.policy
+            == detcore_model::network_trace::NetworkPolicy::Record
+        {
+            if self.runtime_backend() != Backend::Ptrace || self.no_namespace || self.namespace_only
+            {
+                return Err(network_policy_refusal(
+                    "network Record requires the owned ptrace container and authentic initial table",
+                ));
+            }
+            return super::network_run::run_record_at_owned(
+                container,
+                guards,
+                roots,
+                self.network_accepted_recovery.as_deref(),
+                "with_container",
+                execute,
+            );
+        }
+        let replay = self.det_opts.det_config.network_trace.policy
+            == detcore_model::network_trace::NetworkPolicy::Replay;
+        if self.det_opts.det_config.network_trace.policy
+            == detcore_model::network_trace::NetworkPolicy::UnsafeLive
+        {
+            if self.network_accepted_recovery.is_some() {
+                return Err(network_policy_refusal(
+                    "accepted recovery root requires Record or Replay custody",
+                ));
+            }
+            return super::owned_container::run(
+                container,
+                guards,
+                resources,
+                private_pid_namespace,
+                "with_container",
+                timeout,
+                move |guards| execute(guards, None),
+            );
+        }
+        if !matches!(self.runtime_backend(), Backend::Ptrace | Backend::E9patch)
+            || self.no_namespace
+            || self.namespace_only
+        {
+            return Err(network_policy_refusal(
+                "network disabled: this execution path has no authenticated Unix guard enrollment",
+            ));
+        }
+        if replay {
+            super::network_run::run_replay_at_owned(
+                container,
+                guards,
+                roots,
+                self.network_accepted_recovery.as_deref(),
+                "with_container",
+                None,
+                move |guards, resource, _| execute(guards, resource),
+            )
+        } else {
+            super::network_run::run_at_owned(
+                container,
+                guards,
+                roots,
+                self.network_accepted_recovery.as_deref(),
+                "with_container",
+                execute,
+            )
+        }
+    }
+
+    fn run_value(
+        value: super::network_run::RunValue,
+    ) -> Result<(ExitStatus, Option<Output>), Error> {
+        match value {
+            super::network_run::RunValue::Run(status, output) => Ok((status, output)),
+            _ => Err(Error::msg("wrong authenticated network result kind")),
+        }
+    }
+    fn verify_value(value: super::network_run::RunValue) -> Result<(Output, u64), Error> {
+        match value {
+            super::network_run::RunValue::Verify(output, count) => Ok((output, count)),
+            _ => Err(Error::msg(
+                "wrong authenticated network verification result kind",
+            )),
+        }
+    }
+
     fn run_in_container(
         &self,
         global: &GlobalOpts,
@@ -5645,6 +5806,7 @@ impl RunOpts {
         summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
         network_output_fd: Option<i32>,
+        network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
 
@@ -5701,14 +5863,19 @@ impl RunOpts {
             guest_capture,
             |summary_json| {
                 if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-                    let out = hermit::run_with_output_backend_timeout(
-                        command,
-                        config,
-                        self.summary,
-                        summary_json,
-                        backend,
-                        timeout,
-                    )?;
+                    let (out, skid_overshoots) =
+                        hermit::run_with_output_backend_timeout_and_network_resources(
+                            command,
+                            config,
+                            self.summary,
+                            summary_json,
+                            backend,
+                            timeout,
+                            network_runtime,
+                        )?;
+                    if skid_overshoots > 0 {
+                        return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
+                    }
                     if let Some(capture) = guest_capture {
                         capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
                         Ok((out.status, None))
@@ -5716,13 +5883,14 @@ impl RunOpts {
                         Ok((out.status, Some(out)))
                     }
                 } else {
-                    let status = hermit::run_with_backend_timeout(
+                    let status = hermit::run_with_backend_timeout_and_network_resources(
                         command,
                         config,
                         self.summary,
                         summary_json,
                         backend,
                         timeout,
+                        network_runtime,
                     )?;
                     Ok((status, None))
                 }
@@ -5735,6 +5903,7 @@ impl RunOpts {
         log_file: &mut Option<fs::File>,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
+        network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
     ) -> Result<(Output, u64), Error> {
         // HACK: Use interior mutability to workaround not being able to pass
         // `log_file` by value. Guaranteed by caller to never panic.
@@ -5777,13 +5946,14 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
-        hermit::run_with_output_backend_timeout_and_skid_overshoots(
+        hermit::run_with_output_backend_timeout_and_network_resources(
             command,
             config,
             self.summary,
             &self.summary_json,
             self.runtime_backend(),
             None,
+            network_runtime,
         )
     }
 }
@@ -6528,5 +6698,51 @@ mod tests {
             rendered.contains("refusing to fall back"),
             "the refusal did not say why it refused: {rendered}"
         );
+    }
+    #[test]
+    fn v4_replay_epoch_uses_exact_trace_value_and_refuses_explicit_mismatch() {
+        use detcore_model::network_trace::NetworkCreationModelV4;
+        use detcore_model::network_trace::NetworkReleaseModelV4;
+        use detcore_model::network_trace::NetworkTraceV4;
+        use detcore_model::network_trace::ReceiveEnvironmentV3;
+        let epoch: Epoch = "2026-01-01T00:00:00.000000001Z".parse().unwrap();
+        let trace = NetworkTrace::V4(NetworkTraceV4 {
+            epoch,
+            channels: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            creation_model: NetworkCreationModelV4::OutboundAndDatagramV1,
+            release_model: NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes: vec![] },
+            native_receive_observations: vec![],
+            fresh_stream_profiles: vec![],
+            receive_environment: ReceiveEnvironmentV3::SingleRecorderNamespaceV1,
+            channel_socket_classes: vec![],
+            fresh_send_timeouts: vec![],
+        });
+        assert_eq!(trace_epoch(&trace), epoch);
+        let mut config = DetConfig::default();
+        resolve_run_epoch(
+            &mut config,
+            false,
+            Some(trace_epoch(&trace)),
+            capture_current_epoch(),
+        )
+        .unwrap();
+        assert_eq!(config.epoch, epoch);
+        assert!(config.epoch_explicit);
+        let wrong: Epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+        config.epoch = wrong;
+        assert!(
+            resolve_run_epoch(
+                &mut config,
+                true,
+                Some(trace_epoch(&trace)),
+                capture_current_epoch()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match network trace epoch")
+        );
+        assert_eq!(config.epoch, wrong);
     }
 }

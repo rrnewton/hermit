@@ -188,6 +188,15 @@ fn safehermit(
     fixture: &Path,
     client: &[&str],
 ) -> Output {
+    if super::network_boundary::active() {
+        let output = super::network_boundary::run(evidence, label, arguments, fixture, client);
+        super::network_boundary::assert_receipt(evidence, label, None);
+        assert!(
+            !matches!(output.status.code(), None | Some(124 | 137)),
+            "{label} hit a bound"
+        );
+        return output;
+    }
     let wrapper = std::env::var_os("HERMIT_SAFEHERMIT")
         .expect("HERMIT_SAFEHERMIT must name the parent bounded wrapper");
     let report = evidence.join(format!("{label}.safehermit"));
@@ -302,8 +311,8 @@ fn native_endpoint_identity_fixture_changes_actual_socket_creation_order() {
 }
 
 #[test]
-#[ignore = "requires explicit bounded ptrace execution and a private quota-enabled evidence directory"]
 fn endpoint_identity_replays_creation_orders_and_refuses_wrong_peers() {
+    super::network_boundary::initialize("identity");
     let _guard = super::hermit_record_lock();
     let fixture = &super::workload("c_network_channel_identity").path;
     let temporary;

@@ -32,6 +32,7 @@ mod image;
 mod instruction_map;
 mod list;
 mod logdiff;
+mod network_run;
 mod oci;
 mod owned_container;
 mod podman_store;
@@ -490,8 +491,14 @@ fn main() {
             }
         }
     }
+    if accepted_service::grouped_requested() {
+        accepted_service::run_grouped(startup_stdin());
+    }
     if accepted_service::requested() {
         accepted_service::run(startup_stdin());
+    }
+    if accepted_service::readback_requested() {
+        accepted_service::run_readback(startup_stdin());
     }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
@@ -597,6 +604,12 @@ fn main() {
 /// positions are consistent: the code channel exists to tell hermit's failures
 /// apart from the guest's, not to subdivide hermit's own.
 fn failure_exit_code(error: &Error) -> i32 {
+    if let Some(failure) = error.downcast_ref::<network_run::UnpublishedGuestFailure>() {
+        return match failure.status() {
+            ExitStatus::Exited(code) => code,
+            ExitStatus::Signaled(signal, _) => detcore_model::signal_exit_status(signal as i32),
+        };
+    }
     // A completed comparison with a recorded PMU skid overshoot is an
     // understood infrastructure failure. Hermit deliberately declines to
     // vouch for the result, so it uses the same coarse exit class as other
@@ -634,6 +647,13 @@ fn failure_exit_code(error: &Error) -> i32 {
 }
 
 fn classify_failure(error: &Error) -> String {
+    if let Some(failure) = error.downcast_ref::<network_run::UnpublishedGuestFailure>() {
+        return format!(
+            "HERMIT_GUEST_FAILURE class=guest-exit status={:?} guard={} result=withheld",
+            failure.status(),
+            failure.phase()
+        );
+    }
     if let Some(overshoot) = error.downcast_ref::<hermit::SkidOvershootError>() {
         return format!(
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={}",

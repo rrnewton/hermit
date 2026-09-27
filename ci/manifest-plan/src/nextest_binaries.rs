@@ -26,7 +26,7 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 3;
+const RECORD_SCHEMA: u32 = 4;
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
 const CPU_WRAPPER_PACKAGE: &str = "hermit-manifest-plan";
@@ -326,6 +326,7 @@ struct BinaryIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct SelectionRecord {
     build_args: Vec<String>,
+    target_platforms: Vec<String>,
     metadata: FileIdentity,
     binaries: Vec<BinaryIdentity>,
     runtime_files: Vec<FileIdentity>,
@@ -340,6 +341,8 @@ struct PreparedRecord {
     rustc: String,
     cargo_config: BTreeMap<PathBuf, Option<FileIdentity>>,
     build_environment: BTreeMap<String, String>,
+    // Producer-only native fallback; explicit CLI targets still override it.
+    native_target: Option<String>,
     cargo_metadata: FileIdentity,
     selections: BTreeMap<String, SelectionRecord>,
     guests: Vec<FileIdentity>,
@@ -433,7 +436,11 @@ fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), Stri
     Ok(())
 }
 
-fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), PreparationError> {
+fn prepare_cpu_wrapper(
+    root: &Path,
+    destination: &Path,
+    native_target: Option<&str>,
+) -> Result<(), PreparationError> {
     cargo_output(
         root,
         &[
@@ -447,6 +454,7 @@ fn prepare_cpu_wrapper(root: &Path, destination: &Path) -> Result<(), Preparatio
         ]
         .map(String::from),
         destination,
+        native_target,
     )
 }
 
@@ -457,15 +465,17 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let artifacts = LockedArtifacts::open(&root, true)?;
+    let native_target = native_preparation_target(&root, &rustc_identity()?)?;
     let cargo_path = artifacts.root.join("standalone-cargo.json");
     cargo_output(
         &root,
         &["metadata", "--locked", "--format-version", "1"].map(String::from),
         &cargo_path,
+        native_target.as_deref(),
     )?;
     let cargo = read_json(&cargo_path)?;
     let events = artifacts.root.join("standalone-cpu-wrapper.jsonl");
-    prepare_cpu_wrapper(&root, &events)?;
+    prepare_cpu_wrapper(&root, &events, native_target.as_deref())?;
     Ok(cpu_wrapper_artifact(
         &fs::read_to_string(events).map_err(|e| e.to_string())?,
         &cargo,
@@ -570,8 +580,14 @@ pub fn budget_context(
             })
         })
         .collect::<BTreeSet<_>>();
-    let build = serde_json::to_vec(&(&record.rustc, &parsed.build, environment, config))
-        .map_err(|e| e.to_string())?;
+    let build = serde_json::to_vec(&(
+        &record.rustc,
+        &parsed.build,
+        &record.native_target,
+        environment,
+        config,
+    ))
+    .map_err(|e| e.to_string())?;
     let machine = fs::read_to_string("/proc/cpuinfo")
         .map_err(|e| e.to_string())?
         .lines()
@@ -934,12 +950,105 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
 }
 
-fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), PreparationError> {
+// Keep native host build dependencies and native target cdylibs in distinct
+// Cargo output directories. Cargo itself resolves ancestor/local configuration;
+// explicit CLI, environment and configured targets retain their precedence.
+fn native_target_from_inputs(
+    rustc: &str,
+    environment_target: bool,
+    config: &Value,
+) -> Result<Option<String>, String> {
+    if environment_target
+        || !config["build"]["target"].is_null()
+        || !config["env"]["CARGO_BUILD_TARGET"].is_null()
+    {
+        return Ok(None);
+    }
+    let hosts = rustc
+        .lines()
+        .filter_map(|line| line.strip_prefix("host: "))
+        .collect::<Vec<_>>();
+    if hosts.len() != 1 || hosts[0].is_empty() || hosts[0].contains(char::is_whitespace) {
+        return Err("compiler identity has no unique native target".into());
+    }
+    Ok(Some(hosts[0].to_owned()))
+}
+
+fn preparation_cargo_config(root: &Path) -> Result<Value, String> {
+    let output = Command::new("cargo")
+        .args([
+            "-Z",
+            "unstable-options",
+            "config",
+            "get",
+            "--format=json",
+            "--offline",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot resolve preparation Cargo configuration: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot resolve preparation Cargo configuration: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let config: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid resolved Cargo configuration: {error}"))?;
+    if !config.is_object() {
+        return Err("resolved Cargo configuration is not an object".into());
+    }
+    Ok(config)
+}
+
+fn native_preparation_target(root: &Path, rustc: &str) -> Result<Option<String>, String> {
+    native_target_from_inputs(
+        rustc,
+        std::env::var_os("CARGO_BUILD_TARGET").is_some(),
+        &preparation_cargo_config(root)?,
+    )
+}
+
+fn target_platforms(metadata: &Value) -> Result<Vec<String>, String> {
+    metadata["rust-build-meta"]["target-platforms"]
+        .as_array()
+        .ok_or("prepared metadata has no target platforms")?
+        .iter()
+        .map(|platform| string(platform, "triple").map(str::to_owned))
+        .collect()
+}
+
+fn check_native_target(
+    native: Option<&str>,
+    args: &[String],
+    platforms: &[String],
+) -> Result<(), String> {
+    if let Some(native) = native {
+        if !args
+            .iter()
+            .any(|arg| arg == "--target" || arg.starts_with("--target="))
+            && (platforms.len() != 1 || platforms[0] != native)
+        {
+            return Err("prepared metadata differs from the explicit native target".into());
+        }
+    }
+    Ok(())
+}
+
+fn cargo_output(
+    root: &Path,
+    args: &[String],
+    destination: &Path,
+    native_target: Option<&str>,
+) -> Result<(), PreparationError> {
     let output = fs::File::create(destination).map_err(|e| e.to_string())?;
-    let status = Command::new(root.join("ci/run-with-reverie-dbt-budget.sh"))
-        .arg("cargo")
-        .args(args)
-        .env("CARGO_BUILD_JOBS", "8")
+    let mut command = Command::new(root.join("ci/run-with-reverie-dbt-budget.sh"));
+    command.arg("cargo").args(args).env("CARGO_BUILD_JOBS", "8");
+    if let Some(target) = native_target {
+        command.env("CARGO_BUILD_TARGET", target);
+    }
+    let status = command
         .current_dir(root)
         .stdout(output)
         .status()
@@ -977,7 +1086,9 @@ fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> 
     if record.sources != sources(&cargo, root)? {
         return Err("prepared executables are stale: source identity changed".into());
     }
-    if record.rustc != rustc_identity()?
+    let rustc = rustc_identity()?;
+    if record.rustc != rustc
+        || record.native_target != native_preparation_target(root, &rustc)?
         || record.build_environment != build_environment()
         || record.cargo_config != cargo_config(root)?
     {
@@ -1001,6 +1112,14 @@ fn verify_selection(
     }
     check_identity(&selected.metadata, false)?;
     let metadata = read_json(&selected.metadata.path)?;
+    if selected.target_platforms != target_platforms(&metadata)? {
+        return Err("prepared target platforms changed".into());
+    }
+    check_native_target(
+        record.native_target.as_deref(),
+        args,
+        &selected.target_platforms,
+    )?;
     let (binaries, runtime_files) = metadata_binaries(&metadata, cargo, &record.target)?;
     if selected.binaries != binaries || selected.runtime_files != runtime_files {
         return Err("prepared executable, package identity, or runtime file changed".into());
@@ -1241,6 +1360,10 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             .as_nanos()
     ));
     fs::create_dir(&generation).map_err(|e| e.to_string())?;
+    let before_rustc = rustc_identity()?;
+    let before_environment = build_environment();
+    let before_config = cargo_config(&root)?;
+    let native_target = native_preparation_target(&root, &before_rustc)?;
     let cargo_path = generation.join("cargo.json");
     cargo_output(
         &root,
@@ -1251,12 +1374,10 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             "--locked".into(),
         ],
         &cargo_path,
+        native_target.as_deref(),
     )?;
     let cargo = read_json(&cargo_path)?;
     let before_sources = sources(&cargo, &root)?;
-    let before_rustc = rustc_identity()?;
-    let before_environment = build_environment();
-    let before_config = cargo_config(&root)?;
     let target = PathBuf::from(string(&cargo, "target_directory")?);
     fs::create_dir_all(&target).map_err(|e| e.to_string())?;
     if !target.is_absolute() || target.canonicalize().map_err(|e| e.to_string())? != target {
@@ -1273,7 +1394,12 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             "binaries-only".into(),
         ];
         args.extend(selection.iter().cloned());
-        cargo_output(&root, &args, &generation.join(format!("{key}.json")))?;
+        cargo_output(
+            &root,
+            &args,
+            &generation.join(format!("{key}.json")),
+            native_target.as_deref(),
+        )?;
     }
     let needs_guests = has_test_selection(selections.values(), "hermit_modes");
     let needs_record_workloads = has_test_selection(selections.values(), "record_replay");
@@ -1291,16 +1417,20 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             ]
             .map(String::from),
             &guest_path,
+            native_target.as_deref(),
         )?;
     }
     let cpu_wrapper_path = generation.join("cpu-wrapper.jsonl");
-    prepare_cpu_wrapper(&root, &cpu_wrapper_path)?;
+    prepare_cpu_wrapper(&root, &cpu_wrapper_path, native_target.as_deref())?;
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
     for (key, build_args) in selections {
         let path = generation.join(format!("{key}.json"));
-        let (binaries, runtime_files) = metadata_binaries(&read_json(&path)?, &cargo, &target)?;
+        let metadata_value = read_json(&path)?;
+        let target_platforms = target_platforms(&metadata_value)?;
+        check_native_target(native_target.as_deref(), &build_args, &target_platforms)?;
+        let (binaries, runtime_files) = metadata_binaries(&metadata_value, &cargo, &target)?;
         let metadata = file_identity(&path, false)?;
         let args = [
             "nextest",
@@ -1315,11 +1445,17 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         .map(String::from);
         // Nextest itself must accept every complete metadata pair after the
         // final build; this enumerates tests and never invokes the compiler.
-        cargo_output(&root, &args, &generation.join(format!("{key}.tests.json")))?;
+        cargo_output(
+            &root,
+            &args,
+            &generation.join(format!("{key}.tests.json")),
+            native_target.as_deref(),
+        )?;
         recorded_selections.insert(
             key,
             SelectionRecord {
                 build_args,
+                target_platforms,
                 metadata,
                 binaries,
                 runtime_files,
@@ -1353,6 +1489,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         rustc: before_rustc,
         cargo_config: before_config,
         build_environment: before_environment,
+        native_target,
         cargo_metadata: file_identity(&cargo_path, false)?,
         selections: recorded_selections,
         guests,
@@ -1470,6 +1607,15 @@ pub fn run(
             serde_json::to_string(&guests).map_err(|e| e.to_string())?,
         )
         .current_dir(&root);
+    // Network acceptance must use the exact non-test CLI retained by this
+    // prepared selection, including a non-default Cargo target directory.
+    command.env_remove("HERMIT_PREPARED_NETWORK_CLI");
+    if has_test_selection(std::iter::once(&parsed.build), "record_replay") {
+        command.env(
+            "HERMIT_PREPARED_NETWORK_CLI",
+            network_cli_in_selection(&record, &cargo, &selection)?,
+        );
+    }
     // Never inherit an unverified population from the caller's environment.
     command.env_remove(record_workloads::PREPARED_ENV);
     if let Some(workloads) = record_workloads {
@@ -1495,6 +1641,75 @@ pub fn assert_profile(root: &Path, profile: &str) -> Result<(), String> {
     verify_guests(&record)?;
     verify_record_workloads(&record, &cargo)?;
     Ok(())
+}
+
+/// Resolve the actual Cargo non-test CLI used by the prepared record_replay
+/// selection. This respects Cargo's authenticated target directory; it does
+/// not assume target/debug or search ambient PATH.
+pub fn network_cli(root: &Path) -> Result<PathBuf, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let artifacts = LockedArtifacts::open(&root, false)?;
+    let record = artifacts.current()?;
+    let cargo = verify_record(&root, &record)?;
+    let args = crate::nextest_build_selections::for_step("test.network_tcp")
+        .ok_or("missing declared network build selection")?
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect::<Vec<_>>();
+    let selection = verify_selection(&record, &cargo, &args)?;
+    network_cli_in_selection(&record, &cargo, &selection)
+}
+
+fn network_cli_in_selection(
+    record: &PreparedRecord,
+    cargo: &Value,
+    selection: &SelectionRecord,
+) -> Result<PathBuf, String> {
+    let packages = cargo["packages"]
+        .as_array()
+        .ok_or("missing Cargo packages")?;
+    let cli_packages = packages
+        .iter()
+        .filter(|item| item["name"].as_str() == Some("hermit"))
+        .collect::<Vec<_>>();
+    if cli_packages.len() != 1 {
+        return Err("prepared Hermit package is missing or ambiguous".into());
+    }
+    let package = cli_packages[0];
+    if !package["targets"]
+        .as_array()
+        .ok_or("missing CLI targets")?
+        .iter()
+        .any(|target| {
+            target["name"].as_str() == Some("hermit")
+                && target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")))
+        })
+    {
+        return Err("Cargo did not declare the normal Hermit binary".into());
+    }
+    let metadata = read_json(&selection.metadata.path)?;
+    let files = metadata["rust-build-meta"]["non-test-binaries"][string(package, "id")?]
+        .as_array()
+        .ok_or("prepared record_replay selection has no Hermit runtime artifacts")?;
+    let mut matches = BTreeSet::new();
+    for file in files {
+        let path = target_path(&record.target, string(file, "path")?)?;
+        if path.file_name() == Some(std::ffi::OsStr::new("hermit")) {
+            let identity = selection
+                .runtime_files
+                .iter()
+                .find(|identity| identity.path == path)
+                .ok_or("Hermit runtime artifact was not verified in its selection")?;
+            check_identity(identity, true)?;
+            matches.insert(path);
+        }
+    }
+    if matches.len() != 1 {
+        return Err("prepared Hermit runtime artifact is missing or ambiguous".into());
+    }
+    Ok(matches.into_iter().next().unwrap())
 }
 
 pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, String> {
@@ -1583,7 +1798,7 @@ mod tests {
                 "targets": [{"name": "fixture", "kind": ["lib"]}]
             }]});
             let metadata = serde_json::json!({"rust-build-meta": {
-                "target-directory": target, "non-test-binaries": {}
+                "target-directory": target, "non-test-binaries": {}, "target-platforms": []
             }, "rust-binaries": {"fixture": {
                 "binary-id": "fixture", "package-id": package, "binary-name": "fixture",
                 "kind": "lib", "build-platform": "target", "binary-path": executable
@@ -1603,6 +1818,7 @@ mod tests {
             let args = vec!["-p".into(), "fixture".into(), "--lib".into()];
             let selected = SelectionRecord {
                 build_args: args.clone(),
+                target_platforms: target_platforms(&self.metadata).unwrap(),
                 metadata: file_identity(&path, false).unwrap(),
                 binaries,
                 runtime_files,
@@ -1619,6 +1835,7 @@ mod tests {
                     rustc: String::new(),
                     cargo_config: BTreeMap::new(),
                     build_environment: BTreeMap::new(),
+                    native_target: None,
                     cargo_metadata: file_identity(&cargo, false).unwrap(),
                     selections: BTreeMap::from([(selection_key(&args), selected)]),
                     guests: vec![],
@@ -1662,6 +1879,131 @@ mod tests {
             cargo
         }
     }
+    #[test]
+    fn native_preparation_default_preserves_explicit_target_sources() {
+        let rustc = "rustc fixture\nhost: x86_64-unknown-linux-gnu\n";
+        let empty = serde_json::json!({});
+        assert_eq!(
+            native_target_from_inputs(rustc, false, &empty).unwrap(),
+            Some("x86_64-unknown-linux-gnu".into())
+        );
+        assert_eq!(
+            native_target_from_inputs(rustc, true, &empty).unwrap(),
+            None
+        );
+        for config in [
+            serde_json::json!({"build":{"target":"aarch64-unknown-linux-gnu"}}),
+            serde_json::json!({"build":{"target":["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu"]}}),
+            serde_json::json!({"env":{"CARGO_BUILD_TARGET":{"value":"aarch64-unknown-linux-gnu","force":true}}}),
+        ] {
+            assert_eq!(
+                native_target_from_inputs(rustc, false, &config).unwrap(),
+                None
+            );
+        }
+        assert!(native_target_from_inputs("rustc fixture", false, &empty).is_err());
+        assert!(native_target_from_inputs("host: first\nhost: second\n", false, &empty).is_err());
+    }
+
+    #[test]
+    fn preparation_reads_cargo_ancestor_and_local_target_precedence() {
+        let fixture = Fixture::new();
+        let child = fixture.root.join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(
+            fixture.root.join("rust-toolchain.toml"),
+            include_str!("../../../rust-toolchain.toml"),
+        )
+        .unwrap();
+        fs::create_dir(fixture.root.join(".cargo")).unwrap();
+        fs::write(
+            fixture.root.join(".cargo/config.toml"),
+            "[build]\ntarget = \"aarch64-unknown-linux-gnu\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            preparation_cargo_config(&child).unwrap()["build"]["target"],
+            "aarch64-unknown-linux-gnu"
+        );
+        fs::create_dir(child.join(".cargo")).unwrap();
+        fs::write(
+            child.join(".cargo/config.toml"),
+            "[build]\ntarget = \"x86_64-unknown-linux-gnu\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            preparation_cargo_config(&child).unwrap()["build"]["target"],
+            "x86_64-unknown-linux-gnu"
+        );
+        fs::write(child.join(".cargo/config.toml"), "[build\n").unwrap();
+        assert!(preparation_cargo_config(&child).is_err());
+    }
+
+    #[test]
+    fn prepared_native_target_requires_actual_platform_and_honors_cli_override() {
+        let native = Some("x86_64-unknown-linux-gnu");
+        assert!(check_native_target(native, &[], &["x86_64-unknown-linux-gnu".into()]).is_ok());
+        assert!(check_native_target(native, &[], &[]).is_err());
+        assert!(check_native_target(native, &[], &["aarch64-unknown-linux-gnu".into()]).is_err());
+        for args in [
+            vec!["--target".into(), "aarch64-unknown-linux-gnu".into()],
+            vec!["--target=aarch64-unknown-linux-gnu".into()],
+        ] {
+            assert!(
+                check_native_target(native, &args, &["aarch64-unknown-linux-gnu".into()]).is_ok()
+            );
+        }
+        let fixture = Fixture::new();
+        let (mut record, args) = fixture.selection();
+        let selected = record.selections.get_mut(&selection_key(&args)).unwrap();
+        selected.target_platforms.push("forged-target".into());
+        assert!(
+            verify_selection(&record, &fixture.cargo, &args)
+                .unwrap_err()
+                .contains("target platforms changed")
+        );
+    }
+
+    #[test]
+    fn network_cli_uses_exact_prepared_non_test_artifact_in_custom_target() {
+        let mut fixture = Fixture::new();
+        let package = fixture.cargo["packages"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fixture.cargo["packages"][0]["name"] = "hermit".into();
+        fixture.cargo["packages"][0]["targets"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "hermit", "kind": ["bin"]}));
+        let cli = fixture.target.join("debug/hermit");
+        fs::create_dir(cli.parent().unwrap()).unwrap();
+        fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.metadata["rust-build-meta"]["non-test-binaries"][&package] =
+            serde_json::json!([{"path": "debug/hermit"}]);
+        let (record, args) = fixture.selection();
+        let selected = record.selections.get(&selection_key(&args)).unwrap();
+        assert_eq!(
+            network_cli_in_selection(&record, &fixture.cargo, selected).unwrap(),
+            cli
+        );
+        let mut missing = selected.clone();
+        missing.runtime_files.clear();
+        assert!(network_cli_in_selection(&record, &fixture.cargo, &missing).is_err());
+        let mut wrong = fixture.cargo.clone();
+        wrong["packages"][0]["name"] = "other".into();
+        assert!(network_cli_in_selection(&record, &wrong, selected).is_err());
+        let mut ambiguous = fixture.cargo.clone();
+        ambiguous["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(fixture.cargo["packages"][0].clone());
+        assert!(network_cli_in_selection(&record, &ambiguous, selected).is_err());
+        fs::write(&cli, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(network_cli_in_selection(&record, &fixture.cargo, selected).is_err());
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
@@ -1743,7 +2085,7 @@ mod tests {
         let population = record_workloads::consume_prepared(true, Some(&raw))
             .unwrap()
             .unwrap();
-        assert_eq!(population.len(), 42);
+        assert_eq!(population.len(), 46);
         assert_eq!(
             population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
             record_workloads::names().collect()

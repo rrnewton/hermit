@@ -18,6 +18,7 @@ mod consts;
 mod desync;
 pub mod logdiff_report;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
+pub mod accepted_terminal;
 pub mod e9patch;
 mod error;
 mod event;
@@ -38,6 +39,7 @@ pub mod run_evidence;
 pub mod unix_guard;
 pub mod unix_guard_control;
 pub mod unix_guard_package;
+pub mod unix_guard_terminal;
 
 pub use canonical_verdict::Verdict;
 
@@ -2435,6 +2437,9 @@ pub fn run_with_backend_timeout_and_network_resources(
     }
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
+        let mut native_owner = network_runtime
+            .as_ref()
+            .map(|resource| resource.controller_disposal_owner());
         return ptrace_completion::run(timeout, move |control| async move {
             let report = SkidOvershootReport::begin(true);
             let config = prepare_backend_config(config, backend);
@@ -2448,6 +2453,7 @@ pub fn run_with_backend_timeout_and_network_resources(
                 Some(control),
             )
             .await;
+            let result = finish_native_controller_result(result, &mut native_owner).await;
             report.finish(result)
         });
     }
@@ -2626,12 +2632,64 @@ where
 // Keep the executor's by-value future small on the container's fixed stack.
 // The backend future is polled on this same current-thread runtime; boxing
 // changes storage, not task spawning, cancellation, or the deadline boundary.
-fn run_current_thread<F: std::future::Future>(future: std::pin::Pin<Box<F>>) -> F::Output {
+fn run_current_thread<F, C, T>(future: std::pin::Pin<Box<F>>, native_cleanup: C) -> Result<T, Error>
+where
+    F: std::future::Future<Output = Result<T, Error>>,
+    C: std::future::Future<Output = std::io::Result<()>>,
+{
+    let runtime = new_controller_runtime().expect("Failed building the Runtime");
+    let result = runtime.block_on(future);
+    match runtime.block_on(native_cleanup) {
+        Ok(()) => result,
+        Err(cleanup) => {
+            // A blocking syscall cannot be aborted. Runtime::drop would wait
+            // without a deadline after the run's SIGALRM guard was disarmed.
+            // The authenticated startup owner and the worker retain the same
+            // custody through deferred result publication and container exit.
+            // This error must reach the outside finalizer; it is never success
+            // or evidence that transport/socket custody has settled.
+            runtime.shutdown_background();
+            match result {
+                Err(primary) => {
+                    Err(primary.context(format!("native controller cleanup: {cleanup}")))
+                }
+                Ok(_) => Err(Error::new(cleanup).context("native controller cleanup")),
+            }
+        }
+    }
+}
+
+async fn finish_native_controller_runtime(
+    owner: &mut Option<detcore::network_runtime::NetworkRuntimeOwner>,
+) -> std::io::Result<()> {
+    match owner {
+        // The actual backend future has ended. The separate startup owner
+        // remains outside this runner through container result publication.
+        Some(owner) => unsafe { owner.finish_native_controller_tasks().await },
+        None => Ok(()),
+    }
+}
+
+async fn finish_native_controller_result<T>(
+    result: Result<T, Error>,
+    owner: &mut Option<detcore::network_runtime::NetworkRuntimeOwner>,
+) -> Result<T, Error> {
+    match (result, finish_native_controller_runtime(owner).await) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => {
+            Err(Error::new(cleanup).context("native controller cleanup"))
+        }
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("native controller cleanup: {cleanup}")))
+        }
+    }
+}
+
+pub(crate) fn new_controller_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("Failed building the Runtime")
-        .block_on(future)
 }
 
 fn run_with_backend_inner(
@@ -2643,18 +2701,24 @@ fn run_with_backend_inner(
     timeout: Option<Duration>,
     network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<ExitStatus, Error> {
-    run_current_thread(Box::pin(with_run_deadline(
-        timeout,
-        Box::pin(dispatch_backend(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            backend,
-            network_runtime,
-            None,
+    let mut native_owner = network_runtime
+        .as_ref()
+        .map(|resource| resource.controller_disposal_owner());
+    run_current_thread(
+        Box::pin(with_run_deadline(
+            timeout,
+            Box::pin(dispatch_backend(
+                command,
+                config,
+                print_summary,
+                print_summary_to_json_file,
+                backend,
+                network_runtime,
+                None,
+            )),
         )),
-    )))
+        finish_native_controller_runtime(&mut native_owner),
+    )
 }
 
 async fn dispatch_backend(
@@ -2873,6 +2937,9 @@ pub fn run_with_output_backend_timeout_and_network_resources(
     }
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
+        let mut native_owner = network_runtime
+            .as_ref()
+            .map(|resource| resource.controller_disposal_owner());
         return ptrace_completion::run(timeout, move |control| async move {
             let report = SkidOvershootReport::begin(true);
             let result = dispatch_output_backend(
@@ -2885,6 +2952,7 @@ pub fn run_with_output_backend_timeout_and_network_resources(
                 Some(control),
             )
             .await;
+            let result = finish_native_controller_result(result, &mut native_owner).await;
             report.finish_with_count(result)
         });
     }
@@ -2917,24 +2985,30 @@ fn run_with_output_backend_inner(
     timeout: Option<Duration>,
     network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
 ) -> Result<Output, Error> {
-    run_current_thread(Box::pin(async move {
-        let guest = Box::pin(dispatch_output_backend(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            backend,
-            network_runtime,
-            None,
-        ));
-        let Some(limit) = timeout else {
-            return guest.await;
-        };
-        match tokio::time::timeout(limit, guest).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
-        }
-    }))
+    let mut native_owner = network_runtime
+        .as_ref()
+        .map(|resource| resource.controller_disposal_owner());
+    run_current_thread(
+        Box::pin(async move {
+            let guest = Box::pin(dispatch_output_backend(
+                command,
+                config,
+                print_summary,
+                print_summary_to_json_file,
+                backend,
+                network_runtime,
+                None,
+            ));
+            let Some(limit) = timeout else {
+                return guest.await;
+            };
+            match tokio::time::timeout(limit, guest).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+            }
+        }),
+        finish_native_controller_runtime(&mut native_owner),
+    )
 }
 
 async fn dispatch_output_backend(
@@ -3363,7 +3437,9 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
     let epoch = detcore_model::config::capture_current_epoch();
     ptrace_completion::run(None, move |control| async move {
         let prepared = PreparedFullRecordTrace::reserve(&dir)?;
-        record_to_async(command, prepared, Vec::new(), None, epoch, control).await
+        let mut native_owner = prepared.controller_disposal_owner();
+        let result = record_to_async(command, prepared, Vec::new(), None, epoch, control).await;
+        finish_native_controller_result(result, &mut native_owner).await
     })
 }
 
@@ -3375,9 +3451,10 @@ pub fn record_to_with_mountinfo(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     epoch: detcore_model::config::Epoch,
 ) -> Result<ExitStatus, Error> {
+    let mut native_owner = prepared_trace.controller_disposal_owner();
     ptrace_completion::run(None, move |control| async move {
         let mount_ids = capture_mountinfo_identity_order()?;
-        record_to_async(
+        let result = record_to_async(
             command,
             prepared_trace,
             mountinfo_root_rewrites,
@@ -3385,7 +3462,8 @@ pub fn record_to_with_mountinfo(
             epoch,
             control,
         )
-        .await
+        .await;
+        finish_native_controller_result(result, &mut native_owner).await
     })
 }
 
@@ -3421,7 +3499,10 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
     let epoch = detcore_model::config::capture_current_epoch();
     ptrace_completion::run(None, move |control| async move {
         let prepared = PreparedFullRecordTrace::reserve(&dir)?;
-        record_with_output_async(command, prepared, Vec::new(), None, epoch, control).await
+        let mut native_owner = prepared.controller_disposal_owner();
+        let result =
+            record_with_output_async(command, prepared, Vec::new(), None, epoch, control).await;
+        finish_native_controller_result(result, &mut native_owner).await
     })
 }
 
@@ -3432,9 +3513,10 @@ pub fn record_with_output_with_mountinfo(
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     epoch: detcore_model::config::Epoch,
 ) -> Result<Output, Error> {
+    let mut native_owner = prepared_trace.controller_disposal_owner();
     ptrace_completion::run(None, move |control| async move {
         let mount_ids = capture_mountinfo_identity_order()?;
-        record_with_output_async(
+        let result = record_with_output_async(
             command,
             prepared_trace,
             mountinfo_root_rewrites,
@@ -3442,7 +3524,8 @@ pub fn record_with_output_with_mountinfo(
             epoch,
             control,
         )
-        .await
+        .await;
+        finish_native_controller_result(result, &mut native_owner).await
     })
 }
 
@@ -3502,6 +3585,7 @@ fn replay_plain(
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
     let mounts = mounts.to_vec();
+    let mut native_owner = prepared.controller_disposal_owner();
     ptrace_completion::run(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
@@ -3512,6 +3596,7 @@ fn replay_plain(
                 .map_err(Error::from)
         }
         .await;
+        let result = finish_native_controller_result(result, &mut native_owner).await;
         report.finish(result)
     })
 }
@@ -3529,6 +3614,7 @@ pub fn replay_with_output_and_mounts(
     mounts: &[Mount],
 ) -> Result<Output, Error> {
     let mounts = mounts.to_vec();
+    let mut native_owner = prepared.controller_disposal_owner();
     ptrace_completion::run(None, move |control| async move {
         let report = SkidOvershootReport::begin(true);
         let result = async {
@@ -3539,6 +3625,7 @@ pub fn replay_with_output_and_mounts(
                 .map_err(Error::from)
         }
         .await;
+        let result = finish_native_controller_result(result, &mut native_owner).await;
         report.finish(result)
     })
 }
@@ -3548,6 +3635,153 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn full_controller_cleanup_follows_cancelled_future_drop() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_owner = Dropped(dropped.clone());
+        let observed = dropped.clone();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_completed = cleaned.clone();
+        let result: Result<(), Error> = run_current_thread(
+            Box::pin(async move {
+                let backend = async move {
+                    let _owned = pending_owner;
+                    std::future::pending::<()>().await;
+                    Ok::<(), Error>(())
+                };
+                tokio::time::timeout(Duration::from_millis(1), backend)
+                    .await
+                    .map_err(|_| Error::msg("original full-run cancellation"))?
+            }),
+            async move {
+                assert!(
+                    observed.load(Ordering::Acquire),
+                    "cleanup raced the still-live backend future"
+                );
+                cleanup_completed.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result.unwrap_err().root_cause().to_string(),
+            "original full-run cancellation"
+        );
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(cleaned.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn full_controller_spawn_error_still_runs_native_cleanup() {
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cleaned.clone();
+        let result: Result<(), Error> = run_current_thread(
+            Box::pin(async { Err(Error::msg("original full tracer spawn failure")) }),
+            async move {
+                observed.store(true, Ordering::Release);
+                Err(std::io::Error::other("native cleanup failure"))
+            },
+        );
+        assert!(cleaned.load(Ordering::Acquire));
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.root_cause().to_string(),
+            "original full tracer spawn failure"
+        );
+        assert!(error.to_string().contains("native cleanup failure"));
+    }
+
+    #[test]
+    fn native_runtime_disposal_preserves_failure_and_reaps_released_worker() {
+        const CHILD: &str = "HERMIT_TEST_NATIVE_RUNTIME_DISPOSAL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::native_runtime_disposal_preserves_failure_and_reaps_released_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "disposal child failed: {status}");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child.wait().unwrap();
+                    panic!("disposal child exceeded original 3s bound; reaped {status}");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            return;
+        }
+
+        let worker = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let submitted = worker.clone();
+        let retained = worker.clone();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = finished.clone();
+        let result: Result<(), Error> = run_current_thread(
+            Box::pin(async move {
+                *submitted.lock().await = Some(tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    // A broken Runtime::drop is finite in this regression too.
+                    let outcome = proceed.recv_timeout(Duration::from_secs(1));
+                    observed.store(true, Ordering::Release);
+                    outcome
+                }));
+                tokio::time::timeout(Duration::from_secs(1), started).await??;
+                Err(Error::msg("original backend failure"))
+            }),
+            async move {
+                let original = tokio::time::Instant::now() + Duration::from_millis(10);
+                let mut owned = retained.lock().await;
+                tokio::time::timeout_at(original, owned.as_mut().unwrap())
+                    .await
+                    .map_err(|_| std::io::Error::other("original native cleanup deadline"))?
+                    .map_err(std::io::Error::other)?
+                    .map_err(std::io::Error::other)
+            },
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.root_cause().to_string(), "original backend failure");
+        assert!(
+            error
+                .to_string()
+                .contains("original native cleanup deadline")
+        );
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "runtime disposal waited for the unresolved syscall"
+        );
+
+        // The original handle is still usable after shutdown_background; this
+        // test ends only after the real worker is released and actually joined.
+        release.send(()).unwrap();
+        let recovery = new_controller_runtime().unwrap();
+        recovery.block_on(async {
+            let task = worker.lock().await.take().unwrap();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        });
+        assert!(finished.load(Ordering::Acquire));
+        assert!(worker.try_lock().unwrap().is_none());
+    }
 
     #[test]
     fn kvm_mountinfo_config_preserves_captured_provenance() {

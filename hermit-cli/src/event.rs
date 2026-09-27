@@ -104,6 +104,12 @@ pub enum SyscallEvent {
     Exec(ExecEvent),
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
+    /// One Read attempt was interrupted before native entry. This preserves
+    /// stream order before handler syscalls without inventing bytes or errno.
+    ReadInterrupted {
+        /// Actual signal number; the live backend must obtain its own stop.
+        signal: i32,
+    },
 }
 
 /// Recorded output and signal side effects of a read syscall.

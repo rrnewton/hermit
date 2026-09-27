@@ -394,6 +394,115 @@ fn create_owned_directory() -> io::Result<PathBuf> {
     Err(io::Error::other("no exclusive owner-control directory"))
 }
 #[test]
+fn unix_guard_native_pidfd_and_readback_protocol_controls() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("network-provider/unix");
+    let root = create_owned_directory().expect("exclusive protocol evidence");
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let binary = root.join("protocol-controls");
+    require_success(
+        &run(
+            &root,
+            "build-protocol",
+            Command::new(&cc)
+                .args([
+                    "-O2",
+                    "-g",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-ffunction-sections",
+                    "-fdata-sections",
+                ])
+                .args([
+                    source.join("protocol-tests.c"),
+                    source.join("keeper-readback.c"),
+                    source.join("keeper-channel.c"),
+                ])
+                .args(["-Wl,--gc-sections", "-Wl,--wrap=syscall", "-o"])
+                .arg(&binary),
+            WALL,
+            Inject::None,
+        )
+        .unwrap(),
+    );
+    require_success(
+        &run(
+            &root,
+            "protocol",
+            &mut Command::new(&binary),
+            WALL,
+            Inject::None,
+        )
+        .unwrap(),
+    );
+    let result = fs::read_to_string(root.join("protocol.stdout")).unwrap();
+    assert!(result.contains("readback_main_controls=13 passed; BPF queries substituted; native transport/pidfds/reaping"), "{result}");
+    let binary = root.join("bootstrap-controls");
+    require_success(&run(
+        &root, "build-bootstrap",
+        Command::new(cc).args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(source.join("keeper-bootstrap-tests.c"))
+            .args(["-Wl,--wrap=fcntl,--wrap=close,--wrap=getsockopt,--wrap=syscall,--wrap=poll,--wrap=clock_gettime", "-o"]).arg(&binary),
+        WALL, Inject::None,
+    ).unwrap());
+    require_success(
+        &run(
+            &root,
+            "bootstrap",
+            &mut Command::new(&binary),
+            WALL,
+            Inject::None,
+        )
+        .unwrap(),
+    );
+    let result = fs::read_to_string(root.join("bootstrap.stdout")).unwrap();
+    assert!(
+        result.contains("guard_bootstrap_controls=8 passed"),
+        "{result}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unix_guard_native_keeper_lifetime_controls() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("network-provider/unix");
+    let root = create_owned_directory().expect("exclusive keeper lifetime evidence");
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let binary = root.join("keeper-lifetime-controls");
+    require_success(
+        &run(
+            &root,
+            "build-lifetime",
+            Command::new(cc)
+                .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+                .arg(source.join("keeper-lifetime-tests.c"))
+                .arg(source.join("keeper-channel.c"))
+                .arg("-o")
+                .arg(&binary),
+            WALL,
+            Inject::None,
+        )
+        .unwrap(),
+    );
+    require_success(
+        &run(
+            &root,
+            "lifetime",
+            &mut Command::new(&binary),
+            WALL,
+            Inject::None,
+        )
+        .unwrap(),
+    );
+    let result = fs::read_to_string(root.join("lifetime.stdout")).unwrap();
+    assert!(result.contains("keeper_lifetime_controls=6 passed; session operations substituted; native main/transport/pidfds/reaping"), "{result}");
+    eprintln!("{result}");
+    if std::env::var_os("HERMIT_GUARD_KEEP_TEST_EVIDENCE").is_none() {
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn unix_guard_owner_controls() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = create_owned_directory().expect("exclusive evidence directory");
@@ -447,7 +556,7 @@ fn unix_guard_owner_controls() {
             .lines()
             .filter(|line| line.starts_with("actual::owner_controls::") && line.ends_with(": test"))
             .count(),
-        10
+        13
     );
     require_success(
         &run(

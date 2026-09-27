@@ -7817,7 +7817,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "617",
+        "NEXTEST_EXPECTED_EXECUTED": "619",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -8035,6 +8035,296 @@
       "fail_fast_family": "test.detcore_parallel"
     },
     {
+      "group": "build",
+      "job": "network_providers",
+      "desc": "Compile maintained network providers for the normal network gates",
+      "description": "Explicit offline provider production. Requires the exact maintained kernel/BTF contract and supported local clang, bpftool, llvm-objcopy and libbpf. Missing or unsupported providers fail; no live-I/O fallback. The public normal tests execute the prepared Cargo CLI beside these authenticated packages.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cli=$(./ci/nextest-binaries.rs network-cli) && ./hermit-cli/network-provider/package.rs --source-dir \"$PWD/hermit-cli/network-provider\" --component accepted --output-dir \"${cli%/*}/network-provider/accepted\" && ./hermit-cli/network-provider/package.rs --source-dir \"$PWD/hermit-cli/network-provider\" --component unix-guard --output-dir \"${cli%/*}/network-provider/unix-guard\"",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts",
+        "build.workspace",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 180,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.network_providers"
+    },
+    {
+      "group": "test",
+      "job": "network_tcp",
+      "desc": "Normal bounded network acceptance: tcp",
+      "description": "Exact nonignored acceptance identity. Official nextest owns the per-attempt cgroup and authoritative CPU/count/terminal cleanup receipts. Each Hermit cell retains its 30-second lethal wall bound, aggregate 4-MiB stream cap, 16-GiB/zero-swap ceiling, independent explicit file-log bounds and full original semantic assertions. No private parent wrapper or whole-guest filesystem-quota claim.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay network_only::external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch -j 1 -- --exact",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.network_tcp"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay"
+      ],
+      "deps": [
+        "build.network_providers",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {
+        "DAGRUN_CGROUP_DELEGATE": "memory,pids",
+        "HERMIT_NEXTEST_NETWORK_BOUNDARY": "tcp",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"record_replay\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.network_tcp"
+    },
+    {
+      "group": "test",
+      "job": "network_poll",
+      "desc": "Normal bounded network acceptance: poll",
+      "description": "Exact nonignored acceptance identity. Official nextest owns the per-attempt cgroup and authoritative CPU/count/terminal cleanup receipts. Each Hermit cell retains its 30-second lethal wall bound, aggregate 4-MiB stream cap, 16-GiB/zero-swap ceiling, independent explicit file-log bounds and full original semantic assertions. No private parent wrapper or whole-guest filesystem-quota claim.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay network_only::blocked_poll_replays_current_lowat_across_schedules -j 1 -- --exact",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.network_poll"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay"
+      ],
+      "deps": [
+        "build.network_providers",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {
+        "DAGRUN_CGROUP_DELEGATE": "memory,pids",
+        "HERMIT_NEXTEST_NETWORK_BOUNDARY": "poll",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"record_replay\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.network_poll"
+    },
+    {
+      "group": "test",
+      "job": "network_recv",
+      "desc": "Normal bounded network acceptance: recv",
+      "description": "Exact nonignored acceptance identity. Official nextest owns the per-attempt cgroup and authoritative CPU/count/terminal cleanup receipts. Each Hermit cell retains its 30-second lethal wall bound, aggregate 4-MiB stream cap, 16-GiB/zero-swap ceiling, independent explicit file-log bounds and full original semantic assertions. No private parent wrapper or whole-guest filesystem-quota claim.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay network_only::blocked_receive_replays_saved_target_across_schedules -j 1 -- --exact",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.network_recv"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay"
+      ],
+      "deps": [
+        "build.network_providers",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {
+        "DAGRUN_CGROUP_DELEGATE": "memory,pids",
+        "HERMIT_NEXTEST_NETWORK_BOUNDARY": "recv",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"record_replay\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.network_recv"
+    },
+    {
+      "group": "test",
+      "job": "network_identity",
+      "desc": "Normal bounded network acceptance: identity",
+      "description": "Exact nonignored acceptance identity. Official nextest owns the per-attempt cgroup and authoritative CPU/count/terminal cleanup receipts. Each Hermit cell retains its 30-second lethal wall bound, aggregate 4-MiB stream cap, 16-GiB/zero-swap ceiling, independent explicit file-log bounds and full original semantic assertions. No private parent wrapper or whole-guest filesystem-quota claim.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay network_channel_identity::endpoint_identity_replays_creation_orders_and_refuses_wrong_peers -j 1 -- --exact",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.network_identity"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay"
+      ],
+      "deps": [
+        "build.network_providers",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {
+        "DAGRUN_CGROUP_DELEGATE": "memory,pids",
+        "HERMIT_NEXTEST_NETWORK_BOUNDARY": "identity",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"record_replay\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.network_identity"
+    },
+    {
+      "group": "test",
+      "job": "network_unix",
+      "desc": "Normal bounded network acceptance: unix",
+      "description": "Exact nonignored acceptance identity. Official nextest owns the per-attempt cgroup and authoritative CPU/count/terminal cleanup receipts. Each Hermit cell retains its 30-second lethal wall bound, aggregate 4-MiB stream cap, 16-GiB/zero-swap ceiling, independent explicit file-log bounds and full original semantic assertions. No private parent wrapper or whole-guest filesystem-quota claim.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay network_unix::default_unix_denies_external_contact_and_preserves_guest_ipc -j 1 -- --exact",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.network_unix"
+        }
+      ],
+      "integration_test_binaries": [
+        "record_replay"
+      ],
+      "deps": [
+        "build.network_providers",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {
+        "DAGRUN_CGROUP_DELEGATE": "memory,pids",
+        "HERMIT_NEXTEST_NETWORK_BOUNDARY": "unix",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"record_replay\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": 1,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "test.network_unix"
+    },
+    {
       "group": "test",
       "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
@@ -8043,7 +8333,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --proc-locks-runtime --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --proc-locks-runtime --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test sysfs_rtc_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -8095,6 +8385,7 @@
         "sockstat_determinism",
         "softnet_stat_determinism",
         "swaps_determinism",
+        "sysfs_rtc_determinism",
         "thp_stats_determinism",
         "verification_report_cli",
         "verification_report_consumers",
@@ -8111,8 +8402,8 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "170",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
+        "NEXTEST_EXPECTED_EXECUTED": "172",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"sysfs_rtc_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -62200,7 +62491,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "617",
+        "NEXTEST_EXPECTED_EXECUTED": "619",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -62413,7 +62704,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test sysfs_rtc_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -62465,6 +62756,7 @@
         "sockstat_determinism",
         "softnet_stat_determinism",
         "swaps_determinism",
+        "sysfs_rtc_determinism",
         "thp_stats_determinism",
         "verification_report_cli",
         "verification_report_consumers",
@@ -62479,8 +62771,8 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "170",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
+        "NEXTEST_EXPECTED_EXECUTED": "172",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"sysfs_rtc_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
       "engine_only": false,

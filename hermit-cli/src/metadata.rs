@@ -18,6 +18,7 @@ use detcore_model::config::Epoch;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::network_trace::NETWORK_TRACE_VERSION_V2;
 use detcore_model::network_trace::NETWORK_TRACE_VERSION_V3;
+use detcore_model::network_trace::NETWORK_TRACE_VERSION_V4;
 use detcore_model::network_trace::NetworkTrace;
 use detcore_model::network_trace::NetworkTraceConfig;
 use reverie::process::Command;
@@ -561,9 +562,10 @@ pub(crate) fn finalize_network_trace_recording(
     {
         NetworkTrace::V2(trace) => (trace.epoch, NETWORK_TRACE_VERSION_V2),
         NetworkTrace::V3(trace) => (trace.history.epoch, NETWORK_TRACE_VERSION_V3),
+        NetworkTrace::V4(trace) => (trace.epoch, NETWORK_TRACE_VERSION_V4),
         NetworkTrace::V1(_) => {
             return Err(Error::msg(
-                "new full recordings require network trace codec V2 or V3",
+                "new full recordings require network trace codec V2, V3 or V4",
             ));
         }
     };
@@ -600,11 +602,11 @@ pub(crate) fn validate_network_trace_replay(
         .ok_or_else(|| Error::msg("recording is incomplete: network trace metadata is missing"))?;
     if !matches!(
         artifact.codec_version,
-        NETWORK_TRACE_VERSION_V2 | NETWORK_TRACE_VERSION_V3
+        NETWORK_TRACE_VERSION_V2 | NETWORK_TRACE_VERSION_V3 | NETWORK_TRACE_VERSION_V4
     ) {
         return Err(Error::msg(format!(
-            "unsupported network trace codec version {}, expected {} or {}",
-            artifact.codec_version, NETWORK_TRACE_VERSION_V2, NETWORK_TRACE_VERSION_V3
+            "unsupported network trace codec version {}, expected {}, {} or {}",
+            artifact.codec_version, NETWORK_TRACE_VERSION_V2, NETWORK_TRACE_VERSION_V3, NETWORK_TRACE_VERSION_V4
         )));
     }
     let bytes = detcore::network_replay::read_bounded_network_trace(file)
@@ -629,9 +631,10 @@ pub(crate) fn validate_network_trace_replay(
     {
         NetworkTrace::V2(trace) => (trace.epoch, NETWORK_TRACE_VERSION_V2),
         NetworkTrace::V3(trace) => (trace.history.epoch, NETWORK_TRACE_VERSION_V3),
+        NetworkTrace::V4(trace) => (trace.epoch, NETWORK_TRACE_VERSION_V4),
         NetworkTrace::V1(_) => {
             return Err(Error::msg(
-                "full replay metadata requires network trace codec V2 or V3",
+                "full replay metadata requires network trace codec V2, V3 or V4",
             ));
         }
     };
@@ -934,6 +937,105 @@ mod tests {
         let error = finalize_network_trace_recording(publication, other_epoch()).unwrap_err();
         assert!(
             error
+                .to_string()
+                .contains("does not match recording metadata epoch")
+        );
+        assert!(!directory.path().join(NETWORK_TRACE_PENDING_NAME).exists());
+        assert!(!directory.path().join(NETWORK_TRACE_NAME).exists());
+    }
+    fn publication_with_v4(
+        directory: &Path,
+        trace_epoch: Epoch,
+    ) -> (NetworkTracePublication, Vec<u8>) {
+        use detcore_model::network_trace::NetworkCreationModelV4;
+        use detcore_model::network_trace::NetworkReleaseModelV4;
+        use detcore_model::network_trace::NetworkTraceV4;
+        use detcore_model::network_trace::ReceiveEnvironmentV3;
+        let trace = NetworkTraceV4 {
+            epoch: trace_epoch,
+            channels: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            creation_model: NetworkCreationModelV4::OutboundAndDatagramV1,
+            release_model: NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes: vec![] },
+            native_receive_observations: vec![],
+            fresh_stream_profiles: vec![],
+            receive_environment: ReceiveEnvironmentV3::SingleRecorderNamespaceV1,
+            channel_socket_classes: vec![],
+            fresh_send_timeouts: vec![],
+        };
+        let mut bytes = Vec::new();
+        NetworkTrace::V4(trace).write_framed(&mut bytes).unwrap();
+        let mut publication =
+            NetworkTracePublication::reserve(&directory.join(NETWORK_TRACE_NAME)).unwrap();
+        std::io::Write::write_all(publication.writer(), &bytes).unwrap();
+        (publication, bytes)
+    }
+
+    #[test]
+    fn v4_sidecar_keeps_exact_bytes_digest_version_and_epoch_gates() {
+        let directory = tempfile::tempdir().unwrap();
+        let (publication, bytes) = publication_with_v4(directory.path(), epoch());
+        let artifact = finalize_network_trace_recording(publication, epoch()).unwrap();
+        assert_eq!(artifact.codec_version, NETWORK_TRACE_VERSION_V4);
+        assert_eq!(artifact.length, bytes.len() as u64);
+        assert_eq!(artifact.digest, detcore::Digest::new(&bytes));
+        let path = directory.path().join(NETWORK_TRACE_NAME);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!directory.path().join(NETWORK_TRACE_PENDING_NAME).exists());
+        let metadata = metadata_with_artifact(artifact.clone(), epoch());
+        assert_eq!(
+            validate_network_trace_replay(fs::File::open(&path).unwrap(), &metadata).unwrap(),
+            bytes
+        );
+        for version in [NETWORK_TRACE_VERSION_V2, NETWORK_TRACE_VERSION_V3] {
+            let mut wrong = artifact.clone();
+            wrong.codec_version = version;
+            let wrong_metadata = metadata_with_artifact(wrong, epoch());
+            assert!(
+                validate_network_trace_replay(fs::File::open(&path).unwrap(), &wrong_metadata)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("version mismatch")
+            );
+        }
+        let wrong_epoch = metadata_with_artifact(artifact.clone(), other_epoch());
+        assert!(
+            validate_network_trace_replay(fs::File::open(&path).unwrap(), &wrong_epoch)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match recording metadata epoch")
+        );
+        let mut wrong = artifact.clone();
+        wrong.length += 1;
+        assert!(
+            validate_network_trace_replay(
+                fs::File::open(&path).unwrap(),
+                &metadata_with_artifact(wrong, epoch())
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("length mismatch")
+        );
+        let mut changed = bytes.clone();
+        changed[28] ^= 1;
+        fs::write(&path, &changed).unwrap();
+        assert!(
+            validate_network_trace_replay(fs::File::open(&path).unwrap(), &metadata)
+                .unwrap_err()
+                .to_string()
+                .contains("digest mismatch")
+        );
+        assert_eq!(fs::read(&path).unwrap(), changed);
+    }
+
+    #[test]
+    fn v4_sidecar_wrong_record_epoch_never_publishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (publication, _) = publication_with_v4(directory.path(), epoch());
+        assert!(
+            finalize_network_trace_recording(publication, other_epoch())
+                .unwrap_err()
                 .to_string()
                 .contains("does not match recording metadata epoch")
         );

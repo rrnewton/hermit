@@ -2169,3 +2169,9 @@ mod network_only;
 
 #[path = "record_replay/network_channel_identity.rs"]
 mod network_channel_identity;
+
+#[path = "record_replay/network_boundary.rs"]
+mod network_boundary;
+
+#[path = "record_replay/network_unix.rs"]
+mod network_unix;

@@ -357,6 +357,32 @@ impl Default for Recorder {
     }
 }
 
+impl detcore::RecordOrReplay for Recorder {
+    async fn invoke_original_read<G: Guest<Self>>(
+        &self, guest: &mut G, call: reverie::syscalls::Read,
+    ) -> Result<reverie::InjectedReadResult, Error> {
+        let debug = DebugEvent::new(call.into(), &guest.memory());
+        let outcome = guest.inject_original_read(call).await;
+        match &outcome {
+            reverie::InjectedReadResult::Complete(result) => {
+                guest.thread_state_mut().push_debug_event(debug).unwrap();
+                self.record_read_result(guest, call, *result);
+            }
+            reverie::InjectedReadResult::Interrupted(ticket) => {
+                let signal = ticket.signal().ok_or_else(|| Error::Tool(
+                    anyhow::anyhow!("interrupted Read ticket has no actual signal cause")))?;
+                // Keep the attempted Read before subsequent handler events.
+                // No ReadV2 bytes or native errno exist for this attempt.
+                guest.thread_state_mut().push_debug_event(debug).unwrap();
+                self.record_event(guest, Ok(SyscallEvent::ReadInterrupted { signal: signal as i32 }));
+            }
+            reverie::InjectedReadResult::RecordedInterruption(_) =>
+                return Err(Error::Tool(anyhow::anyhow!("native recorder received a replay control"))),
+        }
+        Ok(outcome)
+    }
+}
+
 #[reverie::tool]
 impl Tool for Recorder {
     type GlobalState = detcore::GlobalState;
@@ -1440,3 +1466,669 @@ mod mkdir_probe_tests {
         );
     }
 }
+#[cfg(test)]
+mod original_file_delegate_tests {
+    use super::*;
+    use detcore::{OriginalFileExecution, RecordOrReplay};
+    use reverie::syscalls::{Addr, AddrMut, LocalMemory, SyscallInfo};
+    use reverie::{GlobalRPC, Never, Stack, TimerSchedule};
+    use std::os::fd::AsRawFd;
+
+    use reverie::syscalls::Read as SysRead;
+
+    // This Guest executes real test-owned F_GETFL and armed Read syscalls. It does not
+    // synthesize Prepared/Returned or provider selection. These are delegate
+    // stream/provenance controls, not ptrace/provider qualification.
+    struct DelegateGuest<T: RecordOrReplay> {
+        config: detcore::Config,
+        thread: T::ThreadState,
+        injections: usize,
+        permit_injection: bool,
+        read_operands: Option<(i32, usize, usize)>,
+        interrupt_next_read: bool,
+        recorded_interruption_waits: usize,
+    }
+    struct NoStack;
+    struct NoStackGuard;
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+    impl Stack for NoStack {
+        type StackGuard = NoStackGuard;
+        fn size(&self) -> usize {
+            panic!("no stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("no stack")
+        }
+        fn push<'s, V>(&mut self, _: V) -> Addr<'s, V> {
+            panic!("no stack")
+        }
+        fn reserve<'s, V>(&mut self) -> AddrMut<'s, V> {
+            panic!("no stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("no stack")
+        }
+    }
+    #[reverie::tool]
+    impl<T: RecordOrReplay> GlobalRPC<detcore::GlobalState> for DelegateGuest<T> {
+        async fn send_rpc(
+            &self,
+            _: <detcore::GlobalState as GlobalTool>::Request,
+        ) -> <detcore::GlobalState as GlobalTool>::Response {
+            panic!("delegate sent unexpected RPC")
+        }
+        fn config(&self) -> &detcore::Config {
+            &self.config
+        }
+    }
+    #[reverie::tool]
+    impl<T: RecordOrReplay> Guest<T> for DelegateGuest<T> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+        fn tid(&self) -> Tid {
+            Tid::from_raw(std::process::id() as i32)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(std::process::id() as i32)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            LocalMemory::default()
+        }
+        fn thread_state(&self) -> &T::ThreadState {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut T::ThreadState {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("no registers")
+        }
+        async fn stack(&mut self) -> NoStack {
+            panic!("no stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("no daemon")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            assert!(self.permit_injection, "replay attempted a physical syscall");
+            let (nr, args) = call.into_parts();
+            if nr == Sysno::read {
+                assert_eq!(
+                    self.read_operands.take().expect("unarmed test read"),
+                    (args.arg0 as i32, args.arg1, args.arg2)
+                );
+                self.injections += 1;
+                // SAFETY: the armed tuple names the test-owned mapping, and
+                // the sole producer queued at most three bytes (or fd is -1).
+                let result = unsafe {
+                    libc::read(args.arg0 as i32, args.arg1 as *mut libc::c_void, args.arg2)
+                };
+                return if result < 0 {
+                    Err(Errno::new(
+                        io::Error::last_os_error().raw_os_error().unwrap(),
+                    ))
+                } else {
+                    Ok(result as i64)
+                };
+            }
+            assert_eq!(nr, Sysno::fcntl);
+            assert_eq!(args.arg1, libc::F_GETFL as usize);
+            self.injections += 1;
+            let result = unsafe { libc::fcntl(args.arg0 as i32, libc::F_GETFL) };
+            if result < 0 {
+                Err(Errno::new(
+                    io::Error::last_os_error().raw_os_error().unwrap(),
+                ))
+            } else {
+                Ok(i64::from(result))
+            }
+        }
+        async fn inject_original_read(&mut self, call: reverie::syscalls::Read) -> reverie::InjectedReadResult {
+            if std::mem::take(&mut self.interrupt_next_read) {
+                // Explicit delegate input only. This fixture has no native
+                // observation, Task or provider cancellation authority.
+                reverie::InjectedReadResult::Interrupted(reverie::InterruptedSyscall::with_signal(reverie::Signal::SIGUSR1))
+            } else { reverie::InjectedReadResult::Complete(self.inject(call).await) }
+        }
+        async fn await_recorded_read_interruption(
+            &mut self, _: reverie::syscalls::Read, signal: reverie::Signal,
+        ) -> Result<reverie::InterruptedSyscall, Error> {
+            // Delegate-only control. Real stopped-task custody is exercised
+            // separately by interrupted_read_tests through actual ptrace.
+            assert!(!self.permit_injection);
+            self.recorded_interruption_waits += 1;
+            assert_eq!(signal, reverie::Signal::SIGUSR1);
+            Ok(reverie::InterruptedSyscall::with_signal(signal))
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+            panic!("no tail injection")
+        }
+        fn set_timer(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("no timer")
+        }
+        fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("no timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("no clock")
+        }
+    }
+    fn guest<T: RecordOrReplay>(
+        tool: &T,
+        config: &detcore::Config,
+        permit_injection: bool,
+    ) -> DelegateGuest<T> {
+        DelegateGuest {
+            config: config.clone(),
+            thread: tool.init_thread_state(Tid::from_raw(std::process::id() as i32), None),
+            injections: 0,
+            permit_injection,
+            read_operands: None,
+            interrupt_next_read: false,
+            recorded_interruption_waits: 0,
+        }
+    }
+    async fn recorded_fixture() -> (
+        tempfile::TempDir,
+        detcore::Config,
+        [Syscall; 2],
+        [Result<i64, Errno>; 2],
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let config = detcore::Config {
+            replay_data: Some(data.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tool = Recorder::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut recording = guest(&tool, &config, true);
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let calls = [
+            Fcntl::new()
+                .with_fd(file.as_raw_fd())
+                .with_cmd(FcntlCmd::F_GETFL)
+                .into(),
+            Fcntl::new().with_fd(-1).with_cmd(FcntlCmd::F_GETFL).into(),
+        ];
+        assert_eq!(
+            tool.original_file_execution(calls[0]),
+            OriginalFileExecution::Native
+        );
+        let first = tool
+            .handle_syscall_event(&mut recording, calls[0])
+            .await
+            .map_err(|e| e.into_errno().unwrap());
+        let second = tool
+            .handle_syscall_event(&mut recording, calls[1])
+            .await
+            .map_err(|e| e.into_errno().unwrap());
+        assert!(first.is_ok());
+        assert_eq!(second, Err(Errno::EBADF));
+        assert_eq!(recording.injections, 2);
+        drop(recording); // flush the actual Recorder event and debug streams
+        drop(file); // replay must support the original descriptor being virtual
+        (data, config, calls, [first, second])
+    }
+    #[tokio::test]
+    async fn recorded_original_file_consumes_real_recorder_stream_without_injection() {
+        let (_data, config, calls, expected) = recorded_fixture().await;
+        let tool =
+            crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut replay = guest(&tool, &config, false);
+        for (index, call) in calls.into_iter().enumerate() {
+            assert_eq!(
+                tool.original_file_execution(call),
+                OriginalFileExecution::Recorded
+            );
+            let value = tool
+                .consume_recorded_original_file(&mut replay, call)
+                .await
+                .map_err(|e| e.into_errno().unwrap());
+            assert_eq!(value, expected[index]);
+            assert_eq!(replay.thread.count, index as u64 + 1);
+            assert_eq!(replay.injections, 0);
+        }
+    }
+    #[tokio::test]
+    async fn recorded_original_file_drop_before_poll_consumes_no_event_or_physical_call() {
+        let (_data, config, calls, expected) = recorded_fixture().await;
+        let tool =
+            crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut replay = guest(&tool, &config, false);
+        drop(tool.consume_recorded_original_file(&mut replay, calls[0]));
+        assert_eq!(replay.thread.count, 0);
+        assert_eq!(replay.injections, 0);
+        let actual = tool
+            .consume_recorded_original_file(&mut replay, calls[0])
+            .await
+            .map_err(|e| e.into_errno().unwrap());
+        assert_eq!(actual, expected[0]);
+        assert_eq!(replay.thread.count, 1);
+        assert_eq!(replay.injections, 0);
+    }
+    #[tokio::test]
+    async fn recorded_original_file_wrong_command_does_not_consume_return() {
+        let (_data, config, calls, expected) = recorded_fixture().await;
+        let tool =
+            crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut replay = guest(&tool, &config, false);
+        let wrong = Fcntl::new().with_fd(-1).with_cmd(FcntlCmd::F_GETFD).into();
+        assert!(matches!(
+            tool.consume_recorded_original_file(&mut replay, wrong)
+                .await,
+            Err(Error::Tool(_))
+        ));
+        assert_eq!(replay.thread.count, 0);
+        assert_eq!(replay.injections, 0);
+        let actual = tool
+            .consume_recorded_original_file(&mut replay, calls[0])
+            .await
+            .map_err(|e| e.into_errno().unwrap());
+        assert_eq!(actual, expected[0]);
+        assert_eq!(replay.thread.count, 1);
+    }
+    #[tokio::test]
+    async fn recorded_original_file_wrong_debug_identity_is_not_a_return_receipt() {
+        use futures_util::FutureExt;
+        let (_data, config, calls, _) = recorded_fixture().await;
+        let tool =
+            crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut replay = guest(&tool, &config, false);
+        let wrong = Fcntl::new().with_fd(-2).with_cmd(FcntlCmd::F_GETFL).into();
+        assert_ne!(wrong, calls[0]);
+        assert!(
+            std::panic::AssertUnwindSafe(tool.consume_recorded_original_file(&mut replay, wrong))
+                .catch_unwind()
+                .await
+                .is_err()
+        );
+        assert_eq!(replay.injections, 0);
+    }
+
+    const READ_COUNTS: [usize; 6] = [0, 1, 32, 1usize << 32, 0x10000000020, 1];
+    const READ_BYTES: [&[u8]; 6] = [b"", b"a", b"bcd", b"efg", b"hij", b""];
+    const READ_CANARY: u8 = 0xa5;
+
+    // Keep the original full-width access_ok range below the x86_64 user limit,
+    // independently of ASLR. Only the explicitly queued (at most three) bytes
+    // can be copied by the real nonblocking socket read; no helper reads them.
+    struct ReadBuffer(usize);
+    impl ReadBuffer {
+        fn new() -> Self {
+            // SAFETY: a fresh anonymous mapping, released by this owner's Drop.
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_32BIT,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED);
+            let buffer = Self(address as usize);
+            assert!(buffer.0 < 1usize << 31);
+            assert!(buffer.0 + READ_COUNTS[4] < 1usize << 47);
+            buffer
+        }
+        fn bytes(&mut self) -> &mut [u8] {
+            // SAFETY: this uniquely owned mapping contains at least 32 bytes.
+            unsafe { std::slice::from_raw_parts_mut(self.0 as *mut u8, 32) }
+        }
+        fn require(&mut self, expected: &[u8]) {
+            assert_eq!(&self.bytes()[..expected.len()], expected);
+            assert!(
+                self.bytes()[expected.len()..]
+                    .iter()
+                    .all(|b| *b == READ_CANARY)
+            );
+        }
+    }
+    impl Drop for ReadBuffer {
+        fn drop(&mut self) {
+            // SAFETY: this is the exact still-owned mapping and original length.
+            assert_eq!(unsafe { libc::munmap(self.0 as *mut libc::c_void, 4096) }, 0);
+        }
+    }
+
+    struct RecordedReadFixture {
+        _data: tempfile::TempDir,
+        config: detcore::Config,
+        calls: Vec<Syscall>,
+        results: Vec<Result<i64, Errno>>,
+        buffer: ReadBuffer,
+        slot: OwnedFd,
+    }
+
+    async fn recorded_read_fixture() -> RecordedReadFixture {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::net::UnixStream;
+
+        let data = tempfile::tempdir().unwrap();
+        let config = detcore::Config {
+            replay_data: Some(data.path().to_path_buf()),
+            ..Default::default()
+        };
+        let tool = Recorder::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut recording = guest(&tool, &config, true);
+        let (socket, mut producer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let slot: OwnedFd = socket.into();
+        assert!(matches!(
+            tool.fd_replay_kind(recording.pid(), slot.as_raw_fd()),
+            ReplayFdKind::None
+        ));
+        let mut buffer = ReadBuffer::new();
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        for (index, (&count, bytes)) in READ_COUNTS.iter().zip(READ_BYTES).enumerate() {
+            buffer.bytes().fill(READ_CANARY);
+            producer.write_all(bytes).unwrap();
+            let fd = if index == 5 { -1 } else { slot.as_raw_fd() };
+            let call = SysRead::new()
+                .with_fd(fd)
+                .with_buf(AddrMut::from_raw(buffer.0))
+                .with_len(count)
+                .into();
+            recording.read_operands = Some((fd, buffer.0, count));
+            assert_eq!(
+                tool.original_file_execution(call),
+                OriginalFileExecution::Native
+            );
+            let result = tool
+                .handle_syscall_event(&mut recording, call)
+                .await
+                .map_err(|e| e.into_errno().unwrap());
+            let expected = if index == 5 {
+                Err(Errno::EBADF)
+            } else {
+                Ok(bytes.len() as i64)
+            };
+            assert_eq!(result, expected);
+            assert_eq!(recording.injections, index + 1);
+            buffer.require(bytes);
+            calls.push(call);
+            results.push(result);
+        }
+        // A different event variant after all ReadV2/Errno entries detects an
+        // extra or missing payload consumption through the real dispatcher.
+        let sentinel = Fcntl::new()
+            .with_fd(slot.as_raw_fd())
+            .with_cmd(FcntlCmd::F_GETFL)
+            .into();
+        let flags = tool
+            .handle_syscall_event(&mut recording, sentinel)
+            .await
+            .map_err(|e| e.into_errno().unwrap());
+        assert!(flags.is_ok());
+        assert_eq!(recording.injections, 7);
+        calls.push(sentinel);
+        results.push(flags);
+        drop(recording); // flush both actual streams before opening Replayer
+
+        let mut replacement = tempfile::tempfile().unwrap();
+        replacement.write_all(b"replacement").unwrap();
+        replacement.seek(SeekFrom::Start(0)).unwrap();
+        assert_ne!(replacement.as_raw_fd(), slot.as_raw_fd());
+        // SAFETY: both descriptors are owned. Atomically close the original
+        // socket mapping and replace it without an unowned numeric-FD gap.
+        assert_eq!(
+            unsafe {
+                libc::dup3(replacement.as_raw_fd(), slot.as_raw_fd(), libc::O_CLOEXEC)
+            },
+            slot.as_raw_fd()
+        );
+        assert_eq!(
+            producer.write_all(b"!").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        drop(producer);
+        drop(replacement);
+        buffer.bytes().fill(READ_CANARY);
+        RecordedReadFixture {
+            _data: data,
+            config,
+            calls,
+            results,
+            buffer,
+            slot,
+        }
+    }
+
+    async fn replay_read_entry(
+        tool: &crate::replayer::Replayer,
+        replay: &mut DelegateGuest<crate::replayer::Replayer>,
+        fixture: &mut RecordedReadFixture,
+        index: usize,
+    ) {
+        fixture.buffer.bytes().fill(READ_CANARY);
+        let call = fixture.calls[index];
+        assert_eq!(
+            tool.original_file_execution(call),
+            OriginalFileExecution::Recorded
+        );
+        let result = tool
+            .consume_recorded_original_file(replay, call)
+            .await
+            .map_err(|e| e.into_errno().unwrap());
+        assert_eq!(result, fixture.results[index]);
+        fixture
+            .buffer
+            .require(READ_BYTES.get(index).copied().unwrap_or(b""));
+        // count belongs to the debug stream; the trailing Return and EOF below
+        // independently establish the exact payload stream boundary.
+        assert_eq!(replay.thread.count, index as u64 + 1);
+        assert_eq!(replay.injections, 0);
+        // SAFETY: the test still owns this regular-file replacement. Any
+        // accidental read through the reused slot would advance this offset.
+        assert_eq!(
+            unsafe { libc::lseek(fixture.slot.as_raw_fd(), 0, libc::SEEK_CUR) },
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_original_read_real_stream_survives_native_slot_replacement() {
+        let mut fixture = recorded_read_fixture().await;
+        let tool = crate::replayer::Replayer::new(
+            Pid::from_raw(std::process::id() as i32),
+            &fixture.config,
+        );
+        let mut replay = guest(&tool, &fixture.config, false);
+        drop(tool.consume_recorded_original_file(&mut replay, fixture.calls[0]));
+        assert_eq!(replay.thread.count, 0);
+        assert_eq!(replay.injections, 0);
+        fixture.buffer.require(b"");
+        for index in 0..fixture.calls.len() {
+            replay_read_entry(&tool, &mut replay, &mut fixture, index).await;
+        }
+        assert!(matches!(
+            replay.thread.next_event(),
+            Err(bincode::error::DecodeError::Io { inner, .. })
+                if inner.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert!(matches!(
+            replay.thread.next_debug_event(),
+            Err(bincode::error::DecodeError::Io { inner, .. })
+                if inner.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(replay.thread.count, 7);
+        let mut actual = [0_u8; 11];
+        // SAFETY: this bounded postcondition reads only the owned replacement,
+        // after every recorded call has completed; it is not a replay helper.
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    fixture.slot.as_raw_fd(),
+                    actual.as_mut_ptr().cast(),
+                    actual.len(),
+                )
+            },
+            11
+        );
+        assert_eq!(&actual, b"replacement");
+    }
+
+    #[tokio::test]
+    async fn recorded_original_read_rejects_full_operand_mismatch_before_payload() {
+        use futures_util::FutureExt;
+
+        for (index, mismatch) in [(3, 0), (4, 0), (1, 1), (1, 2)] {
+            let mut fixture = recorded_read_fixture().await;
+            let tool = crate::replayer::Replayer::new(
+                Pid::from_raw(std::process::id() as i32),
+                &fixture.config,
+            );
+            let mut replay = guest(&tool, &fixture.config, false);
+            for prior in 0..index {
+                replay_read_entry(&tool, &mut replay, &mut fixture, prior).await;
+            }
+            let Syscall::Read(call) = fixture.calls[index] else {
+                panic!("expected Read")
+            };
+            let wrong = match mismatch {
+                0 => call.with_len(call.len() as u32 as usize),
+                1 => call.with_buf(AddrMut::from_raw(fixture.buffer.0 + 1)),
+                2 => call.with_fd(-1),
+                _ => unreachable!(),
+            };
+            assert_ne!(Syscall::from(wrong), fixture.calls[index]);
+            fixture.buffer.bytes().fill(READ_CANARY);
+            let panic = std::panic::AssertUnwindSafe(
+                tool.consume_recorded_original_file(&mut replay, wrong.into()),
+            )
+            .catch_unwind()
+            .await
+            .expect_err("operand mismatch must refuse");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert!(message.contains("Replay diverged from recording"));
+            // expect_syscall consumes the debug identity before refusing; it
+            // must not consume the corresponding recorded ReadV2 payload.
+            assert_eq!(replay.thread.count, index as u64 + 1);
+            assert_eq!(replay.injections, 0);
+            fixture.buffer.require(b"");
+            let event = replay.thread.next_event().unwrap().event.unwrap();
+            let SyscallEvent::ReadV2(read) = event else {
+                panic!("ReadV2 payload was consumed")
+            };
+            assert_eq!(read.bytes.as_slice(), READ_BYTES[index]);
+            assert_eq!(read.consumed_sigpipe_count, 0);
+            assert!(matches!(read.replay_fd_kind, ReplayFdKind::None));
+            // SAFETY: exact owned replacement, no numeric slot relookup.
+            assert_eq!(
+                unsafe { libc::lseek(fixture.slot.as_raw_fd(), 0, libc::SEEK_CUR) },
+                0
+            );
+        }
+    }
+    #[tokio::test]
+    async fn malformed_read_control_is_not_an_authentic_recorded_einval() {
+        use std::os::fd::FromRawFd;
+        for invalid in [0, i32::MIN, i32::MAX] {
+            let data = tempfile::tempdir().unwrap();
+            let config = detcore::Config { replay_data: Some(data.path().to_path_buf()), ..Default::default() };
+            let recorder = Recorder::new(Pid::from_raw(std::process::id() as i32), &config);
+            let mut recording = guest(&recorder, &config, true);
+            let raw = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) };
+            assert!(raw >= 0, "timerfd fixture: {}", io::Error::last_os_error());
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let mut byte = [0x5a];
+            let read = reverie::syscalls::Read::new().with_fd(fd.as_raw_fd())
+                .with_buf(AddrMut::from_raw(byte.as_mut_ptr() as usize)).with_len(1);
+            // Explicit malformed trace input, followed by an actual Linux
+            // timerfd Read whose one-byte count produces the genuine EINVAL.
+            let debug = DebugEvent::new(read.into(), &recording.memory());
+            recording.thread.push_debug_event(debug).unwrap();
+            recorder.record_event(&mut recording, Ok(SyscallEvent::ReadInterrupted { signal: invalid }));
+            recording.read_operands = Some((read.fd(), read.buf().unwrap().as_raw(), read.len()));
+            assert!(matches!(recorder.invoke_original_read(&mut recording, read).await.unwrap(),
+                reverie::InjectedReadResult::Complete(Err(Errno::EINVAL))));
+            assert_eq!(recording.injections, 1);
+            assert_eq!(byte, [0x5a]);
+            drop(recording);
+            let replayer = crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+            let mut replay = guest(&replayer, &config, false);
+            let error = replayer.invoke_original_read(&mut replay, read).await.unwrap_err();
+            let Error::Tool(error) = error else { panic!("malformed control became a guest errno") };
+            assert_eq!(error.to_string(), format!("recorded Read interruption has invalid signal number {invalid}"));
+            assert_eq!(replay.thread.count, 1);
+            assert_eq!(replay.recorded_interruption_waits, 0);
+            assert_eq!(replay.injections, 0);
+            assert_eq!(byte, [0x5a]);
+            assert!(matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
+                reverie::InjectedReadResult::Complete(Err(Errno::EINVAL))));
+            assert_eq!(replay.thread.count, 2);
+            assert_eq!(replay.recorded_interruption_waits, 0);
+            assert_eq!(replay.injections, 0);
+            assert_eq!(byte, [0x5a]);
+            assert!(matches!(replay.thread.next_event(),
+                Err(bincode::error::DecodeError::Io { inner, .. }) if inner.kind() == io::ErrorKind::UnexpectedEof));
+            assert!(matches!(replay.thread.next_debug_event(),
+                Err(bincode::error::DecodeError::Io { inner, .. }) if inner.kind() == io::ErrorKind::UnexpectedEof));
+        }
+    }
+
+    #[tokio::test]
+    async fn original_read_interruption_preserves_control_handler_and_retry_order() {
+        let data = tempfile::tempdir().unwrap();
+        let config = detcore::Config { replay_data: Some(data.path().to_path_buf()), ..Default::default() };
+        let recorder = Recorder::new(Pid::from_raw(std::process::id() as i32), &config);
+        let mut recording = guest(&recorder, &config, true);
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut bytes = [0x5a; 4];
+        let read = reverie::syscalls::Read::new().with_fd(file.as_raw_fd())
+            .with_buf(AddrMut::from_raw(bytes.as_mut_ptr() as usize)).with_len(bytes.len());
+        recording.interrupt_next_read = true;
+        let result = recorder.invoke_original_read(&mut recording, read).await.unwrap();
+        assert!(matches!(result, reverie::InjectedReadResult::Interrupted(_)));
+        assert_eq!(bytes, [0x5a; 4]);
+        assert_eq!(recording.injections, 0);
+        let sentinel = Fcntl::new().with_fd(file.as_raw_fd()).with_cmd(FcntlCmd::F_GETFL);
+        let flags = recorder.handle_syscall_event(&mut recording, sentinel.into()).await.unwrap();
+        assert_eq!(recording.injections, 1);
+        recording.read_operands = Some((read.fd(), read.buf().unwrap().as_raw(), read.len()));
+        assert!(matches!(recorder.invoke_original_read(&mut recording, read).await.unwrap(),
+            reverie::InjectedReadResult::Complete(Ok(0))));
+        assert_eq!(recording.injections, 2);
+        assert_eq!(bytes, [0x5a; 4]);
+        drop(recording);
+        let replayer = crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+        // The canceled attempt has an explicit control, never ReadV2 or errno.
+        // The old test incorrectly omitted the original replay Read entirely.
+        let mut inspect = guest(&replayer, &config, false);
+        assert!(matches!(inspect.thread.next_event().unwrap().event,
+            Ok(SyscallEvent::ReadInterrupted { signal: libc::SIGUSR1 })));
+        drop(inspect);
+        let mut replay = guest(&replayer, &config, false);
+        assert!(matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
+            reverie::InjectedReadResult::RecordedInterruption(ticket)
+                if ticket.signal() == Some(reverie::Signal::SIGUSR1)));
+        assert_eq!(replay.thread.count, 1);
+        assert_eq!(bytes, [0x5a; 4]);
+        assert_eq!(replay.injections, 0);
+        assert_eq!(replayer.consume_recorded_original_file(&mut replay, sentinel.into()).await.unwrap(), flags);
+        assert_eq!(replay.thread.count, 2);
+        assert!(matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
+            reverie::InjectedReadResult::Complete(Ok(0))));
+        assert_eq!(replay.thread.count, 3);
+        assert_eq!(replay.injections, 0);
+        assert_eq!(bytes, [0x5a; 4]);
+        assert!(matches!(replay.thread.next_event(),
+            Err(bincode::error::DecodeError::Io { inner, .. }) if inner.kind() == io::ErrorKind::UnexpectedEof));
+        assert!(matches!(replay.thread.next_debug_event(),
+            Err(bincode::error::DecodeError::Io { inner, .. }) if inner.kind() == io::ErrorKind::UnexpectedEof));
+    }
+
+}
+
+#[cfg(test)]
+mod interrupted_read_tests;

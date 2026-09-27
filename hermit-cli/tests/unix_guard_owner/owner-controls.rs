@@ -49,6 +49,7 @@ mod owner_controls {
         polls: AtomicUsize,
         registration_error: bool,
         received_deadline: Mutex<Option<Instant>>,
+        snapshot_not_before: Mutex<Option<Instant>>,
     }
     struct Fake(Arc<Probe>);
     impl GuardMonitor for Fake {
@@ -70,6 +71,11 @@ mod owner_controls {
         }
         fn snapshot(&mut self) -> GuardOutcome {
             self.0.snapshots.fetch_add(1, Ordering::SeqCst);
+            if let Some(not_before) = *self.0.snapshot_not_before.lock().unwrap() {
+                while Instant::now() < not_before {
+                    thread::yield_now();
+                }
+            }
             *self.0.snapshot.lock().unwrap()
         }
     }
@@ -101,6 +107,7 @@ mod owner_controls {
             polls: AtomicUsize::new(0),
             registration_error: error,
             received_deadline: Mutex::new(None),
+            snapshot_not_before: Mutex::new(None),
         });
         let (owner, control) = GuardControllerOwner::from_monitor(
             Box::new(Fake(probe.clone())),
@@ -283,7 +290,9 @@ mod owner_controls {
         }
         assert_eq!(probe.snapshots.load(Ordering::SeqCst), before);
         assert_eq!(probe.polls.load(Ordering::SeqCst), 0);
-        owner.stop_and_join(Instant::now()).unwrap();
+        owner
+            .stop_and_join(Instant::now() + Duration::from_secs(1))
+            .unwrap();
     }
     #[test]
     fn waiter_drop_does_not_drop_actual_observer_owner() {
@@ -342,7 +351,9 @@ mod owner_controls {
                 ..
             }
         ));
-        let receipt = owner.stop_and_join(Instant::now()).unwrap();
+        let receipt = owner
+            .stop_and_join(Instant::now() + Duration::from_secs(1))
+            .unwrap();
         assert!(!receipt.observer_was_started);
         assert!(matches!(
             receipt.observation,
@@ -362,11 +373,77 @@ mod owner_controls {
         }
         .unwrap();
         assert_eq!(*probe.received_deadline.lock().unwrap(), Some(original));
-        owner.stop_and_join(Instant::now()).unwrap();
+        owner
+            .stop_and_join(Instant::now() + Duration::from_secs(1))
+            .unwrap();
         let (mut owner, control, probe) = make(None, false);
         let earlier = owner.startup_deadline() - Duration::from_millis(50);
         unsafe { control.register_stopped_initial(std::io::stdout().as_fd(), earlier) }.unwrap();
         assert_eq!(*probe.received_deadline.lock().unwrap(), Some(earlier));
-        owner.stop_and_join(Instant::now()).unwrap();
+        owner
+            .stop_and_join(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn already_finished_observer_cannot_certify_an_expired_deadline() {
+        let (mut owner, control, probe) = make(None, false);
+        register(&*control);
+        let before = probe.snapshots.load(Ordering::SeqCst);
+        assert_eq!(
+            owner.stop_and_join(Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(probe.snapshots.load(Ordering::SeqCst), before);
+        assert_eq!(
+            owner.retained_failures().last().unwrap().operation,
+            "stop_and_join"
+        );
+    }
+    #[test]
+    fn late_final_snapshot_cannot_certify_success() {
+        let (mut owner, control, probe) = make(None, false);
+        register(&*control);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        *probe.snapshot_not_before.lock().unwrap() = Some(deadline);
+        assert_eq!(
+            owner.stop_and_join(deadline).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(Instant::now() >= deadline);
+        assert_eq!(control.observation(), NetworkGuardOutcome::Running);
+        assert_eq!(
+            owner.retained_failures().last().unwrap().operation,
+            "final_snapshot_deadline"
+        );
+    }
+    #[test]
+    fn late_final_snapshot_preserves_policy_and_timeout_after_backend_failure() {
+        let (mut owner, control, probe) = make(None, false);
+        register(&*control);
+        start(&*control, &probe);
+        assert!(matches!(
+            owner.settle_backend_result::<(), _>(Err(io::Error::other("primary"))),
+            GuardedBackendResult::Failure { .. }
+        ));
+        owner.shared.stop.store(true, Ordering::Release);
+        probe.observation.release();
+        wait_finished(&owner);
+        *probe.snapshot.lock().unwrap() = policy();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        *probe.snapshot_not_before.lock().unwrap() = Some(deadline);
+        assert_eq!(
+            owner.stop_and_join(deadline).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(owner.shared.lifecycle.lock().unwrap().observer.is_none());
+        assert!(matches!(
+            owner.retained_terminal(),
+            Some(NetworkGuardTerminal::Policy(_))
+        ));
+        assert_eq!(
+            owner.retained_failures().last().unwrap().operation,
+            "final_snapshot_deadline"
+        );
     }
 }

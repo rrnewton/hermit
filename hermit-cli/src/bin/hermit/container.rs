@@ -849,26 +849,11 @@ fn inject_test_fault(site: &str) {
 /// Returns a [`SerializableError`] rather than a bare [`Error`] so the CLASS
 /// survives: a caught panic is tagged HERE, at the only point that still knows
 /// one happened, and the tag then crosses the process boundary with the message.
-#[cfg(test)]
-fn catch_child_panic<F, T>(f: &mut F) -> Result<T, SerializableError>
+pub(super) fn catch_child_panic<F, T>(f: &mut F) -> Result<T, SerializableError>
 where
     F: FnMut() -> Result<T, Error>,
 {
-    install_panic_location_hook();
-    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        inject_test_fault("with_container");
-        f()
-    })) {
-        Ok(result) => result.map_err(SerializableError::from),
-        Err(payload) => {
-            let location = take_panic_location();
-            Err(SerializableError::from(anyhow!(
-                "panic in container child at {location}: {}",
-                panic_message(&*payload)
-            ))
-            .into_panic())
-        }
-    }
+    catch_child_panic_at("with_container", f)
 }
 
 /// Same child panic boundary with the original explicit call-site fault label.

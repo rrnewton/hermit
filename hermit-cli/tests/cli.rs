@@ -21,6 +21,9 @@ mod kvm_signal_retirement;
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
+#[path = "common/run_timeout.rs"]
+mod run_timeout;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -2956,7 +2959,6 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
         "kvm",
         "--strict",
         "--verify",
-        "--epoch=2026-01-01T00:00:00Z",
         "--base-env=minimal",
         "--epoch=2026-01-01T00:00:00Z",
         "--",
@@ -7114,31 +7116,6 @@ const RUN_TIMEOUT_SPINNER: &[&str] = &["/bin/sh", "-c", "trap '' TERM; while : ;
 /// drain check measured about 4s total.
 const RUN_TIMEOUT_SECS: u64 = 2;
 
-/// Session id of `pid`, or `None` if it is gone.
-///
-/// The comm field is parenthesised and may itself contain spaces and
-/// parentheses, so it is skipped from the LAST `)`. `session` is the sixth
-/// field overall, i.e. index 3 after `state`.
-fn run_timeout_session_of(pid: i32) -> Option<i32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = &stat[stat.rfind(')')? + 1..];
-    after_comm.split_whitespace().nth(3)?.parse().ok()
-}
-
-/// Every live pid in `session`: the outer `hermit`, the container init, and the
-/// guest. Scanning the SESSION rather than a pid is what lets the test see a
-/// process that was reparented away from us.
-fn run_timeout_pids_in_session(session: i32) -> Vec<i32> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
-        .filter(|pid| run_timeout_session_of(*pid) == Some(session))
-        .collect()
-}
-
 /// Run `hermit run --timeout <secs> -- <argv>` as its own session leader.
 ///
 /// Its own session so the test can account for every process the run creates,
@@ -7182,12 +7159,10 @@ fn run_timeout_fires_by_name_and_unwinds_the_container() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let child = spawn_timed_run(RUN_TIMEOUT_SECS, RUN_TIMEOUT_SPINNER);
-    let session = child.id() as i32;
-    let started = Instant::now();
-    let output = child
-        .wait_with_output()
-        .expect("failed to wait for hermit run --timeout");
-    let elapsed = started.elapsed();
+    let observed = run_timeout::wait(child, Instant::now())
+        .expect("failed to observe and clean up hermit run --timeout");
+    let output = observed.output;
+    let elapsed = observed.elapsed;
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     assert_eq!(
@@ -7209,33 +7184,8 @@ fn run_timeout_fires_by_name_and_unwinds_the_container() {
          stderr:\n{stderr}"
     );
 
-    // The unwind. Nothing above this line can distinguish a torn-down container
-    // from an orphaned one.
-    let drained = {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if run_timeout_pids_in_session(session).is_empty() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    };
-    let survivors: Vec<String> = run_timeout_pids_in_session(session)
-        .into_iter()
-        .map(|pid| {
-            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-            format!("{pid} ({})", comm.trim())
-        })
-        .collect();
-    for pid in run_timeout_pids_in_session(session) {
-        // SAFETY: `kill` takes a pid and a signal and touches no caller memory;
-        // a stale pid can only fail with ESRCH. A failing test must not leak the
-        // very processes it is about.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
+    let drained = observed.drained;
+    let survivors = observed.survivors;
     assert!(
         drained,
         "hermit reported the timeout but left the run alive: {survivors:?}. \
@@ -7315,12 +7265,10 @@ fn captured_output_timeout_fires_and_unwinds_the_container() {
         });
     }
     let child = command.spawn().expect("spawn captured-output timeout");
-    let session = child.id() as i32;
-    let started = Instant::now();
-    let output = child
-        .wait_with_output()
-        .expect("wait for captured-output timeout");
-    let elapsed = started.elapsed();
+    let observed = run_timeout::wait(child, Instant::now())
+        .expect("observe and clean up captured-output timeout");
+    let output = observed.output;
+    let elapsed = observed.elapsed;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(124), "{stderr}");
     assert!(stderr.contains("class=run-timeout"), "{stderr}");
@@ -7329,23 +7277,8 @@ fn captured_output_timeout_fires_and_unwinds_the_container() {
         "{stderr}"
     );
     assert!(stderr.contains("Studying target execution"), "{stderr}");
-    let drained = {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if run_timeout_pids_in_session(session).is_empty() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    };
-    let survivors = run_timeout_pids_in_session(session);
-    for pid in &survivors {
-        // SAFETY: only the still-owned test session is being cleaned up.
-        unsafe { libc::kill(*pid, libc::SIGKILL) };
-    }
+    let drained = observed.drained;
+    let survivors = observed.survivors;
     assert!(
         drained,
         "captured-output timeout left the session alive: {survivors:?}"
@@ -7409,8 +7342,9 @@ fn run_timeout_fallback_fires_when_the_unwind_does_not_finish() {
     let child = command
         .spawn()
         .expect("failed to spawn hermit run --timeout");
-    let session = child.id() as i32;
-    let output = child.wait_with_output().expect("failed to wait for hermit");
+    let observed =
+        run_timeout::wait(child, Instant::now()).expect("observe and clean up timeout fallback");
+    let output = observed.output;
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     assert!(
@@ -7433,23 +7367,7 @@ fn run_timeout_fallback_fires_when_the_unwind_does_not_finish() {
          child death. stderr:\n{stderr}"
     );
 
-    let drained = {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if run_timeout_pids_in_session(session).is_empty() {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    };
-    for pid in run_timeout_pids_in_session(session) {
-        // SAFETY: `kill` takes a pid and a signal and touches no caller memory;
-        // a stale pid can only fail with ESRCH.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
+    let drained = observed.drained;
     assert!(
         drained,
         "the fallback `_exit`s the namespace init, and the kernel must then reap \

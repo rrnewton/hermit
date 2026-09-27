@@ -101,9 +101,62 @@ pub struct PreparedFullReplayTrace {
     metadata: Metadata,
     network_trace_input: Vec<u8>,
     controller_can_exit_on_network_refusal: bool,
+    network_runtime: Option<detcore::network_runtime::NetworkRuntimeResources>,
+    controller_gdb_listener: Option<std::net::TcpListener>,
 }
 
 impl PreparedFullReplayTrace {
+    /// Receive debugger transport from the owned startup handoff, after its
+    /// parent alias is retired. The listener is controller-only and CLOEXEC,
+    /// using the same loopback address as the existing port API.
+    #[doc(hidden)]
+    pub fn with_controller_gdb_listener(
+        mut self,
+        listener: std::net::TcpListener,
+    ) -> Result<Self, Error> {
+        if self.controller_gdb_listener.is_some() {
+            return Err(Error::msg(
+                "controller debugger listener was supplied twice",
+            ));
+        }
+        if listener.local_addr()?.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+            return Err(Error::msg(
+                "controller debugger listener changed the loopback address",
+            ));
+        }
+        let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if flags & libc::FD_CLOEXEC == 0 {
+            return Err(Error::msg("controller debugger listener is not CLOEXEC"));
+        }
+        self.controller_gdb_listener = Some(listener);
+        Ok(self)
+    }
+
+    /// Attach the authenticated resources received by this owned controller.
+    /// This does not create provider, file-table, or replay-topology authority.
+    #[doc(hidden)]
+    pub fn with_network_runtime_resources(
+        mut self,
+        resource: detcore::network_runtime::NetworkRuntimeResources,
+    ) -> Result<Self, Error> {
+        if self.network_runtime.is_some() {
+            return Err(Error::msg("full trace network runtime was supplied twice"));
+        }
+        self.network_runtime = Some(resource);
+        Ok(self)
+    }
+
+    pub(crate) fn controller_disposal_owner(
+        &self,
+    ) -> Option<detcore::network_runtime::NetworkRuntimeOwner> {
+        self.network_runtime
+            .as_ref()
+            .map(|resource| resource.controller_disposal_owner())
+    }
+
     /// Open and validate full-replay metadata and its network sidecar.
     pub fn open(data: &Path) -> Result<Self, Error> {
         let directory = open_host_recording_directory(data)?;
@@ -125,6 +178,8 @@ impl PreparedFullReplayTrace {
             metadata,
             network_trace_input,
             controller_can_exit_on_network_refusal: false,
+            network_runtime: None,
+            controller_gdb_listener: None,
         })
     }
 
@@ -169,6 +224,8 @@ impl Replay {
             metadata,
             network_trace_input,
             controller_can_exit_on_network_refusal,
+            network_runtime,
+            controller_gdb_listener,
         } = prepared_trace;
         let dir = data.as_path();
 
@@ -180,7 +237,10 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let mut config = record_or_replay_config(dir, FullReplayPhase::Replay, metadata.epoch);
+        let mut config = crate::prepare_backend_config(
+            record_or_replay_config(dir, FullReplayPhase::Replay, metadata.epoch),
+            crate::Backend::Ptrace,
+        );
         config.network_trace_input = Some(network_trace_input);
         config.controller_can_exit_on_network_refusal = controller_can_exit_on_network_refusal;
         // Recorder events contain the raw bytes from the recording namespace.
@@ -241,15 +301,37 @@ impl Replay {
         command.chroot(chroot.path());
 
         let mut builder = reverie_ptrace::TracerBuilder::<ReplayTool>::new(command).config(config);
-        if let Some(port) = gdbserver {
-            builder = builder.gdbserver(port);
+        match (gdbserver, controller_gdb_listener) {
+            (Some(port), Some(listener)) => {
+                if listener.local_addr()?.port() != port {
+                    return Err(Error::msg("controller debugger listener port changed"));
+                }
+                builder = builder.gdbserver(listener);
+            }
+            (Some(port), None) => {
+                builder = builder.gdbserver(port);
+            }
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(Error::msg(
+                    "debugger listener supplied without debugger mode",
+                ));
+            }
         }
         if sequentialize_threads {
             // Inform gdbserver not to serialize guests because this is
             // done by detcore already.
             builder = builder.sequentialized_guest();
         }
-        let tracer = builder.spawn().await?;
+        let tracer = match network_runtime {
+            Some(resource) => {
+                detcore::network_runtime::with_network_runtime_resources(resource, async {
+                    builder.spawn().await.map_err(Error::from)
+                })
+                .await?
+            }
+            None => builder.spawn().await?,
+        };
 
         Ok(Self {
             tracer,

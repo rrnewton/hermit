@@ -25,7 +25,7 @@ use serde_json::Value;
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Case {
+pub(super) enum Case {
     Poll,
     Recv,
 }
@@ -267,6 +267,10 @@ fn wait_evidence(text: &str, result: &GuestResult, policy: &str) -> Result<Value
 }
 
 fn assert_guard(evidence: &Path, label: &str) {
+    if super::super::network_boundary::active() {
+        super::super::network_boundary::assert_receipt(evidence, label, Some(0));
+        return;
+    }
     let report = fs::read_to_string(evidence.join(format!("{label}.safehermit")))
         .expect("safehermit report");
     let mut fields = BTreeMap::new();
@@ -332,7 +336,7 @@ fn retain_proof(path: &Path, text: &str, result: &GuestResult, policy: &str) {
         .expect("retain LOWAT boundary proof");
 }
 
-pub(super) fn assert_record_replay_lowat(evidence: &Path) {
+pub(super) fn assert_record_replay_lowat(evidence: &Path, case: Case) {
     // Hermit's default file-log limit is 1 GiB. Keep a stricter inherited
     // limit; reject zero/unbounded or enlarged overrides rather than mutating
     // process-global environment shared with other tests.
@@ -349,7 +353,7 @@ pub(super) fn assert_record_replay_lowat(evidence: &Path) {
     }
     fs::create_dir(evidence).expect("new LOWAT evidence directory");
     let fixture = &super::super::workload("c_network_poll_lowat").path;
-    for case in [Case::Poll, Case::Recv] {
+    {
         let directory = evidence.join(case.name());
         fs::create_dir(&directory).unwrap();
         let controller_directory = directory.join("controller");
