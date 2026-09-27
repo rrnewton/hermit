@@ -80,7 +80,7 @@ async fn subsequent_leader_exec_cancellation_consumes_prepared_incarnation() {
         ),
         (
             mm1,
-            GlobalRequest::MarkPastFirstExecve(process, None),
+            GlobalRequest::MarkPastFirstExecve(LEADER, None),
             GlobalResponse::MarkPastFirstExecve(Default::default()),
         ),
         (
