@@ -618,7 +618,11 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_uptime_seconds: u64,
     pub(crate) virtual_realtime_seconds: i64,
     /// Fixed whole-second virtual boot time reported as `/proc/stat` `btime`.
-    pub(crate) virtual_boot_time_seconds: i64,
+    ///
+    /// Present exactly when `ProcfsFile::needs_boot_time` holds. No other file
+    /// consults the boot instant, so an uptime offset that leaves it without an
+    /// `i64` representation cannot fail any other procfs read.
+    pub(crate) virtual_boot_time_seconds: Option<i64>,
     pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
@@ -877,6 +881,12 @@ impl ProcfsFile {
         self.kind == ProcfsKind::RandomUuid
     }
 
+    /// Returns true when this snapshot renders the virtual boot instant, which
+    /// only `/proc/stat` does (its `btime` line).
+    pub(crate) fn needs_boot_time(&self) -> bool {
+        self.kind == ProcfsKind::SystemStat
+    }
+
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
@@ -918,9 +928,11 @@ impl ProcfsFile {
             ProcfsKind::TimerSlack(_) => {
                 unreachable!("timer-slack procfs content is generated from ThreadState")
             }
-            ProcfsKind::SystemStat => {
-                sanitize_system_stat(&contents, virtual_uptime_seconds, virtual_boot_time_seconds)
-            }
+            ProcfsKind::SystemStat => sanitize_system_stat(
+                &contents,
+                virtual_uptime_seconds,
+                virtual_boot_time_seconds.expect("/proc/stat snapshot omitted the boot time"),
+            ),
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
