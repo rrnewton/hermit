@@ -270,7 +270,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
     // Three captured-clock routing controls retain all 810 prior identities (810 + 3 = 813).
-    ("test.detcore_unit", 813),
+    // The futex-deadline clock-refusal control retains all 813 prior identities (813 + 1 = 814).
+    ("test.detcore_unit", 814),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -307,7 +308,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 813),
+    ("test.detcore_unit_on_host", 814),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.recorded_clocks_on_host", 6),
