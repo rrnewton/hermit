@@ -1391,7 +1391,7 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 /// plugin then refused a matched build and aborted the guest before its first
 /// Detcore request. The real values still reach the plugin: the coordinator
 /// sends its resolved `Config` in the RPC handshake. See
-/// [`wire_fingerprint_config`].
+/// `wire_fingerprint_config`.
 pub fn config_wire_fingerprint() -> String {
     let config = wire_fingerprint_config();
     let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
