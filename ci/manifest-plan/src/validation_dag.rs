@@ -145,7 +145,6 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 12] = [
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
-    "build.recorded_clocks",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -241,21 +240,19 @@ struct Profile {
 // full then gained one more step, and privileged and hosted-privileged one
 // each, for the privileged system-utils nodes: 271/272, 11/19 and 12/12
 // before.
-// build.recorded_clocks, build.recorded_clocks_in_pinned_root and
-// test.recorded_clocks add three steps to full (272/273 + 3 = 275/276) and
-// to portable (259/260 + 3 = 262/263), and build.recorded_clocks_on_host
-// and test.recorded_clocks_on_host add two to hosted-portable
-// (250/250 + 2 = 252/252).
+// test.recorded_clocks adds one step to full (272/273 + 1 = 273/274) and
+// to portable (259/260 + 1 = 260/261), and test.recorded_clocks_on_host
+// adds one to hosted-portable (250/250 + 1 = 251/251).
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 275,
-        selected_steps: 276,
+        direct_steps: 273,
+        selected_steps: 274,
     },
     Profile {
         label: "portable",
-        direct_steps: 262,
-        selected_steps: 263,
+        direct_steps: 260,
+        selected_steps: 261,
     },
     Profile {
         label: "quick",
@@ -274,8 +271,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 252,
-        selected_steps: 252,
+        direct_steps: 251,
+        selected_steps: 251,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -738,7 +735,6 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // Split the producer before closing over its shared downstream consumers,
     // so no hosted path retains a dependency on the local full producer.
     split.insert("build.workspace".into());
-    split.insert("build.recorded_clocks".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -763,11 +759,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         }
     }
     // 213 until test.dbt_parity was retired (slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301). build.recorded_clocks
-    // and test.recorded_clocks add two nodes: 212 + 2 = 214.
-    if split.len() != 214 {
+    // https://github.com/rrnewton/hermit/issues/3301). test.recorded_clocks
+    // adds one node: 212 + 1 = 213.
+    if split.len() != 213 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 214",
+            "hosted test dependency closure has {} nodes, expected 213",
             split.len()
         ));
     }
@@ -1831,6 +1827,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     }
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
+    crate::nextest_build_selections::assert_hermit_selections_carry_canonical_features(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
@@ -1839,10 +1836,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
     // since check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes.
-    // This commit's five recorder-clock steps make it 1608 + 5 = 1613.
-    if cfg.steps.len() != 1613 {
+    // test.recorded_clocks and test.recorded_clocks_on_host make it
+    // 1608 + 2 = 1610.
+    if cfg.steps.len() != 1610 {
         return Err(format!(
-            "superset has {} steps, expected 1613",
+            "superset has {} steps, expected 1610",
             cfg.steps.len()
         ));
     }
@@ -3381,9 +3379,8 @@ sys.exit(37)
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
         // 250 since test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        // build.recorded_clocks_on_host and test.recorded_clocks_on_host make
-        // it 250 + 2 = 252.
-        assert_eq!(selected.steps.len(), 252);
+        // test.recorded_clocks_on_host makes it 250 + 1 = 251.
+        assert_eq!(selected.steps.len(), 251);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3435,7 +3432,6 @@ sys.exit(37)
             "build.e2e_artifact_on_host".into(),
             "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
-            "build.recorded_clocks_on_host".into(),
             "check.backend_parity_suites_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
@@ -3444,9 +3440,8 @@ sys.exit(37)
         ]);
         // 212 since test.dbt_parity_on_host was retired with its pinned twin
         // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
-        // build.recorded_clocks_on_host and test.recorded_clocks_on_host make
-        // it 212 + 2 = 214.
-        assert_eq!(new_variants.len(), 214);
+        // test.recorded_clocks_on_host makes it 212 + 1 = 213.
+        assert_eq!(new_variants.len(), 213);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3544,11 +3539,10 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 251 = the 252 hosted-portable direct steps (250 since slice S13
+            // 250 = the 251 hosted-portable direct steps (250 since slice S13
             // of https://github.com/rrnewton/hermit/issues/3301, plus
-            // build.recorded_clocks_on_host and test.recorded_clocks_on_host),
-            // minus the one planted loss.
-            error.contains("hosted-portable label has 251 direct steps"),
+            // test.recorded_clocks_on_host), minus the one planted loss.
+            error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
     }

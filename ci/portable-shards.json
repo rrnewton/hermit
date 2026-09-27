@@ -37,7 +37,6 @@
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",
     "setup.nextest",
-    "build.recorded_clocks",
     "build.workspace",
     "build.manifest_guests"
   ],
