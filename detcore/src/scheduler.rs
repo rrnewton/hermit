@@ -639,6 +639,11 @@ pub struct Scheduler {
     /// Accepted address-space incarnation for raw TIDs explicitly reused by exec.
     exec_incarnations: BTreeMap<DetTid, MmId>,
 
+    /// A transferred non-leader has no remaining incarnation under its former
+    /// TID. This also rejects late consuming RPCs on ptrace, where ordinary
+    /// logical teardown does not use killed-thread cancellation tombstones.
+    retired_transferred_exec_callers: BTreeSet<DetTid>,
+
     /// Tombstoned SaBRe threads whose final asynchronous deregistration statistics were merged.
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
     deregistration_accounted: BTreeSet<DetTid>,
@@ -704,6 +709,10 @@ pub struct Scheduler {
 
     /// Final syscall count reported by each thread when it deregisters.
     pub per_thread_syscalls: BTreeMap<DetTid, u64>,
+
+    /// Counts already consumed from displaced leaders before the current
+    /// transferred incarnation began reporting under the same leader TID.
+    transferred_exec_syscall_offsets: BTreeMap<DetTid, u64>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -1697,6 +1706,7 @@ impl Scheduler {
                 .backend_supports_parked_write_signal_interruption,
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
+            retired_transferred_exec_callers: Default::default(),
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
@@ -1710,6 +1720,7 @@ impl Scheduler {
             timeslices: Default::default(),
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
+            transferred_exec_syscall_offsets: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -2171,6 +2182,32 @@ impl Scheduler {
     /// before it is removed, so process-exit barriers cannot observe a transiently
     /// empty thread group.
     pub fn reconnect_after_exec(&mut self, reconnect: ExecReconnect) -> Vec<DetTid> {
+        self.reconnect_exec(reconnect, None)
+    }
+
+    /// Reconnect a non-leader exec whose backend preserved the caller's Tool
+    /// state and PMU. The replay cursor, rather than the destroyed leader's
+    /// pending duration, determines the replacement's next grant. The grant
+    /// returns a relative duration; reconnect itself advances neither time nor
+    /// the replay cursor and does not issue a scheduler turn.
+    pub(crate) fn reconnect_transferred_exec(&mut self, reconnect: ExecReconnect) -> Vec<DetTid> {
+        assert_ne!(reconnect.caller, reconnect.new_leader);
+        let replay_resume = self.replayer.as_ref().and_then(Replayer::next_resume);
+        let former = reconnect.caller;
+        let leader = reconnect.new_leader;
+        let consumed_syscalls = self.per_thread_syscalls.get(&leader).copied().unwrap_or(0);
+        let retired = self.reconnect_exec(reconnect, replay_resume);
+        self.retired_transferred_exec_callers.insert(former);
+        self.transferred_exec_syscall_offsets
+            .insert(leader, consumed_syscalls);
+        retired
+    }
+
+    fn reconnect_exec(
+        &mut self,
+        reconnect: ExecReconnect,
+        replay_resume: Option<(DetTid, Option<LogicalTime>)>,
+    ) -> Vec<DetTid> {
         let ExecReconnect {
             caller,
             new_leader,
@@ -2203,12 +2240,16 @@ impl Scheduler {
             return siblings;
         }
 
-        let survivor_priority = self
-            .priorities
-            .get(&caller)
-            .copied()
-            .or(reconnect_priority)
-            .expect("exec caller must have a scheduler priority");
+        let survivor_priority = match replay_resume {
+            Some((next_tid, _)) if next_tid == new_leader => REPLAY_FOREGROUND_PRIORITY,
+            Some(_) => REPLAY_DEFERRED_PRIORITY,
+            None => self
+                .priorities
+                .get(&caller)
+                .copied()
+                .or(reconnect_priority)
+                .expect("exec caller must have a scheduler priority"),
+        };
         let mut retired = Vec::new();
         for old_tid in group.into_iter().filter(|tid| *tid != caller) {
             self.logically_kill_thread(&old_tid, &detpid, pre_exec_mm);
@@ -2238,6 +2279,16 @@ impl Scheduler {
             "retired exec leader still had a scheduler registration"
         );
         self.priorities.insert(new_leader, survivor_priority);
+        if let Some((next_tid, timeslice)) = replay_resume
+            && next_tid == new_leader
+        {
+            // Rebuild only the current cursor's decision. The removed entry
+            // could have belonged to the displaced leader, while a prehook's
+            // ContextSwitch(false, new_leader, ..) already refers to the
+            // replacement. Neither priority nor the old entry distinguishes
+            // those cases, and the cursor may have advanced in the meantime.
+            self.timeslices.insert(new_leader, timeslice);
+        }
         if let Some(writer) = &mut self.preemption_writer {
             writer.set_current(new_leader, survivor_priority);
         }
@@ -2312,9 +2363,11 @@ impl Scheduler {
     }
 
     pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
-        self.exec_incarnations
-            .get(&dettid)
-            .is_none_or(|expected| *expected == mm)
+        !self.retired_transferred_exec_callers.contains(&dettid)
+            && self
+                .exec_incarnations
+                .get(&dettid)
+                .is_none_or(|expected| *expected == mm)
     }
 
     pub(crate) fn backend_failed(&self) -> bool {
@@ -2366,13 +2419,17 @@ impl Scheduler {
         self.thread_tree.thread_to_leader.contains_key(&dettid)
     }
 
-    /// Mark a physical exit cleanup as accounted. Non-cancelling backends preserve their existing
-    /// behavior; SaBRe teardown may deliver the cleanup after an earlier logical tombstone.
+    /// Mark a physical exit cleanup as accounted. A transferred leader must
+    /// consume each incarnation once even on a non-cancelling backend; other
+    /// non-cancelling identities preserve their existing behavior.
     pub(crate) fn note_deregistration_accounted(&mut self, dettid: DetTid) -> bool {
         // Remember an owner accounted before a later peer failure as well.
         // Ordinary non-cancelling behavior still accepts its prior callbacks.
         let first = self.deregistration_accounted.insert(dettid);
-        (!self.cancel_killed_thread_rpcs && !self.backend_failed()) || first
+        (!self.cancel_killed_thread_rpcs
+            && !self.backend_failed()
+            && !self.transferred_exec_syscall_offsets.contains_key(&dettid))
+            || first
     }
 
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
@@ -5142,7 +5199,15 @@ impl Scheduler {
 
     /// Record an exiting thread's final completed-syscall count.
     pub fn record_syscall_count(&mut self, dettid: DetTid, count: u64) {
-        self.per_thread_syscalls.insert(dettid, count);
+        let consumed = self
+            .transferred_exec_syscall_offsets
+            .get(&dettid)
+            .copied()
+            .unwrap_or(0);
+        let total = consumed
+            .checked_add(count)
+            .expect("transferred exec syscall count overflow");
+        self.per_thread_syscalls.insert(dettid, total);
     }
 
     /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
@@ -5463,6 +5528,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod test {
+    use reverie::syscalls::Sysno;
+
     use super::*;
     use crate::DetTime;
     use crate::tool_local::RobustListExit;
@@ -5715,6 +5782,370 @@ mod test {
             child_tid_addr: 0,
             reconnect_priority: Some(DEFAULT_PRIORITY),
         })
+    }
+
+    fn reconnect_transferred_exec(
+        sched: &mut Scheduler,
+        leader: DetTid,
+        caller: DetTid,
+        detpid: DetPid,
+        pre_exec_mm: MmId,
+    ) -> Vec<DetTid> {
+        sched.reconnect_transferred_exec(ExecReconnect {
+            caller,
+            new_leader: leader,
+            detpid,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(detpid),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        })
+    }
+
+    fn exec_replay(
+        caller: DetTid,
+        next: DetTid,
+        following: DetTid,
+        branches: Option<u32>,
+    ) -> (Replayer, SchedEvent) {
+        let prehook = SchedEvent::syscall(caller, Sysno::execve, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let mut events = vec![prehook.clone()];
+        if let Some(count) = branches {
+            let branch = SchedEvent::branches(next, count)
+                .with_time(LogicalTime::from_nanos(10_000) + LogicalTime::from_rcbs(count.into()));
+            let other = SchedEvent {
+                op: detcore_model::schedule::Op::OtherInstructions,
+                count: 1,
+                ..branch.clone()
+            };
+            events.extend([branch, other]);
+        } else {
+            events.push(SchedEvent::syscall(
+                next,
+                Sysno::getpid,
+                SyscallPhase::Prehook,
+            ));
+        }
+        events.push(SchedEvent::syscall(
+            following,
+            Sysno::getpid,
+            SyscallPhase::Prehook,
+        ));
+        (Replayer::new(events), prehook)
+    }
+
+    #[tokio::test]
+    async fn transferred_exec_reconnect_restores_replay_pre_hook_continuation_grant() {
+        for branches in [Some(123), None] {
+            let config = Config::default();
+            let mut sched = Scheduler::new(&config);
+            let leader = DetTid::from_raw(17);
+            let caller = DetTid::from_raw(18);
+            let unrelated = DetTid::from_raw(31);
+            let (detpid, pre_exec_mm, old_leader_request) =
+                install_runnable_exec_group(&mut sched, leader, caller);
+            register_known_thread(&mut sched, unrelated);
+            sched.runqueue_push_back(unrelated);
+            let (replayer, prehook) = exec_replay(caller, leader, unrelated, branches);
+            sched.replayer = Some(replayer);
+            let duration = branches.map(|count| LogicalTime::from_rcbs(count.into()));
+
+            // Exercise the actual prehook ContextSwitch(false, leader, ..),
+            // including the priority and pending duration it stages.
+            let consumed = sched.consume_schedevent(&prehook);
+            assert!(consumed.keep_running);
+            assert_eq!(consumed.event_ix, 0);
+            assert_eq!(consumed.timeslice_remaining, duration);
+            assert_eq!(sched.priorities[&caller], REPLAY_DEFERRED_PRIORITY);
+            assert_eq!(sched.priorities[&leader], REPLAY_FOREGROUND_PRIORITY);
+            assert_eq!(sched.timeslices.get(&leader), Some(&duration));
+
+            // The backend consumes the displaced leader before post-exec.
+            // That removes its priority, but not its pending timeslice.
+            sched.logically_kill_thread(&leader, &detpid, pre_exec_mm);
+            let caller_request = sched.next_turns[&caller].req.clone();
+            sched.turn = 41;
+            sched.committed_time = GlobalTime::new(&config).as_nanos();
+            let before = (sched.turn, sched.committed_time);
+            let next_event = sched.replayer.as_ref().unwrap().cursor.peek().cloned();
+            reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+
+            assert_eq!((sched.turn, sched.committed_time), before);
+            assert_eq!(sched.priorities[&leader], REPLAY_FOREGROUND_PRIORITY);
+            assert_eq!(sched.timeslices.get(&leader), Some(&duration));
+            assert!(!sched.timeslices.contains_key(&caller));
+            assert!(matches!(caller_request.try_read(), Some(Err(_))));
+            assert!(matches!(old_leader_request.try_read(), Some(Err(_))));
+            assert_ne!(sched.next_turns[&leader].req, old_leader_request);
+            let replayer = sched.replayer.as_ref().unwrap();
+            assert_eq!(replayer.traced_event_count, 1);
+            assert_eq!(replayer.events_popped, 1);
+            assert_eq!(replayer.cursor.peek(), next_event.as_ref());
+            assert_eq!(
+                replayer.desync_counts,
+                BTreeMap::from([(caller, replayer::DesyncStats::default())])
+            );
+
+            for tid in [leader, unrelated] {
+                let mut resources = Resources::new(tid);
+                resources.insert(ResourceID::MemAddrSpace(tid), Permission::RW);
+                sched.next_turns[&tid].req.put(Ok(resources));
+            }
+            let continuation = sched.next_turns[&leader].resp.clone();
+            let unrelated_response = sched.next_turns[&unrelated].resp.clone();
+            assert!(continuation.try_read().is_none());
+            let sched = Arc::new(Mutex::new(sched));
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            let granted = tokio::time::timeout(
+                Duration::from_secs(5),
+                do_a_turn_blocking(sched.clone(), global_time, &Err(SkipTurn)),
+            )
+            .await
+            .expect("the continuation grant must not stall")
+            .expect("the replay continuation must be runnable");
+            assert_eq!(granted.tid, leader);
+            let Some(SchedResponse::Go(granted_duration)) = continuation.try_read() else {
+                panic!("replacement did not receive an ordinary continuation grant");
+            };
+            assert_eq!(
+                granted_duration,
+                duration.map(|time| SchedValue::Value(time.as_nanos()))
+            );
+            assert!(unrelated_response.try_read().is_none());
+            let sched = sched.lock().unwrap();
+            assert_eq!(sched.turn, before.0 + 1);
+            assert!(!sched.timeslices.contains_key(&leader));
+            assert!(!sched.run_queue.contains_tid(caller));
+            assert_eq!(
+                sched.run_queue.tids().filter(|tid| **tid == leader).count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transferred_exec_reconnect_discards_stale_leader_duration_for_other_replay_task() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let unrelated = DetTid::from_raw(31);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        register_known_thread(&mut sched, unrelated);
+        sched.runqueue_push_back(unrelated);
+        sched
+            .timeslices
+            .insert(leader, Some(LogicalTime::from_nanos(99)));
+        let (replayer, prehook) = exec_replay(caller, unrelated, leader, Some(123));
+        sched.replayer = Some(replayer);
+        let consumed = sched.consume_schedevent(&prehook);
+        assert!(consumed.keep_running);
+        sched.logically_kill_thread(&leader, &detpid, pre_exec_mm);
+
+        reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+
+        assert_eq!(sched.priorities[&leader], REPLAY_DEFERRED_PRIORITY);
+        assert!(!sched.timeslices.contains_key(&leader));
+        assert_eq!(sched.priorities[&unrelated], REPLAY_FOREGROUND_PRIORITY);
+        assert_eq!(
+            sched.timeslices.get(&unrelated),
+            Some(&Some(LogicalTime::from_rcbs(123)))
+        );
+        for tid in [leader, unrelated] {
+            sched.next_turns[&tid].req.put(Ok(Resources::new(tid)));
+        }
+        let continuation = sched.next_turns[&leader].resp.clone();
+        let unrelated_response = sched.next_turns[&unrelated].resp.clone();
+        let sched = Arc::new(Mutex::new(sched));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let granted = tokio::time::timeout(
+            Duration::from_secs(5),
+            do_a_turn_blocking(sched.clone(), global_time, &Err(SkipTurn)),
+        )
+        .await
+        .expect("the unrelated task's grant must not stall")
+        .expect("the other replay task must retain its grant");
+        assert_eq!(granted.tid, unrelated);
+        assert!(continuation.try_read().is_none());
+        let Some(SchedResponse::Go(Some(SchedValue::Value(duration)))) =
+            unrelated_response.try_read()
+        else {
+            panic!("the other replay task lost its pending duration");
+        };
+        assert_eq!(duration, LogicalTime::from_rcbs(123).as_nanos());
+    }
+
+    #[test]
+    fn transferred_exec_reconnect_preserves_survivor_priority_without_replay() {
+        for exhausted_replay in [false, true] {
+            let mut sched = Scheduler::new(&Config::default());
+            let leader = DetTid::from_raw(17);
+            let caller = DetTid::from_raw(18);
+            let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+            sched.priorities.insert(leader, runqueue::FIRST_PRIORITY);
+            let survivor_priority = DEFAULT_PRIORITY + 7;
+            sched.priorities.insert(caller, survivor_priority);
+            sched
+                .timeslices
+                .insert(leader, Some(LogicalTime::from_nanos(99)));
+            if exhausted_replay {
+                sched.replayer = Some(Replayer::new([]));
+            }
+
+            reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+
+            assert_eq!(sched.priorities[&leader], survivor_priority);
+            assert!(!sched.timeslices.contains_key(&leader));
+            assert_eq!(sched.turn, 0);
+        }
+    }
+
+    #[test]
+    fn transferred_exec_reconnect_retires_former_rpc_identity_without_cancellation() {
+        for transfer in [true, false] {
+            let config = Config {
+                cancel_killed_thread_rpcs: false,
+                ..Config::default()
+            };
+            let mut sched = Scheduler::new(&config);
+            let leader = DetTid::from_raw(17);
+            let caller = DetTid::from_raw(18);
+            let unrelated = DetTid::from_raw(31);
+            let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+            let post_exec_mm = pre_exec_mm.for_exec(detpid);
+            register_known_thread(&mut sched, unrelated);
+            let unrelated_mm = MmId::initial(unrelated);
+            assert!(sched.rpc_incarnation_matches(caller, pre_exec_mm));
+
+            if transfer {
+                reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+            } else {
+                reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+            }
+
+            // A transferred caller must not regain a clock component or merge
+            // final statistics through a late ordinary RPC, in any address
+            // space. The legacy reload mode's admission policy is unchanged.
+            for mm in [pre_exec_mm, post_exec_mm, unrelated_mm] {
+                assert_eq!(sched.rpc_incarnation_matches(caller, mm), !transfer);
+            }
+            assert!(!sched.thread_is_logically_killed(caller));
+            assert!(sched.rpc_incarnation_matches(leader, post_exec_mm));
+            assert!(!sched.rpc_incarnation_matches(leader, pre_exec_mm));
+            assert!(sched.rpc_incarnation_matches(unrelated, unrelated_mm));
+            assert!(sched.next_turns.contains_key(&unrelated));
+        }
+    }
+
+    #[test]
+    fn transferred_exec_reconnect_accumulates_consumed_leader_syscalls_once() {
+        let config = Config {
+            cancel_killed_thread_rpcs: false,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let second_caller = DetTid::from_raw(19);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        assert!(sched.note_deregistration_accounted(leader));
+        sched.record_syscall_count(leader, 3);
+        sched.logically_kill_thread(&leader, &detpid, pre_exec_mm);
+
+        reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+        assert!(sched.note_deregistration_accounted(leader));
+        sched.record_syscall_count(leader, 7);
+        assert_eq!(sched.per_thread_syscalls[&leader], 10);
+        assert!(!sched.note_deregistration_accounted(leader));
+        // The count itself is idempotent too; do not add the previous aggregate
+        // each time the current incarnation reports its final count.
+        sched.record_syscall_count(leader, 7);
+        assert_eq!(sched.per_thread_syscalls[&leader], 10);
+
+        sched.thread_tree.add_child(leader, second_caller, false);
+        register_known_thread(&mut sched, second_caller);
+        sched.runqueue_push_back(second_caller);
+        let second_mm = pre_exec_mm.for_exec(detpid);
+        sched.logically_kill_thread(&leader, &detpid, second_mm);
+        reconnect_transferred_exec(&mut sched, leader, second_caller, detpid, second_mm);
+        assert!(sched.note_deregistration_accounted(leader));
+        sched.record_syscall_count(leader, 11);
+        assert_eq!(sched.per_thread_syscalls[&leader], 21);
+        assert!(!sched.note_deregistration_accounted(leader));
+        assert!(!sched.per_thread_syscalls.contains_key(&caller));
+        assert!(!sched.per_thread_syscalls.contains_key(&second_caller));
+    }
+
+    #[test]
+    fn transferred_exec_syscall_accounting_leaves_ordinary_and_reload_behavior_unchanged() {
+        for reload in [false, true] {
+            let config = Config {
+                cancel_killed_thread_rpcs: false,
+                ..Config::default()
+            };
+            let mut sched = Scheduler::new(&config);
+            let leader = DetTid::from_raw(17);
+            let caller = DetTid::from_raw(18);
+            let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+            sched.record_syscall_count(leader, 3);
+            if reload {
+                reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+            }
+
+            assert!(sched.note_deregistration_accounted(leader));
+            sched.record_syscall_count(leader, 7);
+            assert_eq!(sched.per_thread_syscalls[&leader], 7);
+            assert!(sched.note_deregistration_accounted(leader));
+            assert!(sched.transferred_exec_syscall_offsets.is_empty());
+        }
+    }
+
+    #[test]
+    fn transferred_exec_reconnect_only_buffers_replay_during_tentative_selection() {
+        let mut sched = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let unrelated = DetTid::from_raw(31);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        register_known_thread(&mut sched, unrelated);
+        sched.runqueue_push_back(unrelated);
+        let (replayer, prehook) = exec_replay(caller, leader, unrelated, Some(123));
+        sched.replayer = Some(replayer);
+        assert!(sched.consume_schedevent(&prehook).keep_running);
+        assert_eq!(
+            sched.run_queue.tentative_pop_tid(unrelated),
+            Some(unrelated)
+        );
+        let queue = sched.run_queue.tids().copied().collect::<Vec<_>>();
+        sched.turn = 41;
+        sched.committed_time = LogicalTime::from_nanos(17_000);
+        let before = (sched.turn, sched.committed_time);
+
+        reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        assert_eq!(sched.run_queue.tids().copied().collect::<Vec<_>>(), queue);
+        assert_eq!((sched.turn, sched.committed_time), before);
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&leader),
+            Some(&RemovalDisposition::ReplaceThenAdmit)
+        );
+        assert!(sched.next_turns[&leader].resp.try_read().is_none());
+        sched.run_queue.undo_tentative_pop();
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(leader));
+        sched.run_queue.undo_tentative_pop();
+        assert_eq!((sched.turn, sched.committed_time), before);
+        assert_eq!(
+            sched.run_queue.tids().filter(|tid| **tid == leader).count(),
+            1
+        );
+        assert!(!sched.run_queue.contains_tid(caller));
+        assert!(sched.run_queue.contains_tid(unrelated));
     }
 
     #[test]
