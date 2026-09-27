@@ -99,6 +99,10 @@ use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
+use crate::timeouts::LITEINST_2026_09_27_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
 #[cfg(test)]
 use crate::timeouts::NON_CI_CELL_COUNT;
@@ -6445,6 +6449,7 @@ mod tests {
         // https://github.com/rrnewton/hermit/pull/2425 adds these two qualified
         // cells after the frozen calibration. Keep their identities explicit
         // without changing the historical population or timeout overrides.
+        // Its LiteInst identity is counted by the separate 2026-09-27 group.
         let regular_sink = required
             .iter()
             .filter(|cell| cell.id.test == "c-programs/record-replay-file-state-regular-sink")
@@ -6452,7 +6457,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             regular_sink,
-            BTreeSet::from([("verify", Some("ptrace")), ("verify", Some("sabre"))])
+            BTreeSet::from([
+                ("verify", Some("liteinst")),
+                ("verify", Some("ptrace")),
+                ("verify", Some("sabre")),
+            ])
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
         // cells without revising the frozen calibration or any timeout override.
@@ -6487,6 +6496,7 @@ mod tests {
                 + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
+                + LITEINST_2026_09_27_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
                 + 3 // the exact RNG identities asserted above
         );
@@ -6496,12 +6506,13 @@ mod tests {
             "the current manifest census records every enabled ci:false cell"
         );
 
-        // The earlier group was already enabled; the later disabled group adds
+        // The earliest group was already enabled; the later disabled groups add
         // equally to enabled and required, preserving enabled-minus-required.
-        // Both groups retain their separate evidence and ordinary bounds.
+        // Every group retains its separate evidence and ordinary bounds.
         for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
+            .chain(&LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS)
         {
             let cell = required
                 .iter()
@@ -10326,7 +10337,7 @@ esac
             .collect::<Vec<_>>();
         // Pin the selected population and per-backend split, and check every
         // candidate's arguments.
-        assert_eq!(candidates.len(), 173);
+        assert_eq!(candidates.len(), 175);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -10335,7 +10346,7 @@ esac
         }
         assert_eq!(
             by_backend,
-            BTreeMap::from([("kvm", 75), ("liteinst", 97), ("sabre", 1)])
+            BTreeMap::from([("kvm", 75), ("liteinst", 99), ("sabre", 1)])
         );
         assert!(candidates.iter().any(|cell| cell.id.test
             == "backend-parity-c/readdir-order-identity"

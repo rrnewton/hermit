@@ -26,13 +26,14 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -87,13 +88,14 @@ test:
           ptrace: true
           kvm: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Concurrent shell stdout differed between strict verification runs
-          liteinst: The preload runtime cannot survive the shell script's post-start exec
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       replay:
@@ -153,11 +155,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -211,11 +213,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
@@ -273,11 +275,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []
