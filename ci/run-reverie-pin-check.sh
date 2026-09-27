@@ -26,9 +26,19 @@ fi
 # crates to the UNMERGED ERESTART* fix 2befc2ca, which by design cannot pass the
 # ancestry/uniformity pin rules. SPEC section 6 drops pre.reverie_pin for this
 # A/B; this is that drop, stated loudly rather than hidden.
+# --print-pin (the offline pin read used by ci/run-with-reverie-dbt-budget.sh)
+# prints the dependency rev that every tracked Cargo.toml entry still records
+# (b0ede531); the real checker refuses the [patch] header line. reverie-dbt is
+# byte-identical between b0ede531 and 2befc2ca, so the DBT calibration binding
+# is unchanged.
 if [[ $mode == run ]]; then
-    echo "AB1 A/B LOCAL COMMIT: reverie pin check DELIBERATELY SKIPPED (unmerged fix via [patch])" >&2
-    exit 0
+    if [[ " $* " == *" --print-pin "* ]]; then
+        AB1_PRINT_PIN=$(grep -o 'rev = "[0-9a-f]\{40\}"' detcore/Cargo.toml | head -1 | grep -o '[0-9a-f]\{40\}')
+        echo "AB1 A/B LOCAL COMMIT: --print-pin reports the Cargo.toml dependency rev $AB1_PRINT_PIN; sources are [patch]ed to 2befc2ca" >&2
+    else
+        echo "AB1 A/B LOCAL COMMIT: reverie pin check DELIBERATELY SKIPPED (unmerged fix via [patch])" >&2
+        exit 0
+    fi
 fi
 
 mkdir -p target/ci
@@ -42,12 +52,16 @@ if [[ $mode == test ]]; then
     fi
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 --test \
         scripts/check-reverie-pin.rs -o "$checker"
-else
+elif [[ -z ${AB1_PRINT_PIN:-} ]]; then
     RUSTUP_TOOLCHAIN=stable rustc --edition=2021 \
         scripts/check-reverie-pin.rs -o "$checker"
 fi
 
-"$checker" "$@"
+if [[ -n ${AB1_PRINT_PIN:-} ]]; then
+    printf '%s\n' "$AB1_PRINT_PIN"
+else
+    "$checker" "$@"
+fi
 
 # The Reverie checker above enforces uniformity for REVERIE ONLY. Hermit pins
 # three git dependencies, and until this ran, two of them -- liteinst2 and
