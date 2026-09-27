@@ -329,7 +329,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured 845; https://github.com/rrnewton/hermit/issues/3360).
     // Three captured-clock routing controls; 845 prior identities retained:
     // 845 + 3 = 848 (`cargo nextest list --profile ci` measured 848).
-    ("test.detcore_unit", 848),
+    // The futex-deadline clock-refusal control; 848 prior identities
+    // (main's 845 plus the three above) retained:
+    // 848 + 1 = 849 (`cargo nextest list --profile ci` measured 849).
+    ("test.detcore_unit", 849),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -385,7 +388,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 848),
+    ("test.detcore_unit_on_host", 849),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.recorded_clocks_on_host", 6),
