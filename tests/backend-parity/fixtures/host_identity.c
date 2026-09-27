@@ -50,7 +50,10 @@
 #define VIRT_MACHINE  "x86_64"
 #define VIRT_TOTALRAM 1000000000UL
 #define VIRT_PROCS    1U
-#define VIRT_UPTIME   120L
+/* sysinfo(2) rounds positive fractional uptime up. This fixture expects its
+ * initial observation in the first elapsed second after the configured
+ * 120-second boot offset, so the exact integer uptime must be 121. */
+#define VIRT_UPTIME   121L
 #define VIRT_AFFINITY 1
 
 static int fail(const char* field, const char* got) {

@@ -59,6 +59,33 @@ fn logical_clock_ticks(
     clock_t_from_ticks(ticks)
 }
 
+/// Project elapsed logical time into Linux's integer `sysinfo(2)` uptime.
+///
+/// Linux rounds a positive fractional boottime up to the next second. Subtract
+/// the exact internal epoch first so its calendar fraction cannot affect the
+/// result. This projection does not alter the underlying logical clock.
+fn sysinfo_uptime_seconds(
+    now: crate::types::LogicalTime,
+    epoch: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> Result<u64, Error> {
+    let now_ns = now.as_nanos();
+    let epoch_ns = epoch.as_nanos();
+    let elapsed_ns = now_ns.checked_sub(epoch_ns).ok_or_else(|| {
+        Error::Tool(anyhow::anyhow!(
+            "sysinfo observed logical time {now_ns} ns before epoch {epoch_ns} ns"
+        ))
+    })?;
+    // Divide before rounding: adding NANOS_PER_SECOND - 1 to elapsed_ns can
+    // overflow. The rounded quotient of any u64 nanosecond duration fits u64.
+    let seconds =
+        elapsed_ns / NANOS_PER_SECOND + u64::from(!elapsed_ns.is_multiple_of(NANOS_PER_SECOND));
+    // Config accepts the full u64 offset; preserve its existing release-build
+    // wrapping extension, including the subsequent SysInfo -> c_long ABI cast.
+    // Ordinary Linux uptime semantics apply within the nonnegative c_long range.
+    Ok(uptime_offset_seconds.wrapping_add(seconds))
+}
+
 fn prlimit_targets_current_process(
     target_pid: i32,
     deterministic_pid: Option<i32>,
@@ -363,8 +390,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
     ) -> Result<syscalls::SysInfo, Error> {
         let memory = configured_memory(self.cfg.memory);
+        let now = thread_observe_time(guest).await;
+        let epoch = crate::types::DetTime::new(&self.cfg).as_nanos();
         Ok(syscalls::SysInfo {
-            uptime: self.calculate_uptime(guest).await?,
+            uptime: sysinfo_uptime_seconds(now, epoch, self.cfg.sysinfo_uptime_offset)?,
             loads_1: 1,
             loads_5: 1,
             loads_15: 1,
@@ -428,6 +457,146 @@ mod tests {
         let now = boot + LogicalTime::from_millis(25);
 
         assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+    }
+
+    #[test]
+    fn sysinfo_uptime_rounds_positive_elapsed_up() {
+        let epoch = LogicalTime::from_nanos(1_000_000_000_000);
+        for (elapsed_ns, expected_zero, expected_offset) in [
+            (0, 0, 120),
+            (1, 1, 121),
+            (999_999_999, 1, 121),
+            (1_000_000_000, 1, 121),
+            (1_000_000_001, 2, 122),
+            (1_200_000_000, 2, 122),
+        ] {
+            let now = epoch + LogicalTime::from_nanos(elapsed_ns);
+            assert_eq!(
+                sysinfo_uptime_seconds(now, epoch, 0).unwrap(),
+                expected_zero,
+                "elapsed {elapsed_ns} ns without boot offset"
+            );
+            assert_eq!(
+                sysinfo_uptime_seconds(now, epoch, 120).unwrap(),
+                expected_offset,
+                "elapsed {elapsed_ns} ns with boot offset"
+            );
+        }
+    }
+
+    #[test]
+    fn sysinfo_uptime_ignores_epoch_fraction() {
+        for fraction_ns in [0, 1, 1_000, 999_999_000, 999_999_999] {
+            let epoch = LogicalTime::from_nanos(1_000_000_000_000 + fraction_ns);
+            for (elapsed_ns, expected) in [
+                (0, 120),
+                (1, 121),
+                (999_999_999, 121),
+                (1_000_000_000, 121),
+                (1_000_000_001, 122),
+                (1_200_000_000, 122),
+            ] {
+                let now = epoch + LogicalTime::from_nanos(elapsed_ns);
+                assert_eq!(
+                    sysinfo_uptime_seconds(now, epoch, 120).unwrap(),
+                    expected,
+                    "epoch fraction {fraction_ns} ns, elapsed {elapsed_ns} ns"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sysinfo_uptime_rounds_maximum_duration_without_overflow() {
+        let epoch = LogicalTime::from_nanos(0);
+        assert_eq!(
+            sysinfo_uptime_seconds(LogicalTime::MAX, epoch, 0).unwrap(),
+            18_446_744_074
+        );
+        assert_eq!(
+            sysinfo_uptime_seconds(
+                LogicalTime::from_nanos(18_446_744_073_000_000_000),
+                epoch,
+                120,
+            )
+            .unwrap(),
+            18_446_744_193
+        );
+        // An absolute timestamp at the representation limit need not have a
+        // large elapsed duration; subtraction must precede the projection.
+        assert_eq!(
+            sysinfo_uptime_seconds(LogicalTime::MAX, LogicalTime::from_nanos(u64::MAX - 1), 120,)
+                .unwrap(),
+            121
+        );
+    }
+
+    #[test]
+    fn sysinfo_uptime_preserves_wrapping_offset_extension() {
+        let epoch = LogicalTime::from_nanos(0);
+        for (elapsed_ns, offset, expected) in [
+            (0, u64::MAX, u64::MAX),
+            (1, u64::MAX, 0),
+            (1_000_000_000, u64::MAX, 0),
+            (1_000_000_001, u64::MAX, 1),
+            (1, u64::MAX - 1, u64::MAX),
+            (1_000_000_001, u64::MAX - 1, 0),
+        ] {
+            assert_eq!(
+                sysinfo_uptime_seconds(LogicalTime::from_nanos(elapsed_ns), epoch, offset).unwrap(),
+                expected,
+                "elapsed {elapsed_ns} ns, offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn sysinfo_uptime_preserves_signed_abi_conversion() {
+        let epoch = LogicalTime::from_nanos(0);
+        for (elapsed_ns, offset, expected) in [
+            (0, i64::MAX as u64, i64::MAX),
+            (1, i64::MAX as u64, i64::MIN),
+            (0, u64::MAX, -1),
+            (1, u64::MAX, 0),
+        ] {
+            let uptime =
+                sysinfo_uptime_seconds(LogicalTime::from_nanos(elapsed_ns), epoch, offset).unwrap();
+            let info: libc::sysinfo = syscalls::SysInfo {
+                uptime,
+                loads_1: 0,
+                loads_5: 0,
+                loads_15: 0,
+                total_ram: 0,
+                free_ram: 0,
+                shared_ram: 0,
+                buffer_ram: 0,
+                total_swap: 0,
+                free_swap: 0,
+                procs: 0,
+                total_high: 0,
+                free_high: 0,
+                mem_unit: 1,
+            }
+            .into();
+            assert_eq!(info.uptime, expected);
+        }
+    }
+
+    #[test]
+    fn sysinfo_uptime_rejects_time_before_epoch() {
+        let error = sysinfo_uptime_seconds(
+            LogicalTime::from_nanos(999),
+            LogicalTime::from_nanos(1_000),
+            120,
+        )
+        .unwrap_err();
+        let Error::Tool(error) = error else {
+            panic!("an impossible clock must be a tool failure, got {error:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            "sysinfo observed logical time 999 ns before epoch 1000 ns"
+        );
     }
 
     #[test]

@@ -137,7 +137,12 @@ impl RecordVersion {
 // the event stream and replace its recorded random bytes.
 // Early rejection of invalid negative offsets also stops emitting ReadvV2
 // error events for non-random descriptors.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11a);
+// 0x11a -> 0x11b: sysinfo uptime rounds exact elapsed logical time up, removing
+// dependence on the calendar epoch's fraction. Detcore recomputes sysinfo during
+// recording/replay, even with virtualize_time=false; replaying an older stream
+// under the new projection could change guest control flow and event consumption.
+// Sysinfo remains determinized rather than gaining a recorded event.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -162,7 +167,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

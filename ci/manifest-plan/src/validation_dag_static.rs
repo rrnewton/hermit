@@ -226,7 +226,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
-    ("test.detcore_unit", 783),
+    ("test.detcore_unit", 789),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -237,7 +237,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
     ("test.sabre_examples", 6),
-    ("test.hermit_modes", 19),
+    ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
     ("test.ignored_syscall_regressions", 4),
@@ -245,7 +245,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("privileged-test.pmu_buck_chaos_cases", 6),
     ("privileged-test.cli_kvm", 31),
     ("test.cli_on_host", 79),
-    ("test.hermit_modes_on_host", 19),
+    ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 31),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
@@ -255,7 +255,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 783),
+    ("test.detcore_unit_on_host", 789),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 750),
