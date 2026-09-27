@@ -22,6 +22,15 @@ if [[ ${1:-} == --self-test ]]; then
     shift
 fi
 
+# ab1 A/B ONLY (local commit, never pushed): Cargo.toml [patch]es the Reverie
+# crates to the UNMERGED ERESTART* fix 2befc2ca, which by design cannot pass the
+# ancestry/uniformity pin rules. SPEC section 6 drops pre.reverie_pin for this
+# A/B; this is that drop, stated loudly rather than hidden.
+if [[ $mode == run ]]; then
+    echo "AB1 A/B LOCAL COMMIT: reverie pin check DELIBERATELY SKIPPED (unmerged fix via [patch])" >&2
+    exit 0
+fi
+
 mkdir -p target/ci
 compile_dir=$(mktemp -d "$ROOT_DIR/target/ci/check-reverie-pin.XXXXXX")
 checker="$compile_dir/checker"
