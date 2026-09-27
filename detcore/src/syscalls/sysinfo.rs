@@ -380,6 +380,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(uptime_seconds(now, boot, self.cfg.sysinfo_uptime_offset))
     }
 
+    /// The fixed virtual boot instant in whole seconds, reported as `/proc/stat` `btime`.
+    ///
+    /// Fails with `EOVERFLOW` when the configured uptime offset exceeds `i64::MAX`, because the
+    /// boot instant then has no `i64` representation. Only a `/proc/stat` read calls this, so no
+    /// other procfs read can fail on account of the boot instant.
     pub(super) fn virtual_boot_time_seconds(&self) -> Result<i64, Error> {
         let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
         boot_time_seconds(boot, self.cfg.sysinfo_uptime_offset)
@@ -491,6 +496,18 @@ mod tests {
             uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
             121
         );
+    }
+
+    #[test]
+    fn boot_time_is_unrepresentable_exactly_when_the_offset_exceeds_i64_max() {
+        // `/proc/stat` refuses a read exactly when this returns `None`. No other procfs file
+        // consults the boot instant, so this boundary cannot fail any other read.
+        let boot = LogicalTime::from_nanos(1_790_389_350_900_000_000);
+        assert_eq!(
+            boot_time_seconds(boot, i64::MAX as u64),
+            Some(1_790_389_350 - i64::MAX)
+        );
+        assert_eq!(boot_time_seconds(boot, i64::MAX as u64 + 1), None);
     }
 
     #[test]

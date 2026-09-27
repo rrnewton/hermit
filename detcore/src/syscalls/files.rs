@@ -1287,11 +1287,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
+        // Only `/proc/stat` renders the boot instant (`btime`), and an uptime
+        // offset above `i64::MAX` leaves that instant without a representation.
+        // Resolve it before the host snapshot, so such a read fails with
+        // `EOVERFLOW` without touching the host descriptor or the guest buffer,
+        // as a failed Linux read leaves the file offset where it was. Every
+        // other procfs file skips this and cannot fail on the boot instant.
+        let needs_boot_time = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_boot_time())?;
+        let virtual_boot_time_seconds = needs_boot_time
+            .then(|| self.virtual_boot_time_seconds())
+            .transpose()?;
         let contents = self.snapshot_procfs(guest, call).await?;
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
-        let virtual_boot_time_seconds = self.virtual_boot_time_seconds()?;
         // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.
         let virtual_memory_kb = guest.config().memory / 1024;
         // TODO-HUMAN-REVIEW(PR-723): Review injected identity snapshot reads.
@@ -4873,5 +4884,341 @@ mod test {
         for len in 0..8 {
             canonicalize_tcp_info(&mut [0xff; 8][..len]);
         }
+    }
+}
+
+#[cfg(test)]
+mod procfs_boot_time_range {
+    //! Only `/proc/stat` consumes the virtual boot instant (`btime`), so only
+    //! `/proc/stat` may fail when an uptime offset leaves that instant without an
+    //! `i64` representation.
+    //!
+    //! These tests drive the production read path -- `handle_read` ->
+    //! `initialize_procfs_snapshot` -> `snapshot_procfs` -> `ProcfsFile::initialize`
+    //! -> `take_procfs` -- with a real `GlobalState` answering the clock RPCs. Only
+    //! the kernel is scripted: the guest below serves fixed procfs bytes for the
+    //! injected `lseek` and `read` calls and records every injected syscall, so a
+    //! test can also prove that a refused read performed no host I/O.
+
+    use std::path::Path;
+
+    use nix::fcntl::OFlag;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Guest;
+    use reverie::Tool;
+    use reverie::syscalls;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::Errno;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::MemoryAccess;
+    use reverie::syscalls::SyscallInfo;
+    use reverie::syscalls::Sysno;
+
+    use crate::Config;
+    use crate::DetTid;
+    use crate::Detcore;
+    use crate::GlobalState;
+    use crate::fd::FdType;
+    use crate::procfs::ProcfsFile;
+
+    const FD: i32 = 3;
+    const GUEST_PID: i32 = 7;
+    /// Fills the guest buffer before each read, so a test can tell whether any
+    /// byte was written to it.
+    const UNTOUCHED: u8 = 0xa5;
+    /// The smallest offset whose boot instant has no `i64` representation.
+    const UNREPRESENTABLE_OFFSET: u64 = i64::MAX as u64 + 1;
+    /// `2026-01-01T00:00:00Z`, the epoch pinned by `test_config`, less the
+    /// default 120-second uptime offset.
+    const DEFAULT_BTIME: &str = "\nbtime 1767225480\n";
+
+    // Scripted kernel contents. Every volatile field differs from what Detcore
+    // renders, so sanitized output cannot be mistaken for raw host bytes.
+    const PROC_STAT: &[u8] = b"cpu  10 20 30 40 50 60 70 0 0 0\n\
+        cpu0 10 20 30 40 50 60 70 0 0 0\n\
+        intr 12345 1 2\n\
+        ctxt 67890\n\
+        btime 1700000000\n\
+        processes 4242\n\
+        procs_running 3\n\
+        procs_blocked 1\n\
+        softirq 99 1 2\n";
+    const MEMINFO: &[u8] = b"MemTotal:       65536000 kB\nMemFree:        1234 kB\n";
+    const UPTIME: &[u8] = b"12345.67 890.12\n";
+
+    /// A guest whose only kernel object is the procfs descriptor `FD`, backed by
+    /// a fixed byte string. Any other guest operation fails the test.
+    struct ScriptedProcfsGuest<'a> {
+        global: &'a GlobalState,
+        config: &'a Config,
+        thread: crate::ThreadState<()>,
+        kernel: &'static [u8],
+        kernel_offset: usize,
+        injected: Vec<Sysno>,
+    }
+
+    struct NoStack;
+    struct NoStackGuard;
+
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for NoStack {
+        type StackGuard = NoStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("a procfs read must not use a guest stack")
+        }
+
+        fn capacity(&self) -> usize {
+            panic!("a procfs read must not use a guest stack")
+        }
+
+        fn push<'stack, T>(&mut self, _value: T) -> reverie::syscalls::Addr<'stack, T> {
+            panic!("a procfs read must not use a guest stack")
+        }
+
+        fn reserve<'stack, T>(&mut self) -> reverie::syscalls::AddrMut<'stack, T> {
+            panic!("a procfs read must not use a guest stack")
+        }
+
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("a procfs read must not use a guest stack")
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ScriptedProcfsGuest<'_> {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            self.global
+                .receive_rpc(reverie::Tid::from_raw(self.thread.dettid.as_raw()), message)
+                .await
+        }
+
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ScriptedProcfsGuest<'_> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> reverie::Pid {
+            reverie::Pid::from_raw(GUEST_PID)
+        }
+
+        fn pid(&self) -> reverie::Pid {
+            reverie::Pid::from_raw(GUEST_PID)
+        }
+
+        fn ppid(&self) -> Option<reverie::Pid> {
+            None
+        }
+
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("a procfs read must not read guest registers")
+        }
+
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("a procfs read must not use a guest stack")
+        }
+
+        async fn daemonize(&mut self) {
+            panic!("a procfs read must not daemonize")
+        }
+
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (sysno, args) = syscall.into_parts();
+            self.injected.push(sysno);
+            match sysno {
+                Sysno::lseek => {
+                    assert_eq!(
+                        (args.arg0, args.arg1, args.arg2),
+                        (FD as usize, 0, libc::SEEK_SET as usize),
+                        "the snapshot may only rewind the procfs descriptor"
+                    );
+                    self.kernel_offset = 0;
+                    Ok(0)
+                }
+                Sysno::read => {
+                    assert_eq!(args.arg0, FD as usize, "read of an unexpected descriptor");
+                    let remaining = &self.kernel[self.kernel_offset..];
+                    let count = remaining.len().min(args.arg2);
+                    let buffer = AddrMut::from_raw(args.arg1).expect("read buffer is null");
+                    LocalMemory::new().write_exact(buffer, &remaining[..count])?;
+                    self.kernel_offset += count;
+                    Ok(count as i64)
+                }
+                Sysno::getpid => Ok(GUEST_PID.into()),
+                Sysno::getppid => Ok(1),
+                other => panic!("a procfs read injected unexpected syscall {other:?}"),
+            }
+        }
+
+        async fn tail_inject<S: SyscallInfo>(&mut self, _syscall: S) -> reverie::Never {
+            panic!("a procfs read must not retire the guest")
+        }
+
+        fn set_timer(&mut self, _schedule: reverie::TimerSchedule) -> Result<(), reverie::Error> {
+            panic!("a procfs read must not set a timer")
+        }
+
+        fn set_timer_precise(
+            &mut self,
+            _schedule: reverie::TimerSchedule,
+        ) -> Result<(), reverie::Error> {
+            panic!("a procfs read must not set a timer")
+        }
+
+        fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+            panic!("a procfs read must not read a host clock")
+        }
+    }
+
+    fn test_config(uptime_offset: u64) -> Config {
+        Config {
+            // Pinned rather than inherited: `Config::default()` honours `HERMIT_EPOCH`.
+            epoch: "2026-01-01T00:00:00Z".parse().unwrap(),
+            sysinfo_uptime_offset: uptime_offset,
+            // No scheduler daemon: every RPC here is answered synchronously.
+            sequentialize_threads: false,
+            ..Config::default()
+        }
+    }
+
+    struct ProcfsRead {
+        /// The guest-visible bytes of one whole-file `read(2)`, or its errno.
+        result: Result<String, Errno>,
+        /// Every syscall injected on the guest's behalf, in order.
+        injected: Vec<Sysno>,
+        /// The guest buffer after the read.
+        buffer: Vec<u8>,
+    }
+
+    /// Performs the first `read(2)` of a freshly opened procfs file.
+    async fn read_procfs(path: &str, kernel: &'static [u8], uptime_offset: u64) -> ProcfsRead {
+        let config = test_config(uptime_offset);
+        let global = GlobalState::init_global_state(&config).await;
+        let tool: Detcore = Detcore::new(reverie::Pid::from_raw(GUEST_PID), &config);
+        let mut thread = tool.init_thread_state(reverie::Tid::from_raw(GUEST_PID), None);
+        thread.detpid = Some(DetTid::from_raw(GUEST_PID));
+        thread
+            .add_fd(FD, OFlag::O_RDONLY, FdType::Regular, None)
+            .unwrap();
+        let mut procfs = Some(
+            ProcfsFile::from_path(Path::new(path))
+                .unwrap_or_else(|| panic!("{path} must classify as a procfs snapshot")),
+        );
+        thread
+            .with_detfd(FD, |detfd| detfd.set_procfs(procfs.take().unwrap()))
+            .unwrap();
+        let mut guest = ScriptedProcfsGuest {
+            global: &global,
+            config: &config,
+            thread,
+            kernel,
+            kernel_offset: 0,
+            injected: Vec::new(),
+        };
+
+        let mut buffer = vec![UNTOUCHED; 4096];
+        let call = syscalls::Read::new()
+            .with_fd(FD)
+            .with_buf(AddrMut::from_ptr(buffer.as_mut_ptr()))
+            .with_len(buffer.len());
+        let result = match tool.handle_read(&mut guest, call).await {
+            Ok(count) => Ok(String::from_utf8(buffer[..count as usize].to_vec())
+                .expect("scripted procfs contents are ASCII")),
+            Err(reverie::Error::Errno(errno)) => Err(errno),
+            Err(other) => panic!("reading {path} failed outside the syscall ABI: {other}"),
+        };
+        ProcfsRead {
+            result,
+            injected: guest.injected,
+            buffer,
+        }
+    }
+
+    fn uptime_seconds(rendered: &str) -> u64 {
+        rendered
+            .strip_suffix(".00 0.00\n")
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected /proc/uptime rendering {rendered:?}"))
+    }
+
+    #[tokio::test]
+    async fn unrelated_procfs_reads_succeed_when_the_boot_time_is_unrepresentable() {
+        // /proc/meminfo depends on no clock at all.
+        let meminfo = read_procfs("/proc/meminfo", MEMINFO, UNREPRESENTABLE_OFFSET).await;
+        let default_meminfo = read_procfs("/proc/meminfo", MEMINFO, 120).await;
+        assert_eq!(
+            meminfo.result, default_meminfo.result,
+            "/proc/meminfo must not depend on the uptime offset"
+        );
+        let memory_kb = test_config(120).memory / 1024;
+        let rendered = meminfo.result.unwrap();
+        assert!(
+            rendered.starts_with(&format!("MemTotal:       {memory_kb} kB\n")),
+            "/proc/meminfo must render the configured memory: {rendered:?}"
+        );
+
+        // /proc/uptime consumes the offset itself, which is still a valid u64.
+        let default_uptime = read_procfs("/proc/uptime", UPTIME, 120).await;
+        let elapsed = uptime_seconds(default_uptime.result.as_ref().unwrap()) - 120;
+        let uptime = read_procfs("/proc/uptime", UPTIME, UNREPRESENTABLE_OFFSET).await;
+        assert_eq!(
+            uptime.result,
+            Ok(format!("{}.00 0.00\n", UNREPRESENTABLE_OFFSET + elapsed)),
+            "/proc/uptime must still report the configured offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn proc_stat_refuses_an_unrepresentable_boot_time_before_any_host_io() {
+        let refused = read_procfs("/proc/stat", PROC_STAT, UNREPRESENTABLE_OFFSET).await;
+        assert_eq!(refused.result, Err(Errno::EOVERFLOW));
+        assert_eq!(
+            refused.injected,
+            Vec::<Sysno>::new(),
+            "a refused /proc/stat read must not touch the host descriptor: its offset must \
+             stay where Linux leaves it after a failed read"
+        );
+        assert!(
+            refused.buffer.iter().all(|byte| *byte == UNTOUCHED),
+            "a refused /proc/stat read must not leave raw host bytes in the guest buffer"
+        );
+
+        // Control: the same read with a representable boot instant goes through the
+        // scripted kernel and renders the fixed virtual btime, not the host's.
+        let rendered = read_procfs("/proc/stat", PROC_STAT, 120).await;
+        assert!(
+            rendered
+                .injected
+                .starts_with(&[Sysno::lseek, Sysno::read, Sysno::read]),
+            "the control must snapshot through the scripted kernel: {:?}",
+            rendered.injected
+        );
+        let text = rendered.result.unwrap();
+        assert!(text.contains(DEFAULT_BTIME), "{text:?}");
+        assert!(!text.contains("1700000000"), "{text:?}");
     }
 }
