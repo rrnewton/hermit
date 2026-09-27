@@ -81,7 +81,6 @@ const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
-    "build.recorded_clocks",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -164,13 +163,13 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 273,
-        selected_steps: 274,
+        direct_steps: 271,
+        selected_steps: 272,
     },
     Profile {
         label: "portable",
-        direct_steps: 264,
-        selected_steps: 265,
+        direct_steps: 262,
+        selected_steps: 263,
     },
     Profile {
         label: "quick",
@@ -189,8 +188,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 254,
-        selected_steps: 254,
+        direct_steps: 253,
+        selected_steps: 253,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -650,7 +649,6 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // Split the producer before closing over its shared downstream consumers,
     // so no hosted path retains a dependency on the local full producer.
     split.insert("build.workspace".into());
-    split.insert("build.recorded_clocks".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -674,9 +672,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    if split.len() != 215 {
+    if split.len() != 214 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 215",
+            "hosted test dependency closure has {} nodes, expected 214",
             split.len()
         ));
     }
@@ -1661,12 +1659,13 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
+    crate::nextest_build_selections::assert_hermit_selections_carry_canonical_features(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1611 {
+    if cfg.steps.len() != 1608 {
         return Err(format!(
-            "superset has {} steps, expected 1611",
+            "superset has {} steps, expected 1608",
             cfg.steps.len()
         ));
     }
@@ -2923,7 +2922,7 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        assert_eq!(selected.steps.len(), 254);
+        assert_eq!(selected.steps.len(), 253);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -2977,14 +2976,13 @@ sys.exit(37)
             "build.e2e_artifact_on_host".into(),
             "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
-            "build.recorded_clocks_on_host".into(),
             "check.backend_parity_suites_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
-        assert_eq!(new_variants.len(), 215);
+        assert_eq!(new_variants.len(), 214);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3079,7 +3077,7 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            error.contains("hosted-portable label has 253 direct steps"),
+            error.contains("hosted-portable label has 252 direct steps"),
             "{error}"
         );
     }
