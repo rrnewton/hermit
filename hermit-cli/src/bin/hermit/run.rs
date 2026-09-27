@@ -22,6 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -255,23 +256,23 @@ fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
         .context("creating private verification run summary")
 }
 
-fn private_backend_engagement_summary() -> Result<tempfile::NamedTempFile, Error> {
-    tempfile::Builder::new()
-        .prefix(".hermit-backend-engagement-summary-")
-        // See private_summary_dir: visible to the run container, and outside
-        // prepared source identity. Removed on drop.
-        .tempfile_in(private_summary_dir()?)
-        .context("creating private backend-engagement run summary")
-}
-
-fn private_liteinst_counters() -> Result<tempfile::NamedTempFile, Error> {
-    tempfile::Builder::new()
-        .prefix(".hermit-liteinst-counters-")
-        // See private_summary_dir: visible to the run container, and outside
-        // prepared source identity. Removed on drop. It starts empty, so a run
-        // that never publishes leaves nothing a reader could accept.
-        .tempfile_in(private_summary_dir()?)
-        .context("creating private LiteInst counters record")
+/// An unlinked, close-on-exec file for one private record of a
+/// `--backend-engagement-json` run: the run summary, or the LiteInst counters.
+///
+/// ⚠️ THESE MUST HAVE NO NAME. The first version created them as named
+/// tempfiles in `private_summary_dir()`, which is inside the guest's view. A
+/// guest that listed that directory saw one random name per file, different in
+/// every run and absent without the flag, so the measurement itself broke
+/// self-determinism and ptrace/LiteInst parity (review of 359fe93a, F1). The
+/// directory is still `private_summary_dir()` so the inode stays on the same
+/// filesystem as before; `staged_summary::private_output` unlinks it at
+/// creation. The container process inherits the descriptor through the fork
+/// and writes through its controller-local `/proc/self/fd` path; the guest's
+/// `execve` closes it.
+fn private_engagement_output(description: &str) -> Result<Arc<File>, Error> {
+    let file = super::staged_summary::private_output(&private_summary_dir()?)
+        .with_context(|| format!("creating private {description}"))?;
+    Ok(Arc::new(file))
 }
 
 fn read_engagement_summary(summary_path: &Path, backend: Backend) -> Result<RunSummary, Error> {
@@ -290,23 +291,26 @@ fn read_engagement_summary(summary_path: &Path, backend: Backend) -> Result<RunS
     })
 }
 
-fn liteinst_engagement(
-    summary: &RunSummary,
-    counters_path: &Path,
-) -> Result<BackendEngagement, Error> {
+fn read_private_engagement_summary(file: &File, backend: Backend) -> Result<RunSummary, Error> {
+    let backend = backend.as_str();
+    let bytes = super::staged_summary::read_private_output(file).with_context(|| {
+        format!("reading {backend} backend engagement from the private summary")
+    })?;
+    serde_json::from_slice::<RunSummary>(&bytes)
+        .with_context(|| format!("parsing {backend} backend engagement from the private summary"))
+}
+
+fn liteinst_engagement(summary: &RunSummary, counters: &File) -> Result<BackendEngagement, Error> {
     let syscall_entries = summary.syscalls.ok_or_else(|| {
         Error::msg("liteinst backend engagement requires the run summary's syscall count")
     })?;
-    let bytes = fs::read(counters_path)
-        .with_context(|| format!("reading LiteInst counters from {}", counters_path.display()))?;
+    let bytes = super::staged_summary::read_private_output(counters)
+        .context("reading the private LiteInst counters")?;
     if bytes.is_empty() {
-        anyhow::bail!(
-            "the LiteInst run published no counters to {}",
-            counters_path.display()
-        );
+        anyhow::bail!("the LiteInst run published no counters");
     }
-    let counters: LiteinstHostHybridCounters = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing LiteInst counters from {}", counters_path.display()))?;
+    let counters: LiteinstHostHybridCounters =
+        serde_json::from_slice(&bytes).context("parsing the private LiteInst counters")?;
     BackendEngagement::liteinst_host_hybrid(syscall_entries, counters).map_err(Error::msg)
 }
 
@@ -806,10 +810,15 @@ pub struct RunOpts {
     #[clap(skip)]
     e9patch_engagement: Option<BackendEngagement>,
 
-    /// Private file to which the LiteInst run publishes its host-hybrid
-    /// counters for `--backend-engagement-json`.
+    /// Private unlinked file to which the LiteInst run publishes its
+    /// host-hybrid counters for `--backend-engagement-json`.
     #[clap(skip)]
-    liteinst_counters: Option<PathBuf>,
+    liteinst_counters: Option<Arc<File>>,
+
+    /// Private unlinked run summary for `--backend-engagement-json` when the
+    /// caller did not ask for `--summary-json`.
+    #[clap(skip)]
+    engagement_summary: Option<Arc<File>>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -3267,24 +3276,16 @@ impl RunOpts {
                 GuestRunCaptureSession::create(&paths, evidence)
             })
             .transpose()?;
-        let private_engagement_summary = if self.backend_engagement_json.is_some()
+        if self.backend_engagement_json.is_some()
             && matches!(backend, Backend::Ptrace | Backend::Liteinst)
             && self.summary_json.is_none()
         {
-            let file = private_backend_engagement_summary()?;
-            self.summary_json = Some(file.path().to_owned());
-            Some(file)
-        } else {
-            None
-        };
-        let private_liteinst_counters =
-            if self.backend_engagement_json.is_some() && backend == Backend::Liteinst {
-                let file = private_liteinst_counters()?;
-                self.liteinst_counters = Some(file.path().to_owned());
-                Some(file)
-            } else {
-                None
-            };
+            self.engagement_summary =
+                Some(private_engagement_output("backend-engagement run summary")?);
+        }
+        if self.backend_engagement_json.is_some() && backend == Backend::Liteinst {
+            self.liteinst_counters = Some(private_engagement_output("LiteInst counters record")?);
+        }
         // });
 
         // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
@@ -3360,8 +3361,6 @@ impl RunOpts {
                 )?;
             }
             self.write_backend_engagement_after_run(guest_capture.as_ref())?;
-            drop(private_engagement_summary);
-            drop(private_liteinst_counters);
             Ok(status)
         }
     }
@@ -4191,23 +4190,17 @@ impl RunOpts {
         };
         let engagement = match self.selected_backend() {
             Backend::Ptrace => {
-                let summary_path = self.summary_json.as_deref().ok_or_else(|| {
-                    Error::msg("ptrace backend engagement requires a typed run summary")
-                })?;
-                let summary = read_engagement_summary(summary_path, Backend::Ptrace)?;
+                let summary = self.engagement_run_summary(Backend::Ptrace)?;
                 BackendEngagement::Ptrace {
                     scheduler_turns: summary.sched_turns,
                 }
             }
             Backend::Liteinst => {
-                let summary_path = self.summary_json.as_deref().ok_or_else(|| {
-                    Error::msg("liteinst backend engagement requires a typed run summary")
-                })?;
-                let counters_path = self.liteinst_counters.as_deref().ok_or_else(|| {
+                let counters = self.liteinst_counters.as_deref().ok_or_else(|| {
                     Error::msg("liteinst backend engagement requires a counters record")
                 })?;
-                let summary = read_engagement_summary(summary_path, Backend::Liteinst)?;
-                liteinst_engagement(&summary, counters_path)?
+                let summary = self.engagement_run_summary(Backend::Liteinst)?;
+                liteinst_engagement(&summary, counters)?
             }
             Backend::E9patch => self.e9patch_engagement.clone().ok_or_else(|| {
                 Error::msg("e9patch backend engagement was not recorded during preparation")
@@ -4224,6 +4217,21 @@ impl RunOpts {
             capture.require_distinct_from(path, "--backend-engagement-json")?;
         }
         write_backend_engagement(path, engagement)
+    }
+
+    /// The typed run summary the engagement record is computed from: the
+    /// caller's `--summary-json` when given, otherwise the private one.
+    fn engagement_run_summary(&self, backend: Backend) -> Result<RunSummary, Error> {
+        if let Some(file) = self.engagement_summary.as_deref() {
+            return read_private_engagement_summary(file, backend);
+        }
+        let summary_path = self.summary_json.as_deref().ok_or_else(|| {
+            Error::msg(format!(
+                "{} backend engagement requires a typed run summary",
+                backend.as_str()
+            ))
+        })?;
+        read_engagement_summary(summary_path, backend)
     }
 
     fn tmpfs(&self) -> Result<Tmpfs, Error> {
@@ -5176,9 +5184,20 @@ impl RunOpts {
         // LiteInst tracer; the guard lives until the run has published.
         let _liteinst_counters = self
             .liteinst_counters
-            .clone()
+            .as_deref()
             .filter(|_| backend == Backend::Liteinst)
-            .map(hermit::LiteinstCountersSink::install)
+            .map(|file| {
+                file.try_clone()
+                    .context("duplicating the private LiteInst counters descriptor")
+                    .and_then(hermit::LiteinstCountersSink::install)
+            })
+            .transpose()?;
+        // Only ever set when the caller gave no --summary-json, so it never
+        // competes with a captured summary publication below.
+        let private_summary = self
+            .engagement_summary
+            .as_deref()
+            .map(super::staged_summary::private_output_writer)
             .transpose()?;
 
         let timeout = self.run_timeout();
@@ -5186,7 +5205,13 @@ impl RunOpts {
             summary_output,
             self.summary_json.as_deref(),
             guest_capture,
-            |summary_json| {
+            |published| {
+                let summary_json = &match (published, private_summary) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "a private engagement summary cannot be combined with --summary-json"
+                    ),
+                    (published, private) => published.clone().or(private),
+                };
                 if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
                     let out = hermit::run_with_output_backend_timeout(
                         command,
@@ -5440,12 +5465,25 @@ mod tests {
 
     #[test]
     fn liteinst_engagement_record_joins_the_summary_total_and_the_counters() {
-        let summary_file = tempfile::NamedTempFile::new().unwrap();
-        let counters_file = tempfile::NamedTempFile::new().unwrap();
+        // Both private records are the unlinked descriptors a real run uses.
+        fn overwrite(file: &File, bytes: &[u8]) {
+            use std::os::unix::fs::FileExt;
+            file.set_len(0).unwrap();
+            file.write_all_at(bytes, 0).unwrap();
+        }
+        let private = tempfile::tempdir().unwrap();
+        let summary_file = Arc::new(crate::staged_summary::private_output(private.path()).unwrap());
+        let counters_file =
+            Arc::new(crate::staged_summary::private_output(private.path()).unwrap());
+        assert_eq!(
+            fs::read_dir(private.path()).unwrap().count(),
+            0,
+            "the private records must have no directory entry"
+        );
         let engagement_file = tempfile::NamedTempFile::new().unwrap();
         let mut options = RunOpts::parse_from(["hermit", "--backend=liteinst", "/bin/true"]);
-        options.summary_json = Some(summary_file.path().to_owned());
-        options.liteinst_counters = Some(counters_file.path().to_owned());
+        options.engagement_summary = Some(summary_file.clone());
+        options.liteinst_counters = Some(counters_file.clone());
         options.backend_engagement_json = Some(engagement_file.path().to_owned());
 
         // A counters file the run never published is refused, not read as zero.
@@ -5453,7 +5491,7 @@ mod tests {
             syscalls: Some(477),
             ..Default::default()
         };
-        fs::write(summary_file.path(), serde_json::to_vec(&summary).unwrap()).unwrap();
+        overwrite(&summary_file, &serde_json::to_vec(&summary).unwrap());
         let error = options
             .write_backend_engagement_after_run(None)
             .unwrap_err()
@@ -5472,7 +5510,7 @@ mod tests {
                 patched_sites: 2,
                 candidate_sites: 2,
             };
-            fs::write(counters_file.path(), serde_json::to_vec(&counters).unwrap()).unwrap();
+            overwrite(&counters_file, &serde_json::to_vec(&counters).unwrap());
             options.write_backend_engagement_after_run(None).unwrap();
             let report: BackendEngagementReport =
                 serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
@@ -5496,11 +5534,10 @@ mod tests {
         }
 
         // Without the Tool-side total there is no denominator to record.
-        fs::write(
-            summary_file.path(),
-            serde_json::to_vec(&RunSummary::default()).unwrap(),
-        )
-        .unwrap();
+        overwrite(
+            &summary_file,
+            &serde_json::to_vec(&RunSummary::default()).unwrap(),
+        );
         let error = options
             .write_backend_engagement_after_run(None)
             .unwrap_err()
@@ -5992,10 +6029,8 @@ mod tests {
 
         let previous = std::env::current_dir().expect("saving the working directory");
         std::env::set_current_dir(&root).expect("entering the fixture work tree");
-        let produced = [
-            ("verification", private_verify_summary()),
-            ("backend engagement", private_backend_engagement_summary()),
-        ];
+        let produced = [("verification", private_verify_summary())];
+        let engagement = private_engagement_output("backend engagement summary");
         std::env::set_current_dir(&previous).expect("restoring the working directory");
 
         let expected = root.join("ignored");
@@ -6015,6 +6050,39 @@ mod tests {
                 parent.display()
             );
         }
+
+        // The engagement summary has no name at all (it would be guest-visible,
+        // review of 359fe93a F1), so where it landed is read from the kernel's
+        // description of the open descriptor: `<dir>/<entry> (deleted)`.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt as _;
+        let file = engagement.unwrap_or_else(|error| panic!("engagement summary: {error:#}"));
+        assert_eq!(
+            file.metadata().unwrap().nlink(),
+            0,
+            "engagement summary is linked"
+        );
+        let described = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .expect("describing the engagement summary descriptor");
+        let described = described.to_str().expect("UTF-8 fixture path");
+        let described = described
+            .strip_suffix(" (deleted)")
+            .unwrap_or_else(|| panic!("engagement summary {described} is not unlinked"));
+        assert_eq!(
+            Path::new(described).parent(),
+            Some(expected.as_path()),
+            "the engagement summary was created in {described} rather than the disposable \
+             directory, so it is counted as prepared source again"
+        );
+        assert!(
+            std::fs::read_dir(&expected)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .all(|name| name
+                    .to_string_lossy()
+                    .starts_with(".hermit-verify-summary-")),
+            "the engagement summary left a directory entry"
+        );
     }
 
     /// The control, and the reviewer's own case: a regular FILE named `ignored`.

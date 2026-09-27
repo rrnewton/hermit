@@ -1955,65 +1955,41 @@ fn run_liteinst_verifies_detcore_backend() {
     );
 }
 
-/// The LiteInst engagement record's total is the count of syscall entries the
-/// Detcore Tool handled, which the deterministic log shows directly.
-///
-/// The host-hybrid dispatch counters do NOT sum to that total, and this test
-/// does not pretend they do. Reverie counts a dispatch path only for entries it
-/// classifies after its patch runtime is ready, and it leaves out
-/// task-creating syscalls, multi-task entries and sites that are not a two-byte
-/// `syscall` instruction. So the total comes from the Tool (`RunSummary`
-/// `syscalls`), the two numerators come from Reverie, and each numerator
-/// carries that total as its denominator.
-///
-/// The DETLOG check is exact: Detcore logs `inbound syscall` for every entry
-/// once the guest is past its first `execve`, and counts that `execve` itself
-/// without logging it, so a single-process guest has exactly one entry more
-/// than it has logged lines.
-#[test]
-fn run_liteinst_engagement_record_counts_the_logged_syscall_entries() {
-    const CALLS: u64 = 100;
-    liteinst_runtime::ensure_liteinst_runtime();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("create LiteInst engagement directory");
-    let source = directory.path().join("getppid_loop.c");
-    fs::write(
-        &source,
-        format!(
-            "#include <sys/syscall.h>\n#include <unistd.h>\n\
-             int main(void) {{ for (int i = 0; i < {CALLS}; i++) syscall(SYS_getppid); return 0; }}\n"
-        ),
-    )
-    .expect("write LiteInst engagement guest");
-    let guest = directory.path().join("getppid_loop");
-    let compiled = Command::new("cc")
-        .args(["-O1", "-Wall", "-Werror", "-o"])
-        .arg(&guest)
-        .arg(&source)
-        .output()
-        .expect("compile LiteInst engagement guest");
-    assert!(compiled.status.success(), "{compiled:?}");
+/// One LiteInst run of the getppid guest, reduced to what the tests compare.
+struct LiteinstGetppidRun {
+    syscall_entries: u64,
+    patched_site_entries: u64,
+    first_site_seccomp: u64,
+    engagement_class: detcore_model::backend_engagement::LiteinstEngagementClass,
+    inbound: u64,
+}
 
-    let log = directory.path().join("detlog.txt");
-    let engagement = directory.path().join("engagement.json");
-    let (log_arg, engagement_arg, guest_arg) = (
-        log.to_str().unwrap(),
-        engagement.to_str().unwrap(),
-        guest.to_str().unwrap(),
-    );
+/// Run `guest calls` under LiteInst with an engagement record, and check what
+/// holds for every single run: the record validates, the guest's own calls are
+/// all in the DETLOG, the total is exactly the logged entries plus the unlogged
+/// first `execve`, both denominators are that total, and M3 is zero.
+fn liteinst_getppid_engagement_run(
+    directory: &Path,
+    guest: &Path,
+    calls: u64,
+) -> LiteinstGetppidRun {
+    let log = directory.join(format!("detlog-{calls}.txt"));
+    let engagement = directory.join(format!("engagement-{calls}.json"));
+    let calls_arg = calls.to_string();
     let args = [
         "--log",
         "info",
         "--log-file",
-        log_arg,
+        log.to_str().unwrap(),
         "run",
         "--backend",
         "liteinst",
         "--strict",
         "--backend-engagement-json",
-        engagement_arg,
+        engagement.to_str().unwrap(),
         "--",
-        guest_arg,
+        guest.to_str().unwrap(),
+        &calls_arg,
     ];
     let output = hermit(&args);
     assert_success(&output, &args);
@@ -2048,7 +2024,7 @@ fn run_liteinst_engagement_record_counts_the_logged_syscall_entries() {
         .count() as u64;
     // The guest's own calls are all in the log, so the count below is not
     // measuring an empty or truncated log.
-    assert_eq!(getppid, CALLS, "{log}");
+    assert_eq!(getppid, calls, "{log}");
     assert_eq!(
         syscall_entries,
         inbound.len() as u64 + 1,
@@ -2057,20 +2033,199 @@ fn run_liteinst_engagement_record_counts_the_logged_syscall_entries() {
 
     assert_eq!(patched_site_entries.denominator, syscall_entries);
     assert_eq!(ptrace_free_entries.denominator, syscall_entries);
-    // The loop's site is installed on its first entry; every later entry is
-    // dispatched through the patched site. Other patched sites may add more.
-    assert!(
-        patched_site_entries.numerator >= CALLS - 1,
-        "{patched_site_entries:?}"
-    );
-    assert!(first_site_seccomp >= 1);
-    assert!(patched_site_entries.numerator + first_site_seccomp <= syscall_entries);
     // Every host-hybrid hook returns through a ptrace stop.
     assert_eq!(ptrace_free_entries.numerator, 0);
-    assert_eq!(
+    LiteinstGetppidRun {
+        syscall_entries,
+        patched_site_entries: patched_site_entries.numerator,
+        first_site_seccomp,
         engagement_class,
-        detcore_model::backend_engagement::LiteinstEngagementClass::PatchedViaPtrace
+        inbound: inbound.len() as u64,
+    }
+}
+
+/// `later - earlier` for two counters, as a signed value so that a counter
+/// that went DOWN is reported as a wrong number rather than a subtraction panic.
+fn counter_delta(later: u64, earlier: u64) -> i128 {
+    i128::from(later) - i128::from(earlier)
+}
+
+/// The LiteInst engagement record's total is the count of syscall entries the
+/// Detcore Tool handled, which the deterministic log shows directly.
+///
+/// The host-hybrid dispatch counters do NOT sum to that total, and this test
+/// does not pretend they do. Reverie counts a dispatch path only for entries it
+/// classifies after its patch runtime is ready, and it leaves out
+/// task-creating syscalls, multi-task entries and sites that are not a two-byte
+/// `syscall` instruction. So the total comes from the Tool (`RunSummary`
+/// `syscalls`), the two numerators come from Reverie, and each numerator
+/// carries that total as its denominator.
+///
+/// The DETLOG check is exact: Detcore logs `inbound syscall` for every entry
+/// once the guest is past its first `execve`, and counts that `execve` itself
+/// without logging it, so a single-process guest has exactly one entry more
+/// than it has logged lines.
+///
+/// ⚠️ THE NUMERATOR IS CHECKED EXACTLY, BY DIFFERENCE. A single run can only
+/// bound M2 from both sides (`>= CALLS - 1`, `+ first-site <= total`), and the
+/// review of 359fe93a showed a mutation that DOUBLES `direct_hooks` passing
+/// both bounds. So the same binary runs with 0, 100 and 200 loop iterations,
+/// and everything outside the loop is identical between those runs:
+/// - 100 -> 200 adds exactly 100 entries, 100 DETLOG lines and 100 patched-site
+///   entries, and no first-site entry (the loop's site is already installed);
+/// - 0 -> 100 adds exactly 100 entries, each of which is either the loop site's
+///   one installing first-site entry or a patched-site entry. This holds
+///   whether or not libc used the `syscall()` site before the loop, so the
+///   check does not depend on libc; it catches a first-site entry counted as
+///   patched as well as a doubled patched count.
+#[test]
+fn run_liteinst_engagement_record_counts_the_logged_syscall_entries() {
+    const CALLS: u64 = 100;
+    liteinst_runtime::ensure_liteinst_runtime();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create LiteInst engagement directory");
+    let source = directory.path().join("getppid_loop.c");
+    fs::write(
+        &source,
+        "#include <stdlib.h>\n#include <sys/syscall.h>\n#include <unistd.h>\n\
+         int main(int argc, char **argv) {\n\
+           long calls = argc > 1 ? strtol(argv[1], NULL, 10) : 0;\n\
+           for (long i = 0; i < calls; i++) syscall(SYS_getppid);\n\
+           return 0;\n\
+         }\n",
+    )
+    .expect("write LiteInst engagement guest");
+    let guest = directory.path().join("getppid_loop");
+    let compiled = Command::new("cc")
+        .args(["-O1", "-Wall", "-Werror", "-o"])
+        .arg(&guest)
+        .arg(&source)
+        .output()
+        .expect("compile LiteInst engagement guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+
+    let none = liteinst_getppid_engagement_run(directory.path(), &guest, 0);
+    let once = liteinst_getppid_engagement_run(directory.path(), &guest, CALLS);
+    let twice = liteinst_getppid_engagement_run(directory.path(), &guest, 2 * CALLS);
+
+    for (calls, run) in [(CALLS, &once), (2 * CALLS, &twice)] {
+        // The loop's site is installed on its first entry; every later entry is
+        // dispatched through the patched site. Other patched sites may add more.
+        assert!(
+            run.patched_site_entries >= calls - 1,
+            "{calls} calls: M2 {}",
+            run.patched_site_entries
+        );
+        assert!(run.first_site_seccomp >= 1);
+        assert!(run.patched_site_entries + run.first_site_seccomp <= run.syscall_entries);
+        assert_eq!(
+            run.engagement_class,
+            detcore_model::backend_engagement::LiteinstEngagementClass::PatchedViaPtrace
+        );
+    }
+
+    let expected = i128::from(CALLS);
+    // 100 -> 200 calls.
+    assert_eq!(
+        counter_delta(twice.syscall_entries, once.syscall_entries),
+        expected,
+        "total entries"
     );
+    assert_eq!(
+        counter_delta(twice.inbound, once.inbound),
+        expected,
+        "DETLOG inbound lines"
+    );
+    assert_eq!(
+        counter_delta(twice.patched_site_entries, once.patched_site_entries),
+        expected,
+        "patched-site entries (M2 numerator)"
+    );
+    assert_eq!(
+        counter_delta(twice.first_site_seccomp, once.first_site_seccomp),
+        0,
+        "first-site entries once the loop's site is installed"
+    );
+    // 0 -> 100 calls.
+    assert_eq!(
+        counter_delta(once.syscall_entries, none.syscall_entries),
+        expected,
+        "total entries"
+    );
+    assert_eq!(
+        counter_delta(once.inbound, none.inbound),
+        expected,
+        "DETLOG inbound lines"
+    );
+    assert_eq!(
+        counter_delta(once.patched_site_entries, none.patched_site_entries)
+            + counter_delta(once.first_site_seccomp, none.first_site_seccomp),
+        expected,
+        "each loop entry is exactly one patched-site or first-site entry"
+    );
+}
+
+/// The private records behind `--backend-engagement-json` must not be visible
+/// to the guest.
+///
+/// The first version created the run summary and the LiteInst counters as
+/// NAMED tempfiles in the run's disposable summary directory, which the guest
+/// can list. The review of 359fe93a measured `ls -a` of that directory under
+/// the flag: two random names per run, different in every run and absent
+/// without the flag, so the measurement broke self-determinism and made a
+/// LiteInst run (two files) diverge from a ptrace run (one file).
+///
+/// Hermit's cwd here is a work tree whose `ignored/` is disposable, so that is
+/// the directory the private records are created in; the guest lists it twice
+/// per backend and must see it empty both times.
+#[test]
+fn backend_engagement_private_records_are_invisible_to_the_guest() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create engagement visibility work tree");
+    let root = root.path();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), "/ignored/\n").unwrap();
+    let listed = root.join("ignored");
+    fs::create_dir(&listed).unwrap();
+    for backend in ["ptrace", "liteinst"] {
+        let mut listings = Vec::new();
+        for attempt in 0..2 {
+            let engagement = root.join(format!("engagement-{backend}-{attempt}.json"));
+            let args = [
+                "run",
+                "--backend",
+                backend,
+                "--strict",
+                "--backend-engagement-json",
+                engagement.to_str().unwrap(),
+                "--",
+                "/bin/ls",
+                "-a",
+                listed.to_str().unwrap(),
+            ];
+            let output = hermit_command(&args)
+                .current_dir(root)
+                .output()
+                .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+            assert_success(&output, &args);
+            let report: detcore_model::backend_engagement::BackendEngagementReport =
+                serde_json::from_slice(&fs::read(&engagement).expect("read engagement record"))
+                    .expect("parse engagement record");
+            report.validate().expect("engagement record validates");
+            listings.push(stdout(&output));
+        }
+        assert_eq!(
+            listings[0], ".\n..\n",
+            "{backend}: the guest saw a private engagement record"
+        );
+        assert_eq!(listings[1], listings[0], "{backend}: listings differ");
+        assert_eq!(
+            fs::read_dir(&listed).unwrap().count(),
+            0,
+            "{backend}: a private record was left behind"
+        );
+    }
 }
 
 /// Backend statistics are a HARNESS record and must stay out of the INFO parity

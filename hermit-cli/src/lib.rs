@@ -2603,7 +2603,7 @@ async fn dispatch_backend(
         let preload = liteinst_runtime_library_path()?;
         // Statistics are collected only when the CLI asked for an engagement
         // record, so an ordinary run keeps the plain launch.
-        let (exit_status, mut global_state, stats) = match liteinst_engagement::requested_sink() {
+        let (exit_status, mut global_state, stats) = match liteinst_engagement::requested_sink()? {
             None => {
                 let (exit_status, global_state) =
                     reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
@@ -2870,7 +2870,7 @@ async fn dispatch_output_backend(
     if backend == Backend::Liteinst {
         command.stdin(output_backend_stdin()?);
         let preload = liteinst_runtime_library_path()?;
-        let (output, mut global_state, stats) = match liteinst_engagement::requested_sink() {
+        let (output, mut global_state, stats) = match liteinst_engagement::requested_sink()? {
             None => {
                 let (output, global_state) =
                     reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
