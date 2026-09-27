@@ -414,35 +414,27 @@ mod tests {
         // SAFETY: pidfd_open returned a new owned descriptor.
         let client = unsafe { OwnedFd::from_raw_fd(raw as i32) };
         let exited = || helper::parent_exited(client.as_raw_fd()).expect("poll the stand-in pidfd");
-        let status = std::fs::read_to_string(format!("/proc/{client_pid}/status")).unwrap();
-        let parent = status
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:"))
-            .unwrap();
-        assert_eq!(parent.trim().parse::<u32>().unwrap(), helper_pid);
+        assert_live_child(client_pid, helper_pid);
 
         let private = [watch.helper_control_fd, watch.owner.pidfd.as_raw_fd()].map(|fd| {
             let metadata = std::fs::metadata(format!("/proc/{helper_pid}/fd/{fd}")).unwrap();
             (metadata.dev(), metadata.ino())
         });
-        for entry in std::fs::read_dir(format!("/proc/{client_pid}/fd")).unwrap() {
-            // The stand-in's loader still opens and closes its own descriptors
-            // after READY, so an entry may vanish before its stat. That alone
-            // does not show it was never inherited; see the check below.
-            let metadata = match std::fs::metadata(entry.unwrap().path()) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => panic!("stat GDB child descriptor: {error}"),
-            };
+        let identities = complete_descriptor_identities(client_pid);
+        // A client that exits during the listing can yield an empty one, which
+        // would pass without checking anything. It still has its descriptor
+        // table after the listing, so it had that table throughout the listing.
+        assert_live_child(client_pid, helper_pid);
+        for identity in identities {
             assert!(
-                !private.contains(&(metadata.dev(), metadata.ino())),
+                !private.contains(&identity),
                 "the GDB child inherited a private watcher descriptor"
             );
         }
         // While it runs, the stand-in closes only descriptors it opened itself.
         // Its exit closes the rest: GNU sleep's atexit handler closes 1 and 2,
         // exit_files() then drops the whole table, and only after that does
-        // the pidfd report the exit. So the skip is sound only if the same
+        // the pidfd report the exit. So the listing is sound only if the same
         // stand-in still has descriptors 0 to 2 and has not exited.
         let stdio =
             (0..3).all(|fd| std::fs::metadata(format!("/proc/{client_pid}/fd/{fd}")).is_ok());
@@ -455,6 +447,71 @@ mod tests {
         // Control: finish() returns only after the helper reaps the stand-in,
         // so the same pidfd must now report the exit the check above rejects.
         assert!(exited(), "the stand-in pidfd did not report its exit");
+    }
+
+    /// Asserts that `pid` is a child of `parent` that still has its descriptor
+    /// table. An exiting process drops that table before it becomes a zombie
+    /// and never regains it, and from then on its FDSize is 0.
+    fn assert_live_child(pid: u32, parent: u32) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap()
+                .trim()
+        };
+        assert_eq!(field("PPid:").parse::<u32>().unwrap(), parent);
+        let state = field("State:");
+        assert!(
+            !state.starts_with(['Z', 'X']),
+            "process {pid} has exited: {state}"
+        );
+        assert_ne!(
+            field("FDSize:").parse::<u32>().unwrap(),
+            0,
+            "process {pid} is exiting and has no descriptor table"
+        );
+    }
+
+    /// Returns the `(dev, ino)` of every descriptor open in `pid`, taken from one
+    /// listing of `/proc/<pid>/fd` in which every entry could be stat'ed.
+    ///
+    /// READY arrives just after the client's exec, while its startup code (the
+    /// dynamic loader and glibc's locale setup) is still opening and closing
+    /// files, so an entry can be listed and then closed before its stat. Such a
+    /// listing is incomplete and is taken again in full. No entry is ever
+    /// skipped: an incomplete listing that ends after the 10 s deadline panics,
+    /// naming the descriptors that vanished from it. A descriptor inherited across
+    /// exec stays open unless the client closes it, which `/bin/sleep` does not,
+    /// so every complete listing contains it.
+    fn complete_descriptor_identities(pid: u32) -> Vec<(u64, u64)> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut identities = Vec::new();
+            let mut vanished = Vec::new();
+            for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+                let entry = entry.unwrap();
+                match std::fs::metadata(entry.path()) {
+                    Ok(metadata) => identities.push((metadata.dev(), metadata.ino())),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        vanished.push(entry.file_name());
+                    }
+                    Err(error) => panic!("stat {}: {error}", entry.path().display()),
+                }
+            }
+            if vanished.is_empty() {
+                return identities;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no complete descriptor listing of process {pid} after {attempts} attempts; \
+                 descriptors that vanished from the last one: {vanished:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
