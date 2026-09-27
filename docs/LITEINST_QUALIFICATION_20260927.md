@@ -1,6 +1,6 @@
-# LiteInst qualification: 165 verify cells, 2026-09-27
+# LiteInst qualification: 163 verify cells, 2026-09-27
 
-This change enables and selects 165 previously disabled LiteInst `verify`
+This change enables and selects 163 previously disabled LiteInst `verify`
 cells. Each cell has ten clean first-attempt strict repetitions from the
 official pressure runner, all on the ordinary portable lane, and an independent
 audit read every raw result row. Every selected cell's ptrace `verify` cell is
@@ -8,10 +8,20 @@ already selected by full validation, so this ratchets the host hybrid toward
 the ptrace-green set. No cell was gained by an exemption, filter, comparator
 change, bound change or manifest weakening.
 
-The independent audit qualified 166 cells. One of them,
-`system-utils/sort-random`, diverged in the ten-repetition current-source
-screen at the author base, so it keeps its LiteInst disabled entry and is
-not selected. The failure is quoted in the screen section.
+The independent audit qualified 166 cells, and three of them are not
+selected:
+
+- `system-utils/sort-random` diverged in the ten-repetition current-source
+  screen at the author base. The failure is quoted in the screen section.
+- `backend-parity-c/environment-and-workdir` and
+  `backend-parity-c/pipe-multiwriter-ordering` would run in the
+  `backend-parity-c` node, which compares every LiteInst cell against a
+  ptrace reference run. All 97 LiteInst cells already selected in that node
+  fail that comparison in recent full validates, and these two were never
+  measured under it.
+
+Each of the three keeps its LiteInst disabled entry, restored byte-for-byte
+from the base.
 
 ## Identities
 
@@ -52,6 +62,21 @@ not selected. The failure is quoted in the screen section.
   `/proc/uptime` (`calculate_uptime`) is unchanged. The current-source screen
   below reruns all 166 cells at the author base, and reruns these four ten
   times each.
+- **Base of this change.** The branch was rebased onto Hermit `main`
+  `55214f50e4dd` without conflicts, three commits after the author base. That
+  delta was not screened with LiteInst. It contains:
+  - a GDB helper test change (`hermit-cli/src/bin/hermit/gdb_client.rs`);
+  - the KVM process-retirement fence in `detcore/src/scheduler/` and
+    `detcore/src/tool_global.rs`, with its tests and DAG test counts;
+  - a Reverie pin move from `b0ede531` to `a1d07619`. Its changes are in
+    `reverie-kvm` plus one new `GlobalTool::on_backend_process_retired`
+    callback in `reverie/src/tool.rs`, which does nothing by default.
+
+  The new Detcore retirement fence is only armed when a backend installs
+  `BackendSignalControl`. In the pinned Reverie source only `reverie-kvm`
+  provides it. That the delta is inert for LiteInst is a reading of the
+  source, not a measurement. `git diff --quiet b63af4583a 55214f50e4 --
+  tests/e2e/manifests ci/manifest-plan/src/timeouts.rs` exits 0.
 
 ## What was measured and how
 
@@ -71,8 +96,8 @@ Batches 1 to 3 ran concurrently, from 06:21 to 06:54 PDT. Batch 4 ran alone,
 from 06:58 to 07:25:58 PDT, which is `2026-09-27T14:25:58Z`. All four exited 0,
 with walls of 1,752 s, 1,707 s, 1,725 s and 1,648 s.
 
-The audit covered 166 cells. The 165 selected cells contribute 1,650 raw
-repetitions (43 / 40 / 41 / 41 cells by batch). The independent audit
+The audit covered 166 cells. The 163 selected cells contribute 1,630 raw
+repetitions (42 / 39 / 41 / 41 cells by batch). The independent audit
 applied these checks to every repetition:
 
 - exactly one result row, attempt 1, one inner attempt, outcome PASS, guest
@@ -120,23 +145,24 @@ and `ci/compat-envelope/cells.json` come from `scorecard.rs update`,
 `ci/expected-e2e-plan.json` from `test-harness expected-plan`, and
 `ci/dag/validate.json` from `generate-validation-dag --write`.
 
-| Quantity | Before (b63af4583a) | After |
+| Quantity | Before (55214f50e4) | After |
 | --- | ---: | ---: |
-| LiteInst `verify`: selected / enabled but unselected / disabled (of 361) | 146 / 3 / 212 | 311 / 3 / 47 |
-| LiteInst, all modes: selected / not selected / not applicable (of 1,083) | 146 / 3 / 934 | 311 / 3 / 769 |
-| Comparable cells selected by full (of 5,776) | 856 | 1,021 |
+| LiteInst `verify`: selected / enabled but unselected / disabled (of 361) | 146 / 3 / 212 | 309 / 3 / 49 |
+| LiteInst, all modes: selected / not selected / not applicable (of 1,083) | 146 / 3 / 934 | 309 / 3 / 771 |
+| Comparable cells selected by full (of 5,776) | 856 | 1,019 |
 | Enabled but unselected comparable cells | 150 | 150 |
-| Not-applicable comparable cells | 4,770 | 4,605 |
-| Required full-plan cells (including 3 custom commands) | 859 | 1,024 |
-| Hosted-portable plan cells | 855 | 1,020 |
-| Portable backend-parity-c relations (all / LiteInst) | 173 / 97 | 175 / 99 |
-| DAG `result_manifests` entries over all steps (LiteInst `verify` among them) | 2,173 (293) | 2,503 (623) |
+| Not-applicable comparable cells | 4,770 | 4,607 |
+| Required full-plan cells (including 3 custom commands) | 859 | 1,022 |
+| Hosted-portable plan cells | 855 | 1,018 |
+| Portable backend-parity-c relations (all / LiteInst) | 173 / 97 | 173 / 97 |
+| DAG `result_manifests` entries over all steps (LiteInst `verify` among them) | 2,173 (293) | 2,499 (619) |
 
 These are selection counts, not a backend determinism percentage. The
 denominator is unchanged, so the percentages in `SCORECARD.md` are comparable
 across this change. All other backends and modes keep their selection. The 3
-enabled-but-unselected LiteInst cells and the 47 still-disabled LiteInst
-`verify` cells (including `system-utils/sort-random`) are outside this change.
+enabled-but-unselected LiteInst cells and the 49 still-disabled LiteInst
+`verify` cells (including `system-utils/sort-random` and the two
+`backend-parity-c` cells above) are outside this change.
 
 ## Bounds are unchanged
 
@@ -145,11 +171,12 @@ multipliers of 1.0 and 3 GiB of portable memory. No selected cell has a
 per-backend timeout override. The per-log cap, aggregate log quota,
 comparison policy, retry limit and admission rules are untouched.
 
-In `ci/dag/validate.json` only the `result_manifests` of the sixteen existing
-manifest nodes change: eight portable and eight on-host, adding two result
+In `ci/dag/validate.json` only the `result_manifests` of fourteen existing
+manifest nodes change: seven portable and seven on-host, adding two result
 owners per cell. Their commands, 600 s wall and 7,200 s CPU node bounds,
-resources and hints are byte-identical. The added per-node work is the sum of
-the cells' p90 walls:
+resources and hints are byte-identical, and the `backend-parity-c` nodes do
+not change at all. The added per-node work is the sum of the cells' p90
+walls:
 
 | Node | Recent full-validate wall | Added p90 wall | Workers |
 | --- | ---: | ---: | --- |
@@ -159,7 +186,6 @@ the cells' p90 walls:
 | `determinism-stress-c` | 37 to 40 s | 30.6 s | 1 |
 | `determinism-stress` | 30 to 32 s | 26.5 s | 1 |
 | `data-handling` | 51 to 54 s | 17.8 s | 1 |
-| `backend-parity-c` | 145 to 152 s | 5.0 s | 8 |
 | `chaos-c` | 13 to 14 s | 2.3 s | 1 |
 
 The recent walls come from three full validates in the parent workspace's
@@ -189,15 +215,13 @@ are within the unchanged 22/57. The new dated array
 formula and required-selection tests without rewriting the frozen census or
 the earlier 2026-09-16 and 2026-09-17 arrays.
 
-The array is a `static` rather than a `const`. At 165 rows of 104 bytes
-(17,160 bytes) it exceeds Clippy's 16 KiB `large_const_arrays` threshold, and
+The array is a `static` rather than a `const`. At 163 rows of 104 bytes
+(16,952 bytes) it exceeds Clippy's 16 KiB `large_const_arrays` threshold, and
 `static` is Clippy's own suggested fix; no lint is allowed. Newly enabled
 cells add equally to enabled and required, so the enabled-but-unselected count does not move.
 
 | Test | Batch | p90 CPU (µs) | p90 wall (ms) | Derived CPU/wall (s) | Max-sample derived (s) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| backend-parity-c/environment-and-workdir | qual10-batch1 | 1,106,433 | 2,501 | 2/11 | 2/11 |
-| backend-parity-c/pipe-multiwriter-ordering | qual10-batch2 | 1,135,211 | 2,468 | 2/10 | 2/11 |
 | c-programs/dbt-execveat-unsupported | qual10-batch3 | 1,529,430 | 3,215 | 3/13 | 3/15 |
 | c-programs/get-robust-list-self | qual10-batch4 | 941,004 | 2,193 | 2/9 | 2/9 |
 | c-programs/get-robust-list-thread | qual10-batch1 | 1,117,813 | 2,602 | 2/11 | 3/13 |
@@ -441,7 +465,10 @@ single-repetition screen reported all 166 cells short.
 
 In `screen166-r1` the largest per-cell cost was
 `system-utils/auxv-loader-dump` at 8.83 CPU s and 12.11 wall s, inside the
-unchanged 22 / 57 bound; no cell exceeded a third of either bound.
+unchanged 22 / 57 bound. Two cells exceeded a third of the 22 s CPU bound
+(7.33 s): `system-utils/auxv-loader-dump` at 8.83 CPU s and
+`data-handling/archive-roundtrip` at 7.60 CPU s. Every wall time was under a
+third of the 57 s wall bound.
 In `sysinfo4-r10`, `c-programs/sysinfo`, `c-programs/sysinfo-uptime` and
 `system-utils/auxv-loader-dump` passed ten of ten first attempts. Their
 largest costs were 1.05 / 4.00 / 10.15 CPU s and 2.56 / 5.87 / 13.38 wall s,
@@ -475,25 +502,30 @@ In the retained run-1 log, fd 3 at that point is `/proc/self/maps`, opened
 at syscall 1137 and not reopened before the divergence. Syscall 1145 is
 the seventh read on it, of 1,024 bytes. Its first two 256-byte chunks differ
 and its last two match, so the two runs saw different mapping text. The final
-virtual times also differ (174,816,796 ns against 174,816,866 ns). This
-matches the known guest-visible mapping-identity family; it was not
-investigated further here and is not attributed to the one-commit delta.
+virtual times also differ (174,816,796 ns against 174,816,866 ns). This is
+consistent with the guest-visible mapping-identity family that two original
+disabled reasons name. It was not investigated further here, is not
+attributed to the one-commit delta, and is tracked as TaskGraph task
+`liteinst_maps_read_divergence`.
 
 The pressure runner retried that repetition itself, under its ordinary
 retry policy, and the retry passed (`retried_repetitions=1`). Under this
 change's rule a retried pass does not count, and nobody re-ran the cell. The
 cell therefore keeps its LiteInst disabled entry, restored byte-for-byte from
 `b63af4583a` ("LiteInst coverage is owned by its backend compatibility
-partition"). Its calibration row is removed, and all counts and generated
-files were regenerated for 165 cells.
+partition"). Its calibration row is removed.
 
-The runner deletes each fresh checkout when it finishes. The executed ELF
-of `screen166-r1` is therefore identified only by its e2e artifact directory
-key (`1827e78062f5286bd1375ed4b64f8929ca7d3b91ad495b92dd63e94f169f5113`).
-The `sysinfo4-r10` ELF was hashed while the run was live: SHA256
+The runner deletes each fresh checkout when it finishes, but every result
+row records the executed binary's content hash in `binary_sha256`. All 166
+`screen166-r1` rows record
+`8ac164c6b35f8a84cba4188b44f99957199813983489bd72ed7d9def015f2632`, with
+e2e artifact key
+`1827e78062f5286bd1375ed4b64f8929ca7d3b91ad495b92dd63e94f169f5113`. The
+`sysinfo4-r10` ELF was also hashed while the run was live: SHA256
 `2069b04673a871b84dda75312fbc69568d0352967d4b46154d3b554e3536a058`, artifact
-key `c31e8a0ac3ef72bbcadffabefac3e030ca37dc46f2d4aeeaf0c9040315f63201`, used
-by all 41 rows.
+key `c31e8a0ac3ef72bbcadffabefac3e030ca37dc46f2d4aeeaf0c9040315f63201`. All
+41 of its rows record that same value in `binary_sha256`, so the field is a
+checked content identity.
 
 | Screen evidence | SHA256 |
 | --- | --- |
@@ -506,25 +538,51 @@ by all 41 rows.
 The screen results are in the parent workspace's
 `ignored/liteinst-lane-claude/promote-groupc/impl/screen/`.
 
+## Deselected for the ptrace parity reference: two `backend-parity-c` cells
+
+`backend-parity-c/environment-and-workdir` and
+`backend-parity-c/pipe-multiwriter-ordering` passed every raw check, both
+screens and the bounds. They are still not selected. The `backend-parity-c`
+node passes `--parity-reference ptrace`, so after a LiteInst candidate passes,
+the runner executes a ptrace reference cell and fails the candidate when the
+two backends diverge. The evidence above is LiteInst-against-LiteInst only
+and never measured that comparison for these two cells.
+
+The comparison fails for every LiteInst cell the node already runs. The four
+most recent full-validate `results.jsonl` files for
+`manifest_backend_parity_c` (heads `4ad1c594b825`, `694e9392a8ec` and
+`9c5820a6fdc3`, the last twice) each contain the same 97 LiteInst cells with
+two attempts each. All 194 rows are FAIL: 192 with "liteinst diverged from
+ptrace: shared Detcore INFO records" and 2 that also differ in guest stdout.
+Selecting these two cells would add two more reds of that known kind.
+
+Both keep their LiteInst disabled entries, restored byte-for-byte from the
+base, and their calibration rows are removed. All counts and generated files
+were regenerated for the final 163 cells.
+
 ## Original disabled reasons
 
 Only the listed LiteInst disabled entries are removed. Other backends'
-reasons remain unchanged. Among the 165 recipes, 71 existing
+reasons remain unchanged. Among the 163 recipes, 71 existing
 per-backend `ci` maps gain `liteinst: true`; the rest already had `ci: true`.
 The original reasons remain below and in the immutable base, so selection is
 not read as a claim that an old failure never happened. Most are pending
-qualification. Seven are capability claims the evidence contradicts:
+qualification.
 
-- four say "preload runtime cannot survive … exec", yet the retained logs
-  show `libreverie_liteinst.so` re-opened after every `execve`;
-- two say "blocked by guest-visible startup mapping identity", yet they pass
-  10/10 strict;
-- one says "not built beside the binary on the current host".
+Four are capability claims the evidence contradicts. They say "preload
+runtime cannot survive … exec", yet the retained logs show
+`libreverie_liteinst.so` re-opened after every `execve`.
+
+One, `c-programs/pipe2-errno-precedence`, says "blocked by guest-visible
+startup mapping identity". That failure was not reproduced in 10/10 strict
+runs at `19553a64` or in the one-repetition author-base screen. This does not
+contradict the reason: `system-utils/sort-random` also passed 10/10 at
+`19553a64` before it diverged on a `/proc/self/maps` read (see "What this does
+not establish"). The other cell carrying that reason,
+`backend-parity-c/environment-and-workdir`, is not selected.
 
 | Test | Original LiteInst disabled reason |
 | --- | --- |
-| backend-parity-c/environment-and-workdir | LiteInst canonical verification remains blocked by guest-visible startup mapping identity |
-| backend-parity-c/pipe-multiwriter-ordering | LiteInst preload runtime libreverie_liteinst.so is not built beside the binary on the current host; qualify LiteInst separately |
 | c-programs/dbt-execveat-unsupported | Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately |
 | c-programs/get-robust-list-self | Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately |
 | c-programs/get-robust-list-thread | Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately |
@@ -696,21 +754,27 @@ qualification. Seven are capability claims the evidence contradicts:
   execution, and it says nothing about lower overhead.
 - **Same-backend repeats only.** These are LiteInst-against-LiteInst strict
   repeat comparisons. They are not comparisons against a ptrace golden run,
-  and they are not cross-backend parity. The category name `backend-parity-c`
-  is not parity evidence. Its two selected cells run in a node whose selector
-  passes `--parity-reference ptrace`. The candidate-only timings above do not
-  measure the added ptrace pair or its cross-backend verdict, which remains
-  untested. Bounds stay unchanged.
+  and they are not cross-backend parity. No selected cell runs in the
+  `backend-parity-c` node or under `--parity-reference ptrace`. Bounds stay
+  unchanged.
 - **Ten repetitions do not bound rare divergence.** `system-utils/sort-random`
   passed ten of ten at `19553a64` and then diverged once in ten at the author
-  base. The other 162 selected cells were screened once each at the author
+  base. The other 160 selected cells were screened once each at the author
   base, which cannot exclude a divergence of similar frequency. Full
   validation runs each selected cell once per run, so such a cell would
   appear as an intermittent red rather than be hidden.
+- **Every selected cell makes the read on which `sort-random` diverged.**
+  All 163 selected cells open and read `/proc/self/maps` between 24 and 327
+  times per run (openat records in the first retained log of each cell's
+  first qualification repetition; the maximum is
+  `system-utils/auxv-loader-dump`). Which component issues these reads was
+  not established. `sort-random` diverged on such a read, so the one known
+  divergence site is present in all selected cells, not in a rare subset. It is tracked as TaskGraph task `liteinst_maps_read_divergence`.
 - **Historical measurement.** The ten-repetition evidence is at `19553a64`.
   The author-base screen is one repetition per cell, plus ten for the four
   sysinfo cells. That screen bounds only a gross regression from the one-commit
-  delta. It does not re-derive the calibration.
+  delta. It does not re-derive the calibration, and it does not cover the
+  three commits between the author base and `55214f50e4`.
 - **Out of scope.** Nothing here covers replay, chaos, memory determinism,
   arbitrary-program determinism, Linux semantic equivalence on unsupported
   paths, or readiness to replace ptrace.
