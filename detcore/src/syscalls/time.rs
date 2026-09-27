@@ -14,6 +14,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::ClockId;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
@@ -101,6 +102,30 @@ where
     guest.thread_state().observe_guest_clock(raw)
 }
 
+/// Replaces the host wall-clock time that a failed `gettimeofday` may have
+/// stored in `tv` with virtual time, without storing anything Linux did not.
+///
+/// Linux stores `tv_sec`, then `tv_usec`, and only then copies `tz`. A faulting
+/// `tz` therefore fails with EFAULT after the whole host `tv` was stored, and a
+/// `tv` whose `tv_usec` lies on an unwritable page fails after the host
+/// `tv_sec` was stored.
+///
+/// One protection-respecting transfer stops at the first page the guest cannot
+/// write, which for a naturally aligned `tv` is the prefix the kernel stored.
+/// `write_value` is not usable here: it retries a short transfer, and the
+/// ptrace backend sends an eight-byte remainder as PTRACE_POKEDATA, which
+/// ignores page protections and would store into memory the kernel refused.
+/// The guest observes the syscall's own error, so the transfer's outcome is
+/// deliberately not reported.
+fn overwrite_failed_gettimeofday_tv<M: MemoryAccess>(
+    memory: &mut M,
+    tv_addr: AddrMut<Timeval>,
+    tv: &Timeval,
+) {
+    let words = [tv.tv_sec.to_ne_bytes(), tv.tv_usec.to_ne_bytes()];
+    let _ = memory.write(tv_addr.cast::<u8>(), words.as_flattened());
+}
+
 fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
     if target > now {
         target.duration_since(now)
@@ -171,17 +196,23 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let time_ns = guest_clock_time(guest).await;
 
-        let ret = self.record_or_replay(guest, call).await?;
+        // A failed call may still have stored host wall-clock time in `tv`, so
+        // keep its result until `tv` holds virtual time.
+        let result = self.record_or_replay(guest, call).await;
 
         let mut memory = guest.memory();
 
         let tv: Timeval = time_ns.into();
 
         if let Some(tp) = call.tv() {
-            memory.write_value(tp, &tv)?;
+            if result.is_ok() {
+                memory.write_value(tp, &tv)?;
+            } else {
+                overwrite_failed_gettimeofday_tv(&mut memory, tp.into(), &tv);
+            }
         }
 
-        Ok(ret)
+        Ok(result?)
     }
 
     /// time
