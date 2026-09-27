@@ -69,7 +69,34 @@ fn report(value: &Value) -> io::Result<()> {
 
 struct ControllerTerminal;
 
-fn exit_after_controller(service: &mut AcceptedProviderService, _: ControllerTerminal) -> ! {
+fn monotonic_ns() -> Option<u64> {
+    let mut clock: libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) } != 0 {
+        return None;
+    }
+    (clock.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(clock.tv_nsec as u64))
+}
+
+/// Grouped peers bound release by their own first controller-exit observation,
+/// which is never earlier than the exit. `live_before` was sampled before a poll
+/// that still saw the controller live, so it precedes every such observation and
+/// its one second never extends theirs. The original start's second still caps it.
+fn grouped_cutoff(start: u64, live_before: Option<u64>) -> Option<u64> {
+    let full = start.checked_add(1_000_000_000)?;
+    Some(
+        live_before
+            .and_then(|live| live.checked_add(1_000_000_000))
+            .map_or(full, |bound| bound.min(full)),
+    )
+}
+
+fn exit_after_controller(
+    service: &mut AcceptedProviderService,
+    _: ControllerTerminal,
+    live_before: Option<u64>,
+) -> ! {
     // The only constructor is the actual retained-pidfd observation below.
     // Exit is monotonic for that pinned task; EOF and transport/wrapper errors
     // never construct this proof or authorize the irreversible close.
@@ -86,6 +113,8 @@ fn exit_after_controller(service: &mut AcceptedProviderService, _: ControllerTer
         && run.as_ref().is_some_and(|custody| !unresolved(custody))
         && service.observation.is_none()
         && service.last_observation.is_none()
+        && service.fd_observation.is_none()
+        && service.last_fd_observation.is_none()
         && service.run_replies.is_empty()
         && provider_state["active_setters"] == 0
         && provider_state["unresolved_matches"] == 0
@@ -93,8 +122,13 @@ fn exit_after_controller(service: &mut AcceptedProviderService, _: ControllerTer
     let before = serde_json::json!({
         "schema": "hermit-accepted-provider-terminal-v1",
         "phase": "before_close",
+        "fd_journal_pending":service.fd_observation.as_ref().map(|(request,event,_)|serde_json::json!({"request":request,"event":event})),
+        "fd_journal_unretired":service.last_fd_observation,
+        "fd_journal_last_raw_probe":service.last_fd_probe.as_ref().map(|body|serde_json::from_slice::<Value>(body).unwrap_or_else(|_|serde_json::json!({"invalid_raw_bytes":body}))),
         "run": service.incarnation,
         "controller_terminal": true,
+        "controller_live_before_ns": live_before,
+        "run_peer_ended": service.run_peer_ended(),
         "failure": service.failure,
         "bootstrap": bootstrap,
         "run_custody": run,
@@ -106,7 +140,46 @@ fn exit_after_controller(service: &mut AcceptedProviderService, _: ControllerTer
         "requires_external_absence": true,
     });
     successful &= report(&before).is_ok();
-    let closed = service.provider.close_for_process_exit();
+    // The independent parent query uses this original monotonic close boundary,
+    // never a fresh deadline measured after it receives the report.
+    let closed_ns = monotonic_ns();
+    successful &= closed_ns.is_some();
+    let mut grouped_close = None;
+    let closed = if service.grouped_installed {
+        let result = closed_ns
+            .ok_or_else(|| io::Error::other("original grouped close clock unavailable"))
+            .and_then(|start| {
+                grouped_cutoff(start, live_before)
+                    .ok_or_else(|| io::Error::other("original grouped close cutoff overflow"))
+                    .and_then(|cutoff| {
+                        service
+                            .provider
+                            .close_grouped_for_process_exit(start, cutoff)
+                    })
+            });
+        // The native result remains visible even if subsequent runtime custody
+        // or absence verification fails. It never replaces the primary error.
+        grouped_close = service.provider.grouped_close_receipt().cloned();
+        result.and_then(|receipt| {
+            if receipt.native_pointer_retained || !receipt.runtime_completed {
+                return Err(io::Error::other(
+                    "grouped close did not complete actual runtime retirement",
+                ));
+            }
+            let inventory = receipt.inventory.ok_or_else(|| {
+                io::Error::other("grouped unopened retirement has no provider inventory")
+            })?;
+            Ok(vec![ffi::CloseReceipt {
+                incarnation: receipt.incarnation,
+                inventory,
+                close: receipt.close,
+                unexpected_drop: false,
+                requires_external_absence: receipt.requires_external_absence,
+            }])
+        })
+    } else {
+        service.provider.close_for_process_exit()
+    };
     successful &= closed.as_ref().is_ok_and(|receipts| {
         !receipts.is_empty()
             && receipts.iter().all(|receipt| {
@@ -118,10 +191,21 @@ fn exit_after_controller(service: &mut AcceptedProviderService, _: ControllerTer
     let final_report = serde_json::json!({
         "schema": "hermit-accepted-provider-terminal-v1",
         "phase": "after_close",
+        "closed_ns": closed_ns,
         "run": service.incarnation,
         "controller_terminal": true,
         "close_receipts": closed.as_ref().ok().map(|receipts| receipts.iter().map(close_receipt).collect::<Vec<_>>()),
         "close_error": closed.as_ref().err().map(ToString::to_string),
+        "grouped_close": grouped_close.as_ref().map(|receipt| serde_json::json!({
+            "incarnation": receipt.incarnation,
+            "inventory": receipt.inventory.as_ref().map(inventory),
+            "close": CallStatus::from(receipt.close),
+            "original_release_start": receipt.original_release_start,
+            "cutoff": receipt.cutoff,
+            "native_pointer_retained": receipt.native_pointer_retained,
+            "runtime_completed": receipt.runtime_completed,
+            "requires_external_absence": receipt.requires_external_absence,
+        })),
         "service_status": if successful { 0 } else { 125 },
         "requires_external_absence": true,
         "socket_release": "pending_process_exit",
@@ -134,15 +218,17 @@ fn exit_after_controller(service: &mut AcceptedProviderService, _: ControllerTer
 
 fn run_service(service: &mut AcceptedProviderService) -> ! {
     let mut failure_reported = false;
+    let mut live_before = None;
     loop {
+        let sampled = monotonic_ns();
         match service.controller_has_exited() {
-            Ok(true) => exit_after_controller(service, ControllerTerminal),
-            Ok(false) => {}
+            Ok(true) => exit_after_controller(service, ControllerTerminal, live_before),
+            Ok(false) => live_before = sampled.or(live_before),
             Err(error) => {
                 service.failure.get_or_insert_with(|| error.to_string());
             }
         }
-        if service.failure.is_none() {
+        if service.failure.is_none() && !service.run_peer_ended() {
             match catch_unwind(AssertUnwindSafe(|| service.step())) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -156,12 +242,21 @@ fn run_service(service: &mut AcceptedProviderService) -> ! {
             }
         }
         if service.failure.is_some() {
+            // The parent is waiting for this exact bootstrap response before
+            // it can take its existing owned Container cancellation path.
+            // Keep all provider/SCM custody until the original controller exits.
+            service.notify_bootstrap_failure();
             if !failure_reported {
+                let run_send_ended = service.end_run_send_direction();
                 let _ = report(&serde_json::json!({
                     "schema": "hermit-accepted-provider-terminal-v1",
                     "phase": "retained_failure",
                     "run": service.incarnation,
                     "failure": service.failure,
+                    "bootstrap_failure_sent": service.bootstrap_failure_sent,
+                    "bootstrap_failure_send_error": service.bootstrap_failure_send_error,
+                    "run_send_direction_ended": run_send_ended.as_ref().map(|r| r.is_ok()),
+                    "run_send_direction_error": run_send_ended.and_then(Result::err),
                     "controller_terminal": false,
                     "requires_external_recovery": true,
                 }));
@@ -171,6 +266,9 @@ fn run_service(service: &mut AcceptedProviderService) -> ! {
             // proof. The bounded launch owner still owns unit recovery. Avoid
             // repeatedly polling a dead endpoint or rerunning an unknown call.
             std::thread::sleep(Duration::from_millis(10));
+        } else if service.run_peer_ended() {
+            // Nothing remains to receive; wait only for the pidfd proof.
+            std::thread::sleep(super::OBSERVATION_MAINTENANCE);
         } else if let Err(error) =
             service.wait_transport(Instant::now() + super::OBSERVATION_MAINTENANCE)
         {
@@ -200,12 +298,43 @@ pub unsafe fn run_accepted_provider_process(
     incarnation: [u8; 16],
     library: CString,
     object: CString,
+    library_file: OwnedFd,
 ) -> ! {
+    // Retain the exact sealed artifact before even endpoint validation. An
+    // early refusal releases it only through this dedicated process exit.
+    let mut library_file = ManuallyDrop::new(Some(library_file));
     let service =
         unsafe { AcceptedProviderService::from_private_stdin(stdin, incarnation, library, object) };
     match service {
-        Ok(service) => {
+        Ok(mut service) => {
+            service.grouped_library = library_file.take();
             let mut service = ManuallyDrop::new(service);
+            // This dedicated early entry owns the endpoint and sealed library
+            // before process policy setup. No bootstrap/control receipt or
+            // provider work may precede the strict grouped-holder protection.
+            let protected = (|| -> io::Result<()> {
+                if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })();
+            if let Err(error) = protected {
+                service.failure.get_or_insert_with(|| error.to_string());
+                let _ = report(&serde_json::json!({
+                    "schema": "hermit-accepted-provider-terminal-v1",
+                    "phase": "process_protection_failure",
+                    "run": incarnation,
+                    "failure": service.failure,
+                    "controller_terminal": false,
+                    "service_status": 125,
+                }));
+                // The retained service has received no message and created no
+                // BPF owner. Release all original custody only at process exit.
+                unsafe { libc::_exit(125) }
+            }
             run_service(&mut service)
         }
         Err((error, endpoint)) => {
@@ -228,6 +357,25 @@ pub unsafe fn run_accepted_provider_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_cutoff_never_extends_any_later_controller_exit_observation() {
+        let second = 1_000_000_000;
+        let (live, start) = (50 * second, 50 * second + 7_000_000);
+        let cutoff = grouped_cutoff(start, Some(live)).unwrap();
+        assert_eq!(cutoff, live + second);
+        // Every peer's first observation follows the live poll; the Keeper
+        // requires cutoff <= first + 1s. A start-based cutoff fails that for
+        // any observation before the provider's own later start.
+        for first in [live + 1, live + 1_000_000, start - 1, start, start + 1] {
+            assert!(cutoff <= first + second);
+        }
+        // Never later than the original start's second; no live proof keeps it.
+        assert_eq!(grouped_cutoff(start, Some(start + 5)), Some(start + second));
+        assert_eq!(grouped_cutoff(start, None), Some(start + second));
+        assert_eq!(grouped_cutoff(start, Some(u64::MAX)), Some(start + second));
+        assert_eq!(grouped_cutoff(u64::MAX, Some(live)), None);
+    }
 
     #[test]
     fn accepted_provider_terminal_close_is_never_resubmitted() {

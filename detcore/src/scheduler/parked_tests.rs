@@ -2101,3 +2101,7 @@ fn parked_selection_failure_preserves_process_and_optional_task_identity() {
         }
     }
 }
+
+// Additive real-transition controls; all existing test bodies remain unchanged.
+#[path = "ordinary_fd_tests.rs"]
+mod ordinary_fd_tests;

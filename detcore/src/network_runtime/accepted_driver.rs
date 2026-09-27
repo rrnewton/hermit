@@ -115,6 +115,12 @@ impl Driver {
         }
         result.map_err(io::Error::other)
     }
+
+    /// Whether the worker thread was actually joined and its outcome retained.
+    #[cfg(test)]
+    pub(super) fn joined(&self) -> bool {
+        self.thread.is_none() && self.outcome.is_some()
+    }
 }
 
 #[cfg(test)]

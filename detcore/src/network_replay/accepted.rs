@@ -62,7 +62,7 @@ pub struct NetworkAcceptedCompletion {
 /// Private capability: neither a guest RPC nor socket metadata can create it.
 /// Production construction requires BOTH the creation observer and descriptor
 /// mutation service. Neither is qualified yet; ordinary backends have None.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct AcceptedBackendCapability(());
 impl AcceptedBackendCapability {
     #[cfg(test)]
@@ -175,6 +175,7 @@ struct AcceptOperation {
 
 #[derive(Debug, Default)]
 pub(super) struct AcceptedRuntime {
+    installation_capability: Option<AcceptedBackendCapability>,
     pub(super) fresh_send: BTreeMap<StreamSocketKeyV3, ReceiveTimeoutV3>,
     children: Vec<ChildState>,
     physical_listeners: BTreeMap<OpenFileId, AcceptedPhysicalIdentity>,
@@ -231,13 +232,63 @@ impl AcceptedRuntime {
 }
 
 impl NetworkReplayEngine {
+    pub(super) fn check_initial_accepted_record(&self) -> Result<(), NetworkReplayError> {
+        let shadow = self.shadow.as_ref().ok_or(NetworkReplayError::WrongMode)?;
+        let untouched = match &self.mode {
+            EngineState::Record(_) => true,
+            // V4 Record owns the same census; it has no accept issuer to enroll.
+            EngineState::Native(native) => native.untouched_record(),
+            EngineState::Replay(_) => false,
+        };
+        if !untouched
+            || shadow.accepted.is_some()
+            || !shadow.sockets.is_empty()
+            || !shadow.profiles.is_empty()
+            || !shadow.channel_classes.is_empty()
+            || !shadow.units.is_empty()
+            || shadow.namespace.is_some()
+            || !self.channels.is_empty()
+            || !self.stream_calls.is_empty()
+            || !self.socket_controls.is_empty()
+        {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "accepted bootstrap requires the untouched Record engine".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Infallible half of the same initial-census transaction. The caller has
+    /// checked the untouched Record engine before committing its census.
+    pub(super) fn activate_initial_accepted_record(&mut self) {
+        if self.native_receive_version() {
+            // The V4 creation model is outbound/datagram only. Accept stays
+            // WrongMode rather than acquiring a V3 accepted-stream journal.
+            return;
+        }
+        let mut accepted = AcceptedRuntime::record();
+        accepted.installation_capability = Some(AcceptedBackendCapability(()));
+        self.shadow
+            .as_mut()
+            .expect("checked Record shadow")
+            .accepted = Some(accepted);
+    }
+
     /// Explicit enrollment; ordinary V3 Record construction remains unchanged.
     pub(crate) fn record_shadow_accepted(
         epoch: DateTime<Utc>,
-        _cap: AcceptedBackendCapability,
+        cap: AcceptedBackendCapability,
     ) -> Self {
         let mut engine = Self::record_shadow(epoch);
         engine.shadow.as_mut().unwrap().accepted = Some(AcceptedRuntime::record());
+        engine
+            .shadow
+            .as_mut()
+            .unwrap()
+            .accepted
+            .as_mut()
+            .unwrap()
+            .installation_capability = Some(cap);
         engine
     }
     /// Reader dispatch follows the declared variant, never socket defaults.
@@ -475,22 +526,24 @@ impl NetworkReplayEngine {
         runtime.children.push(child);
         Ok(id)
     }
-    /// Derive inheritance at shared external input eligibility, before choosing
-    /// an accepter. A later guest setter never rewrites this captured state.
-    pub(super) fn release_accepted_children(
-        &mut self,
+    /// Stage creation-time inheritance against the same projected input prefix
+    /// as the release plan. Neither the listener nor the child becomes ready.
+    pub(super) fn prepare_accepted_children(
+        &self,
         now: LogicalTime,
-    ) -> Result<BTreeSet<NetworkChannelId>, NetworkReplayError> {
+        released: &[bool],
+        prepared: &mut BTreeMap<ChildCreationIdV1, PreparedChildRelease>,
+    ) -> Result<(), NetworkReplayError> {
         if !self.accepted_mode() {
-            return Ok(BTreeSet::new());
+            return Ok(());
         }
         let EngineState::Replay(replay) = &self.mode else {
-            return Ok(BTreeSet::new());
+            return Ok(());
         };
         let mut pending = Vec::new();
         let mut blocked = BTreeSet::new();
         for child in &self.accepted()?.children {
-            if child.inherited.is_some() {
+            if child.inherited.is_some() || prepared.contains_key(&child.id) {
                 continue;
             }
             if blocked.contains(&child.listener) {
@@ -501,7 +554,7 @@ impl NetworkReplayEngine {
                     .trace
                     .inputs
                     .iter()
-                    .zip(&replay.released)
+                    .zip(released)
                     .any(|(input, released)| {
                         input.channel == child.listener
                             && input.ordinal < child.history_prefix
@@ -523,25 +576,24 @@ impl NetworkReplayEngine {
             if state.key != child.key || state.send_timeout.is_none() {
                 return Err(NetworkReplayError::InvalidAcceptedReceipt);
             }
-            pending.push((child.id, state));
+            pending.push((
+                child.id,
+                PreparedChildRelease {
+                    listener: child.listener,
+                    inherited: state,
+                },
+            ));
         }
-        let mut ready = BTreeSet::new();
         for (id, state) in pending {
-            let child = self
-                .accepted_mut()?
-                .children
-                .iter_mut()
-                .find(|c| c.id == id)
-                .unwrap();
-            child.inherited = Some(state);
-            ready.insert(child.listener);
+            assert!(prepared.insert(id, state).is_none());
         }
-        Ok(ready)
+        Ok(())
     }
-    pub(super) fn accepted_input_ready(
+    pub(super) fn prepared_accepted_input_ready(
         &self,
         channel: NetworkChannelId,
         event: &NetworkInputKindV2,
+        prepared: &BTreeMap<ChildCreationIdV1, PreparedChildRelease>,
     ) -> bool {
         let NetworkInputKindV2::Accept { accepted, .. } = event else {
             return true;
@@ -549,8 +601,46 @@ impl NetworkReplayEngine {
         let Ok(runtime) = self.accepted() else {
             return true;
         };
-        runtime.children.iter().any(|c|c.listener==channel && c.inherited.is_some()
+        runtime.children.iter().any(|c|c.listener==channel && (c.inherited.is_some() || prepared.contains_key(&c.id))
             && matches!(c.planned,Some(ChildDispositionV1::Accepted {channel,..}) if channel==*accepted))
+    }
+    /// Validate every selected creation before the first mutation. A failed or
+    /// repeated commit must not leave a partially inherited child population.
+    pub(super) fn validate_prepared_children(
+        &self,
+        prepared: &BTreeMap<ChildCreationIdV1, PreparedChildRelease>,
+    ) -> Result<(), NetworkReplayError> {
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        let runtime = self.accepted()?;
+        for (id, release) in prepared {
+            if !runtime.children.iter().any(|child| {
+                child.id == *id && child.listener == release.listener && child.inherited.is_none()
+            }) {
+                return Err(NetworkReplayError::ReplayReleaseChanged);
+            }
+        }
+        Ok(())
+    }
+    /// The caller validated the complete plan while holding exclusive engine
+    /// access. No physical effect or asynchronous work occurs during commit.
+    pub(super) fn commit_prepared_children(
+        &mut self,
+        prepared: BTreeMap<ChildCreationIdV1, PreparedChildRelease>,
+    ) {
+        if prepared.is_empty() {
+            return;
+        }
+        let runtime = self.accepted_mut().expect("validated prepared children");
+        for (id, release) in prepared {
+            runtime
+                .children
+                .iter_mut()
+                .find(|child| child.id == id)
+                .expect("validated prepared child")
+                .inherited = Some(release.inherited);
+        }
     }
     pub(super) fn next_child_release(&self) -> Option<LogicalTime> {
         let EngineState::Replay(replay) = &self.mode else {
@@ -850,6 +940,100 @@ impl NetworkReplayEngine {
         operation.confirmed = Some(fact);
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(super) fn original_installation_fixture_cookie(
+        &mut self,
+        child: ChildCreationIdV1,
+        cookie: u64,
+    ) {
+        assert!(
+            cookie != 0
+                && self
+                    .accepted()
+                    .unwrap()
+                    .children
+                    .iter()
+                    .any(|c| c.id == child)
+        );
+        assert!(
+            self.accepted_mut()
+                .unwrap()
+                .provider_cookies
+                .insert(child, cookie)
+                .is_none()
+        );
+    }
+
+    /// Called only by the private original-installation consumer after native
+    /// interval/owner/metadata validation, before the same FD publication.
+    pub(super) fn confirm_original_accepted_installation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        matched: crate::network_runtime::accepted::Resolved,
+        binding: crate::types::FdSlotBinding,
+    ) -> Result<(), NetworkReplayError> {
+        if !self.provider_child_published(matched)? {
+            return Err(NetworkReplayError::InvalidAcceptedReceipt);
+        }
+        let cap = self
+            .accepted()?
+            .installation_capability
+            .ok_or(NetworkReplayError::InvalidAcceptedReceipt)?;
+        self.confirm_accepted_installation(
+            owner,
+            lease,
+            AcceptedInstallationFact::Installed {
+                child: ChildCreationIdV1(matched.creation),
+                fd: binding.slot.fd,
+                open_file: binding.open_file,
+                slot_generation: binding.generation,
+                physical: matched.physical,
+            },
+            &cap,
+        )
+    }
+    /// The runtime alone can construct this negative proof from the original
+    /// command and complete journal. No RPC errno grants no-install authority.
+    pub(crate) fn confirm_original_accepted_no_installation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        permit: super::NetworkFdPublicationPermit,
+        actual: &std::sync::Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+        receipt: &crate::network_runtime::accepted::NoInstallation,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_publication_permit(owner, permit)?;
+        self.accepted_capture_call(owner, lease)?;
+        if !receipt.matches(owner, lease, permit, actual) {
+            return Err(NetworkReplayError::InvalidAcceptedReceipt);
+        }
+        // A real child can be dequeued even though no FD was installed. Its
+        // model disposition and physical retirement are still unresolved; keep
+        // the typed native proof in Accept custody and never label it NoConnection.
+        if receipt.dequeued().is_some() {
+            return Err(NetworkReplayError::UnresolvedAccept(lease));
+        }
+        let state = &self.fd_publications[&permit.files];
+        if state.pending.is_some() || state.enrollment.is_some() || state.reader.is_some() {
+            return Err(NetworkReplayError::InvalidAcceptedReceipt);
+        }
+        let cap = self
+            .accepted()?
+            .installation_capability
+            .ok_or(NetworkReplayError::InvalidAcceptedReceipt)?;
+        self.confirm_accepted_installation(
+            owner,
+            lease,
+            AcceptedInstallationFact::NoConnection {
+                errno: receipt.errno(),
+            },
+            &cap,
+        )?;
+        self.release_empty_fd_publication(owner, permit)
+    }
+
     /// Resolve exact known outcome. Unknown acquisition/allocation/copyout
     /// remains latched; a numeric errno alone never means no connection effect.
     pub fn complete_accepted_socket(
@@ -955,7 +1139,7 @@ impl NetworkReplayEngine {
                     .as_mut()
                     .unwrap()
                     .sockets
-                    .insert(open_file, inherited);
+                    .insert(open_file, super::native_receive::Socket::new(inherited));
                 let channel = match self.ensure_channel(open_file, request) {
                     Ok(c) => c,
                     Err(error) => {
@@ -996,6 +1180,7 @@ impl NetworkReplayEngine {
                             .refresh_readiness();
                         selected.planned.unwrap()
                     }
+                    EngineState::Native(_) => return Err(NetworkReplayError::WrongMode),
                 };
                 self.accepted_mut()?
                     .children

@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Pure schedule-independent network capture and replay state.
 //!
@@ -22,7 +22,27 @@ pub use accepted::NetworkAcceptReservation;
 pub use accepted::NetworkAcceptedChild;
 pub use accepted::NetworkAcceptedCompletion;
 mod fd_mutation;
+mod initial_record;
+pub(crate) use initial_record::initial_record_call_supported;
+mod fd_read_metadata;
+mod helper_copy;
 pub(crate) mod lifetime;
+mod native_receive;
+pub(crate) mod original_connect;
+pub(crate) use native_receive::CompletedNoStore;
+pub(crate) use native_receive::CompletedRecordEmptyAttempt;
+pub(crate) use native_receive::ForegroundStore;
+pub(crate) use native_receive::ForegroundStoreSource;
+pub(crate) use native_receive::FullStoreCompletion;
+pub(crate) use native_receive::NoStoreReturn;
+pub(crate) use native_receive::PreparedPrivatePublication;
+pub(crate) use native_receive::ReceiveSelection;
+pub(crate) use native_receive::RecordNoStore;
+pub(crate) use native_receive::RecordReceiveRetry;
+pub(crate) use native_receive::ReplayReceivePlan;
+pub(crate) use native_receive::StoreOutcome;
+pub(crate) mod native_terminal;
+pub(crate) mod original_installation;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -66,7 +86,6 @@ use detcore_model::network_trace::NetworkEndpointRoleV2;
 use detcore_model::network_trace::NetworkInputEventV2;
 use detcore_model::network_trace::NetworkInputKindV1;
 use detcore_model::network_trace::NetworkInputKindV2;
-use detcore_model::network_trace::NetworkObjectId;
 use detcore_model::network_trace::NetworkOutputEventV2;
 use detcore_model::network_trace::NetworkOutputKindV2;
 use detcore_model::network_trace::NetworkReadinessV2;
@@ -78,6 +97,7 @@ use detcore_model::network_trace::NetworkTraceV1;
 use detcore_model::network_trace::NetworkTraceV2;
 use detcore_model::network_trace::NetworkTraceV3;
 use detcore_model::network_trace::NetworkTraceValidationError;
+use detcore_model::network_trace::NetworkTraceValidationErrorV4;
 use detcore_model::network_trace::NetworkTransportV2;
 use detcore_model::network_trace::ReceiveCopyUnitV1;
 use detcore_model::network_trace::ReceiveEnvironmentV3;
@@ -211,35 +231,6 @@ pub struct NetworkReceiveOptions {
     pub receive_low_water: usize,
 }
 
-/// Kernel-object category represented by one trace-stable ancillary object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkAncillaryObjectKind {
-    /// Open file description transferred through `SCM_RIGHTS`.
-    FileDescriptor,
-}
-
-/// Resolved ancillary object used by the adapter to install a guest fd alias.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NetworkAncillaryObject {
-    /// Trace-stable object identity.
-    pub id: NetworkObjectId,
-    /// Stable Detcore open-file-description identity.
-    pub open_file: OpenFileId,
-    /// Object category.
-    pub kind: NetworkAncillaryObjectKind,
-    /// Number of currently installed descriptor aliases.
-    pub alias_count: u64,
-}
-
-/// One deterministic epoll result, ordered by target OFD identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NetworkEpollEvent {
-    /// Ready target open-file description.
-    pub target: OpenFileId,
-    /// Linux `EPOLL*` result bits.
-    pub events: u32,
-}
-
 /// Connect or accept observation ready for syscall adaptation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionOutcome {
@@ -308,6 +299,13 @@ pub struct NetworkStreamOwner {
     Deserialize
 )]
 pub struct NetworkStreamLeaseId(u64);
+
+#[cfg(test)]
+impl NetworkStreamLeaseId {
+    pub(crate) fn controlled_fixture(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 /// A result from a positive-capacity nonblocking receive into owned scratch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +425,13 @@ enum StreamOperationKind {
 )]
 pub struct NetworkStreamCallId(u64);
 
+impl NetworkStreamCallId {
+    /// Engine-allocated identity carried by an authenticated native command.
+    pub(crate) fn native_command_call(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 impl NetworkStreamCallId {
     pub(crate) fn controlled_fixture(value: u64) -> Self {
@@ -445,6 +450,24 @@ pub struct NetworkStreamCall {
     pub physical_pin_required: bool,
 }
 
+/// Local semantic completion minted only after the exact Call was removed.
+/// A retirement-journal failure cannot revoke the already known pin release,
+/// so the runtime must still consume its matching physical completion.
+#[derive(Debug)]
+pub(crate) struct CompletedStreamCallRelease {
+    owner: NetworkStreamOwner,
+    call: NetworkStreamCallId,
+    retirement: Result<(), NetworkReplayError>,
+}
+impl CompletedStreamCallRelease {
+    pub(crate) fn identity(&self) -> (NetworkStreamOwner, NetworkStreamCallId) {
+        (self.owner, self.call)
+    }
+    pub(crate) fn into_result(self) -> Result<(), NetworkReplayError> {
+        self.retirement
+    }
+}
+
 /// A known result from the just-submitted physical pin acquisition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkStreamPinOutcome {
@@ -459,15 +482,292 @@ enum StreamCallPhase {
     PinAcquireSubmitted,
     Active,
     PinReleaseSubmitted,
+    TerminalPinReleased,
 }
 
 #[derive(Debug, Clone)]
 struct StreamCallState {
     owner: NetworkStreamOwner,
-    open_file: OpenFileId,
+    open_file: Option<OpenFileId>,
     physical_pin_required: bool,
     phase: StreamCallPhase,
     abandoned: bool,
+    // Only the backend's actual final-wait callback sets this. Owner-gone,
+    // logical exec retirement and an empty wait queue are not terminal proof.
+    final_wait: bool,
+    terminal_evidence: Option<crate::network_runtime::native_peer::TerminalEvidence>,
+    // The existing table permit excludes mutations between exact slot
+    // validation and known pidfd_getfd completion. It is not another ledger.
+    capture_publication: Option<NetworkFdPublicationPermit>,
+    capture_control: Option<NetworkStreamLeaseId>,
+    original: Option<original_connect::OriginalCallState>,
+    helper_copy: Option<std::sync::Arc<crate::network_runtime::HelperCopyBinding>>,
+    native_receive: Vec<native_receive::RetainedAttempt>,
+    private_receive: Option<native_receive::PrivateSource>,
+    record_no_store: Option<std::sync::Arc<native_receive::RecordNoStore>>,
+    no_store_completed: bool,
+    replay_receive: Option<std::sync::Arc<native_receive::ReplayStoreSource>>,
+    foreground_store: Option<std::sync::Arc<native_receive::ForegroundStore>>,
+    private_drain: Option<native_receive::PrivateDrain>,
+    native_entry_attempted: Option<std::sync::Arc<native_receive::NativeEntryMarker>>,
+    native_entry: Option<native_receive::NativeEntry>,
+}
+
+/// Short reader admission from the existing table and OFD authorities. This is
+/// not a physical file selection or an additional lifetime/operation ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkFdReadAdmission {
+    /// Existing publication permit and its exact acknowledged prefix.
+    pub publication: NetworkFdPublicationAdmission,
+    /// Original numeric lookup operand, including an invalid descriptor.
+    pub fd: i32,
+    /// Current binding selected while holding publication exclusion.
+    pub binding: Option<crate::types::FdSlotBinding>,
+    /// Existing descriptor control, present exactly when the binding is present.
+    pub control: Option<NetworkStreamLeaseId>,
+    /// Exact external request selected before this token was granted. This is
+    /// progress custody, never native entry, selection or completion evidence.
+    pub(crate) external_grant: Option<crate::resources::ExternalOpId>,
+}
+
+/// Recovery never becomes an empty table observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkFdReadBegin {
+    /// Publish/acknowledge the existing prefix before another admission.
+    Recover,
+    /// Current logical binding under short table/OFD exclusion.
+    Admitted(NetworkFdReadAdmission),
+}
+
+impl NetworkReplayEngine {
+    /// Acquire both existing authorities atomically. In particular a contended
+    /// OFD never leaves a table permit held while the Global RPC waits in NoSeq.
+    pub fn begin_fd_read(
+        &mut self,
+        owner: NetworkStreamOwner,
+        files: FilesId,
+        fd: i32,
+    ) -> Result<NetworkFdReadBegin, NetworkReplayError> {
+        let task = self.publication_owner(owner, files)?;
+        let publication = self.acquire_fd_publication(owner, files)?;
+        if publication.recovery.is_some() {
+            self.fd_publications
+                .get_mut(&files)
+                .expect("acquired table")
+                .active = None;
+            return Ok(NetworkFdReadBegin::Recover);
+        }
+        let binding = self.lifetime.descriptor_binding(task, fd).ok();
+        let controls = match self.begin_descriptor_controls(
+            owner,
+            binding
+                .map(|binding| binding.open_file)
+                .into_iter()
+                .collect(),
+        ) {
+            Ok(controls) => controls,
+            Err(primary) => {
+                self.release_empty_fd_publication(owner, publication.permit)
+                    .expect("unsubmitted reader has no pending prefix");
+                return Err(primary);
+            }
+        };
+        let read = NetworkFdReadAdmission {
+            publication,
+            fd,
+            binding,
+            control: controls.first().map(|(_, lease)| *lease),
+            external_grant: None,
+        };
+        self.fd_publications
+            .get_mut(&files)
+            .expect("admitted table")
+            .reader = Some(read.clone());
+        Ok(NetworkFdReadBegin::Admitted(read))
+    }
+
+    fn validate_fd_read(
+        &self,
+        owner: NetworkStreamOwner,
+        read: &NetworkFdReadAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        self.check_stream_owner(owner)?;
+        self.validate_owned_fd_read(owner, read)
+    }
+
+    // Consuming owner cleanup must also work after final wait made guest RPCs
+    // inadmissible. Exact retained table ownership is checked independently.
+    fn validate_owned_fd_read(
+        &self,
+        owner: NetworkStreamOwner,
+        read: &NetworkFdReadAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        let fail = |message: &str| NetworkReplayError::FdPublicationProtocol(message.into());
+        let permit = read.publication.permit;
+        let task = TaskOwner {
+            tid: owner.thread,
+            mm: owner.mm,
+        };
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| fail("reader publication no longer exists"))?;
+        if permit.owner != owner
+            || publication.active != Some(permit)
+            || publication.reader.as_ref() != Some(read)
+            || self.lifetime.task_files(task).ok() != Some(permit.files)
+        {
+            return Err(fail(
+                "reader is not the exact retained table/owner admission",
+            ));
+        }
+        if read.publication.recovery.is_some()
+            || self.fd_publications[&permit.files].pending.is_some()
+            || self.native_stream_capture_pending(permit)
+            || self.physical_fd_mutation_pending(permit)
+        {
+            return Err(fail(
+                "reader authority has a pending prefix or was already transferred",
+            ));
+        }
+        let cursor = self
+            .lifetime
+            .publication_cursor(task)
+            .map_err(|error| fail(&error.to_string()))?;
+        if cursor
+            != (
+                read.publication.acknowledged_sequence,
+                read.publication.acknowledged_generation,
+            )
+            || self.lifetime.descriptor_binding(task, read.fd).ok() != read.binding
+        {
+            return Err(fail("reader binding or acknowledged prefix changed"));
+        }
+        match (read.binding, read.control) {
+            (Some(binding), Some(lease)) => {
+                let control = self
+                    .socket_controls
+                    .get(&binding.open_file)
+                    .ok_or_else(|| fail("reader descriptor control no longer exists"))?;
+                if binding.slot.files != permit.files
+                    || binding.slot.fd != read.fd
+                    || control.owner != owner
+                    || control.lease != lease
+                    || control.open_file != binding.open_file
+                    || !control.physical.can_release_unchanged()
+                    || self.shadow_probes.contains_key(&lease)
+                    || self
+                        .stream_calls
+                        .values()
+                        .any(|call| call.capture_control == Some(lease))
+                    || self
+                        .stream_operations
+                        .values()
+                        .any(|operation| operation.open_file == binding.open_file)
+                {
+                    return Err(fail("reader descriptor control does not own exact binding"));
+                }
+            }
+            (None, None) => {}
+            _ => return Err(fail("reader control presence differs from binding")),
+        }
+        Ok(())
+    }
+
+    /// Abandon only the still-logical read. A transferred capture must complete
+    /// through its existing Call and physical recovery, never this release RPC.
+    pub fn finish_fd_read(
+        &mut self,
+        owner: NetworkStreamOwner,
+        read: NetworkFdReadAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_fd_read(owner, &read)?;
+        if let Some(control) = read.control {
+            self.finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)?;
+        }
+        self.fd_publications
+            .get_mut(&read.publication.permit.files)
+            .expect("validated reader")
+            .reader = None;
+        self.release_empty_fd_publication(owner, read.publication.permit)
+    }
+
+    fn consume_logical_fd_reads(&mut self, owner: NetworkStreamOwner) {
+        let reads: Vec<_> = self
+            .fd_publications
+            .values()
+            .filter_map(|state| state.reader.as_ref())
+            .filter(|read| read.publication.permit.owner == owner)
+            .cloned()
+            .collect();
+        for read in reads {
+            self.consume_logical_fd_read(owner, read);
+        }
+    }
+
+    fn consume_logical_fd_read(&mut self, owner: NetworkStreamOwner, read: NetworkFdReadAdmission) {
+        self.validate_owned_fd_read(owner, &read)
+            .expect("untransferred logical reader has no submitted physical effect");
+        if let Some(binding) = read.binding {
+            let control = self
+                .socket_controls
+                .remove(&binding.open_file)
+                .expect("validated reader control");
+            assert_eq!(Some(control.lease), read.control);
+            self.complete_deferred_retirement(binding.open_file);
+        }
+        let state = self
+            .fd_publications
+            .get_mut(&read.publication.permit.files)
+            .expect("validated reader publication");
+        state.reader = None;
+        state.active = None;
+    }
+
+    /// Consume one already admitted reader directly into existing Call capture
+    /// custody. There is no release/reacquire window and no second Call ledger.
+    pub fn begin_native_stream_call_from_read(
+        &mut self,
+        owner: NetworkStreamOwner,
+        read: NetworkFdReadAdmission,
+    ) -> Result<NetworkStreamCall, NetworkReplayError> {
+        if !self.fd_table_capability() {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "native capture requires complete backend table authority".into(),
+            ));
+        }
+        self.validate_fd_read(owner, &read)?;
+        let binding = read.binding.ok_or_else(|| {
+            NetworkReplayError::FdPublicationProtocol(
+                "stream capture requires a present admitted descriptor".into(),
+            )
+        })?;
+        let control = read.control.expect("validated present binding/control");
+        let permit = read.publication.permit;
+        // Preflight the only post-transfer table release predicate. A refused
+        // logical transfer must return ownership of the exact original reader.
+        self.validate_publication_permit(owner, permit)?;
+        if self.fd_publications[&permit.files].enrollment.is_some() {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "release would erase a pending prefix or enrollment".into(),
+            ));
+        }
+        let call = self.begin_stream_call_inner(owner, control, Some(binding), Some(permit))?;
+        self.fd_publications
+            .get_mut(&permit.files)
+            .expect("transferred reader")
+            .reader = None;
+        if !call.physical_pin_required {
+            // Preserve the existing logical Replay behavior: no invented native
+            // capture. The caller still consumes its descriptor control.
+            self.release_empty_fd_publication(owner, permit)?;
+            self.stream_calls
+                .get_mut(&call.id)
+                .expect("new call")
+                .capture_publication = None;
+        }
+        Ok(call)
+    }
 }
 
 /// Atomic zero-capacity recv result. No payload reservation or drain is made.
@@ -499,6 +799,9 @@ impl NetworkReplayEngine {
         if state.owner != owner {
             return Err(NetworkReplayError::StreamCallOwnerMismatch(call));
         }
+        if state.original.is_some() || state.open_file.is_none() {
+            return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
+        }
         if state.abandoned {
             return Err(NetworkReplayError::UnresolvedStreamCall(call));
         }
@@ -513,6 +816,82 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         control_lease: NetworkStreamLeaseId,
     ) -> Result<NetworkStreamCall, NetworkReplayError> {
+        self.begin_stream_call_inner(owner, control_lease, None, None)
+    }
+
+    /// Validate the exact original FD installation on the server, then retain
+    /// the existing table authority until its physical capture is known.
+    /// Backend capability is indispensable: unjoined mutations cannot be made
+    /// safe merely by acquiring this permit or validating a historical slot.
+    pub fn begin_native_stream_call(
+        &mut self,
+        owner: NetworkStreamOwner,
+        control_lease: NetworkStreamLeaseId,
+        binding: crate::types::FdSlotBinding,
+    ) -> Result<NetworkStreamCall, NetworkReplayError> {
+        if !self.fd_table_capability() {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "native capture requires complete backend table authority".into(),
+            ));
+        }
+        let task = self.publication_owner(owner, binding.slot.files)?;
+        let current = self
+            .lifetime
+            .descriptor_binding(task, binding.slot.fd)
+            .map_err(|error| NetworkReplayError::FdPublicationProtocol(error.to_string()))?;
+        if current != binding
+            || self.owned_socket_control(owner, control_lease)?.open_file != binding.open_file
+        {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "native capture FD slot generation/OFD changed before admission".into(),
+            ));
+        }
+        let publication = self.acquire_fd_publication(owner, binding.slot.files)?;
+        if publication.recovery.is_some() {
+            // No physical submission occurred. Preserve the pending prefix for
+            // the existing publication recovery path, exactly as FD mutation
+            // admission does; never claim an empty/acknowledged table instead.
+            self.fd_publications
+                .get_mut(&binding.slot.files)
+                .expect("just acquired publication")
+                .active = None;
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "native capture requires prior FD publication recovery".into(),
+            ));
+        }
+        let call = match self.begin_stream_call_inner(
+            owner,
+            control_lease,
+            Some(binding),
+            Some(publication.permit),
+        ) {
+            Ok(call) => call,
+            Err(error) => {
+                self.release_empty_fd_publication(owner, publication.permit)
+                    .expect("new unsubmitted capture has no pending publication");
+                return Err(error);
+            }
+        };
+        if !call.physical_pin_required {
+            // The current Replay adapter still has no physical producer. Its
+            // logical call performs no capture; do not retain a fictional pin.
+            self.release_empty_fd_publication(owner, publication.permit)?;
+            self.stream_calls
+                .get_mut(&call.id)
+                .expect("new call")
+                .capture_publication = None;
+        }
+        Ok(call)
+    }
+
+    fn begin_stream_call_inner(
+        &mut self,
+        owner: NetworkStreamOwner,
+        control_lease: NetworkStreamLeaseId,
+        binding: Option<crate::types::FdSlotBinding>,
+        capture_publication: Option<NetworkFdPublicationPermit>,
+    ) -> Result<NetworkStreamCall, NetworkReplayError> {
+        self.check_native_retirement()?;
         let control = self.owned_socket_control(owner, control_lease)?;
         if !control.physical.can_release_unchanged() {
             return Err(NetworkReplayError::UnresolvedStreamOperation(control_lease));
@@ -526,22 +905,39 @@ impl NetworkReplayEngine {
             .checked_add(1)
             .ok_or(NetworkReplayError::Overflow)?;
         let id = NetworkStreamCallId(self.next_stream_call);
-        let physical_pin_required = matches!(self.mode, EngineState::Record(_));
+        let physical_pin_required = self.mode() == NetworkEngineMode::Record;
         let phase = if physical_pin_required {
             StreamCallPhase::PinAcquireSubmitted
         } else {
             StreamCallPhase::Active
         };
-        self.retain_stream_call_lifetime(owner, id, open_file)?;
+        self.retain_stream_call_lifetime(owner, id, open_file, binding)?;
         self.next_stream_call = next;
         self.stream_calls.insert(
             id,
             StreamCallState {
                 owner,
-                open_file,
+                open_file: Some(open_file),
                 physical_pin_required,
                 phase,
                 abandoned: false,
+                final_wait: false,
+                terminal_evidence: None,
+                original: None,
+                helper_copy: None,
+                native_receive: Vec::new(),
+                private_receive: None,
+                record_no_store: None,
+                no_store_completed: false,
+                replay_receive: None,
+                foreground_store: None,
+                private_drain: None,
+                native_entry_attempted: None,
+                native_entry: None,
+                capture_publication,
+                capture_control: capture_publication
+                    .filter(|_| physical_pin_required)
+                    .map(|_| control_lease),
             },
         );
         Ok(NetworkStreamCall {
@@ -564,22 +960,280 @@ impl NetworkReplayEngine {
         if state.phase != StreamCallPhase::PinAcquireSubmitted || !state.physical_pin_required {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
+        let publication = state.capture_publication;
+        let open_file = state.open_file.expect("validated stream call");
+        if let Some(permit) = publication {
+            self.validate_publication_permit(owner, permit)?;
+        }
         match outcome {
             NetworkStreamPinOutcome::Acquired => {
-                self.stream_calls
-                    .get_mut(&call)
-                    .expect("validated call")
-                    .phase = StreamCallPhase::Active;
+                if let Some(permit) = publication {
+                    self.release_empty_fd_publication(owner, permit)?;
+                }
+                let state = self.stream_calls.get_mut(&call).expect("validated call");
+                state.capture_publication = None;
+                state.phase = StreamCallPhase::Active;
             }
             NetworkStreamPinOutcome::Failed(errno) => {
                 if !(1..=4095).contains(&errno) {
                     return Err(NetworkTraceValidationError::InvalidErrno.into());
                 }
-                let open_file = state.open_file;
                 self.release_stream_call_lifetime(owner, call, open_file)?;
+                if let Some(permit) = publication {
+                    self.release_empty_fd_publication(owner, permit)?;
+                }
                 self.stream_calls.remove(&call);
                 self.complete_deferred_retirement(open_file);
             }
+        }
+        Ok(())
+    }
+
+    fn native_stream_capture_pending(&self, permit: NetworkFdPublicationPermit) -> bool {
+        self.stream_calls.values().any(|call| {
+            call.capture_publication == Some(permit)
+                && (call.original.is_some()
+                    || matches!(
+                        call.phase,
+                        StreamCallPhase::PinAcquireSubmitted | StreamCallPhase::PinReleaseSubmitted
+                    ))
+        })
+    }
+
+    /// Run-owned capture recovery may consume only this original abandoned
+    /// call. It never grants guest/RPC authority to the dead owner.
+    pub(crate) fn abandoned_native_captures(
+        &self,
+        owner: NetworkStreamOwner,
+    ) -> Vec<NetworkStreamCallId> {
+        self.stream_calls
+            .iter()
+            .filter_map(|(id, call)| {
+                (call.owner == owner
+                    && call.abandoned
+                    && call.original.is_none()
+                    && call.capture_control.is_some())
+                .then_some(*id)
+            })
+            .collect()
+    }
+
+    fn check_native_capture_retirement(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<
+        (
+            OpenFileId,
+            NetworkStreamLeaseId,
+            Option<NetworkFdPublicationPermit>,
+        ),
+        NetworkReplayError,
+    > {
+        self.check_native_capture_retirement_state(owner, call, true)
+    }
+
+    fn check_native_capture_retirement_state(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        require_abandoned: bool,
+    ) -> Result<
+        (
+            OpenFileId,
+            NetworkStreamLeaseId,
+            Option<NetworkFdPublicationPermit>,
+        ),
+        NetworkReplayError,
+    > {
+        let state = self
+            .stream_calls
+            .get(&call)
+            .ok_or(NetworkReplayError::UnknownStreamCall(call))?;
+        if state.owner != owner
+            || (require_abandoned && !state.abandoned)
+            || !state.physical_pin_required
+            || state.original.is_some()
+        {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        let control = state
+            .capture_control
+            .ok_or(NetworkReplayError::UnresolvedStreamCall(call))?;
+        let open_file = state
+            .open_file
+            .ok_or(NetworkReplayError::UnresolvedStreamCall(call))?;
+        let held = self
+            .socket_controls
+            .get(&open_file)
+            .ok_or(NetworkReplayError::UnresolvedStreamOperation(control))?;
+        if held.owner != owner
+            || held.lease != control
+            || !held.physical.can_release_unchanged()
+            || self.shadow_probes.contains_key(&control)
+            || self
+                .stream_operations
+                .values()
+                .any(|operation| operation.open_file == open_file)
+            || self
+                .zero_stream_waits
+                .values()
+                .any(|wait| wait.call == call)
+        {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        if let Some(permit) = state.capture_publication {
+            let publication = self
+                .fd_publications
+                .get(&permit.files)
+                .ok_or(NetworkReplayError::UnresolvedStreamCall(call))?;
+            if permit.owner != owner
+                || publication.active != Some(permit)
+                || publication.pending.is_some()
+            {
+                return Err(NetworkReplayError::UnresolvedStreamCall(call));
+            }
+        }
+        Ok((open_file, control, state.capture_publication))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_exhaust_receive_call_ids(&mut self) {
+        self.next_stream_call = u64::MAX;
+    }
+
+    /// Cancel exactly a failed local admission. This is not owner death and
+    /// cannot revoke a neighboring Call, wait, store or published input.
+    pub(crate) fn abandon_failed_native_receive_admission(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<(), NetworkReplayError> {
+        self.check_native_capture_retirement_state(owner, call, false)?;
+        let state = &self.stream_calls[&call];
+        if !matches!(
+            state.phase,
+            StreamCallPhase::PinAcquireSubmitted | StreamCallPhase::Active
+        ) || state.final_wait
+            || state.terminal_evidence.is_some()
+            || state.helper_copy.is_some()
+            || !state.native_receive.is_empty()
+            || state.private_receive.is_some()
+            || state.record_no_store.is_some()
+            || state.replay_receive.is_some()
+            || state.foreground_store.is_some()
+            || state.private_drain.is_some()
+        {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        self.stream_calls.get_mut(&call).unwrap().abandoned = true;
+        Ok(())
+    }
+
+    /// Roll back a logical Replay admission without a physical capture receipt.
+    pub(crate) fn cancel_replay_receive_admission(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        control: NetworkStreamLeaseId,
+    ) -> Result<CompletedStreamCallRelease, NetworkReplayError> {
+        if self.mode() != NetworkEngineMode::Replay || !self.native_receive_version() {
+            return Err(NetworkReplayError::WrongMode);
+        }
+        let state = self.owned_stream_call(owner, call)?;
+        if state.physical_pin_required
+            || state.phase != StreamCallPhase::Active
+            || state.capture_publication.is_some()
+            || state.capture_control.is_some()
+            || state.final_wait
+            || state.terminal_evidence.is_some()
+            || state.helper_copy.is_some()
+            || !state.native_receive.is_empty()
+            || state.private_receive.is_some()
+            || state.record_no_store.is_some()
+            || state.replay_receive.is_some()
+            || state.foreground_store.is_some()
+            || state.private_drain.is_some()
+            || self.zero_stream_waits.values().any(|w| w.call == call)
+        {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        let file = state.open_file.unwrap();
+        if self
+            .stream_operations
+            .values()
+            .any(|op| op.open_file == file)
+        {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        if let Some(held) = self.socket_controls.get(&file) {
+            if held.owner != owner
+                || held.lease != control
+                || !held.physical.can_release_unchanged()
+                || self.shadow_probes.contains_key(&control)
+            {
+                return Err(NetworkReplayError::UnresolvedStreamCall(call));
+            }
+            self.finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)?;
+        }
+        self.begin_stream_call_release(owner, call)?;
+        self.complete_stream_call_release(owner, call)
+    }
+
+    /// Claims terminal close after the runtime has observed the original
+    /// capture result. Competing owner-exit/completion workers cannot both win.
+    pub(crate) fn begin_abandoned_native_capture(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<bool, NetworkReplayError> {
+        let Some(state) = self.stream_calls.get(&call) else {
+            return Ok(false);
+        };
+        if state.owner != owner {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        if !state.abandoned || state.capture_control.is_none() || state.original.is_some() {
+            return Ok(false);
+        }
+        if state.phase == StreamCallPhase::PinReleaseSubmitted {
+            return Ok(false);
+        }
+        if !matches!(
+            state.phase,
+            StreamCallPhase::PinAcquireSubmitted | StreamCallPhase::Active
+        ) {
+            return Err(NetworkReplayError::UnresolvedStreamCall(call));
+        }
+        self.check_native_capture_retirement(owner, call)?;
+        self.stream_calls.get_mut(&call).unwrap().phase = StreamCallPhase::PinReleaseSubmitted;
+        Ok(true)
+    }
+
+    /// Only the run-owned worker calls this after its retained failed capture,
+    /// or after actual known release of its successfully acquired original pin.
+    pub(crate) fn finish_abandoned_native_capture(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<(), NetworkReplayError> {
+        let (open_file, control, publication) =
+            self.check_native_capture_retirement(owner, call)?;
+        if self.stream_calls[&call].phase != StreamCallPhase::PinReleaseSubmitted {
+            return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
+        }
+        self.release_stream_call_lifetime(owner, call, open_file)?;
+        if let Some(permit) = publication {
+            self.fd_publications.get_mut(&permit.files).unwrap().active = None;
+        }
+        self.stream_calls.remove(&call);
+        assert_eq!(
+            self.socket_controls.remove(&open_file).unwrap().lease,
+            control
+        );
+        self.complete_deferred_retirement(open_file);
+        if let Some(permit) = publication {
+            self.prune_dead_fd_publication(permit.files);
         }
         Ok(())
     }
@@ -595,7 +1249,7 @@ impl NetworkReplayEngine {
         if state.phase != StreamCallPhase::Active {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
-        Ok(state.open_file)
+        Ok(state.open_file.expect("validated stream call"))
     }
 
     /// Durable release intent precedes closing the recorder's owned physical
@@ -605,12 +1259,13 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy(call)?;
         self.check_accept_call_release(call)?;
         let state = self.owned_stream_call(owner, call)?;
         if state.phase != StreamCallPhase::Active {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
-        let open_file = state.open_file;
+        let open_file = state.open_file.expect("validated stream call");
         if let Some((id, _)) = self
             .zero_stream_waits
             .iter()
@@ -648,21 +1303,38 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
     ) -> Result<(), NetworkReplayError> {
+        self.complete_stream_call_release(owner, call)?
+            .into_result()
+    }
+
+    /// Unknown or unresolved engine custody returns no completion and cannot
+    /// authorize runtime acknowledgement. The completion's private fields are
+    /// constructed only after semantic Call removal below.
+    pub(crate) fn complete_stream_call_release(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> Result<CompletedStreamCallRelease, NetworkReplayError> {
+        self.require_no_helper_copy(call)?;
         let state = self.owned_stream_call(owner, call)?;
         if state.phase != StreamCallPhase::PinReleaseSubmitted {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
-        let open_file = state.open_file;
+        let open_file = state.open_file.expect("validated stream call");
         self.release_stream_call_lifetime(owner, call, open_file)?;
         self.stream_calls.remove(&call);
         self.complete_deferred_retirement(open_file);
-        Ok(())
+        Ok(CompletedStreamCallRelease {
+            owner,
+            call,
+            retirement: self.check_native_retirement(),
+        })
     }
 
     fn has_stream_references(&self, open_file: OpenFileId) -> bool {
         self.stream_calls
             .values()
-            .any(|call| call.open_file == open_file)
+            .any(|call| call.open_file == Some(open_file))
             || self.socket_controls.contains_key(&open_file)
             || self
                 .stream_operations
@@ -674,16 +1346,17 @@ impl NetworkReplayEngine {
         if !self.retired_open_files.contains(&open_file) || self.has_stream_references(open_file) {
             return None;
         }
-        self.epolls.remove(&open_file);
-        for interests in self.epolls.values_mut() {
-            interests.remove(&open_file);
+        let channel = self.bindings.get(&open_file).copied()?;
+        if self.retain_native_retirement(channel).is_err() {
+            // The first typed error is retained by NativeState. Actual exit and
+            // descriptor cleanup must continue, but custody and finalization
+            // remain fail-closed rather than claiming successful retirement.
+            return None;
         }
-        let channel = self.bindings.remove(&open_file);
-        if let Some(channel) = channel {
-            self.reverse_bindings.remove(&channel);
-            self.retired_channels.insert(channel);
-        }
-        channel
+        self.bindings.remove(&open_file);
+        self.reverse_bindings.remove(&channel);
+        self.retired_channels.insert(channel);
+        Some(channel)
     }
 
     /// Atomic availability/error decision for recv(0), separate from read(0).
@@ -858,7 +1531,7 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         open_files: Vec<OpenFileId>,
     ) -> Result<Vec<(OpenFileId, NetworkStreamLeaseId)>, NetworkReplayError> {
-        self.begin_socket_controls_inner(owner, open_files, None)
+        self.begin_socket_controls_inner(owner, open_files, None, false)
     }
 
     /// Reacquire only short exclusion for an already active syscall, even after
@@ -869,8 +1542,29 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
     ) -> Result<NetworkStreamLeaseId, NetworkReplayError> {
         let open_file = self.stream_call_open_file(owner, call)?;
-        let controls = self.begin_socket_controls_inner(owner, vec![open_file], Some(open_file))?;
+        let controls =
+            self.begin_socket_controls_inner(owner, vec![open_file], Some(open_file), false)?;
         Ok(controls[0].1)
+    }
+
+    /// Descriptor mutations use the same exclusion and lease owner for socket
+    /// and non-socket OFDs. Every requested identity must first be an actual
+    /// binding in this task's shared lifetime table; a bare ID cannot opt in.
+    fn begin_descriptor_controls(
+        &mut self,
+        owner: NetworkStreamOwner,
+        open_files: Vec<OpenFileId>,
+    ) -> Result<Vec<(OpenFileId, NetworkStreamLeaseId)>, NetworkReplayError> {
+        let task = TaskOwner {
+            tid: owner.thread,
+            mm: owner.mm,
+        };
+        for open_file in &open_files {
+            self.lifetime
+                .binding_for_open_file(task, *open_file)
+                .map_err(|error| NetworkReplayError::FdPublicationProtocol(error.to_string()))?;
+        }
+        self.begin_socket_controls_inner(owner, open_files, None, true)
     }
 
     fn begin_socket_controls_inner(
@@ -878,11 +1572,12 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         open_files: Vec<OpenFileId>,
         retired_call_file: Option<OpenFileId>,
+        descriptor_bindings_checked: bool,
     ) -> Result<Vec<(OpenFileId, NetworkStreamLeaseId)>, NetworkReplayError> {
         self.check_stream_owner(owner)?;
         let files: BTreeSet<_> = open_files.into_iter().collect();
         for open_file in &files {
-            if !open_file.is_socket() {
+            if !open_file.is_socket() && !descriptor_bindings_checked {
                 return Err(NetworkReplayError::NonSocketOpenFile(*open_file));
             }
             if self.retired_open_files.contains(open_file) && retired_call_file != Some(*open_file)
@@ -1023,7 +1718,18 @@ impl NetworkReplayEngine {
             self.retired_open_files.insert(open_file);
         }
         self.socket_controls.remove(&open_file);
+        for call in self.stream_calls.values_mut() {
+            if call.capture_control == Some(lease) {
+                call.capture_control = None;
+            }
+        }
         self.complete_deferred_retirement(open_file);
+        if matches!(disposition, NetworkSocketControlFinish::Closed { .. }) {
+            self.check_native_retirement()?;
+        }
+        // Unchanged-control release is also used while unwinding reader/table
+        // admission. Complete that cleanup even after a prior sticky failure;
+        // it grants no new native entry or successful trace finalization.
         Ok(())
     }
 }
@@ -1060,7 +1766,7 @@ struct ShadowReceiveState {
     namespace: Option<NetworkStreamNamespace>,
     profiles: BTreeMap<StreamSocketKeyV3, FreshStreamSocketProfileV3>,
     channel_classes: BTreeMap<NetworkChannelId, StreamSocketKeyV3>,
-    sockets: BTreeMap<OpenFileId, NetworkStreamSocketState>,
+    sockets: BTreeMap<OpenFileId, native_receive::Socket>,
     units: Vec<ReceiveCopyUnitV1>,
     accepted: Option<AcceptedRuntime>,
 }
@@ -1132,6 +1838,21 @@ impl NetworkReplayEngine {
         namespace: NetworkStreamNamespace,
         observed_profile: Option<FreshStreamSocketProfileV3>,
     ) -> Result<NetworkStreamSocketState, NetworkReplayError> {
+        if self.native_receive_version() && self.mode() == NetworkEngineMode::Record {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "V4 fresh socket facts require actual original installation".into(),
+            ));
+        }
+        self.register_stream_socket_profile(open_file, key, namespace, observed_profile)
+    }
+
+    fn register_stream_socket_profile(
+        &mut self,
+        open_file: OpenFileId,
+        key: StreamSocketKeyV3,
+        namespace: NetworkStreamNamespace,
+        observed_profile: Option<FreshStreamSocketProfileV3>,
+    ) -> Result<NetworkStreamSocketState, NetworkReplayError> {
         if !open_file.is_socket() {
             return Err(NetworkReplayError::NonSocketOpenFile(open_file));
         }
@@ -1142,8 +1863,8 @@ impl NetworkReplayEngine {
         if namespace.inode == 0 || shadow.namespace.is_some_and(|first| first != namespace) {
             return Err(NetworkReplayError::StreamNamespaceMismatch);
         }
-        let profile = match (&self.mode, observed_profile) {
-            (EngineState::Record(_), Some(profile)) => {
+        let profile = match (self.mode(), observed_profile) {
+            (NetworkEngineMode::Record, Some(profile)) => {
                 profile
                     .validate()
                     .map_err(|_| NetworkReplayError::StreamProfileMismatch(key))?;
@@ -1157,7 +1878,7 @@ impl NetworkReplayEngine {
                 }
                 profile
             }
-            (EngineState::Replay(_), None) => shadow
+            (NetworkEngineMode::Replay, None) => shadow
                 .profiles
                 .get(&key)
                 .cloned()
@@ -1176,16 +1897,19 @@ impl NetworkReplayEngine {
             normalization: profile.normalization,
             options: profile.initial.clone(),
             consume_epoch: 0,
-            send_timeout: shadow
-                .accepted
-                .as_ref()
-                .and_then(|accepted| accepted.fresh_send.get(&key).copied()),
+            send_timeout: match &self.mode {
+                EngineState::Native(native) => native.fresh_send(key),
+                _ => shadow
+                    .accepted
+                    .as_ref()
+                    .and_then(|accepted| accepted.fresh_send.get(&key).copied()),
+            },
             option_generation: 0,
         };
         if let Some(prior) = shadow.sockets.get(&open_file) {
             // Re-enrollment must never reset guest-mutated options or cursor.
-            return if *prior == state {
-                Ok(prior.clone())
+            return if prior.profile == state {
+                Ok(prior.profile.clone())
             } else {
                 Err(NetworkReplayError::StreamProfileMismatch(key))
             };
@@ -1193,7 +1917,9 @@ impl NetworkReplayEngine {
         let shadow = self.shadow.as_mut().expect("validated shadow state");
         shadow.namespace.get_or_insert(namespace);
         shadow.profiles.entry(key).or_insert(profile);
-        shadow.sockets.insert(open_file, state.clone());
+        shadow
+            .sockets
+            .insert(open_file, native_receive::Socket::new(state.clone()));
         Ok(state)
     }
 
@@ -1209,7 +1935,7 @@ impl NetworkReplayEngine {
             .shadow
             .as_ref()
             .and_then(|shadow| shadow.sockets.get(&open_file))
-            .cloned())
+            .map(|socket| socket.profile.clone()))
     }
 
     /// An admitted syscall's reference remains usable after final alias close.
@@ -1222,7 +1948,7 @@ impl NetworkReplayEngine {
         self.shadow
             .as_ref()
             .and_then(|shadow| shadow.sockets.get(&open_file))
-            .cloned()
+            .map(|socket| socket.profile.clone())
             .ok_or(NetworkReplayError::UnregisteredStreamSocket(open_file))
     }
 
@@ -1296,6 +2022,9 @@ impl NetworkReplayEngine {
     /// Finalize the explicitly selected frame; unresolved ownership always
     /// fails before the output envelope is constructed.
     pub fn into_recorded_versioned_trace(self) -> Result<NetworkTrace, NetworkReplayError> {
+        if self.native_receive_version() {
+            return self.into_native_recorded_trace().map(NetworkTrace::V4);
+        }
         self.check_stream_operations_finished()?;
         let EngineState::Record(history) = self.mode else {
             return Err(NetworkReplayError::WrongMode);
@@ -1806,6 +2535,7 @@ impl NetworkReplayEngine {
         lease: NetworkStreamLeaseId,
         effect: NetworkStreamPhysicalEffect,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         let probe = self.owned_shadow_probe(owner, lease)?;
         if probe.pending.is_some() {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
@@ -1864,6 +2594,7 @@ impl NetworkReplayEngine {
         lease: NetworkStreamLeaseId,
         result: NetworkStreamPhysicalResult,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         let mut next = self.owned_shadow_probe(owner, lease)?.clone();
         let effect = next
             .pending
@@ -1941,6 +2672,7 @@ impl NetworkReplayEngine {
         bytes: Vec<u8>,
         eof: bool,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         let probe = self.owned_shadow_probe(owner, lease)?.clone();
         if probe.pending.is_some() || !probe.cursor_restored() || now < probe.began {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
@@ -2122,6 +2854,8 @@ impl NetworkReplayEngine {
 #[derive(Debug, Clone)]
 struct ShadowDeliveryState {
     call: NetworkStreamCallId,
+    // Offset in the existing Call's immutable native Capture, never a queue unit.
+    private_offset: Option<usize>,
     selected_len: usize,
     cursor_before: Option<i32>,
     next_consume_epoch: u64,
@@ -2162,6 +2896,7 @@ impl NetworkReplayEngine {
         maximum: usize,
         peek_offset: usize,
     ) -> Result<NetworkStreamChunk, NetworkReplayError> {
+        self.require_no_helper_copy(call)?;
         let open_file = self.stream_call_open_file(owner, call)?;
         if maximum == 0 {
             return Err(NetworkReplayError::ZeroStreamReservation);
@@ -2193,6 +2928,7 @@ impl NetworkReplayEngine {
                 *lease,
                 ShadowDeliveryState {
                     call,
+                    private_offset: None,
                     selected_len: *selection_len,
                     cursor_before: socket.options.peek_offset,
                     next_consume_epoch,
@@ -2239,6 +2975,7 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         lease: NetworkStreamLeaseId,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         if self.mode() != NetworkEngineMode::Record {
             return Err(NetworkReplayError::WrongMode);
         }
@@ -2271,6 +3008,7 @@ impl NetworkReplayEngine {
         lease: NetworkStreamLeaseId,
         effect: NetworkStreamPhysicalEffect,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         if let NetworkStreamPhysicalEffect::SetSocketOption { option } = effect {
             return self.submit_socket_option(owner, lease, option);
         }
@@ -2319,6 +3057,7 @@ impl NetworkReplayEngine {
         lease: NetworkStreamLeaseId,
         result: NetworkStreamPhysicalResult,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         if let NetworkStreamPhysicalResult::SocketOption { result } = result {
             return self.confirm_socket_option(owner, lease, result);
         }
@@ -2378,6 +3117,7 @@ impl NetworkReplayEngine {
         disposition: NetworkStreamChunkDisposition,
         record_drain: bool,
     ) -> Result<(), NetworkReplayError> {
+        self.require_no_helper_copy_for_lease(owner, lease)?;
         let Some(state) = self.shadow_deliveries.get(&lease) else {
             return if record_drain {
                 Err(NetworkReplayError::StreamLeaseKindMismatch(lease))
@@ -2727,6 +3467,15 @@ impl NetworkReplayEngine {
 }
 
 impl NetworkReplayEngine {
+    /// Refuse unsupported versioned Record shutdown before either native path.
+    /// This only inspects the actual shared engine and grants no effect authority.
+    pub(crate) fn preflight_socket_shutdown(&self) -> Result<(), NetworkReplayError> {
+        if self.native_receive_version() && self.mode() == NetworkEngineMode::Record {
+            return Err(NetworkReplayError::WrongMode);
+        }
+        Ok(())
+    }
+
     fn validate_replay_shutdown(
         &self,
         open_file: OpenFileId,
@@ -2756,6 +3505,9 @@ impl NetworkReplayEngine {
         if !control.physical.can_release_unchanged() {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
+        // Also defend callers of Submit that bypass the Guest preflight. The
+        // unchanged control remains releasable after this read-only refusal.
+        self.preflight_socket_shutdown()?;
         let open_file = control.open_file;
         if self.mode() == NetworkEngineMode::Replay {
             self.validate_replay_shutdown(open_file, direction)?;
@@ -2810,6 +3562,10 @@ impl NetworkReplayEngine {
             EngineState::Replay(_) => {
                 self.validate_replay_shutdown(open_file, direction)?;
             }
+            EngineState::Native(native) if native.mode() == NetworkEngineMode::Replay => {
+                self.validate_replay_shutdown(open_file, direction)?;
+            }
+            EngineState::Native(_) => return Err(NetworkReplayError::WrongMode),
         }
         match &mut self.mode {
             EngineState::Record(trace) => {
@@ -2822,7 +3578,7 @@ impl NetworkReplayEngine {
                     },
                 });
             }
-            EngineState::Replay(_) => {
+            EngineState::Replay(_) | EngineState::Native(_) => {
                 self.channels
                     .get_mut(&channel)
                     .expect("validated channel")
@@ -2890,47 +3646,35 @@ pub struct NetworkReplayEngine {
     /// retired; fd/OFD reuse must never resurrect an old connection.
     retired_channels: BTreeSet<NetworkChannelId>,
     retired_open_files: BTreeSet<OpenFileId>,
-    ancillary_objects: BTreeMap<NetworkObjectId, AncillaryObjectState>,
-    ancillary_by_open_file: BTreeMap<OpenFileId, NetworkObjectId>,
-    retired_ancillary_objects: BTreeSet<NetworkObjectId>,
-    retired_ancillary_open_files: BTreeSet<OpenFileId>,
-    epolls: BTreeMap<OpenFileId, BTreeMap<OpenFileId, EpollInterestState>>,
-}
-
-#[derive(Debug)]
-struct AncillaryObjectState {
-    open_file: OpenFileId,
-    kind: NetworkAncillaryObjectKind,
-    alias_count: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct ReadinessGeneration {
-    readable: u64,
-    writable: u64,
-    error: u64,
-    hangup: u64,
-}
-
-#[derive(Debug)]
-struct EpollInterestState {
-    events: u32,
-    edge_triggered: bool,
-    one_shot: bool,
-    enabled: bool,
-    seen: ReadinessGeneration,
 }
 
 #[derive(Debug)]
 enum EngineState {
     Record(NetworkTraceV2),
     Replay(ReplayState),
+    Native(native_receive::NativeState),
 }
 
 #[derive(Debug)]
 struct ReplayState {
     trace: NetworkTraceV2,
     released: Vec<bool>,
+}
+
+/// A complete logical cut, selected without publishing any input. This is an
+/// internal engine plan, not evidence that a native receiver observed a send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedReplayRelease {
+    prior_released: Vec<bool>,
+    inputs: Vec<usize>,
+    children: BTreeMap<detcore_model::network_trace::ChildCreationIdV1, PreparedChildRelease>,
+    ready: BTreeSet<NetworkChannelId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedChildRelease {
+    listener: NetworkChannelId,
+    inherited: NetworkStreamSocketState,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2955,7 +3699,6 @@ struct ChannelState {
     local_control_generation: u64,
     peer_write_closed: bool,
     readiness: NetworkReadinessV2,
-    readiness_generation: ReadinessGeneration,
     /// Physical ingress frontier, independent of which reader consumed bytes.
     /// `None` also distinguishes legacy journal-only capture from publication.
     published_ingress: Option<PublishedIngress>,
@@ -3003,65 +3746,6 @@ enum OutboundOutcome {
         stream_offset: u64,
         direction: NetworkShutdownV2,
     },
-}
-
-impl EpollInterestState {
-    fn new(events: u32, generation: ReadinessGeneration, rearm: bool) -> Self {
-        let seen = if rearm {
-            ReadinessGeneration {
-                readable: generation.readable.saturating_sub(1),
-                writable: generation.writable.saturating_sub(1),
-                error: generation.error.saturating_sub(1),
-                hangup: generation.hangup.saturating_sub(1),
-            }
-        } else {
-            ReadinessGeneration::default()
-        };
-        Self {
-            events,
-            edge_triggered: events & libc::EPOLLET as u32 != 0,
-            one_shot: events & libc::EPOLLONESHOT as u32 != 0,
-            enabled: true,
-            seen,
-        }
-    }
-}
-
-fn epoll_events(readiness: NetworkReadinessV2, interest: u32) -> u32 {
-    let mut events = 0;
-    if readiness.readable && interest & libc::EPOLLIN as u32 != 0 {
-        events |= libc::EPOLLIN as u32;
-    }
-    if readiness.writable && interest & libc::EPOLLOUT as u32 != 0 {
-        events |= libc::EPOLLOUT as u32;
-    }
-    // Linux reports ERR/HUP whether or not the caller requested those bits.
-    if readiness.error {
-        events |= libc::EPOLLERR as u32;
-    }
-    if readiness.hangup {
-        events |= libc::EPOLLHUP as u32;
-        if interest & libc::EPOLLRDHUP as u32 != 0 {
-            events |= libc::EPOLLRDHUP as u32;
-        }
-    }
-    events
-}
-
-fn readiness_transitioned(
-    readiness: NetworkReadinessV2,
-    generation: ReadinessGeneration,
-    seen: ReadinessGeneration,
-    interest: u32,
-) -> bool {
-    (readiness.readable
-        && interest & libc::EPOLLIN as u32 != 0
-        && generation.readable > seen.readable)
-        || (readiness.writable
-            && interest & libc::EPOLLOUT as u32 != 0
-            && generation.writable > seen.writable)
-        || (readiness.error && generation.error > seen.error)
-        || (readiness.hangup && generation.hangup > seen.hangup)
 }
 
 /// Upgrade the fully validated V1 single-client envelope into the V2 shared
@@ -3435,11 +4119,6 @@ impl NetworkReplayEngine {
             reverse_bindings: BTreeMap::new(),
             retired_channels: BTreeSet::new(),
             retired_open_files: BTreeSet::new(),
-            ancillary_objects: BTreeMap::new(),
-            ancillary_by_open_file: BTreeMap::new(),
-            retired_ancillary_objects: BTreeSet::new(),
-            retired_ancillary_open_files: BTreeSet::new(),
-            epolls: BTreeMap::new(),
         }
     }
 
@@ -3486,11 +4165,6 @@ impl NetworkReplayEngine {
             reverse_bindings: BTreeMap::new(),
             retired_channels: BTreeSet::new(),
             retired_open_files: BTreeSet::new(),
-            ancillary_objects: BTreeMap::new(),
-            ancillary_by_open_file: BTreeMap::new(),
-            retired_ancillary_objects: BTreeSet::new(),
-            retired_ancillary_open_files: BTreeSet::new(),
-            epolls: BTreeMap::new(),
         })
     }
 
@@ -3502,6 +4176,7 @@ impl NetworkReplayEngine {
             NetworkTrace::V1(trace) => Self::replay(upgrade_v1_trace(trace)?),
             NetworkTrace::V2(trace) => Self::replay(trace),
             NetworkTrace::V3(trace) => Self::replay_shadow(trace),
+            NetworkTrace::V4(trace) => Self::replay_native_receive(trace),
         }
     }
 
@@ -3515,6 +4190,7 @@ impl NetworkReplayEngine {
             NetworkTrace::V1(trace) => trace.epoch,
             NetworkTrace::V2(trace) => trace.epoch,
             NetworkTrace::V3(trace) => trace.history.epoch,
+            NetworkTrace::V4(trace) => trace.epoch,
         };
         if actual_epoch != expected_epoch {
             return Err(NetworkReplayError::EpochMismatch {
@@ -3527,9 +4203,10 @@ impl NetworkReplayEngine {
 
     /// Current capture/replay mode.
     pub fn mode(&self) -> NetworkEngineMode {
-        match self.mode {
+        match &self.mode {
             EngineState::Record(_) => NetworkEngineMode::Record,
             EngineState::Replay(_) => NetworkEngineMode::Replay,
+            EngineState::Native(native) => native.mode(),
         }
     }
 
@@ -3538,24 +4215,21 @@ impl NetworkReplayEngine {
         match &self.mode {
             EngineState::Record(trace) => trace.epoch,
             EngineState::Replay(replay) => replay.trace.epoch,
+            EngineState::Native(native) => native.trace().epoch,
         }
     }
 
     /// Add one channel definition while recording.
     pub fn record_channel(&mut self, channel: NetworkChannelV2) -> Result<(), NetworkReplayError> {
-        let EngineState::Record(trace) = &mut self.mode else {
-            return Err(NetworkReplayError::WrongMode);
-        };
-        if trace
-            .channels
-            .iter()
-            .any(|existing| existing.id == channel.id)
-        {
+        let definitions = self.native_definitions_mut()?;
+        if definitions.iter().any(|existing| existing.id == channel.id) {
             return Err(NetworkReplayError::ChannelAlreadyExists(channel.id));
         }
         self.channels
             .insert(channel.id, ChannelState::new(&channel));
-        trace.channels.push(channel);
+        self.native_definitions_mut()
+            .expect("record mode validated before mutation")
+            .push(channel);
         Ok(())
     }
 
@@ -3774,11 +4448,25 @@ impl NetworkReplayEngine {
             return Err(NetworkReplayError::OpenFileRetired(open_file));
         }
         self.check_shadow_channel_request(open_file, &request)?;
-        match &self.mode {
-            EngineState::Record(_) if request.selected_channel.is_some() => {
+        if self.native_receive_version()
+            && !matches!(
+                (request.transport, request.role),
+                (
+                    NetworkTransportV2::Tcp,
+                    NetworkEndpointRoleV2::OutboundClient
+                ) | (
+                    NetworkTransportV2::Udp | NetworkTransportV2::UnixDatagram,
+                    NetworkEndpointRoleV2::Datagram
+                )
+            )
+        {
+            return Err(NetworkReplayError::WrongMode);
+        }
+        match self.mode() {
+            NetworkEngineMode::Record if request.selected_channel.is_some() => {
                 return Err(NetworkReplayError::InvalidChannelSelection);
             }
-            EngineState::Replay(_) => {
+            NetworkEngineMode::Replay => {
                 if request.observed_local_address.is_some() {
                     return Err(NetworkReplayError::ObservedLocalDuringReplay);
                 }
@@ -3788,7 +4476,7 @@ impl NetworkReplayEngine {
                     return Err(NetworkReplayError::InvalidChannelSelection);
                 }
             }
-            EngineState::Record(_) => {}
+            NetworkEngineMode::Record => {}
         }
 
         if let Some(channel) = self.channel_for(open_file) {
@@ -3808,8 +4496,8 @@ impl NetworkReplayEngine {
             return Ok(channel);
         }
 
-        match &self.mode {
-            EngineState::Record(trace) => {
+        match self.mode() {
+            NetworkEngineMode::Record => {
                 if request.requested_local_constraint.is_some()
                     && request.requested_local_constraint != request.observed_local_address
                 {
@@ -3837,15 +4525,15 @@ impl NetworkReplayEngine {
                 if definition.role == NetworkEndpointRoleV2::Accepted
                     && let Some(listener) = definition.accepted_from
                 {
-                    let parent = trace
-                        .channels
+                    let parent = self
+                        .channel_definitions()
                         .iter()
                         .find(|channel| channel.id == listener)
                         .ok_or(NetworkReplayError::UnknownChannel(listener))?;
                     definitions.push(parent.clone());
                 }
                 NetworkTraceV2 {
-                    epoch: trace.epoch,
+                    epoch: self.trace_epoch(),
                     channels: definitions,
                     inputs: Vec::new(),
                     outputs: Vec::new(),
@@ -3853,10 +4541,7 @@ impl NetworkReplayEngine {
                 .validate()?;
                 let runtime = ChannelState::new(&definition);
 
-                let EngineState::Record(trace) = &mut self.mode else {
-                    unreachable!()
-                };
-                trace.channels.push(definition);
+                self.native_definitions_mut()?.push(definition);
                 if let Some(shadow) = &mut self.shadow
                     && let Some(socket) = shadow.sockets.get(&open_file)
                 {
@@ -3868,11 +4553,10 @@ impl NetworkReplayEngine {
                 self.next_record_channel = next;
                 Ok(channel)
             }
-            EngineState::Replay(replay) => {
+            NetworkEngineMode::Replay => {
                 let definition = if let Some(selected) = request.selected_channel {
-                    let definition = replay
-                        .trace
-                        .channels
+                    let definition = self
+                        .channel_definitions()
                         .iter()
                         .find(|definition| definition.id == selected)
                         .ok_or(NetworkReplayError::UnknownChannel(selected))?;
@@ -3889,9 +4573,7 @@ impl NetworkReplayEngine {
                     }
                     definition
                 } else {
-                    replay
-                        .trace
-                        .channels
+                    self.channel_definitions()
                         .iter()
                         .find(|definition| {
                             !self.retired_channels.contains(&definition.id)
@@ -3956,234 +4638,6 @@ impl NetworkReplayEngine {
         self.bindings.get(&open_file).copied()
     }
 
-    /// Register or confirm one trace-stable ancillary object. Re-registering
-    /// the same identity is idempotent; remapping either side fails closed.
-    pub fn register_ancillary_object(
-        &mut self,
-        id: NetworkObjectId,
-        open_file: OpenFileId,
-        kind: NetworkAncillaryObjectKind,
-    ) -> Result<(), NetworkReplayError> {
-        if self.retired_ancillary_objects.contains(&id) {
-            return Err(NetworkReplayError::AncillaryObjectRetired(id));
-        }
-        if self.retired_ancillary_open_files.contains(&open_file) {
-            return Err(NetworkReplayError::AncillaryOpenFileRetired(open_file));
-        }
-        if let Some(existing) = self.ancillary_objects.get(&id) {
-            return if existing.open_file == open_file && existing.kind == kind {
-                Ok(())
-            } else {
-                Err(NetworkReplayError::AncillaryObjectRemap(id))
-            };
-        }
-        if self.ancillary_by_open_file.contains_key(&open_file) {
-            return Err(NetworkReplayError::AncillaryOpenFileAlreadyRegistered(
-                open_file,
-            ));
-        }
-        self.ancillary_objects.insert(
-            id,
-            AncillaryObjectState {
-                open_file,
-                kind,
-                alias_count: 0,
-            },
-        );
-        self.ancillary_by_open_file.insert(open_file, id);
-        Ok(())
-    }
-
-    /// Resolve an active ancillary object for SCM_RIGHTS installation.
-    pub fn ancillary_object(
-        &self,
-        id: NetworkObjectId,
-    ) -> Result<NetworkAncillaryObject, NetworkReplayError> {
-        if self.retired_ancillary_objects.contains(&id) {
-            return Err(NetworkReplayError::AncillaryObjectRetired(id));
-        }
-        let state = self
-            .ancillary_objects
-            .get(&id)
-            .ok_or(NetworkReplayError::UnknownAncillaryObject(id))?;
-        Ok(NetworkAncillaryObject {
-            id,
-            open_file: state.open_file,
-            kind: state.kind,
-            alias_count: state.alias_count,
-        })
-    }
-
-    /// Reverse-resolve an active trace object from an OFD.
-    pub fn ancillary_object_for_open_file(
-        &self,
-        open_file: OpenFileId,
-    ) -> Result<NetworkAncillaryObject, NetworkReplayError> {
-        let id = self
-            .ancillary_by_open_file
-            .get(&open_file)
-            .copied()
-            .ok_or(NetworkReplayError::UnknownAncillaryOpenFile(open_file))?;
-        self.ancillary_object(id)
-    }
-
-    /// Account for one newly installed fd alias and return its stable OFD.
-    pub fn retain_ancillary_alias(
-        &mut self,
-        id: NetworkObjectId,
-    ) -> Result<OpenFileId, NetworkReplayError> {
-        if self.retired_ancillary_objects.contains(&id) {
-            return Err(NetworkReplayError::AncillaryObjectRetired(id));
-        }
-        let state = self
-            .ancillary_objects
-            .get_mut(&id)
-            .ok_or(NetworkReplayError::UnknownAncillaryObject(id))?;
-        state.alias_count = state
-            .alias_count
-            .checked_add(1)
-            .ok_or(NetworkReplayError::Overflow)?;
-        Ok(state.open_file)
-    }
-
-    /// Account for one closed fd alias without retiring the trace object.
-    pub fn release_ancillary_alias(
-        &mut self,
-        id: NetworkObjectId,
-    ) -> Result<u64, NetworkReplayError> {
-        let state = self.ancillary_objects.get_mut(&id).ok_or_else(|| {
-            if self.retired_ancillary_objects.contains(&id) {
-                NetworkReplayError::AncillaryObjectRetired(id)
-            } else {
-                NetworkReplayError::UnknownAncillaryObject(id)
-            }
-        })?;
-        state.alias_count = state
-            .alias_count
-            .checked_sub(1)
-            .ok_or(NetworkReplayError::AncillaryAliasUnderflow(id))?;
-        Ok(state.alias_count)
-    }
-
-    /// Permanently retire an object after all installed aliases have closed.
-    pub fn retire_ancillary_object(
-        &mut self,
-        id: NetworkObjectId,
-    ) -> Result<OpenFileId, NetworkReplayError> {
-        if self.retired_ancillary_objects.contains(&id) {
-            return Err(NetworkReplayError::AncillaryObjectRetired(id));
-        }
-        let state = self
-            .ancillary_objects
-            .get(&id)
-            .ok_or(NetworkReplayError::UnknownAncillaryObject(id))?;
-        if state.alias_count != 0 {
-            return Err(NetworkReplayError::AncillaryAliasesRemain {
-                id,
-                count: state.alias_count,
-            });
-        }
-        let state = self.ancillary_objects.remove(&id).unwrap();
-        self.ancillary_by_open_file.remove(&state.open_file);
-        self.retired_ancillary_objects.insert(id);
-        self.retired_ancillary_open_files.insert(state.open_file);
-        Ok(state.open_file)
-    }
-
-    /// Register a network OFD with an epoll OFD (`EPOLL_CTL_ADD`).
-    pub fn epoll_add(
-        &mut self,
-        epoll: OpenFileId,
-        target: OpenFileId,
-        events: u32,
-    ) -> Result<(), NetworkReplayError> {
-        self.validate_epoll_registration(epoll, target, events)?;
-        let generation = self.readiness_state(target)?.1;
-        let interests = self.epolls.entry(epoll).or_default();
-        if interests.contains_key(&target) {
-            return Err(NetworkReplayError::EpollInterestAlreadyExists { epoll, target });
-        }
-        interests.insert(target, EpollInterestState::new(events, generation, false));
-        Ok(())
-    }
-
-    /// Replace an interest and rearm `EPOLLONESHOT` (`EPOLL_CTL_MOD`).
-    pub fn epoll_modify(
-        &mut self,
-        epoll: OpenFileId,
-        target: OpenFileId,
-        events: u32,
-    ) -> Result<(), NetworkReplayError> {
-        self.validate_epoll_registration(epoll, target, events)?;
-        let generation = self.readiness_state(target)?.1;
-        let interest = self
-            .epolls
-            .get_mut(&epoll)
-            .and_then(|interests| interests.get_mut(&target))
-            .ok_or(NetworkReplayError::UnknownEpollInterest { epoll, target })?;
-        *interest = EpollInterestState::new(events, generation, true);
-        Ok(())
-    }
-
-    /// Delete an interest (`EPOLL_CTL_DEL`).
-    pub fn epoll_delete(
-        &mut self,
-        epoll: OpenFileId,
-        target: OpenFileId,
-    ) -> Result<(), NetworkReplayError> {
-        let interests = self
-            .epolls
-            .get_mut(&epoll)
-            .ok_or(NetworkReplayError::UnknownEpollInterest { epoll, target })?;
-        if interests.remove(&target).is_none() {
-            return Err(NetworkReplayError::UnknownEpollInterest { epoll, target });
-        }
-        if interests.is_empty() {
-            self.epolls.remove(&epoll);
-        }
-        Ok(())
-    }
-
-    /// Return current events in deterministic target-OFD order.
-    pub fn epoll_ready(
-        &mut self,
-        epoll: OpenFileId,
-    ) -> Result<Vec<NetworkEpollEvent>, NetworkReplayError> {
-        let targets: Vec<_> = self
-            .epolls
-            .get(&epoll)
-            .ok_or(NetworkReplayError::UnknownEpollInstance(epoll))?
-            .keys()
-            .copied()
-            .collect();
-        let snapshots: BTreeMap<_, _> = targets
-            .into_iter()
-            .map(|target| self.readiness_state(target).map(|state| (target, state)))
-            .collect::<Result<_, _>>()?;
-        let interests = self.epolls.get_mut(&epoll).unwrap();
-        let mut ready = Vec::new();
-        for (target, interest) in interests {
-            if !interest.enabled {
-                continue;
-            }
-            let (readiness, generation) = snapshots[target];
-            let current = epoll_events(readiness, interest.events);
-            let transitioned = !interest.edge_triggered
-                || readiness_transitioned(readiness, generation, interest.seen, interest.events);
-            if current != 0 && transitioned {
-                ready.push(NetworkEpollEvent {
-                    target: *target,
-                    events: current,
-                });
-                interest.seen = generation;
-                if interest.one_shot {
-                    interest.enabled = false;
-                }
-            }
-        }
-        Ok(ready)
-    }
-
     /// Release every currently eligible external observation.
     ///
     /// Events on different channels do not block one another. Within a channel,
@@ -4192,50 +4646,95 @@ impl NetworkReplayEngine {
         &mut self,
         now: LogicalTime,
     ) -> Result<BTreeSet<NetworkChannelId>, NetworkReplayError> {
-        let mut ready = self.release_accepted_children(now)?;
-        let EngineState::Replay(replay_view) = &self.mode else {
+        if self.native_receive_version() {
+            return self.release_native_eligible(now);
+        }
+        let prepared = self.prepare_release_eligible(now)?;
+        self.confirm_release_eligible(prepared)
+    }
+
+    /// Compute the least closed eligible prefix at this exact logical time.
+    /// Accepted creation may enable an Accept input, and prior listener inputs
+    /// may enable a later creation. Iterate only those logical dependencies;
+    /// physical completion order is not an input to membership or ordering.
+    fn prepare_release_eligible(
+        &self,
+        now: LogicalTime,
+    ) -> Result<PreparedReplayRelease, NetworkReplayError> {
+        let EngineState::Replay(replay) = &self.mode else {
             return Err(NetworkReplayError::WrongMode);
         };
-        let accepted_ready: Vec<bool> = replay_view
-            .trace
-            .inputs
+        let mut released = replay.released.clone();
+        let mut children = BTreeMap::new();
+        let mut inputs = Vec::new();
+        loop {
+            let before = (inputs.len(), children.len());
+            self.prepare_accepted_children(now, &released, &mut children)?;
+            let mut blocked = BTreeSet::new();
+            for (index, event) in replay.trace.inputs.iter().enumerate() {
+                if released[index] || blocked.contains(&event.channel) {
+                    continue;
+                }
+                let channel = self
+                    .channels
+                    .get(&event.channel)
+                    .expect("validated channel");
+                if !self.prepared_accepted_input_ready(event.channel, &event.event, &children)
+                    || !event.release.is_eligible(now, channel.transmitted)
+                {
+                    blocked.insert(event.channel);
+                    continue;
+                }
+                released[index] = true;
+                inputs.push(index);
+            }
+            if (inputs.len(), children.len()) == before {
+                break;
+            }
+        }
+        // Keep the original release traversal order, including a later pass
+        // enabled by accepted creation. Do not replace it with host arrival
+        // order or reorder a logical dependency by sorting its ordinal.
+        let mut ready: BTreeSet<_> = inputs
             .iter()
-            .map(|input| self.accepted_input_ready(input.channel, &input.event))
+            .map(|index| replay.trace.inputs[*index].channel)
             .collect();
+        ready.extend(children.values().map(|child| child.listener));
+        Ok(PreparedReplayRelease {
+            prior_released: replay.released.clone(),
+            inputs,
+            children,
+            ready,
+        })
+    }
+
+    /// Publish one already-selected cut, without reselecting against a newer
+    /// clock or transmit frontier. This currently completes synchronously under
+    /// the engine lock; it does not manufacture a native-publication receipt.
+    fn confirm_release_eligible(
+        &mut self,
+        prepared: PreparedReplayRelease,
+    ) -> Result<BTreeSet<NetworkChannelId>, NetworkReplayError> {
+        let EngineState::Replay(replay) = &self.mode else {
+            return Err(NetworkReplayError::WrongMode);
+        };
+        if replay.released != prepared.prior_released {
+            return Err(NetworkReplayError::ReplayReleaseChanged);
+        }
+        self.validate_prepared_children(&prepared.children)?;
+        self.commit_prepared_children(prepared.children);
         let EngineState::Replay(replay) = &mut self.mode else {
             unreachable!()
         };
-        let mut blocked = BTreeSet::new();
-        for index in 0..replay.trace.inputs.len() {
-            if replay.released[index] {
-                continue;
-            }
-            let event = &replay.trace.inputs[index];
-            if blocked.contains(&event.channel) {
-                continue;
-            }
-            let channel = self
-                .channels
-                .get(&event.channel)
-                .expect("validated channel");
-            if !accepted_ready[index] || !event.release.is_eligible(now, channel.transmitted) {
-                blocked.insert(event.channel);
-                continue;
-            }
-            let event = event.clone();
+        for index in prepared.inputs {
+            let event = replay.trace.inputs[index].clone();
             self.channels
                 .get_mut(&event.channel)
                 .expect("validated channel")
                 .release_at(event.ordinal, event.event);
             replay.released[index] = true;
-            ready.insert(event.channel);
         }
-        let children = self.release_accepted_children(now)?;
-        if !children.is_empty() {
-            ready.extend(children);
-            ready.extend(self.release_eligible(now)?);
-        }
-        Ok(ready)
+        Ok(prepared.ready)
     }
 
     /// Earliest finite release time whose per-channel transmit watermark is met.
@@ -4243,6 +4742,9 @@ impl NetworkReplayEngine {
     /// The scheduler may advance its existing continuous clock to this exact
     /// time; this function never rounds, resets, or mutates time itself.
     pub fn next_release_time(&self) -> Result<Option<LogicalTime>, NetworkReplayError> {
+        if self.native_receive_version() {
+            return self.next_native_release_time();
+        }
         let EngineState::Replay(replay) = &self.mode else {
             return Err(NetworkReplayError::WrongMode);
         };
@@ -4844,6 +5346,7 @@ impl NetworkReplayEngine {
             unreachable!()
         };
         state.refresh_readiness();
+        self.native_connection_delivered(channel, &outcome);
         Ok(Some(outcome))
     }
 
@@ -4885,8 +5388,10 @@ impl NetworkReplayEngine {
     /// Prove that replay consumed every required input and validated every
     /// output. Any remainder is a fail-closed mismatch.
     pub fn finish(&self) -> Result<(), NetworkReplayError> {
-        self.finish_fd_mutations()?;
         self.check_stream_operations_finished()?;
+        if self.native_receive_version() {
+            return self.finish_native_replay();
+        }
         let EngineState::Replay(replay) = &self.mode else {
             return Err(NetworkReplayError::WrongMode);
         };
@@ -4904,7 +5409,7 @@ impl NetworkReplayEngine {
     fn has_channel(&self, channel: NetworkChannelId) -> bool {
         match &self.mode {
             EngineState::Record(trace) => trace.channels.iter().any(|item| item.id == channel),
-            EngineState::Replay(_) => self.channels.contains_key(&channel),
+            EngineState::Replay(_) | EngineState::Native(_) => self.channels.contains_key(&channel),
         }
     }
 
@@ -4912,6 +5417,7 @@ impl NetworkReplayEngine {
         match &self.mode {
             EngineState::Record(trace) => &trace.channels,
             EngineState::Replay(replay) => &replay.trace.channels,
+            EngineState::Native(native) => &native.trace().channels,
         }
     }
 
@@ -4920,44 +5426,6 @@ impl NetworkReplayEngine {
             .get(&open_file)
             .copied()
             .ok_or(NetworkReplayError::UnboundOpenFile(open_file))
-    }
-
-    fn readiness_state(
-        &self,
-        open_file: OpenFileId,
-    ) -> Result<(NetworkReadinessV2, ReadinessGeneration), NetworkReplayError> {
-        let channel = self.bound_channel(open_file)?;
-        let state = self.runtime_channel(channel)?;
-        Ok((state.readiness, state.readiness_generation))
-    }
-
-    fn validate_epoll_registration(
-        &self,
-        epoll: OpenFileId,
-        target: OpenFileId,
-        events: u32,
-    ) -> Result<(), NetworkReplayError> {
-        if epoll == target {
-            return Err(NetworkReplayError::EpollSelfRegistration(epoll));
-        }
-        let exclusive = libc::EPOLLEXCLUSIVE as u32;
-        if events & exclusive != 0 {
-            return Err(NetworkReplayError::UnsupportedEpollFlags(exclusive));
-        }
-        let supported = (libc::EPOLLIN
-            | libc::EPOLLOUT
-            | libc::EPOLLERR
-            | libc::EPOLLHUP
-            | libc::EPOLLRDHUP
-            | libc::EPOLLET
-            | libc::EPOLLONESHOT) as u32;
-        if events & !supported != 0 {
-            return Err(NetworkReplayError::UnsupportedEpollFlags(
-                events & !supported,
-            ));
-        }
-        self.readiness_state(target)?;
-        Ok(())
     }
 
     fn runtime_channel(
@@ -4982,7 +5450,7 @@ impl NetworkReplayEngine {
         &mut self,
         channel: NetworkChannelId,
     ) -> Result<&mut ChannelState, NetworkReplayError> {
-        if !matches!(self.mode, EngineState::Replay(_)) {
+        if self.mode() != NetworkEngineMode::Replay {
             return Err(NetworkReplayError::WrongMode);
         }
         self.runtime_channel_mut(channel)
@@ -5004,7 +5472,6 @@ impl ChannelState {
             local_control_generation: 0,
             peer_write_closed: false,
             readiness: NetworkReadinessV2::default(),
-            readiness_generation: ReadinessGeneration::default(),
             published_ingress: None,
         }
     }
@@ -5024,13 +5491,17 @@ impl ChannelState {
     }
 
     fn computed_readiness(&self) -> NetworkReadinessV2 {
+        self.computed_readiness_with_front(self.inbound.front())
+    }
+
+    fn computed_readiness_with_front(&self, front: Option<&InboundOutcome>) -> NetworkReadinessV2 {
         let mut readiness = self.explicit_readiness;
-        readiness.readable |= !self.inbound.is_empty() || self.peer_write_closed;
+        readiness.readable |= front.is_some() || self.peer_write_closed;
         readiness.writable |= !self.local_write_closed && !self.outbound.is_empty();
-        readiness.error |= matches!(self.inbound.front(), Some(InboundOutcome::Error { .. }));
+        readiness.error |= matches!(front, Some(InboundOutcome::Error { .. }));
         readiness.hangup |= self.peer_write_closed
             || matches!(
-                self.inbound.front(),
+                front,
                 Some(InboundOutcome::PeerShutdown {
                     direction: NetworkShutdownV2::Write | NetworkShutdownV2::Both,
                     ..
@@ -5041,18 +5512,6 @@ impl ChannelState {
 
     fn refresh_readiness(&mut self) {
         let next = self.computed_readiness();
-        if !self.readiness.readable && next.readable {
-            self.readiness_generation.readable += 1;
-        }
-        if !self.readiness.writable && next.writable {
-            self.readiness_generation.writable += 1;
-        }
-        if !self.readiness.error && next.error {
-            self.readiness_generation.error += 1;
-        }
-        if !self.readiness.hangup && next.hangup {
-            self.readiness_generation.hangup += 1;
-        }
         self.readiness = next;
     }
 
@@ -5683,6 +6142,13 @@ impl NetworkReplayEngine {
             return Err(NetworkReplayError::StreamChunkTooLarge(maximum));
         }
         let operation = self.owned_stream_operation(owner, lease)?;
+        if self
+            .shadow_deliveries
+            .get(&lease)
+            .is_some_and(|delivery| delivery.private_offset.is_some())
+        {
+            return self.read_private_receive_view(owner, lease, offset, maximum);
+        }
         let StreamOperationKind::Delivery {
             at_offset,
             peek_offset,
@@ -5748,6 +6214,16 @@ impl NetworkReplayEngine {
         disposition: NetworkStreamChunkDisposition,
         record_drain: bool,
     ) -> Result<(), NetworkReplayError> {
+        if self.stream_calls.values().any(|state| {
+            state
+                .replay_receive
+                .as_ref()
+                .is_some_and(|source| source.lease() == lease)
+        }) {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "native Replay lease requires its actual foreground store commit".into(),
+            ));
+        }
         self.validate_shadow_delivery_finish(owner, lease, disposition, record_drain)?;
         let operation = self.owned_stream_operation(owner, lease)?.clone();
         let StreamOperationKind::Delivery {
@@ -5920,6 +6396,13 @@ impl NetworkReplayEngine {
     }
 
     fn check_stream_operations_finished(&self) -> Result<(), NetworkReplayError> {
+        self.check_native_retirement()?;
+        // Replay keeps its FD-first diagnostics; Record preserves its existing
+        // accepted/stream diagnostics before checking pure descriptor custody.
+        let fd_first = self.mode() == NetworkEngineMode::Replay;
+        if fd_first {
+            self.finish_fd_mutations()?;
+        }
         self.check_accepted_finished()?;
         if let Some(id) = self.zero_stream_waits.keys().next() {
             return Err(NetworkReplayError::UnresolvedZeroStreamWait(*id));
@@ -5933,6 +6416,9 @@ impl NetworkReplayEngine {
         if let Some(lease) = self.stream_operations.keys().next() {
             return Err(NetworkReplayError::UnresolvedStreamOperation(*lease));
         }
+        if !fd_first {
+            self.finish_fd_mutations()?;
+        }
         Ok(())
     }
 }
@@ -5940,6 +6426,16 @@ impl NetworkReplayEngine {
 /// Fail-closed network capture/replay error.
 #[derive(Debug)]
 pub enum NetworkReplayError {
+    /// Physical cleanup completed, but the V4 retirement journal was invalid.
+    /// The first failure remains authoritative until this engine is discarded.
+    NativeRetirement {
+        /// Channel whose final binding remains retained for diagnosis.
+        channel: NetworkChannelId,
+        /// Exact validation failure that prevented the retirement commit.
+        error: NetworkTraceValidationErrorV4,
+    },
+    /// A different logical release committed after this plan was selected.
+    ReplayReleaseChanged,
     /// A creation/provider/descriptor fact did not match the exact operation.
     InvalidAcceptedReceipt,
     /// No such durable accept receipt exists.
@@ -6054,49 +6550,10 @@ pub enum NetworkReplayError {
     OperationOrderMismatch(NetworkChannelId),
     /// Ancillary objects require the normalized sendmsg/recvmsg path.
     AncillaryRequiresMessageIo(NetworkChannelId),
-    /// Trace object identity was never registered.
-    UnknownAncillaryObject(NetworkObjectId),
-    /// OFD has no trace object identity.
-    UnknownAncillaryOpenFile(OpenFileId),
-    /// Retired trace object identity cannot be reused.
-    AncillaryObjectRetired(NetworkObjectId),
-    /// Existing trace object cannot be remapped to another OFD or kind.
-    AncillaryObjectRemap(NetworkObjectId),
-    /// One OFD cannot have two trace object identities.
-    AncillaryOpenFileAlreadyRegistered(OpenFileId),
-    /// A retired OFD identity cannot be assigned to a new trace object.
-    AncillaryOpenFileRetired(OpenFileId),
-    /// An alias release had no matching retain.
-    AncillaryAliasUnderflow(NetworkObjectId),
-    /// Object retirement requires every installed alias to be closed.
-    AncillaryAliasesRemain {
-        /// Trace object identity.
-        id: NetworkObjectId,
-        /// Installed alias count.
-        count: u64,
-    },
     /// Edge-triggered or one-shot readiness requires adapter-owned interest state.
     UnsupportedReadinessMode,
     /// Epoll flags are not modeled and therefore cannot be replayed safely.
     UnsupportedEpollFlags(u32),
-    /// An epoll OFD cannot watch itself.
-    EpollSelfRegistration(OpenFileId),
-    /// `EPOLL_CTL_ADD` found an existing target registration.
-    EpollInterestAlreadyExists {
-        /// Epoll open-file description.
-        epoll: OpenFileId,
-        /// Watched open-file description.
-        target: OpenFileId,
-    },
-    /// `EPOLL_CTL_MOD`/`DEL` found no target registration.
-    UnknownEpollInterest {
-        /// Epoll open-file description.
-        epoll: OpenFileId,
-        /// Watched open-file description.
-        target: OpenFileId,
-    },
-    /// Epoll OFD has no registered interest set.
-    UnknownEpollInstance(OpenFileId),
     /// Receive flags outside the normalized modeled subset.
     UnsupportedReceiveFlags(i32),
     /// Guest output bytes or datagram metadata differ.
@@ -6225,6 +6682,100 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn release_preparation_is_pure_and_commit_keeps_selected_transmit_frontier() {
+        let mut engine = NetworkReplayEngine::replay(trace()).unwrap();
+        let ofd = open_file(0);
+        engine.bind(ofd, channel_id()).unwrap();
+        assert!(
+            engine
+                .prepare_release_eligible(time(100))
+                .unwrap()
+                .inputs
+                .is_empty()
+        );
+        assert_eq!(
+            engine.transmit_stream(ofd, b"req").unwrap(),
+            StreamTransmitOutcome::Accepted(3)
+        );
+        assert!(
+            engine
+                .prepare_release_eligible(time(9))
+                .unwrap()
+                .inputs
+                .is_empty()
+        );
+        let before = format!("{engine:?}");
+        let prepared = engine.prepare_release_eligible(time(20)).unwrap();
+        assert_eq!(prepared.inputs, vec![0]);
+        assert_eq!(format!("{engine:?}"), before);
+        assert_eq!(
+            engine.receive_stream(ofd, 32, true).unwrap(),
+            StreamReceiveOutcome::WouldBlock
+        );
+
+        // Progress after selection cannot pull another input into this cut.
+        // Production still selects and commits under one engine lock; this
+        // boundary control exercises the factored state transition directly.
+        assert_eq!(
+            engine.transmit_stream(ofd, b"uest").unwrap(),
+            StreamTransmitOutcome::Accepted(4)
+        );
+        engine.confirm_release_eligible(prepared).unwrap();
+        assert_eq!(
+            engine.receive_stream(ofd, 32, true).unwrap(),
+            StreamReceiveOutcome::Bytes(b"response".to_vec())
+        );
+        assert_eq!(
+            engine.receive_stream(ofd, 32, true).unwrap(),
+            StreamReceiveOutcome::WouldBlock
+        );
+        engine.release_eligible(time(20)).unwrap();
+        assert_eq!(
+            engine.receive_stream(ofd, 32, true).unwrap(),
+            StreamReceiveOutcome::EndOfFile
+        );
+        engine.finish().unwrap();
+    }
+
+    #[test]
+    fn release_preparation_keeps_unbound_independent_input_and_rejects_duplicate_commit() {
+        let mut history = trace();
+        let mut other = channel();
+        other.id = NetworkChannelId(2);
+        history.channels.push(other.clone());
+        history.inputs.push(NetworkInputEventV2 {
+            ordinal: 2,
+            channel: other.id,
+            release: NetworkReleaseV2 {
+                not_before_global_time: time(1),
+                after_transmitted_offset: 0,
+            },
+            event: NetworkInputKindV2::StreamBytes {
+                stream_offset: 0,
+                bytes: b"independent".to_vec(),
+            },
+        });
+        let mut engine = NetworkReplayEngine::replay(history).unwrap();
+        let prepared = engine.prepare_release_eligible(time(20)).unwrap();
+        assert_eq!(prepared.inputs, vec![2]);
+        assert_eq!(prepared.ready, BTreeSet::from([other.id]));
+        let duplicate = prepared.clone();
+        engine.confirm_release_eligible(prepared).unwrap();
+        let before = format!("{engine:?}");
+        assert!(matches!(
+            engine.confirm_release_eligible(duplicate),
+            Err(NetworkReplayError::ReplayReleaseChanged)
+        ));
+        assert_eq!(format!("{engine:?}"), before);
+        let ofd = open_file(2);
+        engine.bind(ofd, other.id).unwrap();
+        assert_eq!(
+            engine.receive_stream(ofd, 32, true).unwrap(),
+            StreamReceiveOutcome::Bytes(b"independent".to_vec())
+        );
     }
 
     fn endpoint_binding(peer: NetworkAddressV2) -> NetworkChannelBinding {
@@ -7197,9 +7748,11 @@ mod tests {
                 } else {
                     engine.transmit_datagram_exact(ofd, &packet)
                 };
-                assert!(matches!(wrong_kind,
+                assert!(matches!(
+                    wrong_kind,
                     Err(NetworkReplayError::OutboundMismatch { .. }
-                        | NetworkReplayError::OperationOrderMismatch(_))));
+                        | NetworkReplayError::OperationOrderMismatch(_))
+                ));
                 assert_eq!(format!("{engine:?}"), pending);
                 for mismatch in 0..if exact { 6 } else { 5 } {
                     let mut wrong = packet.clone();
@@ -7208,9 +7761,13 @@ mod tests {
                         1 => wrong.datagram.sequence = 1,
                         2 => wrong.datagram.source = None,
                         3 => wrong.datagram.message_flags = libc::MSG_TRUNC,
-                        4 => wrong.datagram.ancillary = Some(NetworkAncillaryDataV2 {
-                            bytes: vec![1, 2, 3, 4], objects: vec![], truncated: false,
-                        }),
+                        4 => {
+                            wrong.datagram.ancillary = Some(NetworkAncillaryDataV2 {
+                                bytes: vec![1, 2, 3, 4],
+                                objects: vec![],
+                                truncated: false,
+                            })
+                        }
                         5 => wrong.source_length = Some(8),
                         _ => unreachable!(),
                     }
@@ -7219,14 +7776,55 @@ mod tests {
                     } else {
                         engine.transmit_datagram(ofd, &wrong.datagram)
                     };
-                    assert!(matches!(result, Err(NetworkReplayError::OutboundMismatch { .. })));
+                    assert!(matches!(
+                        result,
+                        Err(NetworkReplayError::OutboundMismatch { .. })
+                    ));
                     assert_eq!(format!("{engine:?}"), pending);
-                    assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+                    assert!(matches!(
+                        engine.finish(),
+                        Err(NetworkReplayError::UnconsumedChannel(_))
+                    ));
                 }
-                if exact { engine.transmit_datagram_exact(ofd, &packet).unwrap(); }
-                else { engine.transmit_datagram(ofd, &packet.datagram).unwrap(); }
+                if exact {
+                    engine.transmit_datagram_exact(ofd, &packet).unwrap();
+                } else {
+                    engine.transmit_datagram(ofd, &packet.datagram).unwrap();
+                }
                 engine.finish().unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn shutdown_preflight_actual_engine_modes_are_read_only() {
+        let v2 = NetworkReplayEngine::record(epoch())
+            .into_recorded_trace()
+            .unwrap();
+        let v3 = NetworkReplayEngine::record_shadow(epoch())
+            .into_recorded_versioned_trace()
+            .unwrap();
+        let engines = [
+            (NetworkReplayEngine::record(epoch()), false),
+            (NetworkReplayEngine::replay(v2).unwrap(), false),
+            (NetworkReplayEngine::record_shadow(epoch()), false),
+            (NetworkReplayEngine::replay_versioned(v3).unwrap(), false),
+            (NetworkReplayEngine::record_native_receive(epoch()), true),
+            (
+                NetworkReplayEngine::replay_native_receive(
+                    NetworkReplayEngine::controlled_replay_two_row_trace(),
+                )
+                .unwrap(),
+                false,
+            ),
+        ];
+        for (engine, refuse) in engines {
+            let before = format!("{engine:?}");
+            assert!(matches!(
+                (engine.preflight_socket_shutdown(), refuse),
+                (Err(NetworkReplayError::WrongMode), true) | (Ok(()), false)
+            ));
+            assert_eq!(format!("{engine:?}"), before);
         }
     }
 
@@ -7237,23 +7835,38 @@ mod tests {
         input.outputs.push(NetworkOutputEventV2 {
             channel: channel_id(),
             event: NetworkOutputKindV2::Shutdown {
-                stream_offset: 7, direction: NetworkShutdownV2::Write,
+                stream_offset: 7,
+                direction: NetworkShutdownV2::Write,
             },
         });
         let mut engine = NetworkReplayEngine::replay(input).unwrap();
         let ofd = open_file(0);
         engine.bind(ofd, channel_id()).unwrap();
         let before_bytes = format!("{engine:?}");
-        assert!(matches!(engine.shutdown(ofd, NetworkShutdownV2::Write),
-            Err(NetworkReplayError::UnexpectedShutdown(_))));
+        assert!(matches!(
+            engine.shutdown(ofd, NetworkShutdownV2::Write),
+            Err(NetworkReplayError::UnexpectedShutdown(_))
+        ));
         assert_eq!(format!("{engine:?}"), before_bytes);
-        assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
-        assert_eq!(engine.transmit_stream(ofd, b"request").unwrap(), StreamTransmitOutcome::Accepted(7));
+        assert!(matches!(
+            engine.finish(),
+            Err(NetworkReplayError::UnconsumedChannel(_))
+        ));
+        assert_eq!(
+            engine.transmit_stream(ofd, b"request").unwrap(),
+            StreamTransmitOutcome::Accepted(7)
+        );
         let before_shutdown = format!("{engine:?}");
         for wrong in [NetworkShutdownV2::Read, NetworkShutdownV2::Both] {
-            assert!(matches!(engine.shutdown(ofd, wrong), Err(NetworkReplayError::UnexpectedShutdown(_))));
+            assert!(matches!(
+                engine.shutdown(ofd, wrong),
+                Err(NetworkReplayError::UnexpectedShutdown(_))
+            ));
             assert_eq!(format!("{engine:?}"), before_shutdown);
-            assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+            assert!(matches!(
+                engine.finish(),
+                Err(NetworkReplayError::UnconsumedChannel(_))
+            ));
         }
         engine.shutdown(ofd, NetworkShutdownV2::Write).unwrap();
         engine.finish().unwrap();
@@ -7387,38 +8000,68 @@ mod tests {
 
     #[test]
     fn stream_zero_send_preserves_required_ancillary_until_nonempty_output() {
-        let ancillary = NetworkAncillaryDataV2 { bytes: vec![0; 4],
+        let ancillary = NetworkAncillaryDataV2 {
+            bytes: vec![0; 4],
             objects: vec![detcore_model::network_trace::NetworkAncillaryObjectRefV2 {
                 byte_offset: 0,
                 object: detcore_model::network_trace::NetworkAncillaryObjectV2::FileDescriptor {
                     object: detcore_model::network_trace::NetworkObjectId(7),
                 },
-            }], truncated: false };
-        let mut history = trace(); history.inputs.clear();
+            }],
+            truncated: false,
+        };
+        let mut history = trace();
+        history.inputs.clear();
         history.channels[0].transport = NetworkTransportV2::UnixStream;
         history.channels[0].local_address = None;
-        history.channels[0].peer_address = Some(NetworkAddressV2::UnixAbstract(b"ancillary".to_vec()));
-        history.outputs = vec![NetworkOutputEventV2 { channel: channel_id(),
-            event: NetworkOutputKindV2::StreamMessage { stream_offset: 0, bytes: b"fd".to_vec(),
-                ancillary: ancillary.clone(), message_flags: 0 } }];
+        history.channels[0].peer_address =
+            Some(NetworkAddressV2::UnixAbstract(b"ancillary".to_vec()));
+        history.outputs = vec![NetworkOutputEventV2 {
+            channel: channel_id(),
+            event: NetworkOutputKindV2::StreamMessage {
+                stream_offset: 0,
+                bytes: b"fd".to_vec(),
+                ancillary: ancillary.clone(),
+                message_flags: 0,
+            },
+        }];
         let mut engine = NetworkReplayEngine::replay(history).unwrap();
-        let ofd = open_file(0); engine.bind(ofd, channel_id()).unwrap();
+        let ofd = open_file(0);
+        engine.bind(ofd, channel_id()).unwrap();
         let pending = format!("{engine:?}");
         for _ in 0..3 {
-            assert_eq!(engine.transmit_stream_message(ofd, b"", &ancillary, 0).unwrap(),
-                StreamTransmitOutcome::Accepted(0));
+            assert_eq!(
+                engine
+                    .transmit_stream_message(ofd, b"", &ancillary, 0)
+                    .unwrap(),
+                StreamTransmitOutcome::Accepted(0)
+            );
             assert_eq!(format!("{engine:?}"), pending);
-            assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+            assert!(matches!(
+                engine.finish(),
+                Err(NetworkReplayError::UnconsumedChannel(_))
+            ));
         }
-        assert!(matches!(engine.transmit_stream(ofd, b"fd"),
-            Err(NetworkReplayError::AncillaryRequiresMessageIo(_))));
+        assert!(matches!(
+            engine.transmit_stream(ofd, b"fd"),
+            Err(NetworkReplayError::AncillaryRequiresMessageIo(_))
+        ));
         assert_eq!(format!("{engine:?}"), pending);
-        assert!(matches!(engine.transmit_stream_message(ofd, b"wrong", &ancillary, 0),
-            Err(NetworkReplayError::OutboundMismatch { .. })));
+        assert!(matches!(
+            engine.transmit_stream_message(ofd, b"wrong", &ancillary, 0),
+            Err(NetworkReplayError::OutboundMismatch { .. })
+        ));
         assert_eq!(format!("{engine:?}"), pending);
-        assert_eq!(engine.transmit_stream_message(ofd, b"f", &ancillary, 0).unwrap(),
-            StreamTransmitOutcome::Accepted(1));
-        assert_eq!(engine.transmit_stream(ofd, b"d").unwrap(), StreamTransmitOutcome::Accepted(1));
+        assert_eq!(
+            engine
+                .transmit_stream_message(ofd, b"f", &ancillary, 0)
+                .unwrap(),
+            StreamTransmitOutcome::Accepted(1)
+        );
+        assert_eq!(
+            engine.transmit_stream(ofd, b"d").unwrap(),
+            StreamTransmitOutcome::Accepted(1)
+        );
         engine.finish().unwrap();
     }
 
@@ -7428,7 +8071,9 @@ mod tests {
         // fixture frontier, without allocating a u64-sized trace.
         for message in [false, true] {
             let ancillary = NetworkAncillaryDataV2 {
-                bytes: vec![0; 4], objects: vec![], truncated: false,
+                bytes: vec![0; 4],
+                objects: vec![],
+                truncated: false,
             };
             let mut history = trace();
             history.inputs.clear();
@@ -7436,12 +8081,15 @@ mod tests {
                 channel: channel_id(),
                 event: if message {
                     NetworkOutputKindV2::StreamMessage {
-                        stream_offset: 0, bytes: b"ab".to_vec(),
-                        ancillary: ancillary.clone(), message_flags: 0,
+                        stream_offset: 0,
+                        bytes: b"ab".to_vec(),
+                        ancillary: ancillary.clone(),
+                        message_flags: 0,
                     }
                 } else {
                     NetworkOutputKindV2::StreamBytes {
-                        stream_offset: 0, bytes: b"ab".to_vec(),
+                        stream_offset: 0,
+                        bytes: b"ab".to_vec(),
                     }
                 },
             }];
@@ -7458,7 +8106,10 @@ mod tests {
                 };
                 assert!(matches!(result, Err(NetworkReplayError::Overflow)));
                 assert_eq!(format!("{engine:?}"), pending);
-                assert!(matches!(engine.finish(), Err(NetworkReplayError::UnconsumedChannel(_))));
+                assert!(matches!(
+                    engine.finish(),
+                    Err(NetworkReplayError::UnconsumedChannel(_))
+                ));
             }
             // Clearing only the injected frontier must leave the original
             // bytes and ancillary available to complete exactly once.
@@ -7469,41 +8120,64 @@ mod tests {
                 engine.transmit_stream(ofd, b"a")
             };
             assert_eq!(result.unwrap(), StreamTransmitOutcome::Accepted(1));
-            assert_eq!(engine.transmit_stream(ofd, b"b").unwrap(), StreamTransmitOutcome::Accepted(1));
+            assert_eq!(
+                engine.transmit_stream(ofd, b"b").unwrap(),
+                StreamTransmitOutcome::Accepted(1)
+            );
             engine.finish().unwrap();
         }
     }
 
     #[test]
     fn stream_zero_receive_delivers_control_and_peek_retains_it() {
-        let ancillary = NetworkAncillaryDataV2 { bytes: vec![0; 4],
+        let ancillary = NetworkAncillaryDataV2 {
+            bytes: vec![0; 4],
             objects: vec![detcore_model::network_trace::NetworkAncillaryObjectRefV2 {
                 byte_offset: 0,
                 object: detcore_model::network_trace::NetworkAncillaryObjectV2::FileDescriptor {
                     object: detcore_model::network_trace::NetworkObjectId(7),
                 },
-            }], truncated: false };
+            }],
+            truncated: false,
+        };
         for peek in [false, true] {
-            let mut history = trace(); history.outputs.clear();
+            let mut history = trace();
+            history.outputs.clear();
             history.channels[0].transport = NetworkTransportV2::UnixStream;
             history.channels[0].local_address = None;
-            history.channels[0].peer_address = Some(NetworkAddressV2::UnixAbstract(b"ancillary".to_vec()));
-            history.inputs = vec![NetworkInputEventV2 { ordinal: 0, channel: channel_id(),
-                release: NetworkReleaseV2 { not_before_global_time: time(1), after_transmitted_offset: 0 },
-                event: NetworkInputKindV2::StreamMessage { stream_offset: 0, bytes: b"fd".to_vec(),
-                    ancillary: ancillary.clone(), message_flags: 0 } }];
+            history.channels[0].peer_address =
+                Some(NetworkAddressV2::UnixAbstract(b"ancillary".to_vec()));
+            history.inputs = vec![NetworkInputEventV2 {
+                ordinal: 0,
+                channel: channel_id(),
+                release: NetworkReleaseV2 {
+                    not_before_global_time: time(1),
+                    after_transmitted_offset: 0,
+                },
+                event: NetworkInputKindV2::StreamMessage {
+                    stream_offset: 0,
+                    bytes: b"fd".to_vec(),
+                    ancillary: ancillary.clone(),
+                    message_flags: 0,
+                },
+            }];
             let mut engine = NetworkReplayEngine::replay(history).unwrap();
-            let ofd = open_file(0); engine.bind(ofd, channel_id()).unwrap();
+            let ofd = open_file(0);
+            engine.bind(ofd, channel_id()).unwrap();
             engine.release_eligible(time(1)).unwrap();
             let StreamMessageReceiveOutcome::Message(zero) =
                 engine.receive_stream_message(ofd, 0, true, peek).unwrap()
-            else { panic!("expected zero-payload message"); };
+            else {
+                panic!("expected zero-payload message");
+            };
             assert!(zero.bytes.is_empty());
             assert_eq!(zero.ancillary, Some(ancillary.clone()));
             assert_eq!(zero.message_flags, 0);
             let StreamMessageReceiveOutcome::Message(rest) =
                 engine.receive_stream_message(ofd, 2, true, false).unwrap()
-            else { panic!("expected retained payload"); };
+            else {
+                panic!("expected retained payload");
+            };
             assert_eq!(rest.bytes, b"fd");
             assert_eq!(rest.ancillary, peek.then_some(ancillary.clone()));
             assert_eq!(rest.message_flags, 0);
@@ -7631,205 +8305,6 @@ mod tests {
             StreamReceiveOutcome::Bytes(b"v1".to_vec())
         );
         engine.finish().unwrap();
-    }
-
-    #[test]
-    fn ancillary_registry_preserves_alias_identity_and_tombstones_retirement() {
-        let mut engine = NetworkReplayEngine::replay(trace()).unwrap();
-        let object = NetworkObjectId(41);
-        let underlying = OpenFileId::new(DetTid::from_raw(7), 3);
-        engine
-            .register_ancillary_object(
-                object,
-                underlying,
-                NetworkAncillaryObjectKind::FileDescriptor,
-            )
-            .unwrap();
-        // Dup and fork install distinct descriptor aliases for the same OFD.
-        assert_eq!(engine.retain_ancillary_alias(object).unwrap(), underlying);
-        assert_eq!(engine.retain_ancillary_alias(object).unwrap(), underlying);
-        assert_eq!(engine.ancillary_object(object).unwrap().alias_count, 2);
-        assert_eq!(
-            engine
-                .ancillary_object_for_open_file(underlying)
-                .unwrap()
-                .id,
-            object
-        );
-        assert!(matches!(
-            engine.retire_ancillary_object(object),
-            Err(NetworkReplayError::AncillaryAliasesRemain { count: 2, .. })
-        ));
-        assert_eq!(engine.release_ancillary_alias(object).unwrap(), 1);
-        assert_eq!(engine.release_ancillary_alias(object).unwrap(), 0);
-        assert_eq!(engine.retire_ancillary_object(object).unwrap(), underlying);
-        assert!(matches!(
-            engine.ancillary_object(object),
-            Err(NetworkReplayError::AncillaryObjectRetired(id)) if id == object
-        ));
-        assert!(matches!(
-            engine.register_ancillary_object(
-                object,
-                OpenFileId::new(DetTid::from_raw(7), 4),
-                NetworkAncillaryObjectKind::FileDescriptor,
-            ),
-            Err(NetworkReplayError::AncillaryObjectRetired(id)) if id == object
-        ));
-        assert!(matches!(
-            engine.register_ancillary_object(
-                NetworkObjectId(42),
-                underlying,
-                NetworkAncillaryObjectKind::FileDescriptor,
-            ),
-            Err(NetworkReplayError::AncillaryOpenFileRetired(ofd)) if ofd == underlying
-        ));
-        engine
-            .register_ancillary_object(
-                NetworkObjectId(42),
-                OpenFileId::new(DetTid::from_raw(7), 4),
-                NetworkAncillaryObjectKind::FileDescriptor,
-            )
-            .unwrap();
-    }
-
-    fn readiness_trace(events: Vec<NetworkReadinessV2>) -> NetworkTraceV2 {
-        NetworkTraceV2 {
-            epoch: epoch(),
-            channels: vec![channel()],
-            outputs: vec![],
-            inputs: events
-                .into_iter()
-                .enumerate()
-                .map(|(index, readiness)| NetworkInputEventV2 {
-                    ordinal: index as u64,
-                    channel: channel_id(),
-                    release: NetworkReleaseV2 {
-                        not_before_global_time: time(index as u64 + 1),
-                        after_transmitted_offset: 0,
-                    },
-                    event: NetworkInputKindV2::Readiness(readiness),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn epoll_edge_does_not_repeat_until_a_new_transition() {
-        let readable = NetworkReadinessV2 {
-            readable: true,
-            ..NetworkReadinessV2::default()
-        };
-        let mut engine = NetworkReplayEngine::replay(readiness_trace(vec![
-            readable,
-            NetworkReadinessV2::default(),
-            readable,
-        ]))
-        .unwrap();
-        let target = open_file(0);
-        let epoll = OpenFileId::new(DetTid::from_raw(1), 90);
-        engine.bind(target, channel_id()).unwrap();
-        engine
-            .epoll_add(epoll, target, (libc::EPOLLIN | libc::EPOLLET) as u32)
-            .unwrap();
-        engine.release_eligible(time(1)).unwrap();
-        assert_eq!(engine.epoll_ready(epoll).unwrap().len(), 1);
-        assert!(engine.epoll_ready(epoll).unwrap().is_empty());
-        engine.release_eligible(time(2)).unwrap();
-        assert!(engine.epoll_ready(epoll).unwrap().is_empty());
-        engine.release_eligible(time(3)).unwrap();
-        assert_eq!(engine.epoll_ready(epoll).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn epoll_oneshot_mod_rearms_and_err_hup_are_unconditional() {
-        let readiness = NetworkReadinessV2 {
-            readable: true,
-            error: true,
-            hangup: true,
-            ..NetworkReadinessV2::default()
-        };
-        let mut engine = NetworkReplayEngine::replay(readiness_trace(vec![readiness])).unwrap();
-        let target = open_file(0);
-        let epoll = OpenFileId::new(DetTid::from_raw(1), 91);
-        engine.bind(target, channel_id()).unwrap();
-        let events = libc::EPOLLONESHOT as u32;
-        engine.epoll_add(epoll, target, events).unwrap();
-        engine.release_eligible(time(1)).unwrap();
-        let first = engine.epoll_ready(epoll).unwrap();
-        assert_eq!(first.len(), 1);
-        assert_ne!(first[0].events & libc::EPOLLERR as u32, 0);
-        assert_ne!(first[0].events & libc::EPOLLHUP as u32, 0);
-        assert!(engine.epoll_ready(epoll).unwrap().is_empty());
-        engine.epoll_modify(epoll, target, events).unwrap();
-        assert_eq!(engine.epoll_ready(epoll).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn epoll_orders_by_ofd_retires_interests_and_refuses_exclusive() {
-        let second_channel = NetworkChannelId(2);
-        let mut second = channel();
-        second.id = second_channel;
-        let ready = NetworkReadinessV2 {
-            readable: true,
-            ..NetworkReadinessV2::default()
-        };
-        let mut two = NetworkTraceV2 {
-            epoch: epoch(),
-            channels: vec![channel(), second],
-            outputs: vec![],
-            inputs: vec![],
-        };
-        for (ordinal, channel) in [second_channel, channel_id()].into_iter().enumerate() {
-            two.inputs.push(NetworkInputEventV2 {
-                ordinal: ordinal as u64,
-                channel,
-                release: NetworkReleaseV2 {
-                    not_before_global_time: time(1),
-                    after_transmitted_offset: 0,
-                },
-                event: NetworkInputKindV2::Readiness(ready),
-            });
-        }
-        let mut engine = NetworkReplayEngine::replay(two).unwrap();
-        let first = open_file(1);
-        let second = open_file(2);
-        let epoll = OpenFileId::new(DetTid::from_raw(1), 92);
-        engine.bind(first, channel_id()).unwrap();
-        engine.bind(second, second_channel).unwrap();
-        engine
-            .epoll_add(epoll, second, libc::EPOLLIN as u32)
-            .unwrap();
-        engine
-            .epoll_add(epoll, first, libc::EPOLLIN as u32)
-            .unwrap();
-        assert!(matches!(
-            engine.epoll_add(
-                OpenFileId::new(DetTid::from_raw(1), 93),
-                first,
-                libc::EPOLLEXCLUSIVE as u32,
-            ),
-            Err(NetworkReplayError::UnsupportedEpollFlags(flags))
-                if flags == libc::EPOLLEXCLUSIVE as u32
-        ));
-        engine.release_eligible(time(1)).unwrap();
-        let ready = engine.epoll_ready(epoll).unwrap();
-        assert_eq!(
-            ready.iter().map(|event| event.target).collect::<Vec<_>>(),
-            vec![first, second]
-        );
-        assert_eq!(engine.retire_open_file(first), Some(channel_id()));
-        assert_eq!(
-            engine.epoll_ready(epoll).unwrap(),
-            vec![NetworkEpollEvent {
-                target: second,
-                events: libc::EPOLLIN as u32,
-            }]
-        );
-        engine.retire_open_file(epoll);
-        assert!(matches!(
-            engine.epoll_ready(epoll),
-            Err(NetworkReplayError::UnknownEpollInstance(id)) if id == epoll
-        ));
     }
 
     #[test]
@@ -9159,7 +9634,7 @@ mod tests {
         assert!(engine.stream_delivery.is_empty());
     }
 
-    fn test_fresh_profile(domain: i32) -> FreshStreamSocketProfileV3 {
+    pub(super) fn test_fresh_profile(domain: i32) -> FreshStreamSocketProfileV3 {
         use detcore_model::network_trace::LinuxReceiveHzV3;
         use detcore_model::network_trace::ReceiveBufferStateV3;
         use detcore_model::network_trace::ReceiveTimeoutV3;
@@ -9190,7 +9665,7 @@ mod tests {
         }
     }
 
-    fn test_socket_namespace() -> NetworkStreamNamespace {
+    pub(super) fn test_socket_namespace() -> NetworkStreamNamespace {
         NetworkStreamNamespace {
             device: 4,
             inode: 100,
@@ -9605,7 +10080,7 @@ mod tests {
         }
     }
 
-    fn shadow_probe_fixture() -> (
+    pub(super) fn shadow_probe_fixture() -> (
         NetworkReplayEngine,
         OpenFileId,
         NetworkStreamOwner,
@@ -10572,14 +11047,23 @@ mod tests {
         NetworkStreamOwner,
         accepted::AcceptedBackendCapability,
     ) {
+        accepted_record_fixture_for_listener(open_file(100), stream_owner(31))
+    }
+    fn accepted_record_fixture_for_listener(
+        ofd: OpenFileId,
+        owner: NetworkStreamOwner,
+    ) -> (
+        NetworkReplayEngine,
+        OpenFileId,
+        NetworkStreamOwner,
+        accepted::AcceptedBackendCapability,
+    ) {
         use detcore_model::network_trace::ReceiveTimeoutV3;
         let cap = accepted::AcceptedBackendCapability::controlled_fixture();
         let mut engine = NetworkReplayEngine::record_shadow_accepted(
             epoch(),
             accepted::AcceptedBackendCapability::controlled_fixture(),
         );
-        let ofd = open_file(100);
-        let owner = stream_owner(31);
         let profile = test_fresh_profile(libc::AF_INET);
         engine
             .register_accepted_fresh_send(profile.key, Some(ReceiveTimeoutV3::Infinite))
@@ -10679,6 +11163,1233 @@ mod tests {
             )
             .unwrap()
     }
+    // Controlled receipt fixtures, followed by the actual common production
+    // publisher and shared-FilesId reader admission. No native evidence claim.
+    fn original_socket_enrollment_case(
+        domain: i32,
+        shadow: bool,
+        creation_flags: i32,
+    ) -> (
+        NetworkReplayEngine,
+        NetworkStreamOwner,
+        NetworkStreamOwner,
+        std::sync::Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+        NetworkFdMutationAdmission,
+        original_connect::Admission,
+        crate::network_runtime::original_installation::Installation,
+    ) {
+        use crate::network_runtime::original_installation::Source;
+        use crate::network_runtime::original_installation::installation_fixture;
+        let owner = stream_owner(31);
+        let peer = stream_owner(32);
+        let mut engine = if shadow {
+            NetworkReplayEngine::record_shadow(epoch())
+        } else {
+            NetworkReplayEngine::record(epoch())
+        };
+        engine.fd_table_fixture_enable();
+        let files = engine.fd_publication_fixture_register(owner, None);
+        assert_eq!(
+            engine.fd_publication_fixture_register(peer, Some(owner)),
+            files
+        );
+        let actual = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tool_local::FileMetadata::empty_network_fixture(owner.thread),
+        ));
+        for task in [owner, peer] {
+            engine
+                .associate_fd_metadata(task, &actual, &actual.lock().unwrap())
+                .unwrap();
+        }
+        let NetworkFdMutationBegin::Admitted(mutation) = engine
+            .begin_fd_mutation(owner, files, NetworkFdMutationKind::Socket)
+            .unwrap()
+        else {
+            panic!("Socket admission")
+        };
+        engine
+            .submit_fd_mutation(owner, mutation.publication.permit)
+            .unwrap();
+        let arguments = original_connect::Arguments {
+            kind: original_connect::Kind::Socket,
+            operation: crate::resources::ExternalOpId::new(owner.thread, 10),
+            files,
+            binding: None,
+            fd: domain,
+            address: (libc::SOCK_STREAM | creation_flags) as u64,
+            length: 0,
+            original_count: 0,
+        };
+        let admission = engine
+            .begin_original_socket(owner, arguments, mutation.clone())
+            .unwrap();
+        engine
+            .original_connect_provider_submitted(owner, &admission)
+            .unwrap();
+        engine
+            .original_call_prepared(owner, &admission, None, 71)
+            .unwrap();
+        engine.original_connect_invoked(owner, &admission).unwrap();
+        engine
+            .original_connect_selected(owner, &admission, 71, 7, 31, 101, 13, 19)
+            .unwrap();
+        engine
+            .original_connect_returned(owner, &admission, 17)
+            .unwrap();
+        engine
+            .original_connect_provider_retired(owner, &admission, 17)
+            .unwrap();
+        engine
+            .original_connect_pin_released(owner, &admission)
+            .unwrap();
+        engine
+            .confirm_fd_mutation_result(owner, mutation.publication.permit, Ok(17))
+            .unwrap();
+        let receipt = installation_fixture(
+            owner,
+            actual.clone(),
+            mutation.publication.permit,
+            Source::Socket(admission.call),
+            71,
+            17,
+            false,
+        );
+        (engine, owner, peer, actual, mutation, admission, receipt)
+    }
+    fn original_fresh_enrollment() -> original_installation::FreshStreamEnrollment {
+        let profile = test_fresh_profile(libc::AF_INET);
+        original_installation::FreshStreamEnrollment {
+            key: profile.key,
+            namespace: test_socket_namespace(),
+            observed_profile: Some(profile),
+        }
+    }
+    #[test]
+    fn original_socket_publisher_enrolls_before_shared_peer_classification() {
+        let (mut engine, owner, peer, actual, mutation, admission, receipt) =
+            original_socket_enrollment_case(libc::AF_INET, true, 0);
+        let binding = engine
+            .publish_original_installation(
+                owner,
+                &mutation.publication,
+                &receipt,
+                &actual,
+                &mut actual.lock().unwrap(),
+                nix::fcntl::OFlag::empty(),
+                None,
+                Some(original_fresh_enrollment()),
+                time(20),
+            )
+            .unwrap();
+        // No creator follow-up RPC has executed. The actual peer admission must
+        // already classify the published generation using complete shadow state.
+        let NetworkFdReadBegin::Admitted(read) =
+            engine.begin_fd_read(peer, binding.slot.files, 17).unwrap()
+        else {
+            panic!("published peer reader")
+        };
+        assert_eq!(read.binding, Some(binding));
+        assert_eq!(
+            engine
+                .stream_socket_state(binding.open_file)
+                .unwrap()
+                .unwrap()
+                .options
+                .receive_low_water,
+            1
+        );
+        engine.finish_fd_read(peer, read).unwrap();
+        accepted_set(
+            &mut engine,
+            binding.open_file,
+            peer,
+            NetworkStreamSocketOption::ReceiveLowWater(9),
+        );
+        engine
+            .original_socket_publication_finished(owner, &admission, mutation.publication.permit)
+            .unwrap();
+        engine.finish_original_connect(owner, &admission).unwrap();
+        assert_eq!(
+            engine
+                .stream_socket_state(binding.open_file)
+                .unwrap()
+                .unwrap()
+                .options
+                .receive_low_water,
+            9
+        );
+        assert!(
+            engine.fd_publications[&binding.slot.files]
+                .enrollment
+                .is_none()
+        );
+    }
+    #[test]
+    fn already_removed_original_socket_publishes_historical_success_without_a_live_profile() {
+        use crate::network_runtime::original_installation::Source;
+        use crate::network_runtime::original_installation::removed_installation_fixture;
+        for retired in [false, true] {
+            let (mut engine, owner, peer, actual, mutation, admission, live) =
+                original_socket_enrollment_case(libc::AF_INET, true, 0);
+            // Absence alone still cannot expose an uninitialized live socket.
+            assert!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &mutation.publication,
+                        &live,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::empty(),
+                        None,
+                        None,
+                        time(20)
+                    )
+                    .is_err()
+            );
+            assert!(matches!(
+                engine.begin_fd_read(peer, mutation.publication.permit.files, 17),
+                Err(NetworkReplayError::StreamOperationBusy(_))
+            ));
+            let removed = removed_installation_fixture(
+                owner,
+                actual.clone(),
+                mutation.publication.permit,
+                Source::Socket(admission.call),
+                71,
+                17,
+                retired,
+            );
+            let binding = engine
+                .publish_original_installation(
+                    owner,
+                    &mutation.publication,
+                    &removed,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::empty(),
+                    None,
+                    None,
+                    time(20),
+                )
+                .unwrap();
+            assert_eq!(binding.slot.fd, 17);
+            assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+            assert!(
+                engine
+                    .lifetime
+                    .binding_in_retained_table(binding.slot.files, 17)
+                    .is_none()
+            );
+            let NetworkFdReadBegin::Admitted(read) =
+                engine.begin_fd_read(peer, binding.slot.files, 17).unwrap()
+            else {
+                panic!("peer after proved retirement")
+            };
+            assert_eq!(read.binding, None);
+            engine.finish_fd_read(peer, read).unwrap();
+            engine
+                .original_socket_publication_finished(
+                    owner,
+                    &admission,
+                    mutation.publication.permit,
+                )
+                .unwrap();
+            engine.finish_original_connect(owner, &admission).unwrap();
+        }
+    }
+    #[test]
+    fn original_socket_profile_refusals_keep_generic_recovery_and_ack_closed() {
+        for bad in 0..4 {
+            let (mut engine, owner, peer, actual, mutation, _, receipt) =
+                original_socket_enrollment_case(libc::AF_INET, true, 0);
+            let mut fresh = original_fresh_enrollment();
+            if bad == 1 {
+                fresh.key.domain = libc::AF_INET6;
+            }
+            if bad == 2 {
+                fresh.namespace.inode = 0;
+            }
+            if bad == 3 {
+                fresh
+                    .observed_profile
+                    .as_mut()
+                    .unwrap()
+                    .initial
+                    .receive_low_water = 0;
+            }
+            assert!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &mutation.publication,
+                        &receipt,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::empty(),
+                        None,
+                        (bad != 0).then_some(fresh),
+                        time(20)
+                    )
+                    .is_err()
+            );
+            let permit = mutation.publication.permit;
+            assert!(matches!(
+                engine.begin_fd_read(peer, permit.files, 17),
+                Err(NetworkReplayError::StreamOperationBusy(_))
+            ));
+            assert!(engine.finish_fd_mutations().is_err());
+            if bad < 2 {
+                assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+                assert!(engine.fd_publications[&permit.files].enrollment.is_none());
+            } else {
+                let binding = actual.lock().unwrap().descriptor_binding(17).unwrap();
+                assert!(
+                    engine
+                        .stream_socket_state(binding.open_file)
+                        .unwrap()
+                        .is_none()
+                );
+                let batch = engine.fd_publications[&permit.files]
+                    .pending
+                    .clone()
+                    .unwrap();
+                assert!(
+                    engine
+                        .publish_fd_publication(owner, permit, &batch)
+                        .is_err()
+                );
+                assert!(
+                    engine
+                        .acknowledge_fd_publication(owner, permit, &batch)
+                        .is_err()
+                );
+                assert!(engine.release_empty_fd_publication(owner, permit).is_err());
+                assert!(
+                    !engine.fd_publications[&permit.files]
+                        .enrollment
+                        .as_ref()
+                        .unwrap()
+                        .completed
+                );
+                engine.retire_fd_table_owner(owner);
+                engine.stream_owner_gone(owner);
+                engine.retire_fd_table_owner(peer);
+                engine.stream_owner_gone(peer);
+                assert!(engine.fd_publications[&permit.files].enrollment.is_some());
+                assert!(engine.fd_publications[&permit.files].pending.is_some());
+                assert!(engine.finish_fd_mutations().is_err());
+            }
+        }
+    }
+    #[test]
+    fn original_enrollment_pending_replay_and_ack_do_not_reset_completed_options() {
+        let (mut engine, owner, peer, actual, mutation, _, receipt) =
+            original_socket_enrollment_case(libc::AF_INET, true, 0);
+        let permit = mutation.publication.permit;
+        let (binding, batch) = engine
+            .prepare_original_installation_publication(
+                owner,
+                &mutation.publication,
+                &receipt,
+                &actual,
+                &mut actual.lock().unwrap(),
+                nix::fcntl::OFlag::empty(),
+                None,
+                Some(original_fresh_enrollment()),
+                time(20),
+            )
+            .unwrap();
+        assert!(
+            engine
+                .stream_socket_state(binding.open_file)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            engine
+                .publish_fd_publication(owner, permit, &batch)
+                .unwrap(),
+            batch
+        );
+        assert!(
+            engine.fd_publications[&permit.files]
+                .enrollment
+                .as_ref()
+                .unwrap()
+                .completed
+        );
+        // Exercise idempotence through the existing option-control consumer.
+        // This adversarial component cut makes no guest scheduling claim.
+        accepted_set(
+            &mut engine,
+            binding.open_file,
+            owner,
+            NetworkStreamSocketOption::ReceiveLowWater(9),
+        );
+        assert_eq!(
+            engine
+                .publish_fd_publication(owner, permit, &batch)
+                .unwrap(),
+            batch
+        );
+        let mut changed = batch.clone();
+        changed.sequence += 1;
+        assert!(
+            engine
+                .acknowledge_fd_publication(owner, permit, &changed)
+                .is_err()
+        );
+        assert!(engine.fd_publications[&permit.files].enrollment.is_some());
+        actual
+            .lock()
+            .unwrap()
+            .publication_acknowledge(&batch)
+            .unwrap();
+        engine
+            .acknowledge_fd_publication(owner, permit, &batch)
+            .unwrap();
+        actual
+            .lock()
+            .unwrap()
+            .publication_server_acknowledge(&batch)
+            .unwrap();
+        let NetworkFdReadBegin::Admitted(read) =
+            engine.begin_fd_read(peer, permit.files, 17).unwrap()
+        else {
+            panic!("ACK must complete exact enrollment")
+        };
+        assert_eq!(read.binding, Some(binding));
+        assert_eq!(
+            engine
+                .stream_socket_state(binding.open_file)
+                .unwrap()
+                .unwrap()
+                .options
+                .receive_low_water,
+            9
+        );
+        engine.finish_fd_read(peer, read).unwrap();
+        assert!(engine.fd_publications[&permit.files].enrollment.is_none());
+    }
+    #[test]
+    fn original_socket_retry_resumes_each_existing_publication_cut_without_new_generation() {
+        for cut in 0..4 {
+            let (mut engine, owner, peer, actual, mutation, admission, receipt) =
+                original_socket_enrollment_case(libc::AF_INET, true, 0);
+            let permit = mutation.publication.permit;
+            let mut prepared = None;
+            if cut >= 1 {
+                prepared = Some(
+                    engine
+                        .prepare_original_installation_publication(
+                            owner,
+                            &mutation.publication,
+                            &receipt,
+                            &actual,
+                            &mut actual.lock().unwrap(),
+                            nix::fcntl::OFlag::empty(),
+                            None,
+                            Some(original_fresh_enrollment()),
+                            time(20),
+                        )
+                        .unwrap(),
+                );
+            }
+            if cut >= 2 {
+                let (binding, batch) = prepared.as_ref().unwrap();
+                engine.publish_fd_publication(owner, permit, batch).unwrap();
+                accepted_set(
+                    &mut engine,
+                    binding.open_file,
+                    owner,
+                    NetworkStreamSocketOption::ReceiveLowWater(9),
+                );
+            }
+            if cut >= 3 {
+                actual
+                    .lock()
+                    .unwrap()
+                    .publication_acknowledge(&prepared.as_ref().unwrap().1)
+                    .unwrap();
+            }
+            // These are the actual adapter's two entry checks, including the
+            // cut where publication already consumed the mutation state.
+            assert_eq!(
+                engine
+                    .original_socket_publication(owner, &admission)
+                    .unwrap(),
+                (mutation.clone(), 17)
+            );
+            engine
+                .confirm_original_socket_publication_result(owner, &admission)
+                .unwrap();
+            assert!(
+                engine
+                    .confirm_fd_mutation_result(owner, permit, Ok(17))
+                    .is_err()
+            );
+            assert!(matches!(
+                engine.begin_fd_read(peer, permit.files, 17),
+                Err(NetworkReplayError::StreamOperationBusy(_))
+            ));
+            let binding = engine
+                .publish_original_installation(
+                    owner,
+                    &mutation.publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::empty(),
+                    None,
+                    Some(original_fresh_enrollment()),
+                    time(30),
+                )
+                .unwrap();
+            if let Some((prior, batch)) = prepared {
+                assert_eq!(binding, prior);
+                assert_eq!(batch.entries.len(), 1);
+                assert_eq!(batch.entries[0].replacement.after.unwrap().binding, binding);
+            }
+            assert_eq!(binding.generation, 1);
+            assert_eq!(
+                actual.lock().unwrap().descriptor_binding(17).unwrap(),
+                binding
+            );
+            let NetworkFdReadBegin::Admitted(read) =
+                engine.begin_fd_read(peer, permit.files, 17).unwrap()
+            else {
+                panic!("same-table reader after exact recovered ACK")
+            };
+            assert_eq!(read.binding, Some(binding));
+            if cut >= 2 {
+                assert_eq!(
+                    engine
+                        .stream_socket_state(binding.open_file)
+                        .unwrap()
+                        .unwrap()
+                        .options
+                        .receive_low_water,
+                    9
+                );
+            }
+            engine.finish_fd_read(peer, read).unwrap();
+            engine
+                .original_socket_publication_finished(owner, &admission, permit)
+                .unwrap();
+            engine.finish_original_connect(owner, &admission).unwrap();
+            engine.retire_fd_table_owner(owner);
+            engine.stream_owner_gone(owner);
+            engine.retire_fd_table_owner(peer);
+            engine.stream_owner_gone(peer);
+            engine.finish_fd_mutations().unwrap();
+        }
+    }
+
+    #[test]
+    fn original_installation_retry_rejects_changed_inputs_without_replacing_retained_batch() {
+        use crate::network_runtime::original_installation::Source;
+        use crate::network_runtime::original_installation::installation_fixture;
+        for bad in 0..9 {
+            let (mut engine, owner, peer, actual, mutation, admission, receipt) =
+                original_socket_enrollment_case(libc::AF_INET, true, 0);
+            let permit = mutation.publication.permit;
+            let (binding, batch) = engine
+                .prepare_original_installation_publication(
+                    owner,
+                    &mutation.publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::empty(),
+                    None,
+                    Some(original_fresh_enrollment()),
+                    time(20),
+                )
+                .unwrap();
+            let mut changed_admission = mutation.publication.clone();
+            if bad == 0 {
+                changed_admission.acknowledged_generation += 1;
+            }
+            let changed = installation_fixture(
+                owner,
+                actual.clone(),
+                permit,
+                Source::Socket(if bad == 1 {
+                    NetworkStreamCallId(admission.call.0 + 1)
+                } else {
+                    admission.call
+                }),
+                if bad == 2 { 72 } else { 71 },
+                if bad == 3 { 18 } else { 17 },
+                bad == 4,
+            );
+            let mut fresh = original_fresh_enrollment();
+            if bad == 5 {
+                fresh.namespace.inode += 1;
+            }
+            let flags = if bad == 6 {
+                nix::fcntl::OFlag::O_NONBLOCK
+            } else {
+                nix::fcntl::OFlag::empty()
+            };
+            let stat = if bad == 7 {
+                Some(crate::stat::DetStat::default())
+            } else {
+                None
+            };
+            let supplied = if bad == 8 { None } else { Some(fresh) };
+            assert!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &changed_admission,
+                        &changed,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        flags,
+                        stat,
+                        supplied,
+                        time(30)
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                actual.lock().unwrap().descriptor_binding(17).unwrap(),
+                binding
+            );
+            assert!(engine.fd_publications[&permit.files].enrollment.is_some());
+            assert_eq!(
+                engine
+                    .prepare_original_installation_publication(
+                        owner,
+                        &mutation.publication,
+                        &receipt,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::empty(),
+                        None,
+                        Some(original_fresh_enrollment()),
+                        time(30)
+                    )
+                    .unwrap(),
+                (binding, batch)
+            );
+            assert!(matches!(
+                engine.begin_fd_read(peer, permit.files, 17),
+                Err(NetworkReplayError::StreamOperationBusy(_))
+            ));
+            // Refused changes never corrupt the original exact retry.
+            assert_eq!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &mutation.publication,
+                        &receipt,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::empty(),
+                        None,
+                        Some(original_fresh_enrollment()),
+                        time(30)
+                    )
+                    .unwrap(),
+                binding
+            );
+        }
+    }
+
+    #[test]
+    fn original_socket_consumer_stores_rdwr_and_only_creation_status_flags() {
+        for flags in [
+            0,
+            libc::SOCK_NONBLOCK,
+            libc::SOCK_CLOEXEC,
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        ] {
+            let (mut engine, owner, _, actual, mutation, _, receipt) =
+                original_socket_enrollment_case(libc::AF_INET, false, flags);
+            let binding = engine
+                .publish_original_installation(
+                    owner,
+                    &mutation.publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    original_installation::socket_installation_flags(libc::SOCK_STREAM | flags),
+                    None,
+                    None,
+                    time(20),
+                )
+                .unwrap();
+            let metadata = actual.lock().unwrap();
+            let fd = &metadata.file_handles[&binding.slot.fd];
+            assert_eq!(
+                fd.status_flags(),
+                libc::O_RDWR | (flags & libc::SOCK_NONBLOCK)
+            );
+            assert_eq!(fd.status_flags() & libc::O_ACCMODE, libc::O_RDWR);
+            assert_ne!(fd.status_flags() & libc::O_ACCMODE, libc::O_WRONLY);
+            assert_eq!(fd.is_cloexec(), flags & libc::SOCK_CLOEXEC != 0);
+            assert_eq!(fd.is_nonblocking(), flags & libc::SOCK_NONBLOCK != 0);
+        }
+    }
+    #[test]
+    fn original_non_tcp_and_v2_socket_publications_keep_their_existing_classification() {
+        for (domain, shadow) in [(libc::AF_UNIX, true), (libc::AF_INET, false)] {
+            let (mut engine, owner, peer, actual, mutation, _, receipt) =
+                original_socket_enrollment_case(domain, shadow, 0);
+            let binding = engine
+                .publish_original_installation(
+                    owner,
+                    &mutation.publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::empty(),
+                    None,
+                    None,
+                    time(20),
+                )
+                .unwrap();
+            let NetworkFdReadBegin::Admitted(read) =
+                engine.begin_fd_read(peer, binding.slot.files, 17).unwrap()
+            else {
+                panic!("ordinary Socket remains admitted")
+            };
+            assert_eq!(read.binding, Some(binding));
+            assert!(
+                engine
+                    .stream_socket_state(binding.open_file)
+                    .unwrap()
+                    .is_none()
+            );
+            engine.finish_fd_read(peer, read).unwrap();
+        }
+    }
+
+    #[test]
+    fn accepted_original_consumer_joins_same_child_metadata_ack_and_installed_completion() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::network_runtime::accepted::Resolved;
+        use crate::network_runtime::original_installation::Source;
+        use crate::network_runtime::original_installation::installation_fixture;
+        use crate::tool_local::FileMetadata;
+        let (mut engine, listener, owner, cap) = accepted_record_fixture();
+        let child = accepted_observe(&mut engine, listener, &cap);
+        engine.original_installation_fixture_cookie(child, 77);
+        let call = active_pinned_call(&mut engine, listener, owner);
+        let reservation = engine.begin_accepted_socket(owner, call).unwrap().unwrap();
+        engine
+            .submit_accepted_socket(owner, reservation.lease)
+            .unwrap();
+        // Component authority only: the production constructor still refuses
+        // incomplete FD coverage. The consumer below is the production path.
+        engine.fd_table_fixture_enable();
+        let files = engine.fd_publication_fixture_register(owner, None);
+        let actual = Arc::new(Mutex::new(FileMetadata::empty_network_fixture(
+            owner.thread,
+        )));
+        engine
+            .associate_fd_metadata(owner, &actual, &actual.lock().unwrap())
+            .unwrap();
+        let peer = stream_owner(32);
+        assert_eq!(
+            engine.fd_publication_fixture_register(peer, Some(owner)),
+            files
+        );
+        engine
+            .associate_fd_metadata(peer, &actual, &actual.lock().unwrap())
+            .unwrap();
+        let publication = engine.acquire_fd_publication(owner, files).unwrap();
+        let matched = Resolved {
+            creation: child.0,
+            cookie: 77,
+            physical: accepted::AcceptedPhysicalIdentity {
+                provider: 7,
+                object: 11,
+                namespace: 9,
+            },
+        };
+        let wrong = installation_fixture(
+            owner,
+            actual.clone(),
+            publication.permit,
+            Source::Accepted {
+                lease: reservation.lease,
+                child: Resolved {
+                    cookie: 78,
+                    ..matched
+                },
+            },
+            71,
+            17,
+            false,
+        );
+        assert!(
+            engine
+                .publish_original_installation(
+                    owner,
+                    &publication,
+                    &wrong,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::O_CLOEXEC,
+                    None,
+                    None,
+                    time(20)
+                )
+                .is_err()
+        );
+        assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        let receipt = installation_fixture(
+            owner,
+            actual.clone(),
+            publication.permit,
+            Source::Accepted {
+                lease: reservation.lease,
+                child: matched,
+            },
+            71,
+            17,
+            false,
+        );
+        let binding = engine
+            .publish_original_installation(
+                owner,
+                &publication,
+                &receipt,
+                &actual,
+                &mut actual.lock().unwrap(),
+                nix::fcntl::OFlag::O_CLOEXEC,
+                None,
+                None,
+                time(20),
+            )
+            .unwrap();
+        assert_eq!(binding.slot.fd, 17);
+        assert_eq!(
+            actual.lock().unwrap().descriptor_binding(17).unwrap(),
+            binding
+        );
+        // Before the creator's existing CompleteAcceptedSocket follow-up, a
+        // real shared-table reader sees both the inherited state and channel.
+        let NetworkFdReadBegin::Admitted(read) = engine.begin_fd_read(peer, files, 17).unwrap()
+        else {
+            panic!("accepted peer reader")
+        };
+        assert_eq!(read.binding, Some(binding));
+        assert!(
+            engine
+                .stream_socket_state(binding.open_file)
+                .unwrap()
+                .is_some()
+        );
+        assert!(engine.channel_for(binding.open_file).is_some());
+        engine.finish_fd_read(peer, read).unwrap();
+        accepted_set(
+            &mut engine,
+            binding.open_file,
+            peer,
+            NetworkStreamSocketOption::ReceiveLowWater(9),
+        );
+        let completed = engine
+            .complete_accepted_socket(
+                owner,
+                reservation.lease,
+                Ok(17),
+                Some(binding.open_file),
+                time(20),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.open_file, binding.open_file);
+        assert_eq!(completed.fd, 17);
+        assert_eq!(
+            engine
+                .stream_socket_state(binding.open_file)
+                .unwrap()
+                .unwrap()
+                .options
+                .receive_low_water,
+            9
+        );
+        assert!(engine.fd_publications[&files].enrollment.is_none());
+        assert!(
+            engine
+                .publish_original_installation(
+                    owner,
+                    &publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::O_CLOEXEC,
+                    None,
+                    None,
+                    time(20)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            actual.lock().unwrap().descriptor_binding(17).unwrap(),
+            binding
+        );
+    }
+
+    #[test]
+    fn accepted_installation_then_removal_keeps_historical_completion_and_peer_absence() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::network_runtime::accepted::Resolved;
+        use crate::network_runtime::original_installation::Source;
+        use crate::network_runtime::original_installation::installation_fixture;
+        use crate::network_runtime::original_installation::removed_installation_fixture;
+        use crate::tool_local::FileMetadata;
+        let (mut engine, listener, owner, cap) = accepted_record_fixture();
+        let child = accepted_observe(&mut engine, listener, &cap);
+        engine.original_installation_fixture_cookie(child, 77);
+        let call = active_pinned_call(&mut engine, listener, owner);
+        let reservation = engine.begin_accepted_socket(owner, call).unwrap().unwrap();
+        engine
+            .submit_accepted_socket(owner, reservation.lease)
+            .unwrap();
+        // Component authority only: the production constructor still refuses
+        // incomplete FD coverage. The consumer below is the production path.
+        engine.fd_table_fixture_enable();
+        let files = engine.fd_publication_fixture_register(owner, None);
+        let actual = Arc::new(Mutex::new(FileMetadata::empty_network_fixture(
+            owner.thread,
+        )));
+        engine
+            .associate_fd_metadata(owner, &actual, &actual.lock().unwrap())
+            .unwrap();
+        let peer = stream_owner(32);
+        assert_eq!(
+            engine.fd_publication_fixture_register(peer, Some(owner)),
+            files
+        );
+        engine
+            .associate_fd_metadata(peer, &actual, &actual.lock().unwrap())
+            .unwrap();
+        let publication = engine.acquire_fd_publication(owner, files).unwrap();
+        let matched = Resolved {
+            creation: child.0,
+            cookie: 77,
+            physical: accepted::AcceptedPhysicalIdentity {
+                provider: 7,
+                object: 11,
+                namespace: 9,
+            },
+        };
+        let wrong = installation_fixture(
+            owner,
+            actual.clone(),
+            publication.permit,
+            Source::Accepted {
+                lease: reservation.lease,
+                child: Resolved {
+                    cookie: 78,
+                    ..matched
+                },
+            },
+            71,
+            17,
+            false,
+        );
+        assert!(
+            engine
+                .publish_original_installation(
+                    owner,
+                    &publication,
+                    &wrong,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::O_CLOEXEC,
+                    None,
+                    None,
+                    time(20)
+                )
+                .is_err()
+        );
+        assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        let receipt = removed_installation_fixture(
+            owner,
+            actual.clone(),
+            publication.permit,
+            Source::Accepted {
+                lease: reservation.lease,
+                child: matched,
+            },
+            71,
+            17,
+            true,
+        );
+        let binding = engine
+            .publish_original_installation(
+                owner,
+                &publication,
+                &receipt,
+                &actual,
+                &mut actual.lock().unwrap(),
+                nix::fcntl::OFlag::O_CLOEXEC,
+                None,
+                None,
+                time(20),
+            )
+            .unwrap();
+        assert_eq!(binding.slot.fd, 17);
+        assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        assert!(
+            engine
+                .lifetime
+                .binding_in_retained_table(files, 17)
+                .is_none()
+        );
+        let NetworkFdReadBegin::Admitted(read) = engine.begin_fd_read(peer, files, 17).unwrap()
+        else {
+            panic!("shared peer must observe completed removal")
+        };
+        assert_eq!(read.binding, None);
+        engine.finish_fd_read(peer, read).unwrap();
+        // The unchanged original completion remains success for its historical
+        // generation; a later actual removal cannot rewrite native accept.
+        let completed = engine
+            .complete_accepted_socket(
+                owner,
+                reservation.lease,
+                Ok(17),
+                Some(binding.open_file),
+                time(20),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.open_file, binding.open_file);
+        assert_eq!(completed.fd, 17);
+        assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        assert!(engine.fd_publications[&files].enrollment.is_none());
+    }
+
+    #[test]
+    fn accepted_original_consumer_resumes_retained_child_before_and_after_local_ack() {
+        for cut in 0..3 {
+            use std::sync::Arc;
+            use std::sync::Mutex;
+
+            use crate::network_runtime::accepted::Resolved;
+            use crate::network_runtime::original_installation::Source;
+            use crate::network_runtime::original_installation::installation_fixture;
+            use crate::tool_local::FileMetadata;
+            let (mut engine, listener, owner, cap) = accepted_record_fixture();
+            let child = accepted_observe(&mut engine, listener, &cap);
+            engine.original_installation_fixture_cookie(child, 77);
+            let call = active_pinned_call(&mut engine, listener, owner);
+            let reservation = engine.begin_accepted_socket(owner, call).unwrap().unwrap();
+            engine
+                .submit_accepted_socket(owner, reservation.lease)
+                .unwrap();
+            // Component authority only: the production constructor still refuses
+            // incomplete FD coverage. The consumer below is the production path.
+            engine.fd_table_fixture_enable();
+            let files = engine.fd_publication_fixture_register(owner, None);
+            let actual = Arc::new(Mutex::new(FileMetadata::empty_network_fixture(
+                owner.thread,
+            )));
+            engine
+                .associate_fd_metadata(owner, &actual, &actual.lock().unwrap())
+                .unwrap();
+            let peer = stream_owner(32);
+            assert_eq!(
+                engine.fd_publication_fixture_register(peer, Some(owner)),
+                files
+            );
+            engine
+                .associate_fd_metadata(peer, &actual, &actual.lock().unwrap())
+                .unwrap();
+            let publication = engine.acquire_fd_publication(owner, files).unwrap();
+            let matched = Resolved {
+                creation: child.0,
+                cookie: 77,
+                physical: accepted::AcceptedPhysicalIdentity {
+                    provider: 7,
+                    object: 11,
+                    namespace: 9,
+                },
+            };
+            let wrong = installation_fixture(
+                owner,
+                actual.clone(),
+                publication.permit,
+                Source::Accepted {
+                    lease: reservation.lease,
+                    child: Resolved {
+                        cookie: 78,
+                        ..matched
+                    },
+                },
+                71,
+                17,
+                false,
+            );
+            assert!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &publication,
+                        &wrong,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::O_CLOEXEC,
+                        None,
+                        None,
+                        time(20)
+                    )
+                    .is_err()
+            );
+            assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+            let receipt = installation_fixture(
+                owner,
+                actual.clone(),
+                publication.permit,
+                Source::Accepted {
+                    lease: reservation.lease,
+                    child: matched,
+                },
+                71,
+                17,
+                false,
+            );
+            let (prepared_binding, batch) = engine
+                .prepare_original_installation_publication(
+                    owner,
+                    &publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::O_CLOEXEC,
+                    None,
+                    None,
+                    time(20),
+                )
+                .unwrap();
+            // Same batch recovery must not reconfirm/dequeue a different child.
+            assert!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &publication,
+                        &wrong,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::O_CLOEXEC,
+                        None,
+                        None,
+                        time(21)
+                    )
+                    .is_err()
+            );
+            if cut >= 1 {
+                engine
+                    .publish_fd_publication(owner, publication.permit, &batch)
+                    .unwrap();
+            }
+            if cut >= 2 {
+                actual
+                    .lock()
+                    .unwrap()
+                    .publication_acknowledge(&batch)
+                    .unwrap();
+            }
+            assert!(matches!(
+                engine.begin_fd_read(peer, files, 17),
+                Err(NetworkReplayError::StreamOperationBusy(_))
+            ));
+            let binding = engine
+                .publish_original_installation(
+                    owner,
+                    &publication,
+                    &receipt,
+                    &actual,
+                    &mut actual.lock().unwrap(),
+                    nix::fcntl::OFlag::O_CLOEXEC,
+                    None,
+                    None,
+                    time(20),
+                )
+                .unwrap();
+            assert_eq!(binding, prepared_binding);
+            assert_eq!(binding.slot.fd, 17);
+            assert_eq!(
+                actual.lock().unwrap().descriptor_binding(17).unwrap(),
+                binding
+            );
+            // Before the creator's existing CompleteAcceptedSocket follow-up, a
+            // real shared-table reader sees both the inherited state and channel.
+            let NetworkFdReadBegin::Admitted(read) = engine.begin_fd_read(peer, files, 17).unwrap()
+            else {
+                panic!("accepted peer reader")
+            };
+            assert_eq!(read.binding, Some(binding));
+            assert!(
+                engine
+                    .stream_socket_state(binding.open_file)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(engine.channel_for(binding.open_file).is_some());
+            engine.finish_fd_read(peer, read).unwrap();
+            accepted_set(
+                &mut engine,
+                binding.open_file,
+                peer,
+                NetworkStreamSocketOption::ReceiveLowWater(9),
+            );
+            let completed = engine
+                .complete_accepted_socket(
+                    owner,
+                    reservation.lease,
+                    Ok(17),
+                    Some(binding.open_file),
+                    time(20),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.open_file, binding.open_file);
+            assert_eq!(completed.fd, 17);
+            assert_eq!(
+                engine
+                    .stream_socket_state(binding.open_file)
+                    .unwrap()
+                    .unwrap()
+                    .options
+                    .receive_low_water,
+                9
+            );
+            assert!(engine.fd_publications[&files].enrollment.is_none());
+            assert!(
+                engine
+                    .publish_original_installation(
+                        owner,
+                        &publication,
+                        &receipt,
+                        &actual,
+                        &mut actual.lock().unwrap(),
+                        nix::fcntl::OFlag::O_CLOEXEC,
+                        None,
+                        None,
+                        time(20)
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                actual.lock().unwrap().descriptor_binding(17).unwrap(),
+                binding
+            );
+        }
+    }
+
     fn accepted_install(
         engine: &mut NetworkReplayEngine,
         listener: OpenFileId,
@@ -10768,6 +12479,150 @@ mod tests {
             panic!("expected explicit V3")
         };
         trace
+    }
+
+    #[test]
+    fn release_eligible_rejects_late_invalid_child_without_publishing_valid_prefix() {
+        use detcore_model::network_trace::ChildDispositionV1;
+        let mut trace = accepted_trace_fixture();
+        let listener_channel = trace.history.inputs[0].channel;
+        trace.history.inputs[0].ordinal = 1;
+        trace.history.inputs.insert(
+            0,
+            NetworkInputEventV2 {
+                ordinal: 0,
+                channel: listener_channel,
+                release: NetworkReleaseV2 {
+                    not_before_global_time: time(9),
+                    after_transmitted_offset: 0,
+                },
+                event: NetworkInputKindV2::Readiness(NetworkReadinessV2 {
+                    readable: true,
+                    ..NetworkReadinessV2::default()
+                }),
+            },
+        );
+        let ReceiveModelV1::DeclaredCopyUnitsWithAcceptV2 { accepted, .. } =
+            &mut trace.receive_model
+        else {
+            panic!("explicit accepted model required")
+        };
+        accepted.children[0].history_prefix = 1;
+        let ChildDispositionV1::Accepted { input_ordinal, .. } =
+            &mut accepted.children[0].disposition
+        else {
+            panic!("accepted child required")
+        };
+        *input_ordinal = 1;
+        trace.validate().unwrap();
+        let mut engine = NetworkReplayEngine::replay_shadow(trace).unwrap();
+        let listener = open_file(200);
+        // A channel binding alone is insufficient for child inheritance. The
+        // missing socket enrollment is reached only after the valid prefix.
+        engine.bind(listener, listener_channel).unwrap();
+        assert_eq!(engine.next_release_time().unwrap(), Some(time(9)));
+        let before = format!("{engine:?}");
+        assert!(matches!(
+            engine.release_eligible(time(20)),
+            Err(NetworkReplayError::InvalidAcceptedReceipt)
+        ));
+        assert_eq!(format!("{engine:?}"), before);
+    }
+
+    #[test]
+    fn accepted_release_preparation_captures_inheritance_without_publishing_child() {
+        let mut engine = NetworkReplayEngine::replay_shadow(accepted_trace_fixture()).unwrap();
+        let listener = open_file(201);
+        let owner = stream_owner(81);
+        let profile = test_fresh_profile(libc::AF_INET);
+        engine
+            .register_accepted_fresh_send(profile.key, None)
+            .unwrap();
+        engine
+            .register_stream_socket(listener, profile.key, test_socket_namespace(), None)
+            .unwrap();
+        engine
+            .ensure_channel(
+                listener,
+                NetworkChannelBinding {
+                    transport: NetworkTransportV2::Tcp,
+                    role: NetworkEndpointRoleV2::Listener,
+                    peer_address: None,
+                    requested_local_constraint: None,
+                    observed_local_address: None,
+                    accepted_from: None,
+                    selected_channel: None,
+                },
+            )
+            .unwrap();
+        accepted_set(
+            &mut engine,
+            listener,
+            owner,
+            NetworkStreamSocketOption::ReceiveLowWater(7),
+        );
+        let before = format!("{engine:?}");
+        let prepared = engine.prepare_release_eligible(time(10)).unwrap();
+        assert_eq!(prepared.children.len(), 1);
+        assert_eq!(
+            prepared
+                .children
+                .values()
+                .next()
+                .unwrap()
+                .inherited
+                .options
+                .receive_low_water,
+            7
+        );
+        assert_eq!(format!("{engine:?}"), before);
+        assert_eq!(engine.next_child_release(), Some(time(10)));
+        assert!(
+            engine
+                .prepare_release_eligible(time(9))
+                .unwrap()
+                .children
+                .is_empty()
+        );
+
+        accepted_set(
+            &mut engine,
+            listener,
+            owner,
+            NetworkStreamSocketOption::ReceiveLowWater(9),
+        );
+        engine.confirm_release_eligible(prepared).unwrap();
+        assert_eq!(engine.next_child_release(), None);
+        engine.release_eligible(time(20)).unwrap();
+        let capability = accepted::AcceptedBackendCapability::controlled_fixture();
+        let ofd = open_file(202);
+        accepted_install(
+            &mut engine,
+            listener,
+            owner,
+            detcore_model::network_trace::ChildCreationIdV1(1),
+            &capability,
+            ofd,
+        );
+        assert_eq!(
+            engine
+                .stream_socket_state(ofd)
+                .unwrap()
+                .unwrap()
+                .options
+                .receive_low_water,
+            7
+        );
+        assert_eq!(
+            engine
+                .stream_socket_state(listener)
+                .unwrap()
+                .unwrap()
+                .options
+                .receive_low_water,
+            9
+        );
+        engine.finish().unwrap();
     }
     #[test]
     fn accepted_child_keeps_creation_options_after_listener_changes_and_exact_endpoints() {
@@ -11001,6 +12856,261 @@ mod tests {
             Err(NetworkReplayError::UnresolvedAcceptedChild(_))
         ));
     }
+    // Use the existing local installation journal and lifetime publisher to
+    // enroll the listener while FD capability is active. The controlled
+    // physical-effect helper is test evidence, not a native installation.
+    fn accepted_fd_record_fixture() -> (
+        NetworkReplayEngine,
+        NetworkStreamOwner,
+        FilesId,
+        std::sync::Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+        crate::types::FdSlotBinding,
+    ) {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::tool_local::FileMetadata;
+        let owner = stream_owner(31);
+        let actual = Arc::new(Mutex::new(FileMetadata::empty_network_fixture(
+            owner.thread,
+        )));
+        let (mut candidate, replacement) = actual
+            .lock()
+            .unwrap()
+            .prepare_original_installation(owner.thread, 7, nix::fcntl::OFlag::O_RDWR, None)
+            .unwrap();
+        let binding = replacement.after.unwrap().binding;
+        let (mut engine, listener, owner, _) =
+            accepted_record_fixture_for_listener(binding.open_file, owner);
+        engine.fd_table_fixture_enable();
+        let files = engine.fd_publication_fixture_register(owner, None);
+        assert_eq!(binding.slot.files, files);
+        assert_eq!(binding.slot.fd, 7);
+        assert_eq!(binding.open_file, listener);
+        engine
+            .associate_fd_metadata(owner, &actual, &actual.lock().unwrap())
+            .unwrap();
+        let admission = engine.acquire_fd_publication(owner, files).unwrap();
+        let effect = engine.fd_publication_fixture_effect(owner, replacement);
+        candidate
+            .associate_network_installation(replacement.installation_generation, effect)
+            .unwrap();
+        let batch = candidate.publication_snapshot(&admission).unwrap();
+        *actual.lock().unwrap() = candidate;
+        engine
+            .publish_fd_publication(owner, admission.permit, &batch)
+            .unwrap();
+        actual
+            .lock()
+            .unwrap()
+            .publication_acknowledge(&batch)
+            .unwrap();
+        engine
+            .acknowledge_fd_publication(owner, admission.permit, &batch)
+            .unwrap();
+        actual
+            .lock()
+            .unwrap()
+            .publication_server_acknowledge(&batch)
+            .unwrap();
+        assert_eq!(
+            actual.lock().unwrap().descriptor_binding(7).unwrap(),
+            binding
+        );
+        assert_eq!(engine.fd_publication_fixture_cursor(owner), (1, 1));
+        (engine, owner, files, actual, binding)
+    }
+
+    fn active_fd_pinned_call(
+        engine: &mut NetworkReplayEngine,
+        owner: NetworkStreamOwner,
+        binding: crate::types::FdSlotBinding,
+    ) -> NetworkStreamCallId {
+        assert!(engine.fd_table_capability());
+        let NetworkFdReadBegin::Admitted(read) = engine
+            .begin_fd_read(owner, binding.slot.files, binding.slot.fd)
+            .unwrap()
+        else {
+            panic!("listener descriptor admission")
+        };
+        assert_eq!(read.binding, Some(binding));
+        let call = engine
+            .begin_native_stream_call_from_read(owner, read.clone())
+            .unwrap();
+        assert!(call.physical_pin_required);
+        engine
+            .confirm_stream_call_pin(owner, call.id, NetworkStreamPinOutcome::Acquired)
+            .unwrap();
+        engine
+            .finish_socket_control(
+                owner,
+                read.control.unwrap(),
+                NetworkSocketControlFinish::Unchanged,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.stream_call_open_file(owner, call.id).unwrap(),
+            binding.open_file
+        );
+        call.id
+    }
+
+    #[test]
+    fn accepted_original_negative_consumer_confirms_before_completion_and_releases_peer() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use crate::network_runtime::accepted::checked_no_installation_fixture;
+        use crate::tool_local::FileMetadata;
+        let (mut engine, owner, files, actual, listener) = accepted_fd_record_fixture();
+        let peer = stream_owner(32);
+        assert_eq!(
+            engine.fd_publication_fixture_register(peer, Some(owner)),
+            files
+        );
+        engine
+            .associate_fd_metadata(peer, &actual, &actual.lock().unwrap())
+            .unwrap();
+        let call = active_fd_pinned_call(&mut engine, owner, listener);
+        let reservation = engine.begin_accepted_socket(owner, call).unwrap().unwrap();
+        engine
+            .submit_accepted_socket(owner, reservation.lease)
+            .unwrap();
+        let admission = engine.acquire_fd_publication(owner, files).unwrap();
+        let receipt = checked_no_installation_fixture(
+            owner,
+            reservation.lease,
+            actual.clone(),
+            admission.clone(),
+            false,
+        );
+        assert!(
+            engine
+                .complete_accepted_socket(
+                    owner,
+                    reservation.lease,
+                    Err(libc::EAGAIN),
+                    None,
+                    time(10)
+                )
+                .is_err()
+        );
+        let wrong = Arc::new(Mutex::new(FileMetadata::empty_network_fixture(
+            owner.thread,
+        )));
+        assert!(
+            engine
+                .confirm_original_accepted_no_installation(
+                    owner,
+                    reservation.lease,
+                    admission.permit,
+                    &wrong,
+                    &receipt
+                )
+                .is_err()
+        );
+        assert!(engine.acquire_fd_publication(peer, files).is_err());
+        engine
+            .confirm_original_accepted_no_installation(
+                owner,
+                reservation.lease,
+                admission.permit,
+                &actual,
+                &receipt,
+            )
+            .unwrap();
+        // The original accepter has not made its completion RPC yet.
+        let peer_admission = engine.acquire_fd_publication(peer, files).unwrap();
+        engine
+            .release_empty_fd_publication(peer, peer_admission.permit)
+            .unwrap();
+        assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        assert!(
+            engine
+                .complete_accepted_socket(
+                    owner,
+                    reservation.lease,
+                    Err(libc::EINTR),
+                    None,
+                    time(10)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .complete_accepted_socket(
+                    owner,
+                    reservation.lease,
+                    Err(libc::EAGAIN),
+                    None,
+                    time(10)
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            engine
+                .complete_accepted_socket(
+                    owner,
+                    reservation.lease,
+                    Err(libc::EAGAIN),
+                    None,
+                    time(11)
+                )
+                .unwrap(),
+            None
+        );
+        engine.begin_stream_call_release(owner, call).unwrap();
+        engine.finish_stream_call_release(owner, call).unwrap();
+    }
+
+    #[test]
+    fn accepted_original_negative_consumer_preserves_dequeued_and_dead_owner_refusals() {
+        use crate::network_runtime::accepted::checked_no_installation_fixture;
+        for dead in [false, true] {
+            let (mut engine, owner, files, actual, listener) = accepted_fd_record_fixture();
+            let call = active_fd_pinned_call(&mut engine, owner, listener);
+            let reservation = engine.begin_accepted_socket(owner, call).unwrap().unwrap();
+            engine
+                .submit_accepted_socket(owner, reservation.lease)
+                .unwrap();
+            let admission = engine.acquire_fd_publication(owner, files).unwrap();
+            let receipt = checked_no_installation_fixture(
+                owner,
+                reservation.lease,
+                actual.clone(),
+                admission.clone(),
+                !dead,
+            );
+            if dead {
+                engine.stream_owner_gone(owner);
+            }
+            assert!(
+                engine
+                    .confirm_original_accepted_no_installation(
+                        owner,
+                        reservation.lease,
+                        admission.permit,
+                        &actual,
+                        &receipt
+                    )
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .complete_accepted_socket(
+                        owner,
+                        reservation.lease,
+                        Err(libc::EAGAIN),
+                        None,
+                        time(10)
+                    )
+                    .is_err()
+            );
+            assert!(actual.lock().unwrap().descriptor_binding(17).is_err());
+        }
+    }
+
     #[test]
     fn accepted_pending_operation_blocks_call_release_and_preserves_unknown_effects_on_exit() {
         let (mut engine, listener, owner, cap) = accepted_record_fixture();
@@ -11458,6 +13568,10 @@ mod tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Physical syscall family which produced a descriptor installation.
 pub enum NetworkFdInstallKind {
+    /// One original Openat allocation with an authenticated fd_install pair.
+    Openat,
+    /// One original epoll allocation with the same authenticated fd_install pair.
+    EpollCreate,
     /// One fresh socket descriptor.
     Socket,
     /// Both descriptors from one atomic socketpair result.
@@ -11474,6 +13588,8 @@ pub enum NetworkFdInstallKind {
     ScmRights,
     /// A regular descriptor which replaced a network slot.
     RegularReplacement,
+    /// Original accepted-child installation, bound to the same accept receipt.
+    Accept,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Exact confirmed physical effect associated with one local installation.
@@ -11602,6 +13718,14 @@ pub struct NetworkFdLocalPublication {
 struct FdPublicationState {
     active: Option<NetworkFdPublicationPermit>,
     pending: Option<NetworkFdPublicationBatch>,
+    // Same publication owns semantic enrollment until its exact ACK.
+    enrollment: Option<original_installation::Enrollment>,
+    // Same sole table authority; present only before a logical reader transfers
+    // its permit/control to the existing Call. This is not a physical receipt.
+    reader: Option<NetworkFdReadAdmission>,
+    // Actual backend-owned metadata object, not a serialized snapshot. Weak
+    // association grants no table/task authority and keeps sharing counts intact.
+    metadata: Option<std::sync::Weak<std::sync::Mutex<crate::tool_local::FileMetadata>>>,
 }
 #[derive(Debug, Clone)]
 struct ConfirmedFdInstallation {
@@ -11614,6 +13738,8 @@ struct ConfirmedFdInstallation {
     installations: Vec<detcore_model::fd::NetworkFdSlotReplacement>,
     open_files: Vec<Option<OpenFileId>>,
     sources: Vec<SlotInstallationSource>,
+    // Generic numeric kernel-result confirmation cannot issue original birth authority.
+    original_creation: Option<original_installation::OriginalCreationAuthority>,
 }
 
 impl NetworkReplayEngine {
@@ -11705,6 +13831,11 @@ impl NetworkReplayEngine {
         batch: &NetworkFdPublicationBatch,
     ) -> Result<NetworkFdPublicationBatch, NetworkReplayError> {
         let task = self.validate_publication_permit(owner, permit)?;
+        if self.fd_publications[&permit.files].reader.is_some() {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "reader permit cannot publish a mutation".into(),
+            ));
+        }
         if batch.files != permit.files {
             return Err(NetworkReplayError::FdPublicationProtocol(
                 "batch table differs from permit".into(),
@@ -11735,6 +13866,8 @@ impl NetworkReplayEngine {
                     "stale or changed acknowledged prefix".into(),
                 ));
             }
+            self.settle_fd_enrollment(permit, batch)?;
+            self.complete_fd_mutation_publication(owner, permit)?;
             return Ok(batch.clone());
         }
         let mut entries = Vec::with_capacity(batch.entries.len());
@@ -11783,6 +13916,28 @@ impl NetworkReplayEngine {
                     NetworkReplayError::FdPublicationProtocol("missing confirmed provenance".into())
                 })?
                 .clone();
+            let source = if let Some(original) = &physical.original_creation {
+                let kind = match physical.kind {
+                    NetworkFdInstallKind::Socket => lifetime::OriginalCreationKind::Socket,
+                    NetworkFdInstallKind::EpollCreate => lifetime::OriginalCreationKind::Epoll,
+                    _ => {
+                        return Err(NetworkReplayError::FdPublicationProtocol(
+                            "original creation proof changed its confirmed kind".into(),
+                        ));
+                    }
+                };
+                if source != SlotInstallationSource::Fresh {
+                    return Err(NetworkReplayError::FdPublicationProtocol(
+                        "original creation proof is not a fresh installation".into(),
+                    ));
+                }
+                SlotInstallationSource::FreshOriginal {
+                    owner: original.owner(),
+                    kind,
+                }
+            } else {
+                source
+            };
             entries.push(SlotPublicationEntry {
                 replacement: entry.replacement,
                 source,
@@ -11849,6 +14004,9 @@ impl NetworkReplayEngine {
         self.fd_publication_history
             .insert((batch.files, batch.sequence), batch.clone());
         self.fd_publications.get_mut(&permit.files).unwrap().pending = Some(batch.clone());
+        // Enrollment is part of the same synchronous publication. A failure
+        // retains the exact plan/prefix and controls for generic recovery.
+        self.settle_fd_enrollment(permit, batch)?;
         // The real installation and exact recovery prefix are now durable.
         // Release its short controls before replying; local ACK loss cannot
         // strand a dead owner's controls or require repeating a kernel effect.
@@ -11874,6 +14032,8 @@ impl NetworkReplayEngine {
                 "uncommitted or mismatched local ACK".into(),
             ));
         }
+        self.settle_fd_enrollment(permit, batch)?;
+        self.complete_fd_mutation_publication(owner, permit)?;
         let task = self.publication_owner(owner, permit.files)?;
         self.lifetime
             .acknowledge_publication_batch(task, batch.sequence, batch.through_generation)
@@ -11882,6 +14042,7 @@ impl NetworkReplayEngine {
             .remove(&(batch.files, batch.sequence));
         let state = self.fd_publications.get_mut(&permit.files).unwrap();
         state.pending = None;
+        state.enrollment = None;
         state.active = None;
         Ok(())
     }
@@ -11893,22 +14054,35 @@ impl NetworkReplayEngine {
     ) -> Result<(), NetworkReplayError> {
         self.validate_publication_permit(owner, permit)?;
         let state = self.fd_publications.get_mut(&permit.files).unwrap();
-        if state.pending.is_some() {
+        if state.pending.is_some() || state.enrollment.is_some() {
             return Err(NetworkReplayError::FdPublicationProtocol(
-                "release would erase a pending prefix".into(),
+                "release would erase a pending prefix or enrollment".into(),
+            ));
+        }
+        if state.reader.is_some() {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "release would erase an owned reader".into(),
             ));
         }
         state.active = None;
         Ok(())
     }
     fn fd_publication_owner_gone(&mut self, owner: NetworkStreamOwner) {
+        self.consume_logical_fd_reads(owner);
         let unresolved: BTreeSet<_> = self
             .fd_publications
             .values()
             .filter_map(|state| {
                 state
                     .active
-                    .filter(|permit| self.physical_fd_mutation_pending(*permit))
+                    .filter(|permit| {
+                        self.physical_fd_mutation_pending(*permit)
+                            || self.native_stream_capture_pending(*permit)
+                            || state
+                                .enrollment
+                                .as_ref()
+                                .is_some_and(|plan| !plan.completed)
+                    })
                     .map(|p| p.lease)
             })
             .collect();
@@ -11983,6 +14157,7 @@ impl NetworkReplayEngine {
                 returned_fds: vec![fd],
                 installations: vec![replacement],
                 open_files: vec![replacement.after.map(|slot| slot.binding.open_file)],
+                original_creation: None,
                 sources: vec![if replacement.after.is_some() {
                     SlotInstallationSource::Fresh
                 } else {
@@ -12184,6 +14359,7 @@ mod fd_publication_authority_tests {
                     b.after.map(|slot| slot.binding.open_file),
                 ],
                 sources: vec![SlotInstallationSource::Fresh, SlotInstallationSource::Fresh],
+                original_creation: None,
             },
         );
         let entry = |change: NetworkFdSlotReplacement, result_index, returned_fd| {
@@ -12224,5 +14400,375 @@ mod fd_publication_authority_tests {
         engine
             .acknowledge_fd_publication(owner, permit, &value)
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fd_read_transfer_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::types::DetTid;
+    use crate::types::FdSlot;
+    use crate::types::FdSlotBinding;
+    use crate::types::MmId;
+    use crate::types::NetworkFdSlot;
+    use crate::types::NetworkFdSlotReplacement;
+
+    fn setup() -> (
+        NetworkReplayEngine,
+        NetworkStreamOwner,
+        NetworkStreamOwner,
+        FdSlotBinding,
+    ) {
+        let thread = DetTid::from_raw(81);
+        let owner = NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        let peer = NetworkStreamOwner {
+            thread: DetTid::from_raw(82),
+            mm: owner.mm,
+        };
+        let mut engine = NetworkReplayEngine::record(Utc.timestamp_opt(1_790_000_000, 0).unwrap());
+        // Explicit component authority; this is not the production capability
+        // issuer or native capture evidence.
+        engine.fd_table_fixture_enable();
+        let files = engine.fd_publication_fixture_register(owner, None);
+        assert_eq!(
+            engine.fd_publication_fixture_register(peer, Some(owner)),
+            files
+        );
+        let binding = FdSlotBinding {
+            slot: FdSlot { files, fd: 7 },
+            generation: 1,
+            open_file: OpenFileId::new_socket(thread, 1),
+        };
+        let replacement = NetworkFdSlotReplacement {
+            files,
+            installation_generation: 1,
+            before: None,
+            after: Some(NetworkFdSlot {
+                binding,
+                cloexec: false,
+            }),
+        };
+        let effect = engine.fd_publication_fixture_effect(owner, replacement);
+        let permit = engine.acquire_fd_publication(owner, files).unwrap().permit;
+        let batch = NetworkFdPublicationBatch {
+            files,
+            sequence: 1,
+            previous_generation: 0,
+            through_generation: 1,
+            entries: vec![NetworkFdPublicationEntry {
+                replacement,
+                effect,
+            }],
+        };
+        engine
+            .publish_fd_publication(owner, permit, &batch)
+            .unwrap();
+        engine
+            .acknowledge_fd_publication(owner, permit, &batch)
+            .unwrap();
+        (engine, owner, peer, binding)
+    }
+    fn read(
+        engine: &mut NetworkReplayEngine,
+        owner: NetworkStreamOwner,
+        binding: FdSlotBinding,
+    ) -> NetworkFdReadAdmission {
+        let NetworkFdReadBegin::Admitted(read) = engine
+            .begin_fd_read(owner, binding.slot.files, binding.slot.fd)
+            .unwrap()
+        else {
+            panic!("unexpected recovery")
+        };
+        assert_eq!(read.binding, Some(binding));
+        read
+    }
+    #[test]
+    fn fd_read_transfer_keeps_exact_permit_until_known_capture_without_reacquisition() {
+        let (mut engine, owner, peer, binding) = setup();
+        let read = read(&mut engine, owner, binding);
+        let next_lease = engine.next_stream_lease;
+        let call = engine
+            .begin_native_stream_call_from_read(owner, read.clone())
+            .unwrap();
+        assert_eq!(engine.next_stream_lease, next_lease);
+        assert_eq!(
+            engine.stream_calls[&call.id].capture_publication,
+            Some(read.publication.permit)
+        );
+        assert_eq!(engine.stream_calls[&call.id].capture_control, read.control);
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (1, 1, 1, 1)
+        );
+        assert!(matches!(
+            engine.acquire_fd_publication(peer, binding.slot.files),
+            Err(NetworkReplayError::StreamOperationBusy(_))
+        ));
+        assert!(engine.finish_fd_read(owner, read.clone()).is_err());
+        assert!(
+            engine
+                .begin_native_stream_call_from_read(owner, read.clone())
+                .is_err()
+        );
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (1, 1, 1, 1)
+        );
+        // This explicit component result is not an executed pidfd_getfd receipt.
+        engine
+            .confirm_stream_call_pin(owner, call.id, NetworkStreamPinOutcome::Acquired)
+            .unwrap();
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (1, 1, 0, 1)
+        );
+        let publication = engine
+            .acquire_fd_publication(peer, binding.slot.files)
+            .unwrap();
+        engine
+            .release_empty_fd_publication(peer, publication.permit)
+            .unwrap();
+        assert!(matches!(
+            engine.begin_socket_controls(peer, vec![binding.open_file]),
+            Err(NetworkReplayError::StreamOperationBusy(_))
+        ));
+        engine
+            .finish_socket_control(
+                owner,
+                read.control.unwrap(),
+                NetworkSocketControlFinish::Unchanged,
+            )
+            .unwrap();
+        let peer_control = engine
+            .begin_socket_controls(peer, vec![binding.open_file])
+            .unwrap()[0]
+            .1;
+        engine
+            .finish_socket_control(peer, peer_control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+        assert_eq!(
+            engine.stream_call_open_file(owner, call.id).unwrap(),
+            binding.open_file
+        );
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (1, 0, 0, 1)
+        );
+        engine.begin_stream_call_release(owner, call.id).unwrap();
+        engine.finish_stream_call_release(owner, call.id).unwrap();
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (0, 0, 0, 0)
+        );
+    }
+    #[test]
+    fn fd_read_busy_descriptor_never_holds_table_while_waiting_for_peer() {
+        let (mut engine, owner, peer, binding) = setup();
+        let control = engine
+            .begin_socket_controls(peer, vec![binding.open_file])
+            .unwrap()[0]
+            .1;
+        let next_call = engine.next_stream_call;
+        assert!(
+            matches!(engine.begin_fd_read(owner, binding.slot.files, 7), Err(NetworkReplayError::StreamOperationBusy(id)) if id == control)
+        );
+        assert_eq!(engine.next_stream_call, next_call);
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (0, 1, 0, 0)
+        );
+        assert!(engine.fd_publications[&binding.slot.files].reader.is_none());
+        let publication = engine
+            .acquire_fd_publication(peer, binding.slot.files)
+            .unwrap();
+        engine
+            .release_empty_fd_publication(peer, publication.permit)
+            .unwrap();
+        engine
+            .finish_socket_control(peer, control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+        let read = read(&mut engine, owner, binding);
+        engine.finish_fd_read(owner, read).unwrap();
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (0, 0, 0, 0)
+        );
+    }
+    #[test]
+    fn fd_read_wrong_owner_prefix_slot_and_control_leave_original_authority_intact() {
+        let (mut engine, owner, peer, binding) = setup();
+        let read = read(&mut engine, owner, binding);
+        for variant in 0..6 {
+            let mut wrong = read.clone();
+            let sender = if variant == 0 { peer } else { owner };
+            match variant {
+                0 => {}
+                1 => wrong.publication.permit.owner.mm = MmId::initial(DetTid::from_raw(99)),
+                2 => wrong.publication.acknowledged_sequence += 1,
+                3 => wrong.binding.as_mut().unwrap().generation += 1,
+                4 => wrong.control = None,
+                5 => wrong.fd = 8,
+                _ => unreachable!(),
+            }
+            let before = format!("{engine:?}");
+            assert!(
+                engine
+                    .begin_native_stream_call_from_read(sender, wrong.clone())
+                    .is_err()
+            );
+            assert!(engine.finish_fd_read(sender, wrong).is_err());
+            assert_eq!(format!("{engine:?}"), before);
+        }
+        assert!(
+            engine
+                .release_empty_fd_publication(owner, read.publication.permit)
+                .is_err()
+        );
+        engine.finish_fd_read(owner, read).unwrap();
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (0, 0, 0, 0)
+        );
+    }
+    #[test]
+    fn fd_read_lost_pretransfer_reply_is_consumed_without_inventing_capture() {
+        for final_wait_first in [false, true] {
+            let (mut engine, owner, peer, binding) = setup();
+            let _lost = read(&mut engine, owner, binding);
+            assert_eq!(
+                engine.native_capture_fixture_counts(binding.open_file),
+                (0, 1, 1, 0)
+            );
+            if final_wait_first {
+                assert!(!engine.native_stream_final_wait(owner));
+            }
+            engine.retire_fd_table_owner(owner);
+            engine.stream_owner_gone(owner);
+            assert_eq!(
+                engine.native_capture_fixture_counts(binding.open_file),
+                (0, 0, 0, 0)
+            );
+            let publication = engine
+                .acquire_fd_publication(peer, binding.slot.files)
+                .unwrap();
+            engine
+                .release_empty_fd_publication(peer, publication.permit)
+                .unwrap();
+            assert_eq!(
+                engine
+                    .lifetime
+                    .descriptor_binding(
+                        TaskOwner {
+                            tid: peer.thread,
+                            mm: peer.mm
+                        },
+                        7
+                    )
+                    .unwrap(),
+                binding
+            );
+        }
+    }
+    #[test]
+    fn fd_read_lost_transfer_reply_remains_the_original_capture_calls_custody() {
+        let (mut engine, owner, _peer, binding) = setup();
+        let read = read(&mut engine, owner, binding);
+        let call = engine
+            .begin_native_stream_call_from_read(owner, read.clone())
+            .unwrap();
+        assert!(engine.fd_publications[&binding.slot.files].reader.is_none());
+        engine.retire_fd_table_owner(owner);
+        engine.stream_owner_gone(owner);
+        assert_eq!(engine.abandoned_native_captures(owner), vec![call.id]);
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (1, 1, 1, 1)
+        );
+        assert!(engine.finish_fd_read(owner, read.clone()).is_err());
+        assert!(
+            engine
+                .begin_native_stream_call_from_read(owner, read)
+                .is_err()
+        );
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            engine.stream_calls[&call.id].phase,
+            StreamCallPhase::PinAcquireSubmitted
+        );
+        assert!(!engine.stream_calls[&call.id].final_wait);
+    }
+    #[test]
+    fn fd_read_known_capture_failure_releases_only_its_call_before_control_ack() {
+        let (mut engine, owner, _peer, binding) = setup();
+        let read = read(&mut engine, owner, binding);
+        let call = engine
+            .begin_native_stream_call_from_read(owner, read.clone())
+            .unwrap();
+        let before = format!("{engine:?}");
+        assert!(
+            engine
+                .confirm_stream_call_pin(owner, call.id, NetworkStreamPinOutcome::Failed(0))
+                .is_err()
+        );
+        assert_eq!(format!("{engine:?}"), before);
+        engine
+            .confirm_stream_call_pin(owner, call.id, NetworkStreamPinOutcome::Failed(libc::EPERM))
+            .unwrap();
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (0, 1, 0, 0)
+        );
+        assert!(engine.finish_fd_read(owner, read.clone()).is_err());
+        engine
+            .finish_socket_control(
+                owner,
+                read.control.unwrap(),
+                NetworkSocketControlFinish::Unchanged,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.native_capture_fixture_counts(binding.open_file),
+            (0, 0, 0, 0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_version_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn native_versioned_finalization_and_replay_share_exact_epoch_and_frame() {
+        let epoch: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let engine = NetworkReplayEngine::record_native_receive(epoch);
+        let trace = engine.into_recorded_versioned_trace().unwrap();
+        assert!(matches!(&trace, NetworkTrace::V4(native) if native.epoch == epoch));
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let decoded = NetworkTrace::read_framed(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, trace);
+        let replay =
+            NetworkReplayEngine::replay_versioned_with_expected_epoch(decoded.clone(), epoch)
+                .unwrap();
+        assert!(replay.native_receive_version());
+        assert_eq!(replay.mode(), NetworkEngineMode::Replay);
+        assert_eq!(replay.trace_epoch(), epoch);
+        let wrong = epoch + chrono::Duration::nanoseconds(1);
+        assert!(
+            matches!(NetworkReplayEngine::replay_versioned_with_expected_epoch(decoded, wrong),
+            Err(NetworkReplayError::EpochMismatch { expected, actual }) if expected == wrong && actual == epoch)
+        );
+        assert!(matches!(
+            replay.into_recorded_versioned_trace(),
+            Err(NetworkReplayError::WrongMode)
+        ));
     }
 }

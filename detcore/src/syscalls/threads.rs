@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! System calls for dealing with threads and concurrency.
 
@@ -874,6 +874,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let backend_uninstrumented_thread =
             flags.contains(CloneFlags::CLONE_THREAD) && !self.cfg.backend_dispatches_thread_tools;
 
+        // NoSeq vfork must publish inheritance at its actual child startup,
+        // before the kernel releases the parent's suspended clone continuation.
+        let child_registers_no_seq =
+            !self.cfg.sequentialize_threads && !backend_uninstrumented_thread;
+
         // Publication and table ownership are established before the physical
         // clone, not when its returned TID is observed after a vfork child ran.
         let fd_clone = self
@@ -883,26 +888,50 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
 
+        let native_birth_required = fd_clone.is_some();
+        let child_registers_common = child_registers_no_seq || native_birth_required;
+        let child_priority_entropy = if (parent_blocks_for_child || child_registers_common)
+            && self.cfg.chaos
+            && self.cfg.replay_preemptions_from.is_none()
+            && self.cfg.replay_schedule_from.is_none()
+        {
+            let mut parent_chaos_prng = guest.thread_state().chaos_prng.clone();
+            Some(parent_chaos_prng.next_u64())
+        } else {
+            None
+        };
+        let no_seq_birth = if child_registers_common {
+            Some(
+                crate::tool_global::prepare_no_seq_child_birth(
+                    guest,
+                    flags,
+                    ctid,
+                    exit_signal,
+                    child_priority_entropy,
+                    fd_clone
+                        .as_ref()
+                        .map(|admission| admission.publication.permit),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
+        assert!(ts.pending_no_seq_birth.is_none());
+        ts.pending_no_seq_birth = no_seq_birth.clone();
         assert!(ts.pending_fd_clone.is_none());
         ts.pending_fd_clone = fd_clone
             .as_ref()
             .map(|admission| admission.publication.permit);
         ts.clone_flags = Some(flags);
+        ts.native_birth_required = native_birth_required;
+        ts.native_child_outcome = None;
 
         let parent_dettid = ts.dettid;
-        let child_priority_entropy = if parent_blocks_for_child
-            && self.cfg.chaos
-            && self.cfg.replay_preemptions_from.is_none()
-            && self.cfg.replay_schedule_from.is_none()
-        {
-            let mut parent_chaos_prng = ts.chaos_prng.clone();
-            Some(parent_chaos_prng.next_u64())
-        } else {
-            None
-        };
         if parent_blocks_for_child {
             ts.pending_vfork = Some(PendingVfork {
                 parent_dettid,
@@ -935,12 +964,70 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, resources).await;
         }
 
+        if let Some(admission) = &fd_clone {
+            crate::tool_global::prepare_network_native_birth(
+                guest,
+                admission.publication.permit,
+                Syscall::from(clone_family).number() as i32,
+            )
+            .await?;
+        }
+        if native_birth_required || !self.cfg.sequentialize_threads {
+            assert_eq!(guest.thread_state_mut().uninvoked_fd_clone.take(), fd_clone);
+        }
+        if let Some(birth) = &no_seq_birth {
+            assert_eq!(
+                guest.thread_state_mut().uninvoked_wait_call.take(),
+                Some(crate::scheduler::UninvokedWaitCall::birth(birth.clone()))
+            );
+        }
+        // No suspension separates consuming the uninvoked marker and invoking
+        // the original native syscall. Any later cancellation is unknown.
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
-        let observed_res = self
-            .observe_network_fd_result(guest, fd_clone.as_ref(), maybe_res)
-            .await;
+        if let Some(admission) = &fd_clone {
+            crate::tool_global::collect_network_native_birth(
+                guest,
+                admission.publication.permit,
+                maybe_res,
+            )
+            .await?;
+        }
+        let native_outcome = if maybe_res.is_ok() {
+            guest
+                .thread_state()
+                .native_construction()
+                .map_err(|e| Error::Tool(anyhow::anyhow!(e)))?
+        } else {
+            None
+        };
+        let successful_flags = native_outcome
+            .as_ref()
+            .map_or(flags, |outcome| outcome.flags());
+        let successful_ctid = native_outcome
+            .as_ref()
+            .map_or(ctid, |outcome| outcome.clear_child_tid());
+        let successful_exit_signal = native_outcome
+            .as_ref()
+            .map_or(exit_signal, |outcome| outcome.exit_signal());
+        let actual_is_vfork = successful_flags.contains(CloneFlags::CLONE_VFORK);
+        let actual_parent_blocks = actual_is_vfork
+            || (self.cfg.backend_serializes_fork_children
+                && !successful_flags.contains(CloneFlags::CLONE_THREAD));
+        // Clear only on the actual native error. An absent parent callback
+        // retains both the birth record and the submitted descriptor permit.
+        if let (Some(birth), Err(errno)) = (&no_seq_birth, maybe_res) {
+            crate::tool_global::cancel_no_seq_child_birth(guest, birth.clone(), errno).await?;
+        }
+        let observed_res = if no_seq_birth.is_some() && maybe_res.is_err() {
+            // CancelNoSeqBirth atomically settled the same known native error
+            // and exact submitted FD permit. Do not send a duplicate result.
+            maybe_res.map_err(Error::from)
+        } else {
+            self.observe_network_fd_result(guest, fd_clone.as_ref(), maybe_res)
+                .await
+        };
 
-        if parent_blocks_for_child && self.cfg.sequentialize_threads {
+        if actual_parent_blocks && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
             if maybe_res.is_err() {
                 // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
@@ -952,7 +1039,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     ResourceID::VforkFailed(blocking_child_op_id),
                     Permission::RW,
                 );
-                resources.fyi(if is_vfork {
+                resources.fyi(if actual_is_vfork {
                     "clone_vfork_failed"
                 } else {
                     "clone_serialized_child_failed"
@@ -962,7 +1049,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     ResourceID::BlockedExternalContinue(blocking_child_op_id),
                     Permission::RW,
                 );
-                resources.fyi(if is_vfork {
+                resources.fyi(if actual_is_vfork {
                     "clone_vfork"
                 } else {
                     "clone_serialized_child"
@@ -972,13 +1059,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let ts = guest.thread_state_mut();
+        ts.native_child_outcome = None;
+        ts.native_birth_required = false;
         ts.clone_flags = None; // Unset, now that it has been read by the child.
         ts.pending_vfork = None;
+        ts.pending_no_seq_birth = None;
         ts.pending_fd_clone = None;
 
         let res = observed_res?;
 
-        if !flags.contains(CloneFlags::CLONE_THREAD) {
+        if !successful_flags.contains(CloneFlags::CLONE_THREAD) {
             // Only a successful process clone can let another process mutate
             // inherited open file descriptions. Failed clone-family calls leave
             // the previously observed flock state authoritative.
@@ -987,7 +1077,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // Match ordinary clone: the parent consumes the priority entropy after
         // the child has inherited the parent state.
-        if parent_blocks_for_child
+        if (parent_blocks_for_child || child_registers_common)
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
@@ -998,14 +1088,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let child_tid = Pid::from_raw(res as i32);
-        let child_dettid = DetTid::from_raw(child_tid.into()); // TODO(T78538674), virtualized tid/pid
+        let child_dettid = native_outcome.as_ref().map_or_else(
+            || DetTid::from_raw(child_tid.into()),
+            |outcome| outcome.child().thread,
+        );
         trace!(
             "[detcore] dtid {} cloned, continuing parent + register new thread.",
             child_dettid
         );
 
-        if !parent_blocks_for_child && !backend_uninstrumented_thread {
-            create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal, None).await;
+        if !parent_blocks_for_child && !backend_uninstrumented_thread && !child_registers_common {
+            create_child_thread(
+                guest,
+                child_dettid,
+                successful_ctid,
+                Some(successful_flags),
+                successful_exit_signal,
+                None,
+            )
+            .await;
+        }
+        if let Some(birth) = no_seq_birth {
+            // A surviving parent cannot execute a post-clone group/session
+            // mutation before its physical child's common registration.
+            crate::tool_global::join_no_seq_child_birth(guest, birth, child_dettid).await?;
         }
 
         {
@@ -1018,7 +1124,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
 
-        Ok(child_dettid.as_raw() as i64)
+        // Keep the original same-call kernel result. Child construction uses
+        // its held-generation projection, never a guessed PID-namespace map.
+        Ok(if native_outcome.is_some() {
+            res
+        } else {
+            child_dettid.as_raw() as i64
+        })
     }
 
     // TODO-HUMAN-REVIEW(PR-2985): Review scheduler tracking of set_tid_address.

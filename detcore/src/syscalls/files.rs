@@ -4,9 +4,11 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! System calls for dealing with the file system.
+
+mod owned_read;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -65,11 +67,40 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
+/// Selects only modeled metadata access. Numeric compatibility callers keep
+/// each original lookup at its original point; admitted callers use one OFD.
+enum ProcfsReadDescription<'a> {
+    Numeric(i32),
+    Selected(&'a DetFd),
+}
+impl ProcfsReadDescription<'_> {
+    fn with<T: RecordOrReplay, G: Guest<Detcore<T>>, V>(
+        &self,
+        guest: &G,
+        action: impl FnOnce(&DetFd) -> V,
+    ) -> Result<V, Errno> {
+        match self {
+            Self::Numeric(fd) => {
+                // FileMetadata::with_detfd invokes its FnMut callback once,
+                // after lookup while retaining the same metadata lock.
+                let mut action = Some(action);
+                guest.thread_state().with_detfd(*fd, |description| {
+                    action.take().expect("single descriptor lookup callback")(description)
+                })
+            }
+            Self::Selected(description) => Ok(action(description)),
+        }
+    }
+}
+
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     // An otherwise unsafe "cast" which leans on the `linux_flags_assumptions` below.
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
 }
+
+#[cfg(test)]
+use crate::network_runtime::required_initial_metadata;
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -506,16 +537,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         write: bool,
     ) -> Result<(), Errno> {
         guest.thread_state().with_detfd(fd, |detfd| {
-            let flags = detfd.status_flags();
-            let mode = flags & libc::O_ACCMODE;
-            let denied = flags & libc::O_PATH != 0
-                || if write {
-                    mode == libc::O_RDONLY
-                } else {
-                    mode == libc::O_WRONLY
-                };
-            (!denied).then_some(()).ok_or(Errno::EBADF)
+            self.require_timer_slack_description_access(detfd, write)
         })?
+    }
+
+    fn require_timer_slack_description_access(
+        &self,
+        detfd: &DetFd,
+        write: bool,
+    ) -> Result<(), Errno> {
+        let flags = detfd.status_flags();
+        let mode = flags & libc::O_ACCMODE;
+        let denied = flags & libc::O_PATH != 0
+            || if write {
+                mode == libc::O_RDONLY
+            } else {
+                mode == libc::O_WRONLY
+            };
+        (!denied).then_some(()).ok_or(Errno::EBADF)
     }
 
     fn read_timer_slack_input<G: Guest<Self>>(
@@ -536,27 +575,70 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn read_timer_slack<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        fd: RawFd,
+        fd: i32,
         buffer: Option<AddrMut<'_, u8>>,
         maximum: usize,
     ) -> Result<i64, Error> {
-        self.require_timer_slack_access(guest, fd, false)?;
+        self.read_timer_slack_description(
+            guest,
+            ProcfsReadDescription::Numeric(fd),
+            buffer,
+            maximum,
+        )
+        .await
+    }
+
+    async fn read_selected_timer_slack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        detfd: &DetFd,
+        buffer: Option<AddrMut<'_, u8>>,
+        maximum: usize,
+    ) -> Result<i64, Error> {
+        self.read_timer_slack_description(
+            guest,
+            ProcfsReadDescription::Selected(detfd),
+            buffer,
+            maximum,
+        )
+        .await
+    }
+
+    async fn read_timer_slack_description<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        description: ProcfsReadDescription<'_>,
+        buffer: Option<AddrMut<'_, u8>>,
+        maximum: usize,
+    ) -> Result<i64, Error> {
+        description.with(guest, |detfd| {
+            self.require_timer_slack_description_access(detfd, false)
+        })??;
         if maximum == 0 {
             return Ok(0);
         }
-        let binding = self
-            .timer_slack_binding(guest, fd)?
+        let binding = description
+            .with(guest, |detfd| {
+                detfd
+                    .procfs_timer_slack_binding()
+                    .map(|(target, device, inode)| TimerSlackBinding {
+                        target,
+                        device,
+                        inode,
+                    })
+            })?
             .expect("timer-slack read lost its procfs classification");
         self.require_current_timer_slack_target(guest, binding)
             .await?;
         let value = guest.thread_state().timer_slack_ns;
-        let preview = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.preview_procfs_timer_slack(value, maximum))?
+        let preview = description
+            .with(guest, |detfd| {
+                detfd.preview_procfs_timer_slack(value, maximum)
+            })?
             .expect("timer-slack procfs state disappeared");
         let copied = copy_timer_slack_output(&mut guest.memory(), buffer, &preview.bytes)?;
         if copied != 0 {
-            guest.thread_state().with_detfd(fd, |detfd| {
+            description.with(guest, |detfd| {
                 detfd.commit_procfs_timer_slack_read(&preview, copied);
             })?;
         }
@@ -825,12 +907,124 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // TODO-HUMAN-REVIEW: original allocation, held-file identity and publication;
+    // bind this audit marker to the introducing PR when this slice is partitioned.
+    async fn handle_original_openat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+    ) -> Result<i64, Error> {
+        // Tracer reads are advisory. Linux still validates the actual original
+        // flags/path/dirfd in its own order; no annotation error becomes the
+        // guest's result and no bad dirfd defeats a valid absolute pathname.
+        let path: Option<PathBuf> = call.path().and_then(|path| path.read(&guest.memory()).ok());
+        let observed_path = path.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else if call.dirfd() == libc::AT_FDCWD {
+                resolved_at_fdcwd_path(guest.pid().as_raw(), path).unwrap_or_else(|| path.clone())
+            } else {
+                guest
+                    .thread_state()
+                    .with_detfd(call.dirfd(), |fd| fd.path())
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| path.clone(), |directory| directory.join(path))
+            }
+        });
+        // Preserve the ordinary path scheduling marker, including unreadable
+        // annotations. The original invocation separately yields its turn
+        // while Linux and the held-file observer may block.
+        let resource = path.map_or_else(
+            || ResourceID::PathsTransitive(PathBuf::from("/")),
+            ResourceID::Path,
+        );
+        let request = guest.thread_state().mk_request(resource, Permission::R);
+        resource_request(guest, request).await;
+        let result = async {
+            let (returned, published) = self.network_original_openat(guest, call).await?;
+            let binding = published.binding.ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "positive Openat lacks original publication"
+                ))
+            })?;
+            if i64::from(binding.slot.fd) != returned {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "Openat publication changed actual returned descriptor"
+                )));
+            }
+            if !published.live {
+                return Ok(returned);
+            }
+            let path = observed_path.or_else(|| published.resolved_path.clone());
+            let mut procfs = path
+                .as_ref()
+                .and_then(|path| ProcfsFile::from_path(path))
+                .or_else(|| {
+                    published
+                        .resolved_path
+                        .as_ref()
+                        .and_then(|path| ProcfsFile::from_path(path))
+                });
+            if procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::needs_bound_thread_identity)
+            {
+                // These are identity queries, not a second FD capture/getattr.
+                // Final annotation below still checks the exact published binding.
+                let tgid = guest.inject(syscalls::Getpid::new()).await? as i32;
+                let tid = guest.inject(syscalls::Gettid::new()).await? as i32;
+                let ppid = guest.inject(syscalls::Getppid::new()).await? as i32;
+                procfs
+                    .as_mut()
+                    .unwrap()
+                    .bind_thread_identity(tgid, tid, ppid);
+            }
+            if procfs
+                .as_ref()
+                .and_then(ProcfsFile::timer_slack_target)
+                .is_some()
+            {
+                let stat = published.stat.ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "Openat procfs annotation lacks exact held stat"
+                    ))
+                })?;
+                let stat = libc::stat::from(&stat);
+                procfs
+                    .as_mut()
+                    .unwrap()
+                    .bind_timer_slack_identity(stat.st_dev, stat.st_ino);
+            }
+            guest
+                .thread_state()
+                .with_published_detfd(binding, |detfd| {
+                    if let Some(path) = &path {
+                        detfd.set_path(path);
+                    }
+                    if let Some(procfs) = procfs.clone() {
+                        detfd.set_procfs(procfs);
+                    }
+                })?;
+            Ok(returned)
+        }
+        .await;
+        // Match the ordinary path protocol on success, native errno and
+        // annotation failure. Terminal cancellation retains its backend owner.
+        resource_release_all(guest).await;
+        result
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Openat,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if self.network_fd_tracking_active(guest) {
+            return self.handle_original_openat(guest, call).await;
+        }
         let path = call.path().ok_or(Errno::EFAULT)?;
         let path: PathBuf = path.read(&guest.memory())?;
         // A relative spelling is not the object. `chdir("/sys/module/kvm");
@@ -957,6 +1151,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Close,
     ) -> Result<i64, Error> {
+        if guest.config().network_trace.policy
+            == detcore_model::network_trace::NetworkPolicy::Record
+            && self.accepted_model_mode(guest).await?
+        {
+            // Actual shared engine admission still requires the private complete
+            // capability. Configuration and this dispatch are not its issuer.
+            return self.network_original_close(guest, call).await;
+        }
         let fd = call.fd();
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
@@ -1294,6 +1496,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
+        self.initialize_procfs_description(guest, call, ProcfsReadDescription::Numeric(call.fd()))
+            .await
+    }
+
+    // This retains modeled identity only. snapshot_procfs's internal physical
+    // lseek/Read operands still need their separate native custody join.
+    async fn initialize_selected_procfs_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        detfd: &DetFd,
+    ) -> Result<(), Error> {
+        self.initialize_procfs_description(guest, call, ProcfsReadDescription::Selected(detfd))
+            .await
+    }
+
+    async fn initialize_procfs_description<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        description: ProcfsReadDescription<'_>,
+    ) -> Result<(), Error> {
         let contents = self.snapshot_procfs(guest, call).await?;
         let virtual_uptime_seconds = self.calculate_uptime(guest).await?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
@@ -1307,9 +1531,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             std::path::Path::new("/dev/ptmx"),
             std::path::Path::new("/dev/pts/ptmx"),
         ]);
-        let target_fd = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
+        let target_fd = description.with(guest, |detfd| detfd.procfs_target_fd())?;
         let fdinfo_identity = if let Some(target_fd) = target_fd {
             let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
@@ -1402,9 +1624,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        let needs_random_uuid = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
+        let needs_random_uuid =
+            description.with(guest, |detfd| detfd.procfs_needs_random_uuid())?;
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
         let random_uuid =
@@ -1422,9 +1643,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // BOTH COLUMNS, not just the inode. `determinize_stat` sanitizes
         // `st_dev` as well, so rewriting only the inode would leave the device
         // disagreeing -- the same defect with the reported symptom removed.
-        let needs_mapping_identities = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
+        let needs_mapping_identities =
+            description.with(guest, |detfd| detfd.procfs_needs_mapping_identities())?;
         let mut mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
         if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
@@ -1460,9 +1680,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
             }
         }
-        let mountinfo = if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
+        let mountinfo = if description
+            .with(guest, |detfd| detfd.procfs_needs_mountinfo_identities())?
         {
             let mut rows = crate::procfs::parse_mountinfo(&contents).ok_or_else(|| {
                 Error::Tool(anyhow::anyhow!(
@@ -1541,7 +1760,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        guest.thread_state().with_detfd(call.fd(), |detfd| {
+        description.with(guest, |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
@@ -1559,6 +1778,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         })?;
         Ok(())
+    }
+
+    /// Shared capability-None zero-Read path. Preserve the original syscall
+    /// and Linux's local validation; do not infer success from its byte count.
+    /// Factoring this small future avoids nesting the whole positive Read loop
+    /// in the network adapter. The ordinary caller retains its timer-slack
+    /// precedence and both callers deliberately bypass Recorder/Replayer.
+    pub(super) async fn execute_native_zero_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<i64, Error> {
+        debug_assert_eq!(call.len(), 0);
+        Ok(guest.inject(Syscall::from(call)).await?)
     }
 
     /// SYS_read system call (MAYHANG).
@@ -1595,8 +1828,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(0);
             }
             // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
+            return self.execute_native_zero_read(guest, call).await;
         }
 
         let needs_procfs_snapshot = guest
@@ -1658,7 +1890,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(self.record_or_replay(guest, call).await?)
                 }
             }
-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
+            FdType::Signalfd
+            | FdType::Eventfd
+            | FdType::Timerfd
+            | FdType::Inotify
+            | FdType::Inherited { .. } => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
@@ -2078,7 +2314,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        // Only route writes through the nonblockable-fd path when the fd is actually
+        // Anonymous inherited objects have unknown creation provenance; preserve
+        // their single native operation through the shared blocking/nonblocking
+        // helper. No status flag is changed to manufacture nonblocking behavior.
+        // Known pipe/socket writes use the nonblockable-fd path when actually
         // physically nonblocking. Detcore-created pipes are physically nonblocking in every
         // sequential mode, including record/replay, so their logically blocking writes use
         // the completion helper below. A physically blocking fd instead uses the original
@@ -2087,8 +2326,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
             self.execute_blocking_pipe_write(guest, call, open_file_id)
                 .await
-        } else if physically_nonblocking
-            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        } else if matches!(fd_type, FdType::Inherited { .. })
+            || (physically_nonblocking
+                && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd))
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
         } else if guest.config().deterministic_io {
@@ -2294,8 +2534,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             self.execute_blocking_pipe_writev(guest, call, open_file_id)
                 .await
-        } else if physically_nonblocking
-            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        } else if matches!(fd_type, FdType::Inherited { .. })
+            || (physically_nonblocking
+                && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd))
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
         } else {
@@ -2422,8 +2663,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 rng_output,
             )
-        } else if physically_nonblocking
-            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+        } else if matches!(fd_type, FdType::Inherited { .. })
+            || (physically_nonblocking
+                && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd))
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
         } else {
@@ -2902,6 +3144,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match call.cmd() {
             F_GETFL => {
+                if self.network_fd_tracking_active(guest) {
+                    return self.network_original_get_flags(guest, call).await;
+                }
                 let control = self.begin_shadow_fd_control(guest, fd).await?;
                 let result = async {
                     let physical_flags = self.record_or_replay(guest, call).await?;
@@ -4499,6 +4744,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             .memory()
             .write_exact(dirent.cast(), dents_bytes.as_slice())?;
         Ok(nb)
+    }
+}
+
+#[cfg(test)]
+mod initial_metadata_startup_tests {
+    use super::*;
+
+    #[test]
+    fn required_capture_error_cannot_be_ignored_by_ptrace_startup() {
+        for errno in [Errno::EBADF, Errno::EFAULT, Errno::EIO, Errno::EINTR] {
+            // This is the exact distinction at run_loop_internal's
+            // handle_thread_start boundary: an ordinary injection errno can
+            // be ignored there, while an admission failure must propagate.
+            assert_eq!(Error::from(errno).into_errno().unwrap(), errno);
+            let failure = required_initial_metadata::<()>(Err(errno), 7, 91).unwrap_err();
+            let propagated = failure.into_errno().expect_err("startup must abort");
+            let Error::Tool(context) = propagated else {
+                panic!("required capture failure lost its tool classification");
+            };
+            assert_eq!(context.downcast_ref::<Errno>(), Some(&errno));
+            let diagnostic = context.to_string();
+            assert!(diagnostic.contains("fd 7"));
+            assert!(diagnostic.contains("physical OFD 91"));
+            assert!(diagnostic.contains(&errno.to_string()));
+        }
+        assert_eq!(required_initial_metadata(Ok(123_u64), 7, 91).unwrap(), 123);
     }
 }
 

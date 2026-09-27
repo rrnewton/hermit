@@ -140,12 +140,29 @@ impl ReadyPolledRead {
             && expected == *resources
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TurnProtocol {
     pub epoch: u64,
     pub owner: NextTurnOwner,
     pub origin: Option<ResourceOrigin>,
     ready_read: Option<ReadyPolledRead>,
+    /// Transport only: the engine retains the exact admitted read owner.
+    pub fd_read: Option<crate::network_replay::NetworkFdReadAdmission>,
+    /// Exact empty transport issued by a real foreground grant/handback.
+    pub(super) foreground_fd: Option<super::ordinary_fd::ForegroundFdGrant>,
+}
+// Preserve the exact existing diagnostic field set/order. Private authority
+// must not add Ivar identities or alter scheduler/debug log representations.
+impl std::fmt::Debug for TurnProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnProtocol")
+            .field("epoch", &self.epoch)
+            .field("owner", &self.owner)
+            .field("origin", &self.origin)
+            .field("ready_read", &self.ready_read)
+            .field("fd_read", &self.fd_read)
+            .finish()
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequestKey {
@@ -172,6 +189,13 @@ pub struct ResumeTicket {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ResourceReply {
     Grant(ResumeStatus),
+    /// The same real grant, with its short FD admission ready for consuming transfer.
+    ReadGrant {
+        /// Existing resume disposition; this variant is emitted only on normal Go.
+        status: ResumeStatus,
+        /// Engine-owned current binding and publication token.
+        read: crate::network_replay::NetworkFdReadAdmission,
+    },
     ObserveSignal(Box<AlarmControl>),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1051,6 +1075,13 @@ impl Scheduler {
                     turn.protocol.ready_read = None;
                     // This empty, queued gate protects the real remaining-time
                     // copyout, posthook and frame delivery. No synthetic turn.
+                    self.record_ordinary_fd_grant(
+                        crate::network_replay::NetworkStreamOwner {
+                            thread: wait.dettid,
+                            mm: owned.origin.mm,
+                        },
+                        super::ordinary_fd::OrdinaryFdResume::ReturningCaught,
+                    );
                     Ok(FinishAck::Interrupted)
                 }
                 ObservationFinish::Terminate { selection } => {

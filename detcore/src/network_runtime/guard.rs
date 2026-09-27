@@ -179,9 +179,13 @@ impl NetworkGuardControllerAbort {
             NetworkGuardTerminal::Policy(_) => detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
             NetworkGuardTerminal::Internal(_) => 125,
         };
+        let description = match first {
+            NetworkGuardTerminal::Policy(_) => "network disabled by Unix policy",
+            NetworkGuardTerminal::Internal(_) => "Unix network guard internal failure",
+        };
         let _ = writeln!(
             crate::util::RetryingStderr,
-            "hermit: Unix network guard terminal: {first:?}; unfinished state is not published"
+            "hermit: {description}: {first:?}; unfinished state is not published"
         );
         crate::tool_global::exit_owned_controller(status)
     }

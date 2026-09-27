@@ -566,9 +566,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Setsid,
     ) -> Result<i64, Error> {
-        let res = guest.inject(call).await?;
         let process = guest.thread_state().detpid.expect("detpid unset");
-        let _ = create_session(guest, process).await;
+        let change = crate::tool_global::prepare_process_group_change(
+            guest,
+            crate::scheduler::ProcessGroupChangeKind::Session { process },
+        )
+        .await?;
+        if let Some(change) = &change {
+            assert_eq!(
+                guest.thread_state_mut().uninvoked_wait_call.take(),
+                Some(crate::scheduler::UninvokedWaitCall::group(change.clone()))
+            );
+        }
+        // No await occurs between this marker and the native invocation.
+        let native = guest.inject(call).await;
+        if let Some(change) = change {
+            crate::tool_global::complete_process_group_change(guest, change, native).await?;
+        } else if native.is_ok() {
+            let _ = create_session(guest, process).await;
+        }
+        let res = native?;
 
         // task is trying to become a daemon process. for more details
         // see: https://notes.shichao.io/apue/ch13/
@@ -586,7 +603,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Setpgid,
     ) -> Result<i64, Error> {
-        let res = guest.inject(call).await?;
         let caller = guest.thread_state().detpid.expect("detpid unset");
         let process = if call.pid() == 0 {
             caller
@@ -598,8 +614,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             DetPid::from_raw(call.pgid())
         };
-        let _ = set_process_group(guest, process, group).await;
-        Ok(res)
+        let change = crate::tool_global::prepare_process_group_change(
+            guest,
+            crate::scheduler::ProcessGroupChangeKind::Set { process, group },
+        )
+        .await?;
+        if let Some(change) = &change {
+            assert_eq!(
+                guest.thread_state_mut().uninvoked_wait_call.take(),
+                Some(crate::scheduler::UninvokedWaitCall::group(change.clone()))
+            );
+        }
+        // No await occurs between this marker and the native invocation.
+        let native = guest.inject(call).await;
+        if let Some(change) = change {
+            crate::tool_global::complete_process_group_change(guest, change, native).await?;
+        } else if native.is_ok() {
+            let _ = set_process_group(guest, process, group).await;
+        }
+        native.map_err(Error::from)
     }
 
     /// membarrier (system call).

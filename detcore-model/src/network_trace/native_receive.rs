@@ -192,8 +192,7 @@ pub struct NetworkNativeReceiveObservationV4 {
     pub fragments: Vec<NetworkNativeCopyFragmentV4>,
 }
 
-/// Typed V4 framing remains deliberately absent from the umbrella NetworkTrace
-/// dispatcher until shared-engine and CLI integration are reviewed together.
+/// Native receive history with the shared typed and umbrella V4 framing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkTraceV4 {
@@ -288,6 +287,22 @@ fn canonical(ids: &[NetworkReleaseNodeIdV4], count: usize) -> Validation {
     Ok(())
 }
 
+fn validate_channel_creation(c: &NetworkChannelV2) -> Validation {
+    if !matches!(
+        (c.role, c.transport),
+        (
+            NetworkEndpointRoleV2::OutboundClient,
+            NetworkTransportV2::Tcp
+        ) | (
+            NetworkEndpointRoleV2::Datagram,
+            NetworkTransportV2::Udp | NetworkTransportV2::UnixDatagram
+        )
+    ) {
+        return Err(Invalid::UnsupportedCreation);
+    }
+    Ok(())
+}
+
 impl NetworkTraceV4 {
     /// Pure canonical frontier of the specified producer-ledger prefix. This
     /// can inspect an incomplete recorder journal, so it does not validate the
@@ -353,18 +368,7 @@ impl NetworkTraceV4 {
         payload.validate()?;
         drop(payload);
         for c in &self.channels {
-            if !matches!(
-                (c.role, c.transport),
-                (
-                    NetworkEndpointRoleV2::OutboundClient,
-                    NetworkTransportV2::Tcp
-                ) | (
-                    NetworkEndpointRoleV2::Datagram,
-                    NetworkTransportV2::Udp | NetworkTransportV2::UnixDatagram
-                )
-            ) {
-                return Err(Invalid::UnsupportedCreation);
-            }
+            validate_channel_creation(c)?;
         }
         self.validate_profiles()?;
         self.validate_graph(epoch)?;
@@ -382,10 +386,15 @@ impl NetworkTraceV4 {
         if version != NETWORK_TRACE_VERSION_V4 {
             return Err(NetworkTraceCodecError::UnsupportedVersion(version).into());
         }
+        Self::decode_payload(&payload)
+    }
+
+    /// Shared bounded V4 payload decoder for typed and umbrella framing.
+    pub(super) fn decode_payload(payload: &[u8]) -> Result<Self, NetworkTraceCodecErrorV4> {
         // Preserve old decoders exactly. This format independently bounds
         // decoded claims as well as the common 64 MiB framed payload.
         let (trace, consumed): (Self, _) = bincode::serde::decode_from_slice(
-            &payload,
+            payload,
             bincode::config::standard()
                 .with_limit::<{ MAX_NETWORK_TRACE_PAYLOAD_BYTES as usize }>(),
         )

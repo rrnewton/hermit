@@ -1,6 +1,6 @@
-//! Physical descriptor mutation admission. The ordinary constructor supplies no
-//! capability until all backend table mutations have a proven interception
-//! boundary. A publication cursor alone is never that capability.
+//! Physical descriptor mutation admission. Config and publication cursors grant
+//! no capability. The owned stopped-root census can activate the intercepted
+//! single-root Record operation set; its entry gate refuses all unjoined shapes.
 
 use reverie::syscalls::CloneFlags;
 
@@ -11,13 +11,14 @@ use crate::types::FdSlotBinding;
 use crate::types::NetworkFdSlot;
 use crate::types::NetworkFdSlotReplacement;
 
-/// Proof supplied by a backend with complete descriptor-table mutation coverage.
-/// No production constructor exists in this incomplete vertical slice.
+/// Run-private admission for the intercepted descriptor-table operation set.
+/// Production issuance consumes the retained stopped-root census atomically;
+/// unsupported shapes are refused at syscall entry before a physical effect.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NetworkFdTableCapability(());
 
-/// Capability seam for the real backend. No backend has closed the complete
-/// mutation inventory yet; there is no flag which bypasses that requirement.
+/// Config cannot issue run-private FD authority. Production admission is the
+/// retained initial-census transaction, never this deserializable configuration.
 pub(crate) fn backend_fd_table_capability(
     _cfg: &crate::Config,
 ) -> Option<NetworkFdTableCapability> {
@@ -36,6 +37,10 @@ impl NetworkFdTableCapability {
 pub enum NetworkFdMutationKind {
     /// A single fresh socket; success returns its new descriptor.
     Socket,
+    /// Original Openat, admitted for publication only after its real return.
+    Openat,
+    /// Original epoll_create/epoll_create1 after the exact native return.
+    EpollCreate,
     /// Kernel clone, with the existing exact clone-family flags.
     Clone {
         /// Original flags, including CLONE_FILES and CLONE_THREAD.
@@ -94,20 +99,470 @@ struct FdMutationState {
     kernel_result: Option<Result<i64, i32>>,
     installation_confirmed: bool,
     clone_child: Option<(TaskOwner, DetPid)>,
+    native_birth: Option<crate::network_runtime::native_birth::NativeBirthAdmission>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct FdLifecycleState {
     capability: Option<NetworkFdTableCapability>,
     mutations: BTreeMap<NetworkStreamLeaseId, FdMutationState>,
-    retired_ports: BTreeSet<OpenFileId>,
+    pub(super) retired_ports: BTreeSet<OpenFileId>,
 }
 
 fn protocol(message: &str) -> NetworkReplayError {
     NetworkReplayError::FdPublicationProtocol(message.to_owned())
 }
 
+impl NetworkFdPublicationPermit {
+    /// Correlation for the existing private provider command; possession of the
+    /// number is not authority without this full retained permit.
+    pub(crate) fn native_command_call(self) -> u64 {
+        self.lease.0
+    }
+}
+
 impl NetworkReplayEngine {
+    pub(super) fn validate_original_socket_mutation(
+        &self,
+        owner: NetworkStreamOwner,
+        admission: &NetworkFdMutationAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        let state = self.fd_mutation(owner, admission.publication.permit)?;
+        if !self.fd_table_capability()
+            || state.admission != *admission
+            || !state.submitted
+            || state.kernel_result.is_some()
+            || state.installation_confirmed
+            || admission.kind != NetworkFdMutationKind::Socket
+            || !admission.controls.is_empty()
+        {
+            return Err(protocol(
+                "Socket Call must consume its exact submitted allocator permit",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only the existing original Call's positive pre-submission/disarm path
+    /// calls this after it has proved the actual invocation never entered.
+    pub(super) fn discard_uninvoked_socket_mutation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        permit: NetworkFdPublicationPermit,
+    ) -> Result<(), NetworkReplayError> {
+        let state = self.fd_mutation(owner, permit)?;
+        if state.admission.kind != NetworkFdMutationKind::Socket
+            || !state.submitted
+            || state.kernel_result.is_some()
+            || state.installation_confirmed
+            || !state.admission.controls.is_empty()
+        {
+            return Err(protocol(
+                "uninvoked Socket changed its submitted allocator custody",
+            ));
+        }
+        self.fd_lifecycle.mutations.remove(&permit.lease);
+        Ok(())
+    }
+
+    /// Called only after the existing original Call authenticates its actual
+    /// completion. A blocking allocator owns no table permit during execution.
+    pub(super) fn admit_completed_original_allocation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        files: FilesId,
+        kind: super::original_connect::Kind,
+        returned: i64,
+    ) -> Result<NetworkFdMutationAdmission, NetworkReplayError> {
+        let kind = match kind {
+            super::original_connect::Kind::Socket => NetworkFdMutationKind::Socket,
+            super::original_connect::Kind::Openat => NetworkFdMutationKind::Openat,
+            super::original_connect::Kind::EpollCreate { .. } => NetworkFdMutationKind::EpollCreate,
+            _ => {
+                return Err(protocol(
+                    "non-allocator requested completed allocation admission",
+                ));
+            }
+        };
+        if !self.fd_table_capability() || !(-4095..=i64::from(i32::MAX)).contains(&returned) {
+            return Err(protocol(
+                "completed allocator lost capability or actual result",
+            ));
+        }
+        let publication = self.acquire_fd_publication(owner, files)?;
+        let admission = NetworkFdMutationAdmission {
+            publication,
+            kind,
+            controls: Vec::new(),
+        };
+        let lease = admission.publication.permit.lease;
+        // Same retained mutation slot as every other FD publisher. `submitted`
+        // refers to the already-completed original Call, never a second syscall.
+        assert!(
+            self.fd_lifecycle
+                .mutations
+                .insert(
+                    lease,
+                    FdMutationState {
+                        admission: admission.clone(),
+                        submitted: true,
+                        kernel_result: Some(if returned < 0 {
+                            Err((-returned) as i32)
+                        } else {
+                            Ok(returned)
+                        }),
+                        installation_confirmed: false,
+                        clone_child: None,
+                        native_birth: None,
+                    }
+                )
+                .is_none()
+        );
+        Ok(admission)
+    }
+
+    /// Physical confirmation is consumed by the atomic lifetime publication.
+    /// Recovery must name exactly one side of that transition: either the
+    /// original unconsumed confirmation, or the identical pending/history pair.
+    /// Absence of a confirmation by itself grants no recovery authority.
+    fn terminal_allocator_prefix_applied(
+        &self,
+        prior: &NetworkFdMutationAdmission,
+        recovery: Option<&NetworkFdPublicationBatch>,
+    ) -> Result<bool, NetworkReplayError> {
+        let permit = prior.publication.permit;
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("terminal allocator lost its publication state"))?;
+        let confirmation = self.fd_installations.contains_key(&permit.lease);
+        let Some(batch) = recovery else {
+            if confirmation || publication.enrollment.is_some() || publication.pending.is_some() {
+                return Err(protocol(
+                    "unprepared terminal allocator has retained installation effects",
+                ));
+            }
+            return Ok(false);
+        };
+        let plan = publication
+            .enrollment
+            .as_ref()
+            .ok_or_else(|| protocol("terminal allocator recovery lost its exact enrollment"))?;
+        if plan.permit != permit || plan.batch() != batch {
+            return Err(protocol(
+                "terminal allocator recovery changed its original enrollment prefix",
+            ));
+        }
+        let history = self
+            .fd_publication_history
+            .get(&(permit.files, batch.sequence));
+        match (confirmation, publication.pending.as_ref(), history) {
+            (true, None, None) if !plan.completed => Ok(false),
+            (false, Some(pending), Some(history)) if pending == batch && history == batch => {
+                Ok(true)
+            }
+            _ => Err(protocol(
+                "terminal allocator confirmation does not match its exact publication phase",
+            )),
+        }
+    }
+
+    /// Transfer only an already-completed allocator's unconfirmed publication
+    /// lease. No syscall or physical effect is discarded/reissued. The original
+    /// Call retains the previous admission as well as the exact raw result.
+    pub(super) fn transfer_terminal_allocator_mutation(
+        &mut self,
+        prior: &NetworkFdMutationAdmission,
+        publisher: NetworkStreamOwner,
+        returned: i64,
+        recovery: Option<NetworkFdPublicationBatch>,
+    ) -> Result<NetworkFdMutationAdmission, NetworkReplayError> {
+        let permit = prior.publication.permit;
+        let task = self.publication_owner(publisher, permit.files)?;
+        let state = self.fd_lifecycle.mutations.get(&permit.lease);
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("terminal allocator lost its publication state"))?;
+        let expected = if returned < 0 {
+            Err((-returned) as i32)
+        } else {
+            Ok(returned)
+        };
+        let recovering = recovery.is_some();
+        let applied = self.terminal_allocator_prefix_applied(prior, recovery.as_ref())?;
+        let cursor = self
+            .lifetime
+            .publication_cursor(task)
+            .map_err(|e| protocol(&e.to_string()))?;
+        let mutation_valid = state.map_or_else(
+            || {
+                publication
+                    .enrollment
+                    .as_ref()
+                    .is_some_and(|plan| recovering && plan.completed)
+            },
+            |state| {
+                state.admission == *prior
+                    && state.submitted
+                    && state.kernel_result == Some(expected)
+                    && state.installation_confirmed == recovering
+                    && state.clone_child.is_none()
+                    && state.native_birth.is_none()
+            },
+        );
+        if !self.gone_stream_owners.contains(&permit.owner)
+            || !mutation_valid
+            || !prior.controls.is_empty()
+            || !matches!(
+                prior.kind,
+                NetworkFdMutationKind::Socket
+                    | NetworkFdMutationKind::Openat
+                    | NetworkFdMutationKind::EpollCreate
+            )
+            || prior.publication.recovery.is_some()
+            || publication.reader.is_some()
+            || publication.active.is_some_and(|active| active != permit)
+            || (publication.active.is_none()
+                && !publication
+                    .enrollment
+                    .as_ref()
+                    .is_some_and(|plan| recovering && plan.completed))
+            || (recovering != publication.enrollment.is_some())
+            || publication
+                .pending
+                .as_ref()
+                .is_some_and(|batch| recovery.as_ref() != Some(batch))
+            || cursor
+                != if applied {
+                    let batch = recovery
+                        .as_ref()
+                        .expect("applied recovery has an exact prefix");
+                    (batch.sequence, batch.through_generation)
+                } else {
+                    (
+                        prior.publication.acknowledged_sequence,
+                        prior.publication.acknowledged_generation,
+                    )
+                }
+        {
+            return Err(protocol(
+                "terminal allocator changed its exact retained publication prefix",
+            ));
+        }
+        let mut transferred = prior.clone();
+        transferred.publication.permit.owner = publisher;
+        transferred.publication.acknowledged_sequence = cursor.0;
+        transferred.publication.acknowledged_generation = cursor.1;
+        transferred.publication.recovery = recovery;
+        if let Some(state) = self.fd_lifecycle.mutations.get_mut(&permit.lease) {
+            state.admission = transferred.clone();
+        }
+        self.fd_publications.get_mut(&permit.files).unwrap().active =
+            Some(transferred.publication.permit);
+        Ok(transferred)
+    }
+
+    /// Complete a known historical Install->Remove only after the last real
+    /// table owner and pending shares have gone. Its admission/result are still
+    /// retained by the original Call until the normal retirement join.
+    pub(super) fn retire_terminal_allocator_mutation(
+        &mut self,
+        prior: &NetworkFdMutationAdmission,
+        returned: i64,
+        recovery: Option<&NetworkFdPublicationBatch>,
+    ) -> Result<(), NetworkReplayError> {
+        let permit = prior.publication.permit;
+        let state = self.fd_lifecycle.mutations.get(&permit.lease);
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("terminal allocator lost its retained publication"))?;
+        let recovering = recovery.is_some();
+        self.terminal_allocator_prefix_applied(prior, recovery)?;
+        let mutation_valid = state.map_or_else(
+            || {
+                publication
+                    .enrollment
+                    .as_ref()
+                    .is_some_and(|plan| recovering && plan.completed)
+            },
+            |state| {
+                state.admission == *prior
+                    && state.submitted
+                    && state.kernel_result == Some(Ok(returned))
+                    && state.installation_confirmed == recovering
+                    && state.clone_child.is_none()
+                    && state.native_birth.is_none()
+            },
+        );
+        if self.lifetime.table_exists(permit.files)
+            || !self.gone_stream_owners.contains(&permit.owner)
+            || !mutation_valid
+            || !prior.controls.is_empty()
+            || !matches!(
+                prior.kind,
+                NetworkFdMutationKind::Socket
+                    | NetworkFdMutationKind::Openat
+                    | NetworkFdMutationKind::EpollCreate
+            )
+            || prior.publication.recovery.is_some()
+            || publication.reader.is_some()
+            || publication.active.is_some_and(|active| active != permit)
+            || (publication.active.is_none()
+                && !publication
+                    .enrollment
+                    .as_ref()
+                    .is_some_and(|plan| recovering && plan.completed))
+            || recovering != publication.enrollment.is_some()
+            || publication
+                .pending
+                .as_ref()
+                .is_some_and(|batch| recovery != Some(batch))
+        {
+            return Err(protocol(
+                "terminal allocator cannot discard a live or unmatched publication",
+            ));
+        }
+        let mut lifetime = self.lifetime.clone();
+        lifetime
+            .prune_dead_table_publication(permit.files)
+            .map_err(|error| protocol(&error.to_string()))?;
+        // The caller transfers the exact prior admission/enrollment and fresh
+        // physical receipt into the original Call before its final removal.
+        self.fd_lifecycle.mutations.remove(&permit.lease);
+        self.fd_installations.remove(&permit.lease);
+        self.fd_publications.remove(&permit.files);
+        self.fd_publication_history
+            .retain(|(files, _), _| *files != permit.files);
+        self.lifetime = lifetime;
+        Ok(())
+    }
+
+    pub(super) fn retire_terminal_failed_allocator_mutation(
+        &mut self,
+        prior: &NetworkFdMutationAdmission,
+        returned: i64,
+    ) -> Result<(), NetworkReplayError> {
+        let permit = prior.publication.permit;
+        if !(-4095..0).contains(&returned)
+            || !self.gone_stream_owners.contains(&permit.owner)
+            || !prior.controls.is_empty()
+            || prior.publication.recovery.is_some()
+            || !matches!(
+                prior.kind,
+                NetworkFdMutationKind::Socket
+                    | NetworkFdMutationKind::Openat
+                    | NetworkFdMutationKind::EpollCreate
+            )
+            || self.fd_installations.contains_key(&permit.lease)
+        {
+            return Err(protocol(
+                "terminal negative allocator changed known no-effect custody",
+            ));
+        }
+        let publication = self.fd_publications.get(&permit.files);
+        if let Some(state) = self.fd_lifecycle.mutations.get(&permit.lease) {
+            if state.admission != *prior
+                || !state.submitted
+                || state.kernel_result != Some(Err((-returned) as i32))
+                || state.installation_confirmed
+                || state.clone_child.is_some()
+                || state.native_birth.is_some()
+                || publication.is_none_or(|p| {
+                    p.active != Some(permit)
+                        || p.pending.is_some()
+                        || p.enrollment.is_some()
+                        || p.reader.is_some()
+                })
+            {
+                return Err(protocol(
+                    "terminal negative allocator still has unmatched mutation effects",
+                ));
+            }
+            self.fd_lifecycle.mutations.remove(&permit.lease);
+            self.fd_publications.get_mut(&permit.files).unwrap().active = None;
+            self.prune_dead_fd_publication(permit.files);
+        } else if publication.is_some_and(|p| {
+            p.active == Some(permit)
+                || p.enrollment
+                    .as_ref()
+                    .is_some_and(|plan| plan.permit == permit)
+        }) {
+            return Err(protocol(
+                "negative allocator cleanup lost mutation before publication retirement",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_original_socket_publication(
+        &self,
+        owner: NetworkStreamOwner,
+        admission: &NetworkFdMutationAdmission,
+        returned: i64,
+    ) -> Result<(), NetworkReplayError> {
+        let permit = admission.publication.permit;
+        self.validate_publication_permit(owner, permit)?;
+        if !matches!(
+            admission.kind,
+            NetworkFdMutationKind::Socket
+                | NetworkFdMutationKind::Openat
+                | NetworkFdMutationKind::EpollCreate
+        ) || !admission.controls.is_empty()
+            || !(-4095..=i64::from(i32::MAX)).contains(&returned)
+        {
+            return Err(protocol("Socket publication changed its original mutation"));
+        }
+        let expected = if returned < 0 {
+            Err((-returned) as i32)
+        } else {
+            Ok(returned)
+        };
+        if let Some(state) = self.fd_lifecycle.mutations.get(&permit.lease) {
+            if state.admission != *admission
+                || !state.submitted
+                || state.kernel_result.is_some_and(|prior| prior != expected)
+                || (state.installation_confirmed && state.kernel_result != Some(expected))
+            {
+                return Err(protocol(
+                    "Socket publication changed its retained native result",
+                ));
+            }
+        } else {
+            // Publication may have consumed the mutation before local ACK.
+            // Only its exact completed enrollment/pending batch closes that gap.
+            self.validate_completed_socket_publication(admission, returned)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn retain_original_socket_publication_result(
+        &mut self,
+        owner: NetworkStreamOwner,
+        admission: &NetworkFdMutationAdmission,
+        returned: i64,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_original_socket_publication(owner, admission, returned)?;
+        if self
+            .fd_lifecycle
+            .mutations
+            .get(&admission.publication.permit.lease)
+            .is_some_and(|state| state.kernel_result.is_none())
+        {
+            self.confirm_fd_mutation_result(
+                owner,
+                admission.publication.permit,
+                if returned < 0 {
+                    Err((-returned) as i32)
+                } else {
+                    Ok(returned)
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn fd_table_capability(&self) -> bool {
         self.fd_lifecycle.capability.is_some()
     }
@@ -120,8 +575,9 @@ impl NetworkReplayEngine {
         self.fd_lifecycle.capability = Some(capability);
     }
 
-    /// Called at authenticated initial scheduler registration, never from an
-    /// arbitrary local snapshot or a reload that should consume an exec receipt.
+    /// Empty tables exist only in controlled legacy component fixtures. The
+    /// production path must consume the private initial census below.
+    #[cfg(test)]
     pub(crate) fn register_initial_fd_table(
         &mut self,
         owner: NetworkStreamOwner,
@@ -144,6 +600,97 @@ impl NetworkReplayEngine {
         Ok(true)
     }
 
+    /// Called only inside the retained runtime + stopped-root scheduler commit.
+    /// This grants the bounded original-operation route whose dispatch rejects
+    /// unsupported descriptor mutations before native entry. Config and the
+    /// serializable view/claim cannot manufacture the retained association.
+    pub(crate) fn admit_initial_record_census(
+        &mut self,
+        association: &crate::network_runtime::InitialTableAssociation,
+        claim: &crate::network_runtime::InitialTableClaim,
+        process: DetPid,
+    ) -> Result<(), NetworkReplayError> {
+        if self.fd_table_capability()
+            || !self.fd_lifecycle.mutations.is_empty()
+            || !self.fd_publications.is_empty()
+            || !self.fd_installations.is_empty()
+            || !self.fd_publication_history.is_empty()
+        {
+            return Err(protocol(
+                "initial capability was already issued or publication started",
+            ));
+        }
+        self.check_initial_accepted_record()?;
+        association
+            .validate_root_identity()
+            .map_err(|e| protocol(&e.to_string()))?;
+        association
+            .check_claim(claim)
+            .map_err(|e| protocol(&e.to_string()))?;
+        // An inherited socket has no enrolled stream/profile in the untouched
+        // Record engine. Its exact census must not mint partial socket authority.
+        // O_PATH is classified by the same existing physical profile predicate.
+        if claim.view.descriptors.iter().any(|row| {
+            crate::fd::FdType::from_initial_profile(
+                row.mode,
+                row.status_flags,
+                row.device_major,
+                row.device_minor,
+            ) == Some(crate::fd::FdType::Socket)
+        }) {
+            return Err(protocol(
+                "initial Record socket profile enrollment is not implemented",
+            ));
+        }
+        let owner = association.owner();
+        self.check_stream_owner(owner)?;
+        self.lifetime
+            .register_census(
+                TaskOwner {
+                    tid: owner.thread,
+                    mm: owner.mm,
+                },
+                process,
+                claim.view.files,
+                &claim.slots,
+                claim.through_generation,
+            )
+            .map_err(|e| protocol(&e.to_string()))?;
+        // register_census validates into a candidate before replacing the ledger.
+        // Nothing fallible or asynchronous follows its commit under this lock.
+        self.fd_lifecycle.capability = Some(NetworkFdTableCapability(()));
+        self.activate_initial_accepted_record();
+        Ok(())
+    }
+
+    pub(crate) fn register_initial_census(
+        &mut self,
+        association: &crate::network_runtime::InitialTableAssociation,
+        claim: &crate::network_runtime::InitialTableClaim,
+        process: DetPid,
+    ) -> Result<(), NetworkReplayError> {
+        if !self.fd_table_capability() {
+            return Err(protocol("initial census cannot grant backend capability"));
+        }
+        association
+            .check_claim(claim)
+            .map_err(|e| protocol(&e.to_string()))?;
+        let owner = association.owner();
+        self.check_stream_owner(owner)?;
+        self.lifetime
+            .register_census(
+                TaskOwner {
+                    tid: owner.thread,
+                    mm: owner.mm,
+                },
+                process,
+                claim.view.files,
+                &claim.slots,
+                claim.through_generation,
+            )
+            .map_err(|e| protocol(&e.to_string()))
+    }
+
     fn validate_fd_mutation_kind(
         &self,
         owner: NetworkStreamOwner,
@@ -152,9 +699,10 @@ impl NetworkReplayEngine {
     ) -> Result<Option<Vec<OpenFileId>>, NetworkReplayError> {
         let task = self.publication_owner(owner, files)?;
         match kind {
-            NetworkFdMutationKind::Socket | NetworkFdMutationKind::Clone { .. } => {
-                Ok(Some(Vec::new()))
-            }
+            NetworkFdMutationKind::Socket
+            | NetworkFdMutationKind::Openat
+            | NetworkFdMutationKind::EpollCreate
+            | NetworkFdMutationKind::Clone { .. } => Ok(Some(Vec::new())),
             NetworkFdMutationKind::Exec { receipt } => {
                 if receipt.caller != owner.thread
                     || receipt.mm != owner.mm
@@ -223,6 +771,14 @@ impl NetworkReplayEngine {
         if !self.fd_table_capability() {
             return Ok(NetworkFdMutationBegin::Dormant);
         }
+        if matches!(
+            kind,
+            NetworkFdMutationKind::Openat | NetworkFdMutationKind::EpollCreate
+        ) {
+            return Err(protocol(
+                "Openat cannot acquire a publication permit before native completion",
+            ));
+        }
         let Some(controls) = self.validate_fd_mutation_kind(owner, files, &kind)? else {
             return Ok(NetworkFdMutationBegin::Refresh);
         };
@@ -235,7 +791,7 @@ impl NetworkReplayEngine {
             self.fd_publications.get_mut(&files).unwrap().active = None;
             return Ok(NetworkFdMutationBegin::Recover);
         }
-        let controls = match self.begin_socket_controls(owner, controls) {
+        let controls = match self.begin_descriptor_controls(owner, controls) {
             Ok(controls) => controls,
             Err(primary) => {
                 self.release_empty_fd_publication(owner, publication.permit)
@@ -281,6 +837,7 @@ impl NetworkReplayEngine {
                         kernel_result: None,
                         installation_confirmed: false,
                         clone_child: None,
+                        native_birth: None,
                     }
                 )
                 .is_none()
@@ -346,6 +903,76 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
+    /// Switch the already submitted clone escrow to an unresolved native
+    /// outcome before arming its provider command. The same permit remains
+    /// exclusive through actual child admission, even after creator exit.
+    pub(crate) fn prepare_native_birth_escrow(
+        &mut self,
+        owner: NetworkStreamOwner,
+        permit: NetworkFdPublicationPermit,
+    ) -> Result<(), NetworkReplayError> {
+        let state = self.fd_mutation(owner, permit)?;
+        if !state.submitted
+            || state.kernel_result.is_some()
+            || state.clone_child.is_some()
+            || !matches!(state.admission.kind, NetworkFdMutationKind::Clone { .. })
+        {
+            return Err(protocol(
+                "native birth does not name a submitted original clone",
+            ));
+        }
+        self.lifetime
+            .defer_clone_choice(clone_ticket(permit))
+            .map_err(|e| protocol(&e.to_string()))
+    }
+
+    /// The only native outcome selector takes private runtime authority from
+    /// the retained creator command and backend child event, not RPC fields.
+    pub(crate) fn admit_native_birth(
+        &mut self,
+        birth: &crate::network_runtime::native_birth::NativeBirthAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        let permit = birth.permit();
+        let state = self
+            .fd_lifecycle
+            .mutations
+            .get(&permit.lease)
+            .filter(|s| {
+                s.admission.publication.permit == permit
+                    && s.submitted
+                    && s.clone_child.is_none()
+                    && s.kernel_result.is_none_or(|result| result.is_ok())
+            })
+            .ok_or_else(|| protocol("native birth lost original clone escrow"))?;
+        if state.admission.kind
+            != (NetworkFdMutationKind::Clone {
+                flags: birth.flags(),
+            })
+        {
+            return Err(protocol(
+                "native birth changed immutable original clone request",
+            ));
+        }
+        if let Some(old) = &state.native_birth {
+            return if old == birth {
+                Ok(())
+            } else {
+                Err(protocol("native birth outcome changed"))
+            };
+        }
+        self.lifetime
+            .resolve_clone_choice(clone_ticket(permit), birth.shared_files())
+            .map_err(|e| protocol(&e.to_string()))?;
+        // Request equality still governs cancellation and errno. Successful
+        // inheritance consumes this separately authenticated actual outcome.
+        self.fd_lifecycle
+            .mutations
+            .get_mut(&permit.lease)
+            .unwrap()
+            .native_birth = Some(birth.clone());
+        Ok(())
+    }
+
     /// Capture the actual kernel result before fstat/profile/publication awaits.
     /// Handler cancellation without this acknowledgement leaves a pending effect.
     pub fn confirm_fd_mutation_result(
@@ -384,7 +1011,7 @@ impl NetworkReplayEngine {
         }
         if let Some((child, _)) = state.clone_child {
             if result != Ok(i64::from(child.tid.as_raw())) {
-                return Err(protocol("parent clone result contradicts registered child"));
+                return Err(protocol("parent clone result contradicts observed child"));
             }
             self.fd_lifecycle.mutations.remove(&permit.lease).unwrap();
             return Ok(());
@@ -431,6 +1058,25 @@ impl NetworkReplayEngine {
                 }
                 (NetworkFdInstallKind::Socket, SlotInstallationSource::Fresh)
             }
+            NetworkFdMutationKind::EpollCreate => {
+                if change.before.is_some() || after.binding.open_file.is_socket() {
+                    return Err(protocol(
+                        "original epoll replaced a tracked slot or socket class",
+                    ));
+                }
+                (
+                    NetworkFdInstallKind::EpollCreate,
+                    SlotInstallationSource::Fresh,
+                )
+            }
+            NetworkFdMutationKind::Openat => {
+                if change.before.is_some() {
+                    return Err(protocol(
+                        "original Openat replaced an occupied tracked slot",
+                    ));
+                }
+                (NetworkFdInstallKind::Openat, SlotInstallationSource::Fresh)
+            }
             NetworkFdMutationKind::Alias {
                 source,
                 kind,
@@ -471,6 +1117,7 @@ impl NetworkReplayEngine {
                 installations: vec![change],
                 open_files: vec![Some(after.binding.open_file)],
                 sources: vec![source],
+                original_creation: None,
             },
         );
         self.fd_lifecycle
@@ -678,17 +1325,34 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
-    pub(super) fn finish_fd_mutations(&self) -> Result<(), NetworkReplayError> {
+    pub(crate) fn finish_fd_mutations(&self) -> Result<(), NetworkReplayError> {
+        if let Some(plan) = self
+            .fd_publications
+            .values()
+            .find_map(|state| state.enrollment.as_ref())
+        {
+            return Err(NetworkReplayError::UnresolvedStreamOperation(
+                plan.permit.lease,
+            ));
+        }
         if let Some((&lease, _)) = self.fd_lifecycle.mutations.first_key_value() {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }
-        if self.fd_table_capability() {
+        // Logical Replay owns registered tasks and operation leases even when
+        // it has no native descriptor-table capability.
+        if self.fd_table_capability() || self.mode() == NetworkEngineMode::Replay {
             self.lifetime
                 .finish()
                 .map_err(|error| protocol(&error.to_string()))?;
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum InheritedCloneDisposition {
+    Admit,
+    RetireBeforeStart,
 }
 
 fn clone_ticket(permit: NetworkFdPublicationPermit) -> lifetime::CloneTicket {
@@ -766,6 +1430,295 @@ impl NetworkReplayEngine {
                 .clone_child = Some((child_task, process));
         }
         Ok(true)
+    }
+
+    /// Read-only fence before disarming an actually uninvoked provider command.
+    /// The existing mutation and publication remain held across that await.
+    pub(crate) fn validate_uninvoked_clone_admission(
+        &self,
+        admission: &NetworkFdMutationAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        let permit = admission.publication.permit;
+        let state = self
+            .fd_lifecycle
+            .mutations
+            .get(&permit.lease)
+            .ok_or_else(|| protocol("uninvoked clone admission is not retained"))?;
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("uninvoked clone lost table publication"))?;
+        if !matches!(admission.kind, NetworkFdMutationKind::Clone { .. })
+            || state.admission != *admission
+            || !admission.controls.is_empty()
+            || state.kernel_result.is_some()
+            || (state.clone_child.is_some() || state.native_birth.is_some())
+            || state.installation_confirmed
+            || publication.active != Some(permit)
+            || publication.pending.is_some()
+        {
+            return Err(protocol("uninvoked clone changed exact pending custody"));
+        }
+        Ok(())
+    }
+
+    /// Settle the exact returned clone admission retained before its Submit RPC.
+    /// The consuming callback supplies non-invocation, never parent death alone.
+    pub(crate) fn cancel_uninvoked_clone_admission(
+        &mut self,
+        admission: &NetworkFdMutationAdmission,
+    ) -> Result<(), NetworkReplayError> {
+        let permit = admission.publication.permit;
+        let NetworkFdMutationKind::Clone { flags } = admission.kind else {
+            return Err(protocol("uninvoked clone receipt has another operation"));
+        };
+        let state = self
+            .fd_lifecycle
+            .mutations
+            .get(&permit.lease)
+            .ok_or_else(|| protocol("uninvoked clone admission is not retained"))?;
+        if state.admission != *admission || !admission.controls.is_empty() {
+            return Err(protocol("uninvoked clone admission changed exact custody"));
+        }
+        if !state.submitted {
+            return self.cancel_unsubmitted_fd_mutation(permit.owner, permit);
+        }
+        self.cancel_uninvoked_cloned_fd_table(permit, flags)
+    }
+
+    /// Only the consuming backend ThreadState's exact uninvoked marker may call
+    /// this path. Parent death alone cannot settle a submitted native clone.
+    pub(crate) fn cancel_uninvoked_cloned_fd_table(
+        &mut self,
+        permit: NetworkFdPublicationPermit,
+        flags: CloneFlags,
+    ) -> Result<(), NetworkReplayError> {
+        let state = self
+            .fd_lifecycle
+            .mutations
+            .get(&permit.lease)
+            .ok_or_else(|| protocol("uninvoked clone lost its retained mutation"))?;
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("uninvoked clone lost its table admission"))?;
+        if state.admission.publication.permit != permit
+            || state.admission.kind != (NetworkFdMutationKind::Clone { flags })
+            || !state.submitted
+            || state.kernel_result.is_some()
+            || (state.clone_child.is_some() || state.native_birth.is_some())
+            || state.installation_confirmed
+            || !state.admission.controls.is_empty()
+            || publication.active != Some(permit)
+            || publication.pending.is_some()
+        {
+            return Err(protocol(
+                "uninvoked clone contradicts retained physical state",
+            ));
+        }
+        let retired = self
+            .lifetime
+            .cancel_clone(clone_ticket(permit))
+            .map_err(|error| protocol(&error.to_string()))?;
+        self.retire_lifetime_open_files(retired);
+        self.fd_lifecycle.mutations.remove(&permit.lease).unwrap();
+        self.fd_publications.get_mut(&permit.files).unwrap().active = None;
+        self.prune_dead_fd_publication(permit.files);
+        Ok(())
+    }
+
+    /// Settle one exact known failed clone at normal return or actual terminal
+    /// observation. The caller owns the original birth reservation and native
+    /// errno. A missing mutation or different result remains an error.
+    pub(crate) fn settle_failed_cloned_fd_table(
+        &mut self,
+        permit: NetworkFdPublicationPermit,
+        flags: CloneFlags,
+        errno: i32,
+    ) -> Result<(), NetworkReplayError> {
+        let state = self
+            .fd_lifecycle
+            .mutations
+            .get(&permit.lease)
+            .ok_or_else(|| protocol("failed clone lost retained mutation"))?;
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("failed clone lost table admission"))?;
+        if !(1..=4095).contains(&errno)
+            || state.admission.publication.permit != permit
+            || state.admission.kind != (NetworkFdMutationKind::Clone { flags })
+            || !state.submitted
+            || (state.clone_child.is_some() || state.native_birth.is_some())
+            || state.installation_confirmed
+            || !state.admission.controls.is_empty()
+            || state
+                .kernel_result
+                .is_some_and(|result| result != Err(errno))
+            || publication.active != Some(permit)
+            || publication.pending.is_some()
+        {
+            return Err(protocol("known failed clone contradicts exact custody"));
+        }
+        let retired = self
+            .lifetime
+            .cancel_clone(clone_ticket(permit))
+            .map_err(|error| protocol(&error.to_string()))?;
+        self.retire_lifetime_open_files(retired);
+        self.fd_lifecycle.mutations.remove(&permit.lease).unwrap();
+        self.fd_publications.get_mut(&permit.files).unwrap().active = None;
+        self.prune_dead_fd_publication(permit.files);
+        Ok(())
+    }
+
+    pub(crate) fn validate_child_birth_permit(
+        &self,
+        parent: NetworkStreamOwner,
+        permit: NetworkFdPublicationPermit,
+        flags: CloneFlags,
+    ) -> Result<(), NetworkReplayError> {
+        let state = self.fd_mutation(parent, permit)?;
+        if !state.submitted
+            || state.kernel_result.is_some()
+            || state.clone_child.is_some()
+            || state.admission.kind != (NetworkFdMutationKind::Clone { flags })
+        {
+            return Err(protocol("birth preparation lacks exact submitted clone"));
+        }
+        Ok(())
+    }
+
+    /// Consume the exact clone permit inherited by a real backend child. Unlike
+    /// ordinary parent publication, the submitting task may already be retired.
+    /// The caller authenticates the child callback and inherited birth metadata;
+    /// this method authenticates the still-retained physical submission and the
+    /// original table reservation. It never recovers a permit by scanning a PID.
+    pub(crate) fn register_inherited_cloned_fd_table(
+        &mut self,
+        permit: NetworkFdPublicationPermit,
+        child: NetworkStreamOwner,
+        process: DetPid,
+        flags: CloneFlags,
+    ) -> Result<(), NetworkReplayError> {
+        self.complete_inherited_clone(
+            permit,
+            child,
+            process,
+            flags,
+            InheritedCloneDisposition::Admit,
+        )
+    }
+
+    /// Called only after the exact inherited birth and native NewChild were
+    /// matched at the backend's actual final wait, before any child startup.
+    pub(crate) fn retire_prestart_cloned_fd_table(
+        &mut self,
+        permit: NetworkFdPublicationPermit,
+        child: NetworkStreamOwner,
+        process: DetPid,
+        flags: CloneFlags,
+    ) -> Result<(), NetworkReplayError> {
+        self.complete_inherited_clone(
+            permit,
+            child,
+            process,
+            flags,
+            InheritedCloneDisposition::RetireBeforeStart,
+        )
+    }
+
+    fn complete_inherited_clone(
+        &mut self,
+        permit: NetworkFdPublicationPermit,
+        child: NetworkStreamOwner,
+        process: DetPid,
+        flags: CloneFlags,
+        disposition: InheritedCloneDisposition,
+    ) -> Result<(), NetworkReplayError> {
+        if !self.fd_table_capability() {
+            return Err(protocol("inherited clone cannot enable table capability"));
+        }
+        self.check_stream_owner(child)?;
+        let state = self
+            .fd_lifecycle
+            .mutations
+            .get(&permit.lease)
+            .ok_or_else(|| protocol("inherited clone has no retained submission"))?;
+        let publication = self
+            .fd_publications
+            .get(&permit.files)
+            .ok_or_else(|| protocol("inherited clone lost its table publication"))?;
+        let actual_matches = match &state.native_birth {
+            Some(actual) => {
+                actual.child_owner() == child
+                    && actual.child_process() == process
+                    && actual.terminal()
+                        == matches!(disposition, InheritedCloneDisposition::RetireBeforeStart)
+                    && actual.actual_flags() == flags
+            }
+            None => state.admission.kind == (NetworkFdMutationKind::Clone { flags }),
+        };
+        if state.admission.publication.permit != permit
+            || !actual_matches
+            || !state.submitted
+            || state.clone_child.is_some()
+            || state.installation_confirmed
+            || !state.admission.controls.is_empty()
+            || publication.active != Some(permit)
+            || publication.pending.is_some()
+            || child.thread == permit.owner.thread
+            || child.mm
+                != crate::types::MmId::for_clone(
+                    permit.owner.mm,
+                    child.thread,
+                    flags.contains(CloneFlags::CLONE_VM),
+                )
+            || state
+                .kernel_result
+                .is_some_and(|result| result != Ok(i64::from(child.thread.as_raw())))
+        {
+            return Err(protocol(
+                "inherited child contradicts exact clone submission",
+            ));
+        }
+        let parent_returned = state.kernel_result.is_some();
+        let parent_retired = self
+            .lifetime
+            .task_files(TaskOwner {
+                tid: permit.owner.thread,
+                mm: permit.owner.mm,
+            })
+            .is_err();
+        let child_task = TaskOwner {
+            tid: child.thread,
+            mm: child.mm,
+        };
+        if matches!(disposition, InheritedCloneDisposition::RetireBeforeStart) {
+            let retired = self
+                .lifetime
+                .retire_prestart_clone(clone_ticket(permit), child_task)
+                .map_err(|error| protocol(&error.to_string()))?;
+            self.retire_lifetime_open_files(retired);
+        } else {
+            self.lifetime
+                .commit_clone(clone_ticket(permit), child_task, process)
+                .map_err(|error| protocol(&error.to_string()))?;
+        }
+        // All table/lease/pending checks precede the lifetime commit. This is
+        // the one child-consumption path; generic publication still requires
+        // the live submitting owner and is deliberately unchanged.
+        self.fd_publications.get_mut(&permit.files).unwrap().active = None;
+        if parent_returned || parent_retired {
+            self.fd_lifecycle.mutations.remove(&permit.lease).unwrap();
+        } else {
+            self.fd_lifecycle
+                .mutations
+                .get_mut(&permit.lease)
+                .unwrap()
+                .clone_child = Some((child_task, process));
+        }
+        self.prune_dead_fd_publication(permit.files);
+        Ok(())
     }
 
     pub(super) fn physical_fd_mutation_pending(&self, permit: NetworkFdPublicationPermit) -> bool {
@@ -947,18 +1900,35 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
         open_file: OpenFileId,
+        exact: Option<FdSlotBinding>,
     ) -> Result<(), NetworkReplayError> {
         if !self.fd_table_capability() {
             return Ok(());
         }
+        self.retain_registered_stream_call_lifetime(owner, call, open_file, exact)
+    }
+    // Logical Replay owns the same registered table/slot and lease without a
+    // corresponding physical provider slot. Its caller has separately admitted
+    // that exact logical publication; this helper never issues native authority.
+    pub(super) fn retain_registered_stream_call_lifetime(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        open_file: OpenFileId,
+        exact: Option<FdSlotBinding>,
+    ) -> Result<(), NetworkReplayError> {
         let task = TaskOwner {
             tid: owner.thread,
             mm: owner.mm,
         };
-        let binding = self
-            .lifetime
-            .binding_for_open_file(task, open_file)
-            .map_err(|error| protocol(&error.to_string()))?;
+        let binding = match exact {
+            Some(binding) if binding.open_file == open_file => binding,
+            Some(_) => return Err(protocol("stream call binding changed OFD")),
+            None => self
+                .lifetime
+                .binding_for_open_file(task, open_file)
+                .map_err(|error| protocol(&error.to_string()))?,
+        };
         self.lifetime
             .retain_binding(task, binding, stream_call_pin(owner, call))
             .map_err(|error| protocol(&error.to_string()))
@@ -973,13 +1943,23 @@ impl NetworkReplayEngine {
         if !self.fd_table_capability() {
             return Ok(());
         }
+        self.release_registered_stream_call_lifetime(
+            owner,
+            call,
+            open_file,
+            lifetime::TransportResolution::CompletedAndRecorded,
+        )
+    }
+    pub(super) fn release_registered_stream_call_lifetime(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        open_file: OpenFileId,
+        resolution: lifetime::TransportResolution,
+    ) -> Result<(), NetworkReplayError> {
         let retired = self
             .lifetime
-            .acknowledge_transport(
-                stream_call_pin(owner, call),
-                open_file,
-                lifetime::TransportResolution::CompletedAndRecorded,
-            )
+            .acknowledge_transport(stream_call_pin(owner, call), open_file, resolution)
             .map_err(|error| protocol(&error.to_string()))?;
         self.retire_lifetime_open_files(retired);
         Ok(())
@@ -988,7 +1968,10 @@ impl NetworkReplayEngine {
     /// Actual backend task consumption closes a table owner even if local Arcs
     /// linger. A stale MM cannot detach a replacement, and operation refs stay.
     pub(crate) fn retire_fd_table_owner(&mut self, owner: NetworkStreamOwner) {
-        if !self.fd_table_capability() {
+        // A recorded Call may retain an explicitly registered logical table
+        // without physical descriptor coverage. Exact TaskOwner lookup below,
+        // not Replay mode alone, authorizes this consuming ledger transition.
+        if !self.fd_table_capability() && self.mode() != NetworkEngineMode::Replay {
             return;
         }
         let task = TaskOwner {
@@ -998,6 +1981,9 @@ impl NetworkReplayEngine {
         let Ok(files) = self.lifetime.task_files(task) else {
             return;
         };
+        // No physical submission exists while the exact read is still retained
+        // by its table permit. Transferred reads are owned by Calls instead.
+        self.consume_logical_fd_reads(owner);
         // An admission whose Submit was never processed cannot have reached
         // Guest::inject: the handler waits for that acknowledgement first.
         // A lost Submit reply has submitted=true and deliberately fails this guard.
@@ -1027,8 +2013,8 @@ impl NetworkReplayEngine {
             self.finish_unchanged_fd_mutation(owner, permit)
                 .expect("known unchanged physical mutation prevalidated during exact owner exit");
         }
-        // Registered child is a positive kernel effect. A dead parent's missing
-        // return value does not undo the child's table or leave an unknown clone.
+        // An observed child is a positive kernel effect, including a child whose
+        // prestart final wait settled its escrow. Parent death cannot undo it.
         self.fd_lifecycle.mutations.retain(|_, state| {
             state.admission.publication.permit.owner != owner || state.clone_child.is_none()
         });
@@ -1038,14 +2024,22 @@ impl NetworkReplayEngine {
     }
 
     pub(super) fn prune_dead_fd_publication(&mut self, files: FilesId) {
-        if self.lifetime.table_exists(files) {
+        if self.lifetime.table_exists(files)
+            || self
+                .fd_publications
+                .get(&files)
+                .is_some_and(|state| state.enrollment.is_some())
+        {
             return;
         }
         let unknown = self
             .fd_publications
             .get(&files)
             .and_then(|state| state.active)
-            .is_some_and(|permit| self.physical_fd_mutation_pending(permit));
+            .is_some_and(|permit| {
+                self.physical_fd_mutation_pending(permit)
+                    || self.native_stream_capture_pending(permit)
+            });
         if unknown {
             return;
         }
@@ -1060,6 +2054,28 @@ impl NetworkReplayEngine {
 
 #[cfg(test)]
 impl NetworkReplayEngine {
+    pub(crate) fn native_capture_fixture_cancel_unsubmitted(
+        &mut self,
+        owner: NetworkStreamOwner,
+        permit: NetworkFdPublicationPermit,
+    ) -> Result<(), NetworkReplayError> {
+        self.cancel_unsubmitted_fd_mutation(owner, permit)
+    }
+
+    pub(crate) fn native_capture_fixture_counts(
+        &self,
+        open_file: OpenFileId,
+    ) -> (usize, usize, usize, usize) {
+        (
+            self.stream_calls.len(),
+            self.socket_controls.len(),
+            self.fd_publications
+                .values()
+                .filter(|state| state.active.is_some())
+                .count(),
+            self.lifetime.counts(open_file).transports,
+        )
+    }
     pub(crate) fn fd_table_fixture_enable(&mut self) {
         self.install_fd_table_capability(NetworkFdTableCapability::controlled_fixture());
     }
@@ -1198,6 +2214,367 @@ mod tests {
         }
     }
 
+    fn recording_finalizers()
+    -> [fn(NetworkReplayEngine) -> Result<NetworkTrace, NetworkReplayError>; 2] {
+        [
+            |engine| engine.into_recorded_trace().map(NetworkTrace::V2),
+            NetworkReplayEngine::into_recorded_versioned_trace,
+        ]
+    }
+
+    #[test]
+    fn recording_finalizers_reject_pure_fd_mutation_until_result_consumption_and_owner_retirement()
+    {
+        for finalize in recording_finalizers() {
+            for consumed in [false, true] {
+                let (mut engine, owner, files) = setup();
+                let EngineState::Record(expected) = &engine.mode else {
+                    unreachable!("setup constructs a recorder");
+                };
+                let expected = expected.clone();
+                let admission = admitted(&mut engine, owner, files, NetworkFdMutationKind::Socket);
+                let permit = admission.publication.permit;
+                engine.submit_fd_mutation(owner, permit).unwrap();
+                assert!(admission.controls.is_empty());
+                assert!(engine.stream_calls.is_empty());
+                assert!(engine.socket_controls.is_empty());
+                assert!(engine.stream_operations.is_empty());
+                assert!(engine.zero_stream_waits.is_empty());
+                if consumed {
+                    // Explicit component kernel-error input uses the existing
+                    // confirmation/consumption path, never an inferred close.
+                    engine
+                        .confirm_fd_mutation_result(owner, permit, Err(libc::EMFILE))
+                        .unwrap();
+                    engine.finish_unchanged_fd_mutation(owner, permit).unwrap();
+                    assert!(engine.fd_lifecycle.mutations.is_empty());
+                    engine.retire_fd_table_owner(owner);
+                    engine.lifetime.finish().unwrap();
+                    assert_eq!(finalize(engine).unwrap(), NetworkTrace::V2(expected));
+                } else {
+                    // With no StreamCall/control/operation, only the exact
+                    // pending descriptor mutation can produce this receipt.
+                    assert!(matches!(
+                        finalize(engine),
+                        Err(NetworkReplayError::UnresolvedStreamOperation(actual))
+                            if actual == permit.lease
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_finalizers_reject_registered_owner_until_exact_retirement() {
+        for finalize in recording_finalizers() {
+            for retired in [false, true] {
+                let (mut engine, owner, _) = setup();
+                let EngineState::Record(expected) = &engine.mode else {
+                    unreachable!("setup constructs a recorder");
+                };
+                let expected = expected.clone();
+                assert!(engine.fd_lifecycle.mutations.is_empty());
+                assert!(engine.stream_calls.is_empty());
+                assert!(engine.socket_controls.is_empty());
+                assert!(engine.stream_operations.is_empty());
+                assert!(engine.zero_stream_waits.is_empty());
+                if retired {
+                    engine.retire_fd_table_owner(owner);
+                    engine.lifetime.finish().unwrap();
+                    assert_eq!(finalize(engine).unwrap(), NetworkTrace::V2(expected));
+                } else {
+                    assert!(matches!(
+                        finalize(engine),
+                        Err(NetworkReplayError::FdPublicationProtocol(message))
+                            if message == lifetime::LifetimeError::OutstandingOwners.to_string()
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_capture_rejects_fixed_source_and_stale_generation_before_call() {
+        let (mut engine, owner, files) = setup();
+        let source = socket(&mut engine, owner, files, 7, 1);
+        let other = socket(&mut engine, owner, files, 8, 2);
+        let control = engine
+            .begin_socket_controls(owner, vec![source.binding.open_file])
+            .unwrap()[0]
+            .1;
+        let next_call = engine.next_stream_call;
+        let mut stale = source.binding;
+        stale.generation += 1;
+        for invalid in [stale, other.binding] {
+            assert!(
+                engine
+                    .begin_native_stream_call(owner, control, invalid)
+                    .is_err()
+            );
+            assert_eq!(engine.next_stream_call, next_call);
+            assert!(engine.stream_calls.is_empty());
+            assert!(engine.fd_publications[&files].active.is_none());
+            assert_eq!(
+                engine.lifetime.counts(source.binding.open_file).transports,
+                0
+            );
+        }
+        engine
+            .finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+    }
+
+    #[test]
+    fn native_capture_rejects_replaced_slot_even_while_old_ofd_alias_survives() {
+        let (mut engine, owner, files) = setup();
+        let source = socket(&mut engine, owner, files, 7, 1);
+        let replacement = socket(&mut engine, owner, files, 8, 2);
+        let duplicate = admitted(
+            &mut engine,
+            owner,
+            files,
+            alias(source, NetworkFdInstallKind::Dup, None, None),
+        );
+        engine
+            .submit_fd_mutation(owner, duplicate.publication.permit)
+            .unwrap();
+        engine
+            .confirm_fd_mutation_result(owner, duplicate.publication.permit, Ok(9))
+            .unwrap();
+        commit_install(
+            &mut engine,
+            owner,
+            &duplicate,
+            None,
+            slot(owner, 9, 3, source.binding.open_file),
+        );
+        let replace = admitted(
+            &mut engine,
+            owner,
+            files,
+            alias(
+                replacement,
+                NetworkFdInstallKind::Dup2,
+                Some(7),
+                Some(source),
+            ),
+        );
+        engine
+            .submit_fd_mutation(owner, replace.publication.permit)
+            .unwrap();
+        engine
+            .confirm_fd_mutation_result(owner, replace.publication.permit, Ok(7))
+            .unwrap();
+        commit_install(
+            &mut engine,
+            owner,
+            &replace,
+            Some(source),
+            slot(owner, 7, 4, replacement.binding.open_file),
+        );
+        let control = engine
+            .begin_socket_controls(owner, vec![source.binding.open_file])
+            .unwrap()[0]
+            .1;
+        let next_call = engine.next_stream_call;
+        assert!(
+            engine
+                .begin_native_stream_call(owner, control, source.binding)
+                .is_err()
+        );
+        assert_eq!(engine.next_stream_call, next_call);
+        assert!(engine.stream_calls.is_empty());
+        assert!(engine.fd_publications[&files].active.is_none());
+        assert_eq!(engine.lifetime.counts(source.binding.open_file).slots, 1);
+        assert_eq!(
+            engine.lifetime.counts(source.binding.open_file).transports,
+            0
+        );
+        engine
+            .finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+            .unwrap();
+    }
+
+    #[test]
+    fn native_capture_holds_table_until_known_pin_outcome() {
+        for outcome in [
+            NetworkStreamPinOutcome::Acquired,
+            NetworkStreamPinOutcome::Failed(libc::EPERM),
+        ] {
+            let (mut engine, owner, files) = setup();
+            let source = socket(&mut engine, owner, files, 7, 1);
+            let control = engine
+                .begin_socket_controls(owner, vec![source.binding.open_file])
+                .unwrap()[0]
+                .1;
+            let call = engine
+                .begin_native_stream_call(owner, control, source.binding)
+                .unwrap();
+            let permit = engine.stream_calls[&call.id].capture_publication.unwrap();
+            assert!(call.physical_pin_required);
+            assert!(engine.native_stream_capture_pending(permit));
+            for kind in [
+                NetworkFdMutationKind::Socket,
+                NetworkFdMutationKind::Clone {
+                    flags: CloneFlags::CLONE_FILES,
+                },
+            ] {
+                assert!(matches!(engine.begin_fd_mutation(owner, files, kind),
+                    Err(NetworkReplayError::StreamOperationBusy(lease)) if lease == permit.lease));
+            }
+            assert_eq!(engine.fd_publications[&files].active, Some(permit));
+            assert_eq!(
+                engine.lifetime.counts(source.binding.open_file).transports,
+                1
+            );
+            engine
+                .confirm_stream_call_pin(owner, call.id, outcome)
+                .unwrap();
+            assert!(!engine.native_stream_capture_pending(permit));
+            assert!(engine.fd_publications[&files].active.is_none());
+            engine
+                .finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+                .unwrap();
+            if outcome == NetworkStreamPinOutcome::Acquired {
+                assert_eq!(
+                    engine.lifetime.counts(source.binding.open_file).transports,
+                    1
+                );
+                engine.begin_stream_call_release(owner, call.id).unwrap();
+                engine.finish_stream_call_release(owner, call.id).unwrap();
+            }
+            assert!(engine.stream_calls.is_empty());
+            assert_eq!(
+                engine.lifetime.counts(source.binding.open_file).transports,
+                0
+            );
+            let next = admitted(&mut engine, owner, files, NetworkFdMutationKind::Socket);
+            engine
+                .cancel_unsubmitted_fd_mutation(owner, next.publication.permit)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_capture_unknown_owner_exit_keeps_exact_table_and_pin_custody() {
+        for shared in [false, true] {
+            let (mut engine, owner, files) = setup();
+            let sibling = NetworkStreamOwner {
+                thread: DetTid::from_raw(62),
+                mm: owner.mm,
+            };
+            if shared {
+                engine.fd_publication_fixture_register(sibling, Some(owner));
+            }
+            let source = socket(&mut engine, owner, files, 7, 1);
+            let control = engine
+                .begin_socket_controls(owner, vec![source.binding.open_file])
+                .unwrap()[0]
+                .1;
+            let call = engine
+                .begin_native_stream_call(owner, control, source.binding)
+                .unwrap();
+            let permit = engine.stream_calls[&call.id].capture_publication.unwrap();
+            engine.retire_fd_table_owner(owner);
+            engine.stream_owner_gone(owner);
+            assert!(engine.native_stream_capture_pending(permit));
+            assert_eq!(engine.fd_publications[&files].active, Some(permit));
+            assert_eq!(
+                engine.lifetime.counts(source.binding.open_file).transports,
+                1
+            );
+            assert!(engine.stream_calls[&call.id].abandoned);
+            assert!(engine.lifetime.finish().is_err());
+            if shared {
+                assert!(
+                    matches!(engine.begin_fd_mutation(sibling, files, NetworkFdMutationKind::Socket),
+                    Err(NetworkReplayError::StreamOperationBusy(lease)) if lease == permit.lease)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_capture_never_infers_backend_capability_from_registered_slot() {
+        let (mut engine, owner, files) = setup();
+        let source = socket(&mut engine, owner, files, 7, 1);
+        let control = engine
+            .begin_socket_controls(owner, vec![source.binding.open_file])
+            .unwrap()[0]
+            .1;
+        engine.fd_lifecycle.capability = None;
+        let next_call = engine.next_stream_call;
+        assert!(
+            engine
+                .begin_native_stream_call(owner, control, source.binding)
+                .is_err()
+        );
+        assert_eq!(engine.next_stream_call, next_call);
+        assert!(engine.stream_calls.is_empty());
+        assert!(engine.fd_publications[&files].active.is_none());
+        assert_eq!(
+            engine.lifetime.counts(source.binding.open_file).transports,
+            0
+        );
+    }
+
+    #[test]
+    fn regular_stdout_alias_and_mixed_replacement_use_shared_mutation_owner() {
+        let (mut engine, owner, files) = setup();
+        let task = TaskOwner {
+            tid: owner.thread,
+            mm: owner.mm,
+        };
+        let regular = slot(owner, 1, 1, OpenFileId::new(owner.thread, 0));
+        engine
+            .lifetime
+            .publish_created_slot(task, regular, None)
+            .unwrap();
+        let socket = socket(&mut engine, owner, files, 4, 2);
+        assert!(matches!(
+            engine.begin_socket_controls(owner, vec![regular.binding.open_file]),
+            Err(NetworkReplayError::NonSocketOpenFile(_))
+        ));
+        let duplicate = admitted(
+            &mut engine,
+            owner,
+            files,
+            alias(regular, NetworkFdInstallKind::Dup, None, None),
+        );
+        engine
+            .submit_fd_mutation(owner, duplicate.publication.permit)
+            .unwrap();
+        engine
+            .confirm_fd_mutation_result(owner, duplicate.publication.permit, Ok(7))
+            .unwrap();
+        let alias_slot = slot(owner, 7, 3, regular.binding.open_file);
+        commit_install(&mut engine, owner, &duplicate, None, alias_slot);
+        assert_eq!(
+            engine.lifetime.descriptor_binding(task, 7).unwrap(),
+            alias_slot.binding
+        );
+        let replace = admitted(
+            &mut engine,
+            owner,
+            files,
+            alias(regular, NetworkFdInstallKind::Dup2, Some(4), Some(socket)),
+        );
+        assert_eq!(replace.controls.len(), 2);
+        engine
+            .submit_fd_mutation(owner, replace.publication.permit)
+            .unwrap();
+        engine
+            .confirm_fd_mutation_result(owner, replace.publication.permit, Ok(4))
+            .unwrap();
+        let replacement = slot(owner, 4, 4, regular.binding.open_file);
+        commit_install(&mut engine, owner, &replace, Some(socket), replacement);
+        assert_eq!(
+            engine.lifetime.descriptor_binding(task, 4).unwrap(),
+            replacement.binding
+        );
+        assert!(engine.lifetime.is_retired(socket.binding.open_file));
+        assert_eq!(engine.lifetime.counts(regular.binding.open_file).slots, 3);
+    }
     #[test]
     fn ordinary_backend_has_no_partial_mutation_capability() {
         assert!(backend_fd_table_capability(&crate::Config::default()).is_none());
@@ -2232,5 +3609,544 @@ mod tests {
         assert!(engine.fd_publication_fixture_is_retired(target.binding.open_file));
         engine.acknowledge_fd_publication(owner, p, &batch).unwrap();
         assert!(engine.take_lifetime_retired_ports().is_empty());
+    }
+    #[test]
+    fn inherited_clone_consumes_retained_shared_or_copied_table_after_parent_exit() {
+        for shared in [false, true] {
+            for parent_result in [false, true] {
+                let (mut engine, parent, files) = setup();
+                let source = socket(&mut engine, parent, files, 7, 1);
+                let flags = if shared {
+                    CloneFlags::CLONE_FILES
+                } else {
+                    CloneFlags::empty()
+                };
+                let child = NetworkStreamOwner {
+                    thread: DetTid::from_raw(62),
+                    mm: MmId::for_clone(parent.mm, DetTid::from_raw(62), false),
+                };
+                let admission = admitted(
+                    &mut engine,
+                    parent,
+                    files,
+                    NetworkFdMutationKind::Clone { flags },
+                );
+                let permit = admission.publication.permit;
+                engine.submit_fd_mutation(parent, permit).unwrap();
+                if parent_result {
+                    engine
+                        .confirm_fd_mutation_result(parent, permit, Ok(62))
+                        .unwrap();
+                }
+                engine.retire_fd_table_owner(parent);
+                engine.stream_owner_gone(parent);
+                assert_eq!(engine.fd_publications[&files].active, Some(permit));
+                assert!(!engine.fd_publication_fixture_is_retired(source.binding.open_file));
+                assert!(engine.release_empty_fd_publication(parent, permit).is_err());
+                engine
+                    .register_inherited_cloned_fd_table(permit, child, child.thread, flags)
+                    .unwrap();
+                let expected_files = if shared {
+                    files
+                } else {
+                    FilesId::forked(child.thread)
+                };
+                assert_eq!(engine.fd_table_fixture_files(child), Some(expected_files));
+                let binding = engine
+                    .lifetime
+                    .descriptor_binding(
+                        TaskOwner {
+                            tid: child.thread,
+                            mm: child.mm,
+                        },
+                        7,
+                    )
+                    .unwrap();
+                assert_eq!(binding.open_file, source.binding.open_file);
+                assert_eq!(binding.generation, source.binding.generation);
+                assert!(!engine.fd_lifecycle.mutations.contains_key(&permit.lease));
+                let after = format!("{engine:?}");
+                assert!(
+                    engine
+                        .register_inherited_cloned_fd_table(permit, child, child.thread, flags)
+                        .is_err()
+                );
+                assert_eq!(format!("{engine:?}"), after);
+                engine.retire_fd_table_owner(child);
+                assert!(engine.fd_publication_fixture_is_retired(source.binding.open_file));
+                engine.finish_fd_mutations().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_clone_rejects_wrong_owner_lease_table_flags_and_child_mm_without_effect() {
+        let (mut engine, parent, files) = setup();
+        let source = socket(&mut engine, parent, files, 7, 1);
+        let flags = CloneFlags::empty();
+        let child = NetworkStreamOwner {
+            thread: DetTid::from_raw(62),
+            mm: MmId::for_clone(parent.mm, DetTid::from_raw(62), false),
+        };
+        let admission = admitted(
+            &mut engine,
+            parent,
+            files,
+            NetworkFdMutationKind::Clone { flags },
+        );
+        let permit = admission.publication.permit;
+        engine.submit_fd_mutation(parent, permit).unwrap();
+        engine.retire_fd_table_owner(parent);
+        engine.stream_owner_gone(parent);
+        let before = format!("{engine:?}");
+        let mut wrong = permit;
+        wrong.owner.mm = parent.mm.for_exec(parent.thread);
+        let mut wrong_lease = permit;
+        wrong_lease.lease = NetworkStreamLeaseId(permit.lease.0 + 1);
+        let mut wrong_table = permit;
+        wrong_table.files = FilesId::forked(child.thread);
+        for candidate in [wrong, wrong_lease, wrong_table] {
+            assert!(
+                engine
+                    .register_inherited_cloned_fd_table(candidate, child, child.thread, flags)
+                    .is_err()
+            );
+            assert_eq!(format!("{engine:?}"), before);
+        }
+        assert!(
+            engine
+                .register_inherited_cloned_fd_table(
+                    permit,
+                    child,
+                    child.thread,
+                    CloneFlags::CLONE_FILES
+                )
+                .is_err()
+        );
+        assert!(
+            engine
+                .register_inherited_cloned_fd_table(
+                    permit,
+                    NetworkStreamOwner {
+                        mm: parent.mm,
+                        ..child
+                    },
+                    child.thread,
+                    flags
+                )
+                .is_err()
+        );
+        assert_eq!(format!("{engine:?}"), before);
+        assert!(!engine.fd_publication_fixture_is_retired(source.binding.open_file));
+        engine
+            .register_inherited_cloned_fd_table(permit, child, child.thread, flags)
+            .unwrap();
+    }
+
+    #[test]
+    fn inherited_clone_cannot_invent_submission_or_override_native_failure() {
+        for result in [None, Some(Err(libc::EAGAIN)), Some(Ok(63))] {
+            let (mut engine, parent, files) = setup();
+            let flags = CloneFlags::empty();
+            let child = NetworkStreamOwner {
+                thread: DetTid::from_raw(62),
+                mm: MmId::for_clone(parent.mm, DetTid::from_raw(62), false),
+            };
+            let admission = admitted(
+                &mut engine,
+                parent,
+                files,
+                NetworkFdMutationKind::Clone { flags },
+            );
+            let permit = admission.publication.permit;
+            if let Some(result) = result {
+                engine.submit_fd_mutation(parent, permit).unwrap();
+                engine
+                    .confirm_fd_mutation_result(parent, permit, result)
+                    .unwrap();
+            }
+            let before = format!("{engine:?}");
+            assert!(
+                engine
+                    .register_inherited_cloned_fd_table(permit, child, child.thread, flags)
+                    .is_err()
+            );
+            assert_eq!(format!("{engine:?}"), before);
+        }
+    }
+    #[test]
+    fn inherited_clone_uninvoked_consumption_releases_retired_parent_table_custody() {
+        for shared in [false, true] {
+            let (mut engine, parent, files) = setup();
+            let source = socket(&mut engine, parent, files, 7, 1);
+            let flags = if shared {
+                CloneFlags::CLONE_FILES
+            } else {
+                CloneFlags::empty()
+            };
+            let admission = admitted(
+                &mut engine,
+                parent,
+                files,
+                NetworkFdMutationKind::Clone { flags },
+            );
+            let permit = admission.publication.permit;
+            engine.submit_fd_mutation(parent, permit).unwrap();
+            engine.retire_fd_table_owner(parent);
+            engine.stream_owner_gone(parent);
+            assert!(!engine.fd_publication_fixture_is_retired(source.binding.open_file));
+            let before = format!("{engine:?}");
+            let mut wrong = permit;
+            wrong.owner.mm = parent.mm.for_exec(parent.thread);
+            assert!(
+                engine
+                    .cancel_uninvoked_cloned_fd_table(wrong, flags)
+                    .is_err()
+            );
+            assert_eq!(format!("{engine:?}"), before);
+            engine
+                .cancel_uninvoked_cloned_fd_table(permit, flags)
+                .unwrap();
+            assert!(engine.fd_publication_fixture_is_retired(source.binding.open_file));
+            engine.finish_fd_mutations().unwrap();
+            let after = format!("{engine:?}");
+            assert!(
+                engine
+                    .cancel_uninvoked_cloned_fd_table(permit, flags)
+                    .is_err()
+            );
+            assert_eq!(format!("{engine:?}"), after);
+        }
+    }
+
+    #[test]
+    fn prestart_terminal_clone_retires_shared_or_copied_escrow_without_child_admission() {
+        for flags in [CloneFlags::empty(), CloneFlags::CLONE_FILES] {
+            for parent_gone in [false, true] {
+                let (mut engine, parent, files) = setup();
+                let source = socket(&mut engine, parent, files, 7, 1);
+                let child = NetworkStreamOwner {
+                    thread: DetTid::from_raw(62),
+                    mm: MmId::for_clone(parent.mm, DetTid::from_raw(62), false),
+                };
+                let a = admitted(
+                    &mut engine,
+                    parent,
+                    files,
+                    NetworkFdMutationKind::Clone { flags },
+                );
+                let permit = a.publication.permit;
+                engine.submit_fd_mutation(parent, permit).unwrap();
+                if parent_gone {
+                    engine.retire_fd_table_owner(parent);
+                    engine.stream_owner_gone(parent);
+                }
+                assert!(!engine.fd_publication_fixture_is_retired(source.binding.open_file));
+                assert_eq!(
+                    engine
+                        .lifetime
+                        .counts(source.binding.open_file)
+                        .clone_reservations,
+                    usize::from(!flags.contains(CloneFlags::CLONE_FILES))
+                );
+                assert_eq!(engine.fd_publications[&files].active, Some(permit));
+                engine
+                    .retire_prestart_cloned_fd_table(permit, child, child.thread, flags)
+                    .unwrap();
+                assert_eq!(engine.fd_table_fixture_files(child), None);
+                assert_eq!(
+                    engine
+                        .lifetime
+                        .counts(source.binding.open_file)
+                        .clone_reservations,
+                    0
+                );
+                assert_eq!(
+                    engine.fd_publication_fixture_is_retired(source.binding.open_file),
+                    parent_gone
+                );
+                let after = format!("{engine:?}");
+                assert!(
+                    engine
+                        .retire_prestart_cloned_fd_table(permit, child, child.thread, flags)
+                        .is_err()
+                );
+                assert_eq!(format!("{engine:?}"), after);
+                if !parent_gone {
+                    assert!(
+                        engine
+                            .confirm_fd_mutation_result(parent, permit, Ok(63))
+                            .is_err()
+                    );
+                    assert_eq!(format!("{engine:?}"), after);
+                    engine
+                        .confirm_fd_mutation_result(parent, permit, Ok(62))
+                        .unwrap();
+                    engine.retire_fd_table_owner(parent);
+                    engine.stream_owner_gone(parent);
+                }
+                assert!(engine.fd_publication_fixture_is_retired(source.binding.open_file));
+                engine.finish_fd_mutations().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn prestart_terminal_clone_rejects_changed_custody_without_releasing_anything() {
+        for wrong in ["permit", "MM", "flags", "native-error"] {
+            let (mut engine, parent, files) = setup();
+            let source = socket(&mut engine, parent, files, 7, 1);
+            let a = admitted(
+                &mut engine,
+                parent,
+                files,
+                NetworkFdMutationKind::Clone {
+                    flags: CloneFlags::empty(),
+                },
+            );
+            let mut permit = a.publication.permit;
+            engine.submit_fd_mutation(parent, permit).unwrap();
+            let mut child = NetworkStreamOwner {
+                thread: DetTid::from_raw(62),
+                mm: MmId::for_clone(parent.mm, DetTid::from_raw(62), false),
+            };
+            let mut flags = CloneFlags::empty();
+            if wrong == "permit" {
+                permit.owner.mm = parent.mm.for_exec(parent.thread);
+            }
+            if wrong == "MM" {
+                child.mm = child.mm.for_exec(child.thread);
+            }
+            if wrong == "flags" {
+                flags = CloneFlags::CLONE_FILES;
+            }
+            if wrong == "native-error" {
+                engine
+                    .confirm_fd_mutation_result(parent, permit, Err(libc::EAGAIN))
+                    .unwrap();
+            }
+            let before = format!("{engine:?}");
+            assert!(
+                engine
+                    .retire_prestart_cloned_fd_table(permit, child, child.thread, flags)
+                    .is_err(),
+                "{wrong}"
+            );
+            assert_eq!(format!("{engine:?}"), before, "{wrong}");
+            assert_eq!(
+                engine
+                    .lifetime
+                    .counts(source.binding.open_file)
+                    .clone_reservations,
+                1
+            );
+            assert!(!engine.fd_publication_fixture_is_retired(source.binding.open_file));
+        }
+    }
+
+    #[test]
+    fn observed_failed_clone_releases_exact_shared_or_copied_reservation_once() {
+        for flags in [CloneFlags::empty(), CloneFlags::CLONE_FILES] {
+            let (mut engine, owner, files) = setup();
+            let source = socket(&mut engine, owner, files, 7, 1);
+            let a = admitted(
+                &mut engine,
+                owner,
+                files,
+                NetworkFdMutationKind::Clone { flags },
+            );
+            let permit = a.publication.permit;
+            engine.submit_fd_mutation(owner, permit).unwrap();
+            engine.retire_fd_table_owner(owner);
+            engine.stream_owner_gone(owner);
+            assert!(!engine.fd_publication_fixture_is_retired(source.binding.open_file));
+            assert!(engine.fd_lifecycle.mutations.contains_key(&permit.lease));
+            engine
+                .settle_failed_cloned_fd_table(permit, flags, libc::EAGAIN)
+                .unwrap();
+            assert!(!engine.fd_lifecycle.mutations.contains_key(&permit.lease));
+            assert!(engine.fd_publication_fixture_is_retired(source.binding.open_file));
+            assert!(
+                engine
+                    .settle_failed_cloned_fd_table(permit, flags, libc::EAGAIN)
+                    .is_err()
+            );
+            engine.finish_fd_mutations().unwrap();
+        }
+    }
+
+    #[test]
+    fn observed_failed_clone_rejects_changed_permit_and_contradictory_outcome() {
+        for wrong in [
+            "lease",
+            "flags",
+            "errno",
+            "native_success",
+            "different_errno",
+        ] {
+            let (mut engine, owner, files) = setup();
+            let flags = CloneFlags::empty();
+            let a = admitted(
+                &mut engine,
+                owner,
+                files,
+                NetworkFdMutationKind::Clone { flags },
+            );
+            let permit = a.publication.permit;
+            engine.submit_fd_mutation(owner, permit).unwrap();
+            let mut actual = permit;
+            let mut actual_flags = flags;
+            let mut errno = libc::EAGAIN;
+            match wrong {
+                "lease" => actual.lease.0 += 1,
+                "flags" => actual_flags = CloneFlags::CLONE_FILES,
+                "errno" => errno = 0,
+                "native_success" => engine
+                    .confirm_fd_mutation_result(owner, permit, Ok(62))
+                    .unwrap(),
+                "different_errno" => engine
+                    .confirm_fd_mutation_result(owner, permit, Err(libc::EINVAL))
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                engine
+                    .settle_failed_cloned_fd_table(actual, actual_flags, errno)
+                    .is_err(),
+                "{wrong}"
+            );
+            assert!(engine.fd_lifecycle.mutations.contains_key(&permit.lease));
+            assert_eq!(engine.fd_publications[&files].active, Some(permit));
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_actual_fd_tests {
+    use chrono::TimeZone;
+
+    use super::*;
+    use crate::types::DetTid;
+    use crate::types::MmId;
+    fn prepared(
+        actual: CloneFlags,
+        terminal: bool,
+    ) -> (
+        NetworkReplayEngine,
+        NetworkFdMutationAdmission,
+        crate::network_runtime::native_birth::NativeBirthAdmission,
+    ) {
+        let thread = DetTid::from_raw(41);
+        let owner = NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        let mut engine = NetworkReplayEngine::record(Utc.timestamp_opt(1_790_000_000, 0).unwrap());
+        engine.fd_table_fixture_enable();
+        engine.register_initial_fd_table(owner, thread).unwrap();
+        let NetworkFdMutationBegin::Admitted(admission) = engine
+            .begin_fd_mutation(
+                owner,
+                FilesId::initial(thread),
+                NetworkFdMutationKind::Clone {
+                    flags: CloneFlags::empty(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("original clone admission");
+        };
+        let permit = admission.publication.permit;
+        engine.submit_fd_mutation(owner, permit).unwrap();
+        engine.prepare_native_birth_escrow(owner, permit).unwrap();
+        let proof = crate::network_runtime::native_birth::synthetic_admission_for_permit(
+            permit, actual, terminal,
+        );
+        (engine, admission, proof)
+    }
+    #[test]
+    fn actual_files_choice_consumes_same_escrow_without_changing_request() {
+        for actual in [
+            CloneFlags::empty(),
+            CloneFlags::CLONE_FILES | CloneFlags::CLONE_VM,
+        ] {
+            let (mut engine, original, proof) = prepared(actual, false);
+            let permit = original.publication.permit;
+            engine.admit_native_birth(&proof).unwrap();
+            engine.admit_native_birth(&proof).unwrap();
+            assert_eq!(
+                engine.fd_lifecycle.mutations[&permit.lease].admission,
+                original
+            );
+            assert!(engine.cancel_uninvoked_clone_admission(&original).is_err());
+            engine
+                .register_inherited_cloned_fd_table(
+                    permit,
+                    proof.child_owner(),
+                    proof.child_process(),
+                    actual,
+                )
+                .unwrap();
+            let expected = if actual.contains(CloneFlags::CLONE_FILES) {
+                permit.files
+            } else {
+                FilesId::forked(proof.child_owner().thread)
+            };
+            assert_eq!(
+                engine.fd_table_fixture_files(proof.child_owner()),
+                Some(expected)
+            );
+            assert!(
+                engine
+                    .confirm_fd_mutation_result(permit.owner, permit, Ok(999))
+                    .is_err()
+            );
+            engine
+                .confirm_fd_mutation_result(
+                    permit.owner,
+                    permit,
+                    Ok(i64::from(proof.child_owner().thread.as_raw())),
+                )
+                .unwrap();
+        }
+    }
+    #[test]
+    fn prestart_actual_files_retirement_does_not_register_live_child() {
+        for actual in [CloneFlags::empty(), CloneFlags::CLONE_FILES] {
+            let (mut engine, original, proof) = prepared(actual, true);
+            let permit = original.publication.permit;
+            engine.admit_native_birth(&proof).unwrap();
+            assert!(
+                engine
+                    .settle_failed_cloned_fd_table(permit, CloneFlags::empty(), libc::ECHILD)
+                    .is_err()
+            );
+            engine
+                .retire_prestart_cloned_fd_table(
+                    permit,
+                    proof.child_owner(),
+                    proof.child_process(),
+                    actual,
+                )
+                .unwrap();
+            assert_eq!(engine.fd_table_fixture_files(proof.child_owner()), None);
+            assert_eq!(
+                engine.fd_lifecycle.mutations[&permit.lease].admission,
+                original
+            );
+            engine
+                .confirm_fd_mutation_result(
+                    permit.owner,
+                    permit,
+                    Ok(i64::from(proof.child_owner().thread.as_raw())),
+                )
+                .unwrap();
+        }
+    }
+}
+
+impl NetworkReplayEngine {
+    pub(super) fn foreground_fd_mutations_settled(&self) -> bool {
+        self.fd_lifecycle.mutations.is_empty()
     }
 }

@@ -56,7 +56,6 @@ use crate::network_replay::NetworkStreamLeaseId;
 use crate::network_replay::NetworkStreamNamespace;
 use crate::network_replay::NetworkStreamPhysicalEffect;
 use crate::network_replay::NetworkStreamPhysicalResult;
-use crate::network_replay::NetworkStreamPinOutcome;
 use crate::network_replay::NetworkStreamQueueStatus;
 use crate::network_replay::NetworkStreamSocketOption;
 use crate::network_replay::NetworkStreamSocketState;
@@ -143,6 +142,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Sendto(call) => self.network_open_file(guest, call.fd()).is_some(),
             Syscall::Recvmsg(call) => self.network_open_file(guest, call.sockfd()).is_some(),
             Syscall::Sendmsg(call) => self.network_open_file(guest, call.fd()).is_some(),
+            Syscall::Recvmmsg(call) => self.network_open_file(guest, call.fd()).is_some(),
+            Syscall::Sendmmsg(call) => self.network_open_file(guest, call.sockfd()).is_some(),
             Syscall::Shutdown(call) => self.network_open_file(guest, call.fd()).is_some(),
             Syscall::Poll(call) => self.poll_array_has_network_fd(
                 guest,
@@ -191,6 +192,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             return None;
         }
 
+        // Guest memory sampled before submission is not evidence of the bytes
+        // Linux later commits, including partial faults or concurrent mutation.
+        // Keep network output owned here and refuse before payload access or
+        // native submission until the shared engine has an authenticated TX join.
+        // Ordinary file/stdout writes and explicit live policy retain dispatch.
+        if policy == NetworkPolicy::Record {
+            let output_fd = match call {
+                Syscall::Write(call) => Some(call.fd()),
+                Syscall::Writev(call) => Some(call.fd()),
+                Syscall::Sendto(call) => Some(call.fd()),
+                _ => None,
+            };
+            if output_fd.is_some_and(|fd| self.network_open_file(guest, fd).is_some()) {
+                return Some(Err(engine_error(
+                    "Record network output requires authenticated native transmission receipts",
+                )));
+            }
+        }
+
         match call {
             Syscall::Socket(call) => Some(self.network_socket(guest, call).await),
             Syscall::Connect(call) => Some(self.network_connect(guest, call, policy).await),
@@ -204,7 +224,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(self.network_accept4(guest, call, policy).await)
             }
             Syscall::Read(call) if self.network_open_file(guest, call.fd()).is_some() => {
-                Some(self.network_read(guest, call, policy).await)
+                Some(self.network_read(guest, call, policy, true).await)
             }
             Syscall::Write(call) if self.network_open_file(guest, call.fd()).is_some() => {
                 Some(self.network_write(guest, call, policy).await)
@@ -270,6 +290,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "sendmsg ancillary relocation is not yet implemented",
                 )))
             }
+            Syscall::Recvmmsg(call) if self.network_open_file(guest, call.fd()).is_some() => {
+                Some(Err(engine_error(
+                    "recvmmsg batch and ancillary capture is not yet implemented",
+                )))
+            }
+            Syscall::Sendmmsg(call) if self.network_open_file(guest, call.sockfd()).is_some() => {
+                Some(Err(engine_error(
+                    "sendmmsg batch and ancillary capture is not yet implemented",
+                )))
+            }
             _ => None,
         }
     }
@@ -285,6 +315,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Creating the local descriptor is not external communication. Bypass
         // Recorder/Replayer so it cannot create a second per-thread event.
+        if self.network_fd_tracking_active(guest) {
+            let result = self.network_original_socket(guest, call).await;
+            return self.finish_original_invocation(guest, result).await;
+        }
         let admission = self
             .begin_network_fd_mutation(guest, crate::network_replay::NetworkFdMutationKind::Socket)
             .await?;
@@ -295,7 +329,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.add_fd(
             guest,
             fd,
-            OFlag::from_bits_truncate(call.r#type()),
+            crate::network_replay::original_installation::socket_installation_flags(call.r#type()),
             FdType::Socket,
         )
         .await?;
@@ -303,6 +337,583 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.complete_network_fd_installation(guest, admission.as_ref(), fd)
             .await?;
         Ok(i64::from(fd))
+    }
+
+    async fn network_original_socket<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Socket,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::Kind;
+        let arguments = self
+            .stage_original_call(
+                guest,
+                call.into(),
+                Kind::Socket,
+                call.family(),
+                u64::from(call.r#type() as u32),
+                call.protocol(),
+                crate::OriginalFileExecution::Native,
+            )
+            .await?;
+        let admission = match network_request(
+            guest,
+            NetworkRequest::NativeBeginOriginalAllocator { arguments },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalConnectAdmission(admission) => admission,
+            reply => {
+                return Err(engine_error(format!(
+                    "Socket admission changed reply {reply:?}"
+                )));
+            }
+        };
+        let local = guest.thread_state_mut().original_connect.as_mut().unwrap();
+        local.arguments = admission.arguments.clone();
+        local.admission = Some(admission.clone());
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeSubmitOriginalConnect {
+                admission: admission.clone(),
+            },
+        )
+        .await?;
+        self.mark_original_syscall_invoked(guest);
+        let result = guest.inject(call).await.map_err(Error::from);
+        let (admission, outcome, result, returned) = self
+            .observe_original_call_result(guest, admission, result)
+            .await?;
+        // The service has already authenticated the held file against this
+        // original installation and positively closed its auxiliary duplicate.
+        // No guest fstat/getsockopt buffer is accessed while the table is held.
+        // None still needs the publisher's exact Install->Remove proof.
+        let stat = if guest.config().virtualize_metadata {
+            outcome
+                .socket
+                .as_ref()
+                .map(|observed| observed.metadata.stat)
+        } else {
+            None
+        };
+        let enrollment = if let Some(observed) = outcome.socket.as_ref() {
+            self.capture_original_socket_profile(guest, call, observed)
+                .await?
+        } else {
+            None
+        };
+        match network_request(
+            guest,
+            NetworkRequest::NativePublishOriginalSocket {
+                admission: admission.clone(),
+                stat,
+                enrollment,
+            },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalSocketInstallation(binding)
+                if binding.map(|b| i64::from(b.slot.fd)) == (returned >= 0).then_some(returned) => {
+            }
+            reply => {
+                return Err(engine_error(format!(
+                    "Socket publication changed original result {reply:?}"
+                )));
+            }
+        };
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeRetireOriginalConnect { admission },
+        )
+        .await?;
+        guest.thread_state_mut().original_connect = None;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3174): native epoll allocator authority.
+    pub(crate) async fn network_original_epoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let result = self.network_original_epoll_inner(guest, call).await;
+        self.finish_original_invocation(guest, result).await
+    }
+
+    async fn network_original_epoll_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::Kind;
+        let kind = match call {
+            Syscall::EpollCreate(_) => Kind::EpollCreate { legacy: true },
+            Syscall::EpollCreate1(_) => Kind::EpollCreate { legacy: false },
+            _ => {
+                return Err(engine_error(
+                    "epoll allocator received another original syscall",
+                ));
+            }
+        };
+        let source = self.record_or_replay.original_file_execution(call);
+        if source != crate::OriginalFileExecution::Native {
+            return Err(engine_error(
+                "original epoll admission requires the actual native allocator",
+            ));
+        }
+        let (nr, raw) = call.into_parts();
+        // Keep the original syscall and complete raw register tuple. In particular
+        // epoll_create(size <= 0) must reach Linux rather than become create1(0).
+        let arguments = self
+            .stage_original_call(guest, call, kind, raw.arg0 as i32, nr as u64, 0, source)
+            .await?;
+        let admission = match network_request(
+            guest,
+            NetworkRequest::NativeBeginOriginalAllocator { arguments },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalConnectAdmission(admission) => admission,
+            reply => {
+                return Err(engine_error(format!(
+                    "epoll admission changed reply {reply:?}"
+                )));
+            }
+        };
+        let local = guest.thread_state_mut().original_connect.as_mut().unwrap();
+        local.arguments = admission.arguments.clone();
+        local.admission = Some(admission.clone());
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeSubmitOriginalConnect {
+                admission: admission.clone(),
+            },
+        )
+        .await?;
+        self.mark_original_syscall_invoked(guest);
+        let result = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
+        if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
+            return Err(result.unwrap_err());
+        }
+        let (admission, _, result, returned) = self
+            .observe_original_call_result(guest, admission, result)
+            .await?;
+        match network_request(
+            guest,
+            NetworkRequest::NativePublishOriginalEpoll {
+                admission: admission.clone(),
+            },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalEpollInstallation(binding)
+                if binding.map(|b| i64::from(b.slot.fd)) == (returned >= 0).then_some(returned) => {
+            }
+            reply => {
+                return Err(engine_error(format!(
+                    "epoll publication changed actual result {reply:?}"
+                )));
+            }
+        }
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeRetireOriginalConnect { admission },
+        )
+        .await?;
+        guest.thread_state_mut().original_connect = None;
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3174): paired native epoll control prerequisite.
+    pub(crate) async fn network_original_epoll_ctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollCtl,
+    ) -> Result<i64, Error> {
+        let result = self.network_original_epoll_ctl_inner(guest, call).await;
+        self.finish_original_invocation(guest, result).await
+    }
+    async fn network_original_epoll_ctl_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollCtl,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::Kind;
+        let source = self.record_or_replay.original_file_execution(call.into());
+        if source != crate::OriginalFileExecution::Native {
+            return Err(engine_error(
+                "epoll control requires actual native registration authority",
+            ));
+        }
+        let (_, raw) = call.into_parts();
+        let arguments = self
+            .stage_original_call(
+                guest,
+                call.into(),
+                Kind::EpollCtl,
+                raw.arg0 as i32,
+                raw.arg3 as u64,
+                raw.arg1 as i32,
+                source,
+            )
+            .await?;
+        let operation = arguments.operation;
+        self.begin_original_epoll_ctl_wait(guest, operation).await?;
+        let observed = async {
+            let admission = self
+                .admit_original_call(guest, arguments, source, None)
+                .await?;
+            self.mark_original_syscall_invoked(guest);
+            let result = self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+            if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
+                return Err(result.unwrap_err());
+            }
+            // A selected native file may still need another allocator's
+            // foreground publication. Keep this same Call outside the run
+            // queue through the actual history/effect/retirement observation.
+            // There is no fd_read/table exclusion across original input copy.
+            self.observe_original_call_result(guest, admission, result)
+                .await
+        }
+        .await;
+        // Every returned preparation/delegate/observation error pays the same
+        // continuation. Actual terminal cancellation retains Local/Call for
+        // backend final wait; it cannot invent a native result or handback.
+        self.finish_original_epoll_ctl_wait(guest, operation).await;
+        let (admission, _, result, _) = observed?;
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeRetireOriginalConnect { admission },
+        )
+        .await?;
+        guest.thread_state_mut().original_connect = None;
+        result
+    }
+
+    /// Qualification-only entry until the positive capability and changed-
+    /// schedule runtime controls are approved. The production gate stays closed.
+    pub(crate) async fn network_foreground_epoll_ctl<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollCtl,
+    ) -> Result<i64, Error> {
+        let result = self.network_foreground_epoll_ctl_inner(guest, call).await;
+        self.finish_original_invocation(guest, result).await
+    }
+    async fn network_foreground_epoll_ctl_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollCtl,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::Kind;
+        let source = self.record_or_replay.original_file_execution(call.into());
+        if source != crate::OriginalFileExecution::Native {
+            return Err(engine_error(
+                "foreground ctl requires actual original native authority",
+            ));
+        }
+        let (_, raw) = call.into_parts();
+        let arguments = self
+            .stage_original_call(
+                guest,
+                call.into(),
+                Kind::EpollCtl,
+                raw.arg0 as i32,
+                raw.arg3 as u64,
+                raw.arg1 as i32,
+                source,
+            )
+            .await?;
+        let operation = arguments.operation;
+        let admission = match network_request(
+            guest,
+            NetworkRequest::NativeBeginForegroundEpollCtl { arguments },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalConnectAdmission(admission) => admission,
+            reply => {
+                return Err(engine_error(format!(
+                    "foreground ctl admission changed reply {reply:?}"
+                )));
+            }
+        };
+        let local = guest.thread_state_mut().original_connect.as_mut().unwrap();
+        local.arguments = admission.arguments.clone();
+        local.admission = Some(admission.clone());
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeSubmitOriginalConnect {
+                admission: admission.clone(),
+            },
+        )
+        .await?;
+        self.mark_original_syscall_invoked(guest);
+        // Native mutation happens inside the exact granted foreground turn.
+        let result = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
+        if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
+            return Err(result.unwrap_err());
+        }
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeForegroundEpollCtlReturned {
+                admission: admission.clone(),
+            },
+        )
+        .await?;
+        // Only the already-returned semantic/history join may now background.
+        self.begin_original_epoll_ctl_wait(guest, operation).await?;
+        let observed = self
+            .observe_original_call_result(guest, admission, result)
+            .await;
+        self.finish_original_epoll_ctl_wait(guest, operation).await;
+        let (admission, _, result, _) = observed?;
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeRetireOriginalConnect { admission },
+        )
+        .await?;
+        guest.thread_state_mut().original_connect = None;
+        result
+    }
+
+    pub(crate) async fn network_original_openat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+    ) -> Result<
+        (
+            i64,
+            crate::network_runtime::original_installation::OpenatPublication,
+        ),
+        Error,
+    > {
+        let (result, published) = match self.network_original_openat_inner(guest, call).await {
+            Ok((raw, published)) => (Ok(raw), Some(published)),
+            Err(error) => (Err(error), None),
+        };
+        let raw = self.finish_original_invocation(guest, result).await?;
+        Ok((
+            raw,
+            published.ok_or_else(|| engine_error("Openat lost its completed publication"))?,
+        ))
+    }
+
+    /// Existing external-IO turn protocol only. Local syscall latency is not
+    /// an external network input. These adapters do not prove independence or
+    /// activate Openat/EpollCtl in the initial Record gate.
+    async fn begin_original_local_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        operation: ExternalOpId,
+        label: &str,
+        lost_grant: &str,
+    ) -> Result<(), Error> {
+        if guest.config().sequentialize_threads {
+            let mut request = Resources::new(guest.thread_state().dettid);
+            request.insert(ResourceID::BlockingExternalIO(operation), Permission::RW);
+            request.fyi(label);
+            if resource_request(guest, request).await != crate::tool_global::ResumeStatus::Normal {
+                return Err(engine_error(lost_grant));
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_original_local_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        operation: ExternalOpId,
+        label: &str,
+    ) {
+        if guest.config().sequentialize_threads {
+            let mut continuation = Resources::new(guest.thread_state().dettid);
+            continuation.insert(
+                ResourceID::BlockedExternalContinue(operation),
+                Permission::RW,
+            );
+            continuation.fyi(label);
+            // The response is scheduler handback, never a replacement native
+            // result. An actual signal/terminal path keeps its existing owner.
+            resource_request(guest, continuation).await;
+        }
+    }
+
+    pub(crate) async fn begin_original_openat_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        operation: ExternalOpId,
+    ) -> Result<(), Error> {
+        self.begin_original_local_wait(
+            guest,
+            operation,
+            "original openat and held-file observation",
+            "Openat lost its actual external-IO grant before invocation",
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_original_openat_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        operation: ExternalOpId,
+    ) {
+        self.finish_original_local_wait(
+            guest,
+            operation,
+            "original openat and held-file observation complete",
+        )
+        .await;
+    }
+
+    pub(crate) async fn begin_original_epoll_ctl_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        operation: ExternalOpId,
+    ) -> Result<(), Error> {
+        self.begin_original_local_wait(
+            guest,
+            operation,
+            "epoll_ctl",
+            "epoll control lost its actual external-IO grant before invocation",
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_original_epoll_ctl_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        operation: ExternalOpId,
+    ) {
+        self.finish_original_local_wait(guest, operation, "epoll_ctl")
+            .await;
+    }
+
+    async fn network_original_openat_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Openat,
+    ) -> Result<
+        (
+            i64,
+            crate::network_runtime::original_installation::OpenatPublication,
+        ),
+        Error,
+    > {
+        use crate::network_replay::original_connect::Kind;
+        let source = self.record_or_replay.original_file_execution(call.into());
+        if source != crate::OriginalFileExecution::Native {
+            return Err(engine_error(
+                "original Openat admission requires the actual native allocator",
+            ));
+        }
+        let (_, raw) = call.into_parts();
+        let arguments = self
+            .stage_original_call(
+                guest,
+                call.into(),
+                Kind::Openat,
+                raw.arg0 as i32,
+                raw.arg1 as u64,
+                raw.arg2 as i32,
+                source,
+            )
+            .await?;
+        let operation = arguments.operation;
+        self.begin_original_openat_wait(guest, operation).await?;
+        let observed = async {
+            let admission = match network_request(
+                guest,
+                NetworkRequest::NativeBeginOriginalAllocator { arguments },
+            )
+            .await
+            .map_err(engine_rpc_error)?
+            {
+                NetworkReply::OriginalConnectAdmission(admission) => admission,
+                reply => {
+                    return Err(engine_error(format!(
+                        "Openat admission changed reply {reply:?}"
+                    )));
+                }
+            };
+            let local = guest.thread_state_mut().original_connect.as_mut().unwrap();
+            local.arguments = admission.arguments.clone();
+            local.admission = Some(admission.clone());
+            self.shadow_ack(
+                guest,
+                NetworkRequest::NativeSubmitOriginalConnect {
+                    admission: admission.clone(),
+                },
+            )
+            .await?;
+            self.mark_original_syscall_invoked(guest);
+            // Keep the actual delegate/registers. Neither an ordinary turn nor
+            // a table permit spans FIFO open, original uaccess or helper getattr.
+            let result = self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+            if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
+                return Err(result.unwrap_err());
+            }
+            let (admission, _, result, returned) = self
+                .observe_original_call_result(guest, admission, result)
+                .await?;
+            self.shadow_ack(
+                guest,
+                NetworkRequest::NativeObserveOriginalOpenat {
+                    admission: admission.clone(),
+                },
+            )
+            .await?;
+            Ok((admission, result, returned))
+        }
+        .await;
+        // Every returned admission/delegate/observation error pays the same
+        // continuation before fail_original_connect publishes failure. A future
+        // canceled by actual task termination retains the original Call instead.
+        self.finish_original_openat_wait(guest, operation).await;
+        let (admission, result, returned) = observed?;
+        let published = match network_request(
+            guest,
+            NetworkRequest::NativePublishOriginalOpenat {
+                admission: admission.clone(),
+            },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalOpenatInstallation(published)
+                if published.binding.map(|b| i64::from(b.slot.fd))
+                    == (returned >= 0).then_some(returned) =>
+            {
+                published
+            }
+            reply => {
+                return Err(engine_error(format!(
+                    "Openat publication changed original result {reply:?}"
+                )));
+            }
+        };
+        self.shadow_ack(
+            guest,
+            NetworkRequest::NativeRetireOriginalConnect { admission },
+        )
+        .await?;
+        guest.thread_state_mut().original_connect = None;
+        result.map(|raw| (raw, published))
     }
 
     async fn ensure_channel<G: Guest<Self>>(
@@ -354,6 +965,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Connect,
         policy: NetworkPolicy,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW: original fdget and kernel-copy receipt consumer.
+        // Replay remains on its existing unactivated path until real topology
+        // has been prepared. The admitted Record path never pre-reads sockaddr.
+        if policy == NetworkPolicy::Record && self.original_connect_record_route(guest).await? {
+            return self.network_original_connect(guest, call).await;
+        }
         let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
         let peer = read_network_address(guest, call.uservaddr(), call.addrlen())?;
         self.ensure_stream_channel(guest, open_file, call.fd(), peer)
@@ -406,6 +1024,944 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
             NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
         }
+    }
+
+    /// Original Record connect: actual kernel selection, copy and return join
+    /// the same Call which held the table before capture. The provider Driver
+    /// releases that table at positive fdget, even if sockaddr uaccess blocks.
+    async fn network_original_connect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Connect,
+    ) -> Result<i64, Error> {
+        let result = self.network_original_connect_inner(guest, call).await;
+        self.finish_original_invocation(guest, result).await
+    }
+
+    pub(crate) async fn finish_original_invocation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        result: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        if let Err(error) = &result {
+            if let Some(local) = guest.thread_state().original_connect.clone() {
+                // Returning a Tool error would let the backend drop this task
+                // before its final wait. Publish the existing run-failure fence
+                // and retain this future until exact-task cleanup cancels it.
+                // A completed native errno has already retired Local custody.
+                let published = network_request(
+                    guest,
+                    NetworkRequest::NativeOriginalConnectFailed {
+                        local,
+                        detail: format!("{error:#}"),
+                    },
+                )
+                .await;
+                if !matches!(published, Ok(NetworkReply::Unit)) {
+                    tracing::error!(
+                        ?published,
+                        "original Connect failure publication was not acknowledged"
+                    );
+                }
+                return futures::future::pending().await;
+            }
+        }
+        result
+    }
+
+    async fn prepare_original_call_from<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        kind: crate::network_replay::original_connect::Kind,
+        fd: i32,
+        address: u64,
+        length: i32,
+        source: crate::OriginalFileExecution,
+    ) -> Result<crate::network_replay::original_connect::Admission, Error> {
+        let arguments = self
+            .stage_original_call(guest, call, kind, fd, address, length, source)
+            .await?;
+        self.admit_original_call(guest, arguments, source, None)
+            .await
+    }
+
+    /// Install exact local cancellation custody before the first admission
+    /// await. The binding here is only a preview until the selected grant.
+    async fn stage_original_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        kind: crate::network_replay::original_connect::Kind,
+        fd: i32,
+        address: u64,
+        length: i32,
+        source: crate::OriginalFileExecution,
+    ) -> Result<crate::network_replay::original_connect::Arguments, Error> {
+        use crate::network_replay::original_connect::Arguments;
+        use crate::network_replay::original_connect::Local;
+        if source == crate::OriginalFileExecution::Native && !self.network_fd_tracking_active(guest)
+        {
+            return Err(engine_error(
+                "original syscall requires complete FD-table mutation custody",
+            ));
+        }
+        if source == crate::OriginalFileExecution::Native
+            && (!<Self as reverie::Tool>::observe_injected_syscalls(guest.config())
+                || !<Self as reverie::Tool>::observe_injected_syscall_preparation(guest.config()))
+        {
+            return Err(engine_error(
+                "original syscall requires actual backend preparation observation",
+            ));
+        }
+        if !kind.allocator() {
+            self.publish_network_fd_installations(guest).await?;
+        }
+        let (_, raw) = call.into_parts();
+        let arguments = {
+            let state = guest.thread_state();
+            let metadata = state.file_metadata.lock().unwrap();
+            Arguments {
+                kind,
+                operation: ExternalOpId::new(state.dettid, state.stats.syscall_count),
+                files: metadata.files_id,
+                binding: if kind.allocator()
+                    || kind == crate::network_replay::original_connect::Kind::EpollCtl
+                {
+                    None // An allocator does not select the returned descriptor before entry
+                } else {
+                    metadata.descriptor_binding(fd).ok()
+                },
+                fd,
+                address,
+                length,
+                original_count: match kind {
+                    crate::network_replay::original_connect::Kind::Read => raw.arg2 as u64,
+                    crate::network_replay::original_connect::Kind::Openat => raw.arg3 as u64,
+                    crate::network_replay::original_connect::Kind::EpollCtl => {
+                        u64::from(raw.arg2 as u32)
+                    }
+                    _ => 0,
+                },
+            }
+        };
+        if guest.thread_state().original_connect.is_some() {
+            return Err(engine_error("original Connect already has local custody"));
+        }
+        guest.thread_state_mut().original_connect = Some(Local {
+            arguments: arguments.clone(),
+            raw_arguments: [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5],
+            admission: None,
+            invoked: false,
+            returned: None,
+        });
+        Ok(arguments)
+    }
+
+    async fn admit_original_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        arguments: crate::network_replay::original_connect::Arguments,
+        source: crate::OriginalFileExecution,
+        read: Option<crate::network_replay::NetworkFdReadAdmission>,
+    ) -> Result<crate::network_replay::original_connect::Admission, Error> {
+        let request = match (source, read) {
+            (crate::OriginalFileExecution::Native, Some(read)) => {
+                NetworkRequest::NativeBeginOriginalExternalFromRead { arguments, read }
+            }
+            (crate::OriginalFileExecution::Native, None) => {
+                NetworkRequest::NativeBeginOriginalConnect { arguments }
+            }
+            (crate::OriginalFileExecution::Recorded, None) => {
+                NetworkRequest::BeginRecordedOriginalFile { arguments }
+            }
+            (crate::OriginalFileExecution::Recorded, Some(_)) => {
+                return Err(engine_error(
+                    "external read transfer cannot produce a recorded result",
+                ));
+            }
+        };
+        let admission = match network_request(guest, request)
+            .await
+            .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalConnectAdmission(admission) => admission,
+            reply => {
+                return Err(engine_error(format!(
+                    "unexpected original Connect admission {reply:?}"
+                )));
+            }
+        };
+        let local = guest.thread_state_mut().original_connect.as_mut().unwrap();
+        local.arguments = admission.arguments.clone();
+        local.admission = Some(admission.clone());
+        if source == crate::OriginalFileExecution::Native {
+            self.shadow_ack(
+                guest,
+                NetworkRequest::NativeSubmitOriginalConnect {
+                    admission: admission.clone(),
+                },
+            )
+            .await?;
+        }
+        Ok(admission)
+    }
+
+    async fn observe_original_call_result<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: crate::network_replay::original_connect::Admission,
+        result: Result<i64, Error>,
+    ) -> Result<
+        (
+            crate::network_replay::original_connect::Admission,
+            crate::network_runtime::original_connect::Outcome,
+            Result<i64, Error>,
+            i64,
+        ),
+        Error,
+    > {
+        // A synthetic injection interruption is not a native syscall return.
+        // Refuse immediately with custody retained; never wait forever or turn
+        // a missing provider session into a successful negative observation.
+        let returned = guest
+            .thread_state()
+            .original_connect
+            .as_ref()
+            .and_then(|local| local.returned)
+            .ok_or_else(|| engine_error("original Connect has no real backend completion"))?;
+        let outcome = match network_request(
+            guest,
+            NetworkRequest::NativeOriginalConnectOutcome {
+                admission: admission.clone(),
+            },
+        )
+        .await
+        .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalConnectOutcome(outcome)
+                if outcome.admission == admission && outcome.returned == returned =>
+            {
+                outcome
+            }
+            reply => {
+                return Err(engine_error(format!(
+                    "original Connect changed retained completion {reply:?}"
+                )));
+            }
+        };
+        let actual = match &result {
+            Ok(value) => Some(*value),
+            Err(error) => error_errno(error).map(|errno| -i64::from(errno)),
+        };
+        if actual != Some(returned) {
+            return Err(engine_error(
+                "original Connect backend and guest completion disagree",
+            ));
+        }
+        Ok((admission, outcome, result, returned))
+    }
+
+    async fn network_original_invoke<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        kind: crate::network_replay::original_connect::Kind,
+        fd: i32,
+        address: u64,
+        length: i32,
+    ) -> Result<
+        (
+            crate::network_replay::original_connect::Admission,
+            crate::network_runtime::original_connect::Outcome,
+            Result<i64, Error>,
+            i64,
+        ),
+        Error,
+    > {
+        let mut arguments = self
+            .stage_original_call(
+                guest,
+                call,
+                kind,
+                fd,
+                address,
+                length,
+                crate::OriginalFileExecution::Native,
+            )
+            .await?;
+        // A queued request owns no table. Strict mode admits this lookup at
+        // the existing selected external grant; NoSeq uses the same engine's
+        // atomic read admission without inventing a scheduler request.
+        let read = if guest.config().sequentialize_threads {
+            let state = guest.thread_state();
+            let mut resources = Resources::new(state.dettid);
+            resources.insert(
+                ResourceID::BlockingNetworkCapture(arguments.operation),
+                Permission::RW,
+            );
+            resources.fyi(call.name());
+            resources.fd_read = Some(crate::scheduler::fd_read::FdReadIntent {
+                owner: crate::network_replay::NetworkStreamOwner {
+                    thread: state.dettid,
+                    mm: state.mm_id,
+                },
+                files: arguments.files,
+                fd,
+                operation: arguments.operation,
+            });
+            match crate::tool_global::fd_read_resource_request(guest, resources).await {
+                crate::scheduler::parked::ResourceReply::ReadGrant {
+                    status: crate::tool_global::ResumeStatus::Normal,
+                    read,
+                } => read,
+                // An actual cancelled/terminal transport is handled by the
+                // existing backend consuming path. Never inject this numeric
+                // FD using a signal response in place of an owned lookup.
+                _ => {
+                    return Err(engine_error(
+                        "original external invocation lost its selected grant",
+                    ));
+                }
+            }
+        } else {
+            self.begin_network_fd_read(guest, fd).await?
+        };
+        arguments.binding = read.binding;
+        guest
+            .thread_state_mut()
+            .original_connect
+            .as_mut()
+            .expect("local custody precedes selected request")
+            .arguments = arguments.clone();
+        let admission = self
+            .admit_original_call(
+                guest,
+                arguments,
+                crate::OriginalFileExecution::Native,
+                Some(read),
+            )
+            .await?;
+        let result = self
+            .live_network_syscall_after_grant(
+                guest,
+                call,
+                NetworkPhysicalCompletion::OriginalConnect,
+            )
+            .await;
+        self.observe_original_call_result(guest, admission, result)
+            .await
+    }
+
+    fn mark_original_syscall_invoked<G: Guest<Self>>(&self, guest: &mut G) {
+        let local = guest
+            .thread_state_mut()
+            .original_connect
+            .as_mut()
+            .expect("original Connect marker installed before admission");
+        assert!(!local.invoked && local.admission.is_some());
+        local.invoked = true;
+    }
+
+    async fn network_original_connect_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Connect,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::Kind;
+        let (_, raw) = call.into_parts();
+        let (admission, outcome, result, returned) = self
+            .network_original_invoke(
+                guest,
+                call.into(),
+                Kind::Connect,
+                call.fd(),
+                raw.arg1 as u64,
+                call.addrlen(),
+            )
+            .await?;
+        let capture = self
+            .capture_original_connect(guest, &admission, &outcome, returned)
+            .await;
+        // Retire even if semantic capture refuses; a failed run must not turn
+        // into an unbounded Call/transport journal. Physical errors retain custody.
+        let retirement = self
+            .shadow_ack(
+                guest,
+                NetworkRequest::NativeRetireOriginalConnect { admission },
+            )
+            .await;
+        if retirement.is_ok() {
+            guest.thread_state_mut().original_connect = None;
+        }
+        finish_shadow_operation(result, capture.and(retirement))
+    }
+
+    /// Semantic capture of a returned original Connect, before retirement.
+    /// The V4 recorder publishes from the retained native completion; the V3
+    /// stream capture stays the only other consumer and refuses a V4 engine.
+    pub(crate) async fn capture_original_connect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: &crate::network_replay::original_connect::Admission,
+        outcome: &crate::network_runtime::original_connect::Outcome,
+        returned: i64,
+    ) -> Result<(), Error> {
+        use crate::network_replay::original_connect::Pin;
+        let native_record = guest
+            .local_global_state()
+            .and_then(|global| global.native_receive_mode())
+            == Some(crate::network_replay::NetworkEngineMode::Record);
+        {
+            if let Some(Pin::Socket {
+                domain,
+                kind,
+                protocol,
+            }) = &outcome.pin
+            {
+                // Local validation/copy failures need no external channel. A
+                // positive native copy supplies bytes; no late guest reread or
+                // fd-based getsockopt supplies this original operation's facts.
+                if let Some(bytes) = &outcome.address {
+                    // Linux can reject a successfully copied but too-short
+                    // sockaddr before any external endpoint exists. Preserve
+                    // that actual error just like native EBADF/copy-EFAULT.
+                    let peer = match read_captured_network_address(bytes) {
+                        Ok(peer) => peer,
+                        Err(_) if returned < 0 && captured_sockaddr_too_short(bytes) => {
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let transport = classify_stream_transport([*domain, *kind, *protocol])?;
+                    let open_file = admission
+                        .arguments
+                        .binding
+                        .ok_or_else(|| engine_error("selected socket lost its admitted OFD"))?
+                        .open_file;
+                    if native_record && returned != 0 {
+                        // V4 has no Connect error-result issuer. Refuse before
+                        // the engine acquires a channel for this endpoint.
+                        return Err(engine_error(
+                            "V4 Record Connect error result has no native publisher",
+                        ));
+                    }
+                    self.ensure_channel(
+                        guest,
+                        open_file,
+                        NetworkChannelBinding {
+                            transport,
+                            role: NetworkEndpointRoleV2::OutboundClient,
+                            peer_address: Some(peer),
+                            requested_local_constraint: None,
+                            observed_local_address: None,
+                            accepted_from: None,
+                            selected_channel: None,
+                        },
+                    )
+                    .await?;
+                    if native_record {
+                        // The paid continuation made this the foreground turn;
+                        // the provider and pin are retired but not consumed.
+                        let global = guest.local_global_state().ok_or_else(|| {
+                            engine_error("V4 Connect publication lost actual local global state")
+                        })?;
+                        return global
+                            .publish_foreground_native_connected(
+                                guest.tid(),
+                                guest.thread_state(),
+                                admission,
+                            )
+                            .map_err(engine_rpc_error);
+                    }
+                    let observed_at = thread_observe_time(guest).await;
+                    let connection = if returned == 0 {
+                        NetworkConnectionResultV2::Connected
+                    } else {
+                        NetworkConnectionResultV2::Error(
+                            i32::try_from(-returned).map_err(engine_error)?,
+                        )
+                    };
+                    network_request(
+                        guest,
+                        NetworkRequest::CaptureStreamInput {
+                            open_file,
+                            observed_at,
+                            input: NetworkCapturedStreamInput::Connect(connection),
+                        },
+                    )
+                    .await
+                    .map_err(engine_rpc_error)?;
+                } else if returned == 0 {
+                    return Err(engine_error(
+                        "successful original Connect lacks copied address",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Execute the already supported F_GETFL through the shared original Call.
+    /// Prepared snapshots only the admitted local virtual flag. The provider's
+    /// actual fdget_raw owns file selection; original sys_exit and the backend
+    /// raw completion own the result. A later reused numeric FD is never read.
+    pub(crate) async fn network_original_get_flags<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Fcntl,
+    ) -> Result<i64, Error> {
+        let result = self.original_get_flags_inner(guest, call).await;
+        self.finish_original_invocation(guest, result).await
+    }
+
+    async fn original_get_flags_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Fcntl,
+    ) -> Result<i64, Error> {
+        use crate::network_replay::original_connect::FileOperation;
+        use crate::network_replay::original_connect::Kind;
+        let operation = FileOperation::GetFlags;
+        if guest.thread_state().original_file_metadata.is_some() {
+            return Err(engine_error(
+                "previous file metadata observation remains unconsumed",
+            ));
+        }
+        let source = self.record_or_replay.original_file_execution(call.into());
+        let admission = self
+            .prepare_original_call_from(
+                guest,
+                call.into(),
+                Kind::File(operation),
+                call.fd(),
+                operation.syscall() as u64,
+                operation.command(),
+                source,
+            )
+            .await?;
+        let result = match source {
+            crate::OriginalFileExecution::Native => {
+                self.mark_original_syscall_invoked(guest);
+                // The ordinary caller keeps its original turn/resources.
+                let result = self
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await;
+                if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
+                    // Delegate failure supplies no kernel result. Preserve its
+                    // original diagnostic for finish_original_invocation's
+                    // retained-custody failure fence; do not replace it with a
+                    // missing-backend-return error or fabricate a completion.
+                    return result;
+                }
+                self.observe_original_call_result(guest, admission.clone(), result)
+                    .await?
+                    .2
+            }
+            crate::OriginalFileExecution::Recorded => {
+                let observed = guest
+                    .thread_state()
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .observe_original_file_metadata(&admission)
+                    .map_err(engine_error)?;
+                guest.thread_state_mut().original_file_metadata = Some(observed);
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::SelectRecordedOriginalFile {
+                        admission: admission.clone(),
+                    },
+                )
+                .await?;
+                // This producer consumes the same Return event as legacy replay.
+                // It never injects and never marks Local.invoked/returned.
+                self.record_or_replay
+                    .consume_recorded_original_file(&mut guest.into_guest(), call.into())
+                    .await
+            }
+        };
+        let observed_return = match &result {
+            Ok(value) => Some(*value),
+            Err(Error::Errno(errno)) => Some(-i64::from(errno.into_raw())),
+            Err(_) => None,
+        };
+        if observed_return.is_none() {
+            return result;
+        }
+        let adjusted = (|| -> Result<i64, Error> {
+            let observed = guest
+                .thread_state()
+                .original_file_metadata
+                .as_ref()
+                .filter(|observation| observation.admission == admission)
+                .ok_or_else(|| {
+                    engine_error("original file lacks its admitted metadata observation")
+                })?;
+            let returned_flags = result?;
+            let logical_nonblocking = observed
+                .logical_nonblocking
+                .ok_or_else(|| engine_error("successful F_GETFL had no admitted descriptor"))?;
+            let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
+            Ok(if logical_nonblocking {
+                returned_flags | nonblocking
+            } else {
+                returned_flags & !nonblocking
+            })
+        })();
+        let retirement = match source {
+            crate::OriginalFileExecution::Native => {
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::NativeRetireOriginalConnect { admission },
+                )
+                .await
+            }
+            crate::OriginalFileExecution::Recorded => {
+                let returned = observed_return.expect("only a consumed Return reaches retirement");
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::CompleteRecordedOriginalFile {
+                        admission,
+                        returned,
+                    },
+                )
+                .await
+            }
+        };
+        if retirement.is_ok() {
+            guest.thread_state_mut().original_connect = None;
+            guest.thread_state_mut().original_file_metadata = None;
+        }
+        finish_shadow_operation(adjusted, retirement)
+    }
+
+    /// Transfer one actual scalar Read attempt to the existing original Call.
+    /// The caller has already obtained the final ordinary/external grant. This
+    /// helper neither asks for a resource nor retries or moves guest bytes.
+    pub(crate) async fn original_read_attempt<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        read: crate::network_replay::NetworkFdReadAdmission,
+        delegated: bool,
+    ) -> Result<i64, Error> {
+        let result = async {
+            let source = if delegated {
+                self.record_or_replay.original_file_execution(call.into())
+            } else {
+                crate::OriginalFileExecution::Native
+            };
+            let admission = self
+                .begin_original_read_call(guest, call, read, Some(source))
+                .await?;
+            let result = match source {
+                crate::OriginalFileExecution::Native => self
+                    .execute_original_read_call(guest, call, admission.clone(), delegated)
+                    .await?
+                    .map_err(Error::from),
+                crate::OriginalFileExecution::Recorded => {
+                    let observed = guest
+                        .thread_state()
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .observe_original_file_metadata(&admission)
+                        .map_err(engine_error)?;
+                    guest.thread_state_mut().original_file_metadata = Some(observed);
+                    self.shadow_ack(
+                        guest,
+                        NetworkRequest::SelectRecordedOriginalFile {
+                            admission: admission.clone(),
+                        },
+                    )
+                    .await?;
+                    match self
+                        .record_or_replay
+                        .invoke_original_read(&mut guest.into_guest(), call)
+                        .await?
+                    {
+                        reverie::InjectedReadResult::Complete(result) => {
+                            result.map_err(Error::from)
+                        }
+                        reverie::InjectedReadResult::RecordedInterruption(ticket) => {
+                            self.shadow_ack(
+                                guest,
+                                NetworkRequest::CompleteRecordedReadInterruption {
+                                    admission: admission.clone(),
+                                },
+                            )
+                            .await?;
+                            guest.thread_state_mut().original_connect = None;
+                            guest.thread_state_mut().original_file_metadata = None;
+                            return Err(Error::Tool(anyhow::Error::new(ticket)));
+                        }
+                        reverie::InjectedReadResult::Interrupted(_) => {
+                            return Err(engine_error(
+                                "recorded Read acquired native interruption custody",
+                            ));
+                        }
+                    }
+                }
+            };
+            let returned = match &result {
+                Ok(value) => *value,
+                Err(Error::Errno(errno)) => -i64::from(errno.into_raw()),
+                Err(_) => return result,
+            };
+            let cleanup = match source {
+                crate::OriginalFileExecution::Native => {
+                    self.shadow_ack(
+                        guest,
+                        NetworkRequest::NativeRetireOriginalConnect { admission },
+                    )
+                    .await
+                }
+                crate::OriginalFileExecution::Recorded => {
+                    self.shadow_ack(
+                        guest,
+                        NetworkRequest::CompleteRecordedOriginalFile {
+                            admission,
+                            returned,
+                        },
+                    )
+                    .await
+                }
+            };
+            if cleanup.is_ok() {
+                guest.thread_state_mut().original_connect = None;
+                guest.thread_state_mut().original_file_metadata = None;
+            }
+            finish_shadow_operation(result, cleanup)
+        }
+        .await;
+        self.finish_original_invocation(guest, result).await
+    }
+
+    /// Execute one already admitted Read through the same backend boundary for
+    /// ordinary and network callers. The inner result is an authenticated native
+    /// return; interruption and ownership/delegate failures remain outer errors.
+    /// This helper adds no scheduling request and moves no guest payload bytes.
+    async fn execute_original_read_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        admission: crate::network_replay::original_connect::Admission,
+        delegated: bool,
+    ) -> Result<Result<i64, Errno>, Error> {
+        self.execute_original_read_with_outcome(guest, call, admission, delegated)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    async fn execute_original_read_with_outcome<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        admission: crate::network_replay::original_connect::Admission,
+        delegated: bool,
+    ) -> Result<
+        (
+            Result<i64, Errno>,
+            crate::network_runtime::original_connect::Outcome,
+        ),
+        Error,
+    > {
+        self.mark_original_syscall_invoked(guest);
+        let outcome = if delegated {
+            self.record_or_replay
+                .invoke_original_read(&mut guest.into_guest(), call)
+                .await?
+        } else {
+            guest.inject_original_read(call).await
+        };
+        match outcome {
+            reverie::InjectedReadResult::RecordedInterruption(_) => Err(engine_error(
+                "native Read received recorded interruption control",
+            )),
+            reverie::InjectedReadResult::Complete(result) => {
+                let (_, outcome, observed, _) = self
+                    .observe_original_call_result(guest, admission, result.map_err(Error::from))
+                    .await?;
+                match observed {
+                    Ok(value) => Ok((Ok(value), outcome)),
+                    Err(Error::Errno(errno)) => Ok((Err(errno), outcome)),
+                    Err(error) => Err(error),
+                }
+            }
+            reverie::InjectedReadResult::Interrupted(ticket) => {
+                let local = guest
+                    .thread_state()
+                    .original_connect
+                    .as_ref()
+                    .ok_or_else(|| engine_error("interrupted Read lost Local"))?;
+                if local.invoked
+                    || local.returned.is_some()
+                    || local.admission.as_ref() != Some(&admission)
+                {
+                    return Err(engine_error(
+                        "interrupted Read lacks actual backend no-entry observation",
+                    ));
+                }
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::NativeRetireInterruptedRead { admission },
+                )
+                .await?;
+                guest.thread_state_mut().original_connect = None;
+                guest.thread_state_mut().original_file_metadata = None;
+                Err(Error::Tool(anyhow::Error::new(ticket)))
+            }
+        }
+    }
+
+    /// Install Local before the consuming RPC; a lost reply remains owned by
+    /// the same Call and actual ThreadState cleanup. None denotes Detcore's
+    /// modeled Read, never an unknown or inferred native completion.
+    pub(crate) async fn begin_original_read_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        read: crate::network_replay::NetworkFdReadAdmission,
+        source: Option<crate::OriginalFileExecution>,
+    ) -> Result<crate::network_replay::original_connect::Admission, Error> {
+        use crate::network_replay::original_connect::Arguments;
+        use crate::network_replay::original_connect::Kind;
+        use crate::network_replay::original_connect::Local;
+        let (_, raw) = call.into_parts();
+        let state = guest.thread_state();
+        if state.original_connect.is_some() || state.original_file_metadata.is_some() {
+            return Err(engine_error(
+                "Read attempt overlaps retained original invocation",
+            ));
+        }
+        if source == Some(crate::OriginalFileExecution::Native)
+            && (!<Self as reverie::Tool>::observe_injected_syscalls(guest.config())
+                || !<Self as reverie::Tool>::observe_injected_syscall_preparation(guest.config()))
+        {
+            return Err(engine_error(
+                "Read requires actual backend preparation and completion observations",
+            ));
+        }
+        let arguments = Arguments {
+            kind: Kind::Read,
+            operation: ExternalOpId::new(state.dettid, state.stats.syscall_count),
+            files: read.publication.permit.files,
+            binding: read.binding,
+            fd: call.fd(),
+            address: raw.arg1 as u64,
+            length: 0,
+            original_count: raw.arg2 as u64,
+        };
+        guest.thread_state_mut().original_connect = Some(Local {
+            arguments: arguments.clone(),
+            raw_arguments: [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5],
+            admission: None,
+            invoked: false,
+            returned: None,
+        });
+        let request = match source {
+            Some(source) => NetworkRequest::BeginOriginalFileFromRead {
+                arguments,
+                read,
+                source,
+            },
+            None => NetworkRequest::BeginEmulatedReadFromRead { arguments, read },
+        };
+        let admission = match network_request(guest, request)
+            .await
+            .map_err(engine_rpc_error)?
+        {
+            NetworkReply::OriginalConnectAdmission(admission) => admission,
+            other => return Err(engine_error(format!("unexpected Read admission {other:?}"))),
+        };
+        let local = guest
+            .thread_state_mut()
+            .original_connect
+            .as_mut()
+            .expect("staged Read owner");
+        local.arguments = admission.arguments.clone();
+        local.admission = Some(admission.clone());
+        if source == Some(crate::OriginalFileExecution::Native) {
+            self.shadow_ack(
+                guest,
+                NetworkRequest::NativeSubmitOriginalConnect {
+                    admission: admission.clone(),
+                },
+            )
+            .await?;
+        }
+        Ok(admission)
+    }
+
+    pub(crate) async fn finish_emulated_read_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        admission: crate::network_replay::original_connect::Admission,
+        result: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        let returned = match &result {
+            Ok(value) => Some(*value),
+            Err(Error::Errno(errno)) => Some(-i64::from(errno.into_raw())),
+            Err(_) => None,
+        };
+        let result = if let Some(returned) = returned {
+            let cleanup = self
+                .shadow_ack(
+                    guest,
+                    NetworkRequest::CompleteEmulatedRead {
+                        admission,
+                        returned,
+                    },
+                )
+                .await;
+            if cleanup.is_ok() {
+                guest.thread_state_mut().original_connect = None;
+            }
+            finish_shadow_operation(result, cleanup)
+        } else {
+            result
+        };
+        self.finish_original_invocation(guest, result).await
+    }
+
+    /// SYS_close uses the same admitted Call and actual completion channel.
+    /// Early physical removal is published by the Driver, before flush returns;
+    /// this wrapper does not remove by errno or retry the numeric descriptor.
+    pub(super) async fn network_original_close<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Close,
+    ) -> Result<i64, Error> {
+        let result = async {
+            let (admission, outcome, result, _) = self
+                .network_original_invoke(
+                    guest,
+                    call.into(),
+                    crate::network_replay::original_connect::Kind::Close,
+                    call.fd(),
+                    0,
+                    0,
+                )
+                .await?;
+            if outcome.pin.is_some() || outcome.address.is_some() {
+                return Err(engine_error(
+                    "close completion contains a duplicate file pin or connect copy",
+                ));
+            }
+            let retirement = self
+                .shadow_ack(
+                    guest,
+                    NetworkRequest::NativeRetireOriginalConnect { admission },
+                )
+                .await;
+            if retirement.is_ok() {
+                guest.thread_state_mut().original_connect = None;
+            }
+            finish_shadow_operation(result, retirement)
+        }
+        .await;
+        self.finish_original_invocation(guest, result).await
     }
 
     async fn ensure_listener_channel<G: Guest<Self>>(
@@ -554,80 +2110,256 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map_err(engine_rpc_error)?;
                 Ok(i64::from(fd))
             }
-            NetworkPolicy::Replay => loop {
-                let now = thread_observe_time(guest).await;
-                network_request(guest, NetworkRequest::ReleaseEligible(now))
-                    .await
-                    .map_err(engine_rpc_error)?;
-                match network_request(guest, NetworkRequest::TakeConnectionOutcome(listener))
-                    .await
-                    .map_err(engine_rpc_error)?
-                {
-                    NetworkReply::Connection(Some(crate::NetworkConnection::Accept {
-                        accepted,
-                        peer,
-                        ancillary: None,
-                    })) => {
-                        let family = match peer.as_ref() {
-                            Some(NetworkAddressV2::Inet6 { .. }) => libc::AF_INET6,
-                            Some(NetworkAddressV2::UnixPath(_))
-                            | Some(NetworkAddressV2::UnixAbstract(_))
-                            | Some(NetworkAddressV2::UnixUnnamed) => libc::AF_UNIX,
-                            _ => libc::AF_INET,
-                        };
-                        let socket = syscalls::Socket::new()
-                            .with_family(family)
-                            .with_type(libc::SOCK_STREAM | call.flags().bits())
-                            .with_protocol(0);
-                        let fd =
-                            i32::try_from(guest.inject(socket).await?).map_err(|_| Errno::EIO)?;
-                        self.add_fd(
-                            guest,
-                            fd,
-                            OFlag::from_bits_truncate(call.flags().bits()),
-                            FdType::Socket,
-                        )
-                        .await?;
-                        let open_file = guest.thread_state().socket_open_file_id(fd)?;
-                        let transport = read_socket_stream_transport(guest, fd).await?;
-                        self.ensure_channel(
-                            guest,
-                            open_file,
-                            NetworkChannelBinding {
-                                transport,
-                                role: NetworkEndpointRoleV2::Accepted,
-                                peer_address: peer.clone(),
-                                requested_local_constraint: None,
-                                observed_local_address: None,
-                                accepted_from: Some(listener_channel),
-                                selected_channel: Some(accepted),
-                            },
-                        )
-                        .await?;
-                        write_accept_peer(guest, call, peer.as_ref())?;
-                        break Ok(i64::from(fd));
-                    }
-                    NetworkReply::Connection(Some(crate::NetworkConnection::Accept {
-                        ancillary: Some(_),
-                        ..
-                    })) => {
-                        break Err(engine_error(
-                            "accept ancillary objects require message-level materialization",
-                        ));
-                    }
-                    NetworkReply::Connection(Some(crate::NetworkConnection::Error(errno))) => {
-                        break errno_result(errno);
-                    }
-                    NetworkReply::Connection(None) => {
-                        self.wait_for_network(guest, listener, NetworkWaitKind::Readable)
-                            .await;
-                    }
-                    reply => {
-                        break Err(engine_error(format!("unexpected accept reply {reply:?}")));
+            // Trace-v2 has no reserved-FD/copyout receipt. Refuse before
+            // consuming an outcome or creating any native/semantic descriptor.
+            NetworkPolicy::Replay => Err(engine_error(
+                "Replay accept requires original reservation/copyout authority",
+            )),
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
+    pub(crate) async fn owned_network_read_uses_shadow<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file: OpenFileId,
+    ) -> Result<bool, Error> {
+        Ok(self.shadow_socket_state(guest, open_file).await?.is_some())
+    }
+
+    /// Consume the scalar dispatcher's single admitted observation. The V3
+    /// handoff moves its permit/control into capture_publication; no numeric
+    /// descriptor classification is repeated after the transfer.
+    pub(crate) async fn network_read_from_admission<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        policy: NetworkPolicy,
+        read: crate::network_replay::NetworkFdReadAdmission,
+        metadata: crate::tool_local::NetworkFdReadMetadata,
+    ) -> Result<i64, Error> {
+        let open_file = metadata
+            .socket
+            .ok_or_else(|| engine_error("owned network Read lost socket identity"))?;
+        let nonblocking = metadata
+            .nonblocking
+            .ok_or_else(|| engine_error("owned Read lost status flags"))?;
+        if call.len() == 0 {
+            // Zero payload does not prove a successful syscall. Preserve the
+            // original pointer, selected file and Linux validation/restart path
+            // in both policies. Network-owned Read deliberately bypasses the
+            // ordinary Recorder/Replayer: local validation is not peer ingress.
+            // The existing Call still requires real Prepared/Returned evidence
+            // or positive cancellation and exact retirement before handback.
+            return self.original_read_attempt(guest, call, read, false).await;
+        }
+        let native_mode = guest
+            .local_global_state()
+            .and_then(|global| global.native_receive_mode());
+        if let Some(mode) = native_mode {
+            // Range precedence belongs to the authenticated, still-stopped
+            // original Read. It grants neither mapped access nor a Store.
+            let range = match mode {
+                crate::network_replay::NetworkEngineMode::Record => {
+                    crate::tool_global::CheckedReadRange::inspect(guest, call, &read, metadata)
+                        .map(Some)
+                }
+                crate::network_replay::NetworkEngineMode::Replay => {
+                    match guest.inspect_original_read_range(call) {
+                        Ok(reverie::OriginalReadRangeVerdict::Allowed) => Ok(None),
+                        Ok(reverie::OriginalReadRangeVerdict::Fault) => Err(Errno::EFAULT.into()),
+                        Err(error) => Err(error),
                     }
                 }
-            },
+            };
+            let checked_range = match range {
+                Ok(range) => range,
+                Err(primary) => {
+                    let cleanup = self
+                        .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                        .await;
+                    return finish_shadow_operation(Err(primary), cleanup);
+                }
+            };
+            let Some(global) = guest.local_global_state() else {
+                let cleanup = self
+                    .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                    .await;
+                return finish_shadow_operation(
+                    Err(engine_error("V4 receive lost actual local global state")),
+                    cleanup,
+                );
+            };
+            // The existing reader transfers through the actual local issuer.
+            // On failure, its consuming disposition owns all subsequent cleanup;
+            // an error does not authorize blindly finishing the old read again.
+            let tid = guest.tid();
+            let state = guest.thread_state();
+            let destination = call.buf().map_or(0, |address| address.as_raw()) as u64;
+            let admitted = match mode {
+                crate::network_replay::NetworkEngineMode::Record => {
+                    global
+                        .begin_private_receive_call(tid, state, read, destination, call.len())
+                        .await
+                }
+                crate::network_replay::NetworkEngineMode::Replay => {
+                    global.begin_replay_receive_call(tid, state, read, destination, call.len())
+                }
+            };
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(failure) => {
+                    let failure = global.cleanup_receive_admission_failure(failure).await;
+                    let primary = engine_rpc_error(failure.primary().clone());
+                    let cleanup = match failure.cleanup_diagnostic() {
+                        Some(error) => Err(engine_rpc_error(error.clone())),
+                        None => Ok(()),
+                    };
+                    return finish_shadow_operation(Err(primary), cleanup);
+                }
+            };
+            let invocation = match checked_range {
+                Some(range) => match global
+                    .bind_private_receive_invocation(range, tid, state, call, admitted)
+                {
+                    Ok(invocation) => Some(invocation),
+                    Err(failure) => {
+                        let failure = global.cleanup_receive_admission_failure(failure).await;
+                        let primary = engine_rpc_error(failure.primary().clone());
+                        let cleanup = match failure.cleanup_diagnostic() {
+                            Some(error) => Err(engine_rpc_error(error.clone())),
+                            None => Ok(()),
+                        };
+                        return finish_shadow_operation(Err(primary), cleanup);
+                    }
+                },
+                None => None,
+            };
+            return self
+                .foreground_v4_receive_from_call(
+                    guest,
+                    call,
+                    admitted,
+                    mode,
+                    nonblocking,
+                    invocation,
+                )
+                .await;
+        }
+        if self.shadow_socket_state(guest, open_file).await?.is_some() {
+            let pin = self
+                .capture_admitted_host_stream_call(guest, read, metadata)
+                .await?;
+            let segments = [(call.buf().map_or(0, |address| address.as_raw()), call.len())];
+            return self
+                .shadow_stream_receive_with_pin(
+                    guest,
+                    pin,
+                    NetworkReceiveContext {
+                        segments: &segments,
+                        flags: 0,
+                        zero_read: true,
+                        restart_errno: call.signal_interrupt_errno(),
+                        policy,
+                    },
+                )
+                .await;
+        }
+        match policy {
+            NetworkPolicy::Record => {
+                let result = async {
+                    let admission = self
+                        .begin_original_read_call(
+                            guest,
+                            call,
+                            read,
+                            Some(crate::OriginalFileExecution::Native),
+                        )
+                        .await?;
+                    // The existing network grant precedes this shared Read
+                    // boundary; capture still consumes only its actual result.
+                    let result = self
+                        .execute_original_read_call(guest, call, admission.clone(), false)
+                        .await?
+                        .map_err(Error::from);
+                    let capture = self
+                        .capture_scalar_network_read(guest, open_file, call, &result)
+                        .await;
+                    let cleanup = self
+                        .shadow_ack(
+                            guest,
+                            NetworkRequest::NativeRetireOriginalConnect { admission },
+                        )
+                        .await;
+                    if cleanup.is_ok() {
+                        guest.thread_state_mut().original_connect = None;
+                        guest.thread_state_mut().original_file_metadata = None;
+                    }
+                    finish_shadow_operation(result, capture.and(cleanup))
+                }
+                .await;
+                self.finish_original_invocation(guest, result).await
+            }
+            NetworkPolicy::Replay => {
+                let admission = self
+                    .begin_original_read_call(guest, call, read, None)
+                    .await?;
+                let result = self
+                    .replay_scalar_network_read(guest, open_file, call, nonblocking)
+                    .await;
+                self.finish_emulated_read_call(guest, admission, result)
+                    .await
+            }
             NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
+    async fn capture_scalar_network_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file: OpenFileId,
+        call: syscalls::Read,
+        result: &Result<i64, Error>,
+    ) -> Result<(), Error> {
+        let input = match result {
+            Ok(0) => NetworkCapturedStreamInput::EndOfFile,
+            Ok(count) => {
+                let count = usize::try_from(*count).map_err(|_| Errno::EIO)?;
+                let address = call.buf().ok_or(Errno::EFAULT)?;
+                let mut bytes = vec![0; count];
+                guest.memory().read_exact(address, &mut bytes)?;
+                NetworkCapturedStreamInput::Bytes(bytes)
+            }
+            Err(error) => NetworkCapturedStreamInput::Error(
+                error_errno(error).ok_or_else(|| engine_error(error))?,
+            ),
+        };
+        self.capture_input(guest, open_file, input).await
+    }
+
+    async fn replay_scalar_network_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file: OpenFileId,
+        call: syscalls::Read,
+        nonblocking: bool,
+    ) -> Result<i64, Error> {
+        let outcome = self
+            .replay_stream_receive(guest, open_file, call.len(), nonblocking)
+            .await?;
+        match outcome {
+            NetworkStreamReceive::Bytes(bytes) => {
+                if !bytes.is_empty() {
+                    guest
+                        .memory()
+                        .write_exact(call.buf().ok_or(Errno::EFAULT)?, &bytes)?;
+                }
+                Ok(bytes.len() as i64)
+            }
+            NetworkStreamReceive::EndOfFile => Ok(0),
+            NetworkStreamReceive::Error(errno) => errno_result(errno),
+            NetworkStreamReceive::WouldBlock => Err(Errno::EAGAIN.into()),
+            NetworkStreamReceive::Pending => unreachable!(),
         }
     }
 
@@ -636,7 +2368,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
         policy: NetworkPolicy,
+        zero_read: bool,
     ) -> Result<i64, Error> {
+        if zero_read && call.len() == 0 {
+            // The capability-None dispatcher retains the ordinary zero-Read
+            // operation in both policies. It must still execute local Linux
+            // validation and must not publish EOF or a local errno as ingress.
+            // recv(len=0) does not have this Read-only behavior.
+            return self.execute_native_zero_read(guest, call).await;
+        }
         let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
         if self.shadow_socket_state(guest, open_file).await?.is_some() {
             let segments = [(call.buf().map_or(0, |address| address.as_raw()), call.len())];
@@ -647,7 +2387,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     NetworkReceiveContext {
                         segments: &segments,
                         flags: 0,
-                        zero_read: true,
+                        zero_read,
                         restart_errno: call.signal_interrupt_errno(),
                         policy,
                     },
@@ -661,40 +2401,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         match policy {
             NetworkPolicy::Record => {
                 let result = self.live_network_syscall(guest, call.into()).await;
-                let input = match &result {
-                    Ok(0) => NetworkCapturedStreamInput::EndOfFile,
-                    Ok(count) => {
-                        let count = usize::try_from(*count).map_err(|_| Errno::EIO)?;
-                        let address = call.buf().ok_or(Errno::EFAULT)?;
-                        let mut bytes = vec![0; count];
-                        guest.memory().read_exact(address, &mut bytes)?;
-                        NetworkCapturedStreamInput::Bytes(bytes)
-                    }
-                    Err(error) => NetworkCapturedStreamInput::Error(
-                        error_errno(error).ok_or_else(|| engine_error(error))?,
-                    ),
-                };
-                self.capture_input(guest, open_file, input).await?;
+                self.capture_scalar_network_read(guest, open_file, call, &result)
+                    .await?;
                 result
             }
             NetworkPolicy::Replay => {
-                let outcome = self
-                    .replay_stream_receive(guest, open_file, call.len(), nonblocking)
-                    .await?;
-                match outcome {
-                    NetworkStreamReceive::Bytes(bytes) => {
-                        if !bytes.is_empty() {
-                            guest
-                                .memory()
-                                .write_exact(call.buf().ok_or(Errno::EFAULT)?, &bytes)?;
-                        }
-                        Ok(bytes.len() as i64)
-                    }
-                    NetworkStreamReceive::EndOfFile => Ok(0),
-                    NetworkStreamReceive::Error(errno) => errno_result(errno),
-                    NetworkStreamReceive::WouldBlock => Err(Errno::EAGAIN.into()),
-                    NetworkStreamReceive::Pending => unreachable!(),
-                }
+                self.replay_scalar_network_read(guest, open_file, call, nonblocking)
+                    .await
             }
             NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
         }
@@ -814,11 +2527,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Poll,
         policy: NetworkPolicy,
     ) -> Result<i64, Error> {
-        let timeout = match call.timeout() {
-            -1 => None,
-            timeout if timeout < -1 => return Err(Errno::EINVAL.into()),
-            timeout => Some(Duration::from_millis(timeout as u64)),
-        };
+        let timeout = poll_timeout_duration(call.timeout());
         self.network_poll_common(
             guest,
             call.into(),
@@ -1242,7 +2951,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_fd(call.fd())
             .with_buf(call.buf())
             .with_len(call.len());
-        self.network_read(guest, read, policy).await
+        self.network_read(guest, read, policy, false).await
     }
 
     async fn network_sendto<G: Guest<Self>>(
@@ -1320,6 +3029,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
         let direction = shutdown_direction(call.how())?;
+        // The shared engine must refuse unsupported V4 Record before either
+        // native branch, including an unenrolled socket on an RPC-only Guest.
+        self.shadow_ack(guest, NetworkRequest::PreflightSocketShutdown)
+            .await?;
         if self.shadow_socket_state(guest, open_file).await?.is_some()
             && let Some(control) = self.begin_shadow_fd_control(guest, call.fd()).await?
         {
@@ -1471,6 +3184,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.insert(ResourceID::BlockingNetworkCapture(op_id), Permission::RW);
         resources.fyi(call.name());
         resource_request(guest, resources).await;
+        self.live_network_syscall_after_grant(guest, call, completion)
+            .await
+    }
+
+    /// The caller has paid its original external grant. Physical observation
+    /// and the one existing continuation remain independent of table release.
+    async fn live_network_syscall_after_grant<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        completion: NetworkPhysicalCompletion,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        if matches!(completion, NetworkPhysicalCompletion::OriginalConnect) {
+            self.mark_original_syscall_invoked(guest);
+        }
+        // No await separates this marker transition from the first injection poll.
         let result = guest.inject(call).await.map_err(Error::from);
         // Ptrace capture's first poll is synchronous through global dispatch.
         // No scheduler continuation or other await intervenes after injection.
@@ -1486,6 +3217,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 enum NetworkPhysicalCompletion {
     None,
+    OriginalConnect,
     Accept(crate::network_replay::NetworkAcceptLeaseId),
 }
 
@@ -1933,6 +3665,12 @@ fn readiness_to_poll_revents(readiness: NetworkReadinessV2, events: i16) -> i16 
     revents
 }
 
+/// Linux poll(2) treats every negative timeout as an infinite wait.
+/// This is distinct from ppoll's timespec, where negative fields are invalid.
+fn poll_timeout_duration(timeout: i32) -> Option<Duration> {
+    (timeout >= 0).then(|| Duration::from_millis(timeout as u64))
+}
+
 fn iovec_capacity(segments: &[(usize, usize)]) -> Result<usize, Error> {
     let total = segments.iter().try_fold(0usize, |total, (_, length)| {
         total.checked_add(*length).ok_or(Errno::EINVAL)
@@ -2089,23 +3827,6 @@ where
     read_network_address(guest, Some(address.cast()), length as i32)
 }
 
-fn write_accept_peer<G, T>(
-    guest: &mut G,
-    call: syscalls::Accept4,
-    peer: Option<&NetworkAddressV2>,
-) -> Result<(), Error>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let Some(address) = call.sockaddr() else {
-        return Ok(());
-    };
-    // The typed Accept4 facade uses usize here; Linux's ABI is socklen_t.
-    let length_address = call.addrlen().ok_or(Errno::EFAULT)?.cast();
-    write_accept_peer_memory(&mut guest.memory(), address, length_address, peer)
-}
-
 fn write_accept_peer_memory<M: MemoryAccess>(
     memory: &mut M,
     address: AddrMut<libc::sockaddr>,
@@ -2244,49 +3965,117 @@ where
         return Err(Errno::EINVAL.into());
     }
     let family: libc::sa_family_t = guest.memory().read_value(address.cast())?;
-    match i32::from(family) {
+    let family = i32::from(family);
+    let copy_length = match family {
         libc::AF_INET => {
-            if length < std::mem::size_of::<libc::sockaddr_in>() as i32 {
+            let required = std::mem::size_of::<libc::sockaddr_in>();
+            if length < required as i32 {
                 return Err(Errno::EINVAL.into());
             }
-            let raw: libc::sockaddr_in = guest.memory().read_value(address.cast())?;
-            Ok(NetworkAddressV2::Inet4 {
-                address: raw.sin_addr.s_addr.to_ne_bytes(),
-                port: u16::from_be(raw.sin_port),
-            })
+            required
         }
         libc::AF_INET6 => {
-            if length < std::mem::size_of::<libc::sockaddr_in6>() as i32 {
+            // Linux accepts the original 24-byte IPv6 sockaddr without scope.
+            // Preserve supplied 24..27 bytes; use scope only when all 28 exist.
+            let required = std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id);
+            if length < required as i32 {
                 return Err(Errno::EINVAL.into());
             }
-            let raw: libc::sockaddr_in6 = guest.memory().read_value(address.cast())?;
-            Ok(NetworkAddressV2::Inet6 {
-                address: raw.sin6_addr.s6_addr,
-                port: u16::from_be(raw.sin6_port),
-                flowinfo: raw.sin6_flowinfo,
-                scope_id: raw.sin6_scope_id,
-            })
+            (length as usize).min(std::mem::size_of::<libc::sockaddr_in6>())
         }
         libc::AF_UNIX => {
-            let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
             let length = usize::try_from(length).map_err(|_| Errno::EINVAL)?;
             if length > std::mem::size_of::<libc::sockaddr_un>() {
                 return Err(Errno::EINVAL.into());
             }
-            if length <= path_offset {
+            if length <= std::mem::offset_of!(libc::sockaddr_un, sun_path) {
                 return Ok(NetworkAddressV2::UnixUnnamed);
             }
-            let mut bytes = vec![0; length];
-            guest.memory().read_exact(address.cast(), &mut bytes)?;
-            let path = &bytes[path_offset..];
-            if path.first() == Some(&0) {
-                Ok(NetworkAddressV2::UnixAbstract(path[1..].to_vec()))
-            } else {
-                Ok(NetworkAddressV2::UnixPath(path.to_vec()))
-            }
+            length
         }
-        family => Err(engine_error(format!(
-            "unsupported connect address family {family}"
+        family => {
+            return Err(engine_error(format!(
+                "unsupported connect address family {family}"
+            )));
+        }
+    };
+    // This legacy guest-input wrapper retains its original first-family read
+    // and bounded copy order. Original Record Connect never enters this path:
+    // its input to the same pure decoder is the retained kernel copy.
+    let mut bytes = vec![0; copy_length];
+    guest.memory().read_exact(address.cast(), &mut bytes)?;
+    decode_network_address(family, &bytes)
+}
+
+fn captured_sockaddr_too_short(bytes: &[u8]) -> bool {
+    let Some(family) = bytes.get(..2) else {
+        return true;
+    };
+    let required = match i32::from(u16::from_ne_bytes([family[0], family[1]])) {
+        libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
+        libc::AF_INET6 => std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id),
+        libc::AF_UNIX => std::mem::offset_of!(libc::sockaddr_un, sun_path),
+        _ => return false,
+    };
+    bytes.len() < required
+}
+
+fn read_captured_network_address(bytes: &[u8]) -> Result<NetworkAddressV2, Error> {
+    let family = bytes
+        .get(..2)
+        .ok_or_else(|| engine_error("captured sockaddr lacks family"))?;
+    decode_network_address(i32::from(u16::from_ne_bytes([family[0], family[1]])), bytes)
+}
+
+/// Normalize bytes only; neither adapter is permitted to obtain the other's
+/// input by rereading guest memory or looking up the numeric FD after return.
+fn decode_network_address(family: i32, bytes: &[u8]) -> Result<NetworkAddressV2, Error> {
+    let required = |size: usize| {
+        if bytes.len() >= size {
+            Ok(())
+        } else {
+            Err(engine_error(
+                "captured sockaddr is too short for its family",
+            ))
+        }
+    };
+    match family {
+        libc::AF_INET => {
+            required(std::mem::size_of::<libc::sockaddr_in>())?;
+            Ok(NetworkAddressV2::Inet4 {
+                address: bytes[4..8].try_into().unwrap(),
+                port: u16::from_be_bytes(bytes[2..4].try_into().unwrap()),
+            })
+        }
+        libc::AF_INET6 => {
+            required(std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id))?;
+            Ok(NetworkAddressV2::Inet6 {
+                address: bytes[8..24].try_into().unwrap(),
+                port: u16::from_be_bytes(bytes[2..4].try_into().unwrap()),
+                flowinfo: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+                scope_id: bytes
+                    .get(24..28)
+                    .map_or(0, |scope| u32::from_ne_bytes(scope.try_into().unwrap())),
+            })
+        }
+        libc::AF_UNIX => {
+            let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            if bytes.len() > std::mem::size_of::<libc::sockaddr_un>() {
+                return Err(engine_error(
+                    "captured Unix sockaddr exceeds native storage",
+                ));
+            }
+            let path = bytes
+                .get(offset..)
+                .ok_or_else(|| engine_error("captured Unix sockaddr lacks native path offset"))?;
+            Ok(match path.first() {
+                None => NetworkAddressV2::UnixUnnamed,
+                Some(0) => NetworkAddressV2::UnixAbstract(path[1..].to_vec()),
+                Some(_) => NetworkAddressV2::UnixPath(path.to_vec()),
+            })
+        }
+        other => Err(engine_error(format!(
+            "unsupported captured Connect address family {other}"
         ))),
     }
 }
@@ -2380,9 +4169,6 @@ fn copy_stream_chunk_to_user<M: MemoryAccess>(
         error: (written != bytes.len()).then_some(Errno::EFAULT),
     }
 }
-
-// Proposal fragment only. Requires exact core seam API.fragment.rs and
-// NetworkWaitKind::ReadableAtLeast(usize); not applied or compiled.
 
 // Preserve the primary typed failure across independent cleanup. This mirrors
 // the CLI's finish_run_with_cleanup boundary without reclassifying prose.
@@ -2500,6 +4286,43 @@ mod shadow_completion_tests {
     }
 
     #[test]
+    fn ipv6_original_24_byte_sockaddr_matches_native_and_ignores_incomplete_scope() {
+        // Native ::1 stream connect(length=24) accepted and transferred payload
+        // in root-connect-address-audit-v1. These literal bytes also exercise
+        // the common guest/captured codec without executing any socket here.
+        let mut bytes = vec![0u8; 29];
+        bytes[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
+        bytes[4..8].copy_from_slice(&0x10203040u32.to_ne_bytes());
+        bytes[23] = 1;
+        bytes[24..28].copy_from_slice(&0x55667788u32.to_ne_bytes());
+        for length in 24..=29 {
+            let mut address = [0; 16];
+            address[15] = 1;
+            let expected = NetworkAddressV2::Inet6 {
+                address,
+                port: 0x1234,
+                flowinfo: 0x10203040,
+                scope_id: if length < 28 { 0 } else { 0x55667788 },
+            };
+            assert_eq!(
+                read_captured_network_address(&bytes[..length]).unwrap(),
+                expected
+            );
+            assert_eq!(
+                decode_network_address(libc::AF_INET6, &bytes[..length]).unwrap(),
+                expected
+            );
+            assert!(!captured_sockaddr_too_short(&bytes[..length]));
+        }
+        for length in 0..24 {
+            assert!(read_captured_network_address(&bytes[..length]).is_err());
+            assert!(decode_network_address(libc::AF_INET6, &bytes[..length]).is_err());
+            assert!(captured_sockaddr_too_short(&bytes[..length]));
+        }
+    }
+
+    #[test]
     fn primary_refusal_survives_independent_cleanup_failure() {
         let error = finish_shadow_operation::<()>(
             Err(refusal()),
@@ -2544,54 +4367,39 @@ mod shadow_completion_tests {
 
 // Current selected physical path. The remote-mapping version is retained in
 // remote-mapping-draft/, not composed into this candidate.
-use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
-use std::os::fd::IntoRawFd;
-use std::os::fd::OwnedFd;
-use std::os::fd::RawFd;
-
 struct NetworkHostSocketPin {
     call: NetworkStreamCallId,
-    fd: Option<OwnedFd>,
+    native: bool,
     nonblocking: bool,
 }
 
-impl NetworkHostSocketPin {
-    fn physical_fd(&self) -> Result<RawFd, Error> {
-        self.fd
-            .as_ref()
-            .map(AsRawFd::as_raw_fd)
-            .ok_or_else(|| engine_error("Replay/socket call has no physical descriptor authority"))
-    }
-}
-
-// Called only after explicit ptrace capability and short OFD/FD-slot admission.
-// No await or scheduler yield occurs between these calls. PIDFD_THREAD selects
-// THIS thread's files table, including CLONE_THREAD without CLONE_FILES.
-fn duplicate_ptrace_socket(tid: i32, fd: i32) -> Result<OwnedFd, std::io::Error> {
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, tid, libc::O_EXCL as libc::c_uint) };
-    if pidfd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
-    let duplicate = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0u32) };
-    if duplicate < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate as RawFd) };
-    // pidfd_getfd itself specifies CLOEXEC. Check rather than create a window
-    // in which a concurrently spawned process could inherit this reference.
-    let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if flags & libc::FD_CLOEXEC == 0 {
-        return Err(std::io::Error::other("pidfd_getfd did not set CLOEXEC"));
-    }
-    Ok(duplicate)
-}
-
 impl<T: RecordOrReplay> Detcore<T> {
+    fn check_host_stream_capture<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        policy: NetworkPolicy,
+    ) -> Result<(), Error> {
+        if policy == NetworkPolicy::Record && !guest.config().backend_supports_host_socket_pin {
+            return Err(engine_error(
+                "selected backend has no authenticated host socket-pin implementation",
+            ));
+        }
+        if !self.network_fd_tracking_active(guest) {
+            return Err(engine_error(
+                "native stream capture lacks complete backend FD-table admission",
+            ));
+        }
+        // Backend pinning and helper-private Peek bytes do not authenticate
+        // current kernel rollback layout or an exact foreground copy. V3's
+        // declared publication units cannot supply either missing authority.
+        if policy == NetworkPolicy::Record {
+            return Err(engine_error(
+                "Record host stream capture requires authenticated current-layout and copy authority",
+            ));
+        }
+        Ok(())
+    }
+
     async fn begin_host_stream_call<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2599,104 +4407,131 @@ impl<T: RecordOrReplay> Detcore<T> {
         expected: OpenFileId,
         policy: NetworkPolicy,
     ) -> Result<NetworkHostSocketPin, Error> {
-        if policy == NetworkPolicy::Record && !guest.config().backend_supports_host_socket_pin {
-            // No numeric KVM/DBT scheduler ID ever reaches host pidfd_open.
+        self.check_host_stream_capture(guest, policy)?;
+        let read = self.begin_network_fd_read(guest, fd).await?;
+        let observed = {
+            let table = guest.thread_state().file_metadata.clone();
+            let observed = table.lock().unwrap().observe_fd_read(&read);
+            observed
+        };
+        let observed = match observed {
+            Ok(observed) if observed.socket == Some(expected) => observed,
+            other => {
+                let error = match other {
+                    Err(error) => error,
+                    _ => engine_error("FD slot changed before stream-call admission"),
+                };
+                let released = self
+                    .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                    .await;
+                return finish_shadow_operation(Err(error), released);
+            }
+        };
+        self.capture_admitted_host_stream_call(guest, read, observed)
+            .await
+    }
+
+    /// Recovery uses the existing publication owner. No metadata mutex, table
+    /// permit or OFD control survives a wait on another admitted reader/mutator.
+    pub(crate) async fn begin_network_fd_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+    ) -> Result<crate::network_replay::NetworkFdReadAdmission, Error> {
+        loop {
+            self.publish_network_fd_installations(guest).await?;
+            let files = guest.thread_state().file_metadata.lock().unwrap().files_id;
+            match network_request(guest, NetworkRequest::BeginFdRead { files, fd })
+                .await
+                .map_err(engine_rpc_error)?
+            {
+                NetworkReply::FdRead(crate::network_replay::NetworkFdReadBegin::Admitted(read)) => {
+                    return Ok(read);
+                }
+                NetworkReply::FdRead(crate::network_replay::NetworkFdReadBegin::Recover) => {}
+                reply => {
+                    return Err(engine_error(format!(
+                        "unexpected reader admission {reply:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Consuming transfer point for the owned dispatcher/scan input. The Global
+    /// side validates this exact read and moves its permit/control into the
+    /// existing Call before starting capture; it never reacquires the table.
+    async fn capture_admitted_host_stream_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        read: crate::network_replay::NetworkFdReadAdmission,
+        observed: crate::tool_local::NetworkFdReadMetadata,
+    ) -> Result<NetworkHostSocketPin, Error> {
+        // Owned scalar dispatch reaches this consuming entry directly. Refuse
+        // before capture, while releasing the exact admission it already owns.
+        if let Err(error) =
+            self.check_host_stream_capture(guest, guest.config().network_trace.policy)
+        {
+            let cleanup = self
+                .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                .await;
+            return finish_shadow_operation(Err(error), cleanup);
+        }
+        let expected = read
+            .binding
+            .ok_or_else(|| engine_error("capture read has no binding"))?
+            .open_file;
+        if observed.binding != read.binding || observed.socket != Some(expected) {
             return Err(engine_error(
-                "selected backend has no authenticated host socket-pin implementation",
+                "capture observation differs from its admitted binding",
             ));
         }
-        let control = self
-            .begin_shadow_fd_control(guest, fd)
-            .await?
-            .ok_or_else(|| engine_error("stream enrollment disappeared before pin admission"))?;
-        if self.network_open_file(guest, fd) != Some(expected) {
-            self.shadow_ack(
-                guest,
-                NetworkRequest::FinishSocketControl {
-                    lease: control.lease,
-                    disposition: NetworkSocketControlFinish::Unchanged,
-                },
-            )
-            .await?;
-            // This is an internal restart requirement, never an invented guest
-            // EBADF. Full FD-slot admission must prevent this before activation.
-            return Err(engine_error("FD slot changed before stream-call admission"));
+        // The old begin_shadow_fd_control required an enrolled V3 state.
+        // Read that state under this exact descriptor control before capture.
+        let state = self.shadow_socket_state(guest, expected).await;
+        if !matches!(state, Ok(Some(_))) {
+            let error = match state {
+                Err(error) => error,
+                _ => engine_error("stream enrollment disappeared before pin admission"),
+            };
+            let cleanup = self
+                .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                .await;
+            return finish_shadow_operation(Err(error), cleanup);
         }
-        let call = match network_request(
-            guest,
-            NetworkRequest::BeginStreamCall {
-                control_lease: control.lease,
-            },
-        )
-        .await
-        .map_err(engine_rpc_error)?
+        let nonblocking = observed
+            .nonblocking
+            .ok_or_else(|| engine_error("capture read has no flag observation"))?;
+        let control = read
+            .control
+            .ok_or_else(|| engine_error("capture read has no descriptor control"))?;
+        let call = match network_request(guest, NetworkRequest::NativeBeginStreamCall { read })
+            .await
+            .map_err(engine_rpc_error)?
         {
             NetworkReply::StreamCall(call) if call.open_file == expected => call,
+            NetworkReply::NativeStreamPinFailed(errno) => {
+                return Err(engine_error(format!(
+                    "cannot acquire physical stream reference: errno {errno}"
+                )));
+            }
             other => {
                 return Err(engine_error(format!(
                     "unexpected stream call admission {other:?}"
                 )));
             }
         };
-        let nonblocking = guest
-            .thread_state()
-            .with_detfd(fd, |entry| entry.is_nonblocking())?;
-        let duplicate = if call.physical_pin_required {
-            if policy != NetworkPolicy::Record {
-                return Err(engine_error("Replay requested a physical pin"));
-            }
-            // BeginStreamCall durably marked PinAcquireSubmitted first. The
-            // stopped ptrace callback and FD-slot admission authenticate tid/fd.
-            let result = duplicate_ptrace_socket(guest.tid().as_raw(), fd);
-            match result {
-                Ok(duplicate) => {
-                    self.shadow_ack(
-                        guest,
-                        NetworkRequest::ConfirmStreamCallPin {
-                            id: call.id,
-                            outcome: NetworkStreamPinOutcome::Acquired,
-                        },
-                    )
-                    .await?;
-                    Some(duplicate)
-                }
-                Err(error) => {
-                    let errno = error.raw_os_error().unwrap_or(libc::EIO);
-                    self.shadow_ack(
-                        guest,
-                        NetworkRequest::ConfirmStreamCallPin {
-                            id: call.id,
-                            outcome: NetworkStreamPinOutcome::Failed(errno),
-                        },
-                    )
-                    .await?;
-                    self.shadow_ack(
-                        guest,
-                        NetworkRequest::FinishSocketControl {
-                            lease: control.lease,
-                            disposition: NetworkSocketControlFinish::Unchanged,
-                        },
-                    )
-                    .await?;
-                    return Err(engine_error(format!(
-                        "cannot acquire physical stream reference: {error}"
-                    )));
-                }
-            }
-        } else {
-            None
-        };
         self.shadow_ack(
             guest,
             NetworkRequest::FinishSocketControl {
-                lease: control.lease,
+                lease: control,
                 disposition: NetworkSocketControlFinish::Unchanged,
             },
         )
         .await?;
         Ok(NetworkHostSocketPin {
             call: call.id,
-            fd: duplicate,
+            native: call.physical_pin_required,
             nonblocking,
         })
     }
@@ -2704,33 +4539,28 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn finish_host_stream_call<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut pin: NetworkHostSocketPin,
+        pin: NetworkHostSocketPin,
         result: Result<i64, Error>,
     ) -> Result<i64, Error> {
         let cleanup = async {
-            self.shadow_ack(
-                guest,
-                NetworkRequest::BeginStreamCallRelease { id: pin.call },
-            )
-            .await?;
-            if let Some(fd) = pin.fd.take() {
-                let raw = fd.into_raw_fd();
-                let closed = unsafe { libc::close(raw) };
-                // Linux releases a valid close descriptor even if a later error is
-                // returned. EBADF means ownership itself failed and stays latched.
-                if closed < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
-                {
-                    return Err(engine_error(
-                        "owned socket pin became invalid before release",
-                    ));
-                }
+            if pin.native {
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::NativeReleaseStreamCall { call: pin.call },
+                )
+                .await
+            } else {
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::BeginStreamCallRelease { id: pin.call },
+                )
+                .await?;
+                self.shadow_ack(
+                    guest,
+                    NetworkRequest::FinishStreamCallRelease { id: pin.call },
+                )
+                .await
             }
-            self.shadow_ack(
-                guest,
-                NetworkRequest::FinishStreamCallRelease { id: pin.call },
-            )
-            .await?;
-            Ok(())
         }
         .await;
         finish_shadow_operation(result, cleanup)
@@ -2752,7 +4582,10 @@ fn checked_accept4_socket_type(flags: i32) -> Result<i32, Errno> {
 // qualified child observer and fd installation service. This is their actual
 // syscall caller, not a post-hoc RegisterAccepted/default-copy shortcut.
 impl<T: RecordOrReplay> Detcore<T> {
-    async fn accepted_model_mode<G: Guest<Self>>(&self, guest: &mut G) -> Result<bool, Error> {
+    pub(super) async fn accepted_model_mode<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<bool, Error> {
         if !matches!(
             guest.config().network_trace.policy,
             NetworkPolicy::Record | NetworkPolicy::Replay
@@ -2769,6 +4602,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))),
         }
     }
+    /// Record Connect admission follows the actual engine capability. V3 binds
+    /// it to the accepted runtime; V4 binds it to admitted descriptor tracking
+    /// in a V4 Record engine, whose global entry is the native Connect join.
+    pub(crate) async fn original_connect_record_route<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<bool, Error> {
+        if guest.config().network_trace.policy != NetworkPolicy::Record {
+            return Ok(false);
+        }
+        let native = guest
+            .local_global_state()
+            .and_then(|global| global.native_receive_mode());
+        if native.is_some() {
+            return Ok(
+                native == Some(crate::network_replay::NetworkEngineMode::Record)
+                    && self.network_fd_tracking_active(guest),
+            );
+        }
+        self.accepted_model_mode(guest).await
+    }
     async fn accepted_socket_transaction<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2779,11 +4633,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // __sys_accept4 resolves the FD first; the network dispatcher has
         // already selected this tracked socket. __sys_accept4_file then checks
         // the raw flag mask before FD allocation, pointer copy or queue wait.
-        let replay_socket_type = if policy == NetworkPolicy::Replay {
-            Some(checked_accept4_socket_type(call.flags().bits())?)
-        } else {
-            None
-        };
+        if policy == NetworkPolicy::Replay {
+            checked_accept4_socket_type(call.flags().bits())?;
+            return Err(engine_error(
+                "Replay accept requires original reservation/copyout authority",
+            ));
+        }
         let pin = self
             .begin_host_stream_call(guest, call.sockfd(), listener, policy)
             .await?;
@@ -2832,64 +4687,55 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             )
             .await?;
-            let result: Result<i64, Error> = if policy == NetworkPolicy::Record {
-                self.shadow_ack(
-                    guest,
-                    NetworkRequest::PrepareAcceptedEffect {
-                        lease: reservation.lease,
-                        fd: call.sockfd(),
-                        flags: call.flags().bits(),
-                    },
-                )
-                .await?;
-                // Original guest address/length preserve Linux allocation and
-                // copyout priority. No preliminary scratch accept or validation.
-                self.live_network_syscall_with_completion(
+            // Replay was refused above, before queue reservation or allocation.
+            self.shadow_ack(
+                guest,
+                NetworkRequest::PrepareAcceptedEffect {
+                    lease: reservation.lease,
+                    fd: call.sockfd(),
+                    flags: call.flags().bits(),
+                },
+            )
+            .await?;
+            // Original guest address/length preserve Linux allocation and
+            // copyout priority. No preliminary scratch accept or validation.
+            let result = self
+                .live_network_syscall_with_completion(
                     guest,
                     call.into(),
                     NetworkPhysicalCompletion::Accept(reservation.lease),
                 )
-                .await
-            } else {
-                let child = reservation
-                    .child
-                    .as_ref()
-                    .ok_or_else(|| engine_error("Replay lacks reserved child"))?;
-                let socket = syscalls::Socket::new()
-                    .with_family(child.key.domain)
-                    .with_type(
-                        replay_socket_type.expect("Replay flags validated before queue access"),
-                    )
-                    .with_protocol(child.key.protocol);
-                let fd = guest.inject(socket).await?;
-                // The allocation service must retain this actual descriptor
-                // through any copyout fault; the errno is not a no-effect proof.
-                write_accept_peer(guest, call, Some(&child.peer))?;
-                Ok(fd)
-            };
+                .await;
             let kernel_result = match &result {
                 Ok(fd) => Ok(i32::try_from(*fd).map_err(|_| Errno::EIO)?),
                 Err(Error::Errno(errno)) => Err(errno.into_raw()),
                 Err(_) => return result,
             };
-            if policy == NetworkPolicy::Record && kernel_result.is_ok() {
-                self.shadow_ack(
+            let installed = if policy == NetworkPolicy::Record {
+                match network_request(
                     guest,
                     NetworkRequest::ResolveAcceptedProvider {
                         lease: reservation.lease,
                     },
                 )
-                .await?;
-            }
-            if let Ok(fd) = kernel_result {
-                self.add_fd(
-                    guest,
-                    fd,
-                    OFlag::from_bits_truncate(call.flags().bits()),
-                    FdType::Socket,
-                )
-                .await?;
-            }
+                .await
+                .map_err(engine_rpc_error)?
+                {
+                    NetworkReply::AcceptedInstallation(binding)
+                        if Some(binding.slot.fd) == kernel_result.ok() =>
+                    {
+                        Some(binding)
+                    }
+                    NetworkReply::AcceptedNoInstallation if kernel_result.is_err() => None,
+                    reply => {
+                        return Err(engine_error(format!(
+                            "accepted original installation changed: {reply:?}"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
             // The service has to publish its matched descriptor fact BEFORE
             // this RPC. A return value/add_fd never fabricates that authority.
             let completion = network_request(
@@ -2897,10 +4743,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 NetworkRequest::CompleteAcceptedSocket {
                     lease: reservation.lease,
                     kernel_result,
-                    installed_open_file: kernel_result
-                        .ok()
-                        .map(|fd| guest.thread_state().socket_open_file_id(fd))
-                        .transpose()?,
+                    installed_open_file: installed.map(|binding| binding.open_file),
                 },
             )
             .await
@@ -2954,139 +4797,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-fn host_socket_i32(fd: RawFd, name: i32) -> Result<i32, Errno> {
-    let mut value = 0i32;
-    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            name,
-            (&raw mut value).cast(),
-            &raw mut length,
-        )
-    };
-    if result < 0 {
-        return Err(Errno::new(
-            std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        ));
-    }
-    if length != std::mem::size_of::<i32>() as libc::socklen_t {
-        return Err(Errno::EIO);
-    }
-    Ok(value)
-}
-
-fn host_set_cursor(fd: RawFd, value: i32) -> Result<(), Errno> {
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEEK_OFF,
-            (&raw const value).cast(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        )
-    };
-    if result < 0 {
-        Err(Errno::new(
-            std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn host_peek_suffix(fd: RawFd, prefix: usize) -> Result<(usize, Vec<u8>), Errno> {
-    let maximum = prefix
-        .checked_add(SHADOW_UNIT)
-        .filter(|count| *count <= NETWORK_MAX_RW_COUNT)
-        .ok_or(Errno::EOVERFLOW)?;
-    let vectors = prefix
-        .div_ceil(SHADOW_VIEW)
-        .min(libc::UIO_MAXIOV as usize - 1);
-    let sink_size = if vectors == 0 {
-        0
-    } else {
-        prefix.div_ceil(vectors)
-    };
-    let mut sink = vec![0u8; sink_size];
-    let mut suffix = vec![0u8; SHADOW_UNIT];
-    let mut iov = Vec::with_capacity(vectors + 1);
-    let mut left = prefix;
-    for _ in 0..vectors {
-        let count = left.min(sink_size);
-        iov.push(libc::iovec {
-            iov_base: sink.as_mut_ptr().cast(),
-            iov_len: count,
-        });
-        left -= count;
-    }
-    iov.push(libc::iovec {
-        iov_base: suffix.as_mut_ptr().cast(),
-        iov_len: SHADOW_UNIT,
-    });
-    let mut header = libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: iov.as_mut_ptr(),
-        msg_iovlen: iov.len(),
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    };
-    let result = unsafe { libc::recvmsg(fd, &raw mut header, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-    if result < 0 {
-        return Err(Errno::new(
-            std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        ));
-    }
-    let count = result as usize;
-    if count < prefix || count > maximum {
-        return Err(Errno::EIO);
-    }
-    suffix.truncate(count - prefix);
-    Ok((count, suffix))
-}
-
-fn host_poll_state(fd: RawFd) -> Result<i16, Errno> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN | libc::POLLOUT | libc::POLLRDHUP,
-        revents: 0,
-    };
-    let result = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
-    if result < 0 {
-        return Err(Errno::new(
-            std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        ));
-    }
-    if !(0..=1).contains(&result) || pollfd.revents & libc::POLLNVAL != 0 {
-        return Err(Errno::EIO);
-    }
-    Ok(pollfd.revents)
-}
-
-fn host_queued_bytes(fd: RawFd) -> Result<usize, Errno> {
-    let mut count = 0i32;
-    let result = unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut count) };
-    if result < 0 {
-        return Err(Errno::new(
-            std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        ));
-    }
-    usize::try_from(count).map_err(|_| Errno::EIO)
-}
-
 const SHADOW_UNIT: usize = 1024;
 const SHADOW_VIEW: usize = 512;
 const NETWORK_MAX_RW_COUNT: usize = 0x7fff_f000;
@@ -3137,6 +4847,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
         .await
     }
+    async fn native_stream_effect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        lease: NetworkStreamLeaseId,
+        effect: NetworkStreamPhysicalEffect,
+    ) -> Result<crate::network_runtime::native_peer::Observation, Error> {
+        match network_request(guest, NetworkRequest::NativeStreamEffect { lease, effect })
+            .await
+            .map_err(engine_rpc_error)?
+        {
+            NetworkReply::NativeStreamObservation(observed) => Ok(observed),
+            reply => Err(engine_error(format!(
+                "unexpected native stream effect reply {reply:?}"
+            ))),
+        }
+    }
     async fn set_host_shadow_cursor<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3144,19 +4870,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         lease: NetworkStreamLeaseId,
         value: i32,
     ) -> Result<(), Error> {
-        self.shadow_submit(
-            guest,
-            lease,
-            NetworkStreamPhysicalEffect::SetPeekOffset { value },
-        )
-        .await?;
-        let result = host_set_cursor(pin.physical_fd()?, value);
-        let confirmation = match result {
-            Ok(()) => NetworkStreamPhysicalResult::Unit,
-            Err(errno) => NetworkStreamPhysicalResult::Errno(errno.into_raw()),
-        };
-        self.shadow_confirm(guest, lease, confirmation).await?;
-        result.map_err(|error| engine_error(format!("physical cursor transition failed: {error}")))
+        let _ = pin; // The lease was joined to this call by its engine-produced reply.
+        let observed = self
+            .native_stream_effect(
+                guest,
+                lease,
+                NetworkStreamPhysicalEffect::SetPeekOffset { value },
+            )
+            .await?;
+        match observed.confirmation {
+            NetworkStreamPhysicalResult::Unit => Ok(()),
+            other => Err(engine_error(format!(
+                "physical cursor transition failed: {other:?}"
+            ))),
+        }
     }
 
     async fn observe_shadow_stream<G: Guest<Self>>(
@@ -3194,33 +4921,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 other => return Err(engine_error(format!("unexpected shadow probe {other:?}"))),
             };
         let lease = probe.lease;
-        let fd = pin.physical_fd()?;
-        self.shadow_submit(guest, lease, NetworkStreamPhysicalEffect::ReadPeekOffset)
+        let observed = self
+            .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::ReadPeekOffset)
             .await?;
-        let saved = match host_socket_i32(fd, libc::SO_PEEK_OFF) {
-            Ok(value) => {
-                self.shadow_confirm(guest, lease, NetworkStreamPhysicalResult::PeekOffset(value))
-                    .await?;
-                Some(value)
-            }
-            Err(errno) if errno == Errno::ENOPROTOOPT || errno == Errno::EOPNOTSUPP => {
-                self.shadow_confirm(
-                    guest,
-                    lease,
-                    NetworkStreamPhysicalResult::Errno(errno.into_raw()),
-                )
-                .await?;
+        let saved = match observed.confirmation {
+            NetworkStreamPhysicalResult::PeekOffset(value) => Some(value),
+            NetworkStreamPhysicalResult::Errno(errno)
+                if errno == libc::ENOPROTOOPT || errno == libc::EOPNOTSUPP =>
+            {
                 None
             }
-            Err(errno) => {
-                self.shadow_confirm(
-                    guest,
-                    lease,
-                    NetworkStreamPhysicalResult::Errno(errno.into_raw()),
-                )
-                .await?;
+            other => {
                 return Err(engine_error(format!(
-                    "owned socket cursor query failed: {errno}"
+                    "owned socket cursor query failed: {other:?}"
                 )));
             }
         };
@@ -3231,14 +4944,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             .retained_prefix
             .checked_add(SHADOW_UNIT)
             .ok_or_else(|| engine_error("shadow prefix overflow"))?;
-        self.shadow_submit(guest, lease, NetworkStreamPhysicalEffect::Peek { maximum })
+        let observed = self
+            .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::Peek { maximum })
             .await?;
-        let peek = host_peek_suffix(fd, probe.retained_prefix);
-        let confirmation = match &peek {
-            Ok((count, _)) => NetworkStreamPhysicalResult::Peeked { count: *count },
-            Err(errno) => NetworkStreamPhysicalResult::Errno(errno.into_raw()),
+        let peek = match observed.confirmation {
+            NetworkStreamPhysicalResult::Peeked { count } => Ok((count, observed.bytes)),
+            NetworkStreamPhysicalResult::Errno(errno) => Err(Errno::new(errno)),
+            other => {
+                return Err(engine_error(format!(
+                    "unexpected native PEEK result {other:?}"
+                )));
+            }
         };
-        self.shadow_confirm(guest, lease, confirmation).await?;
         // The restoration is attempted before any interpretation of known
         // recv errors. Unknown RPC/effect completion remains durably unresolved.
         if let Some(value) = saved.filter(|value| *value >= 0) {
@@ -3261,26 +4978,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )));
             }
         };
-        self.shadow_submit(guest, lease, NetworkStreamPhysicalEffect::PollState)
+        let observed = self
+            .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::PollState)
             .await?;
-        let revents = host_poll_state(fd)
-            .map_err(|error| engine_error(format!("owned poll0 failed: {error}")))?;
-        self.shadow_confirm(
-            guest,
-            lease,
-            NetworkStreamPhysicalResult::PollState { revents },
-        )
-        .await?;
-        self.shadow_submit(guest, lease, NetworkStreamPhysicalEffect::QueuedBytes)
+        let NetworkStreamPhysicalResult::PollState { revents } = observed.confirmation else {
+            return Err(engine_error(
+                "owned poll0 did not return a poll observation",
+            ));
+        };
+        let observed = self
+            .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::QueuedBytes)
             .await?;
-        let queued = host_queued_bytes(fd)
-            .map_err(|error| engine_error(format!("owned FIONREAD failed: {error}")))?;
-        self.shadow_confirm(
-            guest,
-            lease,
-            NetworkStreamPhysicalResult::QueuedBytes { count: queued },
-        )
-        .await?;
+        let NetworkStreamPhysicalResult::QueuedBytes { count: queued } = observed.confirmation
+        else {
+            return Err(engine_error(
+                "owned FIONREAD did not return a queue observation",
+            ));
+        };
         // sk_err/soft-error observations are core-owned effect transitions;
         // a plain readiness bit never fabricates an errno or clears a slot.
         let unseen = queued.checked_sub(probe.retained_prefix).ok_or_else(|| {
@@ -3328,35 +5042,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         self.shadow_ack(guest, NetworkRequest::BeginRecordDrain { lease })
             .await?;
-        let fd = pin.physical_fd()?;
+        let _ = pin; // This lease already identifies the captured original OFD.
         let mut drained = 0;
         while drained < selection_len {
             let maximum = (selection_len - drained).min(SHADOW_VIEW);
-            self.shadow_submit(guest, lease, NetworkStreamPhysicalEffect::Drain { maximum })
+            let observed = self
+                .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::Drain { maximum })
                 .await?;
-            let mut bytes = vec![0u8; maximum];
-            let result =
-                unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), maximum, libc::MSG_DONTWAIT) };
-            if result < 0 {
-                let errno = std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO);
-                self.shadow_confirm(guest, lease, NetworkStreamPhysicalResult::Errno(errno))
-                    .await?;
-                return Err(engine_error(format!(
-                    "physical stream drain failed: errno {errno}"
-                )));
-            }
-            let count = result as usize;
-            if count == 0 || count > maximum {
-                return Err(engine_error("physical stream drain stopped short"));
-            }
-            bytes.truncate(count);
-            // This confirms physical bytes against the immutable reservation;
-            // it does not yet consume any logical prefix of the selected unit.
-            self.shadow_confirm(guest, lease, NetworkStreamPhysicalResult::Drained { bytes })
-                .await?;
-            drained += count;
+            let NetworkStreamPhysicalResult::Drained { bytes } = observed.confirmation else {
+                return Err(engine_error("physical stream drain did not complete"));
+            };
+            // The shared engine has already checked every actual byte against
+            // the immutable selection. Zero/short-error remains unresolved.
+            drained += bytes.len();
         }
         self.shadow_ack(guest, NetworkRequest::FinishRecordDrain { lease })
             .await
@@ -3406,200 +5104,33 @@ fn authenticated_stream_namespace(physical_tid: i32) -> Result<NetworkStreamName
     })
 }
 
-// Record-only namespace bootstrap. The scratch descriptor is in the recorder's
-// table, never the guest's. It is never connected, bound, or exposed to the guest.
-// A different namespace is an explicit integration failure, not host fallback.
+// Keep the live-task namespace check at the adapter boundary. Terminal recovery
+// calls the same physical observer with the original Call's held namespace.
 fn record_receive_normalization(
     physical_tid: i32,
     key: StreamSocketKeyV3,
 ) -> Result<(LinuxReceiveNormalizationV3, bool), Error> {
-    use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::MetadataExt;
-    let namespace = |path: &str| -> Result<std::fs::File, Error> {
-        std::fs::File::open(path).map_err(Error::Io)
-    };
-    let identity = |file: &std::fs::File| -> Result<(u64, u64), Error> {
-        let stat = file.metadata().map_err(Error::Io)?;
-        Ok((stat.dev(), stat.ino()))
-    };
+
     let guest_path = format!("/proc/{physical_tid}/ns/net");
-    let guest_ns = namespace(&guest_path)?;
-    let recorder_ns = namespace("/proc/thread-self/ns/net")?;
-    if identity(&guest_ns)? != identity(&recorder_ns)? {
-        return Err(engine_error(
-            "V3 profile bootstrap needs a namespace-owned helper; host defaults are not authoritative",
-        ));
-    }
-    // No await between pinning the current thread namespace and these syscalls.
-    let raw = unsafe {
-        libc::socket(
-            key.domain,
-            key.socket_type | libc::SOCK_CLOEXEC,
-            key.protocol,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: successful socket returned one uniquely owned descriptor.
-    let scratch = unsafe { OwnedFd::from_raw_fd(raw) };
-    let fd = scratch.as_raw_fd();
-    let scalar_get = |name: i32| -> Result<i32, Error> {
-        let mut value = 0i32;
-        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                name,
-                (&raw mut value).cast(),
-                &raw mut length,
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if length != std::mem::size_of::<i32>() as libc::socklen_t {
-            return Err(engine_error("profile scratch scalar size mismatch"));
-        }
-        Ok(value)
-    };
-    let scalar_set = |name: i32, value: i32| -> std::io::Result<()> {
-        let result = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                name,
-                (&raw const value).cast(),
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if result < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    };
-    let timeout_set = |seconds: i64, microseconds: i64| -> Result<(), Error> {
-        let value = libc::timeval {
-            tv_sec: seconds,
-            tv_usec: microseconds,
-        };
-        let result = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                (&raw const value).cast(),
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
-    };
-    let timeout_get = || -> Result<(i64, i64), Error> {
-        let mut value = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        };
-        let mut length = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
-        let result = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                (&raw mut value).cast(),
-                &raw mut length,
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        if length != std::mem::size_of::<libc::timeval>() as libc::socklen_t {
-            return Err(engine_error("profile scratch timeout size mismatch"));
-        }
-        Ok((value.tv_sec, value.tv_usec))
-    };
-    let read_limits = || -> Result<(u32, u32), Error> {
-        fn values(path: &str) -> Result<Vec<u32>, Error> {
-            let text = std::fs::read_to_string(path).map_err(Error::Io)?;
-            text.split_whitespace()
-                .map(|part| {
-                    part.parse::<u32>()
-                        .map_err(|error| engine_error(format!("invalid {path}: {error}")))
-                })
-                .collect()
-        }
-        let system = values("/proc/sys/net/core/rmem_max")?;
-        let namespace = values("/proc/sys/net/ipv4/tcp_rmem")?;
-        if system.len() != 1 || namespace.len() != 3 {
-            return Err(engine_error("receive buffer sysctl shape mismatch"));
-        }
-        Ok((system[0], namespace[2]))
-    };
-    let before_limits = read_limits()?;
-    timeout_set(0, 1)?;
-    let (seconds, microseconds) = timeout_get()?;
-    let hz = LinuxReceiveHzV3::from_one_microsecond_probe(seconds, microseconds)
-        .ok_or_else(|| engine_error("kernel timeout rounding is outside the audited profile"))?;
-    // This socket is private, so irreversible RCVBUF_LOCK is harmless here.
-    scalar_set(libc::SO_RCVBUF, 0).map_err(Error::Io)?;
-    let minimum_receive_buffer = u32::try_from(scalar_get(libc::SO_RCVBUF)?)
-        .map_err(|_| engine_error("negative minimum receive buffer"))?;
-    let mut normalization = LinuxReceiveNormalizationV3 {
-        hz,
-        system_rmem_max: before_limits.0,
-        namespace_tcp_rmem_max: before_limits.1,
-        minimum_receive_buffer,
-        peek_offset_set_supported: false,
-    };
-    normalization
-        .validate()
-        .map_err(|error| engine_error(format!("invalid receive profile: {error:?}")))?;
-    // Check the HZ300 integer-division boundary rather than infer a whole
-    // normalization law from only the one-microsecond witness.
-    for (seconds, microseconds) in [(0, 999_999), (-1, 0), (0, 0)] {
-        timeout_set(seconds, microseconds)?;
-        let expected = normalization
-            .normalize_timeout(seconds, microseconds)
-            .map_err(|error| engine_error(format!("timeout normalization: {error:?}")))?
-            .exposed_timeval(hz);
-        if timeout_get()? != expected {
-            return Err(engine_error("kernel timeout profile witness mismatch"));
-        }
-    }
-    let peek_offset_set_supported = match scalar_set(libc::SO_PEEK_OFF, 0) {
-        Ok(()) => {
-            if scalar_get(libc::SO_PEEK_OFF)? != 0 {
-                return Err(engine_error("scratch peek cursor mismatch"));
-            }
-            true
-        }
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EOPNOTSUPP | libc::ENOPROTOOPT)
-            ) =>
-        {
-            false
-        }
-        Err(error) => return Err(Error::Io(error)),
-    };
-    normalization.peek_offset_set_supported = peek_offset_set_supported;
-    if before_limits != read_limits()?
-        || identity(&guest_ns)? != identity(&namespace(&guest_path)?)?
-        || identity(&recorder_ns)? != identity(&namespace("/proc/thread-self/ns/net")?)?
-    {
+    let guest_namespace = std::fs::File::open(&guest_path).map_err(Error::Io)?;
+    let before = guest_namespace.metadata().map_err(Error::Io)?;
+    let profile =
+        crate::network_runtime::socket_profile::record_receive_normalization_in_namespace(
+            guest_namespace.as_fd(),
+            key,
+        )?;
+    let after = std::fs::File::open(&guest_path)
+        .map_err(Error::Io)?
+        .metadata()
+        .map_err(Error::Io)?;
+    if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
         return Err(engine_error(
             "receive profile namespace or sysctl changed during bootstrap",
         ));
     }
-    // OwnedFd drops on every success/error path. No socket network operation ran.
-    Ok((normalization, peek_offset_set_supported))
+    Ok(profile)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -3619,14 +5150,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         fd: i32,
         call: syscalls::Socket,
     ) -> Result<(), Error> {
-        if !self.shadow_mode(guest).await? {
-            return Ok(());
+        if let Some((open_file, enrollment)) = self
+            .capture_fresh_stream_socket(guest, fd, call, true)
+            .await?
+        {
+            self.register_fresh_stream_socket(
+                guest,
+                open_file.expect("existing path captured its binding"),
+                enrollment,
+            )
+            .await?;
         }
-        if !matches!(call.family(), libc::AF_INET | libc::AF_INET6)
+        Ok(())
+    }
+
+    async fn capture_original_socket_profile<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Socket,
+        observed: &crate::network_runtime::installation_observation::Checked,
+    ) -> Result<Option<FreshStreamEnrollment>, Error> {
+        if !self.shadow_mode(guest).await?
+            || !matches!(call.family(), libc::AF_INET | libc::AF_INET6)
             || call.r#type() & !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) != libc::SOCK_STREAM
             || !matches!(call.protocol(), 0 | libc::IPPROTO_TCP)
         {
-            return Ok(());
+            return Ok(None);
+        }
+        if !guest.config().backend_supports_host_socket_pin {
+            return Err(engine_error(
+                "original Socket profile lacks authenticated namespace support",
+            ));
         }
         let key = StreamSocketKeyV3 {
             transport: NetworkTransportV2::Tcp,
@@ -3634,7 +5188,77 @@ impl<T: RecordOrReplay> Detcore<T> {
             socket_type: libc::SOCK_STREAM,
             protocol: libc::IPPROTO_TCP,
         };
-        let open_file = guest.thread_state().socket_open_file_id(fd)?;
+        let namespace = authenticated_stream_namespace(guest.tid().as_raw())?;
+        if namespace.inode != observed.namespace {
+            return Err(engine_error(
+                "held original socket differs from admitted network namespace",
+            ));
+        }
+        let observed_profile = if guest.config().network_trace.policy == NetworkPolicy::Record {
+            // Existing Record-only normalization uses host-owned scratch and
+            // checks namespace/sysctl identity. It never touches guest buffers.
+            let (normalization, _) = record_receive_normalization(guest.tid().as_raw(), key)?;
+            Some(
+                observed
+                    .fresh_profile(key, normalization)
+                    .map_err(Error::Io)?,
+            )
+        } else {
+            None
+        };
+        if namespace != authenticated_stream_namespace(guest.tid().as_raw())? {
+            return Err(engine_error(
+                "original Socket namespace changed during normalization",
+            ));
+        }
+        if self.accepted_model_mode(guest).await? {
+            self.shadow_ack(
+                guest,
+                NetworkRequest::RegisterAcceptedFreshSend {
+                    key,
+                    observed: observed_profile
+                        .as_ref()
+                        .map(|_| ReceiveTimeoutV3::Infinite),
+                },
+            )
+            .await?;
+        }
+        Ok(Some(FreshStreamEnrollment {
+            key,
+            namespace,
+            observed_profile,
+        }))
+    }
+
+    async fn capture_fresh_stream_socket<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        call: syscalls::Socket,
+        existing_local: bool,
+    ) -> Result<Option<(Option<OpenFileId>, FreshStreamEnrollment)>, Error> {
+        if !self.shadow_mode(guest).await? {
+            return Ok(None);
+        }
+        if !matches!(call.family(), libc::AF_INET | libc::AF_INET6)
+            || call.r#type() & !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC) != libc::SOCK_STREAM
+            || !matches!(call.protocol(), 0 | libc::IPPROTO_TCP)
+        {
+            return Ok(None);
+        }
+        let key = StreamSocketKeyV3 {
+            transport: NetworkTransportV2::Tcp,
+            domain: call.family(),
+            socket_type: libc::SOCK_STREAM,
+            protocol: libc::IPPROTO_TCP,
+        };
+        // Preserve the ordinary path's original lookup/copy order. Original
+        // Socket uses capture_original_socket_profile with its held observation.
+        let open_file = if existing_local {
+            Some(guest.thread_state().socket_open_file_id(fd)?)
+        } else {
+            None
+        };
         if !guest.config().backend_supports_host_socket_pin {
             return Err(engine_error(
                 "selected backend has no authenticated socket-namespace implementation",
@@ -3718,6 +5342,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
         }
+        Ok(Some((
+            open_file,
+            FreshStreamEnrollment {
+                key,
+                namespace,
+                observed_profile,
+            },
+        )))
+    }
+
+    async fn register_fresh_stream_socket<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file: OpenFileId,
+        enrollment: FreshStreamEnrollment,
+    ) -> Result<(), Error> {
+        let FreshStreamEnrollment {
+            key,
+            namespace,
+            observed_profile,
+        } = enrollment;
         match network_request(
             guest,
             NetworkRequest::RegisterStreamSocket {
@@ -3737,6 +5382,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 }
+
+use crate::network_replay::original_installation::FreshStreamEnrollment;
 
 async fn read_socket_timeval<G, T>(guest: &mut G, fd: i32, name: i32) -> Result<(i64, i64), Error>
 where
@@ -4431,6 +6078,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         let pin = self
             .begin_host_stream_call(guest, fd, open_file, request.policy)
             .await?;
+        self.shadow_stream_receive_with_pin(guest, pin, request)
+            .await
+    }
+
+    async fn shadow_stream_receive_with_pin<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pin: NetworkHostSocketPin,
+        request: NetworkReceiveContext<'_>,
+    ) -> Result<i64, Error> {
         let mut zero_wait = NetworkZeroReceiveWait::default();
         let result = async {
             // Snapshot timeout/low-water at admitted-call linearization, after
@@ -4814,6 +6471,42 @@ impl<T: RecordOrReplay> Detcore<T> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// One scan lookup. Copying the poll/select input happens before entry;
+    /// neither this short admission nor capture spans guest-memory access.
+    async fn admit_shadow_poll_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        policy: NetworkPolicy,
+    ) -> Result<Option<NetworkHostSocketPin>, Error> {
+        self.check_host_stream_capture(guest, policy)?;
+        let read = self.begin_network_fd_read(guest, fd).await?;
+        let observed = {
+            let table = guest.thread_state().file_metadata.clone();
+            let observed = table.lock().unwrap().observe_fd_read(&read);
+            observed
+        };
+        match observed {
+            Ok(observed) if observed.socket.is_some() => self
+                .capture_admitted_host_stream_call(guest, read, observed)
+                .await
+                .map(Some),
+            observed => {
+                let result = match observed {
+                    Ok(observed) if observed.binding.is_none() => Ok(None),
+                    Ok(_) => Err(engine_error(
+                        "mixed network and non-network poll sets are not replayable",
+                    )),
+                    Err(error) => Err(error),
+                };
+                let cleanup = self
+                    .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+                    .await;
+                finish_shadow_operation(result, cleanup)
+            }
+        }
+    }
+
     // Caller preserves the existing poll/select ABI copying and timeout fields.
     async fn shadow_poll_fds<G: Guest<Self>>(
         &self,
@@ -4839,33 +6532,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if pollfd.fd < 0 {
                         continue;
                     }
-                    let Some(open_file) = self.network_open_file(guest, pollfd.fd) else {
-                        if guest.thread_state().with_detfd(pollfd.fd, |_| ()).is_ok() {
-                            return Err(engine_error(
-                                "mixed network and non-network poll sets are not replayable",
-                            ));
-                        }
-                        pollfd.revents = libc::POLLNVAL;
-                        ready = true;
-                        continue;
-                    };
-                    let Some(state) = self.shadow_socket_state(guest, open_file).await? else {
-                        return Err(engine_error(
-                            "V3 poll needs the separate legacy-socket composition path",
-                        ));
-                    };
-                    // Reuse one per-call file reference for repeated pollfd
-                    // entries, while preserving each input row and its mask.
+                    // Repeated rows retain the existing scan reference, but
+                    // never combine it with metadata from a reused numeric FD.
                     let at = if let Some(at) = pins.iter().position(|(fd, _)| *fd == pollfd.fd) {
                         at
                     } else {
-                        let pin = self
-                            .begin_host_stream_call(guest, pollfd.fd, open_file, policy)
-                            .await?;
+                        let Some(pin) = self.admit_shadow_poll_fd(guest, pollfd.fd, policy).await?
+                        else {
+                            pollfd.revents = libc::POLLNVAL;
+                            ready = true;
+                            continue;
+                        };
                         pins.push((pollfd.fd, pin));
                         pins.len() - 1
                     };
                     let pin = &pins[at].1;
+                    let state = self.shadow_call_socket_state(guest, pin.call).await?;
                     let before = self.shadow_queue_status(guest, pin.call).await?;
                     if policy == NetworkPolicy::Record && !before.listener {
                         // CompleteShadowProbe atomically journals its confirmed
@@ -5089,6 +6771,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn negative_poll_timeouts_match_linux_without_a_deadline() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"x").unwrap();
+        for timeout in [-1, -2, i32::MIN] {
+            let mut descriptor = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Keep the witness ready, so the native infinite wait is bounded
+            // by a queued byte. poll does not consume it between cases.
+            assert_eq!(unsafe { libc::poll(&mut descriptor, 1, timeout) }, 1);
+            assert_eq!(descriptor.revents, libc::POLLIN);
+            assert_eq!(poll_timeout_duration(timeout), None);
+        }
+        assert_eq!(poll_timeout_duration(0), Some(Duration::ZERO));
+        assert_eq!(poll_timeout_duration(1), Some(Duration::from_millis(1)));
+        assert_eq!(
+            poll_timeout_duration(i32::MAX),
+            Some(Duration::from_millis(i32::MAX as u64)),
+        );
+    }
 
     #[test]
     fn stream_transport_requires_exact_domain_type_and_protocol() {
@@ -5586,6 +7296,1697 @@ mod accepted_flags_tests {
                 socket_type & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK),
                 valid
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod original_file_delegate_error_tests {
+    use std::future::Future;
+    use std::sync::Mutex;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Never;
+    use reverie::Tid;
+    use reverie::TimerSchedule;
+    use reverie::Tool;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::Sysno;
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use super::*;
+    use crate::Config;
+    use crate::network_replay::original_connect::Arguments;
+    use crate::network_replay::original_connect::FileOperation;
+    use crate::network_replay::original_connect::Kind;
+    use crate::network_replay::original_connect::Local;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::tool_global::GlobalState;
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct FailingDelegate;
+    #[reverie::tool]
+    impl Tool for FailingDelegate {
+        type GlobalState = GlobalState;
+        type ThreadState = usize;
+        async fn handle_syscall_event<G: Guest<Self>>(
+            &self,
+            guest: &mut G,
+            call: Syscall,
+        ) -> Result<i64, Error> {
+            assert!(matches!(call, Syscall::Fcntl(c)
+                if matches!(c.cmd(), syscalls::FcntlCmd::F_GETFL)));
+            let mode = *guest.thread_state();
+            *guest.thread_state_mut() += 1;
+            match mode {
+                0 => Err(Error::Tool(anyhow::anyhow!("exact delegate tool failure"))),
+                2 => Err(Error::Io(std::io::Error::other(
+                    "exact delegate IO failure",
+                ))),
+                _ => panic!("delegate called more than once"),
+            }
+        }
+    }
+    impl RecordOrReplay for FailingDelegate {
+        fn original_file_execution(&self, call: Syscall) -> crate::OriginalFileExecution {
+            if matches!(call, Syscall::Openat(_)) {
+                crate::OriginalFileExecution::Recorded
+            } else {
+                crate::OriginalFileExecution::Native
+            }
+        }
+        async fn invoke_original_read<G: Guest<Self>>(
+            &self,
+            _guest: &mut G,
+            _call: reverie::syscalls::Read,
+        ) -> Result<reverie::InjectedReadResult, Error> {
+            panic!("the failing F_GETFL fixture must not invoke a native Read")
+        }
+    }
+
+    struct NoStack;
+    struct NoStackGuard;
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+    impl Stack for NoStack {
+        type StackGuard = NoStackGuard;
+        fn size(&self) -> usize {
+            panic!("unexpected stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("unexpected stack")
+        }
+        fn push<'s, V>(&mut self, _: V) -> Addr<'s, V> {
+            panic!("unexpected stack")
+        }
+        fn reserve<'s, V>(&mut self) -> AddrMut<'s, V> {
+            panic!("unexpected stack")
+        }
+        fn commit(self) -> Result<NoStackGuard, Errno> {
+            panic!("unexpected stack")
+        }
+    }
+    // Batch traffic must not fall through to the per-thread recorder/replayer
+    // while the shared message engine lacks its typed partial-batch contract.
+    // The strict Guest panics on memory access, injection, clock, or RPC. The
+    // queued native byte witnesses that refusing the batch has no data effect.
+    #[tokio::test]
+    async fn unsupported_socket_batches_stay_in_shared_dispatch_without_native_effects() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        for policy in [NetworkPolicy::Record, NetworkPolicy::Replay] {
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(b"preserved").unwrap();
+            let mut config = Config::default();
+            config.network_trace.policy = policy;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            thread
+                .add_fd(socket.as_raw_fd(), OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let mut guest = DelegateGuest {
+                config: &config,
+                thread,
+                requests: Mutex::new(vec![]),
+            };
+            let mut payload = [0xabu8; 9];
+            let mut iov = libc::iovec {
+                iov_base: payload.as_mut_ptr().cast(),
+                iov_len: payload.len(),
+            };
+            let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            message.msg_hdr.msg_iov = &raw mut iov;
+            message.msg_hdr.msg_iovlen = 1;
+            message.msg_len = u32::MAX;
+            let receive: Syscall = syscalls::Recvmmsg::new()
+                .with_fd(socket.as_raw_fd())
+                .with_mmsg(AddrMut::from_raw((&raw mut message) as usize))
+                .with_vlen(1)
+                .with_flags(libc::MSG_DONTWAIT as u32)
+                .into();
+            let send: Syscall = syscalls::Sendmmsg::new()
+                .with_sockfd(socket.as_raw_fd())
+                .with_msgvec(Addr::from_raw((&raw const message) as usize))
+                .with_vlen(1)
+                .with_flags(libc::MSG_DONTWAIT)
+                .into();
+            for call in [receive, send] {
+                assert!(tool.network_io_owns(&mut guest, call));
+                let result = tool
+                    .try_handle_network_io(&mut guest, call)
+                    .await
+                    .expect("socket batch must remain owned by shared adapter");
+                assert!(matches!(&result, Err(Error::Tool(_))));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("batch and ancillary capture is not yet implemented")
+                );
+            }
+            assert_eq!(
+                *guest.thread.as_ref(),
+                0,
+                "ordinary delegate was not called"
+            );
+            assert!(guest.requests.lock().unwrap().is_empty());
+            assert!(guest.thread.original_connect.is_none());
+            assert_eq!(payload, [0xab; 9]);
+            assert_eq!(message.msg_len, u32::MAX);
+            let mut peer_available = -1;
+            assert_eq!(
+                unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &mut peer_available) },
+                0
+            );
+            assert_eq!(peer_available, 0, "refused send batch emitted no bytes");
+            // The exact nonempty header is a valid native receive, not a
+            // zero-vlen/null-pointer fixture that would have no data effect.
+            assert_eq!(
+                unsafe {
+                    libc::recvmmsg(
+                        socket.as_raw_fd(),
+                        &raw mut message,
+                        1,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                    )
+                },
+                1
+            );
+            assert_eq!(message.msg_len, 9);
+            assert_eq!(&payload, b"preserved");
+            assert_eq!(
+                unsafe {
+                    libc::sendmmsg(socket.as_raw_fd(), &raw mut message, 1, libc::MSG_DONTWAIT)
+                },
+                1
+            );
+            assert_eq!(message.msg_len, 9);
+            let mut echoed = [0; 9];
+            peer.read_exact(&mut echoed).unwrap();
+            assert_eq!(&echoed, b"preserved");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_boundary_does_not_reclassify_non_socket_or_explicit_live_policy() {
+        for policy in [
+            NetworkPolicy::Record,
+            NetworkPolicy::Replay,
+            NetworkPolicy::Deny,
+            NetworkPolicy::UnsafeLive,
+        ] {
+            let mut config = Config::default();
+            config.network_trace.policy = policy;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            thread
+                .add_fd(77, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let mut guest = DelegateGuest {
+                config: &config,
+                thread,
+                requests: Mutex::new(vec![]),
+            };
+            for fd in [77, 78] {
+                if fd == 77 && matches!(policy, NetworkPolicy::Record | NetworkPolicy::Replay) {
+                    continue;
+                }
+                for call in [
+                    Syscall::from(syscalls::Recvmmsg::new().with_fd(fd)),
+                    Syscall::from(syscalls::Sendmmsg::new().with_sockfd(fd)),
+                ] {
+                    assert!(!tool.network_io_owns(&mut guest, call));
+                    assert!(tool.try_handle_network_io(&mut guest, call).await.is_none());
+                }
+            }
+            assert!(guest.requests.lock().unwrap().is_empty());
+            assert_eq!(*guest.thread.as_ref(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_output_without_native_receipts_refuses_before_memory_or_native_effects() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut config = Config::default();
+        config.network_trace.policy = NetworkPolicy::Record;
+        let tid = Tid::from_raw(73);
+        let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+        let mut thread = tool.init_thread_state(tid, None);
+        thread
+            .add_fd(socket.as_raw_fd(), OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let mut guest = DelegateGuest {
+            config: &config,
+            thread,
+            requests: Mutex::new(vec![]),
+        };
+        let payload = *b"exact native output";
+        let iov = libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        };
+        let fd = socket.as_raw_fd() as usize;
+        let calls = [
+            (Sysno::write, payload.as_ptr() as usize, payload.len()),
+            (Sysno::writev, (&raw const iov) as usize, 1),
+            (Sysno::sendto, payload.as_ptr() as usize, payload.len()),
+        ];
+        for (number, address, count) in calls {
+            for (address, count) in [(address, count), (0, 0), (0, 1)] {
+                let call = Syscall::from_raw(
+                    number,
+                    syscalls::SyscallArgs::new(fd, address, count, 0, 0, 0),
+                );
+                assert!(tool.network_io_owns(&mut guest, call));
+                let result = tool
+                    .try_handle_network_io(&mut guest, call)
+                    .await
+                    .expect("unqualified output must remain owned by the shared adapter");
+                let Err(Error::Tool(error)) = result else {
+                    panic!("output refusal changed type")
+                };
+                assert_eq!(
+                    error.to_string(),
+                    "shared network engine refused operation: Record network output requires authenticated native transmission receipts"
+                );
+            }
+        }
+        assert_eq!(
+            *guest.thread.as_ref(),
+            0,
+            "ordinary delegate was not called"
+        );
+        assert!(guest.requests.lock().unwrap().is_empty());
+        assert!(guest.thread.original_connect.is_none());
+        let mut available = -1;
+        assert_eq!(
+            unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &mut available) },
+            0
+        );
+        assert_eq!(available, 0, "refused output emitted no bytes");
+        // The exact nonempty operands are real native output, not inert shapes.
+        for (number, address, count) in calls {
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        number as libc::c_long,
+                        fd,
+                        address,
+                        count,
+                        0usize,
+                        0usize,
+                        0usize,
+                    )
+                },
+                payload.len() as libc::c_long
+            );
+            let mut observed = [0; 19];
+            peer.read_exact(&mut observed).unwrap();
+            assert_eq!(observed, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_output_refusal_preserves_non_socket_and_explicit_live_dispatch() {
+        for policy in [
+            NetworkPolicy::Record,
+            NetworkPolicy::Replay,
+            NetworkPolicy::Deny,
+            NetworkPolicy::UnsafeLive,
+        ] {
+            let mut config = Config::default();
+            config.network_trace.policy = policy;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            thread
+                .add_fd(77, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let mut guest = DelegateGuest {
+                config: &config,
+                thread,
+                requests: Mutex::new(vec![]),
+            };
+            for fd in [libc::STDOUT_FILENO, 78, 77] {
+                if fd == 77 && matches!(policy, NetworkPolicy::Record | NetworkPolicy::Replay) {
+                    continue;
+                }
+                for number in [Sysno::write, Sysno::writev, Sysno::sendto] {
+                    let call = Syscall::from_raw(
+                        number,
+                        syscalls::SyscallArgs::new(fd as usize, 0, 1, 0, 0, 0),
+                    );
+                    assert!(!tool.network_io_owns(&mut guest, call));
+                    assert!(tool.try_handle_network_io(&mut guest, call).await.is_none());
+                }
+            }
+            assert!(guest.requests.lock().unwrap().is_empty());
+            assert_eq!(*guest.thread.as_ref(), 0);
+        }
+    }
+
+    // Explicit boundary inputs exercise the actual direct/owned adapter paths.
+    // These do not manufacture a provider receipt or claim a qualified V3 state.
+    struct CaptureGuardGuest<'a> {
+        config: &'a Config,
+        thread: crate::ThreadState<usize>,
+        admitted: Option<crate::network_replay::NetworkFdReadAdmission>,
+        state_query: bool,
+        cleanup_failure: bool,
+        events: Mutex<Vec<&'static str>>,
+    }
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for CaptureGuardGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let mut events = self.events.lock().unwrap();
+            let reply = match request.2 {
+                GlobalRequest::Network(NetworkRequest::StreamSocketState { open_file }) => {
+                    assert!(self.state_query);
+                    assert!(events.is_empty());
+                    let read = self.admitted.as_ref().expect("owned read fixture");
+                    assert_eq!(
+                        Some(open_file),
+                        read.binding.map(|binding| binding.open_file)
+                    );
+                    events.push("state");
+                    Ok(NetworkReply::StreamSocketState(Some(
+                        NetworkStreamSocketState {
+                            key: StreamSocketKeyV3 {
+                                transport: NetworkTransportV2::UnixStream,
+                                domain: libc::AF_UNIX,
+                                socket_type: libc::SOCK_STREAM,
+                                protocol: 0,
+                            },
+                            normalization: LinuxReceiveNormalizationV3 {
+                                hz: LinuxReceiveHzV3::Hz1000,
+                                peek_offset_set_supported: true,
+                                system_rmem_max: 212992,
+                                namespace_tcp_rmem_max: 6291456,
+                                minimum_receive_buffer: 2304,
+                            },
+                            options: StreamSocketOptionsV3 {
+                                peek_offset: Some(-1),
+                                receive_low_water: 1,
+                                receive_timeout: ReceiveTimeoutV3::Infinite,
+                                receive_buffer: ReceiveBufferStateV3 {
+                                    bytes: 212992,
+                                    user_locked: false,
+                                    tcp_scaling_ratio: 128,
+                                },
+                            },
+                            consume_epoch: 0,
+                            send_timeout: None,
+                            option_generation: 0,
+                        },
+                    )))
+                }
+                GlobalRequest::Network(NetworkRequest::FinishFdRead { admission }) => {
+                    assert_eq!(Some(&admission), self.admitted.as_ref());
+                    assert_eq!(
+                        events.as_slice(),
+                        if self.state_query {
+                            &["state"][..]
+                        } else {
+                            &[]
+                        }
+                    );
+                    events.push("finish");
+                    if self.cleanup_failure {
+                        Err(NetworkRpcError::internal(
+                            "controlled exact admission cleanup failure",
+                        ))
+                    } else {
+                        Ok(NetworkReply::Unit)
+                    }
+                }
+                other => panic!(
+                    "unqualified capture must not obtain a Call, touch ingress or wait: {other:?}"
+                ),
+            };
+            (None, GlobalResponse::Network(reply))
+        }
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+    #[reverie::tool]
+    impl Guest<Detcore<FailingDelegate>> for CaptureGuardGuest<'_> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+        fn tid(&self) -> Tid {
+            Tid::from_raw(self.thread.dettid.as_raw())
+        }
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            panic!("unqualified capture accessed payload memory")
+        }
+        fn thread_state(&self) -> &crate::ThreadState<usize> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<usize> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("unexpected regs")
+        }
+        async fn stack(&mut self) -> NoStack {
+            panic!("unexpected stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("unexpected daemonization")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+            panic!("unqualified capture invoked native receive")
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+            panic!("unexpected tail injection")
+        }
+        fn set_timer(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("unqualified capture observed ingress time")
+        }
+    }
+
+    #[tokio::test]
+    async fn record_host_capture_refuses_missing_layout_authority_before_admission() {
+        for (pin, tracking, detail) in [
+            (
+                false,
+                false,
+                "selected backend has no authenticated host socket-pin implementation",
+            ),
+            (
+                true,
+                false,
+                "native stream capture lacks complete backend FD-table admission",
+            ),
+            (
+                true,
+                true,
+                "Record host stream capture requires authenticated current-layout and copy authority",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.network_trace.policy = NetworkPolicy::Record;
+            config.backend_supports_host_socket_pin = pin;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            if tracking {
+                thread.file_metadata = std::sync::Arc::new(Mutex::new(
+                    crate::tool_local::FileMetadata::empty_network_fixture(thread.dettid),
+                ));
+            }
+            thread
+                .add_fd(77, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let open_file = thread.socket_open_file_id(77).unwrap();
+            let mut guest = CaptureGuardGuest {
+                config: &config,
+                thread,
+                admitted: None,
+                state_query: false,
+                cleanup_failure: false,
+                events: Mutex::new(Vec::new()),
+            };
+            let Err(Error::Tool(error)) = tool
+                .begin_host_stream_call(&mut guest, 77, open_file, NetworkPolicy::Record)
+                .await
+            else {
+                panic!("unqualified host capture did not refuse before admission")
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("shared network engine refused operation: {detail}")
+            );
+            assert!(guest.events.lock().unwrap().is_empty());
+            assert_eq!(*guest.thread.as_ref(), 0);
+            assert!(guest.thread.original_connect.is_none());
+            if tracking {
+                // This narrow guard does not grant Replay fidelity; its prior
+                // pin/census-only check is unchanged and still separate work.
+                tool.check_host_stream_capture(&guest, NetworkPolicy::Replay)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn record_owned_capture_refuses_and_releases_exact_read_without_touching_ingress() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        use crate::network_replay::NetworkFdPublicationAdmission;
+        use crate::network_replay::NetworkFdPublicationPermit;
+        use crate::network_replay::NetworkFdReadAdmission;
+        use crate::network_replay::NetworkStreamOwner;
+        for through_read in [false, true] {
+            for cleanup_failure in [false, true] {
+                let (mut endpoint, mut peer) = UnixStream::pair().unwrap();
+                peer.write_all(b"retained").unwrap();
+                let mut destination = [0xa5; 8];
+                let mut config = Config::default();
+                config.network_trace.policy = NetworkPolicy::Record;
+                config.backend_supports_host_socket_pin = true;
+                let tid = Tid::from_raw(73);
+                let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+                let mut thread = tool.init_thread_state(tid, None);
+                thread.file_metadata = std::sync::Arc::new(Mutex::new(
+                    crate::tool_local::FileMetadata::empty_network_fixture(thread.dettid),
+                ));
+                thread
+                    .add_fd(endpoint.as_raw_fd(), OFlag::empty(), FdType::Socket, None)
+                    .unwrap();
+                let owner = NetworkStreamOwner {
+                    thread: thread.dettid,
+                    mm: thread.mm_id,
+                };
+                let (read, metadata) = {
+                    let table = thread.file_metadata.lock().unwrap();
+                    let binding = table.descriptor_binding(endpoint.as_raw_fd()).unwrap();
+                    let read = NetworkFdReadAdmission {
+                        publication: NetworkFdPublicationAdmission {
+                            permit: NetworkFdPublicationPermit {
+                                files: table.files_id,
+                                owner,
+                                lease: NetworkStreamLeaseId::controlled_fixture(1),
+                            },
+                            acknowledged_sequence: 0,
+                            acknowledged_generation: 0,
+                            recovery: None,
+                        },
+                        fd: endpoint.as_raw_fd(),
+                        binding: Some(binding),
+                        control: Some(NetworkStreamLeaseId::controlled_fixture(2)),
+                        external_grant: None,
+                    };
+                    let metadata = crate::tool_local::NetworkFdReadMetadata {
+                        binding: Some(binding),
+                        socket: Some(binding.open_file),
+                        nonblocking: Some(false),
+                    };
+                    (read, metadata)
+                };
+                let mut guest = CaptureGuardGuest {
+                    config: &config,
+                    thread,
+                    admitted: Some(read.clone()),
+                    state_query: through_read,
+                    cleanup_failure,
+                    events: Mutex::new(Vec::new()),
+                };
+                let result = if through_read {
+                    let call = syscalls::Read::new()
+                        .with_fd(endpoint.as_raw_fd())
+                        .with_buf(AddrMut::from_ptr(destination.as_mut_ptr()))
+                        .with_len(destination.len());
+                    tool.network_read_from_admission(
+                        &mut guest,
+                        call,
+                        NetworkPolicy::Record,
+                        read,
+                        metadata,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    tool.capture_admitted_host_stream_call(&mut guest, read, metadata)
+                        .await
+                        .map(|_| ())
+                };
+                let Err(Error::Tool(error)) = result else {
+                    panic!("capture refusal changed type")
+                };
+                let primary = "shared network engine refused operation: Record host stream capture requires authenticated current-layout and copy authority";
+                if cleanup_failure {
+                    let chain = format!("{error:#}");
+                    assert!(chain.contains(primary));
+                    assert!(chain.contains("controlled exact admission cleanup failure"));
+                    assert!(chain.contains("secondary network cleanup failure"));
+                } else {
+                    assert_eq!(error.to_string(), primary);
+                }
+                assert_eq!(
+                    guest.events.lock().unwrap().as_slice(),
+                    if through_read {
+                        &["state", "finish"][..]
+                    } else {
+                        &["finish"][..]
+                    }
+                );
+                assert_eq!(*guest.thread.as_ref(), 0);
+                assert!(guest.thread.original_connect.is_none());
+                assert!(guest.thread.original_file_metadata.is_none());
+                assert_eq!(destination, [0xa5; 8]);
+                let mut available = -1;
+                assert_eq!(
+                    unsafe { libc::ioctl(endpoint.as_raw_fd(), libc::FIONREAD, &mut available) },
+                    0
+                );
+                assert_eq!(available, 8);
+                endpoint.read_exact(&mut destination).unwrap();
+                assert_eq!(&destination, b"retained");
+            }
+        }
+    }
+
+    struct DelegateGuest<'a> {
+        config: &'a Config,
+        thread: crate::ThreadState<usize>,
+        requests: Mutex<Vec<GlobalRequest>>,
+    }
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for DelegateGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            assert!(matches!(
+                &request.2,
+                GlobalRequest::Network(NetworkRequest::NativeOriginalConnectFailed { .. })
+            ));
+            self.requests.lock().unwrap().push(request.2.clone());
+            (None, GlobalResponse::Network(Ok(NetworkReply::Unit)))
+        }
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+    #[reverie::tool]
+    impl Guest<Detcore<FailingDelegate>> for DelegateGuest<'_> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+        fn tid(&self) -> Tid {
+            Tid::from_raw(self.thread.dettid.as_raw())
+        }
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            panic!("unexpected memory")
+        }
+        fn thread_state(&self) -> &crate::ThreadState<usize> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<usize> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("unexpected regs")
+        }
+        async fn stack(&mut self) -> NoStack {
+            panic!("unexpected stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("unexpected daemonization")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+            panic!("a delegate failure must not manufacture physical invocation")
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+            panic!("unexpected tail injection")
+        }
+        fn set_timer(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("unexpected clock")
+        }
+    }
+
+    // This exercises the real delegate/lossless-helper and failure-fence
+    // boundaries, not unreachable Native admission. Local is explicit setup;
+    // no capability, Call, Prepared, Returned, provider or final-wait receipt is
+    // created. RPC ACK is explicit boundary input; this checks the actual
+    // failure request and pending custody, not scheduler final cleanup. The
+    // production None gate remains untouched.
+    #[tokio::test]
+    async fn original_file_delegate_tool_and_io_errors_reach_retained_failure_fence_unchanged() {
+        for sequential in [true, false] {
+            for (mode, expected) in [
+                (0, "exact delegate tool failure"),
+                (2, "exact delegate IO failure"),
+            ] {
+                let config = Config {
+                    sequentialize_threads: sequential,
+                    ..Config::default()
+                };
+                let tid = Tid::from_raw(73);
+                let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+                let mut thread = tool.init_thread_state(tid, None);
+                *thread.as_mut() = mode;
+                let call = syscalls::Fcntl::new()
+                    .with_fd(7)
+                    .with_cmd(syscalls::FcntlCmd::F_GETFL);
+                let operation = FileOperation::GetFlags;
+                let local = Local {
+                    arguments: Arguments {
+                        kind: Kind::File(operation),
+                        operation: ExternalOpId::new(thread.dettid, thread.stats.syscall_count),
+                        files: thread.file_metadata.lock().unwrap().files_id,
+                        binding: None,
+                        fd: 7,
+                        address: operation.syscall() as u64,
+                        length: operation.command(),
+                        original_count: 0,
+                    },
+                    raw_arguments: [7, libc::F_GETFL as usize, 0, 0, 0, 0],
+                    admission: None,
+                    invoked: false,
+                    returned: None,
+                };
+                thread.original_connect = Some(local.clone());
+                let mut guest = DelegateGuest {
+                    config: &config,
+                    thread,
+                    requests: Mutex::new(vec![]),
+                };
+                assert!(crate::network_replay::backend_fd_table_capability(&config).is_none());
+                let result = tool
+                    .record_or_replay_preserving_tool_errors(&mut guest, call)
+                    .await;
+                assert_eq!(result.as_ref().unwrap_err().to_string(), expected);
+                assert!(matches!(
+                    (&result, mode),
+                    (Err(Error::Tool(_)), 0) | (Err(Error::Io(_)), 2)
+                ));
+                assert_eq!(*guest.thread.as_ref(), mode + 1);
+                assert!(guest.requests.lock().unwrap().is_empty());
+                let mut fence = Box::pin(tool.finish_original_invocation(&mut guest, result));
+                let waker = futures::task::noop_waker();
+                assert!(
+                    fence
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&waker))
+                        .is_pending()
+                );
+                drop(fence);
+                let requests = guest.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(matches!(&requests[0], GlobalRequest::Network(
+                    NetworkRequest::NativeOriginalConnectFailed { local: actual, detail })
+                    if actual == &local && detail == expected));
+                assert_eq!(guest.thread.original_connect.as_ref(), Some(&local));
+                assert!(guest.thread.original_file_metadata.is_none());
+            }
+        }
+    }
+
+    // The actual CLI Replayer classification is checked in its own module.
+    // Here the real adapter must reject that declaration before creating Local
+    // custody, contacting the provider, or calling a delegate that can create a
+    // placeholder. No backend admission is fabricated by this boundary test.
+    #[tokio::test]
+    async fn recorded_openat_refuses_before_local_call_or_provider_enrollment() {
+        for policy in [NetworkPolicy::Record, NetworkPolicy::Replay] {
+            for sequential in [true, false] {
+                let mut config = Config {
+                    sequentialize_threads: sequential,
+                    ..Config::default()
+                };
+                config.network_trace.policy = policy;
+                let tid = Tid::from_raw(73);
+                let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+                let thread = tool.init_thread_state(tid, None);
+                let mut guest = DelegateGuest {
+                    config: &config,
+                    thread,
+                    requests: Mutex::new(vec![]),
+                };
+                let result = tool
+                    .network_original_openat(&mut guest, syscalls::Openat::new())
+                    .await;
+                assert!(matches!(&result, Err(Error::Tool(_))));
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "shared network engine refused operation: original Openat admission requires the actual native allocator"
+                );
+                assert!(guest.thread.original_connect.is_none());
+                assert!(guest.thread.original_file_metadata.is_none());
+                assert!(guest.requests.lock().unwrap().is_empty());
+                assert_eq!(*guest.thread.as_ref(), 0, "delegate was never invoked");
+            }
+        }
+    }
+
+    struct ZeroReadGuest<'a> {
+        config: &'a Config,
+        thread: crate::ThreadState<usize>,
+        calls: usize,
+        admitted: Option<Mutex<ZeroReadAdmissionBoundary>>,
+    }
+    // Explicit adapter boundary inputs, not a provider-issued admission or
+    // physical selection receipt. The real host Read supplies only its result.
+    struct ZeroReadAdmissionBoundary {
+        read: crate::network_replay::NetworkFdReadAdmission,
+        admission: Option<crate::network_replay::original_connect::Admission>,
+        events: Vec<&'static str>,
+        returned: Option<i64>,
+    }
+    fn native_zero_read(call: syscalls::Read) -> Result<i64, Errno> {
+        assert_eq!(call.len(), 0);
+        let result = unsafe {
+            libc::read(
+                call.fd(),
+                call.buf()
+                    .map_or(std::ptr::null_mut(), |p| p.as_raw() as *mut libc::c_void),
+                0,
+            )
+        };
+        if result < 0 {
+            Err(Errno::new(
+                std::io::Error::last_os_error().raw_os_error().unwrap(),
+            ))
+        } else {
+            Ok(result as i64)
+        }
+    }
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ZeroReadGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let Some(boundary) = &self.admitted else {
+                panic!(
+                    "local zero-Read validation must not publish or release network ingress: {:?}",
+                    request.2
+                )
+            };
+            let mut boundary = boundary.lock().unwrap();
+            let local = self
+                .thread
+                .original_connect
+                .as_ref()
+                .expect("Local precedes admission RPC");
+            let reply = match request.2 {
+                GlobalRequest::Network(NetworkRequest::BeginOriginalFileFromRead {
+                    arguments,
+                    read,
+                    source,
+                }) => {
+                    assert!(boundary.events.is_empty());
+                    assert_eq!(source, crate::OriginalFileExecution::Native);
+                    assert_eq!(read, boundary.read);
+                    assert_eq!(arguments, local.arguments);
+                    assert_eq!(arguments.kind, Kind::Read);
+                    assert_eq!(arguments.files, read.publication.permit.files);
+                    assert_eq!(arguments.fd, read.fd);
+                    assert_eq!(arguments.binding, read.binding);
+                    assert_eq!(arguments.address, local.raw_arguments[1] as u64);
+                    assert_eq!(arguments.original_count, 0);
+                    assert!(
+                        !local.invoked && local.returned.is_none() && local.admission.is_none()
+                    );
+                    let admission = crate::network_replay::original_connect::Admission {
+                        call: crate::network_replay::NetworkStreamCallId::controlled_fixture(1),
+                        arguments,
+                    };
+                    boundary.admission = Some(admission.clone());
+                    boundary.events.push("begin-native");
+                    NetworkReply::OriginalConnectAdmission(admission)
+                }
+                GlobalRequest::Network(NetworkRequest::NativeSubmitOriginalConnect {
+                    admission,
+                }) => {
+                    assert_eq!(boundary.events, ["begin-native"]);
+                    assert_eq!(boundary.admission.as_ref(), Some(&admission));
+                    assert_eq!(local.admission.as_ref(), Some(&admission));
+                    assert!(!local.invoked && local.returned.is_none());
+                    boundary.events.push("submit");
+                    NetworkReply::Unit
+                }
+                GlobalRequest::Network(NetworkRequest::NativeOriginalConnectOutcome {
+                    admission,
+                }) => {
+                    assert_eq!(
+                        boundary.events,
+                        ["begin-native", "submit", "typed-native-read"]
+                    );
+                    assert_eq!(boundary.admission.as_ref(), Some(&admission));
+                    assert_eq!(local.admission.as_ref(), Some(&admission));
+                    assert!(local.invoked);
+                    let returned = boundary.returned.expect("native Read completed");
+                    assert_eq!(local.returned, Some(returned));
+                    boundary.events.push("outcome");
+                    NetworkReply::OriginalConnectOutcome(
+                        crate::network_runtime::original_connect::Outcome {
+                            admission,
+                            returned,
+                            pin: None,
+                            address: None,
+                            socket: None,
+                            read_copy: None,
+                        },
+                    )
+                }
+                GlobalRequest::Network(NetworkRequest::NativeRetireOriginalConnect {
+                    admission,
+                }) => {
+                    assert_eq!(
+                        boundary.events,
+                        ["begin-native", "submit", "typed-native-read", "outcome"]
+                    );
+                    assert_eq!(boundary.admission.as_ref(), Some(&admission));
+                    assert_eq!(local.admission.as_ref(), Some(&admission));
+                    assert_eq!(local.returned, boundary.returned);
+                    boundary.events.push("retire");
+                    NetworkReply::Unit
+                }
+                other => panic!(
+                    "zero Read must not release, emulate or publish network ingress: {other:?}"
+                ),
+            };
+            (None, GlobalResponse::Network(Ok(reply)))
+        }
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+    #[reverie::tool]
+    impl Guest<Detcore<FailingDelegate>> for ZeroReadGuest<'_> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+        fn tid(&self) -> Tid {
+            Tid::from_raw(self.thread.dettid.as_raw())
+        }
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            panic!("zero Read must not access payload in the adapter")
+        }
+        fn thread_state(&self) -> &crate::ThreadState<usize> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<usize> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("unexpected regs")
+        }
+        async fn stack(&mut self) -> NoStack {
+            panic!("unexpected stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("unexpected daemonization")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            assert!(
+                self.admitted.is_none(),
+                "admitted zero Read requires the typed shared boundary"
+            );
+            let (number, arguments) = syscall.into_parts();
+            let Syscall::Read(call) = Syscall::from_raw(number, arguments) else {
+                panic!("zero Read changed syscall shape")
+            };
+            self.calls += 1;
+            native_zero_read(call)
+        }
+        async fn inject_original_read(
+            &mut self,
+            call: syscalls::Read,
+        ) -> reverie::InjectedReadResult {
+            let mut boundary = self
+                .admitted
+                .as_ref()
+                .expect("typed Read requires explicit admission")
+                .lock()
+                .unwrap();
+            assert_eq!(boundary.events, ["begin-native", "submit"]);
+            let local = self.thread.original_connect.as_mut().unwrap();
+            assert_eq!(local.admission, boundary.admission);
+            assert!(local.invoked && local.returned.is_none());
+            let (_, raw) = call.into_parts();
+            assert_eq!(
+                local.raw_arguments,
+                [raw.arg0, raw.arg1, raw.arg2, raw.arg3, raw.arg4, raw.arg5]
+            );
+            self.calls += 1;
+            let result = native_zero_read(call);
+            let returned = match result {
+                Ok(n) => n,
+                Err(errno) => -i64::from(errno.into_raw()),
+            };
+            // Supply the adapter's expected completion input explicitly. This
+            // assignment is not an authenticated backend observation.
+            local.returned = Some(returned);
+            boundary.returned = Some(returned);
+            boundary.events.push("typed-native-read");
+            reverie::InjectedReadResult::Complete(result)
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+            panic!("unexpected tail injection")
+        }
+        fn set_timer(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("local zero Read must not observe ingress time")
+        }
+    }
+
+    struct InaccessibleZeroBuffer(*mut libc::c_void);
+    impl InaccessibleZeroBuffer {
+        fn new() -> Self {
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED);
+            Self(address)
+        }
+    }
+    impl Drop for InaccessibleZeroBuffer {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::munmap(self.0, 4096) }, 0);
+        }
+    }
+
+    // Real Linux results pass through the capability-None network dispatcher
+    // callee and existing ordinary zero-Read handler. This is not a native
+    // provider/Call or complete Record->Replay qualification. The strict Guest
+    // rejects payload access, clock/RPC activity and Recorder/Replayer calls.
+    #[tokio::test]
+    async fn zero_scalar_read_network_policies_preserve_native_validation_without_ingress() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        for policy in [NetworkPolicy::Record, NetworkPolicy::Replay] {
+            for queued in [false, true] {
+                for nonblocking in [false, true] {
+                    let (mut endpoint, mut peer) = UnixStream::pair().unwrap();
+                    endpoint.set_nonblocking(nonblocking).unwrap();
+                    if queued {
+                        peer.write_all(b"retained").unwrap();
+                    }
+                    let invalid = InaccessibleZeroBuffer::new();
+                    let mut config = Config::default();
+                    config.network_trace.policy = policy;
+                    let tid = Tid::from_raw(73);
+                    let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+                    let mut thread = tool.init_thread_state(tid, None);
+                    thread
+                        .add_fd(
+                            endpoint.as_raw_fd(),
+                            if nonblocking {
+                                OFlag::O_NONBLOCK
+                            } else {
+                                OFlag::empty()
+                            },
+                            FdType::Socket,
+                            None,
+                        )
+                        .unwrap();
+                    let mut guest = ZeroReadGuest {
+                        config: &config,
+                        thread,
+                        calls: 0,
+                        admitted: None,
+                    };
+                    for (address, expected) in [
+                        (0, None),
+                        (invalid.0 as usize, None),
+                        (usize::MAX, Some(Errno::EFAULT)),
+                    ] {
+                        let call = syscalls::Read::new()
+                            .with_fd(endpoint.as_raw_fd())
+                            .with_buf(AddrMut::from_raw(address))
+                            .with_len(0);
+                        let result = tool
+                            .try_handle_network_io(&mut guest, call.into())
+                            .await
+                            .expect("registered socket Read remains network-owned");
+                        match expected {
+                            None => assert_eq!(result.unwrap(), 0),
+                            Some(errno) => assert!(
+                                matches!(result, Err(Error::Errno(actual)) if actual == errno)
+                            ),
+                        }
+                        let mut available = -1;
+                        assert_eq!(
+                            unsafe {
+                                libc::ioctl(endpoint.as_raw_fd(), libc::FIONREAD, &mut available)
+                            },
+                            0
+                        );
+                        assert_eq!(available, if queued { 8 } else { 0 });
+                    }
+                    assert_eq!(guest.calls, 3);
+                    assert_eq!(
+                        *guest.thread.as_ref(),
+                        0,
+                        "ordinary Recorder/Replayer was not called"
+                    );
+                    assert!(guest.thread.original_connect.is_none());
+                    assert!(crate::network_replay::backend_fd_table_capability(&config).is_none());
+                    if !queued {
+                        peer.write_all(b"retained").unwrap();
+                    }
+                    let mut bytes = [0; 8];
+                    endpoint.read_exact(&mut bytes).unwrap();
+                    assert_eq!(&bytes, b"retained");
+                }
+            }
+        }
+    }
+
+    // Exercises the admitted adapter path with explicit admission/ACK and
+    // completion boundary inputs. It does not qualify provider selection,
+    // backend Prepared/Returned issuance or a real Record->Replay session.
+    #[tokio::test]
+    async fn zero_scalar_read_admitted_policies_use_native_call_and_retire_without_ingress() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        use crate::network_replay::NetworkFdPublicationAdmission;
+        use crate::network_replay::NetworkFdPublicationPermit;
+        use crate::network_replay::NetworkFdReadAdmission;
+        use crate::network_replay::NetworkStreamLeaseId;
+        use crate::network_replay::NetworkStreamOwner;
+        for policy in [NetworkPolicy::Record, NetworkPolicy::Replay] {
+            for queued in [false, true] {
+                for nonblocking in [false, true] {
+                    let (mut endpoint, mut peer) = UnixStream::pair().unwrap();
+                    endpoint.set_nonblocking(nonblocking).unwrap();
+                    if queued {
+                        peer.write_all(b"retained").unwrap();
+                    }
+                    let inaccessible = InaccessibleZeroBuffer::new();
+                    for (address, expected) in [
+                        (0, None),
+                        (inaccessible.0 as usize, None),
+                        (usize::MAX, Some(Errno::EFAULT)),
+                    ] {
+                        let mut config = Config::default();
+                        config.network_trace.policy = policy;
+                        let tid = Tid::from_raw(73);
+                        let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+                        let mut thread = tool.init_thread_state(tid, None);
+                        thread
+                            .add_fd(
+                                endpoint.as_raw_fd(),
+                                if nonblocking {
+                                    OFlag::O_NONBLOCK
+                                } else {
+                                    OFlag::empty()
+                                },
+                                FdType::Socket,
+                                None,
+                            )
+                            .unwrap();
+                        let owner = NetworkStreamOwner {
+                            thread: thread.dettid,
+                            mm: thread.mm_id,
+                        };
+                        let (read, metadata) = {
+                            let file_metadata = thread.file_metadata.lock().unwrap();
+                            let binding = file_metadata
+                                .descriptor_binding(endpoint.as_raw_fd())
+                                .unwrap();
+                            let read = NetworkFdReadAdmission {
+                                publication: NetworkFdPublicationAdmission {
+                                    permit: NetworkFdPublicationPermit {
+                                        files: file_metadata.files_id,
+                                        owner,
+                                        lease: NetworkStreamLeaseId::controlled_fixture(1),
+                                    },
+                                    acknowledged_sequence: 0,
+                                    acknowledged_generation: 0,
+                                    recovery: None,
+                                },
+                                fd: endpoint.as_raw_fd(),
+                                binding: Some(binding),
+                                control: Some(NetworkStreamLeaseId::controlled_fixture(2)),
+                                external_grant: None,
+                            };
+                            let metadata = crate::tool_local::NetworkFdReadMetadata {
+                                binding: Some(binding),
+                                socket: Some(binding.open_file),
+                                nonblocking: Some(nonblocking),
+                            };
+                            (read, metadata)
+                        };
+                        let mut guest = ZeroReadGuest {
+                            config: &config,
+                            thread,
+                            calls: 0,
+                            admitted: Some(Mutex::new(ZeroReadAdmissionBoundary {
+                                read: read.clone(),
+                                admission: None,
+                                events: Vec::new(),
+                                returned: None,
+                            })),
+                        };
+                        assert!(
+                            crate::network_replay::backend_fd_table_capability(&config).is_none()
+                        );
+                        let call = syscalls::Read::new()
+                            .with_fd(endpoint.as_raw_fd())
+                            .with_buf(AddrMut::from_raw(address))
+                            .with_len(0);
+                        let result = tool
+                            .network_read_from_admission(&mut guest, call, policy, read, metadata)
+                            .await;
+                        match expected {
+                            None => assert_eq!(result.unwrap(), 0),
+                            Some(errno) => assert!(
+                                matches!(result, Err(Error::Errno(actual)) if actual == errno)
+                            ),
+                        }
+                        assert_eq!(guest.calls, 1);
+                        assert_eq!(
+                            *guest.thread.as_ref(),
+                            0,
+                            "network-owned Read bypasses the ordinary delegate"
+                        );
+                        assert!(guest.thread.original_connect.is_none());
+                        assert!(guest.thread.original_file_metadata.is_none());
+                        let boundary = guest.admitted.as_ref().unwrap().lock().unwrap();
+                        assert_eq!(
+                            boundary.events,
+                            [
+                                "begin-native",
+                                "submit",
+                                "typed-native-read",
+                                "outcome",
+                                "retire"
+                            ]
+                        );
+                        assert_eq!(
+                            boundary.returned,
+                            Some(expected.map_or(0, |e| -i64::from(e.into_raw())))
+                        );
+                        let mut available = -1;
+                        assert_eq!(
+                            unsafe {
+                                libc::ioctl(endpoint.as_raw_fd(), libc::FIONREAD, &mut available)
+                            },
+                            0
+                        );
+                        assert_eq!(available, if queued { 8 } else { 0 });
+                    }
+                    if !queued {
+                        peer.write_all(b"retained").unwrap();
+                    }
+                    let mut bytes = [0; 8];
+                    endpoint.read_exact(&mut bytes).unwrap();
+                    assert_eq!(&bytes, b"retained");
+                }
+            }
+        }
+    }
+
+    // Corrects the rejected packet's Linux oracle. This preserves its exact
+    // UINTPTR_MAX zero-iovec as an explicit EFAULT, and keeps separate valid
+    // user-range inaccessible/NULL zero vectors. It does not claim the current
+    // network Readv adapter retains the kernel's imported iterator.
+    #[test]
+    fn zero_readv_native_import_distinguishes_invalid_range_without_consuming_bytes() {
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        for queued in [false, true] {
+            let (mut endpoint, mut peer) = UnixStream::pair().unwrap();
+            endpoint.set_nonblocking(true).unwrap();
+            if queued {
+                peer.write_all(b"retained").unwrap();
+            }
+            let inaccessible = InaccessibleZeroBuffer::new();
+            // Preserve the rejected packet's contrasting receive operation:
+            // recv(len=0) may wait or return EAGAIN even though Read is empty.
+            let received = unsafe {
+                libc::recv(
+                    endpoint.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    0,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if queued {
+                assert_eq!(received, 0);
+            } else {
+                assert_eq!(received, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+            }
+            for (base, expected) in [(inaccessible.0, 0), (usize::MAX as *mut libc::c_void, -1)] {
+                let iov = [
+                    libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    },
+                    libc::iovec {
+                        iov_base: base,
+                        iov_len: 0,
+                    },
+                ];
+                let result =
+                    unsafe { libc::readv(endpoint.as_raw_fd(), iov.as_ptr(), iov.len() as i32) };
+                assert_eq!(result, expected);
+                if expected < 0 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::EFAULT)
+                    );
+                }
+                let mut available = -1;
+                assert_eq!(
+                    unsafe { libc::ioctl(endpoint.as_raw_fd(), libc::FIONREAD, &mut available) },
+                    0
+                );
+                assert_eq!(available, if queued { 8 } else { 0 });
+            }
+            if !queued {
+                peer.write_all(b"retained").unwrap();
+            }
+            let mut bytes = [0; 8];
+            endpoint.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"retained");
+        }
+    }
+}
+
+#[cfg(test)]
+mod epoll_ctl_scheduling_tests;
+
+impl<T: RecordOrReplay> Detcore<T> {
+    /// Execute one exact V4 foreground store from the same admitted Call.
+    /// The positive bounded scalar slice has no guest-memory helper thread.
+    async fn foreground_v4_receive_from_call<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        admitted: crate::network_replay::NetworkStreamCall,
+        mode: crate::network_replay::NetworkEngineMode,
+        nonblocking: bool,
+        invocation: Option<crate::tool_global::CheckedReadInvocation>,
+    ) -> Result<i64, Error> {
+        // The authenticated range/flags stay in this live callback; only a
+        // blocking Record EAGAIN consumes them, for the same-Call retry.
+        let pin = NetworkHostSocketPin {
+            call: admitted.id,
+            native: admitted.physical_pin_required,
+            nonblocking,
+        };
+        let prepared = match mode {
+            crate::network_replay::NetworkEngineMode::Record => {
+                self.prepare_v4_private_probe(guest, &pin).await.map(Some)
+            }
+            crate::network_replay::NetworkEngineMode::Replay => Ok(None),
+        };
+        self.foreground_v4_receive_after_probe(
+            guest,
+            call,
+            admitted,
+            mode,
+            nonblocking,
+            prepared,
+            invocation,
+        )
+        .await
+    }
+
+    /// Continue the same admitted Call after canonical Peek/cursor restoration.
+    /// Preparation failures use the same physical release and preserve their
+    /// primary error; this continuation neither captures nor invents a source.
+    pub(crate) async fn foreground_v4_receive_after_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        admitted: crate::network_replay::NetworkStreamCall,
+        mode: crate::network_replay::NetworkEngineMode,
+        nonblocking: bool,
+        prepared_probe: Result<Option<NetworkStreamLeaseId>, Error>,
+        mut invocation: Option<crate::tool_global::CheckedReadInvocation>,
+    ) -> Result<i64, Error> {
+        let pin = NetworkHostSocketPin {
+            call: admitted.id,
+            native: admitted.physical_pin_required,
+            nonblocking,
+        };
+        let destination = call.buf().map_or(0, |address| address.as_raw()) as u64;
+        // A failed retry transfers the Call to its own ordinary release; the
+        // common release below must not submit a second one.
+        let mut retry_owns_release = false;
+        let work = async {
+            let mut probe = prepared_probe?;
+            loop {
+                let mut empty = None;
+                if mode == crate::network_replay::NetworkEngineMode::Replay {
+                    let now = thread_observe_time(guest).await;
+                    match network_request(guest, NetworkRequest::ReleaseEligible(now))
+                        .await.map_err(engine_rpc_error)?
+                    {
+                        NetworkReply::ReadyChannels(_) => {}
+                        other => return Err(engine_error(format!(
+                            "unexpected V4 Replay input-release reply {other:?}"))),
+                    }
+                }
+                // End ALL borrowed Guest/local-global/store authority before a park.
+                {
+                    let tid = guest.tid();
+                    let state = guest.thread_state();
+                    let global = guest.local_global_state().ok_or_else(||
+                        engine_error("V4 receive backend lacks its actual local global state"))?;
+                    let selection = match mode {
+                        crate::network_replay::NetworkEngineMode::Record =>
+                            global.prepare_private_receive(tid, state, admitted.id,
+                                probe.expect("Record owns its actual private probe"),
+                                call.len(), destination).await.map_err(engine_rpc_error)?,
+                        crate::network_replay::NetworkEngineMode::Replay =>
+                            global.prepare_replay_receive(tid, state, admitted.id,
+                                call.len(), destination, nonblocking).await.map_err(engine_rpc_error)?,
+                    };
+                    match selection {
+                    crate::network_replay::ReceiveSelection::Bytes(permit) => {
+                        let mut memory = guest.memory();
+                        let (raw, full) = permit.copy(tid, state, &mut memory)
+                            .map_err(engine_rpc_error)?;
+                        let full = full.ok_or_else(|| engine_error(format!(
+                            "V4 receive retains incomplete foreground memory outcome: {raw:?}")))?;
+                        let returned = match mode {
+                            crate::network_replay::NetworkEngineMode::Record => {
+                                global.reconcile_foreground_store(full.clone()).await
+                                    .map_err(engine_rpc_error)?;
+                                let prepared = global.prepare_foreground_receive_publication(&full)
+                                    .map_err(engine_rpc_error)?;
+                                global.publish_foreground_native_receive(&prepared)
+                                    .map_err(engine_rpc_error)?
+                            }
+                            crate::network_replay::NetworkEngineMode::Replay =>
+                                global.commit_replay_receive_store(&full).map_err(engine_rpc_error)?,
+                        };
+                        return i64::try_from(returned).map_err(engine_error);
+                    }
+                    crate::network_replay::ReceiveSelection::NoStore(completed) => {
+                        match completed.outcome() {
+                            crate::network_replay::NoStoreReturn::Eof => return Ok(0),
+                            crate::network_replay::NoStoreReturn::WouldBlock if nonblocking =>
+                                return Err(Errno::EAGAIN.into()),
+                            crate::network_replay::NoStoreReturn::WouldBlock
+                                if mode == crate::network_replay::NetworkEngineMode::Replay =>
+                                return Err(engine_error(
+                                    "V4 Replay blocking empty attempt completed without a logical wait")),
+                            crate::network_replay::NoStoreReturn::WouldBlock => empty = Some(completed),
+                        }
+                    }
+                    crate::network_replay::ReceiveSelection::Wait => {}
+                    }
+                }
+                if let Some(completed) = empty {
+                    // Blocking Record EAGAIN: the kernel would sleep in this
+                    // same read. Use the existing Record observation timer,
+                    // then rearm the SAME Call under a new Normal grant. The
+                    // timer is an observation-latency bound, not a timeout.
+                    let invocation = invocation.as_mut().ok_or_else(|| engine_error(
+                        "V4 Record blocking retry lacks its authenticated original invocation"))?;
+                    match self.wait_shadow_network(
+                        guest,
+                        vec![(pin.call, NetworkWaitKind::ReadableAtLeast(1))],
+                        None,
+                        call.signal_interrupt_errno(),
+                        NetworkPolicy::Record,
+                        None,
+                    ).await? {
+                        NetworkShadowWaitOutcome::Ready { entered_zero_wait: false } => {}
+                        // Dropping the unconsumed token leaves the Call to the
+                        // ordinary release below; the read restarts or fails
+                        // with its own interrupt errno, as Linux would.
+                        NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false } =>
+                            return Err(call.signal_interrupt_errno().into()),
+                        _ => return Err(engine_error(
+                            "nonzero V4 Record receive acquired a zero-wait receipt")),
+                    }
+                    let tid = guest.tid();
+                    let global = guest.local_global_state().ok_or_else(||
+                        engine_error("V4 receive backend lacks its actual local global state"))?;
+                    if let Err(failure) = global
+                        .resume_private_receive_call(tid, guest.thread_state(), call, invocation, completed)
+                        .await
+                    {
+                        retry_owns_release = true;
+                        let failure = global.cleanup_receive_retry_failure(failure).await;
+                        let cleanup = match failure.cleanup_diagnostic() {
+                            Some(error) => Err(engine_rpc_error(error.clone())),
+                            None if failure.released() => Ok(()),
+                            None => Err(engine_error("V4 Record retry cleanup retained its Call")),
+                        };
+                        return finish_shadow_operation(
+                            Err(engine_rpc_error(failure.primary().clone())), cleanup);
+                    }
+                    // Fresh canonical probe on the same OFD and new grant.
+                    probe = Some(self.prepare_v4_private_probe(guest, &pin).await?);
+                    continue;
+                }
+                // Wait can arise only from untouched logical Replay selection.
+                // Record completes one actual source or returns its exact error.
+                if mode != crate::network_replay::NetworkEngineMode::Replay {
+                    return Err(engine_error("Record source unexpectedly absent before store"));
+                }
+                if nonblocking {
+                    return Err(engine_error("V4 nonblocking selection unexpectedly requested a wait"));
+                }
+                // Replay selection has already checked low-water=1/infinite timeout.
+                // Retain the same logical Call; no source, permit or exclusion is held.
+                match self.wait_shadow_network(
+                    guest,
+                    vec![(pin.call, NetworkWaitKind::ReadableAtLeast(1))],
+                    None,
+                    call.signal_interrupt_errno(),
+                    NetworkPolicy::Replay,
+                    None,
+                ).await? {
+                    NetworkShadowWaitOutcome::Ready { entered_zero_wait: false } => {}
+                    NetworkShadowWaitOutcome::Signaled { entered_zero_wait: false } =>
+                        return Err(call.signal_interrupt_errno().into()),
+                    _ => return Err(engine_error(
+                        "nonzero V4 Replay receive acquired a zero-wait receipt")),
+                }
+                // A fresh iteration obtains actual new TID/state/root/MM/grant and
+                // mapping authority. No prior permit or old epoch crosses this await.
+            }
+        }.await;
+        if retry_owns_release {
+            return work;
+        }
+        // Existing release preserves the primary and retains any unresolved
+        // physical/helper/store custody. It cannot report cleanup on a busy Call.
+        self.finish_host_stream_call(guest, pin, work).await
+    }
+
+    /// Canonical helper PEEK is a private source. No PollState/FIONREAD or V3
+    /// CompleteShadowProbe transition may turn it into publication authority.
+    async fn prepare_v4_private_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pin: &NetworkHostSocketPin,
+    ) -> Result<NetworkStreamLeaseId, Error> {
+        let probe =
+            match network_request(guest, NetworkRequest::BeginShadowProbe { call: pin.call })
+                .await
+                .map_err(engine_rpc_error)?
+            {
+                NetworkReply::ShadowProbe(probe) => probe,
+                other => return Err(engine_error(format!("unexpected V4 probe reply {other:?}"))),
+            };
+        let lease = probe.lease;
+        let observed = self
+            .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::ReadPeekOffset)
+            .await?;
+        let saved = match observed.confirmation {
+            NetworkStreamPhysicalResult::PeekOffset(value) => Some(value),
+            NetworkStreamPhysicalResult::Errno(errno)
+                if errno == libc::ENOPROTOOPT || errno == libc::EOPNOTSUPP =>
+            {
+                None
+            }
+            other => return Err(engine_error(format!("V4 cursor query failed: {other:?}"))),
+        };
+        if saved.is_some_and(|value| value >= 0) {
+            self.set_host_shadow_cursor(guest, pin, lease, -1).await?;
+        }
+        let maximum = probe
+            .retained_prefix
+            .checked_add(SHADOW_UNIT)
+            .ok_or_else(|| engine_error("V4 probe prefix overflow"))?;
+        let observed = self
+            .native_stream_effect(guest, lease, NetworkStreamPhysicalEffect::Peek { maximum })
+            .await?;
+        // Only a known completed effect permits cursor restoration. An unknown
+        // native RPC remains retained and cannot authorize a second command.
+        if let Some(value) = saved.filter(|value| *value >= 0) {
+            self.set_host_shadow_cursor(guest, pin, lease, value)
+                .await?;
+        }
+        self.complete_v4_private_probe_observation(lease, observed)
+    }
+
+    pub(crate) fn complete_v4_private_probe_observation(
+        &self,
+        lease: NetworkStreamLeaseId,
+        observed: crate::network_runtime::native_peer::Observation,
+    ) -> Result<NetworkStreamLeaseId, Error> {
+        // This result only selects the existing probe for the local issuer.
+        // Canonical no-store authority still comes from its retained joined
+        // helper/entry/cursor transaction, never from zero or errno alone.
+        match observed.confirmation {
+            NetworkStreamPhysicalResult::Peeked { .. } => Ok(lease),
+            NetworkStreamPhysicalResult::Errno(errno) if errno == libc::EAGAIN => Ok(lease),
+            other => Err(engine_error(format!(
+                "V4 positive-source adapter has no qualified terminal/wait outcome: {other:?}"
+            ))),
         }
     }
 }

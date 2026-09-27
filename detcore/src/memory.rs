@@ -17,6 +17,12 @@ use crate::types::FutexID;
 use crate::types::MmId;
 use crate::types::SharedMemoryObjectId;
 
+mod original_arena;
+pub(crate) use original_arena::OriginalArena;
+pub(crate) use original_arena::OriginalCopySpan;
+pub(crate) use original_arena::changes_foreground_lineage;
+pub(crate) use original_arena::invalidates_original_arena;
+
 const PAGE_SIZE: usize = 4096;
 
 fn page_aligned_len(len: usize) -> usize {
@@ -50,8 +56,11 @@ impl SharedMapping {
 }
 
 /// Shared mappings visible in one Linux memory address space.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct MemoryMetadata {
+    // Native permission is never reconstructed from a serialized memory model.
+    #[serde(skip)]
+    original_arena: original_arena::State,
     next_anonymous_sequence: u64,
     shared_mappings: BTreeMap<usize, SharedMapping>,
     /// The guest's program break when it was first observed, i.e. the base of
@@ -61,6 +70,19 @@ pub(crate) struct MemoryMetadata {
     /// The guest's most recently observed program break.
     #[serde(default)]
     brk_current: Option<u64>,
+}
+
+impl Clone for MemoryMetadata {
+    fn clone(&self) -> Self {
+        Self {
+            next_anonymous_sequence: self.next_anonymous_sequence,
+            shared_mappings: self.shared_mappings.clone(),
+            brk_start: self.brk_start,
+            brk_current: self.brk_current,
+            // A fork/clone of the model never inherits native MM authority.
+            original_arena: original_arena::State::default(),
+        }
+    }
 }
 
 impl MemoryMetadata {

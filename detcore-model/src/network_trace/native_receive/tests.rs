@@ -744,7 +744,7 @@ fn zero_length_stream_and_ancillary_rows_cannot_become_numeric_progress() {
 }
 
 #[test]
-fn explicit_v4_roundtrip_preserves_data_while_generic_reader_refuses_version_four() {
+fn explicit_v4_roundtrip_preserves_data_through_typed_and_umbrella_readers() {
     let trace = cross_channel();
     let mut bytes = vec![];
     trace.write_framed(&mut bytes).unwrap();
@@ -754,10 +754,23 @@ fn explicit_v4_roundtrip_preserves_data_while_generic_reader_refuses_version_fou
         NetworkTraceV4::read_framed(Cursor::new(&bytes)).unwrap(),
         trace
     );
-    assert!(matches!(
-        NetworkTrace::read_framed(Cursor::new(&bytes)),
-        Err(NetworkTraceCodecError::UnsupportedVersion(4))
-    ));
+    assert_eq!(
+        NetworkTrace::read_framed(Cursor::new(&bytes)).unwrap(),
+        NetworkTrace::V4(trace.clone())
+    );
+    let mut umbrella_bytes = Vec::new();
+    NetworkTrace::V4(trace.clone())
+        .write_framed(&mut umbrella_bytes)
+        .unwrap();
+    assert_eq!(umbrella_bytes, bytes);
+    for unknown in [5u32, 99] {
+        let mut unknown_bytes = bytes.clone();
+        unknown_bytes[16..20].copy_from_slice(&unknown.to_le_bytes());
+        assert!(
+            matches!(NetworkTrace::read_framed(Cursor::new(unknown_bytes)),
+            Err(NetworkTraceCodecError::UnsupportedVersion(actual)) if actual == unknown)
+        );
+    }
     let mut json = serde_json::to_value(&trace).unwrap();
     json["unexpected"] = serde_json::json!(true);
     assert!(serde_json::from_value::<NetworkTraceV4>(json).is_err());
@@ -1272,4 +1285,236 @@ fn unix_datagram_exact_zero_output_has_typed_coverage_and_exact_address_presence
             })
         );
     }
+}
+
+#[test]
+fn v4_umbrella_and_typed_decoder_preserve_exact_refusal_classes() {
+    let mut frame = Vec::new();
+    cross_channel().write_framed(&mut frame).unwrap();
+    for end in 0..frame.len() {
+        assert!(
+            matches!(
+                NetworkTraceV4::read_framed(Cursor::new(&frame[..end])),
+                Err(NetworkTraceCodecErrorV4::Frame(
+                    NetworkTraceCodecError::Truncated
+                ))
+            ),
+            "typed {end}"
+        );
+        assert!(
+            matches!(
+                NetworkTrace::read_framed(Cursor::new(&frame[..end])),
+                Err(NetworkTraceCodecError::Truncated)
+            ),
+            "umbrella {end}"
+        );
+    }
+    let mut trailing = frame.clone();
+    trailing.push(0);
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&trailing)),
+        Err(NetworkTraceCodecErrorV4::Frame(
+            NetworkTraceCodecError::TrailingData
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&trailing)),
+        Err(NetworkTraceCodecError::TrailingData)
+    ));
+    let payload_length = u64::from_le_bytes(frame[20..28].try_into().unwrap());
+    trailing[20..28].copy_from_slice(&(payload_length + 1).to_le_bytes());
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&trailing)),
+        Err(NetworkTraceCodecErrorV4::Frame(
+            NetworkTraceCodecError::TrailingPayloadData
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&trailing)),
+        Err(NetworkTraceCodecError::TrailingPayloadData)
+    ));
+    let mut oversized = frame[..28].to_vec();
+    oversized[20..28].copy_from_slice(&(MAX_NETWORK_TRACE_PAYLOAD_BYTES + 1).to_le_bytes());
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&oversized)),
+        Err(NetworkTraceCodecErrorV4::Frame(
+            NetworkTraceCodecError::TooLarge
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&oversized)),
+        Err(NetworkTraceCodecError::TooLarge)
+    ));
+    let mut bad_magic = frame.clone();
+    bad_magic[0] ^= 1;
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&bad_magic)),
+        Err(NetworkTraceCodecErrorV4::Frame(
+            NetworkTraceCodecError::BadMagic
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&bad_magic)),
+        Err(NetworkTraceCodecError::BadMagic)
+    ));
+}
+
+#[test]
+fn v4_umbrella_and_typed_payloads_keep_bounded_decode_and_structural_validation() {
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = NETWORK_TRACE_MAGIC.to_vec();
+        bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V4.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+    // The first field is the epoch string. Its decoded length claim exceeds
+    // the limit despite a tiny complete frame; no large allocation is needed.
+    let claim = bincode::serde::encode_to_vec(
+        MAX_NETWORK_TRACE_PAYLOAD_BYTES + 1,
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let oversized_claim = frame(&claim);
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&oversized_claim)),
+        Err(NetworkTraceCodecErrorV4::Frame(
+            NetworkTraceCodecError::Decode(bincode::error::DecodeError::LimitExceeded)
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&oversized_claim)),
+        Err(NetworkTraceCodecError::Decode(
+            bincode::error::DecodeError::LimitExceeded
+        ))
+    ));
+    let malformed = frame(&[255]);
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&malformed)),
+        Err(NetworkTraceCodecErrorV4::Frame(
+            NetworkTraceCodecError::Decode(_)
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&malformed)),
+        Err(NetworkTraceCodecError::Decode(_))
+    ));
+    let mut invalid = cross_channel();
+    nodes(&mut invalid)[0].id = NetworkReleaseNodeIdV4(2);
+    assert_eq!(invalid.validate(), Err(Invalid::NonCanonicalNode));
+    let payload = bincode::serde::encode_to_vec(&invalid, bincode::config::standard()).unwrap();
+    let invalid_frame = frame(&payload);
+    assert!(matches!(
+        NetworkTraceV4::read_framed(Cursor::new(&invalid_frame)),
+        Err(NetworkTraceCodecErrorV4::Validation(
+            Invalid::NonCanonicalNode
+        ))
+    ));
+    assert!(matches!(
+        NetworkTrace::read_framed(Cursor::new(&invalid_frame)),
+        Err(NetworkTraceCodecError::ValidationV4(
+            Invalid::NonCanonicalNode
+        ))
+    ));
+    let mut typed_output = Vec::new();
+    assert!(matches!(
+        invalid.write_framed(&mut typed_output),
+        Err(NetworkTraceCodecErrorV4::Validation(
+            Invalid::NonCanonicalNode
+        ))
+    ));
+    assert!(typed_output.is_empty());
+    let mut umbrella_output = Vec::new();
+    assert!(matches!(
+        NetworkTrace::V4(invalid).write_framed(&mut umbrella_output),
+        Err(NetworkTraceCodecError::ValidationV4(
+            Invalid::NonCanonicalNode
+        ))
+    ));
+    assert!(umbrella_output.is_empty());
+}
+
+#[test]
+fn finite_channel_creation_accepts_each_supported_transport_with_valid_v2_premises() {
+    let payload = NetworkTraceV2 {
+        epoch: Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
+        channels: [
+            NetworkTransportV2::Tcp,
+            NetworkTransportV2::Udp,
+            NetworkTransportV2::UnixDatagram,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(n, transport)| NetworkChannelV2 {
+            id: NetworkChannelId(n as u64 + 1),
+            transport,
+            role: if transport == NetworkTransportV2::Tcp {
+                NetworkEndpointRoleV2::OutboundClient
+            } else {
+                NetworkEndpointRoleV2::Datagram
+            },
+            local_address: None,
+            peer_address: if transport == NetworkTransportV2::UnixDatagram {
+                None
+            } else {
+                Some(NetworkAddressV2::Inet4 {
+                    address: [192, 0, 2, 2],
+                    port: 443,
+                })
+            },
+            accepted_from: None,
+        })
+        .collect(),
+        inputs: vec![],
+        outputs: vec![],
+    };
+    assert_eq!(payload.validate(), Ok(()));
+    for channel in &payload.channels {
+        assert_eq!(validate_channel_creation(channel), Ok(()));
+    }
+}
+
+#[test]
+fn finite_channel_creation_rejects_valid_accepted_child_independently_of_listener() {
+    let listener = NetworkChannelV2 {
+        id: NetworkChannelId(1),
+        transport: NetworkTransportV2::Tcp,
+        role: NetworkEndpointRoleV2::Listener,
+        local_address: None,
+        peer_address: None,
+        accepted_from: None,
+    };
+    let child = NetworkChannelV2 {
+        id: NetworkChannelId(2),
+        transport: NetworkTransportV2::Tcp,
+        role: NetworkEndpointRoleV2::Accepted,
+        local_address: None,
+        peer_address: Some(NetworkAddressV2::Inet4 {
+            address: [192, 0, 2, 2],
+            port: 443,
+        }),
+        accepted_from: Some(listener.id),
+    };
+    let mut outbound = child.clone();
+    outbound.id = NetworkChannelId(3);
+    outbound.role = NetworkEndpointRoleV2::OutboundClient;
+    outbound.accepted_from = None;
+    let payload = NetworkTraceV2 {
+        epoch: Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
+        channels: vec![listener.clone(), child.clone(), outbound.clone()],
+        inputs: vec![],
+        outputs: vec![],
+    };
+    assert_eq!(payload.validate(), Ok(()));
+    // Only the Accepted child reaches this invocation. A Listener refusal
+    // elsewhere in the trace cannot mask a missing Accepted restriction.
+    assert_eq!(
+        validate_channel_creation(&child),
+        Err(Invalid::UnsupportedCreation)
+    );
+    assert_eq!(
+        validate_channel_creation(&listener),
+        Err(Invalid::UnsupportedCreation)
+    );
+    assert_eq!(validate_channel_creation(&outbound), Ok(()));
 }

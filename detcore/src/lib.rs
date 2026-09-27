@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Detcore is a Reverie tool that determinizes the execution of a process.
 //!
@@ -96,6 +96,7 @@ pub use digest::Digest;
 use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 use raw_cpuid::cpuid;
+pub use record_or_replay::OriginalFileExecution;
 pub use record_or_replay::RecordOrReplay;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -113,7 +114,6 @@ use reverie::Tool;
 pub use reverie::process::Namespace;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
-use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
 use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
@@ -132,10 +132,6 @@ pub use tool_global::NetworkCapturedStreamInput;
 pub use tool_global::NetworkCapturedStreamOutput;
 #[doc(hidden)]
 pub use tool_global::NetworkConnection;
-#[doc(hidden)]
-pub use tool_global::NetworkDatagramDelivery;
-#[doc(hidden)]
-pub use tool_global::NetworkDatagramReceive;
 #[doc(hidden)]
 pub use tool_global::NetworkReply;
 #[doc(hidden)]
@@ -172,6 +168,41 @@ fn select_thread_start_detpid(thread_detpid: Option<DetPid>, guest_pid: Pid) -> 
 
 fn is_root_thread_start(is_root_process: bool, dettid: DetTid, detpid: DetPid) -> bool {
     is_root_process && dettid == detpid
+}
+
+/// Local identity handoff from the actual pre-filter root stop. This only
+/// guards custody registration; it never authorizes a census of the old image.
+pub(crate) struct InitialRootStop {
+    owner: network_replay::NetworkStreamOwner,
+    process: i32,
+    thread: i32,
+}
+impl InitialRootStop {
+    fn at_callback(
+        is_root: bool,
+        owner: network_replay::NetworkStreamOwner,
+        process: i32,
+        thread: i32,
+    ) -> Option<Self> {
+        (is_root
+            && owner.mm == MmId::initial(owner.thread)
+            && owner.thread.as_raw() == thread
+            && process == thread)
+            .then_some(Self {
+                owner,
+                process,
+                thread,
+            })
+    }
+
+    pub(crate) fn matches(
+        &self,
+        owner: network_replay::NetworkStreamOwner,
+        process: i32,
+        thread: i32,
+    ) -> bool {
+        self.owner == owner && self.process == process && self.thread == thread
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1072,10 +1103,110 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+// Construct the selected syscall future in an outlined frame. Accepting a factory
+// keeps the large, mutually exclusive future temporaries out of the common
+// dispatcher; boxing a future already constructed there would not do that.
+// The caller still awaits the same future directly, with the same waker and drop.
+#[inline(never)]
+fn boxed_syscall_future<F: std::future::Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
 #[reverie::tool]
 impl<T: RecordOrReplay> Tool for Detcore<T> {
     type GlobalState = GlobalState;
     type ThreadState = ThreadState<T::ThreadState>;
+
+    fn observe_injected_syscalls(config: &Config) -> bool {
+        !config.sequentialize_threads
+            || matches!(
+                config.network_trace.policy,
+                detcore_model::network_trace::NetworkPolicy::Record
+                    | detcore_model::network_trace::NetworkPolicy::Replay
+            )
+    }
+
+    fn observe_injected_syscall_preparation(config: &Config) -> bool {
+        Self::observe_injected_syscalls(config)
+    }
+
+    fn on_injected_syscall_observed(
+        &self,
+        tid: Tid,
+        global: &GlobalState,
+        state: &mut Self::ThreadState,
+        nr: reverie::syscalls::Sysno,
+        args: reverie::syscalls::SyscallArgs,
+        event: reverie::InjectedSyscallEvent,
+    ) {
+        // Memory authority consumes only these real synchronous observations,
+        // including Prepared before the existing early return below.
+        global.observe_original_memory(tid, self.detpid, state, nr, args, event);
+        // Preparation only binds already admitted custody. It is not an
+        // original result, child identity, or no-effect observation.
+        if matches!(
+            event,
+            reverie::InjectedSyscallEvent::Prepared
+                | reverie::InjectedSyscallEvent::Entered
+                | reverie::InjectedSyscallEvent::InterruptedBeforeEntry
+        ) {
+            global.observe_original_connect(tid, self.detpid, state, nr, args, event);
+            return;
+        }
+        global.observe_no_seq_operation(tid, self.detpid, state, nr, args, event);
+        global.observe_original_connect(tid, self.detpid, state, nr, args, event);
+        #[cfg(test)]
+        tool_global::native_prestart_tests::native_birth(tid, global, state, nr, event);
+        #[cfg(test)]
+        tool_global::native_clear_tid_tests::observe(tid, global, state, nr, args, event);
+    }
+
+    fn on_thread_state_ready(
+        &self,
+        tid: Tid,
+        global: &GlobalState,
+        state: &Self::ThreadState,
+    ) -> Result<(), Error> {
+        global.observe_ready_fd_metadata(tid, state)
+    }
+
+    fn on_backend_thread_terminal(
+        &self,
+        tid: Tid,
+        global: &GlobalState,
+        state: &mut Self::ThreadState,
+        _status: ExitStatus,
+    ) {
+        global.revoke_original_foreground(state);
+        #[cfg(test)]
+        let before =
+            tool_global::native_prestart_tests::before_terminal(tid, global, state, _status);
+        global.settle_no_seq_terminal(tid, self.detpid, state);
+        global.observe_original_connect_terminal(tid, self.detpid, state);
+        global.observe_native_stream_terminal(tid, self.detpid, state);
+        #[cfg(test)]
+        tool_global::native_prestart_tests::after_terminal(tid, global, state, before);
+        #[cfg(test)]
+        tool_global::native_clear_tid_tests::terminal(tid, global, state, _status);
+    }
+
+    fn requires_native_child_admission(&self, parent: &Self::ThreadState) -> bool {
+        parent.pending_fd_clone.is_some()
+    }
+
+    async fn admit_native_child(
+        &self,
+        creator: Tid,
+        child: Tid,
+        global: &GlobalState,
+        parent: &mut Self::ThreadState,
+        child_pidfd: std::os::fd::BorrowedFd<'_>,
+        terminal: Option<ExitStatus>,
+    ) -> Result<(), Error> {
+        global
+            .admit_native_child(creator, child, parent, child_pidfd, terminal.is_some())
+            .await
+    }
 
     fn observe_signal_dequeues(config: &Config) -> bool {
         config.kvm_shared_dequeue_timers && config.sequentialize_threads && config.backend_is_kvm
@@ -1498,6 +1629,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Self::ThreadState {
         trace!("[tid {}] detcore init new thread state", tid);
 
+        // The backend's fallible admit_native_child callback must attach this
+        // before entering any child constructor (including wrapped tool state).
+        let native_outcome = parent.and_then(|(_, state)| {
+            state
+                .native_construction()
+                .expect("active native child constructor lost authenticated rebind")
+        });
+        if let Some(outcome) = &native_outcome {
+            assert_eq!(outcome.child().thread.as_raw(), tid.as_raw());
+        }
         let record_or_replay = self
             .record_or_replay
             .init_thread_state(tid, parent.map(|(ptid, ts)| (ptid, ts.as_ref())));
@@ -1506,11 +1647,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         match parent {
             None => ThreadState::new(DetPid::from_raw(tid.into()), &self.cfg, record_or_replay),
             Some(pts) => {
-                let clone_flags = pts
+                let requested_flags = pts
                     .1
                     .clone_flags
                     .expect("clone_flags must be set by parent");
+                let clone_flags = native_outcome
+                    .as_ref()
+                    .map_or(requested_flags, |outcome| outcome.flags());
                 let dettid = DetPid::from_raw(tid.into());
+                let inherited_birth = pts
+                    .1
+                    .pending_no_seq_birth
+                    .as_ref()
+                    .map(|birth| birth.inherit(pts.0, pts.1, tid));
 
                 if pts
                     .1
@@ -1625,7 +1774,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     thread_cpu_start_user_time: last_accounted_user_time,
                     thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
-                    pending_vfork: pts.1.pending_vfork.clone(),
+                    native_birth_required: pts.1.native_birth_required,
+                    native_child_outcome: native_outcome.clone(),
+                    pending_vfork: if native_outcome.is_some() {
+                        None
+                    } else {
+                        pts.1.pending_vfork.clone()
+                    },
+                    pending_no_seq_birth: inherited_birth,
+                    // The invocation marker belongs only to the parent callback.
+                    uninvoked_wait_call: None,
+                    uninvoked_fd_clone: None,
+                    original_connect: None,
+                    original_file_metadata: None,
                     pending_fd_clone: pts.1.pending_fd_clone,
 
                     // Child RNG identity follows the deterministic creation
@@ -1668,6 +1829,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     // We only get to the point of creating child threads if we're past the first execve.
                     past_global_first_execve: true,
+                    initial_network_exec: None,
                     interrupt_at: self.cfg.interrupts_for_thread(dettid),
 
                     // `copy_process()` sets `p->robust_list = NULL` for every
@@ -1689,6 +1851,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
         let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
+        if let Some(outcome) = guest
+            .thread_state()
+            .native_construction()
+            .map_err(|e| Error::Tool(anyhow::anyhow!(e)))?
+        {
+            if outcome.child()
+                != (crate::network_replay::NetworkStreamOwner {
+                    thread: new_dettid,
+                    mm: guest.thread_state().mm_id,
+                })
+                || outcome.process() != detpid
+            {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "native child start changed actual process/MM generation"
+                )));
+            }
+        }
         let is_root_thread = is_root_thread_start(guest.is_root_process(), new_dettid, detpid);
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
@@ -1706,7 +1885,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
+        if let Some(birth) = guest.thread_state_mut().pending_no_seq_birth.take() {
+            tool_global::create_no_seq_child_thread(guest, birth).await?;
+        } else if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
         } else if is_root_thread {
             // There is no fork event to catch for the root thread.
@@ -1754,8 +1935,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         let needs_initial_guard_check =
             is_root_thread && guest.config().backend_supports_host_socket_pin;
-        if needs_fd_runtime || needs_accepted_runtime || needs_initial_guard_check {
-            let registered = tool_global::register_network_physical_task(guest).await?;
+        if (needs_fd_runtime || needs_accepted_runtime || needs_initial_guard_check)
+            && !(is_root_thread && needs_accepted_runtime)
+        {
+            let registered = tool_global::register_network_physical_task(guest, false).await?;
             if needs_fd_runtime && !registered {
                 return Err(Error::Tool(anyhow::anyhow!(
                     "active network lifetime lacks owned ptrace runtime"
@@ -1789,6 +1972,119 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Ok(())
     }
 
+    async fn handle_initial_stop<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        observation: &dyn reverie::InitialCommandObservation,
+    ) -> Result<(), Error> {
+        if guest.config().backend_supports_host_socket_pin
+            && matches!(
+                guest.config().network_trace.policy,
+                detcore_model::network_trace::NetworkPolicy::Record
+                    | detcore_model::network_trace::NetworkPolicy::Replay
+            )
+        {
+            if !guest.is_root_process()
+                || observation.root_tid() != guest.tid()
+                || observation.former_tid().is_some()
+                || guest.pid().as_raw() != guest.tid().as_raw()
+            {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "initial network stop changed backend root identity"
+                )));
+            }
+            let stop = InitialRootStop::at_callback(
+                true,
+                network_replay::NetworkStreamOwner {
+                    thread: guest.thread_state().dettid,
+                    mm: guest.thread_state().mm_id,
+                },
+                guest.pid().as_raw(),
+                guest.tid().as_raw(),
+            )
+            .ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "initial custody registration changed pre-exec MM"
+                ))
+            })?;
+            if !stop.matches(
+                network_replay::NetworkStreamOwner {
+                    thread: guest.thread_state().dettid,
+                    mm: guest.thread_state().mm_id,
+                },
+                observation.root_tid().as_raw(),
+                guest.tid().as_raw(),
+            ) {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "initial custody callback changed task identity"
+                )));
+            }
+            // Register custody only. The initial image census cannot precede
+            // exec's close-on-exec removals or its replacement FilesId/MM.
+            if !tool_global::register_network_physical_task(guest, false).await? {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "initial network stop lacks owned provider runtime"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_initial_exec<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        observation: &dyn reverie::InitialCommandObservation,
+    ) -> Result<(), Error> {
+        if !guest.config().backend_supports_host_socket_pin
+            || !matches!(
+                guest.config().network_trace.policy,
+                detcore_model::network_trace::NetworkPolicy::Record
+                    | detcore_model::network_trace::NetworkPolicy::Replay
+            )
+        {
+            return Ok(());
+        }
+        // Backend provenance is the original root PTRACE_EVENT_EXEC, before
+        // any step, preinit injection or new-image instruction. Never issue a
+        // Guest injection here: metadata is captured through held files locally.
+        if !guest.is_root_process()
+            || observation.root_tid() != guest.tid()
+            || observation.former_tid() != Some(guest.tid())
+            || guest.pid().as_raw() != guest.tid().as_raw()
+        {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "initial network admission changed root EXEC identity"
+            )));
+        }
+        let files = guest.thread_state().pending_exec_files.ok_or_else(|| {
+            Error::Tool(anyhow::anyhow!(
+                "initial EXEC lacks its original logical table preparation"
+            ))
+        })?;
+        if guest.thread_state().initial_network_exec.is_some() {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "initial EXEC handoff already consumed"
+            )));
+        }
+        tool_global::mark_past_first_execve(guest).await;
+        if guest.thread_state().pending_exec_files.is_some()
+            || guest.thread_state().file_metadata.lock().unwrap().files_id != files.new_files
+            || guest.thread_state().mm_id != files.mm.for_exec(files.process)
+        {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "initial EXEC completion changed reserved table/MM"
+            )));
+        }
+        if !tool_global::register_network_physical_task(guest, true).await? {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "initial network admission lacks owned provider runtime"
+            )));
+        }
+        self.initialize_network_fd_tracking(guest).await?;
+        guest.thread_state_mut().initial_network_exec = Some(files);
+        Ok(())
+    }
+
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
         // A successful exec clears the kernel's clear_child_tid registration.
@@ -1797,7 +2093,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             tool_global::set_child_tid_address(guest, 0).await;
         }
 
-        tool_global::mark_past_first_execve(guest).await;
+        if let Some(files) = guest.thread_state_mut().initial_network_exec.take() {
+            if guest.thread_state().pending_exec_files.is_some()
+                || guest.thread_state().mm_id != files.mm.for_exec(files.process)
+                || guest.thread_state().file_metadata.lock().unwrap().files_id != files.new_files
+            {
+                return Err(Errno::EPROTO);
+            }
+        } else {
+            tool_global::mark_past_first_execve(guest).await;
+        }
         self.pre_handler_hook(guest, false).await;
 
         let auxv = guest.auxv();
@@ -1924,6 +2229,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Result<i64, Error> {
         self.pre_handler_hook(guest, false).await;
 
+        // The authenticated initial census activates only this intercepted
+        // original-operation set. No unjoined FD creator/alias/table mutation
+        // may enter Linux and later be guessed from the resulting numeric FD.
+        if self.network_fd_tracking_active(guest)
+            && !crate::network_replay::initial_record_call_supported(call)
+        {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "authenticated Record route has no original effect join for {}",
+                call.number()
+            )));
+        }
+
         let dettid = guest.thread_state().dettid;
 
         if guest.thread_state().guest_past_first_execve() {
@@ -2009,7 +2326,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
-                    self.passthrough(guest, call).await
+                    boxed_syscall_future(|| self.passthrough(guest, call)).await
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2029,12 +2346,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_send_signal => {
                 match call {
                     Syscall::Other(_, args) => {
-                        self.handle_pidfd_send_signal(
-                            guest,
-                            call,
-                            args.arg0 as RawFd,
-                            args.arg3 as u32,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_pidfd_send_signal(
+                                guest,
+                                call,
+                                args.arg0 as RawFd,
+                                args.arg3 as u32,
+                            )
+                        })
                         .await
                     }
                     _ => unreachable!("pidfd_send_signal unexpectedly gained a typed variant"),
@@ -2045,13 +2364,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
                 match call {
                     Syscall::Other(_, args) => {
-                        self.handle_pidfd_getfd(
-                            guest,
-                            call,
-                            args.arg0 as RawFd,
-                            args.arg1 as RawFd,
-                            args.arg2 as u32,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_pidfd_getfd(
+                                guest,
+                                call,
+                                args.arg0 as RawFd,
+                                args.arg1 as RawFd,
+                                args.arg2 as u32,
+                            )
+                        })
                         .await
                     }
                     _ => unreachable!("pidfd_getfd unexpectedly gained a typed variant"),
@@ -2103,7 +2424,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
-                    self.passthrough(guest, call).await
+                    boxed_syscall_future(|| self.passthrough(guest, call)).await
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2116,7 +2437,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
-                    self.passthrough(guest, call).await
+                    boxed_syscall_future(|| self.passthrough(guest, call)).await
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2280,7 +2601,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_ownership_change_noop_syscall(call.number()) =>
             {
-                self.handle_ownership_change_noop(guest, call).await
+                boxed_syscall_future(|| self.handle_ownership_change_noop(guest, call)).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
@@ -2311,7 +2632,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // synchronization. The pinned Reverie exposes close_range as a raw
             // call, so dispatch by Sysno before the typed match.
             SyscallClassification::Determinized if call.number() == Sysno::close_range => {
-                self.handle_close_range(guest, call).await
+                boxed_syscall_future(|| self.handle_close_range(guest, call)).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-839): Optional modern memory APIs vary with
@@ -2329,32 +2650,46 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // epoll_pwait through it. Handled identically to epoll_pwait
             // (scheduler yield + record/replay forwarding).
             SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
-                self.handle_epoll_pwait2(guest, call).await
+                boxed_syscall_future(|| self.handle_epoll_pwait2(guest, call)).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3174): Review explicit Record/Replay socket dispatch.
             // https://github.com/rrnewton/hermit/pull/3174
+            SyscallClassification::Determinized
+                if matches!(call, Syscall::Read(_)) && self.network_fd_tracking_active(guest) =>
+            {
+                let Syscall::Read(read) = call else {
+                    unreachable!()
+                };
+                boxed_syscall_future(|| self.handle_owned_read(guest, read)).await
+            }
             SyscallClassification::Determinized if self.network_io_owns(guest, call) => {
-                self.handle_network_io(guest, call).await
+                boxed_syscall_future(|| self.handle_network_io(guest, call)).await
             }
             SyscallClassification::Determinized => match call {
-                Syscall::Write(w) => self.handle_write(guest, w).await,
+                Syscall::Write(w) => boxed_syscall_future(|| self.handle_write(guest, w)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
-                Syscall::Writev(w) => self.handle_writev(guest, w).await,
-                Syscall::Openat(o) => self.handle_openat(guest, o).await,
-                Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
-                Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
-                Syscall::Close(s) => self.handle_close(guest, s).await,
-                Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_read(guest, s).await
+                Syscall::Writev(w) => boxed_syscall_future(|| self.handle_writev(guest, w)).await,
+                Syscall::Openat(o) => boxed_syscall_future(|| self.handle_openat(guest, o)).await,
+                Syscall::Open(o) => {
+                    boxed_syscall_future(|| self.handle_openat(guest, o.into())).await
                 }
-                Syscall::Read(s) => self.handle_read(guest, s).await,
-                Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
-                Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
+                Syscall::Creat(o) => {
+                    boxed_syscall_future(|| self.handle_openat(guest, o.into())).await
+                }
+                Syscall::Close(s) => boxed_syscall_future(|| self.handle_close(guest, s)).await,
+                Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    boxed_syscall_future(|| self.handle_sock_diag_read(guest, s)).await
+                }
+                Syscall::Read(s) => boxed_syscall_future(|| self.handle_read(guest, s)).await,
+                Syscall::Pread64(s) => boxed_syscall_future(|| self.handle_pread64(guest, s)).await,
+                Syscall::Lseek(s) => boxed_syscall_future(|| self.handle_lseek(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
-                Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,
+                Syscall::Sendfile(s) => {
+                    boxed_syscall_future(|| self.handle_sendfile(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-887): Present a stable pre-4.5-kernel
                 // boundary so callers use determinized read/write copying.
@@ -2362,117 +2697,155 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
                 // read/pread64/pwrite64/writev.
                 Syscall::Readv(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_readv(guest, s).await
+                    boxed_syscall_future(|| self.handle_sock_diag_readv(guest, s)).await
                 }
                 Syscall::Readv(s) => {
-                    self.handle_readv_with_output(guest, s, &mut rng_readv_output)
-                        .await
+                    boxed_syscall_future(|| {
+                        self.handle_readv_with_output(guest, s, &mut rng_readv_output)
+                    })
+                    .await
                 }
                 Syscall::Preadv(s) => {
-                    self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
-                        .await
+                    boxed_syscall_future(|| {
+                        self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
+                    })
+                    .await
                 }
                 Syscall::Preadv2(s) => {
-                    self.handle_preadv2_with_output(guest, s, &mut rng_readv_output)
-                        .await
+                    boxed_syscall_future(|| {
+                        self.handle_preadv2_with_output(guest, s, &mut rng_readv_output)
+                    })
+                    .await
                 }
-                Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
-                Syscall::Pwritev2(s) => self.handle_pwritev2(guest, s).await,
+                Syscall::Pwritev(s) => boxed_syscall_future(|| self.handle_pwritev(guest, s)).await,
+                Syscall::Pwritev2(s) => {
+                    boxed_syscall_future(|| self.handle_pwritev2(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
-                Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
+                Syscall::Pwrite64(s) => {
+                    boxed_syscall_future(|| self.handle_pwrite64(guest, s)).await
+                }
                 // This syscall is advisory; fixed success preserves its API contract.
                 Syscall::Fadvise64(_) => Ok(0),
-                Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
-                Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
+                Syscall::Mmap(s) => boxed_syscall_future(|| self.handle_mmap(guest, s)).await,
+                Syscall::Madvise(s) => boxed_syscall_future(|| self.handle_madvise(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#775)
-                Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
-                Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
-                Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
-                Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
-                Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
-                Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
-                Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
-                Syscall::Statx(s) => self.handle_statx(guest, s).await,
+                Syscall::Mincore(s) => boxed_syscall_future(|| self.handle_mincore(guest, s)).await,
+                Syscall::Munmap(s) => boxed_syscall_future(|| self.handle_munmap(guest, s)).await,
+                Syscall::Mremap(s) => boxed_syscall_future(|| self.handle_mremap(guest, s)).await,
+                Syscall::Stat(s) => {
+                    boxed_syscall_future(|| self.handle_stat_family(guest, s.into())).await
+                }
+                Syscall::Lstat(s) => {
+                    boxed_syscall_future(|| self.handle_stat_family(guest, s.into())).await
+                }
+                Syscall::Fstat(s) => {
+                    boxed_syscall_future(|| self.handle_stat_family(guest, s.into())).await
+                }
+                Syscall::Newfstatat(s) => {
+                    boxed_syscall_future(|| self.handle_stat_family(guest, s.into())).await
+                }
+                Syscall::Statx(s) => boxed_syscall_future(|| self.handle_statx(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#877)
-                Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
+                Syscall::Readlink(s) => {
+                    boxed_syscall_future(|| self.handle_readlink(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
-                Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
+                Syscall::Readlinkat(s) => {
+                    boxed_syscall_future(|| self.handle_readlinkat(guest, s)).await
+                }
+                Syscall::Fcntl(s) => boxed_syscall_future(|| self.handle_fcntl(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-912)
                 Syscall::Ioctl(s)
                     if syscalls::socket_timestamp_ioctl::is_socket_timestamp_ioctl(s) =>
                 {
-                    self.handle_socket_timestamp_ioctl(guest, s).await
+                    boxed_syscall_future(|| self.handle_socket_timestamp_ioctl(guest, s)).await
                 }
-                Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
-                Syscall::Futex(s) => self.handle_futex(guest, s).await,
+                Syscall::Ioctl(s) => boxed_syscall_future(|| self.handle_ioctl(guest, s)).await,
+                Syscall::Futex(s) => boxed_syscall_future(|| self.handle_futex(guest, s)).await,
 
-                Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
-                Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
-                Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
+                Syscall::Clone(s) => {
+                    boxed_syscall_future(|| self.handle_clone_family(guest, s.into())).await
+                }
+                Syscall::Clone3(s) => {
+                    boxed_syscall_future(|| self.handle_clone_family(guest, s.into())).await
+                }
+                Syscall::Fork(s) => {
+                    boxed_syscall_future(|| self.handle_clone_family(guest, s.into())).await
+                }
 
                 // Forward vfork as vfork (rather than rewriting to fork) so the
                 // kernel enforces the CLONE_VFORK parent-blocking contract while the
                 // child registers itself and runs to exec/exit.
-                Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
-                Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
-                Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
+                Syscall::Vfork(s) => {
+                    boxed_syscall_future(|| self.handle_clone_family(guest, s.into())).await
+                }
+                Syscall::Wait4(s) => boxed_syscall_future(|| self.handle_wait4(guest, s)).await,
+                Syscall::Waitid(s) => boxed_syscall_future(|| self.handle_waitid(guest, s)).await,
 
-                Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
-                Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
+                Syscall::Setpgid(s) => boxed_syscall_future(|| self.handle_setpgid(guest, s)).await,
+                Syscall::Setsid(s) => boxed_syscall_future(|| self.handle_setsid(guest, s)).await,
                 Syscall::Gettimeofday(s) => {
                     if virtualize_time {
-                        self.handle_gettimeofday(guest, s).await
+                        boxed_syscall_future(|| self.handle_gettimeofday(guest, s)).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                        })
                         .await
                     }
                 }
                 Syscall::Time(s) => {
                     if virtualize_time {
-                        self.handle_time(guest, s).await
+                        boxed_syscall_future(|| self.handle_time(guest, s)).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                        })
                         .await
                     }
                 }
                 Syscall::ClockGettime(s) => {
                     if virtualize_time {
-                        self.handle_clock_gettime(guest, s).await
+                        boxed_syscall_future(|| self.handle_clock_gettime(guest, s)).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                        })
                         .await
                     }
                 }
                 Syscall::ClockGetres(s) => {
                     if virtualize_time {
-                        self.handle_clock_getres(guest, s).await
+                        boxed_syscall_future(|| self.handle_clock_getres(guest, s)).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                        })
                         .await
                     }
                 }
@@ -2481,22 +2854,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-892)
-                Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
+                Syscall::Getitimer(s) => {
+                    boxed_syscall_future(|| self.handle_getitimer(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
+                Syscall::Setitimer(s) => {
+                    boxed_syscall_future(|| self.handle_setitimer(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-857): Virtual NTP query and fixed mutation refusal.
                 Syscall::Adjtimex(s) => {
                     if virtualize_time {
-                        self.handle_adjtimex(guest, s).await
+                        boxed_syscall_future(|| self.handle_adjtimex(guest, s)).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                        })
                         .await
                     }
                 }
@@ -2504,46 +2883,66 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-857): Clock-id form of virtual NTP query.
                 Syscall::ClockAdjtime(s) => {
                     if virtualize_time {
-                        self.handle_clock_adjtime(guest, s).await
+                        boxed_syscall_future(|| self.handle_clock_adjtime(guest, s)).await
                     } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
+                        boxed_syscall_future(|| {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                        })
                         .await
                     }
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-857): Empty virtual kernel ring buffer.
-                Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
-                Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                Syscall::Syslog(s) => boxed_syscall_future(|| self.handle_syslog(guest, s)).await,
+                Syscall::ArchPrctl(s) => {
+                    boxed_syscall_future(|| self.handle_arch_prctl(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
+                Syscall::Seccomp(s) => boxed_syscall_future(|| self.handle_seccomp(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setpriority(s) => self.handle_setpriority(guest, s).await,
-                Syscall::Uname(s) => self.handle_uname(guest, s).await,
-                Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
-                Syscall::Exit(s) => self.handle_exit(guest, s).await,
+                Syscall::Prctl(s) => boxed_syscall_future(|| self.handle_prctl(guest, s)).await,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Getpriority(s) => {
+                    boxed_syscall_future(|| self.handle_getpriority(guest, s)).await
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                Syscall::Setpriority(s) => {
+                    boxed_syscall_future(|| self.handle_setpriority(guest, s)).await
+                }
+                Syscall::Uname(s) => boxed_syscall_future(|| self.handle_uname(guest, s)).await,
+                Syscall::ExitGroup(s) => {
+                    boxed_syscall_future(|| self.handle_exit_group(guest, s)).await
+                }
+                Syscall::Exit(s) => boxed_syscall_future(|| self.handle_exit(guest, s)).await,
 
-                Syscall::Dup(w) => self.handle_dup(guest, w).await,
-                Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
-                Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
-                Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
-                Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
-                Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
-                Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
-                Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
+                Syscall::Dup(w) => boxed_syscall_future(|| self.handle_dup(guest, w)).await,
+                Syscall::Dup2(w) => boxed_syscall_future(|| self.handle_dup2(guest, w)).await,
+                Syscall::Dup3(w) => boxed_syscall_future(|| self.handle_dup3(guest, w)).await,
+                Syscall::Pipe(w) => {
+                    boxed_syscall_future(|| self.handle_pipe2(guest, w.into())).await
+                }
+                Syscall::Pipe2(w) => boxed_syscall_future(|| self.handle_pipe2(guest, w)).await,
+                Syscall::Getrandom(s) => {
+                    boxed_syscall_future(|| self.handle_getrandom(guest, s)).await
+                }
+                Syscall::Utime(s) => boxed_syscall_future(|| self.handle_utime(guest, s))
+                    .await
+                    .map_err(Into::into),
+                Syscall::Utimes(s) => boxed_syscall_future(|| self.handle_utimes(guest, s))
+                    .await
+                    .map_err(Into::into),
                 // NB: lutimes is a libc function not a syscall
-                Syscall::Utimensat(s) => self.handle_utimensat(guest, s).await.map_err(Into::into),
+                Syscall::Utimensat(s) => boxed_syscall_future(|| self.handle_utimensat(guest, s))
+                    .await
+                    .map_err(Into::into),
                 // NB: futimes/futimens are libc functions not a syscall,
                 // futimesat is obsolete, return -ENOSYS for simplicity.
                 Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
@@ -2551,82 +2950,141 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::IoUringSetup(_)
                 | Syscall::IoUringEnter(_)
                 | Syscall::IoUringRegister(_) => Err(Error::Errno(Errno::ENOSYS)),
-                Syscall::Socket(s) => self.handle_socket(guest, s).await,
-                Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
-                Syscall::Connect(s) => self.handle_connect(guest, s).await,
-                Syscall::Bind(s) => self.handle_bind(guest, s).await,
+                Syscall::Socket(s) => boxed_syscall_future(|| self.handle_socket(guest, s)).await,
+                Syscall::Socketpair(s) => {
+                    boxed_syscall_future(|| self.handle_socketpair(guest, s)).await
+                }
+                Syscall::Connect(s) => boxed_syscall_future(|| self.handle_connect(guest, s)).await,
+                Syscall::Bind(s) => boxed_syscall_future(|| self.handle_bind(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setsockopt(s) => self.handle_setsockopt(guest, s).await,
+                Syscall::Setsockopt(s) => {
+                    boxed_syscall_future(|| self.handle_setsockopt(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Listen(s) => self.handle_listen(guest, s).await,
+                Syscall::Listen(s) => boxed_syscall_future(|| self.handle_listen(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getsockname(s) => self.handle_getsockname(guest, s).await,
+                Syscall::Getsockname(s) => {
+                    boxed_syscall_future(|| self.handle_getsockname(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getpeername(s) => self.handle_getpeername(guest, s).await,
+                Syscall::Getpeername(s) => {
+                    boxed_syscall_future(|| self.handle_getpeername(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
+                Syscall::Getsockopt(s) => {
+                    boxed_syscall_future(|| self.handle_getsockopt(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#818): shutdown is the lone remaining
                 // socket-family syscall; half-closes a tracked socket and
                 // forwards via record_or_replay (KVM ratchet round 12).
-                Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
-                Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
-                Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
-                Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
-                Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
-                Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
-                Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
-                Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
+                Syscall::Shutdown(s) => {
+                    boxed_syscall_future(|| self.handle_shutdown(guest, s)).await
+                }
+                Syscall::Eventfd(s) => {
+                    boxed_syscall_future(|| self.handle_eventfd2(guest, s.into())).await
+                }
+                Syscall::Eventfd2(s) => {
+                    boxed_syscall_future(|| self.handle_eventfd2(guest, s)).await
+                }
+                Syscall::Signalfd(s) => {
+                    boxed_syscall_future(|| self.handle_signalfd4(guest, s.into())).await
+                }
+                Syscall::Signalfd4(s) => {
+                    boxed_syscall_future(|| self.handle_signalfd4(guest, s)).await
+                }
+                Syscall::TimerfdCreate(s) => {
+                    boxed_syscall_future(|| self.handle_timerfd_create(guest, s)).await
+                }
+                Syscall::TimerfdSettime(s) => {
+                    boxed_syscall_future(|| self.handle_timerfd_settime(guest, s)).await
+                }
+                Syscall::TimerfdGettime(s) => {
+                    boxed_syscall_future(|| self.handle_timerfd_gettime(guest, s)).await
+                }
                 Syscall::InotifyInit(s) => {
-                    self.handle_inotify_init1(guest, InotifyInit1::from(s))
+                    boxed_syscall_future(|| self.handle_inotify_init1(guest, InotifyInit1::from(s)))
                         .await
                 }
-                Syscall::InotifyInit1(s) => self.handle_inotify_init1(guest, s).await,
-                Syscall::InotifyAddWatch(s) => self.handle_inotify_add_watch(guest, s).await,
-                Syscall::InotifyRmWatch(s) => self.handle_inotify_rm_watch(guest, s).await,
-                Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
+                Syscall::InotifyInit1(s) => {
+                    boxed_syscall_future(|| self.handle_inotify_init1(guest, s)).await
+                }
+                Syscall::InotifyAddWatch(s) => {
+                    boxed_syscall_future(|| self.handle_inotify_add_watch(guest, s)).await
+                }
+                Syscall::InotifyRmWatch(s) => {
+                    boxed_syscall_future(|| self.handle_inotify_rm_watch(guest, s)).await
+                }
+                Syscall::MemfdCreate(s) => {
+                    boxed_syscall_future(|| self.handle_memfd_create(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-862): Record/replay and register pidfds.
-                Syscall::PidfdOpen(s) => self.handle_pidfd_open(guest, s).await,
+                Syscall::PidfdOpen(s) => {
+                    boxed_syscall_future(|| self.handle_pidfd_open(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-899): Host object handles and mount IDs
                 // are outside Detcore's filesystem identity model.
                 Syscall::NameToHandleAt(_) => Err(Error::Errno(Errno::EOPNOTSUPP)),
-                Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
-                Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
-                Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
+                Syscall::Userfaultfd(s) => {
+                    boxed_syscall_future(|| self.handle_userfaultfd(guest, s)).await
+                }
+                Syscall::Accept(s) => {
+                    boxed_syscall_future(|| self.handle_accept4(guest, s.into())).await
+                }
+                Syscall::Accept4(s) => boxed_syscall_future(|| self.handle_accept4(guest, s)).await,
 
-                Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-                Syscall::ClockNanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-                Syscall::SchedYield(s) => self.handle_sched_yield(guest, s).await,
+                Syscall::Nanosleep(s) => {
+                    boxed_syscall_future(|| self.handle_nanosleep_family(guest, s.into())).await
+                }
+                Syscall::ClockNanosleep(s) => {
+                    boxed_syscall_future(|| self.handle_nanosleep_family(guest, s.into())).await
+                }
+                Syscall::SchedYield(s) => {
+                    boxed_syscall_future(|| self.handle_sched_yield(guest, s)).await
+                }
 
                 // NB: getdents is not recommended, (g)libc should call getdents64 only
                 // see: sysdeps/unix/sysv/linux/getdents.c.
-                Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
-                Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
+                Syscall::Getdents(s) => {
+                    boxed_syscall_future(|| self.handle_getdents(guest, s)).await
+                }
+                Syscall::Getdents64(s) => {
+                    boxed_syscall_future(|| self.handle_getdents64(guest, s)).await
+                }
 
-                Syscall::Poll(s) => self.handle_poll(guest, s).await,
+                Syscall::Poll(s) => boxed_syscall_future(|| self.handle_poll(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
-                Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
+                Syscall::Pselect6(s) => {
+                    boxed_syscall_future(|| self.handle_pselect6(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
-                Syscall::Select(s) => self.handle_select(guest, s).await,
+                Syscall::Select(s) => boxed_syscall_future(|| self.handle_select(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+                Syscall::Ppoll(s) => boxed_syscall_future(|| self.handle_ppoll(guest, s)).await,
                 Syscall::EpollCreate(s) => {
-                    self.handle_epoll_create1(guest, EpollCreate1::from(s))
-                        .await
+                    boxed_syscall_future(|| self.handle_epoll_create(guest, s)).await
                 }
-                Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
-                Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
-                Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
-                Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
+                Syscall::EpollCreate1(s) => {
+                    boxed_syscall_future(|| self.handle_epoll_create1(guest, s)).await
+                }
+                Syscall::EpollCtl(s) => {
+                    boxed_syscall_future(|| self.handle_epoll_ctl(guest, s)).await
+                }
+                Syscall::EpollPwait(s) => {
+                    boxed_syscall_future(|| self.handle_epoll_pwait(guest, s)).await
+                }
+                Syscall::EpollWait(s) => {
+                    boxed_syscall_future(|| self.handle_epoll_wait(guest, s)).await
+                }
                 Syscall::EpollWaitOld(s) => panic!(
                     "Not handling deprecated syscall: {}",
                     s.display(&guest.memory())
@@ -2636,8 +3094,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // The obsolete x86_64 entry point is absent from modern Linux kernels.
                 Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
 
-                Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
-                Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
+                Syscall::SchedGetaffinity(s) => {
+                    boxed_syscall_future(|| self.handle_sched_getaffinity(guest, s)).await
+                }
+                Syscall::SchedSetaffinity(s) => {
+                    boxed_syscall_future(|| self.handle_sched_setaffinity(guest, s)).await
+                }
 
                 // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling
                 // policy. Hermit exposes a single virtual NUMA node and replaces
@@ -2650,15 +3112,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#720)
                 Syscall::Mbind(_) => Ok(0),
                 Syscall::SetMempolicy(_) => Ok(0),
-                Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
+                Syscall::GetMempolicy(s) => {
+                    boxed_syscall_future(|| self.handle_get_mempolicy(guest, s)).await
+                }
                 Syscall::MigratePages(_) => Ok(0),
-                Syscall::MovePages(s) => self.handle_move_pages(guest, s).await,
+                Syscall::MovePages(s) => {
+                    boxed_syscall_future(|| self.handle_move_pages(guest, s)).await
+                }
                 Syscall::SchedSetscheduler(_) => Ok(0),
                 Syscall::SchedSetparam(_) => Ok(0),
                 // Report the fixed default policy SCHED_OTHER (0).
                 Syscall::SchedGetscheduler(_) => Ok(0),
-                Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
-                Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
+                Syscall::SchedGetparam(s) => {
+                    boxed_syscall_future(|| self.handle_sched_getparam(guest, s)).await
+                }
+                Syscall::SchedRrGetInterval(s) => {
+                    boxed_syscall_future(|| self.handle_sched_rr_get_interval(guest, s)).await
+                }
 
                 // ===== BATCH 51: fail-closed utility syscalls, re-enabling chrt,
                 // ionice, and flock under --strict. Detcore replaces the Linux
@@ -2681,19 +3151,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // which it cannot park a thread on deterministically).
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
-                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+                Syscall::SchedGetattr(s) => {
+                    boxed_syscall_future(|| self.handle_sched_getattr(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
-                Syscall::SchedSetattr(s) => self.handle_sched_setattr(guest, s).await,
+                Syscall::SchedSetattr(s) => {
+                    boxed_syscall_future(|| self.handle_sched_setattr(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
-                Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
+                Syscall::IoprioSet(s) => {
+                    boxed_syscall_future(|| self.handle_ioprio_set(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-881): Review virtual ioprio_get defaults.
-                Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
+                Syscall::IoprioGet(s) => {
+                    boxed_syscall_future(|| self.handle_ioprio_get(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#2373)
-                Syscall::Flock(s) => self.handle_flock(guest, s).await,
+                Syscall::Flock(s) => boxed_syscall_future(|| self.handle_flock(guest, s)).await,
 
                 // TODO-HUMAN-REVIEW(PR-1064): recvfrom/read/readv/recvmmsg reach
                 // a NETLINK_SOCK_DIAG dump exactly as recvmsg does. Until they
@@ -2704,15 +3182,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // skip it. Non-socket-diag descriptors take the same path as
                 // before; the predicate is checked inside.
                 Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_recvfrom(guest, s).await
+                    boxed_syscall_future(|| self.handle_sock_diag_recvfrom(guest, s)).await
                 }
-                Syscall::Recvfrom(s) => self.handle_socket_receive(guest, s, s.fd(), true).await,
+                Syscall::Recvfrom(s) => {
+                    boxed_syscall_future(|| self.handle_socket_receive(guest, s, s.fd(), true))
+                        .await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
-                Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
-                Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
-                Syscall::Sendmsg(s) => self.handle_sendmsg(guest, s).await,
-                Syscall::Sendmmsg(s) => self.handle_sendmmsg(guest, s).await,
+                Syscall::Recvmsg(s) => boxed_syscall_future(|| self.handle_recvmsg(guest, s)).await,
+                Syscall::Sendto(s) => boxed_syscall_future(|| self.handle_sendrecv(guest, s)).await,
+                Syscall::Sendmsg(s) => boxed_syscall_future(|| self.handle_sendmsg(guest, s)).await,
+                Syscall::Sendmmsg(s) => {
+                    boxed_syscall_future(|| self.handle_sendmmsg(guest, s)).await
+                }
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
@@ -2723,34 +3206,50 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // introduce nondeterminism.
                 // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
                 Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_recvmmsg(guest, s).await
+                    boxed_syscall_future(|| self.handle_sock_diag_recvmmsg(guest, s)).await
                 }
-                Syscall::Recvmmsg(s) => self.handle_recvmmsg(guest, s).await,
-                Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
-                Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
+                Syscall::Recvmmsg(s) => {
+                    boxed_syscall_future(|| self.handle_recvmmsg(guest, s)).await
+                }
+                Syscall::RtSigtimedwait(s) => {
+                    boxed_syscall_future(|| self.handle_rt_sigtimedwait(guest, s)).await
+                }
+                Syscall::RtSigsuspend(s) => {
+                    boxed_syscall_future(|| self.handle_rt_sigsuspend(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
+                Syscall::RtSigpending(s) => {
+                    boxed_syscall_future(|| self.handle_rt_sigpending(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Kill(s) => self.handle_kill(guest, s).await,
+                Syscall::Kill(s) => boxed_syscall_future(|| self.handle_kill(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Tgkill(s) => self.handle_tgkill(guest, s).await,
+                Syscall::Tgkill(s) => boxed_syscall_future(|| self.handle_tgkill(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::Tkill(s) => self.handle_tkill(guest, s).await,
+                Syscall::Tkill(s) => boxed_syscall_future(|| self.handle_tkill(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtSigqueueinfo(s) => self.handle_rt_sigqueueinfo(guest, s).await,
+                Syscall::RtSigqueueinfo(s) => {
+                    boxed_syscall_future(|| self.handle_rt_sigqueueinfo(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtTgsigqueueinfo(s) => self.handle_rt_tgsigqueueinfo(guest, s).await,
+                Syscall::RtTgsigqueueinfo(s) => {
+                    boxed_syscall_future(|| self.handle_rt_tgsigqueueinfo(guest, s)).await
+                }
 
-                Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
-                Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
+                Syscall::Execve(s) => {
+                    boxed_syscall_future(|| self.handle_execveat(guest, s.into())).await
+                }
+                Syscall::Execveat(s) => {
+                    boxed_syscall_future(|| self.handle_execveat(guest, s)).await
+                }
 
-                Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
+                Syscall::Getcpu(s) => boxed_syscall_future(|| self.handle_getcpu(guest, s)).await,
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#1549): Credential-query
@@ -2765,36 +3264,64 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 | Syscall::Geteuid(_)
                 | Syscall::Getgid(_)
                 | Syscall::Getegid(_) => Ok(0),
-                Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
-                Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
-                Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
-                Syscall::RtSigaction(s) => self.handle_rt_sigaction(guest, s).await,
-                Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
-                Syscall::Pause(s) => self.handle_pause(guest, s).await,
+                Syscall::Getresuid(s) => {
+                    boxed_syscall_future(|| self.handle_getresuid(guest, s)).await
+                }
+                Syscall::Getresgid(s) => {
+                    boxed_syscall_future(|| self.handle_getresgid(guest, s)).await
+                }
+                Syscall::RtSigprocmask(s) => {
+                    boxed_syscall_future(|| self.handle_rt_sigprocmask(guest, s)).await
+                }
+                Syscall::RtSigaction(s) => {
+                    boxed_syscall_future(|| self.handle_rt_sigaction(guest, s)).await
+                }
+                Syscall::Alarm(s) => boxed_syscall_future(|| self.handle_alarm(guest, s)).await,
+                Syscall::Pause(s) => boxed_syscall_future(|| self.handle_pause(guest, s)).await,
 
-                Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
-                Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                Syscall::Getrusage(s) => {
+                    boxed_syscall_future(|| self.handle_getrusage(guest, s)).await
+                }
+                Syscall::Sysinfo(s) => boxed_syscall_future(|| self.handle_sysinfo(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Times(s) => self.handle_times(guest, s).await,
-                Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
+                Syscall::Times(s) => boxed_syscall_future(|| self.handle_times(guest, s)).await,
+                Syscall::Prlimit64(s) => {
+                    boxed_syscall_future(|| self.handle_prlimit64(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getrlimit(s) => self.handle_getrlimit(guest, s).await,
+                Syscall::Getrlimit(s) => {
+                    boxed_syscall_future(|| self.handle_getrlimit(guest, s)).await
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
+                Syscall::Setrlimit(s) => {
+                    boxed_syscall_future(|| self.handle_setrlimit(guest, s)).await
+                }
 
                 // POSIX per-process timers use the virtual clock and scheduler
                 // for deterministic arming and supported signal delivery.
-                Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
-                Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
-                Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
-                Syscall::TimerGetoverrun(s) => self.handle_timer_getoverrun(guest, s).await,
-                Syscall::TimerDelete(s) => self.handle_timer_delete(guest, s).await,
+                Syscall::TimerCreate(s) => {
+                    boxed_syscall_future(|| self.handle_timer_create(guest, s)).await
+                }
+                Syscall::TimerSettime(s) => {
+                    boxed_syscall_future(|| self.handle_timer_settime(guest, s)).await
+                }
+                Syscall::TimerGettime(s) => {
+                    boxed_syscall_future(|| self.handle_timer_gettime(guest, s)).await
+                }
+                Syscall::TimerGetoverrun(s) => {
+                    boxed_syscall_future(|| self.handle_timer_getoverrun(guest, s)).await
+                }
+                Syscall::TimerDelete(s) => {
+                    boxed_syscall_future(|| self.handle_timer_delete(guest, s)).await
+                }
 
                 // Serialized threads share a total memory order, so process-wide
                 // memory barriers are trivially satisfied and can be no-ops.
-                Syscall::Membarrier(s) => self.handle_membarrier(guest, s).await,
+                Syscall::Membarrier(s) => {
+                    boxed_syscall_future(|| self.handle_membarrier(guest, s)).await
+                }
 
                 // Filesystem statistics: passthrough is record/replay-aware so the
                 // (otherwise host-dependent) result is captured and reproduced.
@@ -2802,16 +3329,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // host-varying fields (free blocks/inodes, fsid) so the result is
                 // deterministic under --verify (a bare passthrough diverged, e.g.
                 // for tar).
-                Syscall::Statfs(s) => self.handle_statfs(guest, s).await,
-                Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
+                Syscall::Statfs(s) => boxed_syscall_future(|| self.handle_statfs(guest, s)).await,
+                Syscall::Fstatfs(s) => boxed_syscall_future(|| self.handle_fstatfs(guest, s)).await,
 
                 unexpected => {
-                    self.handle_unsupported_syscall(
-                        guest,
-                        unexpected,
-                        dettid,
-                        panic_on_unsupported_syscalls,
-                    )
+                    boxed_syscall_future(|| {
+                        self.handle_unsupported_syscall(
+                            guest,
+                            unexpected,
+                            dettid,
+                            panic_on_unsupported_syscalls,
+                        )
+                    })
                     .await
                 }
             },
@@ -2822,7 +3351,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // the scheduler supplies the logical CHILD_CLEARTID wake.
             SyscallClassification::PassThrough if call.number() == Sysno::set_tid_address => {
                 match call {
-                    Syscall::SetTidAddress(s) => self.handle_set_tid_address(guest, s).await,
+                    Syscall::SetTidAddress(s) => {
+                        boxed_syscall_future(|| self.handle_set_tid_address(guest, s)).await
+                    }
                     _ => unreachable!("set_tid_address unexpectedly lost its typed variant"),
                 }
             }
@@ -2835,8 +3366,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // against its own futex waiter pool.
             SyscallClassification::PassThrough if call.number() == Sysno::set_robust_list => {
                 match call {
-                    Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
-                    _ => self.passthrough(guest, call).await,
+                    Syscall::SetRobustList(s) => {
+                        boxed_syscall_future(|| self.handle_set_robust_list(guest, s)).await
+                    }
+                    _ => boxed_syscall_future(|| self.passthrough(guest, call)).await,
                 }
             }
             // faccessat2 and fchmodat2 are untyped in the pinned Reverie revision; the
@@ -2844,10 +3377,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // PassThrough syscall, through the blanket arm below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
-            SyscallClassification::PassThrough => self.passthrough(guest, call).await,
+            SyscallClassification::PassThrough => {
+                boxed_syscall_future(|| self.passthrough(guest, call)).await
+            }
             SyscallClassification::Unsupported => {
-                self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
-                    .await
+                boxed_syscall_future(|| {
+                    self.handle_unsupported_syscall(
+                        guest,
+                        call,
+                        dettid,
+                        panic_on_unsupported_syscalls,
+                    )
+                })
+                .await
             }
         };
 
@@ -2941,6 +3483,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         exit_status: ExitStatus,
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
+        #[cfg(test)]
+        let prestart_control = tool_global::native_prestart_tests::before_consuming_exit(
+            tid,
+            &thread_state,
+            exit_status.clone(),
+        );
         debug!(
             "[detcore, dtid {}] thread exit hook, deregistering from scheduler.",
             dettid
@@ -2991,6 +3539,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
+        // Settle exact known-uninvoked custody before ordinary owner cleanup
+        // can prune unsubmitted admissions, and before robust cleanup awaits.
+        tool_global::settle_no_seq_preparations(
+            thread_state.thread_logical_time.clone(),
+            &self.cfg,
+            global_state,
+            mm_id,
+            thread_state.uninvoked_wait_call.take(),
+            thread_state.uninvoked_fd_clone.take(),
+        )
+        .await;
+        tool_global::original_connect_owner_gone(
+            thread_state.thread_logical_time.clone(),
+            mm_id,
+            global_state,
+            thread_state.original_connect.take(),
+        )
+        .await;
         tool_global::network_owner_gone(
             &self.cfg,
             thread_state.thread_logical_time.clone(),
@@ -3067,6 +3633,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 exit_status,
             )
             .await?;
+        #[cfg(test)]
+        tool_global::native_prestart_tests::after_consuming_exit(prestart_control);
 
         Ok(())
     }
@@ -3598,6 +4166,26 @@ mod thread_start_identity_tests {
     use super::*;
 
     #[test]
+    fn initial_root_stop_rejects_child_exec_and_changed_callback_identity() {
+        let thread = DetTid::from_raw(31);
+        let owner = network_replay::NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        let boundary = InitialRootStop::at_callback(true, owner, 31, 31).unwrap();
+        assert!(boundary.matches(owner, 31, 31));
+        assert!(!boundary.matches(owner, 31, 32));
+        assert!(InitialRootStop::at_callback(false, owner, 31, 31).is_none());
+        assert!(InitialRootStop::at_callback(true, owner, 30, 31).is_none());
+        let exec = network_replay::NetworkStreamOwner {
+            mm: owner.mm.for_exec(thread),
+            ..owner
+        };
+        assert!(InitialRootStop::at_callback(true, exec, 31, 31).is_none());
+        assert!(!boundary.matches(exec, 31, 31));
+    }
+
+    #[test]
     fn backend_process_identity_is_preserved() {
         let backend_detpid = DetPid::from_raw(3);
         assert_eq!(
@@ -3695,5 +4283,87 @@ mod thread_cpu_time_tests {
             assert!(user < parent.thread_logical_time.user_cpu_time());
             assert!(system <= parent.thread_logical_time.system_cpu_time());
         }
+    }
+}
+
+#[cfg(test)]
+mod native_actual_constructor_tests {
+    use super::*;
+    #[test]
+    fn actual_fields_reach_constructor_and_shared_semantic_consumer() {
+        for actual in [
+            CloneFlags::empty(),
+            CloneFlags::CLONE_VM,
+            CloneFlags::CLONE_FILES,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND | CloneFlags::CLONE_THREAD,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_VFORK | CloneFlags::CLONE_CHILD_CLEARTID,
+        ] {
+            let cfg = Config {
+                sequentialize_threads: false,
+                ..Config::default()
+            };
+            let tool = <Detcore as Tool>::new(Tid::from_raw(41), &cfg);
+            let (mut sched, birth, outcome) = crate::scheduler::synthetic_common_birth(
+                CloneFlags::empty(),
+                actual,
+                if actual.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+                    0x9876
+                } else {
+                    0
+                },
+                12,
+                false,
+            );
+            let mut parent = ThreadState::new(DetTid::from_raw(41), &cfg, ());
+            parent.detpid = Some(parent.dettid);
+            parent.clone_flags = Some(CloneFlags::empty());
+            parent.pending_fd_clone = birth.fd_permit();
+            parent.pending_no_seq_birth = Some(birth.clone());
+            parent.native_birth_required = true;
+            parent.native_child_outcome = Some(outcome.clone());
+            let child =
+                tool.init_thread_state(Tid::from_raw(42), Some((Tid::from_raw(41), &parent)));
+            assert_eq!(
+                Arc::ptr_eq(&parent.memory_metadata, &child.memory_metadata),
+                actual.contains(CloneFlags::CLONE_VM)
+            );
+            assert_eq!(
+                Arc::ptr_eq(&parent.file_metadata, &child.file_metadata),
+                actual.contains(CloneFlags::CLONE_FILES)
+            );
+            for shared in [
+                Arc::ptr_eq(&parent.posix_timers, &child.posix_timers),
+                Arc::ptr_eq(&parent.resource_limits, &child.resource_limits),
+                Arc::ptr_eq(&parent.process_cpu_time, &child.process_cpu_time),
+                Arc::ptr_eq(&parent.robust_list_process, &child.robust_list_process),
+            ] {
+                assert_eq!(shared, actual.contains(CloneFlags::CLONE_THREAD));
+            }
+            assert_eq!(child.mm_id, outcome.child().mm);
+            assert_eq!(
+                child.pending_no_seq_birth.as_ref().unwrap().flags(),
+                CloneFlags::empty()
+            );
+            let inherited = child.pending_no_seq_birth.as_ref().unwrap();
+            assert!(
+                sched
+                    .thread_tree
+                    .consume_no_seq_birth(inherited, child.dettid)
+            );
+            assert_eq!(
+                sched.registered_process(child.dettid),
+                Some(outcome.process())
+            );
+            assert_eq!(parent.clone_flags, Some(CloneFlags::empty()));
+        }
+    }
+    #[test]
+    fn serialized_active_thread_state_cannot_fall_back_to_requested_fields() {
+        let cfg = Config::default();
+        let mut state = ThreadState::new(DetTid::from_raw(41), &cfg, ());
+        state.native_birth_required = true;
+        let decoded: ThreadState<()> =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert!(decoded.native_construction().is_err());
     }
 }

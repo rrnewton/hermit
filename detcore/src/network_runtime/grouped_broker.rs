@@ -8,8 +8,29 @@
 //! Calls are synchronous and check the original absolute deadline. Durable
 //! filesystem I/O may block; enclosing process supervision remains required.
 //! After durability, deadline checks precede ACKs and C rechecks before effects.
+mod adoption;
+mod cleanup;
+mod cleanup_native;
+mod entry;
+mod guardian;
 mod journal;
+mod keeper;
+mod native;
+mod parent_launch;
+mod runtime_cleanup;
+mod runtime_keeper;
+mod serial;
+mod source_owner;
+
+pub use entry::run_grouped_leaf_delegate_process;
+pub use entry::run_grouped_source_process;
+pub use entry::run_grouped_startup_controller_process;
+pub(super) use native::Bridge;
+pub(super) use runtime_cleanup::RuntimeCleanup;
+pub use runtime_keeper::run_grouped_runtime_keeper_process;
+pub use source_owner::run_grouped_source_owner_process;
 mod owner;
+pub use owner::GroupedParentOwner;
 #[cfg(test)]
 mod tests;
 mod wire;

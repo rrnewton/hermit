@@ -1120,6 +1120,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Preserve legacy size/error ordering in the native network allocator.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    pub async fn handle_epoll_create<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollCreate,
+    ) -> Result<i64, Error> {
+        if self.network_fd_tracking_active(guest) {
+            let dettid = guest.thread_state().dettid;
+            resource_request(guest, Resources::new(dettid)).await;
+            return self.network_original_epoll(guest, call.into()).await;
+        }
+        self.handle_epoll_create1(guest, syscalls::EpollCreate1::from(call))
+            .await
+    }
+
     /// epoll_create1 syscall
     pub async fn handle_epoll_create1<G: Guest<Self>>(
         &self,
@@ -1128,6 +1144,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        if self.network_fd_tracking_active(guest) {
+            return self.network_original_epoll(guest, call.into()).await;
+        }
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         // Register the epoll fd in the DetFd table like every other
         // fd-creating syscall (openat, eventfd2, pipe2, socket, ...). Without
@@ -1159,6 +1179,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollCtl,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3174): actual paired control ownership.
+        // Initial Record epoll capability remains closed until readiness/copy
+        // causality and this native prerequisite are qualified together.
+        if self.network_fd_tracking_active(guest) {
+            return self.network_original_epoll_ctl(guest, call).await;
+        }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
         Ok(self.record_or_replay(guest, call).await?)
@@ -1577,6 +1604,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         if received == 0 || segments.is_empty() {
             return Ok(());
         }
+        let route = self.netlink_route_reply_fd(guest, fd);
+        self.sanitize_selected_sock_diag_segments(guest, route, segments, received)
+    }
+
+    pub(crate) fn sanitize_selected_sock_diag_segments<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        route: bool,
+        segments: &[(usize, usize)],
+        received: usize,
+    ) -> Result<(), Error> {
+        if received == 0 || segments.is_empty() {
+            return Ok(());
+        }
         let mut filled: Vec<(AddrMut<'_, u8>, usize)> = Vec::new();
         let mut buffer: Vec<u8> = Vec::with_capacity(received);
         let mut remaining = received;
@@ -1600,7 +1641,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // sanitizers: one zeroes live interface counters, the other determinizes
         // supported socket identities. The descriptor decides which, so a guest
         // holding both kinds of socket gets each handled correctly.
-        let modified = if self.netlink_route_reply_fd(guest, fd) {
+        let modified = if route {
             crate::netlink_route::sanitize_route_link_stats(&mut buffer)
         } else {
             crate::sock_diag::sanitize_sock_diag_identities(&mut buffer)

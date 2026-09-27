@@ -38,6 +38,18 @@ static ALLOC: test_allocator::Global = test_allocator::Global;
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 struct PhysicalTimerSlackProbe;
 
+// The probe changes only PR_GET_DUMPABLE below. Its Read hook preserves the
+// unchanged syscall and the backend's typed completion/interruption boundary.
+impl detcore::RecordOrReplay for PhysicalTimerSlackProbe {
+    async fn invoke_original_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Read,
+    ) -> Result<reverie::InjectedReadResult, Error> {
+        Ok(guest.inject_original_read(call).await)
+    }
+}
+
 #[reverie::tool]
 impl Tool for PhysicalTimerSlackProbe {
     type GlobalState = detcore::GlobalState;

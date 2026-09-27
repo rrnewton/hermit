@@ -752,9 +752,15 @@ pub fn ioaction_based_on_fd_status<
 ) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    let (phys, virt) = guest.thread_state().with_detfd(fd, |detfd| {
-        (detfd.physically_nonblocking(), detfd.is_nonblocking())
-    })?;
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| ioaction_for_description(fd, detfd))
+}
+
+/// Choose the existing strategy from an already admitted description. This
+/// helper does not look up a numeric descriptor or issue a scheduling request.
+pub(crate) fn ioaction_for_description(fd: i32, detfd: &crate::fd::DetFd) -> IOAction {
+    let (phys, virt) = (detfd.physically_nonblocking(), detfd.is_nonblocking());
     tracing::trace!(
         "Checking FD {} for nonblocking: physical {} / virtual {}",
         fd,
@@ -769,13 +775,13 @@ pub fn ioaction_based_on_fd_status<
         );
     } else if !virt && !phys {
         // FF: logically blocking, physically blocking, this could only work with BlockingExternalIO.
-        Ok(IOAction::Blocking)
+        IOAction::Blocking
     } else if virt && phys {
         // TT: both nonblocking, so firing once is sufficient
-        Ok(IOAction::PassThru)
+        IOAction::PassThru
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
-        Ok(IOAction::NonblockizeRetry)
+        IOAction::NonblockizeRetry
     }
 }
 

@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! The process-local portion of the Detcore Reverie-tool.
 
@@ -107,6 +107,26 @@ pub struct FileMetadata {
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
+}
+
+/// Fence around the one initial import. It names the complete local preimage,
+/// not a physical descriptor claim; the private runtime independently checks
+/// the imported claim against its retained kernel census.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InitialCensusFence {
+    files: FilesId,
+    regular: u64,
+    socket: u64,
+    generation: u64,
+    slots: Vec<NetworkFdSlot>,
+    descriptions: Vec<(
+        RawFd,
+        FdType,
+        i32,
+        bool,
+        Option<DetStat>,
+        Option<ResourceID>,
+    )>,
 }
 
 // FileMetadata is same-image ThreadState transport, not a versioned recording
@@ -239,7 +259,7 @@ impl FileMetadata {
         Ok(())
     }
 
-    fn publication_snapshot(
+    pub(crate) fn publication_snapshot(
         &mut self,
         admission: &NetworkFdPublicationAdmission,
     ) -> Result<NetworkFdPublicationBatch, Error> {
@@ -350,7 +370,10 @@ impl FileMetadata {
         Ok(())
     }
 
-    fn publication_acknowledge(&mut self, batch: &NetworkFdPublicationBatch) -> Result<(), Error> {
+    pub(crate) fn publication_acknowledge(
+        &mut self,
+        batch: &NetworkFdPublicationBatch,
+    ) -> Result<(), Error> {
         if self.network_publication.last_acknowledged.as_ref() == Some(batch) {
             return Ok(());
         }
@@ -506,7 +529,7 @@ impl FileMetadata {
         }
         Ok(())
     }
-    fn publication_server_acknowledge(
+    pub(crate) fn publication_server_acknowledge(
         &mut self,
         batch: &NetworkFdPublicationBatch,
     ) -> Result<(), Error> {
@@ -979,6 +1002,233 @@ impl FileMetadata {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn empty_network_fixture(owner: DetTid) -> Self {
+        let mut table = Self::new(owner);
+        table.track_network_lifetime = true;
+        table
+    }
+
+    fn all_descriptor_slots(&self) -> Vec<NetworkFdSlot> {
+        let mut slots: Vec<_> = self
+            .file_handles
+            .iter()
+            .map(|(&fd, detfd)| NetworkFdSlot {
+                binding: self.descriptor_binding(fd).expect("registered descriptor"),
+                cloexec: detfd.is_cloexec(),
+            })
+            .collect();
+        slots.sort_by_key(|entry| entry.binding.slot.fd);
+        slots
+    }
+
+    #[track_caller]
+    pub(crate) fn initial_census_fence(&self) -> Result<InitialCensusFence, Error> {
+        if self.track_network_lifetime
+            || !self.pending_network_installations.is_empty()
+            || self.network_publication != NetworkFdLocalPublication::default()
+        {
+            // Name every refusing condition and the calling fence site: the
+            // same refusal guards capture, prepare and commit.
+            let publication = &self.network_publication;
+            return Err(fd_publication_error(&format!(
+                "initial census cannot replace an active or pending table \
+                 (at {}: files {:?}, track {}, pending {}, acknowledged sequence {} \
+                 generation {}, in-flight {}, last-acknowledged {}, awaiting-ack {}, \
+                 effects {}, next generation {})",
+                std::panic::Location::caller(),
+                self.files_id,
+                self.track_network_lifetime,
+                self.pending_network_installations.len(),
+                publication.acknowledged_sequence,
+                publication.acknowledged_generation,
+                publication.in_flight.is_some(),
+                publication.last_acknowledged.is_some(),
+                publication.awaiting_global_ack.is_some(),
+                publication.effects.len(),
+                self.next_slot_generation,
+            )));
+        }
+        let mut descriptions: Vec<_> = self
+            .file_handles
+            .iter()
+            .map(|(&fd, entry)| {
+                (
+                    fd,
+                    entry.ty(),
+                    entry.status_flags(),
+                    entry.physically_nonblocking(),
+                    entry.stat(),
+                    entry.resource(),
+                )
+            })
+            .collect();
+        descriptions.sort_by_key(|entry| entry.0);
+        Ok(InitialCensusFence {
+            descriptions,
+            files: self.files_id,
+            regular: self.next_open_file_sequence,
+            socket: self.next_socket_open_file_sequence,
+            generation: self.next_slot_generation,
+            slots: self.all_descriptor_slots(),
+        })
+    }
+
+    pub(crate) fn prepare_initial_census(
+        &self,
+        expected_owner: crate::network_replay::NetworkStreamOwner,
+        view: crate::network_runtime::InitialTableView,
+        metadata: Vec<crate::network_runtime::InitialFileStat>,
+    ) -> Result<
+        (
+            Self,
+            crate::network_runtime::InitialTableClaim,
+            InitialCensusFence,
+        ),
+        Error,
+    > {
+        let fence = self.initial_census_fence()?;
+        if view.registration == 0
+            || view.table == 0
+            || view.owner.thread.as_raw() == 0
+            || view.owner != expected_owner
+            || self.files_id != view.files
+        {
+            return Err(fd_publication_error(
+                "initial census changed root owner/table",
+            ));
+        }
+        crate::network_runtime::check_initial_stats(&view, &metadata)
+            .map_err(|error| fd_publication_error(&error.to_string()))?;
+        let raw_stats: BTreeMap<_, _> = metadata
+            .iter()
+            .map(|observed| (observed.physical_file, observed.stat))
+            .collect();
+        let mut candidate = Self::new(view.owner.thread);
+        candidate.files_id = view.files;
+        // Preserve burned allocator identities; bootstrap placeholders never
+        // become physical authority and their IDs are never reused.
+        candidate.next_open_file_sequence = self.next_open_file_sequence;
+        candidate.next_socket_open_file_sequence = self.next_socket_open_file_sequence;
+        candidate.next_slot_generation = self.next_slot_generation;
+        let mut stdio = BTreeMap::new();
+        for fd in [1, 2, 0] {
+            if let Some(entry) = view.descriptors.iter().find(|entry| entry.fd == fd) {
+                stdio
+                    .entry(entry.physical_file)
+                    .or_insert_with(|| stdio_resource(fd).unwrap());
+            }
+        }
+        // These roles name actual aliases in the authenticated initial-root
+        // census before guest entry, not arbitrary later occupants of 0/1/2.
+        // An initial output shared with stdin retains its output-offset policy.
+        let mut aliases = BTreeMap::<u64, (DetFd, u32, u32, u32, u32)>::new();
+        let mut previous = None;
+        for entry in &view.descriptors {
+            let ty = FdType::from_initial_profile(
+                entry.mode,
+                entry.status_flags,
+                entry.device_major,
+                entry.device_minor,
+            )
+            .ok_or_else(|| fd_publication_error("malformed initial descriptor profile"))?;
+            if entry.fd < 0
+                || entry.physical_file == 0
+                || previous.is_some_and(|old| entry.fd <= old)
+            {
+                return Err(fd_publication_error(
+                    "malformed initial descriptor profile/order",
+                ));
+            }
+            previous = Some(entry.fd);
+            let fd_flags = if entry.cloexec {
+                OFlag::O_CLOEXEC
+            } else {
+                OFlag::empty()
+            };
+            let detfd = if let Some((prior, mode, status, major, minor)) =
+                aliases.get(&entry.physical_file)
+            {
+                if (*mode, *status, *major, *minor)
+                    != (
+                        entry.mode,
+                        entry.status_flags,
+                        entry.device_major,
+                        entry.device_minor,
+                    )
+                {
+                    return Err(fd_publication_error(
+                        "initial aliases changed observed OFD profile",
+                    ));
+                }
+                prior.clone().with_fd(entry.fd).with_fd_flags(fd_flags)
+            } else {
+                let sequence = if ty == FdType::Socket {
+                    candidate.next_socket_open_file_sequence
+                } else {
+                    candidate.next_open_file_sequence
+                };
+                if sequence >= (1u64 << 63) {
+                    return Err(fd_publication_error("initial OFD sequence exhausted"));
+                }
+                let id = candidate.allocate_open_file_id(view.owner.thread, ty);
+                let flags = OFlag::from_bits_retain(entry.status_flags as i32) | fd_flags;
+                let detfd = DetFd::new(entry.fd, flags, ty, id)
+                    .with_stat(raw_stats[&entry.physical_file])
+                    .with_resource(stdio.get(&entry.physical_file).cloned());
+                detfd.mark_flock_mode_unobserved();
+                aliases.insert(
+                    entry.physical_file,
+                    (
+                        detfd.clone(),
+                        entry.mode,
+                        entry.status_flags,
+                        entry.device_major,
+                        entry.device_minor,
+                    ),
+                );
+                detfd
+            };
+            if candidate.next_slot_generation == u64::MAX {
+                return Err(fd_publication_error(
+                    "initial descriptor generation exhausted",
+                ));
+            }
+            candidate.add_detfd(detfd);
+        }
+        let claim = crate::network_runtime::InitialTableClaim {
+            view,
+            metadata,
+            slots: candidate.all_descriptor_slots(),
+            through_generation: candidate.next_slot_generation,
+            base_generation: fence.generation,
+            base_regular_sequence: fence.regular,
+            base_socket_sequence: fence.socket,
+        };
+        Ok((candidate, claim, fence))
+    }
+
+    pub(crate) fn commit_initial_census(
+        &mut self,
+        mut candidate: Self,
+        fence: InitialCensusFence,
+    ) -> Result<(), Error> {
+        if self.initial_census_fence()? != fence
+            || candidate.files_id != self.files_id
+            || candidate.track_network_lifetime
+            || !candidate.pending_network_installations.is_empty()
+            || candidate.network_publication != NetworkFdLocalPublication::default()
+        {
+            return Err(fd_publication_error(
+                "initial metadata changed before exact admission ACK",
+            ));
+        }
+        candidate.track_network_lifetime = true;
+        candidate.network_publication.acknowledged_generation = candidate.next_slot_generation;
+        *self = candidate;
+        Ok(())
+    }
+
     fn allocate_open_file_id(&mut self, creator: DetTid, ty: FdType) -> OpenFileId {
         if ty == FdType::Socket {
             let id = OpenFileId::new_socket(creator, self.next_socket_open_file_sequence);
@@ -1101,9 +1351,16 @@ impl FileMetadata {
                 .collect(),
             track_network_lifetime: self.track_network_lifetime,
             pending_network_installations: Vec::new(),
-            network_publication: NetworkFdLocalPublication {
-                acknowledged_generation: self.next_slot_generation,
-                ..NetworkFdLocalPublication::default()
+            // Only a tracked table has a global ledger cursor to carry. An
+            // untracked table has none; its first cursor is minted solely by
+            // commit_initial_census, whose fence refuses any inherited value.
+            network_publication: if self.track_network_lifetime {
+                NetworkFdLocalPublication {
+                    acknowledged_generation: self.next_slot_generation,
+                    ..NetworkFdLocalPublication::default()
+                }
+            } else {
+                NetworkFdLocalPublication::default()
             },
             file_handles: self
                 .file_handles
@@ -1280,17 +1537,20 @@ impl FileMetadata {
             .checked_add(1)
             .expect("descriptor slot generation exhausted");
         let before = self.network_descriptor_slot(detfd.fd);
-        let after = detfd.socket_open_file_id().map(|open_file| NetworkFdSlot {
-            binding: FdSlotBinding {
-                slot: FdSlot {
-                    files: self.files_id,
-                    fd: detfd.fd,
-                },
-                generation,
-                open_file,
-            },
-            cloexec: detfd.is_cloexec(),
-        });
+        let after =
+            (self.track_network_lifetime || detfd.socket_open_file_id().is_some()).then(|| {
+                NetworkFdSlot {
+                    binding: FdSlotBinding {
+                        slot: FdSlot {
+                            files: self.files_id,
+                            fd: detfd.fd,
+                        },
+                        generation,
+                        open_file: detfd.open_file_id(),
+                    },
+                    cloexec: detfd.is_cloexec(),
+                }
+            });
         self.next_slot_generation = generation;
         self.slot_generations.insert(detfd.fd, generation);
         let replaced = self.file_handles.insert(detfd.fd, detfd);
@@ -1330,7 +1590,9 @@ impl FileMetadata {
 
     fn network_descriptor_slot(&self, fd: RawFd) -> Option<NetworkFdSlot> {
         let detfd = self.file_handles.get(&fd)?;
-        detfd.socket_open_file_id()?;
+        if !self.track_network_lifetime {
+            detfd.socket_open_file_id()?;
+        }
         Some(NetworkFdSlot {
             binding: self.descriptor_binding(fd).expect("registered descriptor"),
             cloexec: detfd.is_cloexec(),
@@ -1360,9 +1622,11 @@ impl FileMetadata {
             .file_handles
             .iter()
             .filter_map(|(&fd, detfd)| {
-                detfd.socket_open_file_id().map(|_| NetworkFdSlot {
-                    binding: self.descriptor_binding(fd).expect("registered descriptor"),
-                    cloexec: detfd.is_cloexec(),
+                (self.track_network_lifetime || detfd.socket_open_file_id().is_some()).then(|| {
+                    NetworkFdSlot {
+                        binding: self.descriptor_binding(fd).expect("registered descriptor"),
+                        cloexec: detfd.is_cloexec(),
+                    }
                 })
             })
             .collect();
@@ -1383,6 +1647,120 @@ impl FileMetadata {
             .remove(&binding.slot.fd)
             .expect("validated descriptor");
         true
+    }
+
+    /// Bind a complete authenticated population atomically. Alias validation
+    /// precedes all writes, so a later conflicting OFD cannot leave a prefix
+    /// newly annotated. Authority is private FileIdentity, never RPC integers.
+    pub(crate) fn bind_native_population(
+        &mut self,
+        identities: &[(
+            FdSlotBinding,
+            crate::network_runtime::original_installation::FileIdentity,
+        )],
+    ) -> Result<(), Error> {
+        let mut descriptions = BTreeMap::new();
+        let mut bindings = std::collections::BTreeSet::new();
+        for &(binding, identity) in identities {
+            if self.descriptor_binding(binding.slot.fd).ok() != Some(binding)
+                || !bindings.insert(binding.slot.fd)
+                || self.file_handles[&binding.slot.fd]
+                    .native_file()
+                    .is_some_and(|old| old != identity)
+                || descriptions
+                    .insert(binding.open_file, identity)
+                    .is_some_and(|old| old != identity)
+            {
+                return Err(fd_publication_error(
+                    "initial native identity changed exact slot/OFD",
+                ));
+            }
+        }
+        for &(binding, identity) in identities {
+            assert!(self.file_handles[&binding.slot.fd].bind_native_file(identity));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_binding_identity(
+        &self,
+        binding: FdSlotBinding,
+    ) -> Option<crate::network_runtime::original_installation::FileIdentity> {
+        (self.descriptor_binding(binding.slot.fd).ok() == Some(binding))
+            .then(|| self.file_handles[&binding.slot.fd].native_file())
+            .flatten()
+    }
+
+    /// Bind only the exact local generation proved by an immutable provider
+    /// receipt. A stale returned number cannot overwrite a reused description.
+    pub(crate) fn bind_native_installation(
+        &mut self,
+        binding: FdSlotBinding,
+        identity: crate::network_runtime::original_installation::FileIdentity,
+    ) -> Result<(), Error> {
+        if self.descriptor_binding(binding.slot.fd).ok() != Some(binding)
+            || !self.file_handles[&binding.slot.fd].bind_native_file(identity)
+        {
+            return Err(fd_publication_error(
+                "native installation changed its exact OFD",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_native_installation(
+        &mut self,
+        binding: FdSlotBinding,
+        identity: crate::network_runtime::original_installation::FileIdentity,
+    ) -> Result<(), Error> {
+        if self.descriptor_binding(binding.slot.fd).ok() != Some(binding)
+            || self.file_handles[&binding.slot.fd].native_file() != Some(identity)
+        {
+            return Err(fd_publication_error(
+                "native removal changed slot generation or physical OFD",
+            ));
+        }
+        assert!(self.remove_descriptor_binding(binding));
+        Ok(())
+    }
+
+    /// add a raw fd
+    pub(crate) fn prepare_original_installation(
+        &self,
+        creator: DetTid,
+        fd: RawFd,
+        flags: OFlag,
+        stat: Option<DetStat>,
+    ) -> Result<(Self, NetworkFdSlotReplacement), Error> {
+        self.prepare_original_installation_typed(creator, fd, flags, FdType::Socket, stat)
+    }
+
+    pub(crate) fn prepare_original_installation_typed(
+        &self,
+        creator: DetTid,
+        fd: RawFd,
+        flags: OFlag,
+        ty: FdType,
+        stat: Option<DetStat>,
+    ) -> Result<(Self, NetworkFdSlotReplacement), Error> {
+        if !self.track_network_lifetime
+            || fd < 0
+            || self.file_handles.contains_key(&fd)
+            || !self.pending_network_installations.is_empty()
+            || self.network_publication.in_flight.is_some()
+            || self.network_publication.awaiting_global_ack.is_some()
+        {
+            return Err(fd_publication_error(
+                "original installation cannot overwrite/recover a local slot",
+            ));
+        }
+        let mut candidate = self.clone();
+        candidate.add_fd(creator, fd, flags, ty, stat)?;
+        let replacement = *candidate
+            .pending_network_installations
+            .last()
+            .expect("tracked fresh installation has one local journal entry");
+        Ok((candidate, replacement))
     }
 
     /// add a raw fd
@@ -1728,6 +2106,523 @@ mod file_metadata_tests {
 
     use super::*;
 
+    fn census_owner(thread: DetTid) -> crate::network_replay::NetworkStreamOwner {
+        crate::network_replay::NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        }
+    }
+
+    fn census_view(owner: DetTid) -> crate::network_runtime::InitialTableView {
+        use crate::network_runtime::InitialDescriptor;
+        crate::network_runtime::InitialTableView {
+            owner: census_owner(owner),
+            files: FilesId::initial(owner),
+            registration: 1,
+            table: 9,
+            descriptors: vec![
+                InitialDescriptor {
+                    fd: 1,
+                    physical_file: 11,
+                    cloexec: false,
+                    mode: 0o100600,
+                    status_flags: libc::O_WRONLY as u32,
+                    device_major: 0,
+                    device_minor: 0,
+                },
+                InitialDescriptor {
+                    fd: 4,
+                    physical_file: 12,
+                    cloexec: false,
+                    mode: 0o140600,
+                    status_flags: libc::O_RDWR as u32,
+                    device_major: 0,
+                    device_minor: 0,
+                },
+                InitialDescriptor {
+                    fd: 7,
+                    physical_file: 11,
+                    cloexec: true,
+                    mode: 0o100600,
+                    status_flags: libc::O_WRONLY as u32,
+                    device_major: 0,
+                    device_minor: 0,
+                },
+            ],
+        }
+    }
+    fn controlled_stats(
+        view: &crate::network_runtime::InitialTableView,
+    ) -> Vec<crate::network_runtime::InitialFileStat> {
+        let mut seen = std::collections::BTreeSet::new();
+        view.descriptors
+            .iter()
+            .filter(|row| seen.insert(row.physical_file))
+            .map(|row| crate::network_runtime::InitialFileStat {
+                fd: row.fd,
+                physical_file: row.physical_file,
+                stat: DetStat {
+                    mode: row.mode,
+                    rdev: libc::makedev(row.device_major, row.device_minor),
+                    inode: 100 + row.physical_file,
+                    size: 73,
+                    ..DetStat::default()
+                },
+            })
+            .collect()
+    }
+    fn prepare_controlled(
+        table: &FileMetadata,
+        expected_owner: DetTid,
+        view: crate::network_runtime::InitialTableView,
+    ) -> Result<
+        (
+            FileMetadata,
+            crate::network_runtime::InitialTableClaim,
+            InitialCensusFence,
+        ),
+        Error,
+    > {
+        let stats = controlled_stats(&view);
+        table.prepare_initial_census(census_owner(expected_owner), view, stats)
+    }
+
+    #[test]
+    fn initial_census_replaces_dummy_slots_with_complete_aliases_before_regular_dup() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let old = table.descriptor_binding(0).unwrap();
+        let (candidate, claim, fence) =
+            prepare_controlled(&table, owner, census_view(owner)).unwrap();
+        assert_eq!(table.descriptor_binding(0).unwrap(), old); // prepare has no effect
+        assert_eq!(claim.slots.len(), 3);
+        assert_eq!(
+            claim.slots[0].binding.open_file,
+            claim.slots[2].binding.open_file
+        );
+        assert_ne!(claim.slots[0].binding.open_file, old.open_file);
+        assert_eq!(
+            candidate.file_handles[&1].stat(),
+            Some(controlled_stats(&census_view(owner))[0].stat)
+        );
+        assert_eq!(
+            candidate.file_handles[&1].stat(),
+            candidate.file_handles[&7].stat()
+        );
+        assert_eq!(candidate.file_handles[&1].ty(), FdType::Regular);
+        table.commit_initial_census(candidate, fence).unwrap();
+        assert_eq!(table.descriptor_binding(0), Err(Errno::EBADF));
+        assert_eq!(table.network_descriptor_slots(), claim.slots);
+        assert_eq!(table.file_handles[&1].known_flock_mode(), None);
+        table.dup_fd(1, 8, OFlag::empty()).unwrap();
+        assert_eq!(
+            table.descriptor_binding(1).unwrap().open_file,
+            table.descriptor_binding(8).unwrap().open_file
+        );
+        let dup = table.pending_network_installations()[0];
+        assert_eq!(dup.before, None);
+        assert_eq!(
+            dup.after.unwrap().binding,
+            table.descriptor_binding(8).unwrap()
+        );
+        let socket = table.network_descriptor_slot(4).unwrap();
+        table.dup_fd(1, 4, OFlag::O_CLOEXEC).unwrap();
+        let mixed = table.pending_network_installations()[1];
+        assert_eq!(mixed.before, Some(socket));
+        assert_eq!(
+            mixed.after.unwrap().binding.open_file,
+            table.descriptor_binding(1).unwrap().open_file
+        );
+        assert!(mixed.after.unwrap().cloexec);
+        assert!(table.descriptor_binding(7).is_ok());
+    }
+    #[test]
+    fn initial_census_anonymous_profiles_keep_flags_and_regular_device_routes() {
+        let owner = DetTid::from_raw(10);
+        for (mode, major, minor, expected) in [
+            (0o600, 0, 0, FdType::Inherited { mode: 0o600 }),
+            (0o100600, 0, 0, FdType::Regular),
+            (0o020600, 1, 8, FdType::Rng),
+            (0o020600, 1, 9, FdType::Rng),
+            (0o020600, 1, 3, FdType::Regular),
+        ] {
+            for nonblocking in [false, true] {
+                let table = FileMetadata::new(owner);
+                let mut view = census_view(owner);
+                for index in [0, 2] {
+                    let row = &mut view.descriptors[index];
+                    row.mode = mode;
+                    row.device_major = major;
+                    row.device_minor = minor;
+                    row.status_flags =
+                        (libc::O_RDWR | if nonblocking { libc::O_NONBLOCK } else { 0 }) as u32;
+                }
+                let (candidate, claim, _) = prepare_controlled(&table, owner, view).unwrap();
+                assert_eq!(
+                    claim.slots[0].binding.open_file,
+                    claim.slots[2].binding.open_file
+                );
+                for fd in [1, 7] {
+                    let entry = &candidate.file_handles[&fd];
+                    assert_eq!(entry.ty(), expected);
+                    assert_eq!(entry.is_nonblocking(), nonblocking);
+                    assert_eq!(entry.physically_nonblocking(), nonblocking);
+                }
+                assert!(candidate.file_handles[&7].is_cloexec());
+                assert!(!candidate.file_handles[&1].is_cloexec());
+            }
+        }
+    }
+
+    #[test]
+    fn initial_stdio_alias_roles_are_retained_but_numeric_replacement_is_not_stdout() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        let mut view = census_view(owner);
+        let mut stdin_alias = view.descriptors[0].clone();
+        stdin_alias.fd = 0;
+        view.descriptors.insert(0, stdin_alias);
+        let (candidate, _, fence) = prepare_controlled(&table, owner, view.clone()).unwrap();
+        table.commit_initial_census(candidate, fence).unwrap();
+        for fd in [0, 1, 7] {
+            assert_eq!(
+                table.file_handles[&fd].resource(),
+                Some(ResourceID::Device(Device::ContainerStdout))
+            );
+        }
+        table.dup_fd(1, 8, OFlag::empty()).unwrap();
+        assert_eq!(
+            table.file_handles[&8].resource(),
+            Some(ResourceID::Device(Device::ContainerStdout))
+        );
+        table
+            .add_fd(owner, 9, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        table.dup_fd(9, 1, OFlag::empty()).unwrap();
+        assert_eq!(table.file_handles[&1].resource(), None);
+        assert_eq!(
+            table.file_handles[&7].resource(),
+            Some(ResourceID::Device(Device::ContainerStdout))
+        );
+        assert!(prepare_controlled(&table, owner, view).is_err());
+    }
+
+    #[test]
+    fn initial_metadata_must_be_complete_exact_and_fenced_before_commit() {
+        let owner = DetTid::from_raw(10);
+        let view = census_view(owner);
+        let stats = controlled_stats(&view);
+        for case in 0..6 {
+            let table = FileMetadata::new(owner);
+            let mut wrong = stats.clone();
+            match case {
+                0 => {
+                    wrong.pop();
+                }
+                1 => wrong.push(stats[0].clone()),
+                2 => wrong[0].fd = 7,
+                3 => wrong[0].physical_file += 1,
+                4 => wrong[0].stat.mode ^= 0o100000,
+                5 => wrong[0].stat.rdev = libc::makedev(1, 9),
+                _ => unreachable!(),
+            }
+            assert!(
+                table
+                    .prepare_initial_census(census_owner(owner), view.clone(), wrong)
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(table.file_handles.is_empty());
+        }
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let (candidate, _, fence) = table
+            .prepare_initial_census(census_owner(owner), view, stats)
+            .unwrap();
+        table.file_handles[&0].set_nonblocking(true);
+        assert!(table.commit_initial_census(candidate, fence).is_err());
+        assert!(table.file_handles[&0].is_nonblocking());
+        assert!(!table.track_network_lifetime);
+    }
+
+    #[test]
+    fn initial_census_fence_names_each_refusing_condition() {
+        let owner = DetTid::from_raw(10);
+        FileMetadata::new(owner).initial_census_fence().unwrap();
+        let mut tracked = FileMetadata::new(owner);
+        tracked.track_network_lifetime = true;
+        let mut pending = FileMetadata::new(owner);
+        pending.track_network_lifetime = true;
+        pending
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        pending.track_network_lifetime = false;
+        let mut cursor = FileMetadata::new(owner);
+        cursor.network_publication.acknowledged_generation = 3;
+        for (table, needle) in [
+            (&tracked, "track true, pending 0,"),
+            (&pending, "track false, pending 1,"),
+            (
+                &cursor,
+                "track false, pending 0, acknowledged sequence 0 generation 3,",
+            ),
+        ] {
+            let message = table.initial_census_fence().unwrap_err().to_string();
+            assert!(
+                message.contains("initial census cannot replace"),
+                "{message}"
+            );
+            assert!(message.contains(needle), "{message}");
+            assert!(message.contains(file!()), "{message}");
+        }
+    }
+
+    #[test]
+    fn untracked_exec_table_is_an_initial_census_base() {
+        let owner = DetTid::from_raw(10);
+        let empty = FileMetadata::new(owner);
+        empty
+            .for_exec(FilesIdAllocator::default().allocate_exec(owner))
+            .initial_census_fence()
+            .unwrap();
+        // Attempt-07's root: three inherited slots before the original EXEC.
+        let mut inherited = FileMetadata::new(owner);
+        for fd in 0..3 {
+            inherited
+                .add_fd(owner, fd, OFlag::empty(), FdType::Regular, None)
+                .unwrap();
+        }
+        let exec = inherited.for_exec(FilesIdAllocator::default().allocate_exec(owner));
+        assert_eq!(
+            exec.network_publication,
+            NetworkFdLocalPublication::default()
+        );
+        let fence = exec.initial_census_fence().unwrap();
+        assert_eq!(fence.generation, 3);
+
+        // A tracked table still carries its cursor and still cannot be censused.
+        let mut tracked = FileMetadata::new(owner);
+        tracked
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        tracked.track_network_lifetime = true;
+        // Its one slot was published and acknowledged before the snapshot.
+        tracked.network_publication.acknowledged_generation = 1;
+        let exec = tracked.for_exec(FilesIdAllocator::default().allocate_exec(owner));
+        assert_eq!(exec.network_publication.acknowledged_generation, 1);
+        assert!(exec.track_network_lifetime);
+        let message = exec.initial_census_fence().unwrap_err().to_string();
+        assert!(
+            message.contains("track true, pending 0, acknowledged sequence 0 generation 1,"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn initial_metadata_discarded_candidate_and_empty_census_do_not_invent_state() {
+        let owner = DetTid::from_raw(10);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let before = table.initial_census_fence().unwrap();
+        let view = census_view(owner);
+        let (candidate, claim, _) = prepare_controlled(&table, owner, view).unwrap();
+        drop(candidate);
+        drop(claim);
+        assert_eq!(table.initial_census_fence().unwrap(), before);
+        assert!(!table.track_network_lifetime);
+
+        let mut empty = census_view(owner);
+        empty.descriptors.clear();
+        let (candidate, claim, fence) = table
+            .prepare_initial_census(census_owner(owner), empty, Vec::new())
+            .unwrap();
+        assert!(candidate.file_handles.is_empty());
+        assert!(claim.slots.is_empty() && claim.metadata.is_empty());
+        table.commit_initial_census(candidate, fence).unwrap();
+        assert!(table.file_handles.is_empty());
+        assert!(table.track_network_lifetime);
+    }
+
+    #[test]
+    fn initial_metadata_o_path_socket_and_rng_use_the_same_non_socket_classifier() {
+        let owner = DetTid::from_raw(10);
+        for (mode, major, minor) in [(0o140600, 0, 0), (0o020600, 1, 8), (0o020600, 1, 9)] {
+            let table = FileMetadata::new(owner);
+            let mut view = census_view(owner);
+            for row in &mut view.descriptors {
+                row.mode = mode;
+                row.device_major = major;
+                row.device_minor = minor;
+                row.status_flags = libc::O_PATH as u32;
+            }
+            let (candidate, claim, _) = prepare_controlled(&table, owner, view).unwrap();
+            for slot in &claim.slots {
+                let fd = &candidate.file_handles[&slot.binding.slot.fd];
+                assert_eq!(fd.ty(), FdType::Regular);
+                assert!(!fd.open_file_id().is_socket());
+                assert_eq!(fd.status_flags(), libc::O_PATH);
+            }
+        }
+    }
+
+    #[test]
+    fn initial_metadata_uses_real_fstat_including_o_path_without_mutating_flags() {
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        let owner = DetTid::from_raw(10);
+        let raw = unsafe { libc::open(c"/dev/urandom".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(raw >= 0, "{}", std::io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let status = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(status >= 0 && descriptor_flags >= 0);
+        let mut raw_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(
+            unsafe { libc::fstat(fd.as_raw_fd(), raw_stat.as_mut_ptr()) },
+            0
+        );
+        let stat: DetStat = unsafe { raw_stat.assume_init() }.into();
+        let mut byte = 0_u8;
+        assert_eq!(
+            unsafe { libc::read(fd.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let mut view = census_view(owner);
+        view.descriptors.retain(|row| row.physical_file == 11);
+        for row in &mut view.descriptors {
+            row.mode = stat.mode;
+            row.device_major = libc::major(stat.rdev);
+            row.device_minor = libc::minor(stat.rdev);
+            row.status_flags = status as u32;
+        }
+        let stats = vec![crate::network_runtime::InitialFileStat {
+            fd: 1,
+            physical_file: 11,
+            stat,
+        }];
+        let mut table = FileMetadata::new(owner);
+        let (candidate, claim, fence) = table
+            .prepare_initial_census(census_owner(owner), view, stats.clone())
+            .unwrap();
+        assert_eq!(claim.metadata, stats);
+        table.commit_initial_census(candidate, fence).unwrap();
+        for alias in [1, 7] {
+            assert_eq!(table.file_handles[&alias].stat(), Some(stat));
+            assert_eq!(table.file_handles[&alias].ty(), FdType::Regular);
+            assert!(!table.file_handles[&alias].open_file_id().is_socket());
+            assert_eq!(table.file_handles[&alias].status_flags(), status);
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) },
+            status
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) },
+            descriptor_flags
+        );
+    }
+
+    #[test]
+    fn initial_census_authenticates_current_owner_with_post_exec_shared_table() {
+        let creator = DetTid::from_raw(10);
+        let current = DetTid::from_raw(99);
+        let expected_owner = crate::network_replay::NetworkStreamOwner {
+            thread: current,
+            mm: MmId::initial(creator).for_exec(creator),
+        };
+        let mut tables = detcore_model::fd::FilesIdAllocator::default();
+        let files = tables.allocate_exec(creator);
+        let mut table = FileMetadata::new(creator);
+        table.files_id = files;
+        let before = table.initial_census_fence().unwrap();
+        let mut view = census_view(creator);
+        // A post-exec table/MM may be shared with a different current thread.
+        // Neither the table creator nor generation zero authenticates that task.
+        view.owner = expected_owner;
+        view.files = files;
+        assert_ne!(files, FilesId::initial(current));
+        assert_ne!(expected_owner.mm, MmId::initial(current));
+        for wrong_owner in [
+            crate::network_replay::NetworkStreamOwner {
+                thread: creator,
+                ..expected_owner
+            },
+            crate::network_replay::NetworkStreamOwner {
+                mm: MmId::initial(creator),
+                ..expected_owner
+            },
+        ] {
+            let mut wrong = view.clone();
+            wrong.owner = wrong_owner;
+            let metadata = controlled_stats(&wrong);
+            assert!(
+                table
+                    .prepare_initial_census(expected_owner, wrong, metadata)
+                    .is_err()
+            );
+            assert_eq!(table.initial_census_fence().unwrap(), before);
+        }
+        let metadata = controlled_stats(&view);
+        let (candidate, claim, fence) = table
+            .prepare_initial_census(expected_owner, view, metadata)
+            .unwrap();
+        assert_eq!(claim.view.owner, expected_owner);
+        assert_eq!(claim.view.files, files);
+        assert_eq!(
+            candidate.file_handles[&1].open_file_id(),
+            OpenFileId::new(current, table.next_open_file_sequence)
+        );
+        assert_eq!(
+            candidate.file_handles[&4].open_file_id(),
+            OpenFileId::new_socket(current, table.next_socket_open_file_sequence)
+        );
+        table.commit_initial_census(candidate, fence).unwrap();
+        assert_eq!(table.files_id, files);
+        assert_eq!(table.network_descriptor_slots(), claim.slots);
+        assert!(table.track_network_lifetime);
+    }
+
+    #[test]
+    fn initial_census_malformed_or_changed_local_state_cannot_commit() {
+        let owner = DetTid::from_raw(10);
+        for case in 0..5 {
+            let table = FileMetadata::new(owner);
+            let mut view = census_view(owner);
+            match case {
+                0 => view.descriptors[0].mode = 0o030600,
+                1 => view.descriptors[2].status_flags ^= libc::O_NONBLOCK as u32,
+                2 => view.descriptors[1].fd = 1,
+                3 => view.owner.thread = DetTid::from_raw(99),
+                4 => view.descriptors[0].physical_file = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                prepare_controlled(&table, owner, view).is_err(),
+                "case {case}"
+            );
+            assert!(table.file_handles.is_empty());
+        }
+        let mut table = FileMetadata::new(owner);
+        let (candidate, _, fence) = prepare_controlled(&table, owner, census_view(owner)).unwrap();
+        table
+            .add_fd(owner, 5, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(table.commit_initial_census(candidate, fence).is_err());
+        assert!(table.descriptor_binding(5).is_ok());
+        assert!(!table.track_network_lifetime);
+    }
     #[test]
     fn descriptor_binding_roundtrip_preserves_generation_and_rejects_malformed_state() {
         let owner = DetTid::from_raw(10);
@@ -1783,7 +2678,15 @@ mod file_metadata_tests {
             .unwrap();
         let replacement = table.pending_network_installations()[1];
         assert_eq!(replacement.before, Some(first));
-        assert_eq!(replacement.after, None);
+        assert_eq!(replacement.after, table.network_descriptor_slot(7));
+        let regular = replacement
+            .after
+            .expect("regular replacement remains occupied");
+        assert!(!regular.binding.open_file.is_socket());
+        assert_eq!(
+            regular.binding.generation,
+            replacement.installation_generation
+        );
         assert!(!table.acknowledge_network_installations(&[replacement]));
         assert_eq!(table.pending_network_installations().len(), 2);
         assert!(table.acknowledge_network_installations(&first_batch));
@@ -2802,10 +3705,32 @@ pub struct ThreadState<T> {
     /// Stated differently, this is just for message-passing communication.
     pub clone_flags: Option<CloneFlags>,
 
+    /// Process-local authenticated construction facts. Serialization cannot issue
+    /// or restore authority; an active state requires its original owner rebind.
+    #[serde(skip)]
+    pub(crate) native_child_outcome:
+        Option<Arc<crate::network_runtime::native_birth_outcome::NativeChildOutcome>>,
+    #[serde(default)]
+    pub(crate) native_birth_required: bool,
+
     /// Registration metadata for a child whose parent cannot resume until the
     /// backend finishes the child. The child consumes this in
     /// `handle_thread_start`; the parent clears its copy when injection returns.
     pub pending_vfork: Option<PendingVfork>,
+    /// Prepared NoSeq birth, bound by the backend when it copies this state.
+    pub(crate) pending_no_seq_birth: Option<crate::scheduler::NoSeqChildBirth>,
+    /// Retained until the native invocation starts; consumed task callback can prove no call.
+    pub(crate) uninvoked_wait_call: Option<crate::scheduler::UninvokedWaitCall>,
+    /// Original Connect invocation custody; never inherited into a new child.
+    #[serde(default)]
+    pub(crate) original_connect: Option<crate::network_replay::original_connect::Local>,
+    /// Exact metadata consumed by the actual Prepared hook while the original
+    /// Call still owns its table permit. Never recovered by a later numeric FD.
+    #[serde(default)]
+    pub(crate) original_file_metadata:
+        Option<crate::network_replay::original_connect::FileMetadataObservation>,
+    /// Exact clone admission retained before Submit may suspend. Parent only.
+    pub(crate) uninvoked_fd_clone: Option<crate::network_replay::NetworkFdMutationAdmission>,
 
     /// Pre-physical table reservation inherited only by the actual clone child.
     pub pending_fd_clone: Option<crate::network_replay::NetworkFdPublicationPermit>,
@@ -2946,6 +3871,11 @@ pub struct ThreadState<T> {
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
     pub(crate) past_global_first_execve: bool,
+
+    /// One-use local handoff from the authenticated initial EXEC callback to
+    /// the later post-exec hook. It cannot be restored from serialized state.
+    #[serde(skip)]
+    pub(crate) initial_network_exec: Option<ExecFilesReceipt>,
 
     /// Guest address of this thread's `struct robust_list_head`, as last
     /// registered by a successful `set_robust_list(2)`.
@@ -3242,7 +4172,14 @@ impl<T> ThreadState<T> {
             thread_cpu_start_user_time: last_accounted_user_time,
             thread_cpu_start_system_time: last_accounted_system_time,
             clone_flags: None,
+            native_child_outcome: None,
+            native_birth_required: false,
             pending_vfork: None,
+            pending_no_seq_birth: None,
+            uninvoked_wait_call: None,
+            uninvoked_fd_clone: None,
+            original_connect: None,
+            original_file_metadata: None,
             pending_fd_clone: None,
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),
@@ -3266,6 +4203,7 @@ impl<T> ThreadState<T> {
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
+            initial_network_exec: None,
             interrupt_at: cfg.interrupts_for_thread(pid),
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
@@ -3523,6 +4461,7 @@ impl<T> ThreadState<T> {
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
+            fd_read: None,
         }
     }
 
@@ -3586,6 +4525,23 @@ impl<T> ThreadState<T> {
             metadata.discover_fd_from_current_process(self.dettid, fd)?;
         }
         metadata.with_detfd(fd, f)
+    }
+
+    /// Annotate only this exact published installation. A concurrent close or
+    /// slot reuse cannot move pathname/procfs state onto another description.
+    pub(crate) fn with_published_detfd<F, U>(
+        &self,
+        binding: FdSlotBinding,
+        f: F,
+    ) -> Result<Option<U>, Errno>
+    where
+        F: FnMut(&mut DetFd) -> U,
+    {
+        let mut metadata = self.metadata();
+        if metadata.descriptor_binding(binding.slot.fd).ok() != Some(binding) {
+            return Ok(None);
+        }
+        metadata.with_detfd(binding.slot.fd, f).map(Some)
     }
 
     /// Capture the exact modeled installation before an admitted mutation.
@@ -5435,14 +6391,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Local dispatch hint, populated only after actual global table admission.
+    /// Every operation still authenticates its owner/MM/table at the global join.
+    pub(crate) fn network_fd_tracking_active<G: Guest<Self>>(&self, guest: &G) -> bool {
+        guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .unwrap()
+            .track_network_lifetime
+    }
+
     /// Bind local tracking only to the capability of its registered global table.
     pub(crate) async fn initialize_network_fd_tracking<G: Guest<Self>>(
         &self,
         guest: &mut G,
     ) -> Result<(), Error> {
-        if !self.cfg.network_trace.uses_trace()
-            || crate::network_replay::backend_fd_table_capability(&self.cfg).is_none()
-        {
+        if !self.cfg.network_trace.uses_trace() {
             return Ok(());
         }
         use crate::network_replay::NetworkFdMutationReply as P;
@@ -5459,8 +6424,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if table.files_id != files {
             return Err(fd_publication_error("tracking table changed"));
         }
-        // No serde-default mutex/token can grant this authority. Normal backend
-        // construction returns false until the entire physical closure is ready.
+        // The local bit is not authority. The global response requires this
+        // actual owner and the table committed from the retained initial census.
         table.track_network_lifetime = active;
         Ok(())
     }
@@ -5488,6 +6453,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let table = table.lock().unwrap();
                 match &kind {
                     crate::network_replay::NetworkFdMutationKind::Socket
+                    | crate::network_replay::NetworkFdMutationKind::Openat
+                    | crate::network_replay::NetworkFdMutationKind::EpollCreate
                     | crate::network_replay::NetworkFdMutationKind::Clone { .. }
                     | crate::network_replay::NetworkFdMutationKind::Exec { .. } => kind.clone(),
                     crate::network_replay::NetworkFdMutationKind::Alias {
@@ -5498,11 +6465,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ..
                     } => {
                         let source = table.descriptor_binding(*source_fd).ok();
-                        if source.is_some_and(|binding| !binding.open_file.is_socket()) {
-                            return Err(fd_publication_error(
-                                "active backend admitted an unjoined regular-source alias route",
-                            ));
-                        }
                         crate::network_replay::NetworkFdMutationKind::Alias {
                             source_fd: *source_fd,
                             source,
@@ -5540,6 +6502,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         "mutation admission changed table or syscall",
                     ));
                 }
+            }
+            if matches!(
+                admission.kind,
+                crate::network_replay::NetworkFdMutationKind::Clone { .. }
+            ) {
+                assert!(guest.thread_state().uninvoked_fd_clone.is_none());
+                guest.thread_state_mut().uninvoked_fd_clone = Some(admission.clone());
             }
             if self
                 .fd_mutation_request(
@@ -5770,5 +6739,119 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.complete_network_fd_installation(guest, Some(&admission), newfd)
             .await?;
         Ok(returned)
+    }
+}
+
+impl<T> ThreadState<T> {
+    pub(crate) fn native_construction(
+        &self,
+    ) -> std::io::Result<
+        Option<Arc<crate::network_runtime::native_birth_outcome::NativeChildOutcome>>,
+    > {
+        if !self.native_birth_required {
+            return Ok(None);
+        }
+        let outcome = self.native_child_outcome.as_ref().ok_or_else(|| {
+            std::io::Error::other("active native ThreadState missing authenticated rebind")
+        })?;
+        if let Some(birth) = &self.pending_no_seq_birth {
+            if outcome.request() != &birth.request_identity() {
+                return Err(std::io::Error::other(
+                    "native ThreadState changed original birth request",
+                ));
+            }
+        }
+        Ok(Some(outcome.clone()))
+    }
+}
+
+#[cfg(test)]
+#[path = "tool_local/original_close_tests.rs"]
+pub(crate) mod original_close_tests;
+
+impl FileMetadata {
+    /// A metadata value only. The caller must separately hold and validate the
+    /// original Call's publication authority before using this observation.
+    pub(crate) fn observe_original_file_metadata(
+        &self,
+        admission: &crate::network_replay::original_connect::Admission,
+    ) -> Result<crate::network_replay::original_connect::FileMetadataObservation, &'static str>
+    {
+        if self.files_id != admission.arguments.files
+            || self.descriptor_binding(admission.arguments.fd).ok() != admission.arguments.binding
+        {
+            return Err("original file metadata changed exact admitted slot");
+        }
+        let logical_nonblocking = self
+            .file_handles
+            .get(&admission.arguments.fd)
+            .map(|descriptor| descriptor.is_nonblocking());
+        if logical_nonblocking.is_some() != admission.arguments.binding.is_some() {
+            return Err("original file metadata presence changed admitted slot");
+        }
+        Ok(
+            crate::network_replay::original_connect::FileMetadataObservation {
+                admission: admission.clone(),
+                logical_nonblocking,
+                status_flags: self
+                    .file_handles
+                    .get(&admission.arguments.fd)
+                    .map(|fd| fd.status_flags()),
+            },
+        )
+    }
+}
+
+/// One metadata observation under existing table/OFD admission. This is not a
+/// physical file pin and cannot authorize an ordinary numeric-FD injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NetworkFdReadMetadata {
+    /// Exact current logical descriptor binding under the read admission.
+    pub binding: Option<FdSlotBinding>,
+    /// Socket identity from that same descriptor observation, when applicable.
+    pub socket: Option<OpenFileId>,
+    /// Virtual status flag from the same descriptor observation.
+    pub nonblocking: Option<bool>,
+}
+
+impl FileMetadata {
+    /// Clone the existing modeled description under exact table admission.
+    /// This is classification custody, never a kernel file selection or pin.
+    pub(crate) fn observe_read_descriptor(
+        &mut self,
+        read: &crate::network_replay::NetworkFdReadAdmission,
+    ) -> Result<Option<crate::fd::DetFd>, Error> {
+        self.observe_fd_read(read)?;
+        Ok(self.file_handles.get(&read.fd).cloned())
+    }
+
+    pub(crate) fn observe_fd_read(
+        &mut self,
+        read: &crate::network_replay::NetworkFdReadAdmission,
+    ) -> Result<NetworkFdReadMetadata, Error> {
+        self.reconcile_publication_admission(&read.publication)?;
+        if self.files_id != read.publication.permit.files
+            || self.descriptor_binding(read.fd).ok() != read.binding
+            || self.network_publication.acknowledged_sequence
+                != read.publication.acknowledged_sequence
+            || self.network_publication.acknowledged_generation
+                != read.publication.acknowledged_generation
+            || read.publication.recovery.is_some()
+        {
+            return Err(fd_publication_error(
+                "reader metadata differs from admitted table/prefix/binding",
+            ));
+        }
+        let descriptor = self.file_handles.get(&read.fd);
+        if descriptor.is_some() != read.binding.is_some() {
+            return Err(fd_publication_error(
+                "reader metadata changed admitted descriptor presence",
+            ));
+        }
+        Ok(NetworkFdReadMetadata {
+            binding: read.binding,
+            socket: descriptor.and_then(|entry| entry.socket_open_file_id()),
+            nonblocking: descriptor.map(|entry| entry.is_nonblocking()),
+        })
     }
 }

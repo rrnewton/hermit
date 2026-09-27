@@ -4,10 +4,12 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Deterministic scheduling algorithm.
 
+pub(crate) mod fd_read;
+pub(crate) mod ordinary_fd;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
@@ -144,6 +146,11 @@ pub struct Action {
 pub enum SchedResponse {
     /// Keep running.
     Go(Option<SchedValue>),
+    /// Same selected turn with short table/OFD custody for consuming transfer.
+    GoFdRead(
+        Option<SchedValue>,
+        crate::network_replay::NetworkFdReadAdmission,
+    ),
 
     /// The guest was interupted by a signal while waiting on the scheduler, and will now execute
     /// the handler.
@@ -173,7 +180,8 @@ pub enum SchedValue {
 pub struct ThreadNextTurn {
     /// The logical Tid of the guest thread.
     pub dettid: DetTid,
-    /// Address of where the child thread Tid will be cleared if CLEARTID was set on clone.
+    /// Modeled clear-TID address. In native-kernel mode the kernel alone owns
+    /// this state; this stored value is not evidence of its current address.
     pub child_tid_addr: usize,
     /// Request from the thread to the scheduler.
     pub req: Ivar<SchedRequest>,
@@ -541,6 +549,31 @@ enum WaitidSignalRequest {
     Pending(Vec<SigWrapper>),
 }
 
+/// Owner of exit-time clear-TID synchronization for this immutable run mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClearTidOwner {
+    Modeled,
+    NativeKernel,
+}
+
+impl ClearTidOwner {
+    fn from_config(cfg: &Config) -> Self {
+        if cfg.sequentialize_threads {
+            Self::Modeled
+        } else {
+            Self::NativeKernel
+        }
+    }
+
+    fn assert_modeled(self) {
+        assert_eq!(
+            self,
+            Self::Modeled,
+            "native kernel owns clear-TID synchronization"
+        );
+    }
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -567,7 +600,7 @@ pub struct Scheduler {
     /// Thread pidfds for backends whose scheduler identities do not name host
     /// tasks directly. The address-space identity prevents stale exec cleanup
     /// from removing a replacement image's descriptor.
-    physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd)>,
+    physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd, bool)>,
 
     /// The current set of actions in the background.
     #[allow(dead_code)]
@@ -583,6 +616,10 @@ pub struct Scheduler {
     /// releases virtual-time-gated input and observes readiness; it never
     /// consumes bytes on behalf of a thread.
     network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
+    /// Shared existing stream publication notification; no separate queue.
+    fd_read_changed: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    fd_read_test_cut: fd_read::TestCutHook,
 
     /// Typed subset of `blocked.external_io_blockers`. Only live network
     /// capture introduces host elapsed time; replay and ordinary IO do not.
@@ -633,7 +670,10 @@ pub struct Scheduler {
     /// run-queue mutation is safe.
     pending_cross_task_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
 
-    /// Child-TID futexes whose kernel clear may still be racing a guest join.
+    /// Selected only at construction from the immutable run configuration.
+    clear_tid_owner: ClearTidOwner,
+
+    /// Modeled child-TID futexes whose kernel clear may still race a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
 
     /// The rendered report for a terminal deadlock, once one has been detected.
@@ -817,15 +857,252 @@ pub struct ThreadTree {
     /// the exact creating task for __WNOTHREAD, clone exit-signal class, and
     /// mutable process-group/session membership.
     process_wait: HashMap<DetPid, ProcessWaitMetadata>,
+    group_change: Option<PendingProcessGroupChange>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ProcessWaitMetadata {
+    reaped: bool,
+    births: HashMap<(ExternalOpId, MmId), NoSeqBirthState>,
+    native_projections:
+        Vec<Arc<crate::network_runtime::native_birth_outcome::NativeTaskProjection>>,
+    historical_births: Vec<Arc<crate::network_runtime::native_birth_outcome::NativeBirthOwner>>,
+    birth_sequences: HashMap<(DetTid, MmId), u64>,
+    // Historical birth parent is not a current-parent/reparent issuer. Until
+    // that issuer exists, native entries cannot answer modeled wait queries.
+    native_birth_parent:
+        Option<Arc<crate::network_runtime::native_birth_outcome::NativeTaskProjection>>,
     wait_parent: Option<DetPid>,
     wait_owner: DetTid,
     exit_signal: libc::c_int,
     process_group: DetPid,
     session: DetPid,
+}
+
+#[derive(Debug, Clone)]
+struct NoSeqBirthState {
+    birth: NoSeqChildBirth,
+    owner_gone: bool,
+    completed_child: Option<NoSeqBirthCompletion>,
+    // Observations belong to this exact existing birth reservation. A scalar
+    // positive return is not interchangeable with a native NewChild event.
+    native: Option<reverie::InjectedSyscallEvent>,
+    // A later native parent exit boundary does not replace the early child
+    // identity or become authority to cancel an already-created child.
+    parent_completion: Option<(reverie::Tid, i64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoSeqBirthCompletion {
+    Registered(DetTid),
+    ExitedBeforeStart(DetTid),
+}
+impl NoSeqBirthCompletion {
+    fn child(self) -> DetTid {
+        match self {
+            Self::Registered(child) | Self::ExitedBeforeStart(child) => child,
+        }
+    }
+}
+
+/// Original group/session operation, still validated by the native kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessGroupChangeKind {
+    /// setpgid's resolved target and requested group (including invalid values).
+    Set {
+        /// Target process.
+        process: DetPid,
+        /// Requested group.
+        group: DetPid,
+    },
+    /// setsid on the caller's process.
+    Session {
+        /// Calling process.
+        process: DetPid,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingProcessGroupChange {
+    change: ProcessGroupChange,
+    native_result: Option<Result<i64, i32>>,
+}
+
+/// Shared wait-registry admission held over native group/session mutation.
+/// Fields are private; serde is the trusted tool RPC transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessGroupChange {
+    owner: crate::network_replay::NetworkStreamOwner,
+    operation: ExternalOpId,
+    kind: ProcessGroupChangeKind,
+    submitted: bool,
+}
+impl ProcessGroupChange {
+    pub(crate) fn owner(&self) -> crate::network_replay::NetworkStreamOwner {
+        self.owner
+    }
+}
+
+/// Exact local preparation still owned by a consumed ThreadState before the
+/// corresponding Guest::inject call. There is no public constructor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UninvokedWaitCall(UninvokedWaitKind);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum UninvokedWaitKind {
+    Birth(NoSeqChildBirth),
+    Group(ProcessGroupChange),
+}
+impl UninvokedWaitCall {
+    pub(crate) fn birth(mut birth: NoSeqChildBirth) -> Self {
+        assert!(birth.child.is_none());
+        birth.submitted = false;
+        Self(UninvokedWaitKind::Birth(birth))
+    }
+    pub(crate) fn group(mut change: ProcessGroupChange) -> Self {
+        change.submitted = false;
+        Self(UninvokedWaitKind::Group(change))
+    }
+    pub(crate) fn clone_submission(
+        &self,
+    ) -> Option<(
+        crate::network_replay::NetworkFdPublicationPermit,
+        reverie::syscalls::CloneFlags,
+    )> {
+        match &self.0 {
+            UninvokedWaitKind::Birth(birth) => birth.fd_permit.map(|permit| (permit, birth.flags)),
+            _ => None,
+        }
+    }
+}
+
+/// A prepared child registration, retained by the common wait registry and
+/// copied only through the backend's actual parent-to-child ThreadState path.
+/// The fields and preparation constructor are private; serde is the existing
+/// trusted tool RPC transport, not a guest-facing capability endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoSeqChildBirth {
+    #[serde(skip)]
+    pub(crate) native_owner:
+        Option<Arc<crate::network_runtime::native_birth_outcome::NativeBirthOwner>>,
+    #[serde(default)]
+    pub(crate) native_required: bool,
+    parent: crate::network_replay::NetworkStreamOwner,
+    process: DetPid,
+    operation: ExternalOpId,
+    flags: reverie::syscalls::CloneFlags,
+    child_tid_addr: usize,
+    exit_signal: libc::c_int,
+    priority_entropy: Option<u64>,
+    fd_permit: Option<crate::network_replay::NetworkFdPublicationPermit>,
+    child: Option<DetTid>,
+    submitted: bool,
+}
+
+impl PartialEq for NoSeqChildBirth {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_identity() == other.request_identity()
+            && self.child == other.child
+            && self.submitted == other.submitted
+    }
+}
+impl Eq for NoSeqChildBirth {}
+
+impl NoSeqChildBirth {
+    pub(crate) fn request_identity(
+        &self,
+    ) -> crate::network_runtime::native_birth_outcome::NativeBirthRequest {
+        crate::network_runtime::native_birth_outcome::NativeBirthRequest {
+            owner: self.parent,
+            process: self.process,
+            operation: self.operation,
+            flags: self.flags,
+            child_tid_addr: self.child_tid_addr,
+            exit_signal: self.exit_signal,
+            priority_entropy: self.priority_entropy,
+            permit: self.fd_permit,
+        }
+    }
+    pub(crate) fn construction(
+        &self,
+    ) -> std::io::Result<
+        Option<Arc<crate::network_runtime::native_birth_outcome::NativeChildOutcome>>,
+    > {
+        if !self.native_required {
+            return Ok(None);
+        }
+        let owner = self.native_owner.as_ref().ok_or_else(|| {
+            std::io::Error::other("active birth lost private owner during serialization")
+        })?;
+        if owner.request() != &self.request_identity() {
+            return Err(std::io::Error::other(
+                "native birth original request changed",
+            ));
+        }
+        owner.outcome().map(Some)
+    }
+
+    pub(crate) fn parent(&self) -> crate::network_replay::NetworkStreamOwner {
+        self.parent
+    }
+    pub(crate) fn process(&self) -> DetPid {
+        self.process
+    }
+    pub(crate) fn flags(&self) -> reverie::syscalls::CloneFlags {
+        self.flags
+    }
+    pub(crate) fn child_tid_addr(&self) -> usize {
+        self.child_tid_addr
+    }
+    pub(crate) fn exit_signal(&self) -> libc::c_int {
+        self.exit_signal
+    }
+    pub(crate) fn priority_entropy(&self) -> Option<u64> {
+        self.priority_entropy
+    }
+    pub(crate) fn fd_permit(&self) -> Option<crate::network_replay::NetworkFdPublicationPermit> {
+        self.fd_permit
+    }
+    pub(crate) fn child(&self) -> Option<DetTid> {
+        self.child
+    }
+
+    /// Called by Tool::init_thread_state with its actual parent reference and
+    /// backend child Tid. Neither a syscall return nor a numeric parent lookup
+    /// constructs this child-bound form.
+    pub(crate) fn inherit<T>(
+        &self,
+        parent_tid: reverie::Tid,
+        parent: &crate::tool_local::ThreadState<T>,
+        child_tid: reverie::Tid,
+    ) -> Self {
+        assert!(
+            self.submitted,
+            "backend birth must follow submission acknowledgement"
+        );
+        assert!(
+            self.child.is_none(),
+            "a birth receipt cannot be inherited twice"
+        );
+        assert_eq!(parent_tid.as_raw(), parent.dettid.as_raw());
+        assert_eq!(self.parent.thread, parent.dettid);
+        assert_eq!(self.parent.mm, parent.mm_id);
+        assert_eq!(Some(self.process), parent.detpid);
+        assert_eq!(Some(self.flags), parent.clone_flags);
+        assert_eq!(self.fd_permit, parent.pending_fd_clone);
+        assert!(
+            parent.uninvoked_wait_call.is_none(),
+            "actual backend child follows native invocation"
+        );
+        assert!(
+            parent.uninvoked_fd_clone.is_none(),
+            "clone admission marker is parent-only and consumed before inject"
+        );
+        let child = DetTid::from_raw(child_tid.as_raw());
+        assert_ne!(child, parent.dettid);
+        let mut inherited = self.clone();
+        inherited.child = Some(child);
+        inherited
+    }
 }
 
 use pretty::Doc;
@@ -971,6 +1248,25 @@ impl ThreadTree {
         clone_parent: bool,
         exit_signal: libc::c_int,
     ) {
+        self.add_child_with_wait_entry(
+            parent_dettid,
+            child_dettid,
+            is_group_leader,
+            clone_parent,
+            exit_signal,
+            None,
+        );
+    }
+
+    fn add_child_with_wait_entry(
+        &mut self,
+        parent_dettid: DetTid,
+        child_dettid: DetTid,
+        is_group_leader: bool,
+        clone_parent: bool,
+        exit_signal: libc::c_int,
+        retained: Option<ProcessWaitMetadata>,
+    ) {
         // TODO(T78538674): virtualize pid/tid:
         if parent_dettid == child_dettid {
             self.add_edge(None, child_dettid);
@@ -981,9 +1277,16 @@ impl ThreadTree {
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
             if parent_dettid == child_dettid {
+                let historical_births = self.displaced_native_births(child_dettid);
                 self.process_wait.insert(
                     child_dettid,
                     ProcessWaitMetadata {
+                        reaped: false,
+                        births: HashMap::new(),
+                        native_projections: Vec::new(),
+                        historical_births,
+                        birth_sequences: HashMap::new(),
+                        native_birth_parent: None,
                         wait_parent: None,
                         wait_owner: child_dettid,
                         exit_signal: libc::SIGCHLD,
@@ -997,32 +1300,31 @@ impl ThreadTree {
                     .get(&parent_dettid)
                     .copied()
                     .expect("process child parent must have a thread-group leader");
-                let parent_metadata = self.process_wait.get(&parent_process).copied().unwrap_or(
-                    ProcessWaitMetadata {
-                        wait_parent: None,
-                        wait_owner: parent_dettid,
-                        exit_signal: libc::SIGCHLD,
-                        process_group: parent_process,
-                        session: parent_process,
-                    },
-                );
-                let (wait_parent, wait_owner) = if clone_parent {
-                    (parent_metadata.wait_parent, parent_metadata.wait_owner)
-                } else {
-                    (Some(parent_process), parent_dettid)
-                };
-                if let Some(wait_parent) = wait_parent {
-                    self.process_parent.insert(child_dettid, wait_parent);
-                }
-                self.process_wait.insert(
+                let parent_metadata = retained.unwrap_or_else(|| {
+                    self.process_wait
+                        .get(&parent_process)
+                        .cloned()
+                        .unwrap_or(ProcessWaitMetadata {
+                            reaped: false,
+                            births: HashMap::new(),
+                            native_projections: Vec::new(),
+                            historical_births: Vec::new(),
+                            birth_sequences: HashMap::new(),
+                            native_birth_parent: None,
+                            wait_parent: None,
+                            wait_owner: parent_dettid,
+                            exit_signal: libc::SIGCHLD,
+                            process_group: parent_process,
+                            session: parent_process,
+                        })
+                });
+                self.add_process_wait_child(
+                    parent_dettid,
+                    parent_process,
                     child_dettid,
-                    ProcessWaitMetadata {
-                        wait_parent,
-                        wait_owner,
-                        exit_signal,
-                        process_group: parent_metadata.process_group,
-                        session: parent_metadata.session,
-                    },
+                    clone_parent,
+                    exit_signal,
+                    parent_metadata,
                 );
             }
         } else {
@@ -1038,22 +1340,1091 @@ impl ThreadTree {
         }
     }
 
+    fn add_process_wait_child(
+        &mut self,
+        parent_dettid: DetTid,
+        parent_process: DetPid,
+        child_dettid: DetTid,
+        clone_parent: bool,
+        exit_signal: libc::c_int,
+        parent_metadata: ProcessWaitMetadata,
+    ) {
+        let (wait_parent, wait_owner) = if clone_parent {
+            (parent_metadata.wait_parent, parent_metadata.wait_owner)
+        } else {
+            (Some(parent_process), parent_dettid)
+        };
+        if let Some(wait_parent) = wait_parent {
+            self.process_parent.insert(child_dettid, wait_parent);
+        }
+        let historical_births = self.displaced_native_births(child_dettid);
+        self.process_wait.insert(
+            child_dettid,
+            ProcessWaitMetadata {
+                reaped: false,
+                births: HashMap::new(),
+                native_projections: Vec::new(),
+                historical_births,
+                birth_sequences: HashMap::new(),
+                native_birth_parent: None,
+                wait_parent,
+                wait_owner,
+                exit_signal,
+                process_group: parent_metadata.process_group,
+                session: parent_metadata.session,
+            },
+        );
+    }
+
+    pub(crate) fn prepare_no_seq_birth(
+        &mut self,
+        parent: crate::network_replay::NetworkStreamOwner,
+        process: DetPid,
+        operation: ExternalOpId,
+        flags: reverie::syscalls::CloneFlags,
+        child_tid_addr: usize,
+        exit_signal: libc::c_int,
+        priority_entropy: Option<u64>,
+        fd_permit: Option<crate::network_replay::NetworkFdPublicationPermit>,
+    ) -> Option<NoSeqChildBirth> {
+        if self.no_seq_birth_admission_busy()
+            || operation.tid != parent.thread
+            || self.thread_to_leader.get(&parent.thread) != Some(&process)
+        {
+            return None;
+        }
+        let projections = self
+            .process_wait
+            .values()
+            .flat_map(|entry| entry.native_projections.iter().cloned())
+            .collect();
+        let entry = self.process_wait.get_mut(&process)?;
+        if entry.reaped
+            || entry.births.contains_key(&(operation, parent.mm))
+            || entry
+                .birth_sequences
+                .get(&(parent.thread, parent.mm))
+                .is_some_and(|last| *last >= operation.sequence)
+        {
+            return None;
+        }
+        let mut birth = NoSeqChildBirth {
+            native_owner: None,
+            native_required: false,
+            parent,
+            process,
+            operation,
+            flags,
+            child_tid_addr,
+            exit_signal,
+            priority_entropy,
+            fd_permit,
+            child: None,
+            submitted: false,
+        };
+        birth.native_owner = Some(
+            crate::network_runtime::native_birth_outcome::NativeBirthOwner::new(
+                birth.request_identity(),
+                entry.process_group,
+                entry.session,
+                projections,
+            ),
+        );
+        entry
+            .birth_sequences
+            .insert((parent.thread, parent.mm), operation.sequence);
+        entry.births.insert(
+            (operation, parent.mm),
+            NoSeqBirthState {
+                birth: birth.clone(),
+                owner_gone: false,
+                completed_child: None,
+                native: None,
+                parent_completion: None,
+            },
+        );
+        Some(birth)
+    }
+
+    pub(crate) fn submit_no_seq_birth(
+        &mut self,
+        birth: &NoSeqChildBirth,
+    ) -> Option<NoSeqChildBirth> {
+        if birth.child.is_some() || birth.submitted {
+            return None;
+        }
+        let retained = self
+            .process_wait
+            .get_mut(&birth.process)?
+            .births
+            .get_mut(&(birth.operation, birth.parent.mm))?;
+        if retained.birth != *birth || retained.owner_gone {
+            return None;
+        }
+        retained.birth.submitted = true;
+        Some(retained.birth.clone())
+    }
+
+    /// Actual ThreadState consumption releases preparations without Submit and
+    /// births already registered by their real child. Unknown submitted effects
+    /// (including a lost Submit reply) remain retained.
+    pub(crate) fn validate_uninvoked_wait_call(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        marker: &UninvokedWaitCall,
+    ) -> bool {
+        match &marker.0 {
+            UninvokedWaitKind::Birth(prepared) => {
+                let Some(state) = self
+                    .process_wait
+                    .get(&prepared.process)
+                    .and_then(|entry| entry.births.get(&(prepared.operation, prepared.parent.mm)))
+                else {
+                    return false;
+                };
+                let mut original = state.birth.clone();
+                original.submitted = false;
+                prepared.parent == owner
+                    && !prepared.submitted
+                    && prepared.child.is_none()
+                    && state.completed_child.is_none()
+                    && state.native.is_none()
+                    && original == *prepared
+            }
+            UninvokedWaitKind::Group(prepared) => {
+                let Some(retained) = &self.group_change else {
+                    return false;
+                };
+                let mut original = retained.change.clone();
+                original.submitted = false;
+                prepared.owner == owner
+                    && !prepared.submitted
+                    && retained.native_result.is_none()
+                    && original == *prepared
+            }
+        }
+    }
+
+    pub(crate) fn retire_no_seq_wait_owner(
+        &mut self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        uninvoked: Option<&UninvokedWaitCall>,
+    ) -> bool {
+        if let Some(marker) = uninvoked {
+            if !self.validate_uninvoked_wait_call(owner, marker) {
+                return false;
+            }
+            match &marker.0 {
+                UninvokedWaitKind::Birth(birth) => {
+                    if let Some(retained) = self
+                        .process_wait
+                        .get(&birth.process)
+                        .and_then(|entry| entry.births.get(&(birth.operation, birth.parent.mm)))
+                        .and_then(|state| state.birth.native_owner.as_ref())
+                    {
+                        if retained.settle_failure(&birth.request_identity()).is_err() {
+                            return false;
+                        }
+                    }
+                    self.process_wait
+                        .get_mut(&birth.process)
+                        .unwrap()
+                        .births
+                        .remove(&(birth.operation, birth.parent.mm))
+                        .unwrap();
+                }
+                UninvokedWaitKind::Group(_) => {
+                    self.group_change = None;
+                }
+            }
+        }
+        let processes: Vec<_> = self
+            .process_wait
+            .iter_mut()
+            .filter_map(|(&process, entry)| {
+                entry.births.retain(|_, state| {
+                    if state.birth.parent != owner {
+                        return true;
+                    }
+                    state.owner_gone = true;
+                    state.birth.submitted && state.completed_child.is_none()
+                });
+                (entry.reaped
+                    && entry.births.is_empty()
+                    && entry.historical_births.iter().all(|owner| owner.complete()))
+                .then_some(process)
+            })
+            .collect();
+        for process in processes {
+            self.process_wait.remove(&process);
+        }
+        if self
+            .group_change
+            .as_ref()
+            .is_some_and(|pending| pending.change.owner == owner && !pending.change.submitted)
+        {
+            self.group_change = None;
+        }
+        true
+    }
+
+    pub(crate) fn pending_no_seq_birth_count(&self) -> usize {
+        self.process_wait
+            .values()
+            .map(|entry| {
+                entry.births.len()
+                    + entry
+                        .historical_births
+                        .iter()
+                        .filter(|owner| !owner.complete())
+                        .count()
+            })
+            .sum()
+    }
+
+    /// Publish a private historical admission into existing wait lifetimes and
+    /// original unresolved birth owners before the admitted task can run.
+    pub(crate) fn rebind_native_birth(&self, birth: &mut NoSeqChildBirth) -> std::io::Result<()> {
+        let request = birth.request_identity();
+        let owner = self
+            .process_wait
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .births
+                    .values()
+                    .filter_map(|state| state.birth.native_owner.as_ref())
+                    .chain(entry.historical_births.iter())
+            })
+            .find(|owner| owner.request() == &request)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::other("native rebind lost exact retained request owner")
+            })?;
+        if !birth.submitted {
+            return Err(std::io::Error::other("native rebind precedes submission"));
+        }
+        if let Some(child) = birth.child {
+            if owner.outcome()?.child().thread != child {
+                return Err(std::io::Error::other("native rebind changed actual child"));
+            }
+        }
+        birth.native_owner = Some(owner);
+        birth.native_required = true;
+        Ok(())
+    }
+
+    pub(crate) fn retain_native_projection(
+        &mut self,
+        projection: Arc<crate::network_runtime::native_birth_outcome::NativeTaskProjection>,
+    ) -> std::io::Result<()> {
+        // Preflight every attachment before changing any existing owner.
+        for owner in self.process_wait.values().flat_map(|entry| {
+            entry
+                .births
+                .values()
+                .filter_map(|state| state.birth.native_owner.as_ref())
+                .chain(entry.historical_births.iter())
+        }) {
+            owner.validate_projection(&projection)?;
+        }
+        let entry = self
+            .process_wait
+            .get_mut(&projection.process())
+            .ok_or_else(|| std::io::Error::other("native projection lost process lifetime"))?;
+        // A numeric slot (including an empty replacement) is not process
+        // authority. Require a retained reference to this exact process Arc.
+        if !entry
+            .native_projections
+            .iter()
+            .any(|old| old.same_process(&projection))
+            || entry
+                .native_projections
+                .iter()
+                .any(|old| !old.same_process(&projection))
+        {
+            return Err(std::io::Error::other(
+                "numeric process slot lacks the exact native lifetime",
+            ));
+        }
+        if let Some(old) = entry
+            .native_projections
+            .iter()
+            .find(|old| old.same_task(&projection))
+        {
+            if **old != *projection {
+                return Err(std::io::Error::other(
+                    "native projection contradicted retained generation",
+                ));
+            }
+        } else {
+            entry.native_projections.push(projection.clone());
+        }
+        for entry in self.process_wait.values_mut() {
+            entry.historical_births.retain(|owner| !owner.complete());
+            for owner in entry
+                .births
+                .values()
+                .filter_map(|state| state.birth.native_owner.as_ref())
+                .chain(entry.historical_births.iter())
+            {
+                owner.retain_projection(projection.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn displaced_native_births(
+        &self,
+        process: DetPid,
+    ) -> Vec<Arc<crate::network_runtime::native_birth_outcome::NativeBirthOwner>> {
+        self.process_wait
+            .get(&process)
+            .map_or_else(Vec::new, |entry| {
+                entry
+                    .births
+                    .values()
+                    .filter_map(|state| state.birth.native_owner.clone())
+                    .chain(entry.historical_births.iter().cloned())
+                    .filter(|owner| !owner.complete())
+                    .collect()
+            })
+    }
+
+    /// One common semantic consumer. The Live disposition alone inserts tree
+    /// membership; terminal-before-start creates only historical wait state.
+    /// Scheduling/time/physical admission remain in their existing live caller.
+    fn consume_native_child(
+        &mut self,
+        birth: &NoSeqChildBirth,
+        child: crate::network_replay::NetworkStreamOwner,
+        disposition: crate::network_runtime::native_birth_outcome::NativeBirthDisposition,
+    ) -> bool {
+        use crate::network_runtime::native_birth_outcome::NativeBirthDisposition;
+        let Ok(Some(outcome)) = birth.construction() else {
+            return false;
+        };
+        let Some(owner) = &birth.native_owner else {
+            return false;
+        };
+        if !birth.submitted
+            || birth.child != Some(child.thread)
+            || outcome.child() != child
+            || outcome.admission().terminal()
+                != (disposition == NativeBirthDisposition::ExitedBeforeStart)
+        {
+            return false;
+        }
+        if let Some(old) = owner.disposition() {
+            return old == disposition;
+        }
+        if self.tree.contains_key(&child.thread)
+            || self
+                .process_wait
+                .get(&child.thread)
+                .is_some_and(|entry| !entry.reaped)
+        {
+            return false;
+        }
+        for retained in self.process_wait.values().flat_map(|entry| {
+            entry
+                .births
+                .values()
+                .filter_map(|state| state.birth.native_owner.as_ref())
+                .chain(entry.historical_births.iter())
+        }) {
+            if retained.validate_projection(outcome.projection()).is_err() {
+                return false;
+            }
+        }
+        let is_process = !outcome
+            .flags()
+            .contains(reverie::syscalls::CloneFlags::CLONE_THREAD);
+        if is_process {
+            let historical_births = self.displaced_native_births(child.thread);
+            self.process_wait.insert(
+                child.thread,
+                ProcessWaitMetadata {
+                    reaped: false,
+                    births: HashMap::new(),
+                    birth_sequences: HashMap::new(),
+                    // This fresh process entry is issued by this exact child
+                    // outcome; existing entries must already hold its process Arc.
+                    native_projections: vec![outcome.projection().clone()],
+                    historical_births,
+                    native_birth_parent: Some(outcome.parent().clone()),
+                    wait_parent: None,
+                    wait_owner: child.thread,
+                    exit_signal: outcome.exit_signal(),
+                    process_group: owner.process_group,
+                    session: owner.session,
+                },
+            );
+        } else {
+            let Some(entry) = self.process_wait.get(&outcome.process()) else {
+                return false;
+            };
+            if !entry
+                .native_projections
+                .iter()
+                .any(|old| old.same_process(outcome.projection()))
+                || entry
+                    .native_projections
+                    .iter()
+                    .any(|old| !old.same_process(outcome.projection()))
+            {
+                return false;
+            }
+        }
+        if disposition == NativeBirthDisposition::Live {
+            if self.tree.contains_key(&birth.parent.thread) {
+                self.add_edge(Some(birth.parent.thread), child.thread);
+            } else {
+                // A retained late birth does not resurrect its retired creator.
+                self.tree.entry(child.thread).or_default();
+            }
+            self.thread_to_leader
+                .insert(child.thread, outcome.process());
+            if is_process {
+                self.thread_group_leaders.insert(child.thread);
+            }
+        }
+        // This is a birth-time parent projection only. Activation still needs
+        // the current reparent frontier; no Outside/current authority is minted.
+        self.retain_native_projection(outcome.projection().clone())
+            .expect("native projection preflight changed under scheduler lock");
+        if let Some(entry) = self.process_wait.get_mut(&birth.process)
+            && let Some(state) = entry.births.get_mut(&(birth.operation, birth.parent.mm))
+            && state.birth.request_identity() == birth.request_identity()
+        {
+            if state.owner_gone || entry.reaped {
+                entry.births.remove(&(birth.operation, birth.parent.mm));
+            } else {
+                state.completed_child = Some(match disposition {
+                    NativeBirthDisposition::Live => NoSeqBirthCompletion::Registered(child.thread),
+                    NativeBirthDisposition::ExitedBeforeStart => {
+                        NoSeqBirthCompletion::ExitedBeforeStart(child.thread)
+                    }
+                });
+            }
+        }
+        owner
+            .consume(disposition)
+            .expect("native disposition changed under scheduler lock");
+        self.prune_reaped_birth_entry(birth.process);
+        true
+    }
+
+    pub(crate) fn check_no_seq_birth(&self, birth: &NoSeqChildBirth, child: DetTid) -> bool {
+        if birth.native_required {
+            let Ok(Some(outcome)) = birth.construction() else {
+                return false;
+            };
+            return birth.submitted
+                && birth.child == Some(child)
+                && outcome.child().thread == child
+                && birth
+                    .native_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.disposition().is_none())
+                && !self.tree.contains_key(&child);
+        }
+
+        if !birth.submitted
+            || birth.child != Some(child)
+            || self.tree.contains_key(&child)
+            || self.thread_to_leader.get(&birth.parent.thread) != Some(&birth.process)
+        {
+            return false;
+        }
+        let Some(original) = self
+            .process_wait
+            .get(&birth.process)
+            .and_then(|entry| entry.births.get(&(birth.operation, birth.parent.mm)))
+        else {
+            return false;
+        };
+        let mut expected = birth.clone();
+        expected.child = None;
+        original.birth == expected
+            && original.completed_child.is_none()
+            && original.native.is_none_or(|native| {
+                native
+                    == reverie::InjectedSyscallEvent::ChildCreated(reverie::Tid::from_raw(
+                        child.as_raw(),
+                    ))
+            })
+    }
+
+    pub(crate) fn consume_no_seq_birth(&mut self, birth: &NoSeqChildBirth, child: DetTid) -> bool {
+        if birth.native_required {
+            let Ok(Some(outcome)) = birth.construction() else {
+                return false;
+            };
+            return outcome.child().thread == child
+                && self.consume_native_child(
+                    birth,
+                    outcome.child(),
+                    crate::network_runtime::native_birth_outcome::NativeBirthDisposition::Live,
+                );
+        }
+
+        if !self.check_no_seq_birth(birth, child) {
+            return false;
+        }
+        // This is the same wait entry used by ordinary registration. The
+        // group/session admission excludes native mutations from preparation
+        // through this registration; an already registered child receives its
+        // own independent entry. Unknown invoked effects keep admission held.
+        let parent_entry = self.process_wait[&birth.process].clone();
+        let flags = birth.flags;
+        self.add_child_with_wait_entry(
+            birth.parent.thread,
+            child,
+            !flags.contains(reverie::syscalls::CloneFlags::CLONE_THREAD),
+            flags.contains(reverie::syscalls::CloneFlags::CLONE_PARENT),
+            birth.exit_signal,
+            Some(parent_entry),
+        );
+        let entry = self.process_wait.get_mut(&birth.process).unwrap();
+        let state = entry
+            .births
+            .get_mut(&(birth.operation, birth.parent.mm))
+            .unwrap();
+        if state.owner_gone || entry.reaped {
+            entry
+                .births
+                .remove(&(birth.operation, birth.parent.mm))
+                .unwrap();
+        } else {
+            state.completed_child = Some(NoSeqBirthCompletion::Registered(child));
+        }
+        self.prune_reaped_birth_entry(birth.process);
+        true
+    }
+
+    /// The final-wait caller also proves that handle_thread_start never entered.
+    /// Require both the inherited local birth and the exact native NewChild;
+    /// neither a positive scalar clone return nor task consumption is enough.
+    pub(crate) fn check_prestart_terminal_birth(
+        &self,
+        birth: &NoSeqChildBirth,
+        child: crate::network_replay::NetworkStreamOwner,
+    ) -> bool {
+        if birth.native_required {
+            let Ok(Some(outcome)) = birth.construction() else {
+                return false;
+            };
+            return self.check_no_seq_birth(birth, child.thread)
+                && outcome.child() == child
+                && outcome.admission().terminal()
+                && !self.process_wait.contains_key(&child.thread);
+        }
+        self.check_no_seq_birth(birth, child.thread)
+            && child.mm
+                == MmId::for_clone(
+                    birth.parent.mm,
+                    child.thread,
+                    birth
+                        .flags
+                        .contains(reverie::syscalls::CloneFlags::CLONE_VM),
+                )
+            && !self.process_wait.contains_key(&child.thread)
+            && self.process_wait[&birth.process].births[&(birth.operation, birth.parent.mm)].native
+                == Some(reverie::InjectedSyscallEvent::ChildCreated(
+                    reverie::Tid::from_raw(child.thread.as_raw()),
+                ))
+    }
+
+    /// Record an actual child that died before startup, without constructing a
+    /// runnable/thread-tree registration. The existing wait registry retains
+    /// its real parent, group and exit-signal class until ordinary native reap.
+    fn complete_prestart_terminal_birth(
+        &mut self,
+        birth: &NoSeqChildBirth,
+        child: crate::network_replay::NetworkStreamOwner,
+    ) -> bool {
+        if birth.native_required {
+            if !self.check_prestart_terminal_birth(birth, child) {
+                return false;
+            }
+            return self.consume_native_child(birth, child,
+                crate::network_runtime::native_birth_outcome::NativeBirthDisposition::ExitedBeforeStart);
+        }
+
+        if !self.check_prestart_terminal_birth(birth, child) {
+            return false;
+        }
+        if !birth
+            .flags
+            .contains(reverie::syscalls::CloneFlags::CLONE_THREAD)
+        {
+            self.add_process_wait_child(
+                birth.parent.thread,
+                birth.process,
+                child.thread,
+                birth
+                    .flags
+                    .contains(reverie::syscalls::CloneFlags::CLONE_PARENT),
+                birth.exit_signal,
+                self.process_wait[&birth.process].clone(),
+            );
+        }
+        let entry = self.process_wait.get_mut(&birth.process).unwrap();
+        let state = entry
+            .births
+            .get_mut(&(birth.operation, birth.parent.mm))
+            .unwrap();
+        if state.owner_gone || entry.reaped {
+            entry
+                .births
+                .remove(&(birth.operation, birth.parent.mm))
+                .unwrap();
+        } else {
+            state.completed_child = Some(NoSeqBirthCompletion::ExitedBeforeStart(child.thread));
+        }
+        self.prune_reaped_birth_entry(birth.process);
+        true
+    }
+
+    /// Only an observed native clone failure cancels a prepared birth. Parent
+    /// teardown deliberately leaves a pending receipt available to its child.
+    pub(crate) fn cancel_no_seq_birth(&mut self, birth: &NoSeqChildBirth) -> bool {
+        if birth.child.is_some() || !birth.submitted {
+            return false;
+        }
+        let Some(entry) = self.process_wait.get_mut(&birth.process) else {
+            return false;
+        };
+        if !entry
+            .births
+            .get(&(birth.operation, birth.parent.mm))
+            .is_some_and(|state| {
+                state.birth == *birth
+                    && state.completed_child.is_none()
+                    && state.native.is_none_or(|native| {
+                        matches!(native, reverie::InjectedSyscallEvent::Returned(raw)
+                            if (-4095..=-1).contains(&raw))
+                    })
+            })
+        {
+            return false;
+        }
+        if let Some(owner) = entry.births[&(birth.operation, birth.parent.mm)]
+            .birth
+            .native_owner
+            .as_ref()
+        {
+            if owner.settle_failure(&birth.request_identity()).is_err() {
+                return false;
+            }
+        }
+        entry.births.remove(&(birth.operation, birth.parent.mm));
+        self.prune_reaped_birth_entry(birth.process);
+        true
+    }
+
+    /// Pending means neither common registration nor authenticated prestart exit completed.
+    /// A surviving parent consumes the exact completed record before guest resume.
+    pub(crate) fn join_no_seq_birth(
+        &mut self,
+        birth: &NoSeqChildBirth,
+        child: DetTid,
+    ) -> Option<bool> {
+        if birth.child.is_some() || !birth.submitted {
+            return Some(false);
+        }
+        let Some(entry) = self.process_wait.get_mut(&birth.process) else {
+            return Some(false);
+        };
+        let Some(state) = entry.births.get(&(birth.operation, birth.parent.mm)) else {
+            return Some(false);
+        };
+        if state.birth != *birth || state.owner_gone {
+            return Some(false);
+        }
+        match state.completed_child {
+            None => None,
+            Some(actual) if actual.child() == child => {
+                entry
+                    .births
+                    .remove(&(birth.operation, birth.parent.mm))
+                    .unwrap();
+                self.prune_reaped_birth_entry(birth.process);
+                Some(true)
+            }
+            Some(_) => Some(false),
+        }
+    }
+
+    pub(crate) fn no_seq_birth_admission_busy(&self) -> bool {
+        self.group_change.is_some()
+    }
+    pub(crate) fn process_group_admission_busy(&self) -> bool {
+        self.group_change.is_some()
+            || self.process_wait.values().any(|entry| {
+                entry
+                    .historical_births
+                    .iter()
+                    .any(|owner| !owner.complete())
+                    || entry
+                        .births
+                        .values()
+                        .any(|state| state.completed_child.is_none())
+            })
+    }
+    pub(crate) fn prepare_process_group_change(
+        &mut self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        operation: ExternalOpId,
+        kind: ProcessGroupChangeKind,
+    ) -> Option<ProcessGroupChange> {
+        if owner.thread != operation.tid || self.process_group_admission_busy() {
+            return None;
+        }
+        let process = *self.thread_to_leader.get(&owner.thread)?;
+        let entry = self.process_wait.get_mut(&process)?;
+        if entry.reaped
+            || entry
+                .birth_sequences
+                .get(&(owner.thread, owner.mm))
+                .is_some_and(|last| *last >= operation.sequence)
+        {
+            return None;
+        }
+        entry
+            .birth_sequences
+            .insert((owner.thread, owner.mm), operation.sequence);
+        let change = ProcessGroupChange {
+            owner,
+            operation,
+            kind,
+            submitted: false,
+        };
+        self.group_change = Some(PendingProcessGroupChange {
+            change: change.clone(),
+            native_result: None,
+        });
+        Some(change)
+    }
+    pub(crate) fn submit_process_group_change(
+        &mut self,
+        change: &ProcessGroupChange,
+    ) -> Option<ProcessGroupChange> {
+        let retained = self.group_change.as_mut()?;
+        if retained.change != *change || change.submitted || retained.native_result.is_some() {
+            return None;
+        }
+        retained.change.submitted = true;
+        Some(retained.change.clone())
+    }
+    pub(crate) fn complete_process_group_change(
+        &mut self,
+        change: &ProcessGroupChange,
+        result: Result<i64, i32>,
+    ) -> bool {
+        if !change.submitted
+            || self.group_change.as_ref().is_none_or(|pending| {
+                pending.change != *change
+                    || pending.native_result.is_some_and(|native| native != result)
+            })
+            || result.as_ref().is_err_and(|e| !(1..=4095).contains(e))
+        {
+            return false;
+        }
+        if let Ok(value) = result {
+            match change.kind {
+                ProcessGroupChangeKind::Set { process, group } => {
+                    if value != 0 {
+                        return false;
+                    }
+                    self.set_process_group(process, group);
+                }
+                ProcessGroupChangeKind::Session { process } => {
+                    if value != i64::from(process.as_raw()) {
+                        return false;
+                    }
+                    self.create_session(process);
+                }
+            }
+        }
+        self.group_change = None;
+        true
+    }
+    /// Retain only an actual backend observation of the same admitted local
+    /// operation. This synchronous prefix runs before Tool continuation/exit
+    /// awaits. Unrelated injected calls do not acquire an admission here.
+    pub(crate) fn observe_no_seq_operation(
+        &mut self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        process: DetPid,
+        operation: ExternalOpId,
+        birth: Option<&NoSeqChildBirth>,
+        nr: reverie::syscalls::Sysno,
+        args: reverie::syscalls::SyscallArgs,
+        event: reverie::InjectedSyscallEvent,
+    ) -> Result<(), &'static str> {
+        use reverie::InjectedSyscallEvent as Event;
+        use reverie::syscalls::Sysno;
+        if let Some(pending) = self.group_change.as_mut()
+            && pending.change.owner.thread == owner.thread
+            && matches!(nr, Sysno::setpgid | Sysno::setsid)
+        {
+            if pending.change.owner != owner || pending.change.operation != operation {
+                return Err("group observation has another retained MM or operation");
+            }
+            let arguments_match = match pending.change.kind {
+                ProcessGroupChangeKind::Session { process: target } => {
+                    nr == Sysno::setsid && target == process
+                }
+                ProcessGroupChangeKind::Set {
+                    process: target,
+                    group,
+                } => {
+                    let actual_target = if args.arg0 as i32 == 0 {
+                        process
+                    } else {
+                        DetPid::from_raw(args.arg0 as i32)
+                    };
+                    let actual_group = if args.arg1 as i32 == 0 {
+                        actual_target
+                    } else {
+                        DetPid::from_raw(args.arg1 as i32)
+                    };
+                    nr == Sysno::setpgid && target == actual_target && group == actual_group
+                }
+            };
+            let Event::Returned(raw) = event else {
+                return Err("group mutation produced a child observation");
+            };
+            if !pending.change.submitted || !arguments_match || pending.native_result.is_some() {
+                return Err("group observation contradicts retained invocation");
+            }
+            let result = reverie::Errno::from_ret(raw as usize)
+                .map(|value| value as i64)
+                .map_err(|errno| errno.into_raw());
+            if result
+                .as_ref()
+                .is_ok_and(|value| match pending.change.kind {
+                    ProcessGroupChangeKind::Set { .. } => *value != 0,
+                    ProcessGroupChangeKind::Session { process } => {
+                        *value != i64::from(process.as_raw())
+                    }
+                })
+            {
+                return Err("group observation has an impossible native result");
+            }
+            pending.native_result = Some(result);
+        }
+        let Some(birth) = birth else {
+            return Ok(());
+        };
+        let clone_number = matches!(nr, Sysno::clone | Sysno::clone3);
+        #[cfg(not(target_arch = "aarch64"))]
+        let clone_number = clone_number || matches!(nr, Sysno::fork | Sysno::vfork);
+        if !clone_number {
+            return Ok(());
+        }
+        if birth.parent != owner || birth.operation != operation || birth.child.is_some() {
+            return Err("parent operation observation carries another birth identity");
+        }
+        let state = self
+            .process_wait
+            .get_mut(&birth.process)
+            .and_then(|entry| entry.births.get_mut(&(birth.operation, birth.parent.mm)))
+            .ok_or("native clone observation lost exact reservation")?;
+        if state.birth != *birth || !birth.submitted {
+            return Err("clone observation contradicts retained invocation");
+        }
+        if let Event::ChildSyscallReturned { child, raw } = event {
+            if state.owner_gone
+                || state.native != Some(Event::ChildCreated(child))
+                || raw != i64::from(child.as_raw())
+                || state.parent_completion.is_some()
+                || state
+                    .completed_child
+                    .is_some_and(|completed| completed.child().as_raw() != child.as_raw())
+            {
+                return Err("parent completion contradicts its exact native child");
+            }
+            state.parent_completion = Some((child, raw));
+            return Ok(());
+        }
+        if state.native.is_some() {
+            return Err("clone observation contradicts retained invocation");
+        }
+        match event {
+            Event::ChildCreated(child)
+                if child.as_raw() > 0 && child.as_raw() != owner.thread.as_raw() => {}
+            Event::Returned(raw) if (-4095..=-1).contains(&raw) => {}
+            _ => return Err("clone scalar return does not prove a native child event"),
+        }
+        state.native = Some(event);
+        Ok(())
+    }
+
+    /// Actual final-wait admission may settle a retained known group result.
+    /// Unknown effect keeps its original gate/custody; the caller reports a
+    /// failed run and wakes teardown instead of manufacturing an outcome.
+    pub(crate) fn settle_terminal_group_operation(
+        &mut self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        uninvoked: Option<&UninvokedWaitCall>,
+    ) -> Result<(), &'static str> {
+        let Some(pending) = self
+            .group_change
+            .as_ref()
+            .filter(|p| p.change.owner == owner)
+        else {
+            return Ok(());
+        };
+        if !pending.change.submitted
+            || uninvoked.is_some_and(|marker| self.validate_uninvoked_wait_call(owner, marker))
+        {
+            return Ok(()); // Existing exact non-invocation cleanup owns this.
+        }
+        let result = pending
+            .native_result
+            .ok_or("terminal creator lacks native group outcome")?;
+        let change = pending.change.clone();
+        if !self.complete_process_group_change(&change, result) {
+            return Err("retained native group outcome failed exact completion");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn terminal_birth_outcome(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        birth: &NoSeqChildBirth,
+        uninvoked: Option<&UninvokedWaitCall>,
+    ) -> Result<Option<i32>, &'static str> {
+        let state = self
+            .process_wait
+            .get(&birth.process)
+            .and_then(|entry| entry.births.get(&(birth.operation, birth.parent.mm)));
+        if birth.child == Some(owner.thread) {
+            // A real child can die before common registration. Do not call that
+            // no-child, forge registration, or release its table reservation.
+            let mut expected = birth.clone();
+            expected.child = None;
+            if owner.mm
+                != MmId::for_clone(
+                    birth.parent.mm,
+                    owner.thread,
+                    birth
+                        .flags
+                        .contains(reverie::syscalls::CloneFlags::CLONE_VM),
+                )
+                || state.is_some_and(|state| state.birth != expected)
+            {
+                return Err("terminal child contradicts inherited birth/MM");
+            }
+            return if state.is_some_and(|state| state.completed_child.is_none()) {
+                Err("actual child terminated before common birth registration")
+            } else {
+                Ok(None)
+            };
+        }
+        if birth.parent != owner || birth.child.is_some() {
+            return Err("terminal operation has another retained birth identity");
+        }
+        let Some(state) = state else {
+            return Ok(None);
+        }; // Already consumed.
+        if state.birth != *birth {
+            return Err("terminal birth changed exact reservation");
+        }
+        if !birth.submitted
+            || state.completed_child.is_some()
+            || uninvoked.is_some_and(|marker| self.validate_uninvoked_wait_call(owner, marker))
+        {
+            return Ok(None);
+        }
+        match state.native {
+            Some(reverie::InjectedSyscallEvent::ChildCreated(_)) => Ok(None),
+            Some(reverie::InjectedSyscallEvent::Returned(raw)) if (-4095..=-1).contains(&raw) => {
+                Ok(Some((-raw) as i32))
+            }
+            _ => Err("terminal creator lost the native clone outcome"),
+        }
+    }
+
+    pub(crate) fn failed_birth_matches(&self, birth: &NoSeqChildBirth, errno: i32) -> bool {
+        birth.submitted
+            && birth.child.is_none()
+            && (1..=4095).contains(&errno)
+            && self
+                .process_wait
+                .get(&birth.process)
+                .and_then(|entry| entry.births.get(&(birth.operation, birth.parent.mm)))
+                .is_some_and(|state| {
+                    state.birth == *birth
+                        && state.completed_child.is_none()
+                        && state.native.is_none_or(|event| {
+                            event == reverie::InjectedSyscallEvent::Returned(-i64::from(errno))
+                        })
+                })
+    }
+
+    pub(crate) fn pending_process_group_change(&self) -> bool {
+        self.group_change.is_some()
+    }
+
+    fn prune_reaped_birth_entry(&mut self, process: DetPid) {
+        if self.process_wait.get(&process).is_some_and(|entry| {
+            entry.reaped
+                && entry.births.is_empty()
+                && entry.historical_births.iter().all(|owner| owner.complete())
+        }) {
+            self.process_wait.remove(&process);
+        }
+    }
+
+    fn reap_wait_entry(&mut self, process: DetPid) {
+        if self.group_change.as_ref().is_some_and(|pending| {
+            !pending.change.submitted
+                && self.thread_to_leader.get(&pending.change.owner.thread) == Some(&process)
+        }) {
+            self.group_change = None;
+        }
+        if let Some(entry) = self.process_wait.get_mut(&process) {
+            entry.reaped = true;
+            entry.births.retain(|_, state| {
+                state.owner_gone = true;
+                state.birth.submitted && state.completed_child.is_none()
+            });
+        }
+        self.prune_reaped_birth_entry(process);
+    }
+
     /// The process that created `pid` (its parent process), if `pid` is not the
     /// root process. Returns a possibly-stale parent if that process has since
     /// exited; callers deliver through `select_signal_target`, which drops a
     /// signal to a `Gone` target.
     pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
+        assert!(
+            self.process_wait
+                .get(pid)
+                .is_none_or(|entry| entry.native_birth_parent.is_none()),
+            "active native current-parent authority is not implemented"
+        );
         self.process_parent.get(pid).copied()
     }
 
     pub fn process_group(&self, pid: DetPid) -> Option<DetPid> {
         self.process_wait
             .get(&pid)
+            .filter(|metadata| !metadata.reaped)
             .map(|metadata| metadata.process_group)
     }
 
     pub fn set_process_group(&mut self, pid: DetPid, process_group: DetPid) -> bool {
-        let Some(metadata) = self.process_wait.get_mut(&pid) else {
+        let Some(metadata) = self
+            .process_wait
+            .get_mut(&pid)
+            .filter(|metadata| !metadata.reaped)
+        else {
             return false;
         };
         metadata.process_group = process_group;
@@ -1061,7 +2432,11 @@ impl ThreadTree {
     }
 
     pub fn create_session(&mut self, pid: DetPid) -> bool {
-        let Some(metadata) = self.process_wait.get_mut(&pid) else {
+        let Some(metadata) = self
+            .process_wait
+            .get_mut(&pid)
+            .filter(|metadata| !metadata.reaped)
+        else {
             return false;
         };
         metadata.session = pid;
@@ -1579,21 +2954,57 @@ pub(crate) async fn finish_selected_turn(
     // Since the scheduler is asynchronous, we need to check our assumptions.  Polling is
     // sufficient here because the thread cannot be racing with us to exit since we know
     // it is *already* parked.
-    let mut mg = sched.lock().unwrap();
-    if mg.backend_failed() {
-        return Err(SkipTurn);
+    loop {
+        let changed = sched
+            .lock()
+            .unwrap()
+            .fd_read_notification()
+            .notified_owned();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let wait = {
+            let mut mg = sched.lock().unwrap();
+            if mg.backend_failed() {
+                return Err(SkipTurn);
+            }
+            mg.abort_turn_if_thread_vanished(next_dtid)?;
+            let decision = mg.try_selected_fd_read(next_dtid, &req, &resp, &rsrcs);
+            #[cfg(test)]
+            mg.fd_read_test_cut.run();
+            match decision {
+                Ok(fd_read::SelectedFdRead::Ready(read)) => {
+                    mg.next_turns
+                        .get_mut(&next_dtid)
+                        .expect("selected transport")
+                        .protocol
+                        .fd_read = read;
+                    // Keep the old request and both commit paths. External IO
+                    // unblocks in step4, so admission must precede that step.
+                    mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
+                    mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
+                    let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
+                    mg.step6_reenquue(next_dtid, sched_yield);
+                    if let Some(call) = rsrcs.as_exit_syscall() {
+                        mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
+                    }
+                    return Ok(rsrcs);
+                }
+                Ok(fd_read::SelectedFdRead::AwaitPriorSelection) => true,
+                Err(error) => {
+                    mg.terminal_deadlock
+                        .get_or_insert_with(|| format!("selected FD admission failed: {error}"));
+                    mg.fail_parked(next_dtid, parked::ProtocolFailure::Identity);
+                    return Err(SkipTurn);
+                }
+            }
+        };
+        if wait {
+            // Membership is the already-granted exact external owner above.
+            // Notify supplies wakeup only; recheck transport, owner and metadata
+            // after every wake with no lock/table permit held while waiting.
+            until_backend_failure(&sched, changed).await?;
+        }
     }
-    mg.abort_turn_if_thread_vanished(next_dtid)?;
-
-    // The logical COMMIT point for the turn is during step4:
-    mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
-    mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
-    let sched_yield = rsrcs.resources.contains_key(&ResourceID::SchedYield);
-    mg.step6_reenquue(next_dtid, sched_yield);
-    if let Some(call) = rsrcs.as_exit_syscall() {
-        mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
-    }
-    Ok(rsrcs)
 }
 
 // A futex request contains only one resource request, for FutexWait.
@@ -1653,6 +3064,47 @@ enum ThreadStatus {
     Running,
     // Absent from run queue, but present in one of the blocked structures.
     NotRunning,
+}
+
+/// A clone of the scheduler-owned thread description. The fields are private;
+/// only exact MM/process/thread matching against its retained entry creates it.
+/// This is not a table/slot capability, and it cannot be deserialized from RPC.
+pub(crate) struct RetainedPhysicalThread {
+    owner: crate::network_replay::NetworkStreamOwner,
+    process: i32,
+    thread: i32,
+    pidfd: OwnedFd,
+}
+/// Borrowed authority for one scheduler-root/physical registration join. Only
+/// Scheduler constructs it from the live root and its retained native pin.
+pub(crate) struct InitialRootRegistration<'a> {
+    owner: crate::network_replay::NetworkStreamOwner,
+    process: DetPid,
+    raw_process: i32,
+    _pin: &'a OwnedFd,
+}
+impl InitialRootRegistration<'_> {
+    pub(crate) fn process(&self) -> DetPid {
+        self.process
+    }
+    pub(crate) fn check(
+        &self,
+        association: &crate::network_runtime::InitialTableAssociation,
+    ) -> std::io::Result<()> {
+        if association.owner() != self.owner || association.process() != self.raw_process {
+            return Err(std::io::Error::other(
+                "initial census changed authenticated root registration",
+            ));
+        }
+        Ok(())
+    }
+}
+impl RetainedPhysicalThread {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (crate::network_replay::NetworkStreamOwner, i32, i32, OwnedFd) {
+        (self.owner, self.process, self.thread, self.pidfd)
+    }
 }
 
 impl Scheduler {
@@ -1719,12 +3171,16 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             network_engine: None,
+            fd_read_changed: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            fd_read_test_cut: Default::default(),
             network_capture_blockers: BTreeMap::new(),
             network_capture_idle_since: None,
             vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
+            clear_tid_owner: ClearTidOwner::from_config(cfg),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             backend_failure: None,
@@ -1764,6 +3220,11 @@ impl Scheduler {
         }
     }
 
+    /// Wake selected readers when the existing publication state changes.
+    pub(crate) fn fd_read_notification(&self) -> Arc<tokio::sync::Notify> {
+        self.fd_read_changed.clone()
+    }
+
     /// Install the run-global capture/replay engine before the scheduler task
     /// starts.  Every clone points at the same mutex-protected state machine.
     pub(crate) fn set_network_engine(&mut self, engine: Option<Arc<Mutex<NetworkReplayEngine>>>) {
@@ -1794,15 +3255,167 @@ impl Scheduler {
         physical_pid: i32,
         physical_tid: i32,
     ) -> std::io::Result<()> {
+        self.register_physical_thread_for(dettid, mm, physical_pid, physical_tid, true)
+    }
+
+    /// Called only from the authenticated stopped ptrace birth callback. Unlike
+    /// signal registration, custody alone must not select native SIGCHLD or
+    /// physical signal delivery. Retries clone the exact retained description.
+    pub(crate) fn register_stopped_ptrace_thread(
+        &mut self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        process: i32,
+        thread: i32,
+    ) -> std::io::Result<RetainedPhysicalThread> {
+        if thread != owner.thread.as_raw() {
+            return Err(std::io::Error::other(
+                "stopped callback thread differs from owner",
+            ));
+        }
+        self.register_physical_thread_for(owner.thread, owner.mm, process, thread, false)?;
+        self.retain_physical_thread(owner, process, thread)
+    }
+
+    fn retain_physical_thread(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        process: i32,
+        thread: i32,
+    ) -> std::io::Result<RetainedPhysicalThread> {
+        let (mm, known_process, known_thread, pin, _) = self
+            .physical_thread_pidfds
+            .get(&owner.thread)
+            .ok_or_else(|| std::io::Error::other("thread has no retained description"))?;
+        if *mm != owner.mm || *known_process != process || *known_thread != thread {
+            return Err(std::io::Error::other("retained task identity changed"));
+        }
+        Ok(RetainedPhysicalThread {
+            owner,
+            process,
+            thread,
+            pidfd: pin.try_clone()?,
+        })
+    }
+
+    /// Seed the initial root at the existing FD-census commit, never through
+    /// the general historical-projection attachment path. The caller holds the
+    /// scheduler, engine and physical custody locks in that order. The pin is
+    /// borrowed from the same custody entry as the authenticated association.
+    pub(crate) fn admit_initial_native_root(
+        &mut self,
+        association: &crate::network_runtime::InitialTableAssociation,
+        custody_pin: &OwnedFd,
+        previous: Option<&Result<(), String>>,
+        admit_census: impl FnOnce(DetPid) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use crate::network_runtime::PidfdIdentity;
+        use crate::network_runtime::native_birth_outcome::NativeTaskProjection;
+        let owner = association.owner();
+        if self.backend_failed()
+            || self.thread_is_logically_killed(owner.thread)
+            || !self.rpc_incarnation_matches(owner.thread, owner.mm)
+            || !self.thread_tree.is_root(owner.thread)
+            || !self.thread_tree.tree.contains_key(&owner.thread)
+            || !self
+                .thread_tree
+                .thread_group_leaders
+                .contains(&owner.thread)
+        {
+            return Err(std::io::Error::other(
+                "initial projection lacks current scheduler root",
+            ));
+        }
+        let process = self
+            .registered_process(owner.thread)
+            .ok_or_else(|| std::io::Error::other("initial projection lost logical process"))?;
+        let (mm, raw_process, raw_thread, pin, _) = self
+            .physical_thread_pidfds
+            .get(&owner.thread)
+            .ok_or_else(|| {
+                std::io::Error::other("initial projection lost stopped backend registration")
+            })?;
+        if *mm != owner.mm
+            || *raw_process != association.process()
+            || raw_process != raw_thread
+            || PidfdIdentity::read(pin)? != PidfdIdentity::read(custody_pin)?
+        {
+            return Err(std::io::Error::other(
+                "initial projection changed retained backend task/MM",
+            ));
+        }
+        let registration = InitialRootRegistration {
+            owner,
+            process,
+            raw_process: *raw_process,
+            _pin: pin,
+        };
+        let projection = NativeTaskProjection::from_initial_root(association, &registration)?;
+        let entry = self
+            .thread_tree
+            .process_wait
+            .get_mut(&process)
+            .ok_or_else(|| std::io::Error::other("initial projection lost root wait lifetime"))?;
+        if entry.reaped
+            || entry.wait_parent.is_some()
+            || entry.wait_owner != owner.thread
+            || entry.native_birth_parent.is_some()
+        {
+            return Err(std::io::Error::other(
+                "initial projection does not name the original root lifetime",
+            ));
+        }
+        if let Some(result) = previous {
+            if result.is_ok()
+                && !entry.native_projections.iter().any(|old| {
+                    **old == *projection
+                        && entry
+                            .native_projections
+                            .iter()
+                            .all(|other| other.same_process(old))
+                })
+            {
+                return Err(std::io::Error::other(
+                    "recovered census lacks its exact initial process Arc",
+                ));
+            }
+            return result.clone().map_err(std::io::Error::other);
+        }
+        if !entry.native_projections.is_empty()
+            || !entry.births.is_empty()
+            || !entry.historical_births.is_empty()
+            || !entry.birth_sequences.is_empty()
+        {
+            return Err(std::io::Error::other(
+                "initial projection cannot reseed an existing lifetime",
+            ));
+        }
+        // Every fallible identity/claim/ledger check precedes this attachment.
+        // register_initial_census is atomic on failure. After it succeeds, this
+        // synchronous append is the only remaining shared-state operation.
+        admit_census(process)?;
+        entry.native_projections.push(projection);
+        Ok(())
+    }
+
+    fn register_physical_thread_for(
+        &mut self,
+        dettid: DetTid,
+        mm: MmId,
+        physical_pid: i32,
+        physical_tid: i32,
+        signal_authority: bool,
+    ) -> std::io::Result<()> {
         if physical_pid <= 0 || physical_tid <= 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "host process and thread IDs must be positive",
             ));
         }
-        if let Some((known_mm, known_pid, known_tid, _)) = self.physical_thread_pidfds.get(&dettid)
+        if let Some((known_mm, known_pid, known_tid, _, signal)) =
+            self.physical_thread_pidfds.get_mut(&dettid)
         {
             if *known_mm == mm && *known_pid == physical_pid && *known_tid == physical_tid {
+                *signal |= signal_authority;
                 return Ok(());
             }
             if *known_mm == mm {
@@ -1826,8 +3439,10 @@ impl Scheduler {
         }
         // SAFETY: pidfd_open returned a new descriptor owned by this process.
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
-        self.physical_thread_pidfds
-            .insert(dettid, (mm, physical_pid, physical_tid, pidfd));
+        self.physical_thread_pidfds.insert(
+            dettid,
+            (mm, physical_pid, physical_tid, pidfd, signal_authority),
+        );
         Ok(())
     }
 
@@ -1845,14 +3460,14 @@ impl Scheduler {
     pub(crate) fn physical_thread_identity(&self, dettid: DetTid) -> Option<(MmId, i32, i32)> {
         self.physical_thread_pidfds
             .get(&dettid)
-            .map(|(mm, pid, tid, _)| (*mm, *pid, *tid))
+            .map(|(mm, pid, tid, _, _)| (*mm, *pid, *tid))
     }
 
     pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
         if !self.backend_requires_thread_directed_process_signals {
             return;
         }
-        let Some((mm, _, _, _)) = self.physical_thread_pidfds.get(&dettid) else {
+        let Some((mm, _, _, _, true)) = self.physical_thread_pidfds.get(&dettid) else {
             self.terminal_deadlock.get_or_insert_with(|| {
                 format!(
                     "HERMIT_DEADLOCK: scheduler cannot complete SIGKILL for dettid {} without its host thread pidfd",
@@ -1866,7 +3481,10 @@ impl Scheduler {
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
-        !self.physical_thread_pidfds.contains_key(&parent)
+        !self
+            .physical_thread_pidfds
+            .get(&parent)
+            .is_some_and(|entry| entry.4)
     }
 
     /// Handle a happens-before checkpoint issued by `dettid` after its `count`th
@@ -2141,6 +3759,7 @@ impl Scheduler {
     /// `set_tid_address(2)` replaces the value supplied by clone. A zero
     /// address disables the exit-time store and wake.
     pub fn set_child_tid_address(&mut self, dettid: DetTid, address: usize) -> bool {
+        self.clear_tid_owner.assert_modeled();
         let Some(next_turn) = self.next_turns.get_mut(&dettid) else {
             return false;
         };
@@ -2156,14 +3775,46 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        self.retire_thread_registration(dtid, detpid, mm, false);
+    }
+
+    /// Consuming NoSeq cleanup has no daemon turn to drain queue intents. Linux
+    /// owns native clear-TID and process waits; this is registration retirement,
+    /// not a second physical-exit observation or a modeled wake.
+    pub(crate) fn consume_no_seq_thread(&mut self, dtid: DetTid, detpid: DetPid, mm: MmId) {
+        assert_eq!(
+            self.clear_tid_owner,
+            ClearTidOwner::NativeKernel,
+            "NoSeq consuming cleanup requires native ownership"
+        );
+        assert!(
+            !self.run_queue.tentative_pop_in_progress(),
+            "NoSeq consuming cleanup cannot own a scheduler selection"
+        );
+        self.retire_thread_registration(&dtid, &detpid, mm, true);
+    }
+
+    fn retire_thread_registration(
+        &mut self,
+        dtid: &DetTid,
+        detpid: &DetPid,
+        mm: MmId,
+        native_consumed: bool,
+    ) {
         if self.cancel_killed_thread_rpcs {
             self.logically_killed_threads.insert(*dtid);
         }
-        // Remove from the runnable queue at the next deterministic drain. This
-        // is safe even if an asynchronous exec reconnect races a live
-        // tentative_pop: the handler never reaches the run queue's mutation
-        // guard and cannot poison the scheduler mutex.
-        self.deschedule_or_defer(*dtid);
+        if native_consumed {
+            // NoSeq has no daemon or tentative selection. Withdraw only this
+            // consumed owner's intents and slot rather than await a drain.
+            self.pending_run_queue_admissions.remove(dtid);
+            self.pending_run_queue_removals.remove(dtid);
+            self.run_queue.remove_tid(*dtid);
+        } else {
+            // Preserve deterministic removal at the next drain, including an
+            // asynchronous exec reconnect during a live tentative selection.
+            self.deschedule_or_defer(*dtid);
+        }
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
         self.remove_physical_thread(dtid, mm);
@@ -2195,7 +3846,9 @@ impl Scheduler {
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled(None));
                 }
-                if nextturn.child_tid_addr != 0 {
+                // NoSeq uses Linux's current registration and native wake.
+                // Never consume its stale modeled address at logical exit.
+                if self.clear_tid_owner == ClearTidOwner::Modeled && nextturn.child_tid_addr != 0 {
                     self.wake_futex_child_cleartid(
                         FutexID::private(mm, nextturn.child_tid_addr),
                         *dtid,
@@ -2212,9 +3865,11 @@ impl Scheduler {
             .into_iter()
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
-            let _ = self.begin_physical_process_exit(*detpid);
+            if !native_consumed {
+                let _ = self.begin_physical_process_exit(*detpid);
+            }
             self.logically_exited_processes.insert(*detpid);
-            if let Some(parent) = self.thread_tree.parent_process(detpid) {
+            if !native_consumed && let Some(parent) = self.thread_tree.parent_process(detpid) {
                 self.wake_child_waiters(parent, *detpid);
             }
             self.blocked.timed_waiters.remove_process_timers(*detpid);
@@ -2424,13 +4079,20 @@ impl Scheduler {
         self.thread_tree.thread_to_leader.contains_key(&dettid)
     }
 
-    /// Mark a physical exit cleanup as accounted. Non-cancelling backends preserve their existing
-    /// behavior; SaBRe teardown may deliver the cleanup after an earlier logical tombstone.
+    pub(crate) fn deregistration_was_accounted(&self, dettid: DetTid) -> bool {
+        self.deregistration_accounted.contains(&dettid)
+    }
+
+    /// Mark consuming cleanup as accounted. NoSeq and cancelling backends
+    /// admit it once; ordinary modeled backends preserve their prior behavior.
     pub(crate) fn note_deregistration_accounted(&mut self, dettid: DetTid) -> bool {
         // Remember an owner accounted before a later peer failure as well.
-        // Ordinary non-cancelling behavior still accepts its prior callbacks.
+        // Ordinary modeled non-cancelling behavior still accepts its prior callbacks.
         let first = self.deregistration_accounted.insert(dettid);
-        (!self.cancel_killed_thread_rpcs && !self.backend_failed()) || first
+        (self.clear_tid_owner == ClearTidOwner::Modeled
+            && !self.cancel_killed_thread_rpcs
+            && !self.backend_failed())
+            || first
     }
 
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
@@ -2683,6 +4345,7 @@ impl Scheduler {
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
     pub fn wake_futex_child_cleartid(&mut self, futid: FutexID, dettid: DetTid) {
+        self.clear_tid_owner.assert_modeled();
         self.cleared_child_tids.insert(futid, dettid);
         debug!(
             "simulate CLONE_CHILD_CLEARTID on futex {:?}, wake one",
@@ -2697,9 +4360,16 @@ impl Scheduler {
     // TODO-HUMAN-REVIEW(PR-845): Review late CLONE_CHILD_CLEARTID wait recovery.
     /// Whether a futex word still names the child that was logically cleared.
     pub(crate) fn child_tid_was_cleared(&self, futid: FutexID, observed: i32) -> bool {
+        self.clear_tid_owner.assert_modeled();
         self.cleared_child_tids
             .get(&futid)
             .is_some_and(|dettid| dettid.as_raw() == observed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_native_clear_tid_idle(&self) {
+        assert_eq!(self.clear_tid_owner, ClearTidOwner::NativeKernel);
+        assert!(self.cleared_child_tids.is_empty());
     }
 
     /// Step: Before we select which thread to run, first we check if some internal data
@@ -3075,16 +4745,64 @@ impl Scheduler {
         self.next_turns.contains_key(&dettid)
     }
 
+    /// Admit only the terminal fact of a backend-bound child. This deliberately
+    /// creates no next_turns entry, priority, clock, physical pin or runnable turn.
+    pub(crate) fn complete_prestart_child_exit(
+        &mut self,
+        birth: &NoSeqChildBirth,
+        child: crate::network_replay::NetworkStreamOwner,
+    ) -> bool {
+        if self.thread_was_registered(child.thread)
+            || self.next_turns.contains_key(&child.thread)
+            || !self
+                .thread_tree
+                .complete_prestart_terminal_birth(birth, child)
+        {
+            return false;
+        }
+        self.hb_note_spawn(child.thread);
+        let flags = match birth.construction() {
+            Ok(Some(outcome)) => outcome.flags(),
+            Ok(None) => birth.flags(),
+            Err(_) => return false,
+        };
+        if !flags.contains(reverie::syscalls::CloneFlags::CLONE_THREAD) {
+            self.logically_exited_processes.insert(child.thread);
+            self.completed_physical_process_exits.insert(child.thread);
+            if !birth.native_required
+                && let Some(parent) = self.thread_tree.parent_process(&child.thread)
+            {
+                self.wake_child_waiters(parent, child.thread);
+            }
+        }
+        true
+    }
+
     /// Return scheduler-owned lifecycle state for an exact child-process wait.
     ///
     /// This deliberately models direct parentage and process liveness rather
     /// than `kill(2)` target resolution. It lets wait syscalls stop exposing
     /// the backend-dependent interval between logical exit and host waitability.
     pub fn exact_child_wait_state(&mut self, parent: DetPid, child: DetPid) -> ExactChildWaitState {
+        assert!(
+            self.thread_tree
+                .process_wait
+                .get(&child)
+                .is_none_or(|entry| entry.native_birth_parent.is_none()),
+            "active native current-parent authority is not implemented"
+        );
         if self.thread_tree.parent_process(&child) != Some(parent) {
             return ExactChildWaitState::Unknown;
         }
 
+        // A child consumed at its first actual final wait has a wait entry but
+        // never had a scheduler thread group. Do not manufacture one to query it.
+        if !self.thread_was_registered(child)
+            && self.logically_exited_processes.contains(&child)
+            && self.completed_physical_process_exits.contains(&child)
+        {
+            return ExactChildWaitState::PhysicallyExited;
+        }
         let live = self
             .thread_tree
             .my_thread_group(&child)
@@ -3108,10 +4826,18 @@ impl Scheduler {
     }
 
     fn child_matches_wait(&self, parent: DetPid, child: DetPid, spec: ChildWaitSpec) -> bool {
+        assert!(
+            self.thread_tree
+                .process_wait
+                .get(&child)
+                .is_none_or(|entry| entry.native_birth_parent.is_none()),
+            "active native current-parent authority is not implemented"
+        );
         let Some(metadata) = self.thread_tree.process_wait.get(&child) else {
             return false;
         };
-        metadata.wait_parent == Some(parent)
+        !metadata.reaped
+            && metadata.wait_parent == Some(parent)
             && spec.owner.is_none_or(|owner| metadata.wait_owner == owner)
             && match spec.exit_class {
                 ChildWaitExitClass::Sigchld => metadata.exit_signal == libc::SIGCHLD,
@@ -3147,7 +4873,7 @@ impl Scheduler {
         self.wake_child_waiters(parent, child);
         self.completed_physical_process_exits.remove(&child);
         self.thread_tree.process_parent.remove(&child);
-        self.thread_tree.process_wait.remove(&child);
+        self.thread_tree.reap_wait_entry(child);
         self.logically_exited_processes.remove(&child)
     }
 
@@ -3229,7 +4955,8 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
-        let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
+        let result = if let Some((_, _, _, pidfd, true)) = self.physical_thread_pidfds.get(&dettid)
+        {
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
@@ -5075,6 +6802,7 @@ impl Scheduler {
             &resp, &dtid
         );
         let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
+        let fd_grant_mm = self.ordinary_fd_grant_mm(dtid);
         if signals.is_empty() {
             let record_wait = self.next_turns.get(&dtid).and_then(|turn| {
                 let origin = turn.protocol.origin.as_ref()?;
@@ -5106,6 +6834,17 @@ impl Scheduler {
                 return Err(SkipTurn);
             }
         }
+        let read = self
+            .next_turns
+            .get_mut(&dtid)
+            .expect("grant owner")
+            .protocol
+            .fd_read
+            .take();
+        assert!(
+            read.is_none() || signals.is_empty(),
+            "signal response cannot carry FD admission"
+        );
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
@@ -5124,10 +6863,26 @@ impl Scheduler {
                 .as_ref()
                 .map(LogicalTime::as_nanos)
                 .map(SchedValue::Value);
-            SchedResponse::Go(as_schedvalue)
+            match read {
+                Some(read) => SchedResponse::GoFdRead(as_schedvalue, read),
+                None => SchedResponse::Go(as_schedvalue),
+            }
+        };
+        let fd_resume = match &answer {
+            SchedResponse::Go(_) | SchedResponse::GoFdRead(_, _) => {
+                Some(ordinary_fd::OrdinaryFdResume::Normal)
+            }
+            SchedResponse::Signaled(_) => Some(ordinary_fd::OrdinaryFdResume::SignalResume),
+            _ => None,
         };
         self.parked.running = Some(dtid);
         resp.put(answer);
+        if let (Some(mm), Some(resume)) = (fd_grant_mm, fd_resume) {
+            self.record_ordinary_fd_grant(
+                crate::network_replay::NetworkStreamOwner { thread: dtid, mm },
+                resume,
+            );
+        }
         Ok(())
     }
 
@@ -8037,7 +9792,7 @@ mod test {
         scheduler
             .register_physical_thread(dettid, mm, physical_pid, physical_tid)
             .expect("PIDFD_THREAD must bind the current test thread");
-        let (_, registered_pid, registered_tid, pidfd) =
+        let (_, registered_pid, registered_tid, pidfd, _) =
             scheduler.physical_thread_pidfds.get(&dettid).unwrap();
         assert_eq!(
             (*registered_pid, *registered_tid),
@@ -8074,6 +9829,84 @@ mod test {
         assert!(scheduler.should_synthesize_child_exit_signal(parent));
         // The existing native-pidfd positive test immediately below remains
         // unchanged; this pure fixture opens no FD and makes no native claim.
+    }
+
+    #[test]
+    fn stopped_ptrace_custody_shares_one_pin_without_changing_signal_authority() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let thread = DetTid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) as i32 });
+        let owner = crate::network_replay::NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        let process = std::process::id() as i32;
+        let first = scheduler
+            .register_stopped_ptrace_thread(owner, process, thread.as_raw())
+            .unwrap();
+        let second = scheduler
+            .register_stopped_ptrace_thread(owner, process, thread.as_raw())
+            .unwrap();
+        assert_eq!(scheduler.physical_thread_pidfds.len(), 1);
+        let inode = |fd: &OwnedFd| {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) }, 0);
+            let st = unsafe { st.assume_init() };
+            (st.st_dev, st.st_ino)
+        };
+        assert_eq!(inode(&first.pidfd), inode(&second.pidfd));
+        assert_eq!(
+            inode(&first.pidfd),
+            inode(&scheduler.physical_thread_pidfds[&thread].3)
+        );
+        assert!(scheduler.should_synthesize_child_exit_signal(thread));
+        assert!(!scheduler.physical_thread_pidfds[&thread].4);
+        let stale = crate::network_replay::NetworkStreamOwner {
+            mm: owner.mm.for_exec(thread),
+            ..owner
+        };
+        assert!(
+            scheduler
+                .retain_physical_thread(stale, process, thread.as_raw())
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .retain_physical_thread(owner, process + 1, thread.as_raw())
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .retain_physical_thread(owner, process, thread.as_raw() + 1)
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .register_stopped_ptrace_thread(owner, process, thread.as_raw() + 1)
+                .is_err()
+        );
+        assert_eq!(
+            inode(&first.pidfd),
+            inode(&scheduler.physical_thread_pidfds[&thread].3)
+        );
+        scheduler
+            .register_physical_thread(thread, owner.mm, process, thread.as_raw())
+            .unwrap();
+        assert!(!scheduler.should_synthesize_child_exit_signal(thread));
+        assert_eq!(
+            inode(&first.pidfd),
+            inode(&scheduler.physical_thread_pidfds[&thread].3)
+        );
+        let third = scheduler
+            .register_stopped_ptrace_thread(owner, process, thread.as_raw())
+            .unwrap();
+        assert!(!scheduler.should_synthesize_child_exit_signal(thread));
+        scheduler.remove_physical_thread(&thread, owner.mm);
+        assert!(
+            scheduler
+                .retain_physical_thread(owner, process, thread.as_raw())
+                .is_err()
+        );
+        assert_eq!(inode(&first.pidfd), inode(&third.pidfd));
     }
 
     #[test]
@@ -9865,8 +11698,179 @@ mod test {
     }
 
     #[test]
+    fn clear_tid_owner_is_selected_from_immutable_run_config() {
+        let mut config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        assert!(config.sequentialize_threads);
+        let modeled = Scheduler::new(&config);
+        config.sequentialize_threads = false;
+        let native = Scheduler::new(&config);
+        assert_eq!(modeled.clear_tid_owner, ClearTidOwner::Modeled);
+        native.assert_native_clear_tid_idle();
+    }
+
+    #[test]
+    fn no_seq_consuming_retirement_removes_only_its_queue_intents_without_a_drain() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: false,
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        });
+        let owner = DetTid::from_raw(100);
+        let peer = DetTid::from_raw(101);
+        for tid in [owner, peer] {
+            scheduler.thread_tree.add_child(tid, tid, true);
+            register_known_thread(&mut scheduler, tid);
+            scheduler.next_turns.get_mut(&tid).unwrap().child_tid_addr = 0x1000;
+            scheduler.runqueue_push_back(tid);
+            scheduler.admit_to_run_queue(tid, AdmitIntent::Fixed(AdmitSide::Back));
+        }
+        scheduler.deschedule_or_defer(owner);
+        let owner_request = scheduler.next_turns[&owner].req.clone();
+        let peer_request = scheduler.next_turns[&peer].req.clone();
+        let committed = scheduler.committed_time;
+        for _ in 0..2 {
+            scheduler.consume_no_seq_thread(owner, owner, MmId::initial(owner));
+            assert!(!scheduler.next_turns.contains_key(&owner));
+            assert!(!scheduler.run_queue.contains_tid(owner));
+            assert!(!scheduler.pending_run_queue_admissions.contains_key(&owner));
+            assert!(!scheduler.pending_run_queue_removals.contains_key(&owner));
+            assert!(scheduler.next_turns.contains_key(&peer));
+            assert!(scheduler.run_queue.contains_tid(peer));
+            assert!(scheduler.pending_run_queue_admissions.contains_key(&peer));
+            assert!(peer_request.try_read().is_none());
+            assert!(matches!(owner_request.try_read(), Some(Err(ThreadExited))));
+            assert!(scheduler.pending_physical_process_exits.is_empty());
+            assert!(scheduler.completed_physical_process_exits.is_empty());
+            assert_eq!(scheduler.committed_time, committed);
+            scheduler.assert_native_clear_tid_idle();
+        }
+    }
+
+    #[test]
+    fn no_seq_same_tid_exec_replacement_resets_consuming_accounting() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        let leader = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        let old_mm = MmId::initial(leader);
+        let current_mm = old_mm.for_exec(leader);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        for tid in [leader, worker] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        scheduler.consume_no_seq_thread(leader, leader, old_mm);
+        assert!(!scheduler.logically_exited_processes.contains(&leader));
+        assert!(scheduler.note_deregistration_accounted(leader));
+        assert!(!scheduler.note_deregistration_accounted(leader));
+        scheduler.reconnect_after_exec(ExecReconnect {
+            caller: worker,
+            new_leader: leader,
+            detpid: leader,
+            pre_exec_mm: old_mm,
+            post_exec_mm: current_mm,
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        });
+        assert!(!scheduler.deregistration_was_accounted(leader));
+        assert!(scheduler.rpc_incarnation_matches(leader, current_mm));
+        assert!(!scheduler.rpc_incarnation_matches(leader, old_mm));
+        assert!(scheduler.next_turns.contains_key(&leader));
+        assert!(!scheduler.next_turns.contains_key(&worker));
+        assert!(scheduler.note_deregistration_accounted(leader));
+        scheduler.consume_no_seq_thread(leader, leader, current_mm);
+        assert!(scheduler.logically_exited_processes.contains(&leader));
+        assert!(!scheduler.next_turns.contains_key(&leader));
+        assert!(!scheduler.pending_run_queue_admissions.contains_key(&leader));
+        assert!(!scheduler.pending_run_queue_removals.contains_key(&leader));
+        assert!(!scheduler.note_deregistration_accounted(leader));
+        scheduler.assert_native_clear_tid_idle();
+    }
+
+    #[test]
+    #[should_panic(expected = "NoSeq consuming cleanup requires native ownership")]
+    fn no_seq_consuming_retirement_rejects_modeled_scheduler() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
+        let tid = DetTid::from_raw(100);
+        scheduler.consume_no_seq_thread(tid, tid, MmId::initial(tid));
+    }
+
+    #[test]
+    fn native_clear_tid_retirement_does_not_use_stored_modeled_address() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        let dettid = DetTid::from_raw(100);
+        let detpid = DetPid::from_raw(100);
+        let request = Ivar::new();
+        scheduler.thread_tree.add_child(dettid, dettid, true);
+        scheduler.next_turns.insert(
+            dettid,
+            ThreadNextTurn {
+                dettid,
+                child_tid_addr: 0x1000,
+                req: request.clone(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        scheduler.logically_kill_thread(&dettid, &detpid, MmId::initial(detpid));
+        assert!(!scheduler.next_turns.contains_key(&dettid));
+        assert!(matches!(request.try_read(), Some(Err(ThreadExited))));
+        scheduler.assert_native_clear_tid_idle();
+    }
+
+    #[test]
+    #[should_panic(expected = "native kernel owns clear-TID synchronization")]
+    fn native_clear_tid_rejects_modeled_setter_even_without_a_registered_thread() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        scheduler.set_child_tid_address(DetTid::from_raw(100), 0x1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "native kernel owns clear-TID synchronization")]
+    fn native_clear_tid_rejects_modeled_wake() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        let dettid = DetTid::from_raw(100);
+        scheduler
+            .wake_futex_child_cleartid(FutexID::private(MmId::initial(dettid), 0x1000), dettid);
+    }
+
+    #[test]
+    #[should_panic(expected = "native kernel owns clear-TID synchronization")]
+    fn native_clear_tid_rejects_modeled_recovery_lookup() {
+        let scheduler = Scheduler::new(&Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        let dettid = DetTid::from_raw(100);
+        scheduler.child_tid_was_cleared(
+            FutexID::private(MmId::initial(dettid), 0x1000),
+            dettid.as_raw(),
+        );
+    }
+
+    #[test]
     fn set_child_tid_address_changes_the_exit_wake_address() {
-        let mut scheduler = Scheduler::new(&Config::default());
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
         let dettid = DetTid::from_raw(100);
         let detpid = DetPid::from_raw(100);
         let mm = MmId::initial(detpid);
@@ -9893,7 +11897,10 @@ mod test {
 
     #[test]
     fn zero_child_tid_address_disables_the_exit_wake() {
-        let mut scheduler = Scheduler::new(&Config::default());
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
         let dettid = DetTid::from_raw(100);
         let detpid = DetPid::from_raw(100);
         let mm = MmId::initial(detpid);
@@ -9920,7 +11927,10 @@ mod test {
 
     #[test]
     fn set_child_tid_address_rejects_a_missing_thread() {
-        let mut scheduler = Scheduler::new(&Config::default());
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
         assert!(!scheduler.set_child_tid_address(DetTid::from_raw(100), 0x2000));
     }
 
@@ -10900,5 +12910,1428 @@ mod test {
         // note_spawn is idempotent, so a re-registration does not shift indices.
         hb.note_spawn(root);
         assert_eq!(hb.anchors_at_syscall(child, 4), vec!["b".to_string()]);
+    }
+    fn parent_completion_fixture() -> (
+        Scheduler,
+        crate::network_replay::NetworkStreamOwner,
+        NoSeqChildBirth,
+        reverie::syscalls::SyscallArgs,
+    ) {
+        use reverie::Tool;
+        use reverie::syscalls::CloneFlags;
+        use reverie::syscalls::SyscallInfo;
+        let cfg = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        };
+        let parent = DetTid::from_raw(61);
+        let mut sched = Scheduler::new(&cfg);
+        sched.thread_tree.add_child(parent, parent, true);
+        let tool: crate::Detcore =
+            crate::Detcore::new(reverie::Tid::from_raw(parent.as_raw()), &cfg);
+        let local = tool.init_thread_state(reverie::Tid::from_raw(parent.as_raw()), None);
+        let owner = crate::network_replay::NetworkStreamOwner {
+            thread: parent,
+            mm: local.mm_id,
+        };
+        let birth = sched
+            .thread_tree
+            .prepare_no_seq_birth(
+                owner,
+                parent,
+                ExternalOpId::new(parent, 3),
+                CloneFlags::empty(),
+                0,
+                libc::SIGCHLD,
+                None,
+                None,
+            )
+            .unwrap();
+        let birth = sched.thread_tree.submit_no_seq_birth(&birth).unwrap();
+        let (nr, args) = reverie::syscalls::Clone::new().into_parts();
+        assert_eq!(nr, reverie::syscalls::Sysno::clone);
+        (sched, owner, birth, args)
+    }
+
+    #[test]
+    fn native_parent_completion_preserves_early_child_and_optional_receipt() {
+        use reverie::InjectedSyscallEvent as Event;
+        use reverie::syscalls::Sysno;
+        for with_completion in [false, true] {
+            let (mut sched, owner, birth, args) = parent_completion_fixture();
+            let child = DetTid::from_raw(62);
+            let child_tid = reverie::Tid::from_raw(child.as_raw());
+            sched
+                .thread_tree
+                .observe_no_seq_operation(
+                    owner,
+                    birth.process,
+                    birth.operation,
+                    Some(&birth),
+                    Sysno::clone,
+                    args,
+                    Event::ChildCreated(child_tid),
+                )
+                .unwrap();
+            if with_completion {
+                sched
+                    .thread_tree
+                    .observe_no_seq_operation(
+                        owner,
+                        birth.process,
+                        birth.operation,
+                        Some(&birth),
+                        Sysno::clone,
+                        args,
+                        Event::ChildSyscallReturned {
+                            child: child_tid,
+                            raw: 62,
+                        },
+                    )
+                    .unwrap();
+            }
+            let state = &sched.thread_tree.process_wait[&birth.process].births
+                [&(birth.operation, owner.mm)];
+            assert_eq!(state.native, Some(Event::ChildCreated(child_tid)));
+            assert_eq!(
+                state.parent_completion,
+                with_completion.then_some((child_tid, 62))
+            );
+            let mut inherited = birth.clone();
+            inherited.child = Some(child);
+            assert!(sched.thread_tree.consume_no_seq_birth(&inherited, child));
+            assert_eq!(
+                sched.thread_tree.join_no_seq_birth(&birth, child),
+                Some(true)
+            );
+            assert_eq!(sched.thread_tree.pending_no_seq_birth_count(), 0);
+        }
+    }
+
+    #[test]
+    fn native_parent_completion_rejects_missing_identity_wrong_result_and_duplicate() {
+        use reverie::InjectedSyscallEvent as Event;
+        use reverie::syscalls::Sysno;
+        let (mut sched, owner, birth, args) = parent_completion_fixture();
+        let child = reverie::Tid::from_raw(62);
+        let valid = Event::ChildSyscallReturned { child, raw: 62 };
+        assert!(
+            sched
+                .thread_tree
+                .observe_no_seq_operation(
+                    owner,
+                    birth.process,
+                    birth.operation,
+                    Some(&birth),
+                    Sysno::clone,
+                    args,
+                    valid
+                )
+                .is_err()
+        );
+        sched
+            .thread_tree
+            .observe_no_seq_operation(
+                owner,
+                birth.process,
+                birth.operation,
+                Some(&birth),
+                Sysno::clone,
+                args,
+                Event::ChildCreated(child),
+            )
+            .unwrap();
+        for event in [
+            Event::ChildSyscallReturned {
+                child: reverie::Tid::from_raw(63),
+                raw: 63,
+            },
+            Event::ChildSyscallReturned { child, raw: 63 },
+            Event::ChildSyscallReturned {
+                child,
+                raw: -(libc::EINTR as i64),
+            },
+        ] {
+            assert!(
+                sched
+                    .thread_tree
+                    .observe_no_seq_operation(
+                        owner,
+                        birth.process,
+                        birth.operation,
+                        Some(&birth),
+                        Sysno::clone,
+                        args,
+                        event
+                    )
+                    .is_err()
+            );
+            assert!(
+                sched.thread_tree.process_wait[&birth.process].births[&(birth.operation, owner.mm)]
+                    .parent_completion
+                    .is_none()
+            );
+        }
+        assert!(
+            sched
+                .thread_tree
+                .observe_no_seq_operation(
+                    owner,
+                    birth.process,
+                    ExternalOpId::new(owner.thread, birth.operation.sequence + 1),
+                    Some(&birth),
+                    Sysno::clone,
+                    args,
+                    valid
+                )
+                .is_err()
+        );
+        sched
+            .thread_tree
+            .observe_no_seq_operation(
+                owner,
+                birth.process,
+                birth.operation,
+                Some(&birth),
+                Sysno::clone,
+                args,
+                valid,
+            )
+            .unwrap();
+        assert!(
+            sched
+                .thread_tree
+                .observe_no_seq_operation(
+                    owner,
+                    birth.process,
+                    birth.operation,
+                    Some(&birth),
+                    Sysno::clone,
+                    args,
+                    valid
+                )
+                .is_err()
+        );
+        let state =
+            &sched.thread_tree.process_wait[&birth.process].births[&(birth.operation, owner.mm)];
+        assert_eq!(state.native, Some(Event::ChildCreated(child)));
+        assert_eq!(state.parent_completion, Some((child, 62)));
+    }
+
+    #[test]
+    fn prestart_terminal_birth_retains_clone_parent_wait_lineage_after_parent_reap() {
+        use reverie::Tool;
+        use reverie::syscalls::CloneFlags;
+        use reverie::syscalls::SyscallInfo;
+        let cfg = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&cfg);
+        let grand = DetTid::from_raw(60);
+        let parent = DetTid::from_raw(61);
+        let child = DetTid::from_raw(62);
+        sched.thread_tree.add_child(grand, grand, true);
+        sched.thread_tree.add_child(grand, parent, true);
+        let tool: crate::Detcore =
+            crate::Detcore::new(reverie::Tid::from_raw(parent.as_raw()), &cfg);
+        let mut local = tool.init_thread_state(reverie::Tid::from_raw(parent.as_raw()), None);
+        local.detpid = Some(parent);
+        local.clone_flags = Some(CloneFlags::CLONE_PARENT);
+        local.stats.syscall_count = 3;
+        let owner = crate::network_replay::NetworkStreamOwner {
+            thread: parent,
+            mm: local.mm_id,
+        };
+        let birth = sched
+            .thread_tree
+            .prepare_no_seq_birth(
+                owner,
+                parent,
+                ExternalOpId::new(parent, 3),
+                CloneFlags::CLONE_PARENT,
+                0,
+                libc::SIGCHLD,
+                None,
+                None,
+            )
+            .unwrap();
+        let birth = sched.thread_tree.submit_no_seq_birth(&birth).unwrap();
+        local.pending_no_seq_birth = Some(birth.clone());
+        let child_state = tool.init_thread_state(
+            reverie::Tid::from_raw(child.as_raw()),
+            Some((reverie::Tid::from_raw(parent.as_raw()), &local)),
+        );
+        let inherited = child_state.pending_no_seq_birth.unwrap();
+        let child_owner = crate::network_replay::NetworkStreamOwner {
+            thread: child,
+            mm: child_state.mm_id,
+        };
+        assert!(
+            !sched.complete_prestart_child_exit(&inherited, child_owner),
+            "inheritance alone does not supply the original native event"
+        );
+        let (nr, args) = reverie::syscalls::Clone::new()
+            .with_flags(nix::sched::CloneFlags::CLONE_PARENT)
+            .into_parts();
+        sched
+            .thread_tree
+            .observe_no_seq_operation(
+                owner,
+                parent,
+                ExternalOpId::new(parent, 3),
+                Some(&birth),
+                nr,
+                args,
+                reverie::InjectedSyscallEvent::ChildCreated(reverie::Tid::from_raw(child.as_raw())),
+            )
+            .unwrap();
+        sched.logically_exited_processes.insert(parent);
+        assert!(sched.consume_child_wait(grand, parent));
+        assert!(sched.thread_tree.process_wait.contains_key(&parent));
+        assert!(sched.thread_tree.process_group(parent).is_none());
+        let before = sched.committed_time;
+        assert!(sched.complete_prestart_child_exit(&inherited, child_owner));
+        assert!(!sched.thread_tree.process_wait.contains_key(&parent));
+        assert!(!sched.thread_was_registered(child));
+        assert!(!sched.next_turns.contains_key(&child));
+        assert_eq!(sched.committed_time, before);
+        assert_eq!(sched.thread_tree.pending_no_seq_birth_count(), 0);
+        assert!(!sched.thread_tree.process_group_admission_busy());
+        let entry = &sched.thread_tree.process_wait[&child];
+        assert_eq!(entry.process_group, grand);
+        assert_eq!(entry.session, grand);
+        assert_eq!(entry.wait_parent, Some(grand));
+        assert_eq!(entry.wait_owner, grand);
+        assert_eq!(
+            sched.exact_child_wait_state(grand, child),
+            ExactChildWaitState::PhysicallyExited
+        );
+        assert!(!sched.complete_prestart_child_exit(&inherited, child_owner));
+        assert!(sched.consume_child_wait(grand, child));
+        assert!(!sched.consume_child_wait(grand, child));
+        assert!(!sched.thread_tree.process_wait.contains_key(&child));
+    }
+
+    #[test]
+    fn no_seq_birth_preserves_wait_lineage_and_excludes_post_birth_group_change() {
+        use reverie::Tool;
+        use reverie::syscalls::CloneFlags;
+        let cfg = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&cfg);
+        let grand = DetTid::from_raw(60);
+        let parent = DetTid::from_raw(61);
+        let child = DetTid::from_raw(62);
+        sched.thread_tree.add_child(grand, grand, true);
+        sched.thread_tree.add_child(grand, parent, true);
+        let tool: crate::Detcore =
+            crate::Detcore::new(reverie::Tid::from_raw(parent.as_raw()), &cfg);
+        let mut local = tool.init_thread_state(reverie::Tid::from_raw(parent.as_raw()), None);
+        local.detpid = Some(parent);
+        local.clone_flags = Some(CloneFlags::CLONE_PARENT);
+        let birth = sched
+            .thread_tree
+            .prepare_no_seq_birth(
+                crate::network_replay::NetworkStreamOwner {
+                    thread: parent,
+                    mm: local.mm_id,
+                },
+                parent,
+                ExternalOpId::new(parent, 3),
+                CloneFlags::CLONE_PARENT,
+                0,
+                libc::SIGCHLD,
+                None,
+                None,
+            )
+            .unwrap();
+        let birth = sched.thread_tree.submit_no_seq_birth(&birth).unwrap();
+        local.pending_no_seq_birth = Some(birth.clone());
+        let child_state = tool.init_thread_state(
+            reverie::Tid::from_raw(child.as_raw()),
+            Some((reverie::Tid::from_raw(parent.as_raw()), &local)),
+        );
+        let inherited = child_state.pending_no_seq_birth.unwrap();
+        // The backend has published the actual physical child. A later group
+        // mutation cannot enter the kernel until this birth is registered.
+        assert!(sched.thread_tree.process_group_admission_busy());
+        assert!(
+            sched
+                .thread_tree
+                .prepare_process_group_change(
+                    crate::network_replay::NetworkStreamOwner {
+                        thread: parent,
+                        mm: local.mm_id
+                    },
+                    ExternalOpId::new(parent, 4),
+                    ProcessGroupChangeKind::Session { process: parent },
+                )
+                .is_none()
+        );
+        sched.logically_exited_processes.insert(parent);
+        assert!(sched.consume_child_wait(grand, parent));
+        assert!(!sched.consume_child_wait(grand, parent));
+        assert!(sched.thread_tree.process_wait.contains_key(&parent));
+        assert!(sched.thread_tree.process_group(parent).is_none());
+        assert!(!sched.child_matches_wait(
+            grand,
+            parent,
+            ChildWaitSpec {
+                selector: ChildWaitSelector::Any,
+                owner: None,
+                exit_class: ChildWaitExitClass::Any,
+            }
+        ));
+        assert!(sched.thread_tree.consume_no_seq_birth(&inherited, child));
+        assert!(!sched.thread_tree.process_wait.contains_key(&parent));
+        let entry = &sched.thread_tree.process_wait[&child];
+        assert_eq!(entry.process_group, grand);
+        assert_eq!(entry.session, grand);
+        assert_eq!(entry.wait_parent, Some(grand));
+        assert_eq!(entry.wait_owner, grand);
+        assert!(!sched.thread_tree.consume_no_seq_birth(&inherited, child));
+    }
+
+    #[test]
+    fn no_seq_birth_group_updates_after_registration_do_not_change_child_inheritance() {
+        use reverie::Tool;
+        use reverie::syscalls::CloneFlags;
+        let cfg = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        };
+        let mut tree = ThreadTree::default();
+        let parent = DetTid::from_raw(61);
+        let child = DetTid::from_raw(62);
+        let grand = DetTid::from_raw(60);
+        tree.add_child(grand, grand, true);
+        tree.add_child(grand, parent, true);
+        let tool: crate::Detcore =
+            crate::Detcore::new(reverie::Tid::from_raw(parent.as_raw()), &cfg);
+        let mut local = tool.init_thread_state(reverie::Tid::from_raw(parent.as_raw()), None);
+        local.detpid = Some(parent);
+        local.clone_flags = Some(CloneFlags::empty());
+        let owner = crate::network_replay::NetworkStreamOwner {
+            thread: parent,
+            mm: local.mm_id,
+        };
+        let birth = tree
+            .prepare_no_seq_birth(
+                owner,
+                parent,
+                ExternalOpId::new(parent, 5),
+                CloneFlags::empty(),
+                0,
+                libc::SIGCHLD,
+                None,
+                None,
+            )
+            .unwrap();
+        let birth = tree.submit_no_seq_birth(&birth).unwrap();
+        local.pending_no_seq_birth = Some(birth.clone());
+        let mut child_state = tool.init_thread_state(
+            reverie::Tid::from_raw(child.as_raw()),
+            Some((reverie::Tid::from_raw(parent.as_raw()), &local)),
+        );
+        let inherited = child_state.pending_no_seq_birth.take().unwrap();
+        assert!(tree.consume_no_seq_birth(&inherited, child));
+        assert!(!tree.process_wait[&parent].births.is_empty());
+        assert_eq!(tree.join_no_seq_birth(&birth, child), Some(true));
+        assert!(tree.process_wait[&parent].births.is_empty());
+        assert!(tree.set_process_group(parent, DetTid::from_raw(77)));
+        assert!(tree.create_session(parent));
+        assert_eq!(tree.process_wait[&child].process_group, grand);
+        assert_eq!(tree.process_wait[&child].session, grand);
+        assert!(
+            tree.prepare_no_seq_birth(
+                owner,
+                parent,
+                ExternalOpId::new(parent, 5),
+                CloneFlags::empty(),
+                0,
+                libc::SIGCHLD,
+                None,
+                None
+            )
+            .is_none()
+        );
+        assert!(!tree.cancel_no_seq_birth(&birth));
+    }
+
+    #[test]
+    fn no_seq_birth_failure_releases_reaped_entry_but_parent_exit_alone_does_not() {
+        use reverie::syscalls::CloneFlags;
+        let mut tree = ThreadTree::default();
+        let parent = DetTid::from_raw(61);
+        tree.add_child(parent, parent, true);
+        let owner = crate::network_replay::NetworkStreamOwner {
+            thread: parent,
+            mm: MmId::initial(parent),
+        };
+        let birth = tree
+            .prepare_no_seq_birth(
+                owner,
+                parent,
+                ExternalOpId::new(parent, 1),
+                CloneFlags::empty(),
+                0,
+                libc::SIGCHLD,
+                None,
+                None,
+            )
+            .unwrap();
+        let birth = tree.submit_no_seq_birth(&birth).unwrap();
+        tree.reap_wait_entry(parent);
+        assert!(tree.process_wait.contains_key(&parent));
+        let mut wrong = birth.clone();
+        wrong.parent.mm = owner.mm.for_exec(parent);
+        assert!(!tree.cancel_no_seq_birth(&wrong));
+        assert!(tree.process_wait.contains_key(&parent));
+        assert!(tree.cancel_no_seq_birth(&birth));
+        assert!(!tree.process_wait.contains_key(&parent));
+        assert!(!tree.cancel_no_seq_birth(&birth));
+    }
+    #[test]
+    fn no_seq_birth_same_sequence_across_exec_keeps_distinct_pending_custody() {
+        use reverie::syscalls::CloneFlags;
+        let mut tree = ThreadTree::default();
+        let parent = DetTid::from_raw(61);
+        tree.add_child(parent, parent, true);
+        let old = crate::network_replay::NetworkStreamOwner {
+            thread: parent,
+            mm: MmId::initial(parent),
+        };
+        let current = crate::network_replay::NetworkStreamOwner {
+            mm: old.mm.for_exec(parent),
+            ..old
+        };
+        let mut births = Vec::new();
+        for owner in [old, current] {
+            let birth = tree
+                .prepare_no_seq_birth(
+                    owner,
+                    parent,
+                    ExternalOpId::new(parent, 1),
+                    CloneFlags::empty(),
+                    0,
+                    libc::SIGCHLD,
+                    None,
+                    None,
+                )
+                .expect("the retained original MM is part of the birth key");
+            births.push(tree.submit_no_seq_birth(&birth).unwrap());
+        }
+        assert_eq!(tree.pending_no_seq_birth_count(), 2);
+        assert!(tree.cancel_no_seq_birth(&births[0]));
+        assert_eq!(tree.pending_no_seq_birth_count(), 1);
+        assert!(!tree.cancel_no_seq_birth(&births[0]));
+        assert!(tree.cancel_no_seq_birth(&births[1]));
+        assert_eq!(tree.pending_no_seq_birth_count(), 0);
+    }
+
+    #[test]
+    fn no_seq_birth_owner_consumption_cancels_only_prepared_not_submitted_custody() {
+        use reverie::syscalls::CloneFlags;
+        for submitted in [false, true] {
+            let mut tree = ThreadTree::default();
+            let parent = DetTid::from_raw(61);
+            tree.add_child(parent, parent, true);
+            let owner = crate::network_replay::NetworkStreamOwner {
+                thread: parent,
+                mm: MmId::initial(parent),
+            };
+            let mut birth = tree
+                .prepare_no_seq_birth(
+                    owner,
+                    parent,
+                    ExternalOpId::new(parent, 1),
+                    CloneFlags::empty(),
+                    0,
+                    libc::SIGCHLD,
+                    None,
+                    None,
+                )
+                .unwrap();
+            if submitted {
+                birth = tree.submit_no_seq_birth(&birth).unwrap();
+            }
+            let wrong = crate::network_replay::NetworkStreamOwner {
+                mm: owner.mm.for_exec(parent),
+                ..owner
+            };
+            tree.retire_no_seq_wait_owner(wrong, None);
+            assert_eq!(tree.pending_no_seq_birth_count(), 1);
+            tree.retire_no_seq_wait_owner(owner, None);
+            assert_eq!(tree.pending_no_seq_birth_count(), usize::from(submitted));
+            tree.reap_wait_entry(parent);
+            assert_eq!(tree.process_wait.contains_key(&parent), submitted);
+            if submitted {
+                assert!(tree.cancel_no_seq_birth(&birth));
+                assert_eq!(tree.pending_no_seq_birth_count(), 0);
+                assert!(!tree.process_wait.contains_key(&parent));
+            }
+        }
+    }
+    #[test]
+    fn no_seq_group_change_excludes_physical_birth_and_preserves_native_error() {
+        use reverie::syscalls::CloneFlags;
+        for sibling in [false, true] {
+            let mut tree = ThreadTree::default();
+            let parent = DetTid::from_raw(61);
+            let actor = if sibling {
+                DetTid::from_raw(63)
+            } else {
+                parent
+            };
+            tree.add_child(parent, parent, true);
+            if sibling {
+                tree.add_child(parent, actor, false);
+            }
+            let owner = crate::network_replay::NetworkStreamOwner {
+                thread: actor,
+                mm: MmId::initial(parent),
+            };
+            let change = tree
+                .prepare_process_group_change(
+                    owner,
+                    ExternalOpId::new(actor, 1),
+                    ProcessGroupChangeKind::Session { process: parent },
+                )
+                .unwrap();
+            assert!(tree.no_seq_birth_admission_busy());
+            let birth_owner = crate::network_replay::NetworkStreamOwner {
+                thread: parent,
+                mm: owner.mm,
+            };
+            assert!(
+                tree.prepare_no_seq_birth(
+                    birth_owner,
+                    parent,
+                    ExternalOpId::new(parent, 2),
+                    CloneFlags::empty(),
+                    0,
+                    libc::SIGCHLD,
+                    None,
+                    None
+                )
+                .is_none()
+            );
+            let submitted = tree.submit_process_group_change(&change).unwrap();
+            let mut wrong = submitted.clone();
+            wrong.owner.mm = owner.mm.for_exec(actor);
+            assert!(!tree.complete_process_group_change(&wrong, Err(libc::EPERM)));
+            assert!(tree.no_seq_birth_admission_busy());
+            assert!(tree.complete_process_group_change(&submitted, Err(libc::EPERM)));
+            assert!(!tree.no_seq_birth_admission_busy());
+            assert_eq!(tree.process_group(parent), Some(parent));
+            assert!(!tree.complete_process_group_change(&submitted, Err(libc::EPERM)));
+            assert!(
+                tree.prepare_process_group_change(
+                    owner,
+                    ExternalOpId::new(actor, 1),
+                    ProcessGroupChangeKind::Session { process: parent }
+                )
+                .is_none()
+            );
+            assert!(
+                tree.prepare_no_seq_birth(
+                    birth_owner,
+                    parent,
+                    ExternalOpId::new(parent, 2),
+                    CloneFlags::empty(),
+                    0,
+                    libc::SIGCHLD,
+                    None,
+                    None
+                )
+                .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn no_seq_group_change_known_success_precedes_later_clone_snapshot() {
+        use reverie::syscalls::CloneFlags;
+        for other_process in [false, true] {
+            let mut tree = ThreadTree::default();
+            let grand = DetTid::from_raw(60);
+            let parent = DetTid::from_raw(61);
+            tree.add_child(grand, grand, true);
+            tree.add_child(grand, parent, true);
+            let actor = if other_process { grand } else { parent };
+            let owner = crate::network_replay::NetworkStreamOwner {
+                thread: actor,
+                mm: MmId::initial(actor),
+            };
+            // setpgid(0, group) is normalized to caller; a real parent's call
+            // targeting its child resolves to that same exact process field.
+            let group = DetTid::from_raw(77);
+            let prepared = tree
+                .prepare_process_group_change(
+                    owner,
+                    ExternalOpId::new(actor, 1),
+                    ProcessGroupChangeKind::Set {
+                        process: parent,
+                        group,
+                    },
+                )
+                .unwrap();
+            let submitted = tree.submit_process_group_change(&prepared).unwrap();
+            assert!(tree.complete_process_group_change(&submitted, Ok(0)));
+            assert_eq!(tree.process_group(parent), Some(group));
+            let birth_owner = crate::network_replay::NetworkStreamOwner {
+                thread: parent,
+                mm: MmId::initial(parent),
+            };
+            let prepared = tree
+                .prepare_no_seq_birth(
+                    birth_owner,
+                    parent,
+                    ExternalOpId::new(parent, 2),
+                    CloneFlags::CLONE_PARENT,
+                    0,
+                    libc::SIGCHLD,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let submitted = tree.submit_no_seq_birth(&prepared).unwrap();
+            assert!(tree.process_group_admission_busy());
+            assert!(tree.cancel_no_seq_birth(&submitted));
+            assert!(
+                !tree.process_group_admission_busy(),
+                "known no-child native result releases group gate"
+            );
+        }
+    }
+
+    #[test]
+    fn no_seq_group_owner_consumption_releases_prepared_but_not_unknown_submitted_effect() {
+        for (submitted, reaped) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut tree = ThreadTree::default();
+            let parent = DetTid::from_raw(61);
+            tree.add_child(parent, parent, true);
+            let owner = crate::network_replay::NetworkStreamOwner {
+                thread: parent,
+                mm: MmId::initial(parent),
+            };
+            let mut change = tree
+                .prepare_process_group_change(
+                    owner,
+                    ExternalOpId::new(parent, 1),
+                    ProcessGroupChangeKind::Session { process: parent },
+                )
+                .unwrap();
+            if submitted {
+                change = tree.submit_process_group_change(&change).unwrap();
+            }
+            let wrong = crate::network_replay::NetworkStreamOwner {
+                mm: owner.mm.for_exec(parent),
+                ..owner
+            };
+            tree.retire_no_seq_wait_owner(wrong, None);
+            assert!(tree.pending_process_group_change());
+            if reaped {
+                tree.reap_wait_entry(parent);
+            } else {
+                tree.retire_no_seq_wait_owner(owner, None);
+            }
+            assert_eq!(tree.pending_process_group_change(), submitted);
+            if submitted {
+                assert!(tree.complete_process_group_change(&change, Err(libc::EINTR)));
+                assert!(!tree.pending_process_group_change());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_common_birth(
+    requested: reverie::syscalls::CloneFlags,
+    actual: reverie::syscalls::CloneFlags,
+    clear_child_tid: u64,
+    exit_signal: i32,
+    terminal: bool,
+) -> (
+    Scheduler,
+    NoSeqChildBirth,
+    Arc<crate::network_runtime::native_birth_outcome::NativeChildOutcome>,
+) {
+    use crate::network_runtime::native_birth::synthetic_admission_for_common_consumer;
+    use crate::network_runtime::native_birth_outcome::synthetic_creator_projection;
+    let mut sched = Scheduler::new(&Config {
+        sequentialize_threads: false,
+        ..Config::default()
+    });
+    let parent = DetTid::from_raw(41);
+    sched.thread_tree.add_child(parent, parent, true);
+    // Test-only stand-in for the still-unissued initial process authority.
+    let creator = synthetic_creator_projection();
+    sched
+        .thread_tree
+        .process_wait
+        .get_mut(&parent)
+        .unwrap()
+        .native_projections
+        .push(creator.clone());
+    sched.thread_tree.retain_native_projection(creator).unwrap();
+    let admission = synthetic_admission_for_common_consumer(
+        requested,
+        actual,
+        clear_child_tid,
+        exit_signal,
+        terminal,
+    );
+    let birth = sched
+        .thread_tree
+        .prepare_no_seq_birth(
+            admission.permit().owner,
+            parent,
+            ExternalOpId::new(parent, 3),
+            requested,
+            0x1111,
+            17,
+            Some(91),
+            Some(admission.permit()),
+        )
+        .unwrap();
+    let mut birth = sched.thread_tree.submit_no_seq_birth(&birth).unwrap();
+    sched.thread_tree.rebind_native_birth(&mut birth).unwrap();
+    let outcome = birth
+        .native_owner
+        .as_ref()
+        .unwrap()
+        .attach(admission)
+        .unwrap();
+    (sched, birth, outcome)
+}
+
+#[cfg(test)]
+mod native_actual_common_consumer_tests {
+    use reverie::syscalls::CloneFlags;
+
+    use super::*;
+    #[test]
+    fn live_and_prestart_share_actual_semantics_but_only_live_enters_tree() {
+        for terminal in [false, true] {
+            let (mut sched, mut birth, outcome) = synthetic_common_birth(
+                CloneFlags::empty(),
+                CloneFlags::CLONE_CHILD_CLEARTID,
+                0x223344,
+                12,
+                terminal,
+            );
+            let original = birth.request_identity();
+            let child = outcome.child();
+            birth.child = Some(child.thread);
+            if terminal {
+                assert!(sched.complete_prestart_child_exit(&birth, child));
+            } else {
+                assert!(sched.thread_tree.consume_no_seq_birth(&birth, child.thread));
+            }
+            let entry = &sched.thread_tree.process_wait[&child.thread];
+            assert_eq!(entry.exit_signal, 12);
+            assert_eq!(
+                entry.native_birth_parent.as_ref().unwrap().thread(),
+                DetTid::from_raw(41)
+            );
+            assert_eq!(entry.wait_parent, None); // Explicitly unissued current relation.
+            assert_eq!(birth.request_identity(), original);
+            assert_eq!(
+                sched.thread_tree.tree.contains_key(&child.thread),
+                !terminal
+            );
+            assert_eq!(
+                sched
+                    .thread_tree
+                    .thread_to_leader
+                    .contains_key(&child.thread),
+                !terminal
+            );
+            assert!(!sched.next_turns.contains_key(&child.thread));
+            assert!(!sched.priorities.contains_key(&child.thread));
+            assert_eq!(
+                sched
+                    .completed_physical_process_exits
+                    .contains(&child.thread),
+                terminal
+            );
+            assert_eq!(
+                sched.thread_tree.join_no_seq_birth(
+                    &NoSeqChildBirth {
+                        child: None,
+                        ..birth.clone()
+                    },
+                    child.thread
+                ),
+                Some(true)
+            );
+            assert!(!sched.thread_tree.check_no_seq_birth(&birth, child.thread));
+        }
+    }
+    #[test]
+    fn serialized_native_birth_requires_original_owner_rebind() {
+        let (sched, mut birth, outcome) =
+            synthetic_common_birth(CloneFlags::empty(), CloneFlags::empty(), 0, 17, false);
+        birth.child = Some(outcome.child().thread);
+        let bytes = serde_json::to_vec(&birth).unwrap();
+        let mut decoded: NoSeqChildBirth = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded.construction().is_err());
+        sched.thread_tree.rebind_native_birth(&mut decoded).unwrap();
+        assert!(Arc::ptr_eq(
+            &decoded.construction().unwrap().unwrap(),
+            &outcome
+        ));
+        decoded.exit_signal += 1;
+        assert!(sched.thread_tree.rebind_native_birth(&mut decoded).is_err());
+    }
+    #[test]
+    fn late_creator_and_reused_numeric_slot_preserve_original_birth_owner() {
+        let (mut sched, mut birth, outcome) =
+            synthetic_common_birth(CloneFlags::empty(), CloneFlags::empty(), 0, 12, true);
+        let parent = birth.parent.thread;
+        let child = outcome.child();
+        sched
+            .thread_tree
+            .retire_no_seq_wait_owner(birth.parent, None);
+        sched.thread_tree.tree.remove(&parent);
+        sched.thread_tree.thread_to_leader.remove(&parent);
+        sched.thread_tree.reap_wait_entry(parent);
+        // Numeric reuse carries unresolved reservations on the existing wait lifetime.
+        sched.thread_tree.add_child(parent, parent, true);
+        birth.child = Some(child.thread);
+        birth.native_owner = None;
+        sched.thread_tree.rebind_native_birth(&mut birth).unwrap();
+        assert!(Arc::ptr_eq(
+            &birth.construction().unwrap().unwrap(),
+            &outcome
+        ));
+        assert!(sched.complete_prestart_child_exit(&birth, child));
+        assert!(!sched.thread_tree.tree.contains_key(&child.thread));
+        assert!(!sched.next_turns.contains_key(&child.thread));
+        assert_eq!(
+            sched.thread_tree.process_wait[&child.thread]
+                .native_birth_parent
+                .as_ref()
+                .unwrap()
+                .thread(),
+            parent
+        );
+    }
+    #[test]
+    fn late_terminal_thread_cannot_rebind_old_process_into_reused_numeric_slot() {
+        let flags = CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND;
+        let (mut sched, mut birth, outcome) = synthetic_common_birth(flags, flags, 0, -1, true);
+        let parent = birth.parent.thread;
+        let child = outcome.child();
+        sched
+            .thread_tree
+            .retire_no_seq_wait_owner(birth.parent, None);
+        sched.thread_tree.tree.remove(&parent);
+        sched.thread_tree.thread_to_leader.remove(&parent);
+        sched.thread_tree.reap_wait_entry(parent);
+        sched.thread_tree.add_child(parent, parent, true);
+        assert!(
+            sched.thread_tree.process_wait[&parent]
+                .native_projections
+                .is_empty()
+        );
+        let replacement_before = format!("{:?}", sched.thread_tree.process_wait[&parent]);
+        let pending_before = sched.thread_tree.pending_no_seq_birth_count();
+        assert_eq!(pending_before, 1);
+        birth.child = Some(child.thread);
+        birth.native_owner = None;
+        sched.thread_tree.rebind_native_birth(&mut birth).unwrap();
+        let original_owner = birth.native_owner.as_ref().unwrap().clone();
+        // Empty replacement slot is unknown generation, not proof of the old process.
+        assert!(!sched.complete_prestart_child_exit(&birth, child));
+        assert!(
+            sched
+                .thread_tree
+                .retain_native_projection(outcome.projection().clone())
+                .is_err()
+        );
+        assert_eq!(
+            format!("{:?}", sched.thread_tree.process_wait[&parent]),
+            replacement_before
+        );
+        assert_eq!(
+            sched.thread_tree.pending_no_seq_birth_count(),
+            pending_before
+        );
+        assert!(original_owner.disposition().is_none());
+        assert!(!original_owner.complete());
+        assert!(Arc::ptr_eq(&original_owner.outcome().unwrap(), &outcome));
+        assert!(
+            sched.thread_tree.process_wait[&parent]
+                .historical_births
+                .iter()
+                .any(|owner| Arc::ptr_eq(owner, &original_owner))
+        );
+        assert!(!sched.thread_was_registered(child.thread));
+        assert!(!sched.next_turns.contains_key(&child.thread));
+        assert!(!sched.priorities.contains_key(&child.thread));
+        assert!(
+            !sched
+                .completed_physical_process_exits
+                .contains(&child.thread)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "active native current-parent authority is not implemented")]
+    fn historical_parent_cannot_answer_current_wait() {
+        let (mut sched, mut birth, outcome) =
+            synthetic_common_birth(CloneFlags::empty(), CloneFlags::empty(), 0, 17, true);
+        birth.child = Some(outcome.child().thread);
+        assert!(sched.complete_prestart_child_exit(&birth, outcome.child()));
+        let _ = sched.exact_child_wait_state(birth.parent.thread, outcome.child().thread);
+    }
+}
+
+#[cfg(test)]
+mod initial_native_root_tests {
+    use super::*;
+    fn activate(
+        sched: &mut Scheduler,
+        engine: &mut NetworkReplayEngine,
+        association: &InitialTableAssociation,
+        claim: &InitialTableClaim,
+        pin: &OwnedFd,
+    ) -> std::io::Result<()> {
+        sched.admit_initial_native_root(association, pin, None, |logical| {
+            engine
+                .admit_initial_record_census(association, claim, logical)
+                .map_err(std::io::Error::other)
+        })
+    }
+    #[test]
+    fn owned_initial_record_census_activates_both_capabilities_at_one_commit() {
+        let (mut sched, _, association, claim, pin) = fixture(false);
+        let mut engine = NetworkReplayEngine::record_shadow(
+            chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+        );
+        assert!(!engine.fd_table_capability());
+        assert!(!engine.accepted_mode());
+        let before = (
+            sched.turn,
+            sched.committed_time,
+            format!("{:?}", sched.run_queue),
+        );
+        activate(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+        assert!(engine.fd_table_capability());
+        assert!(engine.accepted_mode());
+        assert_eq!(
+            engine.fd_table_fixture_files(association.owner()),
+            Some(crate::types::FilesId::initial(association.owner().thread))
+        );
+        let retained = snapshot(&sched, &engine);
+        sched
+            .admit_initial_native_root(&association, &pin, Some(&Ok(())), |_| {
+                panic!("lost reply reissued capability")
+            })
+            .unwrap();
+        assert_eq!(snapshot(&sched, &engine), retained);
+        assert_eq!(
+            (
+                sched.turn,
+                sched.committed_time,
+                format!("{:?}", sched.run_queue)
+            ),
+            before
+        );
+        assert!(crate::network_replay::backend_fd_table_capability(&Config::default()).is_none());
+    }
+    #[test]
+    fn owned_initial_record_rejects_forged_claim_or_changed_mm_without_partial_activation() {
+        for variant in [
+            "claim",
+            "MM",
+            "process",
+            "nonleader",
+            "missing start",
+            "missing provider",
+            "pin",
+            "lost registration",
+        ] {
+            let (mut sched, _, association, mut claim, pin) = fixture(false);
+            let mut engine = NetworkReplayEngine::record_shadow(
+                chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            );
+            let wrong: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+            let changed = if matches!(
+                variant,
+                "MM" | "process" | "nonleader" | "missing start" | "missing provider"
+            ) {
+                changed_initial_root_fixture(&association, variant)
+            } else {
+                association.clone()
+            };
+            if variant == "claim" {
+                claim.through_generation += 1;
+            }
+            if variant == "lost registration" {
+                sched
+                    .physical_thread_pidfds
+                    .remove(&association.owner().thread);
+            }
+            let retained = snapshot(&sched, &engine);
+            assert!(
+                activate(
+                    &mut sched,
+                    &mut engine,
+                    &changed,
+                    &claim,
+                    if variant == "pin" { &wrong } else { &pin }
+                )
+                .is_err(),
+                "{variant}"
+            );
+            assert_eq!(snapshot(&sched, &engine), retained, "{variant}");
+            assert!(!engine.fd_table_capability());
+            assert!(!engine.accepted_mode());
+        }
+    }
+    #[test]
+    fn owned_initial_record_refuses_unenrolled_inherited_socket_before_any_commit() {
+        for (flags, admitted) in [(libc::O_RDWR, false), (libc::O_PATH, true)] {
+            let (mut sched, _, association, _, pin) = fixture(false);
+            let (association, claim) =
+                association.with_initial_fixture_fd(libc::S_IFSOCK, flags as u32);
+            // Both cases first satisfy the exact census/metadata/slot claim.
+            association.check_claim(&claim).unwrap();
+            let mut engine = NetworkReplayEngine::record_shadow(
+                chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            );
+            let before = snapshot(&sched, &engine);
+            let result = activate(&mut sched, &mut engine, &association, &claim, &pin);
+            assert_eq!(result.is_ok(), admitted);
+            if !admitted {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("socket profile enrollment")
+                );
+                assert_eq!(snapshot(&sched, &engine), before);
+            }
+            assert_eq!(engine.fd_table_capability(), admitted);
+            assert_eq!(engine.accepted_mode(), admitted);
+        }
+    }
+
+    #[test]
+    fn owned_initial_record_census_activates_v4_fd_table_without_accept_journal() {
+        let (mut sched, _, association, claim, pin) = fixture(false);
+        let mut engine = NetworkReplayEngine::record_native_receive(
+            chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+        );
+        assert!(!engine.fd_table_capability());
+        activate(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+        assert!(engine.fd_table_capability());
+        assert!(engine.native_receive_version());
+        // V4 has no accept issuer; accept stays WrongMode rather than V3-journaled.
+        assert!(!engine.accepted_mode());
+        assert_eq!(
+            engine.fd_table_fixture_files(association.owner()),
+            Some(crate::types::FilesId::initial(association.owner().thread))
+        );
+    }
+    #[test]
+    fn owned_initial_record_census_refuses_v4_replay_without_partial_activation() {
+        let (mut sched, _, association, claim, pin) = fixture(false);
+        let mut engine = NetworkReplayEngine::replay_native_receive(
+            NetworkReplayEngine::controlled_replay_two_row_trace(),
+        )
+        .unwrap();
+        let retained = snapshot(&sched, &engine);
+        assert!(activate(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        assert!(!engine.fd_table_capability());
+        assert!(!engine.accepted_mode());
+    }
+
+    #[test]
+    fn owned_initial_record_does_not_upgrade_v2_or_an_already_active_engine() {
+        let (mut sched, mut legacy, association, claim, pin) = fixture(false);
+        let retained = snapshot(&sched, &legacy);
+        assert!(activate(&mut sched, &mut legacy, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &legacy), retained);
+        let mut engine = NetworkReplayEngine::record_shadow(
+            chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+        );
+        engine.fd_table_fixture_enable();
+        let retained = snapshot(&sched, &engine);
+        assert!(activate(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+    }
+
+    use crate::network_replay::NetworkReplayEngine;
+    use crate::network_replay::NetworkStreamOwner;
+    use crate::network_runtime::InitialTableAssociation;
+    use crate::network_runtime::InitialTableClaim;
+    use crate::network_runtime::changed_initial_root_fixture;
+    use crate::network_runtime::initial_root_fixture;
+    fn fixture(
+        capability: bool,
+    ) -> (
+        Scheduler,
+        NetworkReplayEngine,
+        InitialTableAssociation,
+        InitialTableClaim,
+        OwnedFd,
+    ) {
+        let mut sched = Scheduler::new(&Config::default());
+        let raw = std::process::id() as i32;
+        let logical = DetTid::from_raw(if raw == 41 { 42 } else { 41 });
+        let owner = NetworkStreamOwner {
+            thread: logical,
+            mm: MmId::initial(logical),
+        };
+        sched.thread_tree.add_child_with_wait_metadata(
+            logical,
+            logical,
+            true,
+            false,
+            libc::SIGCHLD,
+        );
+        assert_ne!(raw, logical.as_raw());
+        sched
+            .register_physical_thread(logical, owner.mm, raw, raw)
+            .unwrap();
+        let pin = sched.physical_thread_pidfds[&logical]
+            .3
+            .try_clone()
+            .unwrap();
+        let (association, claim) = initial_root_fixture(owner, raw);
+        let mut engine = NetworkReplayEngine::record(
+            chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+        );
+        if capability {
+            engine.fd_table_fixture_enable();
+        }
+        (sched, engine, association, claim, pin)
+    }
+    fn commit(
+        sched: &mut Scheduler,
+        engine: &mut NetworkReplayEngine,
+        association: &InitialTableAssociation,
+        claim: &InitialTableClaim,
+        pin: &OwnedFd,
+    ) -> std::io::Result<()> {
+        sched.admit_initial_native_root(association, pin, None, |logical| {
+            assert_eq!(logical, association.owner().thread);
+            assert_ne!(logical.as_raw(), association.process());
+            engine
+                .register_initial_census(association, claim, logical)
+                .map_err(std::io::Error::other)
+        })
+    }
+    fn snapshot(sched: &Scheduler, engine: &NetworkReplayEngine) -> (String, String) {
+        (format!("{:?}", sched.thread_tree), format!("{engine:?}"))
+    }
+    #[test]
+    fn initial_root_joins_distinct_namespaces_and_commits_once_without_a_turn() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        let before = (
+            sched.turn,
+            sched.committed_time,
+            format!("{:?}", sched.run_queue),
+        );
+        commit(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+        let process = association.owner().thread;
+        assert_eq!(
+            engine.fd_table_fixture_files(association.owner()),
+            Some(crate::types::FilesId::initial(process))
+        );
+        let projection = sched.thread_tree.process_wait[&process].native_projections[0].clone();
+        assert_eq!(projection.thread(), process);
+        assert_eq!(projection.process(), process);
+        assert!(projection.same_task(
+            &crate::network_runtime::native_birth_outcome::synthetic_creator_projection()
+        ));
+        let retained = snapshot(&sched, &engine);
+        sched
+            .admit_initial_native_root(&association, &pin, Some(&Ok(())), |_| {
+                panic!("repeated census committed")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &projection,
+            &sched.thread_tree.process_wait[&process].native_projections[0]
+        ));
+        assert_eq!(snapshot(&sched, &engine), retained);
+        assert_eq!(
+            (
+                sched.turn,
+                sched.committed_time,
+                format!("{:?}", sched.run_queue)
+            ),
+            before
+        );
+        // The normal historical attachment now has positive Arc authority;
+        // the unchanged F1 guard does not bootstrap an empty numeric slot.
+        sched
+            .thread_tree
+            .retain_native_projection(projection)
+            .unwrap();
+    }
+    #[test]
+    fn initial_root_changed_census_identity_never_rebinds_the_original_arc() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        commit(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+        let retained = snapshot(&sched, &engine);
+        for field in [
+            "MM",
+            "process",
+            "registration",
+            "request",
+            "command",
+            "provider",
+            "start",
+            "task",
+            "table",
+            "nonleader",
+        ] {
+            let changed = changed_initial_root_fixture(&association, field);
+            assert!(
+                sched
+                    .admit_initial_native_root(&changed, &pin, Some(&Ok(())), |_| panic!(
+                        "changed census committed"
+                    ))
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(snapshot(&sched, &engine), retained, "{field}");
+        }
+    }
+    #[test]
+    fn initial_root_nonleader_or_missing_native_witness_refuses_both_ledgers() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        let retained = snapshot(&sched, &engine);
+        for field in ["nonleader", "missing start", "missing provider"] {
+            let changed = changed_initial_root_fixture(&association, field);
+            assert!(
+                commit(&mut sched, &mut engine, &changed, &claim, &pin).is_err(),
+                "{field}"
+            );
+            assert_eq!(snapshot(&sched, &engine), retained);
+        }
+    }
+    #[test]
+    fn initial_root_old_exec_and_replaced_registration_refuse_before_commit() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        let owner = association.owner();
+        sched
+            .exec_incarnations
+            .insert(owner.thread, owner.mm.for_exec(owner.thread));
+        let retained = snapshot(&sched, &engine);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        sched.exec_incarnations.remove(&owner.thread);
+        sched
+            .physical_thread_pidfds
+            .get_mut(&owner.thread)
+            .unwrap()
+            .0 = owner.mm.for_exec(owner.thread);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+    }
+    #[test]
+    fn initial_root_pin_or_raw_process_mismatch_preserves_both_ledgers() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        let retained = snapshot(&sched, &engine);
+        let wrong_pin: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &wrong_pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        sched
+            .physical_thread_pidfds
+            .get_mut(&association.owner().thread)
+            .unwrap()
+            .1 += 1;
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+    }
+    #[test]
+    fn initial_root_different_pidfd_identity_refuses_before_commit() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        // Another actual thread description is a valid pidfs FD, not merely
+        // a non-pidfd negative. It remains pinned after that thread exits.
+        let other = std::thread::spawn(|| {
+            let thread = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+            let raw = unsafe {
+                libc::syscall(libc::SYS_pidfd_open, thread, libc::O_EXCL as libc::c_uint)
+            };
+            assert!(raw >= 0);
+            unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) }
+        })
+        .join()
+        .unwrap();
+        assert_ne!(
+            crate::network_runtime::PidfdIdentity::read(&pin).unwrap(),
+            crate::network_runtime::PidfdIdentity::read(&other).unwrap()
+        );
+        let retained = snapshot(&sched, &engine);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &other).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        commit(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+    }
+    #[test]
+    fn initial_root_numeric_replacement_cannot_recover_a_prior_success() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        commit(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+        let root = association.owner().thread;
+        let old = sched.thread_tree.process_wait[&root].native_projections[0].clone();
+        sched
+            .thread_tree
+            .add_child_with_wait_metadata(root, root, true, false, libc::SIGCHLD);
+        let retained = snapshot(&sched, &engine);
+        assert!(
+            sched
+                .admit_initial_native_root(&association, &pin, Some(&Ok(())), |_| panic!(
+                    "replacement committed"
+                ))
+                .is_err()
+        );
+        assert!(sched.thread_tree.retain_native_projection(old).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+    }
+    #[test]
+    fn initial_root_nonroot_or_reaped_entry_never_reaches_engine_admission() {
+        let (mut sched, mut engine, association, claim, pin) = fixture(true);
+        let root = association.owner().thread;
+        let other = DetTid::from_raw(if root.as_raw() == 41 { 42 } else { 41 });
+        assert_ne!(other, root);
+        sched.thread_tree.root = Some(other);
+        let retained = snapshot(&sched, &engine);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        sched.thread_tree.root = Some(root);
+        sched
+            .thread_tree
+            .process_wait
+            .get_mut(&root)
+            .unwrap()
+            .reaped = true;
+        let retained = snapshot(&sched, &engine);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+    }
+    #[test]
+    fn initial_root_engine_refusal_preserves_scheduler_and_native_custody() {
+        let (mut sched, mut engine, association, mut claim, pin) = fixture(false);
+        let retained = snapshot(&sched, &engine);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        engine.fd_table_fixture_enable();
+        claim.through_generation = 1; // Empty census cannot publish one generation.
+        let retained = snapshot(&sched, &engine);
+        assert!(commit(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert_eq!(snapshot(&sched, &engine), retained);
+        claim.through_generation = 0;
+        commit(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
     }
 }

@@ -37,7 +37,9 @@ impl GlobalState {
                 (SchedulerRpcResult::Continue(status), time)
             }
             SchedulerRpcResult::ThreadExited => (SchedulerRpcResult::ThreadExited, None),
-            SchedulerRpcResult::Continue(ResourceReply::ObserveSignal(_)) => {
+            SchedulerRpcResult::Continue(
+                ResourceReply::ObserveSignal(_) | ResourceReply::ReadGrant { .. },
+            ) => {
                 self.sched.lock().unwrap().fail_parked(
                     DetTid::from_raw(from.as_raw()),
                     ProtocolFailure::UnexpectedControl,
@@ -244,6 +246,23 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    match capable_resource_reply(guest, resources, capability).await {
+        ResourceReply::Grant(status) => status,
+        _ => terminate_protocol(guest, ProtocolFailure::UnexpectedControl).await,
+    }
+}
+
+/// Shared signal continuation. An owned-read caller consumes the same actual
+/// grant token; ordinary callers retain their original ResumeStatus API.
+pub(super) async fn capable_resource_reply<G, T>(
+    guest: &mut G,
+    resources: Resources,
+    capability: ControlCapability,
+) -> ResourceReply
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let pid = guest.thread_state().detpid.expect("registered process");
     let response = send_and_update_time(
         guest,
@@ -257,7 +276,7 @@ where
     };
     loop {
         let control = match reply {
-            ResourceReply::Grant(status) => return status,
+            reply @ (ResourceReply::Grant(_) | ResourceReply::ReadGrant { .. }) => return reply,
             ResourceReply::ObserveSignal(control) => *control,
         };
         if guest.parked_signal_site() != Some(control.site)
@@ -305,7 +324,7 @@ where
             match (ack, finish) {
                 (FinishAck::AwaitResume(ticket), ObservationFinish::ResumeSameWait) => ticket,
                 (FinishAck::Interrupted, ObservationFinish::InterruptForCaught { .. }) => {
-                    return ResumeStatus::Signaled(None);
+                    return ResourceReply::Grant(ResumeStatus::Signaled(None));
                 }
                 (FinishAck::Terminate, ObservationFinish::Terminate { selection }) => {
                     match guest.terminate_from_parked_signal(selection).await {

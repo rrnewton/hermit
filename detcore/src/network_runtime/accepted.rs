@@ -56,6 +56,66 @@ impl Resolved {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SubmittedAccept {
+    pub listener: AcceptedPhysicalIdentity,
+    pub fd: i32,
+    pub flags: i32,
+}
+/// Exact historical installation. Private fields deliberately supply no
+/// FilesId/OpenFileId/slot generation or public Installed constructor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HistoricalAcceptedInstallation {
+    owner: NetworkStreamOwner,
+    lease: NetworkAcceptLeaseId,
+    command: u64,
+    transition: super::fd_journal::Transition,
+    resolved: Resolved,
+    interference: Vec<u64>,
+}
+/// A negative result of the original accept, joined to the pre-invocation
+/// owner and a complete journal cut. It has no public/RPC constructor.
+#[derive(Debug, Clone)]
+pub(crate) struct NoInstallation {
+    owner: super::original_installation::Owner,
+    lease: NetworkAcceptLeaseId,
+    permit: crate::network_replay::NetworkFdPublicationPermit,
+    errno: i32,
+    dequeued: Option<Resolved>,
+    command: u64,
+    through: u64,
+}
+impl NoInstallation {
+    pub(crate) fn matches(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+        actual: &std::sync::Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+    ) -> bool {
+        self.owner.owner == owner
+            && self.lease == lease
+            && self.permit == permit
+            && self.owner.files == permit.files
+            && permit.owner == owner
+            && std::sync::Arc::ptr_eq(&self.owner.metadata, actual)
+    }
+    pub(crate) fn errno(&self) -> i32 {
+        self.errno
+    }
+    pub(crate) fn dequeued(&self) -> Option<Resolved> {
+        self.dequeued
+    }
+    fn same(&self, other: &Self) -> bool {
+        self.owner.same(&other.owner)
+            && self.lease == other.lease
+            && self.permit == other.permit
+            && self.errno == other.errno
+            && self.dequeued == other.dequeued
+            && self.command == other.command
+            && self.through == other.through
+    }
+}
 #[derive(Debug)]
 struct Accept<T> {
     owner: NetworkStreamOwner,
@@ -67,6 +127,13 @@ struct Accept<T> {
     resolved: Option<Resolved>,
     abandoned: bool,
     prepared_effect: Option<(u64, u64)>,
+    submitted_effect: Option<SubmittedAccept>,
+    historical: Option<HistoricalAcceptedInstallation>,
+    installation_owner: Option<super::original_installation::Owner>,
+    installed: Option<crate::types::FdSlotBinding>,
+    no_installation: Option<NoInstallation>,
+    no_installation_published: bool,
+    installation_admission: Option<crate::network_replay::NetworkFdPublicationAdmission>,
     physical_effect:
         Option<super::accepted_provider::Observation<super::accepted_provider::AcceptedEffect>>,
     collection: Option<Result<(u64, Option<Result<(), String>>), String>>,
@@ -90,6 +157,367 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 impl<T> AcceptedCustody<T> {
+    pub(super) fn bind_installation_owner(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        binding: super::original_installation::Owner,
+    ) -> io::Result<()> {
+        let operation = self.operation(owner, lease)?;
+        if let Some(prior) = &operation.installation_owner {
+            return if prior.same(&binding) {
+                Ok(())
+            } else {
+                Err(invalid(
+                    "accepted preparation changed retained installation owner",
+                ))
+            };
+        }
+        if binding.owner != owner
+            || operation.prepared_effect.is_some()
+            || operation.returned.is_some()
+        {
+            return Err(invalid(
+                "accepted installation owner must precede native preparation",
+            ));
+        }
+        self.operations.get_mut(&lease).unwrap().installation_owner = Some(binding);
+        Ok(())
+    }
+
+    pub(super) fn installation_owner(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<super::original_installation::Owner> {
+        self.operation(owner, lease)?
+            .installation_owner
+            .clone()
+            .ok_or_else(|| invalid("accepted installation lost pre-invocation metadata custody"))
+    }
+
+    pub(super) fn original_installation(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+        through: u64,
+        history: &super::fd_journal::History,
+    ) -> io::Result<super::original_installation::Installation> {
+        let operation = self.operation(owner, lease)?;
+        let historical = operation
+            .historical
+            .as_ref()
+            .ok_or_else(|| invalid("accepted installation lacks original checked history"))?;
+        let super::fd_journal::Transition::Install { begin, end } = &historical.transition else {
+            return Err(invalid(
+                "accepted historical receipt changed transition kind",
+            ));
+        };
+        if historical.owner != owner
+            || historical.lease != lease
+            || operation.returned != Some(Ok(begin.fd))
+        {
+            return Err(invalid(
+                "accepted historical receipt changed original return",
+            ));
+        }
+        super::original_installation::Installation::checked(
+            self.installation_owner(owner, lease)?,
+            permit,
+            super::original_installation::Source::Accepted {
+                lease,
+                child: historical.resolved,
+            },
+            historical.command,
+            begin.fd,
+            begin.file,
+            begin.sequence,
+            end.sequence,
+            through,
+            history,
+        )
+    }
+
+    pub(super) fn retain_installed(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        binding: crate::types::FdSlotBinding,
+    ) -> io::Result<()> {
+        let operation = self.operation(owner, lease)?;
+        let installation_owner = self.installation_owner(owner, lease)?;
+        if operation.returned != Some(Ok(binding.slot.fd))
+            || binding.slot.files != installation_owner.files
+            || binding.generation == 0
+            || !binding.open_file.is_socket()
+            || operation.installed.is_some_and(|prior| prior != binding)
+        {
+            return Err(invalid(
+                "accepted publication changed its exact local installation",
+            ));
+        }
+        self.operations.get_mut(&lease).unwrap().installed = Some(binding);
+        Ok(())
+    }
+
+    pub(super) fn installation_admission(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<Option<crate::network_replay::NetworkFdPublicationAdmission>> {
+        Ok(self.operation(owner, lease)?.installation_admission.clone())
+    }
+    pub(super) fn retain_installation_admission(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        admission: &crate::network_replay::NetworkFdPublicationAdmission,
+    ) -> io::Result<()> {
+        let operation = self.operation(owner, lease)?;
+        let bound = operation
+            .installation_owner
+            .as_ref()
+            .ok_or_else(|| invalid("accepted publication lost its original metadata"))?;
+        if bound.owner != owner
+            || bound.files != admission.permit.files
+            || admission.permit.owner != owner
+            || admission.recovery.is_some()
+            || (operation.historical.is_none()
+                && !(matches!(operation.returned, Some(Err(_)))
+                    && self.collection_result(owner, lease).is_ok()))
+            || operation.installed.is_some()
+            || operation
+                .installation_admission
+                .as_ref()
+                .is_some_and(|old| old != admission)
+        {
+            return Err(invalid("accepted publication changed retained admission"));
+        }
+        self.operations
+            .get_mut(&lease)
+            .unwrap()
+            .installation_admission = Some(admission.clone());
+        Ok(())
+    }
+    pub(super) fn installed(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<Option<crate::types::FdSlotBinding>> {
+        Ok(self.operation(owner, lease)?.installed)
+    }
+
+    pub(super) fn captured_result(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<Result<i32, i32>> {
+        self.operation(owner, lease)?
+            .returned
+            .ok_or_else(|| invalid("accepted original invocation has not returned"))
+    }
+
+    pub(super) fn retained_no_installation(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+    ) -> io::Result<Option<NoInstallation>> {
+        let op = self.operation(owner, lease)?;
+        if op
+            .no_installation
+            .as_ref()
+            .is_some_and(|r| r.permit != permit)
+        {
+            return Err(invalid("negative accepted recovery changed permit"));
+        }
+        Ok(op.no_installation.clone())
+    }
+
+    pub(super) fn no_installation_published(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<bool> {
+        Ok(self.operation(owner, lease)?.no_installation_published)
+    }
+    pub(super) fn retain_no_installation_published(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        receipt: &NoInstallation,
+    ) -> io::Result<()> {
+        let op = self.operation(owner, lease)?;
+        if op.no_installation.as_ref().is_none_or(|r| !r.same(receipt)) {
+            return Err(invalid(
+                "negative accepted publication changed retained proof",
+            ));
+        }
+        self.operations
+            .get_mut(&lease)
+            .unwrap()
+            .no_installation_published = true;
+        Ok(())
+    }
+
+    pub(super) fn no_installation(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+        through: u64,
+        history: &super::fd_journal::History,
+    ) -> io::Result<NoInstallation> {
+        self.collection_result(owner, lease)?;
+        let op = self.operation(owner, lease)?;
+        let bound = self.installation_owner(owner, lease)?;
+        let submitted = op
+            .submitted_effect
+            .as_ref()
+            .ok_or_else(|| invalid("accept operands absent"))?;
+        let (_, command) = op
+            .prepared_effect
+            .ok_or_else(|| invalid("accept preparation absent"))?;
+        let effect = op
+            .physical_effect
+            .as_ref()
+            .ok_or_else(|| invalid("accept result absent"))?;
+        let c = &effect.raw.command;
+        let a = &effect.raw.installation;
+        // Positive ENTERED and SYSCALL_RETURNED, never missing fd_install alone.
+        if bound.owner != owner
+            || permit.owner != owner
+            || permit.files != bound.files
+            || op
+                .installation_admission
+                .as_ref()
+                .is_none_or(|admission| admission.permit != permit)
+            || effect.status.returned != 0
+            || command == 0
+            || c.command != command
+            || c.operation != 4
+            || c.phase != 1
+            || c.reserved != 0
+            || c.original_count != 0
+            || !(-4095..=-1).contains(&c.returned)
+            || op.returned != Some(Err(-c.returned))
+            || bound.provider == 0
+            || c.identity.provider != bound.provider
+            || bound.task == 0
+            || c.task != bound.task
+            || bound.start == 0
+            || c.start_boottime != bound.start
+            || a.command != command
+            || a.accept_lease != lease.0
+            || a.owner_mm != owner.mm.generation()
+            || a.task != bound.task
+            || a.task_start != bound.start
+            || bound.table == 0
+            || a.table != bound.table
+            || a.requested_fd != submitted.fd
+            || a.flags != submitted.flags
+            || a.problem != 0
+            || !matches!(a.phases, 65 | 67 | 71)
+            || a.file != 0
+            || a.install_begin != 0
+            || a.install_end != 0
+            || a.returned_fd != 0
+            || (a.do_accept_errno != 0 && a.do_accept_errno != -c.returned)
+            || op.pin.is_some()
+            || op.historical.is_some()
+            || op.installed.is_some()
+            || op.matched.is_some()
+            || op.resolved.is_some()
+            || history
+                .next()?
+                .checked_sub(1)
+                .is_none_or(|last| last < through)
+            || history.contains_command(command)?
+        {
+            return Err(invalid(
+                "negative accept changed original owner/return or contradicts journal",
+            ));
+        }
+        let empty: super::accepted_provider::Identity =
+            super::accepted_provider_ffi::Identity::default().into();
+        if (a.phases & 2 != 0
+            && (a.listener.provider != submitted.listener.provider
+                || a.listener.object != submitted.listener.object
+                || a.listener.namespace != submitted.listener.namespace))
+            || (a.phases & 2 == 0 && a.listener != empty)
+        {
+            return Err(invalid(
+                "negative accept changed original selected listener",
+            ));
+        }
+        let dequeued = if a.phases & 4 != 0 {
+            if a.child != c.identity
+                || a.child.provider != bound.provider
+                || a.child.object == 0
+                || a.child.namespace == 0
+                || a.child.namespace != submitted.listener.namespace
+                || a.creation == 0
+                || a.creation != c.creation
+                || a.cookie == 0
+                || a.cookie != c.cookie
+            {
+                return Err(invalid("negative accept changed the actual dequeued child"));
+            }
+            Some(Resolved {
+                physical: AcceptedPhysicalIdentity {
+                    provider: a.child.provider,
+                    object: a.child.object,
+                    namespace: a.child.namespace,
+                },
+                creation: a.creation,
+                cookie: a.cookie,
+            })
+        } else {
+            if a.child != empty
+                || a.creation != 0
+                || a.cookie != 0
+                || c.identity.object != 0
+                || c.identity.namespace != 0
+                || c.creation != 0
+                || c.cookie != 0
+            {
+                return Err(invalid("no-connection result contains a dequeued child"));
+            }
+            None
+        };
+        let receipt = NoInstallation {
+            owner: bound,
+            lease,
+            permit,
+            errno: -c.returned,
+            dequeued,
+            command,
+            through,
+        };
+        if op
+            .no_installation
+            .as_ref()
+            .is_some_and(|old| !old.same(&receipt))
+        {
+            return Err(invalid("negative accept changed retained cut"));
+        }
+        self.operations.get_mut(&lease).unwrap().no_installation = Some(receipt.clone());
+        Ok(receipt)
+    }
+
+    pub(super) fn installation_flags(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<i32> {
+        self.operation(owner, lease)?
+            .submitted_effect
+            .as_ref()
+            .map(|s| s.flags)
+            .ok_or_else(|| invalid("accepted installation lacks submitted flag operands"))
+    }
+
     #[cfg(test)]
     pub(super) fn collection_effect_status(
         &self,
@@ -156,6 +584,13 @@ impl<T> AcceptedCustody<T> {
                 resolved: None,
                 abandoned: false,
                 prepared_effect: None,
+                submitted_effect: None,
+                historical: None,
+                installation_owner: None,
+                installed: None,
+                no_installation: None,
+                no_installation_published: false,
+                installation_admission: None,
                 physical_effect: None,
                 collection: None,
             },
@@ -393,6 +828,150 @@ impl<T> AcceptedCustody<T> {
                 "accepted provider effect differs from exact submitted kernel return",
             ));
         }
+        Ok(())
+    }
+
+    pub(super) fn retain_submission(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        submitted: SubmittedAccept,
+    ) -> io::Result<()> {
+        let op = self.operation(owner, lease)?;
+        if op
+            .submitted_effect
+            .as_ref()
+            .is_some_and(|old| old != &submitted)
+        {
+            return Err(invalid("accepted submission changed"));
+        }
+        self.operations.get_mut(&lease).unwrap().submitted_effect = Some(submitted);
+        Ok(())
+    }
+    pub(super) fn installation_end(
+        &self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+    ) -> io::Result<u64> {
+        let op = self.operation(owner, lease)?;
+        let effect = op
+            .physical_effect
+            .as_ref()
+            .ok_or_else(|| invalid("accepted collection not retained"))?;
+        if effect.status.returned != 0 || effect.raw.installation.install_end == 0 {
+            return Err(invalid("accepted installation lacks a complete endpoint"));
+        }
+        Ok(effect.raw.installation.install_end)
+    }
+    pub(super) fn retain_historical(
+        &mut self,
+        owner: NetworkStreamOwner,
+        lease: NetworkAcceptLeaseId,
+        history: &super::fd_journal::History,
+    ) -> io::Result<()> {
+        let op = self.operation(owner, lease)?;
+        self.pin(owner, lease)?;
+        let (_, command) = op
+            .prepared_effect
+            .ok_or_else(|| invalid("accepted preparation absent"))?;
+        let submitted = op
+            .submitted_effect
+            .as_ref()
+            .ok_or_else(|| invalid("accepted submission absent"))?;
+        let resolved = op
+            .resolved
+            .ok_or_else(|| invalid("accepted held-FD resolution absent"))?;
+        let effect = op
+            .physical_effect
+            .as_ref()
+            .ok_or_else(|| invalid("accepted physical effect absent"))?;
+        let c = &effect.raw.command;
+        let a = &effect.raw.installation;
+        let physical = AcceptedPhysicalIdentity {
+            provider: a.child.provider,
+            object: a.child.object,
+            namespace: a.child.namespace,
+        };
+        let listener = AcceptedPhysicalIdentity {
+            provider: a.listener.provider,
+            object: a.listener.object,
+            namespace: a.listener.namespace,
+        };
+        if effect.status.returned != 0
+            || c.operation != 4
+            || c.phase != 1
+            || c.reserved != 0
+            || c.command != command
+            || a.command != command
+            || command == 0
+            || c.task == 0
+            || c.start_boottime == 0
+            || a.task != c.task
+            || a.task_start != c.start_boottime
+            || a.accept_lease != lease.0
+            || a.owner_mm != owner.mm.generation()
+            || a.problem != 0
+            || a.phases != 127
+            || a.do_accept_errno != 0
+            || c.returned < 0
+            || a.returned_fd != c.returned
+            || op.returned != Some(Ok(c.returned))
+            || listener != submitted.listener
+            || physical.provider != listener.provider
+            || physical.namespace != listener.namespace
+            || a.requested_fd != submitted.fd
+            || a.flags != submitted.flags
+            || c.identity != a.child
+            || physical != resolved.physical
+            || a.creation != resolved.creation
+            || c.creation != a.creation
+            || a.cookie != resolved.cookie
+            || c.cookie != a.cookie
+            || a.table == 0
+            || a.file == 0
+        {
+            return Err(invalid(
+                "accepted historical installation identity mismatch",
+            ));
+        }
+        let transition = history
+            .transition(a.install_end)?
+            .ok_or_else(|| invalid("accepted installation endpoint still pending"))?;
+        let super::fd_journal::Transition::Install { begin, end } = &transition else {
+            return Err(invalid("accepted endpoint is not installation"));
+        };
+        if begin.sequence != a.install_begin
+            || end.sequence != a.install_end
+            || begin.table != a.table
+            || begin.file != a.file
+            || begin.fd != a.returned_fd
+            || begin.task != a.task
+            || begin.task_start != a.task_start
+            || begin.accept_command != command
+        {
+            return Err(invalid("accepted journal differs from held effect"));
+        }
+        let receipt = HistoricalAcceptedInstallation {
+            owner,
+            lease,
+            command,
+            interference: history.interference(
+                begin.sequence,
+                end.sequence,
+                a.table,
+                a.returned_fd,
+            ),
+            transition,
+            resolved,
+        };
+        if op
+            .historical
+            .as_ref()
+            .is_some_and(|prior| prior != &receipt)
+        {
+            return Err(invalid("historical accepted receipt changed"));
+        }
+        self.operations.get_mut(&lease).unwrap().historical = Some(receipt);
         Ok(())
     }
 
@@ -833,4 +1412,537 @@ mod resolved_tests {
             Some(libc::EIO)
         );
     }
+}
+
+#[cfg(test)]
+mod historical_tests {
+    use super::super::accepted_provider::CallStatus;
+    use super::super::accepted_provider::Observation;
+    use super::super::accepted_provider_ffi as ffi;
+    use super::super::fd_journal::History;
+    use super::*;
+    fn fixture() -> (
+        AcceptedCustody<u64>,
+        NetworkStreamOwner,
+        NetworkAcceptLeaseId,
+        History,
+    ) {
+        let thread = crate::types::DetTid::from_raw(7);
+        let owner = NetworkStreamOwner {
+            thread,
+            mm: crate::types::MmId::initial(thread),
+        };
+        let lease = NetworkAcceptLeaseId(29);
+        let listener = AcceptedPhysicalIdentity {
+            provider: 9,
+            object: 2,
+            namespace: 4,
+        };
+        let physical = AcceptedPhysicalIdentity {
+            object: 3,
+            ..listener
+        };
+        let mut custody = AcceptedCustody::default();
+        custody
+            .submit(owner, lease, NetworkStreamCallId::controlled_fixture(5))
+            .unwrap();
+        custody
+            .retain_submission(
+                owner,
+                lease,
+                SubmittedAccept {
+                    listener,
+                    fd: 5,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        custody.retain_preparation(owner, lease, 7, 11).unwrap();
+        custody
+            .capture(owner, lease, Ok(8), |_| Ok(77), |_| Ok(()))
+            .unwrap();
+        custody
+            .confirm_resolved(
+                owner,
+                lease,
+                Resolved {
+                    physical,
+                    creation: 5,
+                    cookie: 6,
+                },
+            )
+            .unwrap();
+        let id = ffi::Identity {
+            provider: 9,
+            object: 3,
+            namespace: 4,
+        };
+        let effect = Observation {
+            status: CallStatus {
+                operation: "collect".into(),
+                returned: 0,
+                errno: None,
+            },
+            raw: ffi::AcceptedEffect {
+                command: ffi::CommandResult {
+                    command: 11,
+                    operation: 4,
+                    task: 10,
+                    start_boottime: 11,
+                    identity: id,
+                    creation: 5,
+                    cookie: 6,
+                    returned: 8,
+                    phase: 1,
+                    ..Default::default()
+                },
+                installation: ffi::FdAccept {
+                    command: 11,
+                    accept_lease: 29,
+                    owner_mm: owner.mm.generation(),
+                    task: 10,
+                    task_start: 11,
+                    table: 1,
+                    file: 1,
+                    install_begin: 1,
+                    install_end: 2,
+                    listener: ffi::Identity { object: 2, ..id },
+                    child: id,
+                    creation: 5,
+                    cookie: 6,
+                    phases: 127,
+                    requested_fd: 5,
+                    returned_fd: 8,
+                    ..Default::default()
+                },
+            }
+            .into(),
+        };
+        custody
+            .retain_physical_effect(owner, lease, effect)
+            .unwrap();
+        let begin = ffi::FdEvent {
+            sequence: 1,
+            kind: 1,
+            task: 10,
+            task_start: 11,
+            table: 1,
+            file: 1,
+            fd: 8,
+            accept_command: 11,
+            complete: 1,
+            ..Default::default()
+        };
+        let end = ffi::FdEvent {
+            sequence: 2,
+            kind: 2,
+            dependency: 1,
+            ..begin
+        };
+        let mut history = History::default();
+        for e in [begin, end] {
+            history
+                .retain(
+                    ffi::FdStatus {
+                        next_table: 1,
+                        next_file: 1,
+                        next_event: 2,
+                        problem: 0,
+                    }
+                    .into(),
+                    e.into(),
+                )
+                .unwrap();
+        }
+        (custody, owner, lease, history)
+    }
+    #[test]
+    fn accepted_history_joins_submitted_arguments_actual_callback_and_held_fd() {
+        let (mut c, owner, lease, h) = fixture();
+        c.retain_historical(owner, lease, &h).unwrap();
+        let before = c.operations[&lease].historical.clone();
+        c.retain_historical(owner, lease, &h).unwrap();
+        assert_eq!(before, c.operations[&lease].historical);
+        assert_eq!(*c.pin(owner, lease).unwrap(), 77);
+        assert!(before.unwrap().interference.is_empty());
+    }
+    #[test]
+    fn accepted_history_refuses_changed_scalar_or_lifetime_without_losing_pin() {
+        for cause in 0..24 {
+            let (mut c, owner, lease, h) = fixture();
+            let op = c.operations.get_mut(&lease).unwrap();
+            let raw = &mut op.physical_effect.as_mut().unwrap().raw;
+            match cause {
+                0 => raw.command.command += 1,
+                1 => raw.command.operation = 2,
+                2 => raw.command.phase = 0,
+                3 => raw.command.reserved = 1,
+                4 => raw.installation.task += 1,
+                5 => raw.installation.task_start += 1,
+                6 => raw.installation.table = 2,
+                7 => raw.installation.file = 2,
+                8 => raw.installation.install_begin = 2,
+                9 => raw.installation.install_end = 1,
+                10 => raw.installation.accept_lease += 1,
+                11 => raw.installation.owner_mm += 1,
+                12 => raw.installation.listener.object += 1,
+                13 => raw.installation.flags = 1,
+                14 => raw.installation.requested_fd += 1,
+                15 => raw.installation.returned_fd += 1,
+                16 => raw.installation.phases = 65,
+                17 => raw.installation.problem = 1,
+                18 => raw.installation.cookie += 1,
+                19 => raw.installation.creation += 1,
+                20 => raw.installation.child.namespace += 1,
+                21 => raw.installation.do_accept_errno = 9,
+                22 => raw.command.returned = -9,
+                _ => op.submitted_effect = None,
+            }
+            assert!(
+                c.retain_historical(owner, lease, &h).is_err(),
+                "cause {cause}"
+            );
+            assert!(c.operations[&lease].historical.is_none());
+            assert_eq!(*c.pin(owner, lease).unwrap(), 77);
+        }
+    }
+}
+
+/// Synthetic command/collection inputs for tests of the real private consumer.
+/// This does not certify a native syscall or manufacture a semantic FD fact.
+#[cfg(test)]
+fn no_installation_fixture(
+    owner: NetworkStreamOwner,
+    lease: NetworkAcceptLeaseId,
+    actual: std::sync::Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+    admission: crate::network_replay::NetworkFdPublicationAdmission,
+    dequeued: bool,
+) -> (AcceptedCustody<u64>, super::fd_journal::History) {
+    use super::accepted_provider_ffi as ffi;
+    let mut custody = AcceptedCustody::default();
+    custody
+        .submit(owner, lease, NetworkStreamCallId::controlled_fixture(5))
+        .unwrap();
+    custody
+        .bind_installation_owner(
+            owner,
+            lease,
+            super::original_installation::Owner {
+                owner,
+                metadata: actual,
+                files: admission.permit.files,
+                provider: 7,
+                task: (31u64 << 32) | 31,
+                start: 101,
+                table: 13,
+            },
+        )
+        .unwrap();
+    custody
+        .retain_submission(
+            owner,
+            lease,
+            SubmittedAccept {
+                listener: AcceptedPhysicalIdentity {
+                    provider: 7,
+                    object: 10,
+                    namespace: 9,
+                },
+                fd: 5,
+                flags: 0,
+            },
+        )
+        .unwrap();
+    custody.retain_preparation(owner, lease, 17, 71).unwrap();
+    custody
+        .capture(
+            owner,
+            lease,
+            Err(libc::EAGAIN),
+            |_| panic!("negative result cannot acquire a pin"),
+            |_| Ok(()),
+        )
+        .unwrap();
+    custody
+        .retain_collection_submission(owner, lease, Ok(18))
+        .unwrap();
+    let child = ffi::Identity {
+        provider: 7,
+        object: 12,
+        namespace: 9,
+    };
+    let effect = ffi::AcceptedEffect {
+        command: ffi::CommandResult {
+            command: 71,
+            operation: 4,
+            phase: 1,
+            task: (31u64 << 32) | 31,
+            start_boottime: 101,
+            returned: -libc::EAGAIN,
+            identity: if dequeued {
+                child
+            } else {
+                ffi::Identity {
+                    provider: 7,
+                    ..Default::default()
+                }
+            },
+            creation: if dequeued { 15 } else { 0 },
+            cookie: if dequeued { 16 } else { 0 },
+            ..Default::default()
+        },
+        installation: ffi::FdAccept {
+            command: 71,
+            accept_lease: lease.0,
+            owner_mm: owner.mm.generation(),
+            task: (31u64 << 32) | 31,
+            task_start: 101,
+            table: 13,
+            requested_fd: 5,
+            listener: ffi::Identity {
+                provider: 7,
+                object: 10,
+                namespace: 9,
+            },
+            child: if dequeued { child } else { Default::default() },
+            creation: if dequeued { 15 } else { 0 },
+            cookie: if dequeued { 16 } else { 0 },
+            phases: if dequeued { 71 } else { 67 },
+            do_accept_errno: libc::EAGAIN,
+            ..Default::default()
+        },
+    };
+    custody
+        .complete_collection(
+            owner,
+            lease,
+            18,
+            Ok(super::accepted_provider::Reply::AcceptedEffect(
+                super::accepted_provider::Observation {
+                    status: super::accepted_provider::CallStatus {
+                        operation: "collect_accept".into(),
+                        returned: 0,
+                        errno: None,
+                    },
+                    raw: effect.into(),
+                },
+            )),
+        )
+        .unwrap();
+    custody
+        .retain_installation_admission(owner, lease, &admission)
+        .unwrap();
+    (custody, super::fd_journal::History::default())
+}
+
+#[cfg(test)]
+mod negative_installation_tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::network_replay::NetworkFdPublicationAdmission;
+    use crate::network_replay::NetworkFdPublicationPermit;
+    use crate::network_replay::NetworkStreamLeaseId;
+    use crate::types::DetTid;
+    use crate::types::FilesId;
+    use crate::types::MmId;
+    fn fixture(
+        dequeued: bool,
+    ) -> (
+        AcceptedCustody<u64>,
+        NetworkStreamOwner,
+        NetworkAcceptLeaseId,
+        NetworkFdPublicationPermit,
+        super::super::fd_journal::History,
+    ) {
+        let thread = DetTid::from_raw(31);
+        let owner = NetworkStreamOwner {
+            thread,
+            mm: MmId::initial(thread),
+        };
+        let lease = NetworkAcceptLeaseId(29);
+        let actual = Arc::new(Mutex::new(
+            crate::tool_local::FileMetadata::empty_network_fixture(thread),
+        ));
+        let permit = NetworkFdPublicationPermit {
+            owner,
+            files: FilesId::initial(thread),
+            lease: NetworkStreamLeaseId::controlled_fixture(17),
+        };
+        let admission = NetworkFdPublicationAdmission {
+            permit,
+            acknowledged_sequence: 0,
+            acknowledged_generation: 0,
+            recovery: None,
+        };
+        let (custody, history) = no_installation_fixture(owner, lease, actual, admission, dequeued);
+        (custody, owner, lease, permit, history)
+    }
+    #[test]
+    fn accepted_negative_joins_original_result_and_retains_distinct_dequeued_child() {
+        for (dequeued, listener_entered) in [(false, false), (false, true), (true, true)] {
+            let (mut custody, owner, lease, permit, history) = fixture(dequeued);
+            if !listener_entered {
+                let raw = &mut custody
+                    .operations
+                    .get_mut(&lease)
+                    .unwrap()
+                    .physical_effect
+                    .as_mut()
+                    .unwrap()
+                    .raw;
+                raw.installation.phases = 65;
+                raw.installation.listener =
+                    super::super::accepted_provider_ffi::Identity::default().into();
+                raw.installation.do_accept_errno = 0;
+            }
+            let checked = custody
+                .no_installation(owner, lease, permit, 0, &history)
+                .unwrap();
+            assert_eq!(checked.errno(), libc::EAGAIN);
+            assert_eq!(checked.dequeued().is_some(), dequeued);
+            assert!(custody.pin(owner, lease).is_err());
+            assert!(!custody.no_installation_published(owner, lease).unwrap());
+            assert!(
+                custody
+                    .retained_no_installation(owner, lease, permit)
+                    .unwrap()
+                    .unwrap()
+                    .same(&checked)
+            );
+            custody.abandon(owner);
+            assert!(
+                custody
+                    .no_installation(owner, lease, permit, 0, &history)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn accepted_negative_refuses_original_identity_phase_and_installation_mutations() {
+        for bad in 0..32 {
+            let (mut custody, owner, lease, permit, history) = fixture(false);
+            let op = custody.operations.get_mut(&lease).unwrap();
+            let raw = &mut op.physical_effect.as_mut().unwrap().raw;
+            match bad {
+                0 => raw.command.task ^= 1,
+                1 => raw.command.start_boottime += 1,
+                2 => raw.installation.task ^= 1,
+                3 => raw.installation.task_start += 1,
+                4 => raw.installation.owner_mm += 1,
+                5 => raw.installation.accept_lease += 1,
+                6 => raw.installation.table += 1,
+                7 => raw.command.identity.provider += 1,
+                8 => raw.command.command += 1,
+                9 => raw.installation.command += 1,
+                10 => raw.installation.requested_fd += 1,
+                11 => raw.installation.flags ^= libc::SOCK_CLOEXEC,
+                12 => raw.installation.phases = 64,
+                13 => raw.installation.phases = 3,
+                14 => raw.installation.phases |= 8,
+                15 => raw.installation.phases |= 16,
+                16 => raw.installation.phases |= 32,
+                17 => raw.installation.problem = 1,
+                18 => raw.installation.file = 19,
+                19 => raw.installation.install_begin = 1,
+                20 => raw.installation.install_end = 2,
+                21 => raw.installation.returned_fd = 17,
+                22 => raw.command.returned = -libc::EINTR,
+                23 => raw.command.returned = 0,
+                24 => raw.command.phase = 0,
+                25 => raw.command.operation = 12,
+                26 => raw.command.original_count = 1,
+                27 => raw.installation.listener.object += 1,
+                28 => raw.installation.child.object = 12,
+                29 => raw.command.creation = 15,
+                30 => raw.installation.do_accept_errno = libc::EINTR,
+                31 => raw.command.reserved = 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                custody
+                    .no_installation(owner, lease, permit, 0, &history)
+                    .is_err(),
+                "mutation {bad}"
+            );
+            assert!(custody.operations[&lease].no_installation.is_none());
+            assert!(!custody.no_installation_published(owner, lease).unwrap());
+        }
+    }
+    #[test]
+    fn accepted_negative_requires_complete_origin_journal_and_exact_permit() {
+        use super::super::accepted_provider_ffi as ffi;
+        let (mut custody, owner, lease, permit, mut history) = fixture(false);
+        assert!(
+            custody
+                .no_installation(owner, lease, permit, 1, &history)
+                .is_err()
+        );
+        let wrong = NetworkFdPublicationPermit {
+            lease: NetworkStreamLeaseId::controlled_fixture(18),
+            ..permit
+        };
+        assert!(
+            custody
+                .no_installation(owner, lease, wrong, 0, &history)
+                .is_err()
+        );
+        let begin = ffi::FdEvent {
+            sequence: 1,
+            kind: 1,
+            table: 13,
+            file: 19,
+            task: (31u64 << 32) | 31,
+            task_start: 101,
+            fd: 17,
+            accept_command: 71,
+            complete: 1,
+            ..Default::default()
+        };
+        for row in [
+            begin,
+            ffi::FdEvent {
+                sequence: 2,
+                kind: 2,
+                dependency: 1,
+                ..begin
+            },
+        ] {
+            history
+                .retain(
+                    ffi::FdStatus {
+                        next_table: 13,
+                        next_file: 19,
+                        next_event: 2,
+                        problem: 0,
+                    }
+                    .into(),
+                    row.into(),
+                )
+                .unwrap();
+        }
+        assert!(
+            custody
+                .no_installation(owner, lease, permit, 2, &history)
+                .is_err(),
+            "actual install contradicts errno"
+        );
+        assert!(custody.operations[&lease].no_installation.is_none());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn checked_no_installation_fixture(
+    owner: NetworkStreamOwner,
+    lease: NetworkAcceptLeaseId,
+    actual: std::sync::Arc<std::sync::Mutex<crate::tool_local::FileMetadata>>,
+    admission: crate::network_replay::NetworkFdPublicationAdmission,
+    dequeued: bool,
+) -> NoInstallation {
+    let permit = admission.permit;
+    let (mut custody, history) = no_installation_fixture(owner, lease, actual, admission, dequeued);
+    custody
+        .no_installation(owner, lease, permit, 0, &history)
+        .unwrap()
 }

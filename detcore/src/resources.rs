@@ -427,6 +427,9 @@ pub struct Resources {
     /// for the scheduler's cross-task signal wakeup.
     #[serde(default)]
     pub(crate) signal_interrupt_errno: Option<i32>,
+    /// Lookup to admit at this existing request's grant; queued intent owns nothing.
+    #[serde(default)]
+    pub(crate) fd_read: Option<crate::scheduler::fd_read::FdReadIntent>,
 }
 
 impl fmt::Debug for Resources {
@@ -453,6 +456,7 @@ impl Resources {
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
+            fd_read: None,
         }
     }
 
@@ -471,6 +475,11 @@ impl Resources {
                     e.insert(perm2.clone());
                 }
             }
+        }
+        match (self.fd_read, other.fd_read) {
+            (None, read) => self.fd_read = read,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
         }
         match (self.signal_interrupt_errno, other.signal_interrupt_errno) {
             (None, interrupt) => self.signal_interrupt_errno = interrupt,

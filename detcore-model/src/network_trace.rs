@@ -1391,6 +1391,8 @@ pub enum NetworkTrace {
     V2(NetworkTraceV2),
     /// Explicit declared receive units and socket profiles.
     V3(NetworkTraceV3),
+    /// Native receive observations and typed program-order release producers.
+    V4(NetworkTraceV4),
 }
 
 impl NetworkTraceV2 {
@@ -1677,6 +1679,9 @@ impl NetworkTrace {
                 trace.validate()?;
                 Ok(Self::V3(trace))
             }
+            NETWORK_TRACE_VERSION_V4 => NetworkTraceV4::decode_payload(&payload)
+                .map(Self::V4)
+                .map_err(Into::into),
             version => Err(NetworkTraceCodecError::UnsupportedVersion(version)),
         }
     }
@@ -1687,6 +1692,7 @@ impl NetworkTrace {
             Self::V1(trace) => trace.write_framed(writer),
             Self::V2(trace) => trace.write_framed(writer),
             Self::V3(trace) => trace.write_framed(writer),
+            Self::V4(trace) => trace.write_framed(writer).map_err(Into::into),
         }
     }
 }
@@ -1999,6 +2005,7 @@ pub enum NetworkTraceCodecError {
     Encode(bincode::error::EncodeError),
     Decode(bincode::error::DecodeError),
     Validation(NetworkTraceValidationError),
+    ValidationV4(NetworkTraceValidationErrorV4),
 }
 
 impl fmt::Display for NetworkTraceCodecError {
@@ -2008,6 +2015,15 @@ impl fmt::Display for NetworkTraceCodecError {
 }
 
 impl Error for NetworkTraceCodecError {}
+
+impl From<NetworkTraceCodecErrorV4> for NetworkTraceCodecError {
+    fn from(error: NetworkTraceCodecErrorV4) -> Self {
+        match error {
+            NetworkTraceCodecErrorV4::Frame(error) => error,
+            NetworkTraceCodecErrorV4::Validation(error) => Self::ValidationV4(error),
+        }
+    }
+}
 
 impl From<io::Error> for NetworkTraceCodecError {
     fn from(error: io::Error) -> Self {

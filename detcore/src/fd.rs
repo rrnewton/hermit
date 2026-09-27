@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Deterministic file descriptor
 
@@ -67,6 +67,54 @@ pub enum FdType {
     Userfaultfd,
     /// Random-number generator device
     Rng,
+    /// An inherited anonymous inode (S_IFMT == 0), without creation provenance.
+    /// Linux reports this for epoll/eventfd and other anonymous objects; mode
+    /// alone cannot distinguish them. I/O keeps the kernel's outcome through
+    /// the existing blocking/nonblocking helper, not a guessed subtype.
+    /// This is occupancy/profile evidence, not default-network isolation proof.
+    Inherited { mode: u32 },
+}
+
+impl FdType {
+    /// Classify the checked initial kernel profile into existing I/O behavior.
+    /// Device components are normalized from kernel dev_t, not libc st_rdev.
+    /// Regular includes ordinary openat inode kinds, as in the existing path;
+    /// anonymous objects keep unknown creation provenance rather than becoming
+    /// an epoll, pidfd, or eventfd merely from their inode mode.
+    pub(crate) fn from_initial_profile(
+        mode: u32,
+        status_flags: u32,
+        major: u32,
+        minor: u32,
+    ) -> Option<Self> {
+        let kind = mode & 0o170000;
+        if mode & !0o177777 != 0
+            || major > 0xfff
+            || minor > 0xfffff
+            || (!matches!(kind, 0o020000 | 0o060000) && (major != 0 || minor != 0))
+        {
+            return None;
+        }
+        if !matches!(
+            kind,
+            0 | 0o010000 | 0o020000 | 0o040000 | 0o060000 | 0o100000 | 0o120000 | 0o140000
+        ) {
+            return None;
+        }
+        // An O_PATH file may name a socket inode or random device, but cannot
+        // perform socket/RNG I/O. Keep its native EBADF path and ordinary OFD ID.
+        if status_flags & libc::O_PATH as u32 != 0 {
+            return Some(Self::Regular);
+        }
+        Some(match kind {
+            0 => Self::Inherited { mode },
+            0o010000 => Self::Pipe,
+            0o140000 => Self::Socket,
+            0o020000 if major == 1 && matches!(minor, 8 | 9) => Self::Rng,
+            0o020000 | 0o040000 | 0o060000 | 0o100000 | 0o120000 => Self::Regular,
+            _ => return None,
+        })
+    }
 }
 
 /// Deterministic file descriptor
@@ -86,6 +134,10 @@ pub struct DetFd {
 #[derive(Debug, Serialize, Deserialize)]
 struct OpenFileDescription {
     id: OpenFileId,
+    // Live private provider association, shared by real descriptor aliases.
+    // Serialized metadata cannot mint or restore this physical authority.
+    #[serde(skip)]
+    native_file: Option<crate::network_runtime::original_installation::FileIdentity>,
     /// fd type
     ty: FdType,
     /// Process named by a pidfd created through `pidfd_open`.
@@ -226,6 +278,7 @@ impl DetFd {
             fd_flags: bits & OFlag::O_CLOEXEC.bits(),
             open_file: Arc::new(Mutex::new(OpenFileDescription {
                 id,
+                native_file: None,
                 ty,
                 pidfd_target: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
@@ -251,6 +304,25 @@ impl DetFd {
 
     fn description(&self) -> MutexGuard<'_, OpenFileDescription> {
         self.open_file.lock().expect("open file mutex poisoned")
+    }
+
+    pub(crate) fn bind_native_file(
+        &self,
+        identity: crate::network_runtime::original_installation::FileIdentity,
+    ) -> bool {
+        let mut description = self.description();
+        match description.native_file {
+            Some(prior) => prior == identity,
+            None => {
+                description.native_file = Some(identity);
+                true
+            }
+        }
+    }
+    pub(crate) fn native_file(
+        &self,
+    ) -> Option<crate::network_runtime::original_installation::FileIdentity> {
+        self.description().native_file
     }
 
     /// update fd
@@ -771,6 +843,50 @@ mod tests {
     }
 
     #[test]
+    fn initial_profile_preserves_regular_rng_and_anonymous_behavior() {
+        for mode in [0o020600, 0o040755, 0o060600, 0o100600, 0o120777] {
+            assert_eq!(
+                FdType::from_initial_profile(mode, 0, 0, 0),
+                Some(FdType::Regular)
+            );
+        }
+        for minor in [8, 9] {
+            assert_eq!(
+                FdType::from_initial_profile(0o020600, 0, 1, minor),
+                Some(FdType::Rng)
+            );
+            assert_eq!(
+                FdType::from_initial_profile(0o060600, 0, 1, minor),
+                Some(FdType::Regular)
+            );
+        }
+        assert_eq!(
+            FdType::from_initial_profile(0o020600, 0, 1, 3),
+            Some(FdType::Regular)
+        );
+        assert_eq!(
+            FdType::from_initial_profile(0o020600, 0, 0, 0x108),
+            Some(FdType::Regular)
+        );
+        for mode in [0, 0o600] {
+            assert_eq!(
+                FdType::from_initial_profile(mode, 0, 0, 0),
+                Some(FdType::Inherited { mode })
+            );
+        }
+        for (mode, major, minor) in [
+            (0o030600, 0, 0),
+            (0o200600, 0, 0),
+            (0o100600, 1, 8),
+            (0o600, 1, 8),
+            (0o020600, 0x1000, 8),
+            (0o020600, 1, 0x100000),
+        ] {
+            assert_eq!(FdType::from_initial_profile(mode, 0, major, minor), None);
+        }
+    }
+
+    #[test]
     fn random_status_updates_preserve_immutable_flags_and_replace_mutable_flags() {
         let immutable = OFlag::O_RDWR | OFlag::O_SYNC;
         let original = DetFd::new(
@@ -792,6 +908,78 @@ mod tests {
             (immutable | OFlag::O_NONBLOCK).bits()
         );
         assert!(original.physically_nonblocking());
+    }
+
+    #[test]
+    fn initial_o_path_profiles_do_not_create_socket_or_rng_authority() {
+        assert_eq!(
+            FdType::from_initial_profile(0o140600, libc::O_PATH as u32, 0, 0),
+            Some(FdType::Regular)
+        );
+        assert_eq!(
+            FdType::from_initial_profile(0o020600, libc::O_PATH as u32, 1, 9),
+            Some(FdType::Regular)
+        );
+        assert_eq!(
+            FdType::from_initial_profile(0o020600, 0, 1, 9),
+            Some(FdType::Rng)
+        );
+        assert_eq!(
+            FdType::from_initial_profile(0o140600, 0, 0, 0),
+            Some(FdType::Socket)
+        );
+        assert_eq!(
+            FdType::from_initial_profile(0o030600, libc::O_PATH as u32, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn initial_profile_uses_real_anonymous_inodes_and_normalized_device_numbers() {
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        fn owned(fd: i32) -> OwnedFd {
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+        fn observed(fd: i32) -> FdType {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            assert_eq!(unsafe { libc::fstat(fd, st.as_mut_ptr()) }, 0);
+            let st = unsafe { st.assume_init() };
+            FdType::from_initial_profile(
+                st.st_mode,
+                0,
+                libc::major(st.st_rdev),
+                libc::minor(st.st_rdev),
+            )
+            .unwrap()
+        }
+        let epoll = owned(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) });
+        let event = owned(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) });
+        for fd in [epoll.as_raw_fd(), event.as_raw_fd()] {
+            assert!(matches!(observed(fd), FdType::Inherited { mode } if mode & libc::S_IFMT == 0));
+        }
+        let regular =
+            owned(unsafe { libc::memfd_create(c"census-profile".as_ptr(), libc::MFD_CLOEXEC) });
+        assert_eq!(observed(regular.as_raw_fd()), FdType::Regular);
+        for path in ["/dev/random", "/dev/urandom"] {
+            let file = std::fs::File::open(path).unwrap();
+            assert_eq!(observed(file.as_raw_fd()), FdType::Rng);
+        }
+        let flags = unsafe { libc::fcntl(event.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        let detfd = DetFd::new(
+            9,
+            OFlag::from_bits_retain(flags),
+            observed(event.as_raw_fd()),
+            OpenFileId::new(DetTid::from_raw(10), 0),
+        );
+        assert!(detfd.is_nonblocking() && detfd.physically_nonblocking());
+        assert_eq!(
+            unsafe { libc::fcntl(event.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Pure ownership ledger for network OFDs. No host handles or `Arc` counts are
 //! guest ownership. The coordinator must authenticate lifecycle events and
@@ -40,6 +40,14 @@ use crate::types::NetworkFdSlot;
 use crate::types::NetworkFdSlotReplacement;
 use crate::types::OpenFileId;
 use crate::types::RawFd;
+
+mod creation;
+use creation::OriginalCreation;
+pub(crate) use creation::OriginalCreationKind;
+
+mod selection;
+use selection::PendingSelection;
+pub(crate) use selection::SelectionTicket;
 
 /// Exact task incarnation used by the scheduler's exec and exit protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,11 +86,14 @@ pub(crate) struct LeaseId {
 }
 
 /// Cancellation of a handler future is not evidence about an injected syscall.
-/// Only these explicit physical facts can retire a transport pin. Unknown
+/// Physical invocations require their explicit completion/cancellation fact;
+/// a purely modeled operation has a separate semantic completion. Unknown
 /// effects retain the pin and prevent successful ledger finalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportResolution {
     CompletedAndRecorded,
+    /// Detcore completed a modeled operation; no native invocation occurred.
+    CompletedEmulation,
     CancellationAcknowledgedBeforeSubmission,
     UnknownEffects,
 }
@@ -116,6 +127,8 @@ pub(crate) enum LifetimeError {
     OutstandingOwners,
     PublicationIdentity { files: FilesId, sequence: u64 },
     CloneIdentity,
+    SelectionIdentity(LeaseId),
+    SelectionCapacity { files: FilesId, fd: RawFd },
 }
 
 impl fmt::Display for LifetimeError {
@@ -131,10 +144,16 @@ struct TaskBinding {
     owner: TaskOwner,
     process: DetPid,
     files: FilesId,
+    // This exact backend owner completed local startup/post-exec. Sharing a
+    // table never inherits another task's readiness; no physical fact is implied.
+    metadata_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Table {
+    // Set only by a validated complete census; preserved across fork/exec.
+    // Such a table never accepts a socket-only publication projection.
+    complete_census: bool,
     owners: HashSet<TaskOwner>,
     slots: BTreeMap<RawFd, NetworkSlot>,
     slot_generations: BTreeMap<RawFd, u64>,
@@ -144,6 +163,7 @@ struct Table {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedExec {
     ticket: ExecTicket,
+    complete_census: bool,
     // A provisional snapshot pins its objects but is not an active guest table.
     // The adapter must take this at the serialized exec-unshare boundary.
     slots: BTreeMap<RawFd, NetworkSlot>,
@@ -163,7 +183,8 @@ pub(crate) struct CloneTicket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedClone {
     ticket: CloneTicket,
-    shared: bool,
+    shared: Option<bool>,
+    native_choice: bool,
     table: Table,
 }
 
@@ -172,6 +193,11 @@ struct PreparedClone {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SlotInstallationSource {
     Fresh,
+    /// Derived only from the engine's private, validated original creation.
+    FreshOriginal {
+        owner: TaskOwner,
+        kind: OriginalCreationKind,
+    },
     Alias(FdSlotBinding),
     Transfer(LeaseId),
     NonNetwork,
@@ -202,6 +228,7 @@ pub(crate) struct OwnerCounts {
     pub slots: usize,
     pub exec_reservations: usize,
     pub clone_reservations: usize,
+    pub selection_reservations: usize,
     pub transfers: usize,
     pub transports: usize,
     pub deliveries: usize,
@@ -220,12 +247,15 @@ pub(crate) struct NetworkLifetime {
     tasks: BTreeMap<DetTid, TaskBinding>,
     tables: HashMap<FilesId, Table>,
     used_tables: HashSet<FilesId>,
-    live: BTreeSet<OpenFileId>,
+    // The existing live-OFD authority owns compact birth provenance. This is
+    // bounded by live objects, not an append-only publication/creation history.
+    live: BTreeMap<OpenFileId, Option<OriginalCreation>>,
     retired: BTreeSet<OpenFileId>,
     leases: HashMap<LeaseId, OpenFileId>,
     used_leases: HashSet<LeaseId>,
     pending_exec: BTreeMap<DetPid, PreparedExec>,
     pending_clones: BTreeMap<ExternalOpId, PreparedClone>,
+    pending_selections: HashMap<LeaseId, PendingSelection>,
     used_clones: HashSet<ExternalOpId>,
     used_exec_allocations: HashSet<FilesId>,
     // Exact installations superseded by an authenticated mutation. An old
@@ -273,6 +303,7 @@ impl NetworkLifetime {
             return Err(error());
         }
         let mut candidate = self.clone();
+        let complete = self.tables[&files].complete_census;
         let mut generation = batch.previous_generation;
         for entry in &batch.entries {
             let change = entry.replacement;
@@ -280,6 +311,9 @@ impl NetworkLifetime {
                 || change.installation_generation <= generation
                 || change.installation_generation > batch.through_generation
                 || (change.before.is_none() && change.after.is_none())
+                || (complete
+                    && (change.after.is_none()
+                        || Some(change.installation_generation) != generation.checked_add(1)))
             {
                 return Err(error());
             }
@@ -316,12 +350,15 @@ impl NetworkLifetime {
                 return Err(LifetimeError::SlotIdentity(fd));
             }
             match (&entry.source, change.after) {
-                (SlotInstallationSource::Fresh, Some(after)) => {
+                (
+                    SlotInstallationSource::Fresh | SlotInstallationSource::FreshOriginal { .. },
+                    Some(after),
+                ) => {
                     let object = after.binding.open_file;
-                    if candidate.live.contains(&object) || candidate.retired.contains(&object) {
+                    if candidate.live.contains_key(&object) || candidate.retired.contains(&object) {
                         return Err(LifetimeError::OpenFileAlreadyUsed(object));
                     }
-                    candidate.live.insert(object);
+                    candidate.live.insert(object, None);
                 }
                 (SlotInstallationSource::Alias(source), Some(after)) => {
                     candidate.validate_binding(owner, *source)?;
@@ -348,12 +385,18 @@ impl NetworkLifetime {
             // Advance even when a regular-file replacement has no network after-slot.
             table.last_slot_generation = change.installation_generation;
             if let Some(after) = change.after {
-                candidate.install_binding(after);
+                candidate.install_binding(after)?;
+                if let SlotInstallationSource::FreshOriginal { owner, kind } = &entry.source {
+                    candidate.remember_original_creation(*owner, after.binding, *kind);
+                }
             }
             generation = change.installation_generation;
         }
-        // Non-network-only installations between recorded network transitions
-        // still consume installation generations in the local table snapshot.
+        if complete && generation != batch.through_generation {
+            return Err(error());
+        }
+        // Legacy partial component fixtures may omit non-network generations.
+        // A production census table requires every installation above.
         candidate
             .tables
             .get_mut(&files)
@@ -437,12 +480,57 @@ impl NetworkLifetime {
                     ticket.operation,
                     PreparedClone {
                         ticket,
-                        shared,
+                        shared: Some(shared),
+                        native_choice: false,
                         table
                     }
                 )
                 .is_none()
         );
+        Ok(())
+    }
+
+    /// Before arming an original native clone, retain BOTH possible outcomes.
+    /// Pre-read clone3 flags no longer select a copied or shared table.
+    pub(crate) fn defer_clone_choice(&mut self, ticket: CloneTicket) -> Result<(), LifetimeError> {
+        let pending = self.prepared_clone(ticket)?;
+        if pending.native_choice && pending.shared.is_some() {
+            return Err(LifetimeError::CloneIdentity);
+        }
+        let pending = self.pending_clones.get_mut(&ticket.operation).unwrap();
+        pending.native_choice = true;
+        pending.shared = None;
+        Ok(())
+    }
+
+    /// Called only with the authenticated native birth and the original escrow.
+    /// Resolving a copied outcome can release an ownerless old table; the exact
+    /// copied snapshot remains pinned until the child consumes this escrow.
+    pub(crate) fn resolve_clone_choice(
+        &mut self,
+        ticket: CloneTicket,
+        shared: bool,
+    ) -> Result<(), LifetimeError> {
+        let pending = self.prepared_clone(ticket)?;
+        if !pending.native_choice || pending.shared.is_some_and(|prior| prior != shared) {
+            return Err(LifetimeError::CloneIdentity);
+        }
+        if shared && !self.tables.contains_key(&ticket.files) {
+            return Err(LifetimeError::CloneIdentity);
+        }
+        self.revoke_clone_original_creations(ticket);
+        self.pending_clones
+            .get_mut(&ticket.operation)
+            .unwrap()
+            .shared = Some(shared);
+        if !shared
+            && self
+                .tables
+                .get(&ticket.files)
+                .is_some_and(|t| t.owners.is_empty())
+        {
+            self.tables.remove(&ticket.files);
+        }
         Ok(())
     }
 
@@ -458,9 +546,33 @@ impl NetworkLifetime {
         &mut self,
         ticket: CloneTicket,
     ) -> Result<BTreeSet<OpenFileId>, LifetimeError> {
+        self.release_prepared_clone(ticket)
+    }
+
+    /// The exact backend child reached final wait before executing startup.
+    /// It inherited then released the kernel table; no semantic task/table is
+    /// invented merely to release the already retained clone snapshot.
+    pub(crate) fn retire_prestart_clone(
+        &mut self,
+        ticket: CloneTicket,
+        child: TaskOwner,
+    ) -> Result<BTreeSet<OpenFileId>, LifetimeError> {
+        self.prepared_clone(ticket)?;
+        self.new_task(child)?;
+        if child.tid == ticket.owner.tid {
+            return Err(LifetimeError::CloneIdentity);
+        }
+        self.revoke_clone_original_creations(ticket);
+        self.release_prepared_clone(ticket)
+    }
+
+    fn release_prepared_clone(
+        &mut self,
+        ticket: CloneTicket,
+    ) -> Result<BTreeSet<OpenFileId>, LifetimeError> {
         let shared = self.prepared_clone(ticket)?.shared;
         self.pending_clones.remove(&ticket.operation).unwrap();
-        if shared
+        if shared != Some(false)
             && self
                 .tables
                 .get(&ticket.files)
@@ -481,20 +593,22 @@ impl NetworkLifetime {
     ) -> Result<FilesId, LifetimeError> {
         let pending = self.prepared_clone(ticket)?;
         self.new_task(child)?;
-        let files = if pending.shared {
+        let shared = pending.shared.ok_or(LifetimeError::CloneIdentity)?;
+        let files = if shared {
             ticket.files
         } else {
             FilesId::forked(child.tid)
         };
-        if pending.shared {
+        if shared {
             if !self.tables.contains_key(&files) {
                 return Err(LifetimeError::CloneIdentity);
             }
         } else {
             self.new_table(files)?;
         }
+        self.revoke_clone_original_creations(ticket);
         let pending = self.pending_clones.remove(&ticket.operation).unwrap();
-        if pending.shared {
+        if shared {
             assert!(self.tables.get_mut(&files).unwrap().owners.insert(child));
             assert!(
                 self.tasks
@@ -503,7 +617,8 @@ impl NetworkLifetime {
                         TaskBinding {
                             owner: child,
                             process,
-                            files
+                            files,
+                            metadata_ready: false,
                         }
                     )
                     .is_none()
@@ -517,6 +632,7 @@ impl NetworkLifetime {
                 pending.table.slot_generations,
                 pending.table.last_slot_generation,
             );
+            self.tables.get_mut(&files).unwrap().complete_census = pending.table.complete_census;
         }
         Ok(files)
     }
@@ -535,6 +651,71 @@ impl NetworkLifetime {
         Ok(())
     }
 
+    /// Admit an authenticated complete initial census atomically. Every kind of
+    /// descriptor occupies its real slot in this same ledger; aliases of one
+    /// inherited OFD share exactly one OpenFileId. The adapter authenticates the
+    /// census before calling this method, never a synthesized stdio snapshot.
+    pub(crate) fn register_census(
+        &mut self,
+        owner: TaskOwner,
+        process: DetPid,
+        files: FilesId,
+        initial: &[NetworkFdSlot],
+        through_generation: u64,
+    ) -> Result<(), LifetimeError> {
+        self.new_task(owner)?;
+        self.new_table(files)?;
+        let mut slots = BTreeMap::new();
+        let mut generations = BTreeMap::new();
+        let mut objects = HashSet::new();
+        let mut previous = None;
+        let mut previous_generation = 0;
+        for entry in initial {
+            let binding = entry.binding;
+            let fd = binding.slot.fd;
+            if binding.slot.files != files
+                || fd < 0
+                || previous.is_some_and(|old| fd <= old)
+                || binding.generation <= previous_generation
+                || binding.generation > through_generation
+            {
+                return Err(LifetimeError::SlotGeneration(binding));
+            }
+            if self.live.contains_key(&binding.open_file)
+                || self.retired.contains(&binding.open_file)
+            {
+                return Err(LifetimeError::OpenFileAlreadyUsed(binding.open_file));
+            }
+            previous = Some(fd);
+            previous_generation = binding.generation;
+            slots.insert(
+                fd,
+                NetworkSlot {
+                    open_file: binding.open_file,
+                    cloexec: entry.cloexec,
+                },
+            );
+            generations.insert(fd, binding.generation);
+            objects.insert(binding.open_file);
+        }
+        // No partially registered task/table/OFD survives a rejected census.
+        let mut candidate = self.clone();
+        candidate.insert_table(
+            owner,
+            process,
+            files,
+            slots,
+            generations,
+            through_generation,
+        );
+        candidate.tables.get_mut(&files).unwrap().complete_census = true;
+        candidate
+            .live
+            .extend(objects.into_iter().map(|object| (object, None)));
+        *self = candidate;
+        Ok(())
+    }
+
     fn insert_table(
         &mut self,
         owner: TaskOwner,
@@ -550,6 +731,7 @@ impl NetworkLifetime {
                 .insert(
                     files,
                     Table {
+                        complete_census: false,
                         owners: HashSet::from([owner]),
                         slots,
                         slot_generations,
@@ -565,7 +747,8 @@ impl NetworkLifetime {
                     TaskBinding {
                         owner,
                         process,
-                        files
+                        files,
+                        metadata_ready: false,
                     }
                 )
                 .is_none()
@@ -581,6 +764,7 @@ impl NetworkLifetime {
     ) -> Result<(), LifetimeError> {
         let files = self.task(parent)?.files;
         self.new_task(child)?;
+        self.revoke_table_original_creations(files);
         assert!(self.tables.get_mut(&files).unwrap().owners.insert(child));
         self.tasks.insert(
             child.tid,
@@ -588,6 +772,7 @@ impl NetworkLifetime {
                 owner: child,
                 process,
                 files,
+                metadata_ready: false,
             },
         );
         Ok(())
@@ -608,7 +793,10 @@ impl NetworkLifetime {
         let slots = table.slots.clone();
         let generations = table.slot_generations.clone();
         let last = table.last_slot_generation;
+        let complete = table.complete_census;
+        self.revoke_table_original_creations(old);
         self.insert_table(child, process, files, slots, generations, last);
+        self.tables.get_mut(&files).unwrap().complete_census = complete;
         Ok(())
     }
 
@@ -626,11 +814,12 @@ impl NetworkLifetime {
         if self.tables[&files].slots.contains_key(&fd) {
             return Err(LifetimeError::SlotOccupied(fd));
         }
-        if self.live.contains(&slot.open_file) || self.retired.contains(&slot.open_file) {
+        if self.live.contains_key(&slot.open_file) || self.retired.contains(&slot.open_file) {
             return Err(LifetimeError::OpenFileAlreadyUsed(slot.open_file));
         }
-        self.live.insert(slot.open_file);
-        self.install_generated(files, fd, slot);
+        self.check_selection_installation(files, fd)?;
+        self.live.insert(slot.open_file, None);
+        self.install_generated(files, fd, slot)?;
         Ok(())
     }
 
@@ -669,6 +858,7 @@ impl NetworkLifetime {
         if oldfd == newfd {
             return Ok(BTreeSet::new());
         }
+        self.check_selection_installation(files, newfd)?;
         self.note_removed(files, newfd);
         self.install_generated(
             files,
@@ -677,7 +867,7 @@ impl NetworkLifetime {
                 open_file: old.open_file,
                 cloexec,
             },
-        );
+        )?;
         Ok(self.collect_retired())
     }
 
@@ -708,6 +898,29 @@ impl NetworkLifetime {
         })
     }
 
+    /// Only the engine's still-retained original table permit calls these
+    /// helpers. Numeric task reuse and an errno cannot authorize this path.
+    pub(super) fn binding_in_retained_table(
+        &self,
+        files: FilesId,
+        fd: RawFd,
+    ) -> Option<FdSlotBinding> {
+        self.binding_in_table(files, fd)
+    }
+    pub(super) fn close_retained_binding(
+        &mut self,
+        binding: FdSlotBinding,
+    ) -> Result<BTreeSet<OpenFileId>, LifetimeError> {
+        if self.binding_in_table(binding.slot.files, binding.slot.fd) != Some(binding) {
+            return Err(LifetimeError::SlotIdentity(binding.slot.fd));
+        }
+        self.note_removed(binding.slot.files, binding.slot.fd);
+        let table = self.tables.get_mut(&binding.slot.files).unwrap();
+        table.slots.remove(&binding.slot.fd);
+        table.slot_generations.remove(&binding.slot.fd);
+        Ok(self.collect_retired())
+    }
+
     pub fn descriptor_binding(
         &self,
         owner: TaskOwner,
@@ -734,13 +947,20 @@ impl NetworkLifetime {
 
     fn note_removed(&mut self, files: FilesId, fd: RawFd) {
         if let Some(binding) = self.binding_in_table(files, fd) {
+            self.revoke_original_creation(binding.open_file);
             self.removed_slots.insert(binding);
         }
     }
 
     // Existing transition entry points also allocate incarnations, so tests of
     // clone/exec/transfer exercise the same table state as authenticated adapters.
-    fn install_generated(&mut self, files: FilesId, fd: RawFd, slot: NetworkSlot) {
+    fn install_generated(
+        &mut self,
+        files: FilesId,
+        fd: RawFd,
+        slot: NetworkSlot,
+    ) -> Result<(), LifetimeError> {
+        self.check_selection_installation(files, fd)?;
         let table = self.tables.get_mut(&files).expect("registered table");
         let generation = table
             .last_slot_generation
@@ -749,6 +969,13 @@ impl NetworkLifetime {
         table.last_slot_generation = generation;
         table.slot_generations.insert(fd, generation);
         table.slots.insert(fd, slot);
+        self.revoke_original_creation(slot.open_file);
+        self.note_selection_installation(FdSlotBinding {
+            slot: FdSlot { files, fd },
+            generation,
+            open_file: slot.open_file,
+        });
+        Ok(())
     }
 
     fn validate_install(
@@ -774,8 +1001,9 @@ impl NetworkLifetime {
         Ok(())
     }
 
-    fn install_binding(&mut self, slot: NetworkFdSlot) {
+    fn install_binding(&mut self, slot: NetworkFdSlot) -> Result<(), LifetimeError> {
         let binding = slot.binding;
+        self.check_selection_installation(binding.slot.files, binding.slot.fd)?;
         self.note_removed(binding.slot.files, binding.slot.fd);
         let table = self
             .tables
@@ -792,6 +1020,9 @@ impl NetworkLifetime {
                 cloexec: slot.cloexec,
             },
         );
+        self.revoke_original_creation(binding.open_file);
+        self.note_selection_installation(binding);
+        Ok(())
     }
 
     /// Publish an actual successful socket creation under an authenticated
@@ -805,11 +1036,12 @@ impl NetworkLifetime {
     ) -> Result<BTreeSet<OpenFileId>, LifetimeError> {
         self.validate_install(owner, slot, replaced)?;
         let object = slot.binding.open_file;
-        if self.live.contains(&object) || self.retired.contains(&object) {
+        if self.live.contains_key(&object) || self.retired.contains(&object) {
             return Err(LifetimeError::OpenFileAlreadyUsed(object));
         }
-        self.live.insert(object);
-        self.install_binding(slot);
+        self.check_selection_installation(slot.binding.slot.files, slot.binding.slot.fd)?;
+        self.live.insert(object, None);
+        self.install_binding(slot)?;
         Ok(self.collect_retired())
     }
 
@@ -837,7 +1069,7 @@ impl NetworkLifetime {
         if source.open_file != destination.binding.open_file {
             return Err(LifetimeError::SlotIdentity(source.slot.fd));
         }
-        self.install_binding(destination);
+        self.install_binding(destination)?;
         Ok(self.collect_retired())
     }
 
@@ -908,6 +1140,19 @@ impl NetworkLifetime {
         ))
     }
 
+    /// Record successful local state delivery for this existing task incarnation.
+    /// This cannot create enrollment or inherit a peer's table readiness.
+    pub fn mark_task_metadata_ready(&mut self, owner: TaskOwner) -> Result<(), LifetimeError> {
+        self.task(owner)?;
+        self.tasks.get_mut(&owner.tid).unwrap().metadata_ready = true;
+        Ok(())
+    }
+
+    /// Readiness ends with the exact TaskBinding on exit or successful exec.
+    pub fn task_metadata_ready(&self, owner: TaskOwner) -> Result<bool, LifetimeError> {
+        Ok(self.task(owner)?.metadata_ready)
+    }
+
     pub fn task_files(&self, owner: TaskOwner) -> Result<FilesId, LifetimeError> {
         Ok(self.task(owner)?.files)
     }
@@ -943,6 +1188,9 @@ impl NetworkLifetime {
     ) -> Result<(), LifetimeError> {
         self.slot(owner, fd, expected)?;
         self.new_lease(owner, lease)?;
+        if lease.kind == LeaseKind::Transfer {
+            self.revoke_original_creation(expected);
+        }
         self.used_leases.insert(lease);
         self.leases.insert(lease, expected);
         Ok(())
@@ -974,6 +1222,9 @@ impl NetworkLifetime {
     ) -> Result<(), LifetimeError> {
         self.check_lease(source, expected)?;
         self.new_lease(owner, lease)?;
+        if lease.kind == LeaseKind::Transfer {
+            self.revoke_original_creation(expected);
+        }
         self.used_leases.insert(lease);
         self.leases.insert(lease, expected);
         Ok(())
@@ -1014,7 +1265,7 @@ impl NetworkLifetime {
                 open_file: expected,
                 cloexec,
             },
-        );
+        )?;
         self.leases.remove(&lease);
         Ok(())
     }
@@ -1065,6 +1316,7 @@ impl NetworkLifetime {
         if self.tasks.is_empty()
             && self.pending_exec.is_empty()
             && self.pending_clones.is_empty()
+            && self.pending_selections.is_empty()
             && self.leases.is_empty()
             && self.live.is_empty()
         {
@@ -1092,11 +1344,13 @@ impl NetworkLifetime {
         let slots = table.slots.clone();
         let slot_generations = table.slot_generations.clone();
         let last_slot_generation = table.last_slot_generation;
+        let complete_census = table.complete_census;
         self.used_exec_allocations.insert(ticket.new_files);
         self.pending_exec.insert(
             task.process,
             PreparedExec {
                 ticket,
+                complete_census,
                 slots,
                 slot_generations,
                 last_slot_generation,
@@ -1159,6 +1413,7 @@ impl NetworkLifetime {
             })
             .collect();
         let last_slot_generation = prepared.last_slot_generation;
+        let complete_census = prepared.complete_census;
         let removed: Vec<_> = self
             .tasks
             .values()
@@ -1182,19 +1437,24 @@ impl NetworkLifetime {
             survivor_generations,
             last_slot_generation,
         );
+        self.tables
+            .get_mut(&ticket.new_files)
+            .unwrap()
+            .complete_census = complete_census;
         Ok(self.collect_retired())
     }
 
     fn detach(&mut self, owner: TaskOwner) {
         let task = self.tasks.remove(&owner.tid).expect("validated task");
         assert_eq!(task.owner, owner);
+        self.revoke_owner_original_creations(owner);
         let table = self.tables.get_mut(&task.files).unwrap();
         assert!(table.owners.remove(&owner));
         if table.owners.is_empty()
             && !self
                 .pending_clones
                 .values()
-                .any(|pending| pending.shared && pending.ticket.files == task.files)
+                .any(|pending| pending.shared != Some(false) && pending.ticket.files == task.files)
         {
             self.tables.remove(&task.files);
         }
@@ -1217,6 +1477,19 @@ impl NetworkLifetime {
 
     pub fn table_exists(&self, files: FilesId) -> bool {
         self.tables.contains_key(&files)
+    }
+
+    /// Current task identity only, never an operation-retained table reference.
+    /// Readiness belongs to each exact task, even for CLONE_FILES siblings.
+    pub(super) fn publication_successors(&self, files: FilesId) -> Vec<TaskOwner> {
+        let mut owners: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| task.files == files && task.metadata_ready)
+            .map(|task| task.owner)
+            .collect();
+        owners.sort_by_key(|owner| owner.tid.as_raw());
+        owners
     }
 
     /// A dead, never-reusable table has no successor which needs its completed
@@ -1249,7 +1522,7 @@ impl NetworkLifetime {
         let clone_reservations = self
             .pending_clones
             .values()
-            .filter(|pending| !pending.shared)
+            .filter(|pending| pending.shared != Some(true))
             .flat_map(|pending| pending.table.slots.values())
             .filter(|slot| slot.open_file == open_file)
             .count();
@@ -1257,6 +1530,7 @@ impl NetworkLifetime {
             slots,
             exec_reservations,
             clone_reservations,
+            selection_reservations: self.selection_reservations(open_file),
             ..OwnerCounts::default()
         };
         for (lease, &object) in &self.leases {
@@ -1280,12 +1554,12 @@ impl NetworkLifetime {
     fn collect_retired(&mut self) -> BTreeSet<OpenFileId> {
         let retired: BTreeSet<_> = self
             .live
-            .iter()
+            .keys()
             .copied()
             .filter(|id| self.counts(*id).is_zero())
             .collect();
         for id in &retired {
-            assert!(self.live.remove(id));
+            assert!(self.live.remove(id).is_some());
             assert!(self.retired.insert(*id));
         }
         retired
@@ -1308,6 +1582,256 @@ mod tests {
             },
             cloexec: false,
         }
+    }
+
+    #[test]
+    fn metadata_ready_is_local_to_root_child_and_committed_exec_incarnations() {
+        let (mut state, owner) = setup();
+        assert!(!state.task_metadata_ready(owner).unwrap());
+        state.mark_task_metadata_ready(owner).unwrap();
+        let shared = task(11);
+        state.share_table(owner, shared, shared.tid).unwrap();
+        assert!(!state.task_metadata_ready(shared).unwrap());
+        let copied = task(12);
+        state
+            .copy_table(owner, copied, copied.tid, FilesId::forked(copied.tid))
+            .unwrap();
+        assert!(!state.task_metadata_ready(copied).unwrap());
+        let cloned = task(13);
+        let clone_ticket = CloneTicket {
+            owner,
+            files: FilesId::initial(owner.tid),
+            operation: ExternalOpId::new(owner.tid, 91),
+        };
+        state.prepare_clone(clone_ticket, true).unwrap();
+        state
+            .commit_clone(clone_ticket, cloned, cloned.tid)
+            .unwrap();
+        assert!(!state.task_metadata_ready(cloned).unwrap());
+        assert!(state.task_metadata_ready(owner).unwrap());
+        let mut allocator = crate::types::FilesIdAllocator::default();
+        let failed = prepare(&mut state, &mut allocator, owner).unwrap();
+        assert!(state.cancel_exec(failed).unwrap().is_empty());
+        assert_eq!(state.task_files(owner).unwrap(), failed.old_files);
+        assert!(state.task_metadata_ready(owner).unwrap());
+        let committed = prepare(&mut state, &mut allocator, owner).unwrap();
+        let event = success(committed);
+        state.commit_exec(committed, &event).unwrap();
+        let current = TaskOwner {
+            tid: owner.tid,
+            mm: event.post_exec_mm,
+        };
+        assert!(!state.task_metadata_ready(current).unwrap());
+        let before = state.clone();
+        assert_eq!(
+            state.mark_task_metadata_ready(owner),
+            Err(LifetimeError::StaleTask(owner))
+        );
+        assert_eq!(state, before);
+        state.mark_task_metadata_ready(current).unwrap();
+        assert!(state.task_metadata_ready(current).unwrap());
+        state.exit(current).unwrap();
+        assert_eq!(
+            state.task_metadata_ready(current),
+            Err(LifetimeError::StaleTask(current))
+        );
+        for child in [shared, copied, cloned] {
+            state.exit(child).unwrap();
+        }
+        state.finish().unwrap();
+    }
+
+    #[test]
+    fn native_clone_choice_survives_creator_retirement_without_guessing_shared_files() {
+        for shared in [false, true] {
+            let (mut state, owner) = setup();
+            state.open(owner, 3, slot(0, false)).unwrap();
+            let ticket = CloneTicket {
+                owner,
+                files: FilesId::initial(owner.tid),
+                operation: ExternalOpId::new(owner.tid, 81),
+            };
+            state.prepare_clone(ticket, !shared).unwrap();
+            state.defer_clone_choice(ticket).unwrap();
+            assert!(state.exit(owner).unwrap().is_empty());
+            assert!(!state.is_retired(object(0)));
+            let child = task(12);
+            let before = state.clone();
+            assert_eq!(
+                state.commit_clone(ticket, child, child.tid),
+                Err(LifetimeError::CloneIdentity)
+            );
+            assert_eq!(state, before);
+            state.resolve_clone_choice(ticket, shared).unwrap();
+            let before = state.clone();
+            assert_eq!(
+                state.resolve_clone_choice(ticket, !shared),
+                Err(LifetimeError::CloneIdentity)
+            );
+            assert_eq!(state, before);
+            let table = state.commit_clone(ticket, child, child.tid).unwrap();
+            assert_eq!(
+                table,
+                if shared {
+                    ticket.files
+                } else {
+                    FilesId::forked(child.tid)
+                }
+            );
+            assert_eq!(
+                state.descriptor_binding(child, 3).unwrap().open_file,
+                object(0)
+            );
+            assert!(state.commit_clone(ticket, child, child.tid).is_err());
+            assert_eq!(state.exit(child).unwrap(), BTreeSet::from([object(0)]));
+            state.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn unresolved_native_clone_cancellation_releases_exact_original_escrow_once() {
+        let (mut state, owner) = setup();
+        state.open(owner, 3, slot(0, false)).unwrap();
+        let ticket = CloneTicket {
+            owner,
+            files: FilesId::initial(owner.tid),
+            operation: ExternalOpId::new(owner.tid, 82),
+        };
+        state.prepare_clone(ticket, false).unwrap();
+        state.defer_clone_choice(ticket).unwrap();
+        assert!(state.exit(owner).unwrap().is_empty());
+        let wrong = CloneTicket {
+            operation: ExternalOpId::new(owner.tid, 83),
+            ..ticket
+        };
+        let before = state.clone();
+        assert_eq!(state.cancel_clone(wrong), Err(LifetimeError::CloneIdentity));
+        assert_eq!(state, before);
+        assert_eq!(
+            state.cancel_clone(ticket).unwrap(),
+            BTreeSet::from([object(0)])
+        );
+        assert_eq!(
+            state.cancel_clone(ticket),
+            Err(LifetimeError::CloneIdentity)
+        );
+        state.finish().unwrap();
+    }
+
+    #[test]
+    fn complete_census_has_one_ledger_for_regular_socket_aliases_copy_exec_and_exit() {
+        let owner = task(10);
+        let files = FilesId::initial(owner.tid);
+        let regular = OpenFileId::new(owner.tid, 3);
+        let mut initial = vec![
+            installed(owner, 1, 4, 0),
+            installed(owner, 4, 5, 0),
+            installed(owner, 7, 6, 0),
+        ];
+        initial[0].binding.open_file = regular;
+        initial[2].binding.open_file = regular;
+        initial[2].cloexec = true;
+        let mut state = NetworkLifetime::default();
+        state
+            .register_census(owner, owner.tid, files, &initial, 6)
+            .unwrap();
+        assert_eq!(state.counts(regular).slots, 2);
+        assert_eq!(state.counts(object(0)).slots, 1);
+        let child = task(11);
+        let copied = FilesId::forked(child.tid);
+        state.copy_table(owner, child, child.tid, copied).unwrap();
+        assert!(state.tables[&copied].complete_census);
+        assert_eq!(state.counts(regular).slots, 4);
+        let mut allocator = crate::types::FilesIdAllocator::default();
+        let ticket = prepare(&mut state, &mut allocator, child).unwrap();
+        let event = success(ticket);
+        assert!(state.commit_exec(ticket, &event).unwrap().is_empty());
+        let after = TaskOwner {
+            tid: child.tid,
+            mm: event.post_exec_mm,
+        };
+        assert!(state.tables[&ticket.new_files].complete_census);
+        assert_eq!(
+            state.descriptor_binding(after, 7),
+            Err(LifetimeError::SlotIdentity(7))
+        );
+        assert_eq!(state.counts(regular).slots, 3);
+        assert!(state.exit(owner).unwrap().is_empty());
+        assert_eq!(
+            state.exit(after).unwrap(),
+            BTreeSet::from([regular, object(0)])
+        );
+        state.finish().unwrap();
+    }
+    #[test]
+    fn complete_census_rejects_missing_regular_generation_and_socket_only_replacement() {
+        let owner = task(10);
+        let files = FilesId::initial(owner.tid);
+        let original = installed(owner, 4, 1, 0);
+        let mut state = NetworkLifetime::default();
+        state
+            .register_census(owner, owner.tid, files, &[original], 1)
+            .unwrap();
+        let regular = OpenFileId::new(owner.tid, 3);
+        let after = NetworkFdSlot {
+            binding: FdSlotBinding {
+                slot: FdSlot { files, fd: 4 },
+                generation: 2,
+                open_file: regular,
+            },
+            cloexec: false,
+        };
+        let good = SlotPublicationBatch {
+            files,
+            sequence: 1,
+            previous_generation: 1,
+            through_generation: 2,
+            entries: vec![SlotPublicationEntry {
+                replacement: NetworkFdSlotReplacement {
+                    files,
+                    installation_generation: 2,
+                    before: Some(original),
+                    after: Some(after),
+                },
+                source: SlotInstallationSource::Fresh,
+            }],
+        };
+        for case in 0..3 {
+            let mut bad = good.clone();
+            match case {
+                0 => bad.entries.clear(),
+                1 => {
+                    bad.entries[0].replacement.after = None;
+                    bad.entries[0].source = SlotInstallationSource::NonNetwork;
+                }
+                2 => {
+                    bad.entries[0].replacement.installation_generation = 3;
+                    bad.entries[0]
+                        .replacement
+                        .after
+                        .as_mut()
+                        .unwrap()
+                        .binding
+                        .generation = 3;
+                    bad.through_generation = 3;
+                }
+                _ => unreachable!(),
+            }
+            let before = state.clone();
+            assert!(
+                state.publish_installation_batch(owner, &bad).is_err(),
+                "case {case}"
+            );
+            assert_eq!(state, before);
+        }
+        assert_eq!(
+            state.publish_installation_batch(owner, &good).unwrap(),
+            SlotPublicationResult::Applied {
+                retired: BTreeSet::from([object(0)])
+            }
+        );
+        assert_eq!(state.descriptor_binding(owner, 4).unwrap(), after.binding);
+        assert_eq!(state.counts(regular).slots, 1);
     }
 
     #[test]
@@ -2156,5 +2680,34 @@ mod tests {
             Err(LifetimeError::TableAlreadyUsed(ticket.new_files))
         );
         assert_eq!(state, before);
+    }
+}
+
+impl NetworkLifetime {
+    /// Logical half only: native census/root provenance is checked separately.
+    pub(super) fn validate_foreground_epoll_root(
+        &self,
+        owner: TaskOwner,
+        files: FilesId,
+    ) -> Result<(), LifetimeError> {
+        let task = self.task(owner)?;
+        let table = self
+            .tables
+            .get(&files)
+            .ok_or(LifetimeError::SlotIdentity(-1))?;
+        if task.files != files
+            || !task.metadata_ready
+            || self.tasks.len() != 1
+            || !table.complete_census
+            || table.owners.len() != 1
+            || !table.owners.contains(&owner)
+            || !self.pending_exec.is_empty()
+            || !self.pending_clones.is_empty()
+            || !self.pending_selections.is_empty()
+            || !self.leases.is_empty()
+        {
+            return Err(LifetimeError::SlotIdentity(-1));
+        }
+        Ok(())
     }
 }
