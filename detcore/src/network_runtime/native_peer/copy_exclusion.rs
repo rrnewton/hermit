@@ -45,6 +45,14 @@ impl Calls {
             .unwrap()
             .clone()
     }
+    #[cfg(test)]
+    pub(in crate::network_runtime) fn retry_fixture_pin_count(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+    ) -> usize {
+        std::sync::Arc::strong_count(self.owned(owner, call).unwrap().original.as_ref().unwrap())
+    }
     /// The completed probe lease is gone, but this exact physical Call remains.
     /// This does not pretend that Calls::settled holds with a live pin.
     pub(in crate::network_runtime) fn require_receive_retry_quiescence(

@@ -9302,6 +9302,10 @@ async fn private_record_retry_unknown_worker_retains_pin_until_actual_join() {
     let (release, worker) = runtime
         .controlled_retry_pin_worker(q.root.owner(), q.call)
         .await;
+    assert_eq!(
+        runtime.controlled_retry_pin_count(q.root.owner(), q.call),
+        2
+    );
     let before = f.trace();
     {
         let mut pending = std::pin::pin!(q.state.resume_private_receive_call(
@@ -9325,6 +9329,10 @@ async fn private_record_retry_unknown_worker_retains_pin_until_actual_join() {
     }
     release.send(()).unwrap();
     worker.join().await;
+    assert_eq!(
+        runtime.controlled_retry_pin_count(q.root.owner(), q.call),
+        1
+    );
     let error = q
         .state
         .resume_private_receive_call(q.tid, &q.thread, read, &mut invocation, stale)
@@ -9335,6 +9343,10 @@ async fn private_record_retry_unknown_worker_retains_pin_until_actual_join() {
             .primary()
             .to_string()
             .contains("issuer ended before joint admission")
+    );
+    assert_eq!(
+        runtime.controlled_retry_pin_count(q.root.owner(), q.call),
+        1
     );
     assert_eq!(f.trace(), before);
     assert_eq!(f.frontier(), (0, 0, 0, 0, false, false, 0, 0));

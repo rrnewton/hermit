@@ -344,7 +344,17 @@ impl RuntimeShared {
         NativeWorkerHandle,
         tokio::sync::oneshot::Receiver<std::io::Result<T>>,
     )> {
-        self.start_native_worker_inner(executor, None, operation)
+        self.start_native_worker_inner(executor, None, false, operation)
+    }
+    fn start_native_release_worker<T: Send + 'static>(
+        self: &std::sync::Arc<Self>,
+        executor: tokio::runtime::Handle,
+        operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<(
+        NativeWorkerHandle,
+        tokio::sync::oneshot::Receiver<std::io::Result<T>>,
+    )> {
+        self.start_native_worker_inner(executor, None, true, operation)
     }
     fn start_original_retirement_worker<T: Send + 'static>(
         self: &std::sync::Arc<Self>,
@@ -359,6 +369,7 @@ impl RuntimeShared {
         self.start_native_worker_inner(
             executor,
             Some(NativeRetirement::Original(owner, call)),
+            false,
             operation,
         )
     }
@@ -366,17 +377,19 @@ impl RuntimeShared {
         self: &std::sync::Arc<Self>,
         executor: tokio::runtime::Handle,
         retiring: Option<NativeRetirement>,
+        require_idle: bool,
         operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
     ) -> std::io::Result<(
         NativeWorkerHandle,
         tokio::sync::oneshot::Receiver<std::io::Result<T>>,
     )> {
-        self.start_native_worker_with_quarantine(executor, retiring, None, operation)
+        self.start_native_worker_with_quarantine(executor, retiring, require_idle, None, operation)
     }
     fn start_native_worker_with_quarantine<T: Send + 'static>(
         self: &std::sync::Arc<Self>,
         executor: tokio::runtime::Handle,
         retiring: Option<NativeRetirement>,
+        require_idle: bool,
         quarantine: Option<std::sync::Arc<NativeQuarantine>>,
         operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
     ) -> std::io::Result<(
@@ -386,6 +399,11 @@ impl RuntimeShared {
         let (send, receive) = tokio::sync::oneshot::channel();
         let worker = {
             let mut owned = self.native_workers.lock().unwrap();
+            if require_idle && !owned.tasks.is_empty() {
+                return Err(std::io::Error::other(
+                    "native stream release requires all prior workers to be joined",
+                ));
+            }
             if owned
                 .copy_exclusion
                 .as_ref()
@@ -676,6 +694,7 @@ impl RuntimeShared {
                     let _ = self.start_native_worker_inner(
                         tokio::runtime::Handle::current(),
                         Some(NativeRetirement::Stream(admission)),
+                        false,
                         move || {
                             let work = shared
                                 .native_streams
@@ -997,6 +1016,7 @@ impl NetworkRuntimeResources {
         );
         let shared = std::sync::Arc::get_mut(&mut self.shared).unwrap();
         shared.endpoint = Some(unsafe { OwnedFd::from_raw_fd(fds[0]) });
+        shared.copy_wire = Some(ProviderWireFormat::Abi7Copy4);
         shared
             .accepted
             .lock()
@@ -2010,6 +2030,19 @@ impl NetworkRuntimeResources {
         result.map_err(std::io::Error::other)?
     }
 
+    async fn run_native_release_worker<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        let (worker, receive) = self.shared.start_native_release_worker(
+            tokio::runtime::Handle::try_current().map_err(std::io::Error::other)?,
+            operation,
+        )?;
+        let result = receive.await;
+        self.shared.join_native_worker(&worker).await?;
+        result.map_err(std::io::Error::other)?
+    }
+
     /// Clone the exact scheduler-registered task authority before admission can
     /// outlive its callback. Owner exit may remove the registry entry afterward.
     pub(crate) fn prepare_native_capture_task(
@@ -2286,7 +2319,7 @@ impl NetworkRuntimeResources {
         let shared = self.shared.clone();
         // close may wait for SO_LINGER. Keep that wait off the scheduler thread
         // and do not hold the runtime registry mutex while it waits.
-        self.run_native_worker(move || {
+        self.run_native_release_worker(move || {
             // Move the actual pin only after worker admission. A rejected late
             // callback must leave it in run custody, not close it while dropping
             // a never-submitted closure on the current-thread executor.
@@ -3668,6 +3701,7 @@ mod tests {
                     .start_native_worker_with_quarantine(
                         tokio::runtime::Handle::current(),
                         None,
+                        false,
                         Some(quarantine.clone()),
                         move || {
                             let _ = entered.send(());

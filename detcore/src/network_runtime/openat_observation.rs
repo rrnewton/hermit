@@ -697,6 +697,7 @@ impl RuntimeShared {
             let submitted = self.start_native_worker_with_quarantine(
                 worker_executor,
                 retiring,
+                false,
                 Some(observation.quarantine.clone()),
                 operation,
             );

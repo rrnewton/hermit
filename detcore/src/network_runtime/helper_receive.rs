@@ -867,6 +867,7 @@ impl RuntimeShared {
         let (worker, receive) = self.start_native_worker_with_quarantine(
             executor,
             None,
+            false,
             Some(quarantine.clone()),
             move || {
                 let effect = worker_effect;

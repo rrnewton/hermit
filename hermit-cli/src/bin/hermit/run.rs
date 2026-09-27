@@ -2205,7 +2205,7 @@ fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
     assert!(opts.det_opts.det_config.panic_on_rcb_overshoot);
     assert_eq!(
         format!("{}", opts),
-        " --panic-on-rbc-overshoot --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+        " --epoch=2026-01-01T00:00:00+00:00 --panic-on-rbc-overshoot -- fakeprog"
     );
 }
 

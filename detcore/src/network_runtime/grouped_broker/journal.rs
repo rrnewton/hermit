@@ -1451,10 +1451,13 @@ impl RemovalJournal {
 
 #[cfg(test)]
 mod creator_query_tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let fd = std::fs::File::open(directory.path()).unwrap().into();
         let intent = Intent::new("1a".repeat(16), 31).unwrap();
         let mut store = Store::retain(fd, &intent);

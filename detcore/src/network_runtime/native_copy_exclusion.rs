@@ -510,6 +510,18 @@ impl ControlledRetryPinWorker {
 }
 #[cfg(test)]
 impl NetworkRuntimeResources {
+    pub(crate) fn controlled_retry_pin_count(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        call: crate::network_replay::NetworkStreamCallId,
+    ) -> usize {
+        self.shared
+            .native_streams
+            .lock()
+            .unwrap()
+            .retry_fixture_pin_count(owner, call)
+    }
+
     pub(crate) async fn controlled_retry_pin_worker(
         &self,
         owner: crate::network_replay::NetworkStreamOwner,

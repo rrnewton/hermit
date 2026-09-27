@@ -10171,6 +10171,11 @@ mod tests {
             .thread_tree
             .add_child(parent, parent, true);
         install_test_registration(&state, parent, Ivar::new());
+        state.global_time.lock().unwrap().update_global_time(
+            parent,
+            DetTime::new(&config).as_nanos(),
+            LogicalTime::ZERO,
+        );
         (config, state, parent, MmId::initial(parent))
     }
 
