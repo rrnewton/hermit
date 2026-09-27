@@ -227,6 +227,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
+    // One epoch-fraction uptime control retains all 789 prior identities:
+    // syscalls::sysinfo::tests::uptime_seconds_depend_on_elapsed_time_not_the_epoch_fraction.
     // Three procfs boot-time range controls retain all 790 prior identities.
     // Five btime rendering, boundary and coupling controls, plus one renamed
     // boundary test, retain the other 792 prior identities.
@@ -236,7 +238,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
-    ("test.hermit_integration", 170),
+    // Six procfs_determinism tests of uptime under a sub-second epoch fraction
+    // and of the /proc/stat time64_t boundary retain all 170 prior IDs:
+    // proc_system_cpu_accounting_ignores_the_epoch_fraction,
+    // proc_uptime_ignores_the_epoch_fraction,
+    // sysinfo_uptime_ignores_the_epoch_fraction,
+    // uptime_reads_across_sleep_exec_thread_and_fork_ignore_the_epoch_fraction,
+    // proc_stat_refuses_a_boot_time_below_time64_min_without_side_effects and
+    // proc_stat_renders_the_last_representable_boot_time.
+    ("test.hermit_integration", 176),
     ("test.arbitrary_binaries", 4),
     ("test.cli", 79),
     ("test.liteinst_strict", 24),
@@ -261,8 +271,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     // The host variant selects the same five btime controls and renamed test.
     ("test.detcore_unit_on_host", 798),
-    // The host variant selects the same two additional clock_determinism tests.
-    ("test.hermit_integration_on_host", 170),
+    // The host variant selects the same two additional clock_determinism tests
+    // and the same six additional procfs_determinism tests.
+    ("test.hermit_integration_on_host", 176),
     ("test.hermit_unit_on_host", 750),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),

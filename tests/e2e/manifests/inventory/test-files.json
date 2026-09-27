@@ -1537,6 +1537,12 @@
       "why": "tests/c/proc_locks.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/proc_stat_boot_time_refusal.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/proc_stat_boot_time_refusal.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite compiles this guest and runs it at the last representable and the first unrepresentable --sysinfo-uptime-offset, asserting that /proc/stat renders the boundary btime unsigned and otherwise refuses read, pread64 and a fresh descriptor with EOVERFLOW without writing the buffer or moving the file offset. The offset-specific contract is caller-owned and outside the generic manifest contract, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/process_mrelease_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2141,6 +2147,12 @@
       "path": "tests/c/unix_autobind_stream.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/unix_autobind_stream.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/uptime_read_sequence.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/uptime_read_sequence.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite compiles this guest and runs it under a whole-second epoch and under the same epoch plus 0.999999999 s, asserting that sysinfo(2), /proc/uptime, the /proc/stat CPU counters and btime read identically under both epochs across a one-second sleep, an exec, a second thread and a forked child, that btime stays fixed, and that the uptimes advance as Linux rounds them, sysinfo(2) up and the others down. The paired-epoch comparison is a caller-owned contract that a generic manifest cell does not express, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "disposition": "manifest-test",
