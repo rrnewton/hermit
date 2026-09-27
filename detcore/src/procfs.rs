@@ -9,6 +9,7 @@
 //! Deterministic snapshots for volatile procfs and sysfs files.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -3082,6 +3083,26 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
     Some((libc::makedev(major, minor), inode))
 }
 
+/// The distinct raw `(device, inode)` pairs of one `maps`/`smaps` snapshot, in
+/// the order their FIRST mapping line appears in the text.
+///
+/// This is the order in which the caller mints deterministic identities for
+/// files it has not seen before, so it must be an order the guest controls.
+/// The text is in address order, and Hermit makes guest addresses
+/// deterministic. The raw numbers are not guest-controlled: Linux hands out
+/// shmem and memfd inodes from per-CPU batches, so two memfds created in the
+/// same guest order can get raw inodes in either numeric order. Minting in
+/// sorted raw order (a `BTreeSet`, as this used to be) let that host numbering
+/// decide which file got the lower deterministic inode.
+pub(crate) fn mapping_identities_in_text_order(contents: &str) -> Vec<(u64, u64)> {
+    let mut seen = BTreeSet::new();
+    contents
+        .lines()
+        .filter_map(mapping_header_identity)
+        .filter(|pair| seen.insert(*pair))
+        .collect()
+}
+
 /// Rewrite the device and inode of one mapping header from the caller-supplied
 /// table, preserving every other byte of the line and the COLUMN its pathname
 /// starts in.
@@ -3176,7 +3197,7 @@ fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) 
 }
 
 /// `/proc/*/maps`: rewrite only the device and inode columns.
-fn sanitize_maps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+pub(crate) fn sanitize_maps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
