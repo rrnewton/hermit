@@ -24,6 +24,7 @@ use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;
+use reverie_ptrace::testing::test_fn_with_config;
 
 // Keep this synchronized with the clock-query category in `syscall_time`.
 const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
@@ -360,6 +361,357 @@ fn tod_gettimeofday_faulting_tv_respects_page_protection() {
                 "straddling tv wrote into the read-only page"
             );
             assert_eq!(unsafe { libc::munmap(pages.cast(), 2 * page_size) }, 0);
+        },
+        config,
+        true,
+    );
+}
+
+// The byte that the page-boundary tests below place around the boundary, and
+// how many bytes on each side of it they fill and inspect.
+const BOUNDARY_FILL: u8 = 0xa5;
+const BOUNDARY_WINDOW: usize = 32;
+
+/// The page after the boundary, into which a misaligned `tv` crosses.
+#[derive(Clone, Copy, Debug)]
+enum SecondPage {
+    ReadOnly,
+    NoAccess,
+    Unmapped,
+}
+
+/// Fills the `BOUNDARY_WINDOW` bytes on each side of `boundary`.
+fn fill_boundary(boundary: *mut u8) {
+    unsafe {
+        ptr::write_bytes(
+            boundary.sub(BOUNDARY_WINDOW),
+            BOUNDARY_FILL,
+            2 * BOUNDARY_WINDOW,
+        )
+    };
+}
+
+/// Copies the `BOUNDARY_WINDOW` bytes before `boundary` and the `after` bytes
+/// from it.
+fn boundary_window(boundary: *mut u8, after: usize) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(boundary.sub(BOUNDARY_WINDOW), BOUNDARY_WINDOW + after) }
+        .to_vec()
+}
+
+fn window_word(window: &[u8], start: usize) -> i64 {
+    i64::from_ne_bytes(window[start..start + 8].try_into().unwrap())
+}
+
+fn protect(addr: *mut u8, len: usize, prot: libc::c_int) {
+    assert_eq!(unsafe { libc::mprotect(addr.cast(), len, prot) }, 0);
+}
+
+#[test]
+/// Linux stores each `timeval` word with one eight-byte store, which stores
+/// nothing when either page it touches is unwritable. With `tv` four bytes
+/// before an unwritable page, `tv_sec` crosses into it and no byte changes;
+/// twelve bytes before, `tv_sec` is stored and no byte of `tv_usec` is, not
+/// even the four on the writable page, which may be write-only and so cannot
+/// be read back. The stored `tv_sec` must be virtual.
+fn tod_gettimeofday_misaligned_tv_stores_whole_words_only() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch_micros = config.epoch.timestamp_micros();
+    check_fn_with_config::<Detcore, _>(
+        || {
+            // Address 1 is below mmap_min_addr, so it can never be mapped.
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            let read_write = libc::PROT_READ | libc::PROT_WRITE;
+            // The first page's protection, the second page, and how many bytes
+            // before the boundary `tv` starts.
+            for (first, second, back) in [
+                (read_write, SecondPage::ReadOnly, 4),
+                (read_write, SecondPage::ReadOnly, 12),
+                (read_write, SecondPage::NoAccess, 4),
+                (read_write, SecondPage::NoAccess, 12),
+                (read_write, SecondPage::Unmapped, 4),
+                (read_write, SecondPage::Unmapped, 12),
+                (libc::PROT_WRITE, SecondPage::NoAccess, 12),
+                (libc::PROT_WRITE, SecondPage::Unmapped, 12),
+            ] {
+                let case = format!(
+                    "tv {back} bytes before a {second:?} page, first page protection {first:#x}"
+                );
+                let (pages, page_size) = map_pages(2);
+                let boundary = unsafe { pages.add(page_size) };
+                fill_boundary(boundary);
+                protect(pages, page_size, first);
+                let mapped_after = match second {
+                    SecondPage::ReadOnly => {
+                        protect(boundary, page_size, libc::PROT_READ);
+                        BOUNDARY_WINDOW
+                    }
+                    SecondPage::NoAccess => {
+                        protect(boundary, page_size, libc::PROT_NONE);
+                        BOUNDARY_WINDOW
+                    }
+                    SecondPage::Unmapped => {
+                        assert_eq!(unsafe { libc::munmap(boundary.cast(), page_size) }, 0);
+                        0
+                    }
+                };
+
+                let before = successful_gettimeofday();
+                let result = raw_gettimeofday(unsafe { boundary.sub(back) }.cast(), unmapped);
+                let after = successful_gettimeofday();
+                protect(pages, page_size, read_write);
+                if let SecondPage::NoAccess = second {
+                    protect(boundary, page_size, libc::PROT_READ);
+                }
+                let window = boundary_window(boundary, mapped_after);
+
+                assert_eq!(result, (-1, libc::EFAULT), "{case}");
+                let offsets = [before, after].map(|tv| timeval_micros(&tv) - epoch_micros);
+                assert!(
+                    offsets[0] >= 0 && offsets[1] < MAX_VIRTUAL_OFFSET_MICROS,
+                    "{case}: microseconds past the virtual epoch for [ok, ok]: {offsets:?}"
+                );
+                let mut expected = vec![BOUNDARY_FILL; window.len()];
+                if back == 12 {
+                    let start = BOUNDARY_WINDOW - back;
+                    let stored_sec = window_word(&window, start);
+                    assert!(
+                        (before.tv_sec..=after.tv_sec).contains(&stored_sec),
+                        "{case}: tv_sec {stored_sec} is outside the virtual seconds {}..={}",
+                        before.tv_sec,
+                        after.tv_sec,
+                    );
+                    expected[start..start + 8].copy_from_slice(&stored_sec.to_ne_bytes());
+                }
+                assert!(
+                    window == expected,
+                    "{case}: the bytes from {BOUNDARY_WINDOW} before the boundary are \
+                     {window:02x?}, expected {expected:02x?}"
+                );
+                let mapped_len = match second {
+                    SecondPage::Unmapped => page_size,
+                    _ => 2 * page_size,
+                };
+                assert_eq!(unsafe { libc::munmap(pages.cast(), mapped_len) }, 0);
+            }
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+/// Linux stores into memory mapped with PROT_WRITE but not PROT_READ, which
+/// the tracer cannot read back, so such a `tv` holds host time when `tz`
+/// faults. It must hold virtual time instead, both wholly on a write-only page
+/// and crossing between a write-only page and a read-write one.
+fn tod_gettimeofday_faulting_tz_write_only_tv_receives_virtual_time() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch_micros = config.epoch.timestamp_micros();
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            let read_write = libc::PROT_READ | libc::PROT_WRITE;
+            let write_only = libc::PROT_WRITE;
+            // The first page's protection, the second page's, and how many
+            // bytes before the boundary `tv` starts.
+            for (first, second, back) in [
+                (write_only, write_only, 32),
+                (read_write, write_only, 4),
+                (write_only, read_write, 4),
+                (read_write, write_only, 12),
+            ] {
+                let case = format!(
+                    "tv {back} bytes before the boundary, page protections {first:#x} and \
+                     {second:#x}"
+                );
+                let (pages, page_size) = map_pages(2);
+                let boundary = unsafe { pages.add(page_size) };
+                fill_boundary(boundary);
+                protect(pages, page_size, first);
+                protect(boundary, page_size, second);
+
+                let before = successful_gettimeofday();
+                let result = raw_gettimeofday(unsafe { boundary.sub(back) }.cast(), unmapped);
+                let after = successful_gettimeofday();
+                protect(pages, 2 * page_size, read_write);
+                let window = boundary_window(boundary, BOUNDARY_WINDOW);
+
+                assert_eq!(result, (-1, libc::EFAULT), "{case}");
+                let start = BOUNDARY_WINDOW - back;
+                let stored = libc::timeval {
+                    tv_sec: window_word(&window, start),
+                    tv_usec: window_word(&window, start + 8),
+                };
+                let offsets = [before, stored, after].map(|tv| timeval_micros(&tv) - epoch_micros);
+                assert!(
+                    offsets.is_sorted()
+                        && offsets[0] >= 0
+                        && offsets[2] < MAX_VIRTUAL_OFFSET_MICROS,
+                    "{case}: microseconds past the virtual epoch for [ok, write-only tv, ok]: \
+                     {offsets:?}"
+                );
+                let mut expected = vec![BOUNDARY_FILL; window.len()];
+                expected[start..start + 16].copy_from_slice(&window[start..start + 16]);
+                assert!(
+                    window == expected,
+                    "{case}: bytes outside tv changed: {window:02x?}"
+                );
+                assert_eq!(unsafe { libc::munmap(pages.cast(), 2 * page_size) }, 0);
+            }
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+/// A word crossing a page boundary is stored only when both pages are
+/// writable. It must stay unchanged when the second page is read-only, even
+/// when the first page is write-only and cannot be read back, and when the
+/// first page is read-only or inaccessible, even when the second page is
+/// write-only and cannot be read back. Twelve bytes before a read-only page,
+/// `tv_sec` lies wholly on the write-only page and must be virtual.
+fn tod_gettimeofday_faulting_tz_crossing_word_needs_both_pages_writable() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch_micros = config.epoch.timestamp_micros();
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            let read_write = libc::PROT_READ | libc::PROT_WRITE;
+            // The first page's protection, the second page's, and how many
+            // bytes before the boundary `tv` starts.
+            for (first, second, back) in [
+                (libc::PROT_WRITE, libc::PROT_READ, 4),
+                (libc::PROT_WRITE, libc::PROT_READ, 12),
+                (libc::PROT_READ, read_write, 4),
+                (libc::PROT_NONE, read_write, 4),
+                (libc::PROT_READ, libc::PROT_WRITE, 4),
+                (libc::PROT_NONE, libc::PROT_WRITE, 4),
+            ] {
+                let case = format!(
+                    "tv {back} bytes before the boundary, page protections {first:#x} and \
+                     {second:#x}"
+                );
+                let (pages, page_size) = map_pages(2);
+                let boundary = unsafe { pages.add(page_size) };
+                fill_boundary(boundary);
+                protect(pages, page_size, first);
+                protect(boundary, page_size, second);
+
+                let before = successful_gettimeofday();
+                let result = raw_gettimeofday(unsafe { boundary.sub(back) }.cast(), unmapped);
+                let after = successful_gettimeofday();
+                protect(pages, 2 * page_size, read_write);
+                let window = boundary_window(boundary, BOUNDARY_WINDOW);
+
+                assert_eq!(result, (-1, libc::EFAULT), "{case}");
+                let offsets = [before, after].map(|tv| timeval_micros(&tv) - epoch_micros);
+                assert!(
+                    offsets[0] >= 0 && offsets[1] < MAX_VIRTUAL_OFFSET_MICROS,
+                    "{case}: microseconds past the virtual epoch for [ok, ok]: {offsets:?}"
+                );
+                let mut expected = vec![BOUNDARY_FILL; window.len()];
+                if back == 12 {
+                    let start = BOUNDARY_WINDOW - back;
+                    let stored_sec = window_word(&window, start);
+                    assert!(
+                        (before.tv_sec..=after.tv_sec).contains(&stored_sec),
+                        "{case}: tv_sec {stored_sec} is outside the virtual seconds {}..={}",
+                        before.tv_sec,
+                        after.tv_sec,
+                    );
+                    expected[start..start + 8].copy_from_slice(&stored_sec.to_ne_bytes());
+                }
+                assert!(
+                    window == expected,
+                    "{case}: the bytes from {BOUNDARY_WINDOW} before the boundary are \
+                     {window:02x?}, expected {expected:02x?}"
+                );
+                assert_eq!(unsafe { libc::munmap(pages.cast(), 2 * page_size) }, 0);
+            }
+        },
+        config,
+        true,
+    );
+}
+
+/// Four bytes before the boundary, `tv_sec` starts on a write-only page and
+/// ends on an inaccessible or unmapped one, so neither of its parts can be read
+/// back, and Linux stores nothing. No user-access copy shows whether a page is
+/// writable without writing it, so the repair writes the word, whose four bytes
+/// on the write-only page are stored before the fault. The run must then fail
+/// with that Tool error rather than continue with them stored.
+fn unreadable_crossing_tv_sec_fails_the_run(unmap_second_page: bool) {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let result = test_fn_with_config::<Detcore, _>(
+        move || {
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            let (pages, page_size) = map_pages(2);
+            let boundary = unsafe { pages.add(page_size) };
+            protect(pages, page_size, libc::PROT_WRITE);
+            if unmap_second_page {
+                assert_eq!(unsafe { libc::munmap(boundary.cast(), page_size) }, 0);
+            } else {
+                protect(boundary, page_size, libc::PROT_NONE);
+            }
+            // Reached only if the repair lets the run continue.
+            assert_eq!(
+                raw_gettimeofday(unsafe { boundary.sub(4) }.cast(), unmapped),
+                (-1, libc::EFAULT)
+            );
+        },
+        config,
+        true,
+    );
+    match result {
+        Err(reverie::Error::Tool(error)) => assert_eq!(
+            error.to_string(),
+            "replacing host time in the tv_sec of a failed gettimeofday: stored 4 of its 8 bytes \
+             before a fault, leaving it partly stored"
+        ),
+        other => panic!(
+            "expected the repair's Tool error, got {:?}",
+            other.map(|(output, _)| output.status)
+        ),
+    }
+}
+
+#[test]
+fn tod_gettimeofday_faulting_tz_tv_sec_into_inaccessible_page_fails_the_run() {
+    unreadable_crossing_tv_sec_fails_the_run(false);
+}
+
+#[test]
+fn tod_gettimeofday_faulting_tz_tv_sec_into_unmapped_page_fails_the_run() {
+    unreadable_crossing_tv_sec_fails_the_run(true);
+}
+
+#[test]
+/// With no `tv`, a faulting `tz` still fails with EFAULT.
+fn tod_gettimeofday_null_tv_faulting_tz_fails() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            assert_eq!(
+                raw_gettimeofday(ptr::null_mut(), unmapped),
+                (-1, libc::EFAULT)
+            );
         },
         config,
         true,
