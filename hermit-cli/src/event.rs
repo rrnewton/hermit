@@ -130,6 +130,12 @@ pub struct ClockOutput {
     /// Post-call bytes, including any readable prefix after EFAULT. The
     /// syscall's fixed output size bounds both capture and replay.
     pub bytes: Vec<u8>,
+    /// Pre-call bytes of the same readable prefix, kept only after EFAULT and
+    /// then exactly as long as `bytes`; empty for every other result. A byte
+    /// that differs from `bytes` is one Linux stored before faulting. Replay
+    /// requires guest memory to hold these bytes, then writes only those
+    /// stores.
+    pub pre_call_bytes: Vec<u8>,
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -473,10 +479,20 @@ mod tests {
     #[test]
     fn captured_clock_event_codec_retains_outputs_with_errno() {
         for result in [Ok(0), Err(Errno::EFAULT)] {
+            // Only an EFAULT event carries pre-call bytes, as long as `bytes`.
+            let pre_call = |len, byte| {
+                if result.is_err() {
+                    vec![byte; len]
+                } else {
+                    Vec::new()
+                }
+            };
             for kind in 0..3 {
+                let len = if kind == 2 { 8 } else { 16 };
                 let output = ClockOutput {
                     pointer_present: true,
-                    bytes: vec![0x12; if kind == 2 { 8 } else { 16 }],
+                    bytes: vec![0x12; len],
+                    pre_call_bytes: pre_call(len, 0x56),
                 };
                 let event = Event {
                     event: Ok(match kind {
@@ -487,6 +503,7 @@ mod tests {
                             timezone: ClockOutput {
                                 pointer_present: true,
                                 bytes: vec![0x34; 8],
+                                pre_call_bytes: pre_call(8, 0x78),
                             },
                         }),
                         _ => SyscallEvent::TimeV2(ClockEvent { result, output }),
@@ -506,6 +523,7 @@ mod tests {
                     (Ok(SyscallEvent::GettimeofdayV2(event)), 1) => {
                         assert!(event.timezone.pointer_present);
                         assert_eq!(event.timezone.bytes, vec![0x34; 8]);
+                        assert_eq!(event.timezone.pre_call_bytes, pre_call(8, 0x78));
                         (event.result, event.timeval)
                     }
                     (Ok(SyscallEvent::TimeV2(event)), 2) => (event.result, event.output),
@@ -513,7 +531,8 @@ mod tests {
                 };
                 assert_eq!(decoded_result, result);
                 assert!(output.pointer_present);
-                assert_eq!(output.bytes, vec![0x12; if kind == 2 { 8 } else { 16 }]);
+                assert_eq!(output.bytes, vec![0x12; len]);
+                assert_eq!(output.pre_call_bytes, pre_call(len, 0x56));
             }
         }
     }
