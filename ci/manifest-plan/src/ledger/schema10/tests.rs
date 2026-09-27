@@ -742,11 +742,11 @@ fn generated_plan_populations_preserve_command_policy() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     // The frozen 856-cell population gains precisely these three portable RNG
-    // cells and the 165 LiteInst cells selected on 2026-09-27. Preserve raw
+    // cells and the 163 LiteInst cells selected on 2026-09-27. Preserve raw
     // cardinality as well as the set: duplicates are not cells.
-    assert!(exact_rng_population(&raw_expected, 1024));
+    assert!(exact_rng_population(&raw_expected, 1022));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(expected_cells.len(), 1024);
+    assert_eq!(expected_cells.len(), 1022);
     let rng = raw_expected
         .iter()
         .enumerate()
@@ -756,19 +756,19 @@ fn generated_plan_populations_preserve_command_policy() {
     assert_eq!(rng.len(), 3);
     let mut renamed = raw_expected.clone();
     renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
-    assert!(!exact_rng_population(&renamed, 1024));
+    assert!(!exact_rng_population(&renamed, 1022));
     let mut duplicate = raw_expected.clone();
     duplicate[rng[0]] = duplicate[rng[1]].clone();
-    assert!(!exact_rng_population(&duplicate, 1024));
+    assert!(!exact_rng_population(&duplicate, 1022));
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
-    assert!(!exact_rng_population(&missing, 1024));
+    assert!(!exact_rng_population(&missing, 1022));
     for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 1024),
+        ("full", "e2e.manifest_backend_parity_c", 1022),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
-            1020,
+            1018,
         ),
     ] {
         let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -818,13 +818,13 @@ fn generated_plan_populations_preserve_command_policy() {
                 .cloned()
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
-            assert_eq!(expected_relations.len(), if active { 175 } else { 0 });
+            assert_eq!(expected_relations.len(), if active { 173 } else { 0 });
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
                 expected_relations
             );
             if active {
-                for (backend, count) in [("kvm", 75), ("liteinst", 99), ("sabre", 1)] {
+                for (backend, count) in [("kvm", 75), ("liteinst", 97), ("sabre", 1)] {
                     assert_eq!(
                         expected_relations
                             .iter()

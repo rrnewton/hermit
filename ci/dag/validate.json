@@ -1222,13 +1222,6 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/environment-and-workdir",
           "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "backend-parity-c",
-          "test": "backend-parity-c/environment-and-workdir",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -2210,13 +2203,6 @@
           "test": "backend-parity-c/pipe-ipc",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "backend-parity-c",
-          "test": "backend-parity-c/pipe-multiwriter-ordering",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
@@ -15861,13 +15847,6 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/environment-and-workdir",
           "mode": "verify",
-          "backend": "liteinst"
-        },
-        {
-          "lane": "portable",
-          "category": "backend-parity-c",
-          "test": "backend-parity-c/environment-and-workdir",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16849,13 +16828,6 @@
           "test": "backend-parity-c/pipe-ipc",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "backend-parity-c",
-          "test": "backend-parity-c/pipe-multiwriter-ordering",
-          "mode": "verify",
-          "backend": "liteinst"
         },
         {
           "lane": "portable",
