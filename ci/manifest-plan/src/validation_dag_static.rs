@@ -228,7 +228,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Three procfs boot-time range controls retain all 784 prior identities.
-    ("test.detcore_unit", 787),
+    // Five btime rendering, boundary and coupling controls, plus one renamed
+    // boundary test, retain the other 786 prior identities.
+    ("test.detcore_unit", 792),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -257,7 +259,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 787),
+    // The host variant selects the same five btime controls and renamed test.
+    ("test.detcore_unit_on_host", 792),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 750),
