@@ -1,6 +1,6 @@
-# LiteInst qualification: 163 verify cells, 2026-09-27
+# LiteInst qualification: 162 verify cells, 2026-09-27
 
-This change enables and selects 163 previously disabled LiteInst `verify`
+This change enables and selects 162 previously disabled LiteInst `verify`
 cells. Each cell has ten clean first-attempt strict repetitions from the
 official pressure runner, all on the ordinary portable lane, and an independent
 audit read every raw result row. Every selected cell's ptrace `verify` cell is
@@ -8,7 +8,7 @@ already selected by full validation, so this ratchets the host hybrid toward
 the ptrace-green set. No cell was gained by an exemption, filter, comparator
 change, bound change or manifest weakening.
 
-The independent audit qualified 166 cells, and three of them are not
+The independent audit qualified 166 cells, and four of them are not
 selected:
 
 - `system-utils/sort-random` diverged in the ten-repetition current-source
@@ -19,8 +19,12 @@ selected:
   ptrace reference run. All 97 LiteInst cells already selected in that node
   fail that comparison in recent full validates, and these two were never
   measured under it.
+- `language-runtimes/perl-io-subprocess-time` passed 10/10 in the census
+  (`qual10-batch1`), but the exact-head full validation of this change failed
+  it on both attempts with a guest-visible `ERESTARTSYS` (-512) leak on
+  `close()`. The receipt is quoted in its own section below.
 
-Each of the three keeps its LiteInst disabled entry, restored byte-for-byte
+Each of the four keeps its LiteInst disabled entry, restored byte-for-byte
 from the base.
 
 ## Identities
@@ -116,8 +120,8 @@ Batches 1 to 3 ran concurrently, from 06:21 to 06:54 PDT. Batch 4 ran alone,
 from 06:58 to 07:25:58 PDT, which is `2026-09-27T14:25:58Z`. All four exited 0,
 with walls of 1,752 s, 1,707 s, 1,725 s and 1,648 s.
 
-The audit covered 166 cells. The 163 selected cells contribute 1,630 raw
-repetitions (42 / 39 / 41 / 41 cells by batch). The independent audit
+The audit covered 166 cells. The 162 selected cells contribute 1,620 raw
+repetitions (41 / 39 / 41 / 41 cells by batch). The independent audit
 applied these checks to every repetition:
 
 - exactly one result row, attempt 1, one inner attempt, outcome PASS, guest
@@ -167,22 +171,23 @@ and `ci/compat-envelope/cells.json` come from `scorecard.rs update`,
 
 | Quantity | Before (e63236584625) | After |
 | --- | ---: | ---: |
-| LiteInst `verify`: selected / enabled but unselected / disabled (of 361) | 146 / 3 / 212 | 309 / 3 / 49 |
-| LiteInst, all modes: selected / not selected / not applicable (of 1,083) | 146 / 3 / 934 | 309 / 3 / 771 |
-| Comparable cells selected by full (of 5,776) | 856 | 1,019 |
+| LiteInst `verify`: selected / enabled but unselected / disabled (of 361) | 146 / 3 / 212 | 308 / 3 / 50 |
+| LiteInst, all modes: selected / not selected / not applicable (of 1,083) | 146 / 3 / 934 | 308 / 3 / 772 |
+| Comparable cells selected by full (of 5,776) | 856 | 1,018 |
 | Enabled but unselected comparable cells | 150 | 150 |
-| Not-applicable comparable cells | 4,770 | 4,607 |
-| Required full-plan cells (including 3 custom commands) | 859 | 1,022 |
-| Hosted-portable plan cells | 855 | 1,018 |
+| Not-applicable comparable cells | 4,770 | 4,608 |
+| Required full-plan cells (including 3 custom commands) | 859 | 1,021 |
+| Hosted-portable plan cells | 855 | 1,017 |
 | Portable backend-parity-c relations (all / LiteInst) | 173 / 97 | 173 / 97 |
-| DAG `result_manifests` entries over all steps (LiteInst `verify` among them) | 2,173 (293) | 2,499 (619) |
+| DAG `result_manifests` entries over all steps (LiteInst `verify` among them) | 2,173 (293) | 2,497 (617) |
 
 These are selection counts, not a backend determinism percentage. The
 denominator is unchanged, so the percentages in `SCORECARD.md` are comparable
 across this change. All other backends and modes keep their selection. The 3
-enabled-but-unselected LiteInst cells and the 49 still-disabled LiteInst
-`verify` cells (including `system-utils/sort-random` and the two
-`backend-parity-c` cells above) are outside this change.
+enabled-but-unselected LiteInst cells and the 50 still-disabled LiteInst
+`verify` cells (including `system-utils/sort-random`, the two
+`backend-parity-c` cells and `language-runtimes/perl-io-subprocess-time`
+above) are outside this change.
 
 ## Bounds are unchanged
 
@@ -202,7 +207,7 @@ walls:
 | --- | ---: | ---: | --- |
 | `system-utils` | 114 to 119 s | 102.2 s | 1 (serial) |
 | `c-programs` | 110 to 115 s | 278.1 s | 8 |
-| `language-runtimes` | 72 to 78 s | 65.9 s | 1 |
+| `language-runtimes` | 72 to 78 s | 60.2 s | 1 |
 | `determinism-stress-c` | 37 to 40 s | 30.6 s | 1 |
 | `determinism-stress` | 30 to 32 s | 26.5 s | 1 |
 | `data-handling` | 51 to 54 s | 17.8 s | 1 |
@@ -235,8 +240,8 @@ are within the unchanged 22/57. The new dated array
 formula and required-selection tests without rewriting the frozen census or
 the earlier 2026-09-16 and 2026-09-17 arrays.
 
-The array is a `static` rather than a `const`. At 163 rows of 104 bytes
-(16,952 bytes) it exceeds Clippy's 16 KiB `large_const_arrays` threshold, and
+The array is a `static` rather than a `const`. At 162 rows of 104 bytes
+(16,848 bytes) it exceeds Clippy's 16 KiB `large_const_arrays` threshold, and
 `static` is Clippy's own suggested fix; no lint is allowed. Newly enabled
 cells add equally to enabled and required, so the enabled-but-unselected count does not move.
 
@@ -374,7 +379,6 @@ cells add equally to enabled and required, so the enabled-but-unselected count d
 | language-runtimes/gawk-random | qual10-batch1 | 3,014,594 | 4,753 | 5/20 | 5/22 |
 | language-runtimes/m4-macro-mkstemp | qual10-batch2 | 4,029,368 | 6,156 | 7/25 | 7/27 |
 | language-runtimes/perl-hash-order | qual10-batch4 | 2,555,677 | 4,190 | 4/17 | 5/18 |
-| language-runtimes/perl-io-subprocess-time | qual10-batch1 | 3,809,468 | 5,717 | 6/23 | 6/27 |
 | language-runtimes/perl-random | qual10-batch2 | 6,250,218 | 11,752 | 10/48 | 10/48 |
 | language-runtimes/python-hash-determinism | qual10-batch3 | 4,633,693 | 6,622 | 7/27 | 8/27 |
 | language-runtimes/python-random | qual10-batch4 | 5,019,778 | 7,105 | 8/29 | 8/29 |
@@ -578,12 +582,56 @@ Selecting these two cells would add two more reds of that known kind.
 
 Both keep their LiteInst disabled entries, restored byte-for-byte from the
 base, and their calibration rows are removed. All counts and generated files
-were regenerated for the final 163 cells.
+were regenerated for the final 162 cells.
+
+## Deselected after exact-head full validation: `language-runtimes/perl-io-subprocess-time`
+
+The census qualified this cell: ten of ten clean first-attempt strict
+repetitions in `qual10-batch1`, p90 3,809,468 CPU µs and 5,717 wall ms. The
+exact-head full validation of this change contradicts it. Run
+`validate-liteinst-lane-claude-20260927-promote-d5d2f1eab7c1-1790541584808821677-161928-aa64acc9`
+at Hermit `d5d2f1eab7c18063152483b71074d980d328aaae` failed the LiteInst
+`verify` cell on both attempts. Both result rows record `outcome FAIL`,
+`result crash-error`, `failure_class product_failure` and "verify exited with
+status 125 before producing a terminal comparison" (3,802 ms and 3,741 ms).
+The two stderr captures are byte-identical (SHA256
+`45bd138a1faacc4da6110112367c69c0b97e6b07a6d41e8b4d625acc4b68c5fc`):
+
+```
+hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host
+:: Run1...
+First run errored during --verify, not continuing to a second.
+Exit status: exited with code 255
+...
+close child stdout: Unknown error 512 at - line 28.
+
+HERMIT_INTERNAL_FAILURE class=cli-error
+Error: First run during --verify exited with code 255
+```
+
+The first run stopped, so no second run and no `verify-1.json` comparison
+were produced. Line 28 of the Perl program is
+`close $child_output or die "close child stdout: $!"`, the `close()` of the
+pipe that carries `tr`'s output back from `IPC::Open2`. Errno 512 is
+`ERESTARTSYS`, a kernel-internal restart code that must never reach a guest.
+This is the known LiteInst `ERESTARTSYS` leak family named in "What this does
+not establish", and its fix is not on Hermit `main`. The census's 10/10 did not
+reveal it.
+
+The run's e2e failures are otherwise the same as current `main`. The main
+full validations at `4ad1c594b825` and `694e9392a8ec` each have 284 e2e cells
+with no passing attempt. This run has 285: the same 284 plus this cell. The
+other 162 newly selected cells all passed on their first attempt there.
+
+The cell keeps its LiteInst disabled entry, restored byte-for-byte from the
+base ("LiteInst Perl qualification is tracked by backend compatibility"), and
+its calibration row is removed. It stays disabled until the `ERESTARTSYS` fix
+lands and the cell is qualified again.
 
 ## Original disabled reasons
 
 Only the listed LiteInst disabled entries are removed. Other backends'
-reasons remain unchanged. Among the 163 recipes, 71 existing
+reasons remain unchanged. Among the 162 recipes, 70 existing
 per-backend `ci` maps gain `liteinst: true`; the rest already had `ci: true`.
 The original reasons remain below and in the immutable base, so selection is
 not read as a claim that an old failure never happened. Most are pending
@@ -737,7 +785,6 @@ not establish"). The other cell carrying that reason,
 | language-runtimes/gawk-random | LiteInst awk support is tracked by backend compatibility |
 | language-runtimes/m4-macro-mkstemp | LiteInst m4 qualification is tracked by backend compatibility |
 | language-runtimes/perl-hash-order | LiteInst perl support is tracked by backend compatibility |
-| language-runtimes/perl-io-subprocess-time | LiteInst Perl qualification is tracked by backend compatibility |
 | language-runtimes/perl-random | LiteInst Perl support is tracked by backend compatibility |
 | language-runtimes/python-hash-determinism | LiteInst Python support is tracked by backend compatibility |
 | language-runtimes/python-random | LiteInst Python support is tracked by backend compatibility |
@@ -781,12 +828,12 @@ not establish"). The other cell carrying that reason,
   unchanged.
 - **Ten repetitions do not bound rare divergence.** `system-utils/sort-random`
   passed ten of ten at `19553a64` and then diverged once in ten at the author
-  base. The other 160 selected cells were screened once each at the author
+  base. The other 159 selected cells were screened once each at the author
   base, which cannot exclude a divergence of similar frequency. Full
   validation runs each selected cell once per run, so such a cell would
   appear as an intermittent red rather than be hidden.
 - **Every selected cell opens the file on which `sort-random` diverged.**
-  All 163 selected cells open `/proc/self/maps` between 24 and 327 times per
+  All 162 selected cells open `/proc/self/maps` between 24 and 327 times per
   run (openat records in the first retained log of each cell's first
   qualification repetition; the maximum is `system-utils/auxv-loader-dump`).
   Reads were not counted, and which component issues these opens was not
@@ -801,7 +848,10 @@ not establish"). The other cell carrying that reason,
 - **Out of scope.** Nothing here covers replay, chaos, memory determinism,
   arbitrary-program determinism, Linux semantic equivalence on unsupported
   paths, or readiness to replace ptrace.
-- **No full validate.** The remaining LiteInst gaps in the census failure
+- **No green full validate.** The remaining LiteInst gaps in the census failure
   families (vfork refusal, pre-handshake executable entry, `ERESTARTSYS`
-  leaking after `SIGCHLD`, and others) are unchanged. No full validate of this
-  change is claimed here.
+  leaking after `SIGCHLD`, and others) are unchanged. The one exact-head full
+  validation, at `d5d2f1eab7c1` with 163 cells selected, failed. Its only
+  failure beyond current `main`'s was `language-runtimes/perl-io-subprocess-time`,
+  which is deselected above. No full validate of the 162-cell selection is
+  claimed here.

@@ -1642,7 +1642,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
 /// Hermit 19553a64, including preparation in row-level wall time. The raw sample
 /// hashes are retained in the independent audit; ordinary 22/57 bounds stay fixed.
 /// See docs/LITEINST_QUALIFICATION_20260927.md for source and runtime limits.
-pub static LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 163] = [
+pub static LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 162] = [
     TimeoutCalibration {
         test: "c-programs/dbt-execveat-unsupported",
         mode: "verify",
@@ -3224,18 +3224,6 @@ pub static LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 163] =
         p90_wall_millis: 4_190,
         required_cpu_seconds: 4,
         required_wall_seconds: 17,
-        configured_cpu_seconds: 22,
-        configured_wall_seconds: 57,
-    },
-    TimeoutCalibration {
-        test: "language-runtimes/perl-io-subprocess-time",
-        mode: "verify",
-        backend: "liteinst",
-        samples: 10,
-        p90_cpu_usec: 3_809_468,
-        p90_wall_millis: 5_717,
-        required_cpu_seconds: 6,
-        required_wall_seconds: 23,
         configured_cpu_seconds: 22,
         configured_wall_seconds: 57,
     },
