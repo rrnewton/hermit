@@ -81,6 +81,14 @@ fn assert_pmu_handoffs(log: &str, stdout: &str) {
 }
 
 pub(super) fn run() {
+    run_fixture(false);
+}
+
+pub(super) fn run_exit_only() {
+    run_fixture(true);
+}
+
+fn run_fixture(exit_only: bool) {
     let _lock = super::hermit_run_guard();
     let start = Instant::now();
     let remaining = || {
@@ -89,8 +97,13 @@ pub(super) fn run() {
             .expect("the complete regression must fit the existing 57-second test budget")
     };
     fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).expect("fixture parent");
+    let prefix = if exit_only {
+        "ptrace-nonleader-exec-exit-"
+    } else {
+        "ptrace-nonleader-exec-"
+    };
     let root = tempfile::Builder::new()
-        .prefix("ptrace-nonleader-exec-")
+        .prefix(prefix)
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("retained fixture directory")
         .keep();
@@ -98,7 +111,14 @@ pub(super) fn run() {
         "ptrace nonleader exec artifacts retained at {}",
         root.display()
     );
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nonleader_exec.c");
+    let fixture_name = if exit_only {
+        "nonleader_exec_exit.c"
+    } else {
+        "nonleader_exec.c"
+    };
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture_name);
     fs::copy(&fixture, root.join("guest.c")).expect("retain exact fixture");
     let guest = root.join("program");
     let compile = root.join("compile");
@@ -135,6 +155,9 @@ pub(super) fn run() {
             "run",
             "--backend=ptrace",
             "--base-env=minimal",
+            // CARGO_TARGET_TMPDIR may itself be under host /tmp. Keep that
+            // fixture visible just as the neighboring CLI guest tests do.
+            "--tmp=/tmp",
             "--strict",
             "--epoch=2026-01-01T00:00:00.123456789+00:00",
             "--max-timeslice=200000000",
@@ -159,11 +182,18 @@ pub(super) fn run() {
         );
         let output = bounded_read(&directory.join("stdout"), MIB);
         let stdout = std::str::from_utf8(&output).expect("guest trajectory text");
-        assert_eq!(stdout.lines().count(), 23, "complete two-exec trajectory");
-        assert_eq!(stdout.matches("sample round=").count(), 16);
-        assert_eq!(stdout.matches("gone=ESRCH").count(), 2);
-        assert_eq!(stdout.matches(" running\n").count(), 2);
-        assert!(stdout.ends_with("nonleader-exec-ok rounds=2 final=73 reaped=once\n"));
+        if exit_only {
+            // The replacement only exits successfully. Its success must not
+            // depend on an external supervisor noticing missing output; the
+            // skipped-reconnect mutation must fail in the runtime itself.
+            assert!(stdout.is_empty(), "the exit-only guest has no output");
+        } else {
+            assert_eq!(stdout.lines().count(), 23, "complete two-exec trajectory");
+            assert_eq!(stdout.matches("sample round=").count(), 16);
+            assert_eq!(stdout.matches("gone=ESRCH").count(), 2);
+            assert_eq!(stdout.matches(" running\n").count(), 2);
+            assert!(stdout.ends_with("nonleader-exec-ok rounds=2 final=73 reaped=once\n"));
+        }
         if let Some(previous) = &previous_stdout {
             assert_eq!(
                 &output, previous,
@@ -225,7 +255,9 @@ pub(super) fn run() {
                 .collect();
             assert_eq!(matches.len(), 1, "one complete retained log per execution");
             let log = String::from_utf8(bounded_read(&matches[0], 64 * MIB)).unwrap();
-            assert_pmu_handoffs(&log, stdout);
+            if !exit_only {
+                assert_pmu_handoffs(&log, stdout);
+            }
         }
         previous_stdout = Some(output);
         eprintln!("ptrace nonleader exec pair {pair}: two full canonical executions");

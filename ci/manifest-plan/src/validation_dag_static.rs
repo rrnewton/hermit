@@ -257,7 +257,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
-    ("test.cli", 89),
+    ("test.cli", 90),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -268,7 +268,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("privileged-test.pmu_buck_chaos_cases", 6),
     // One exec timer regression extends 33 KVM cases plus the setup control.
     ("privileged-test.cli_kvm", 35),
-    ("test.cli_on_host", 89),
+    ("test.cli_on_host", 90),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 35),

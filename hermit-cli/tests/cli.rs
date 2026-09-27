@@ -5018,6 +5018,11 @@ fn run_ptrace_nonleader_exec_preserves_identity_and_time() {
     nonleader_exec::run();
 }
 
+#[test]
+fn run_ptrace_nonleader_exec_exit_only() {
+    nonleader_exec::run_exit_only();
+}
+
 /// `--log-file` must resolve on the HOST, exactly like a shell redirect.
 ///
 /// The container mounts a fresh writable /tmp over its root, and tracing is
