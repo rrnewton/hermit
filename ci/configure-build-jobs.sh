@@ -503,8 +503,17 @@ fi
 # fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b0ede531e00dd1e068d0e0b1f220edddcf96d4b5 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b0ede531e00dd1e068d0e0b1f220edddcf96d4b5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a1d07619c7c06d3a525a9db5b6f113bb52a4901b (2026-09-27): from
+# b0ede531e00dd1e068d0e0b1f220edddcf96d4b5, KVM orphan handling, worker
+# retirement and terminal WUNTRACED support leave the full reverie-dbt tree
+# unchanged at a62d15302ee5e907667d1c02f6e629177ad87f61. build.rs remains
+# blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0; DynamoRIO remains tree
+# 117d54d744df23921c531d0fe08537249f5a510a; third-party remains tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
+# This is source-identity carry, not a new timing sample or runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a1d07619c7c06d3a525a9db5b6f113bb52a4901b ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a1d07619c7c06d3a525a9db5b6f113bb52a4901b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
