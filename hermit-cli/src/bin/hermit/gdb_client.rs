@@ -413,15 +413,52 @@ mod tests {
             let metadata = std::fs::metadata(format!("/proc/{helper_pid}/fd/{fd}")).unwrap();
             (metadata.dev(), metadata.ino())
         });
-        for entry in std::fs::read_dir(format!("/proc/{client_pid}/fd")).unwrap() {
-            let metadata = std::fs::metadata(entry.unwrap().path()).unwrap();
+        for identity in complete_descriptor_identities(client_pid) {
             assert!(
-                !private.contains(&(metadata.dev(), metadata.ino())),
+                !private.contains(&identity),
                 "the GDB child inherited a private watcher descriptor"
             );
         }
         drop(rescue);
         watch.finish().expect("GDB helper finish failed");
+    }
+
+    /// Returns the `(dev, ino)` of every descriptor open in `pid`, taken from one
+    /// listing of `/proc/<pid>/fd` in which every entry could be stat'ed.
+    ///
+    /// READY arrives just after the client's exec, while its dynamic loader is
+    /// still opening and closing files, so an entry can be listed and then closed
+    /// before its stat. Such a listing is incomplete and is taken again in full.
+    /// No entry is ever skipped: if no complete listing appears before the
+    /// deadline, this panics and names the descriptors that vanished. A descriptor
+    /// inherited across exec stays open, so every complete listing contains it.
+    fn complete_descriptor_identities(pid: u32) -> Vec<(u64, u64)> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut identities = Vec::new();
+            let mut vanished = Vec::new();
+            for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+                let entry = entry.unwrap();
+                match std::fs::metadata(entry.path()) {
+                    Ok(metadata) => identities.push((metadata.dev(), metadata.ino())),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        vanished.push(entry.file_name());
+                    }
+                    Err(error) => panic!("stat {}: {error}", entry.path().display()),
+                }
+            }
+            if vanished.is_empty() {
+                return identities;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no complete descriptor listing of process {pid} after {attempts} attempts; \
+                 descriptors that vanished from the last one: {vanished:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
