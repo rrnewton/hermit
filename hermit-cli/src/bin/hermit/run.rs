@@ -30,6 +30,7 @@ use clap::Parser;
 use colored::Colorize;
 use detcore_model::backend_engagement::BackendEngagement;
 use detcore_model::backend_engagement::BackendEngagementReport;
+use detcore_model::backend_engagement::LiteinstHostHybridCounters;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
 use detcore_model::summary::RunSummary;
@@ -261,6 +262,52 @@ fn private_backend_engagement_summary() -> Result<tempfile::NamedTempFile, Error
         // prepared source identity. Removed on drop.
         .tempfile_in(private_summary_dir()?)
         .context("creating private backend-engagement run summary")
+}
+
+fn private_liteinst_counters() -> Result<tempfile::NamedTempFile, Error> {
+    tempfile::Builder::new()
+        .prefix(".hermit-liteinst-counters-")
+        // See private_summary_dir: visible to the run container, and outside
+        // prepared source identity. Removed on drop. It starts empty, so a run
+        // that never publishes leaves nothing a reader could accept.
+        .tempfile_in(private_summary_dir()?)
+        .context("creating private LiteInst counters record")
+}
+
+fn read_engagement_summary(summary_path: &Path, backend: Backend) -> Result<RunSummary, Error> {
+    let backend = backend.as_str();
+    let bytes = fs::read(summary_path).with_context(|| {
+        format!(
+            "reading {backend} backend engagement from {}",
+            summary_path.display()
+        )
+    })?;
+    serde_json::from_slice::<RunSummary>(&bytes).with_context(|| {
+        format!(
+            "parsing {backend} backend engagement from {}",
+            summary_path.display()
+        )
+    })
+}
+
+fn liteinst_engagement(
+    summary: &RunSummary,
+    counters_path: &Path,
+) -> Result<BackendEngagement, Error> {
+    let syscall_entries = summary.syscalls.ok_or_else(|| {
+        Error::msg("liteinst backend engagement requires the run summary's syscall count")
+    })?;
+    let bytes = fs::read(counters_path)
+        .with_context(|| format!("reading LiteInst counters from {}", counters_path.display()))?;
+    if bytes.is_empty() {
+        anyhow::bail!(
+            "the LiteInst run published no counters to {}",
+            counters_path.display()
+        );
+    }
+    let counters: LiteinstHostHybridCounters = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing LiteInst counters from {}", counters_path.display()))?;
+    BackendEngagement::liteinst_host_hybrid(syscall_entries, counters).map_err(Error::msg)
 }
 
 fn clear_machine_record(path: &Path, description: &str) -> Result<(), Error> {
@@ -758,6 +805,11 @@ pub struct RunOpts {
     /// not have to recover any count from the presentation banner.
     #[clap(skip)]
     e9patch_engagement: Option<BackendEngagement>,
+
+    /// Private file to which the LiteInst run publishes its host-hybrid
+    /// counters for `--backend-engagement-json`.
+    #[clap(skip)]
+    liteinst_counters: Option<PathBuf>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -3216,7 +3268,7 @@ impl RunOpts {
             })
             .transpose()?;
         let private_engagement_summary = if self.backend_engagement_json.is_some()
-            && backend == Backend::Ptrace
+            && matches!(backend, Backend::Ptrace | Backend::Liteinst)
             && self.summary_json.is_none()
         {
             let file = private_backend_engagement_summary()?;
@@ -3225,6 +3277,14 @@ impl RunOpts {
         } else {
             None
         };
+        let private_liteinst_counters =
+            if self.backend_engagement_json.is_some() && backend == Backend::Liteinst {
+                let file = private_liteinst_counters()?;
+                self.liteinst_counters = Some(file.path().to_owned());
+                Some(file)
+            } else {
+                None
+            };
         // });
 
         // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
@@ -3301,6 +3361,7 @@ impl RunOpts {
             }
             self.write_backend_engagement_after_run(guest_capture.as_ref())?;
             drop(private_engagement_summary);
+            drop(private_liteinst_counters);
             Ok(status)
         }
     }
@@ -3373,11 +3434,14 @@ impl RunOpts {
             );
         }
         if self.backend_engagement_json.is_some()
-            && !matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Dbt)
+            && !matches!(
+                backend,
+                Backend::Ptrace | Backend::E9patch | Backend::Dbt | Backend::Liteinst
+            )
         {
             anyhow::bail!(
                 "--backend-engagement-json is not available for backend `{}`; SaBRe publishes \
-                 HERMIT_SABRE_PATH_EVIDENCE, and liteinst/KVM expose no engagement value",
+                 HERMIT_SABRE_PATH_EVIDENCE, and KVM exposes no engagement value",
                 backend.as_str()
             );
         }
@@ -4130,30 +4194,26 @@ impl RunOpts {
                 let summary_path = self.summary_json.as_deref().ok_or_else(|| {
                     Error::msg("ptrace backend engagement requires a typed run summary")
                 })?;
-                let summary = fs::read(summary_path)
-                    .with_context(|| {
-                        format!(
-                            "reading ptrace backend engagement from {}",
-                            summary_path.display()
-                        )
-                    })
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<RunSummary>(&bytes).with_context(|| {
-                            format!(
-                                "parsing ptrace backend engagement from {}",
-                                summary_path.display()
-                            )
-                        })
-                    })?;
+                let summary = read_engagement_summary(summary_path, Backend::Ptrace)?;
                 BackendEngagement::Ptrace {
                     scheduler_turns: summary.sched_turns,
                 }
+            }
+            Backend::Liteinst => {
+                let summary_path = self.summary_json.as_deref().ok_or_else(|| {
+                    Error::msg("liteinst backend engagement requires a typed run summary")
+                })?;
+                let counters_path = self.liteinst_counters.as_deref().ok_or_else(|| {
+                    Error::msg("liteinst backend engagement requires a counters record")
+                })?;
+                let summary = read_engagement_summary(summary_path, Backend::Liteinst)?;
+                liteinst_engagement(&summary, counters_path)?
             }
             Backend::E9patch => self.e9patch_engagement.clone().ok_or_else(|| {
                 Error::msg("e9patch backend engagement was not recorded during preparation")
             })?,
             Backend::Dbt => unreachable!("the DBT adapter writes its own engagement record"),
-            Backend::Liteinst | Backend::Sabre | Backend::Kvm => {
+            Backend::Sabre | Backend::Kvm => {
                 return Err(Error::msg(format!(
                     "backend `{}` does not expose an engagement value",
                     self.selected_backend().as_str()
@@ -5112,6 +5172,15 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
+        // Installed in this container process, which is the one that runs the
+        // LiteInst tracer; the guard lives until the run has published.
+        let _liteinst_counters = self
+            .liteinst_counters
+            .clone()
+            .filter(|_| backend == Backend::Liteinst)
+            .map(hermit::LiteinstCountersSink::install)
+            .transpose()?;
+
         let timeout = self.run_timeout();
         super::staged_summary::with_published_summary(
             summary_output,
@@ -5229,6 +5298,7 @@ impl Tmpfs {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use detcore_model::backend_engagement::LiteinstEngagementClass;
 
     use super::*;
 
@@ -5366,6 +5436,76 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn liteinst_engagement_record_joins_the_summary_total_and_the_counters() {
+        let summary_file = tempfile::NamedTempFile::new().unwrap();
+        let counters_file = tempfile::NamedTempFile::new().unwrap();
+        let engagement_file = tempfile::NamedTempFile::new().unwrap();
+        let mut options = RunOpts::parse_from(["hermit", "--backend=liteinst", "/bin/true"]);
+        options.summary_json = Some(summary_file.path().to_owned());
+        options.liteinst_counters = Some(counters_file.path().to_owned());
+        options.backend_engagement_json = Some(engagement_file.path().to_owned());
+
+        // A counters file the run never published is refused, not read as zero.
+        let summary = RunSummary {
+            syscalls: Some(477),
+            ..Default::default()
+        };
+        fs::write(summary_file.path(), serde_json::to_vec(&summary).unwrap()).unwrap();
+        let error = options
+            .write_backend_engagement_after_run(None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("published no counters"), "{error}");
+
+        for (direct_hooks, class) in [
+            (0, LiteinstEngagementClass::Control),
+            (99, LiteinstEngagementClass::PatchedViaPtrace),
+        ] {
+            let counters = LiteinstHostHybridCounters {
+                direct_hooks,
+                first_site_seccomp: 2,
+                ptrace_installations: 2,
+                fallback_entries: 0,
+                patched_sites: 2,
+                candidate_sites: 2,
+            };
+            fs::write(counters_file.path(), serde_json::to_vec(&counters).unwrap()).unwrap();
+            options.write_backend_engagement_after_run(None).unwrap();
+            let report: BackendEngagementReport =
+                serde_json::from_slice(&fs::read(engagement_file.path()).unwrap()).unwrap();
+            report.validate().unwrap();
+            let BackendEngagement::Liteinst {
+                engagement_class,
+                syscall_entries,
+                patched_site_entries,
+                ptrace_free_entries,
+                ..
+            } = report.engagement
+            else {
+                panic!("expected a LiteInst record, got {:?}", report.engagement);
+            };
+            assert_eq!(engagement_class, class);
+            assert_eq!(syscall_entries, 477);
+            assert_eq!(patched_site_entries.numerator, direct_hooks);
+            assert_eq!(patched_site_entries.denominator, 477);
+            assert_eq!(ptrace_free_entries.numerator, 0);
+            assert_eq!(ptrace_free_entries.denominator, 477);
+        }
+
+        // Without the Tool-side total there is no denominator to record.
+        fs::write(
+            summary_file.path(),
+            serde_json::to_vec(&RunSummary::default()).unwrap(),
+        )
+        .unwrap();
+        let error = options
+            .write_backend_engagement_after_run(None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("syscall count"), "{error}");
     }
 
     #[test]

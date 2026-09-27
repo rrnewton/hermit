@@ -626,6 +626,23 @@ with tempfile.TemporaryDirectory(prefix="e9patch-engagement-") as tmp:
     else:
         refused = False
     check("missing B0 count fails by shape", refused)
+    engagement["engagement"]["b0_sites"] = 0
+    engagement["schema"] = 3
+    engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
+    check(
+        "the current schema 3 record is accepted",
+        e9patch_engagement(engagement_path) == (7, 6, 0),
+    )
+    for unsupported in (1, 4, True):
+        engagement["schema"] = unsupported
+        engagement_path.write_text(json.dumps(engagement), encoding="utf-8")
+        try:
+            e9patch_engagement(engagement_path)
+        except CorpusError as error:
+            refused = "schema 2 or 3" in str(error)
+        else:
+            refused = False
+        check(f"schema {unsupported!r} is refused by name", refused)
 
 print()
 if FAILURES:

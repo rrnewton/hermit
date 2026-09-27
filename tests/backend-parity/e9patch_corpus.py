@@ -194,8 +194,11 @@ def e9patch_engagement(path: Path) -> tuple[int, int, int]:
         raise CorpusError(f"e9patch engagement record is unavailable: {error}") from error
     if not isinstance(report, dict) or set(report) != {"schema", "engagement"}:
         raise CorpusError("e9patch engagement record has unexpected fields")
-    if report.get("schema") != 2:
-        raise CorpusError("e9patch engagement record must use schema 2")
+    # Schema 3 added the LiteInst variant; the e9patch value is unchanged, and
+    # schema 2 records written before that remain readable.
+    schema = report.get("schema")
+    if isinstance(schema, bool) or schema not in (2, 3):
+        raise CorpusError("e9patch engagement record must use schema 2 or 3")
     engagement = report.get("engagement")
     expected = {"backend", "candidate_sites", "mapped_sites", "b0_sites"}
     if not isinstance(engagement, dict) or set(engagement) != expected:

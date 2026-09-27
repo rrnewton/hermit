@@ -28,6 +28,7 @@ mod id;
 pub mod instruction_map;
 mod interp;
 pub mod liteinst_bootstrap;
+mod liteinst_engagement;
 pub mod liteinst_record;
 mod metadata;
 mod ptrace_completion;
@@ -381,6 +382,8 @@ use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
 pub use id::Id;
+#[doc(hidden)]
+pub use liteinst_engagement::LiteinstCountersSink;
 use metadata::Metadata;
 pub use ptrace_completion::HermitCleanupStage;
 pub use ptrace_completion::HermitCleanupUnconfirmed;
@@ -2598,11 +2601,26 @@ async fn dispatch_backend(
     }
     if backend == Backend::Liteinst {
         let preload = liteinst_runtime_library_path()?;
-        let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                command, config, preload,
-            )
-            .await?;
+        // Statistics are collected only when the CLI asked for an engagement
+        // record, so an ordinary run keeps the plain launch.
+        let (exit_status, mut global_state, stats) = match liteinst_engagement::requested_sink() {
+            None => {
+                let (exit_status, global_state) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (exit_status, global_state, None)
+            }
+            Some(sink) => {
+                let (exit_status, global_state, stats) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (exit_status, global_state, Some((sink, stats)))
+            }
+        };
         if liteinst_requires_forced_shutdown(exit_status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
@@ -2610,6 +2628,9 @@ async fn dispatch_backend(
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
+        if let Some((sink, stats)) = stats {
+            liteinst_engagement::publish(&sink, &stats)?;
+        }
         return Ok(exit_status);
     }
     ensure_backend_dispatch(backend)?;
@@ -2849,11 +2870,24 @@ async fn dispatch_output_backend(
     if backend == Backend::Liteinst {
         command.stdin(output_backend_stdin()?);
         let preload = liteinst_runtime_library_path()?;
-        let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                command, config, preload,
-            )
-            .await?;
+        let (output, mut global_state, stats) = match liteinst_engagement::requested_sink() {
+            None => {
+                let (output, global_state) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+                        command, config, preload,
+                    )
+                    .await?;
+                (output, global_state, None)
+            }
+            Some(sink) => {
+                let (output, global_state, stats) =
+                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+                        Detcore,
+                    >(command, config, preload)
+                    .await?;
+                (output, global_state, Some((sink, stats)))
+            }
+        };
         let status = output.status;
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
@@ -2862,6 +2896,9 @@ async fn dispatch_output_backend(
         global_state
             .clean_up(print_summary, print_summary_to_json_file)
             .await;
+        if let Some((sink, stats)) = stats {
+            liteinst_engagement::publish(&sink, &stats)?;
+        }
         return Ok(Output {
             status,
             stdout: output.stdout,
