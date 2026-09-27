@@ -31,6 +31,7 @@ use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
 use hermit::HERMIT_DEADLINE_EXIT;
+use hermit::HERMIT_LOG_CAP_EXIT;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
 use hermit::capture_mountinfo_identity_order;
@@ -1209,6 +1210,26 @@ impl std::fmt::Display for RunTimeoutMarker {
 
 impl std::error::Error for RunTimeoutMarker {}
 
+/// The container child exited [`hermit::HERMIT_LOG_CAP_EXIT`]: hermit's own
+/// log output crossed `--max-log-bytes` and the writer that crossed it ended
+/// the run. The child printed the bound and byte count to stderr before
+/// exiting; this carries no number for the same reason [`RunTimeoutMarker`]
+/// does not.
+#[derive(Debug)]
+pub struct LogCapExceeded;
+
+impl std::fmt::Display for LogCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit's log output exceeded --max-log-bytes and the run was aborted; \
+             lower the log verbosity or raise --max-log-bytes"
+        )
+    }
+}
+
+impl std::error::Error for LogCapExceeded {}
+
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
 #[derive(Debug)]
@@ -1335,6 +1356,11 @@ pub fn classify_container_result<T>(
         // `run --timeout` fallback exited the init 124 and the run reported 125.
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_DEADLINE_EXIT) => {
             Err(Error::new(RunTimeoutMarker))
+        }
+        // The --max-log-bytes cap, chosen by `CappedWriter` in the init. Same
+        // reason as the deadline arm: without it a working bound reports 125.
+        Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_LOG_CAP_EXIT) => {
+            Err(Error::new(LogCapExceeded))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
         // is: falling through would report a signal-terminated run as an

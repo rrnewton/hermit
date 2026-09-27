@@ -14,6 +14,7 @@ use std::mem;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use hermit::Backend;
@@ -281,6 +282,276 @@ impl<W: Write> Write for BoundedWriter<W> {
     }
 }
 
+/// Parse a `--max-log-bytes` value: a byte count with an optional binary
+/// suffix. `8G` is 8 GiB; `K`, `M`, `G`, `T` are powers of 1024, may be lower
+/// case, and may be spelled `Ki`/`KiB`/`KB` alike -- there is deliberately no
+/// SI reading, so `8G` and `8GiB` cannot mean two different caps.
+///
+/// Zero is refused rather than read as "unlimited": a cap that aborts on the
+/// first log line is never what anyone meant, and the way to run uncapped is to
+/// omit the flag.
+pub fn parse_max_log_bytes(raw: &str) -> Result<u64, String> {
+    let usage = "Give a positive byte count with an optional K/M/G/T suffix \
+                 (powers of 1024), e.g. --max-log-bytes=8G.";
+    let text = raw.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, suffix) = text.split_at(split);
+    if digits.is_empty() {
+        return Err(format!("{raw:?} is not a byte count. {usage}"));
+    }
+    let shift = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "ki" | "kb" | "kib" => 10,
+        "m" | "mi" | "mb" | "mib" => 20,
+        "g" | "gi" | "gb" | "gib" => 30,
+        "t" | "ti" | "tb" | "tib" => 40,
+        _ => return Err(format!("{raw:?} has an unknown size suffix. {usage}")),
+    };
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| format!("{raw:?} is too large for a byte count. {usage}"))?;
+    let bytes = count
+        .checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("{raw:?} is too large for a byte count. {usage}"))?;
+    if bytes == 0 {
+        return Err(format!(
+            "{raw:?} would abort the run on its first log line. Omit --max-log-bytes to \
+             leave hermit's log output uncapped, or give a positive size such as 8G."
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Render a byte count the way `--max-log-bytes` accepts it, choosing the
+/// largest suffix that represents it exactly (`8589934592` -> `8G`).
+pub fn format_byte_size(bytes: u64) -> String {
+    for (shift, suffix) in [(40, "T"), (30, "G"), (20, "M"), (10, "K")] {
+        let unit = 1u64 << shift;
+        if bytes != 0 && bytes.is_multiple_of(unit) {
+            return format!("{}{suffix}", bytes / unit);
+        }
+    }
+    bytes.to_string()
+}
+
+#[derive(Debug)]
+struct SharedByteCount {
+    address: NonNull<AtomicU64>,
+}
+
+// SAFETY: as for SharedWriteError -- one initialized atomic in a MAP_SHARED
+// mapping that stays live while any clone of the owning LogBudget exists.
+unsafe impl Send for SharedByteCount {}
+unsafe impl Sync for SharedByteCount {}
+
+impl Drop for SharedByteCount {
+    fn drop(&mut self) {
+        // SAFETY: this process owns the mapping created in LogBudget::new.
+        unsafe {
+            libc::munmap(self.address.as_ptr().cast(), mem::size_of::<AtomicU64>());
+        }
+    }
+}
+
+/// The `--max-log-bytes` budget: a limit and a running total of the bytes
+/// hermit has offered to its public log sink.
+///
+/// THE TOTAL IS PROCESS-SHARED FOR THE SAME REASON [`WriteErrorLatch`] IS.
+/// Tracing is initialized after the container fork, and `run --verify` forks
+/// one container per run. A heap counter would be copied at each fork, so every
+/// run would get the full budget again; this MAP_SHARED cell, created in `main`
+/// before any fork, makes the cap a total for the invocation.
+#[derive(Clone, Debug)]
+pub struct LogBudget {
+    limit: u64,
+    spent: Arc<SharedByteCount>,
+    /// Rendered up front so the abort path allocates nothing: it can run on
+    /// any thread, with arbitrary locks held.
+    message: Arc<str>,
+}
+
+/// Outcome of charging one write against a [`LogBudget`].
+#[derive(Debug, PartialEq, Eq)]
+enum Charge {
+    /// The write fits; perform it.
+    Within,
+    /// This write is the one that crossed the cap; abort the run.
+    Crossed,
+    /// Another write already crossed the cap and is aborting; drop this one.
+    AlreadyOver,
+}
+
+impl LogBudget {
+    pub fn new(limit: u64) -> io::Result<Self> {
+        // SAFETY: anonymous shared mapping, no fixed address and no backing fd.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mem::size_of::<AtomicU64>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let address = NonNull::new(address.cast::<AtomicU64>())
+            .expect("mmap returned a non-null non-failure address");
+        // SAFETY: the fresh mapping is writable and suitably page-aligned.
+        unsafe { address.as_ptr().write(AtomicU64::new(0)) };
+        Ok(Self {
+            limit,
+            spent: Arc::new(SharedByteCount { address }),
+            message: exceeded_message(limit).into(),
+        })
+    }
+
+    /// The final message printed when the cap fires.
+    pub fn exceeded_message(&self) -> &str {
+        &self.message
+    }
+
+    fn cell(&self) -> &AtomicU64 {
+        // SAFETY: the Arc keeps the initialized mapping live in this process.
+        unsafe { self.spent.address.as_ref() }
+    }
+
+    /// Bytes charged so far, across every process sharing this budget.
+    #[cfg(test)]
+    fn spent(&self) -> u64 {
+        self.cell().load(Ordering::Relaxed)
+    }
+
+    /// Charge `len` bytes. One relaxed `fetch_add` per write: this sits on the
+    /// hot path of every log line, and exactness only matters at the crossing,
+    /// which the returned previous total identifies uniquely.
+    fn charge(&self, len: u64) -> Charge {
+        let before = self.cell().fetch_add(len, Ordering::Relaxed);
+        if before > self.limit {
+            Charge::AlreadyOver
+        } else if before.saturating_add(len) > self.limit {
+            Charge::Crossed
+        } else {
+            Charge::Within
+        }
+    }
+
+    /// Return bytes charged for a write that the sink accepted only in part, so
+    /// the caller's retry of the remainder is not counted twice.
+    fn refund(&self, len: u64) {
+        self.cell().fetch_sub(len, Ordering::Relaxed);
+    }
+}
+
+/// The final message. Names the bound, what happens next, and what to change.
+fn exceeded_message(limit: u64) -> String {
+    format!(
+        "hermit: log output exceeded --max-log-bytes={} ({} bytes); aborting the run and killing \
+         the guest process tree (exit {}). Lower --log / RUST_LOG verbosity, or raise \
+         --max-log-bytes, to let the run finish.\n",
+        format_byte_size(limit),
+        limit,
+        hermit::HERMIT_LOG_CAP_EXIT,
+    )
+}
+
+/// Counts the bytes offered to hermit's public log sink against a
+/// [`LogBudget`] and ends the process when the budget is exhausted.
+///
+/// This sits OUTSIDE [`BoundedWriter`]: the file bound silently discards
+/// beyond 1 GiB while the run continues, so counting after it would never see a
+/// runaway once the file stopped growing. The incident this exists for
+/// (2026-08-17) was hermit's own stderr at `--log=info` -- ~4.5 TB per process
+/// from the scheduler's per-poll banner -- which had no bound at all.
+///
+/// WHY `_exit` FROM INSIDE A WRITER. The writer runs wherever tracing does: the
+/// container init (PID 1 of the run's PID namespace, whose exit makes the
+/// kernel SIGKILL every guest in it), the `--no-namespace` tracer (whose guests
+/// are attached with PTRACE_O_EXITKILL), or the non-blocking appender's worker
+/// thread in one of those processes. In each case ending the process is
+/// exactly how hermit's other deliberate stops tear the guest tree down
+/// (`record --record-timeout`, the container-init stop-signal handler).
+/// `_exit` rather than `exit` because this can run on any thread, possibly
+/// while the subscriber's writer lock is held, and there is nothing left worth
+/// flushing: every sink here is unbuffered. The parent maps the status through
+/// `classify_container_result`.
+pub struct CappedWriter<W: Write> {
+    inner: W,
+    budget: Option<LogBudget>,
+    /// The inner writer is stderr itself, so the final message is written once.
+    inner_is_stderr: bool,
+}
+
+impl<W: Write> CappedWriter<W> {
+    /// Wrap a file sink. `None` disables the cap (no counting at all).
+    pub fn new(inner: W, budget: Option<LogBudget>) -> Self {
+        Self {
+            inner,
+            budget,
+            inner_is_stderr: false,
+        }
+    }
+
+    fn exceeded(&mut self, budget: &LogBudget) -> ! {
+        let message = budget.exceeded_message();
+        if !self.inner_is_stderr {
+            // Best effort: the log should say why it ends. If the file bound has
+            // already truncated it, BoundedWriter drops this, and stderr below
+            // still carries the message.
+            let _ = self.inner.write_all(message.as_bytes());
+            let _ = self.inner.flush();
+        }
+        let _ = detcore::util::RetryingStderr.write_all(message.as_bytes());
+        // SAFETY: _exit has no preconditions; see the type-level note for why
+        // the immediate exit is the teardown.
+        unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
+    }
+}
+
+impl CappedWriter<detcore::util::RetryingStderr> {
+    /// Wrap hermit's stderr sink.
+    pub fn stderr(budget: Option<LogBudget>) -> Self {
+        Self {
+            inner: detcore::util::RetryingStderr,
+            budget,
+            inner_is_stderr: true,
+        }
+    }
+}
+
+impl<W: Write> Write for CappedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let Some(budget) = &self.budget else {
+            return self.inner.write(buf);
+        };
+        match budget.charge(buf.len() as u64) {
+            Charge::Within => {}
+            Charge::Crossed => {
+                let budget = budget.clone();
+                self.exceeded(&budget)
+            }
+            // The crossing writer is already ending the process. Report the
+            // bytes consumed (as BoundedWriter does) rather than erroring.
+            Charge::AlreadyOver => return Ok(buf.len()),
+        }
+        let written = self.inner.write(buf).inspect_err(|_| {
+            budget.refund(buf.len() as u64);
+        })?;
+        if written < buf.len() {
+            budget.refund((buf.len() - written) as u64);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn env_filter(level: LevelFilter) -> EnvFilter {
     EffectiveFilter::from_default_env(level).into_filter()
 }
@@ -487,13 +758,14 @@ pub fn init_stderr_tracing_with_evidence<E>(
     level: Option<LevelFilter>,
     evidence: E,
     backend: Backend,
+    budget: Option<LogBudget>,
 ) -> TracingGuard
 where
     E: Write + Send + 'static,
 {
     align_tracing_pid_baseline(backend);
     let public_layer = tracing_subscriber::fmt::layer()
-        .with_writer(|| detcore::util::RetryingStderr)
+        .with_writer(move || CappedWriter::stderr(budget.clone()))
         .with_ansi(stderr().is_terminal())
         .with_filter(env_filter(level.unwrap_or(DEFAULT_TRACE_LEVEL)));
     let evidence_layer = tracing_subscriber::fmt::layer()
@@ -511,7 +783,7 @@ where
 /// Returns a tracing subscriber that logs to `stderr`.
 ///
 /// NOTE: Writes to stderr are unbuffered, so this may be slow.
-pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
+pub fn stderr_subscriber(level: Option<LevelFilter>, budget: Option<LogBudget>) -> impl Subscriber {
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
 
     let filter = env_filter(level);
@@ -521,8 +793,9 @@ pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
         // after which a full pipe makes these writes fail with EAGAIN. The fmt
         // layer discards the write error, so log lines would vanish with no
         // marker at all. `RetryingStderr` waits for the reader instead of
-        // dropping, and does not alter the flag the guest set.
-        .with_writer(|| detcore::util::RetryingStderr)
+        // dropping, and does not alter the flag the guest set. `CappedWriter`
+        // charges each event against `--max-log-bytes`, when given.
+        .with_writer(move || CappedWriter::stderr(budget.clone()))
         .with_ansi(stderr().is_terminal())
         .finish()
 }
@@ -530,10 +803,14 @@ pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
 /// Initializes tracing to `stderr`.
 ///
 /// NOTE: Writes to stderr are unbuffered, so this may be slow.
-pub fn init_stderr_tracing(level: Option<LevelFilter>, backend: Backend) {
+pub fn init_stderr_tracing(
+    level: Option<LevelFilter>,
+    backend: Backend,
+    budget: Option<LogBudget>,
+) {
     align_tracing_pid_baseline(backend);
 
-    stderr_subscriber(level)
+    stderr_subscriber(level, budget)
         .try_init()
         .expect("global tracing subscriber to install")
 }
@@ -946,5 +1223,173 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut writer = BoundedWriter::new(&mut sink, 5);
         assert_eq!(writer.write(&[b'y'; 40]).unwrap(), 40);
+    }
+
+    #[test]
+    fn max_log_bytes_accepts_binary_suffixes() {
+        for (raw, expected) in [
+            ("1", 1),
+            ("4096", 4096),
+            ("1k", 1 << 10),
+            ("64K", 64 << 10),
+            ("512m", 512 << 20),
+            ("8G", 8 << 30),
+            ("8g", 8 << 30),
+            ("8Gi", 8 << 30),
+            ("8GiB", 8 << 30),
+            ("8GB", 8 << 30),
+            ("2T", 2 << 40),
+            ("100b", 100),
+            (" 8G ", 8 << 30),
+        ] {
+            assert_eq!(parse_max_log_bytes(raw), Ok(expected), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn max_log_bytes_refusals_redirect_to_a_working_value() {
+        for raw in [
+            "",
+            "G",
+            "-1",
+            "8X",
+            "8.5G",
+            "8 G",
+            "99999999999999999999",
+            "20000000T",
+        ] {
+            let error = parse_max_log_bytes(raw).expect_err(raw);
+            assert!(
+                error.contains("e.g. --max-log-bytes=8G"),
+                "{raw:?}: {error}"
+            );
+        }
+        for raw in ["0", "0G"] {
+            let error = parse_max_log_bytes(raw).expect_err(raw);
+            assert!(
+                error.contains("Omit --max-log-bytes") && error.contains("8G"),
+                "{raw:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_sizes_render_in_the_accepted_spelling() {
+        for (bytes, expected) in [
+            (8u64 << 30, "8G"),
+            (1536 << 20, "1536M"),
+            (64 << 10, "64K"),
+            (3 << 40, "3T"),
+            (1000, "1000"),
+        ] {
+            assert_eq!(format_byte_size(bytes), expected);
+            assert_eq!(parse_max_log_bytes(expected), Ok(bytes));
+        }
+    }
+
+    #[test]
+    fn the_budget_reports_the_crossing_exactly_once() {
+        let budget = LogBudget::new(10).unwrap();
+        assert_eq!(budget.charge(4), Charge::Within);
+        assert_eq!(budget.charge(6), Charge::Within, "exactly the limit fits");
+        assert_eq!(budget.charge(1), Charge::Crossed);
+        assert_eq!(budget.charge(1), Charge::AlreadyOver);
+        assert_eq!(budget.charge(100), Charge::AlreadyOver);
+
+        let budget = LogBudget::new(10).unwrap();
+        assert_eq!(budget.charge(8), Charge::Within);
+        budget.refund(3);
+        assert_eq!(budget.spent(), 5);
+        assert_eq!(budget.charge(u64::MAX), Charge::Crossed, "no wraparound");
+    }
+
+    #[test]
+    fn capped_writer_counts_what_it_passes_through() {
+        let mut sink = Vec::new();
+        let budget = LogBudget::new(1 << 20).unwrap();
+        let mut writer = CappedWriter::new(&mut sink, Some(budget.clone()));
+        writer.write_all(b"hello ").unwrap();
+        writer.write_all(b"world\n").unwrap();
+        drop(writer);
+        assert_eq!(sink, b"hello world\n");
+        assert_eq!(budget.spent(), 12);
+
+        // Uncapped: identical output, nothing counted, nothing to abort.
+        let mut sink = Vec::new();
+        let mut writer = CappedWriter::new(&mut sink, None);
+        writer.write_all(&[b'x'; 4096]).unwrap();
+        drop(writer);
+        assert_eq!(sink.len(), 4096);
+    }
+
+    #[test]
+    fn capped_writer_counts_bytes_the_file_bound_discards() {
+        // The cap must still see a runaway after HERMIT_LOG_MAX_BYTES has
+        // stopped the file growing; that is why it wraps BoundedWriter.
+        let mut sink = Vec::new();
+        let budget = LogBudget::new(1 << 20).unwrap();
+        let mut writer = CappedWriter::new(BoundedWriter::new(&mut sink, 8), Some(budget.clone()));
+        for _ in 0..10 {
+            writer.write_all(&[b'z'; 100]).unwrap();
+        }
+        assert_eq!(budget.spent(), 1000);
+    }
+
+    /// End to end in a real process: the write that crosses the cap ends the
+    /// process with HERMIT_LOG_CAP_EXIT, the bytes before it are delivered, the
+    /// bytes of the crossing write are not, and the sink's last words name the
+    /// bound. Also proves the count is shared with a forked child.
+    #[test]
+    fn crossing_the_cap_exits_with_the_log_cap_status_and_says_why() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        let budget = LogBudget::new(100).unwrap();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: the child uses only preformatted data, atomics, write(2) and
+        // _exit, so it is safe after fork in a multithreaded test process.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                libc::close(read_fd);
+                // Keep the test runner's stderr clean.
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                libc::dup2(null, 2);
+                let mut writer =
+                    CappedWriter::new(std::fs::File::from_raw_fd(write_fd), Some(budget.clone()));
+                let _ = writer.write_all(&[b'a'; 60]);
+                let _ = writer.write_all(&[b'b'; 60]);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(write_fd) };
+        let mut output = Vec::new();
+        unsafe { std::fs::File::from_raw_fd(read_fd) }
+            .read_to_end(&mut output)
+            .unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
+
+        let text = String::from_utf8(output).unwrap();
+        let (delivered, message) = text.split_at(60);
+        assert_eq!(delivered, "a".repeat(60));
+        assert!(
+            !message.contains("bbbb"),
+            "the crossing write was not delivered"
+        );
+        assert!(
+            message.starts_with("hermit: log output exceeded --max-log-bytes=100 (100 bytes)"),
+            "{message}"
+        );
+        assert_eq!(
+            budget.spent(),
+            120,
+            "the child's charges are visible to the parent"
+        );
     }
 }

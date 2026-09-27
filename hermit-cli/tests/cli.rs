@@ -88,6 +88,7 @@ use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::GUEST_PROGRAM_NOT_EXECUTABLE_EXIT;
 use hermit::GUEST_PROGRAM_NOT_FOUND_EXIT;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use hermit::HERMIT_LOG_CAP_EXIT;
 use hermit::canonical_verdict::InfrastructureError;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
@@ -6104,6 +6105,117 @@ fn run_ptrace_nonleader_exec_refuses_preemption_artifacts() {
 #[test]
 fn run_kvm_nonleader_exec_is_policy_refusal() {
     kvm_nonleader_exec::run();
+}
+
+/// A guest that never stops, under a log level that makes hermit narrate it.
+/// Without `--max-log-bytes` this writes until the `--timeout` backstop; the
+/// 2026-08-17 incident was this shape at `--log=info`, ~4.5 TB per process.
+const LOG_CAP_NOISY_GUEST: [&str; 3] = ["/bin/sh", "-c", "while :; do /bin/true; done"];
+
+/// `--max-log-bytes` stops a run whose hermit log output runs away: exit 123
+/// (not the `--timeout` backstop's 124, not 125), the final stderr names the
+/// bound, and the stderr hermit wrote stays within cap + final report.
+#[test]
+fn max_log_bytes_aborts_a_run_whose_stderr_log_runs_away() {
+    let _lock = hermit_run_guard();
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+    let tail: String = stderr
+        .chars()
+        .rev()
+        .take(2000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "the log cap must end the run with its own status; stderr tail:\n{tail}"
+    );
+    assert!(
+        stderr.contains(
+            "hermit: log output exceeded --max-log-bytes=64K (65536 bytes); aborting the run"
+        ),
+        "{tail}"
+    );
+    assert!(stderr.contains("HERMIT_LOG_CAP class=log-cap"), "{tail}");
+    assert!(!stderr.contains("HERMIT_INTERNAL_FAILURE"), "{tail}");
+    // The guest's own output is empty, so all of this is hermit's: the capped
+    // log plus the fixed final report, not an unbounded stream.
+    assert!(
+        output.stderr.len() < 65536 + 4096,
+        "stderr was {} bytes",
+        output.stderr.len()
+    );
+}
+
+/// The same cap applies to `--log-file`, counting bytes before the
+/// HERMIT_LOG_MAX_BYTES truncation, and the file itself says why it ends.
+#[test]
+fn max_log_bytes_aborts_a_run_whose_log_file_runs_away() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "--log-file",
+        log.to_str().unwrap(),
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+    assert_eq!(output.status.code(), Some(HERMIT_LOG_CAP_EXIT), "{stderr}");
+    assert!(stderr.contains("exceeded --max-log-bytes=64K"), "{stderr}");
+    let written = fs::read_to_string(&log).unwrap();
+    assert!(
+        written.len() < 65536 + 4096,
+        "log was {} bytes",
+        written.len()
+    );
+    assert!(
+        written
+            .trim_end()
+            .ends_with("raise --max-log-bytes, to let the run finish."),
+        "the log file must end with the reason it ends:\n{}",
+        &written[written.len().saturating_sub(600)..]
+    );
+}
+
+/// The happy path: a run under its cap is unaffected, and a refused value
+/// tells the user what to pass instead.
+#[test]
+fn max_log_bytes_leaves_a_run_under_the_cap_alone_and_refuses_zero() {
+    let _lock = hermit_run_guard();
+    let args = ["--log=info", "--max-log-bytes=1G", "run", "--", "/bin/true"];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert!(!stderr(&output).contains("--max-log-bytes"));
+
+    let output = hermit(&["--max-log-bytes=0", "run", "--", "/bin/true"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let refusal = stderr(&output);
+    assert!(
+        refusal.contains("Omit --max-log-bytes") && refusal.contains("8G"),
+        "{refusal}"
+    );
+    let output = hermit(&["--max-log-bytes=eight", "run", "--", "/bin/true"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr(&output).contains("--max-log-bytes=8G"), "{output:?}");
 }
 
 /// `--log-file` must resolve on the HOST, exactly like a shell redirect.

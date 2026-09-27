@@ -185,6 +185,9 @@ impl RunData {
                 None
             },
             backend: self.analyze_opts.backend,
+            // Analyze's internal runs are not the invocation's public log.
+            max_log_bytes: None,
+            log_budget: None,
             log_file_handle: None,
             run_evidence_log_handle: None,
             run_evidence_write_error: None,

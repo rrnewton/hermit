@@ -20,7 +20,9 @@ use hermit::Backend;
 use tracing::metadata::LevelFilter;
 
 use super::tracing::BoundedWriter;
+use super::tracing::CappedWriter;
 use super::tracing::LatchedWriter;
+use super::tracing::LogBudget;
 use super::tracing::TracingGuard;
 use super::tracing::WriteErrorLatch;
 use super::tracing::init_file_tracing;
@@ -28,6 +30,7 @@ use super::tracing::init_file_tracing_with_evidence;
 use super::tracing::init_stderr_tracing;
 use super::tracing::init_stderr_tracing_with_evidence;
 use super::tracing::log_max_bytes;
+use super::tracing::parse_max_log_bytes;
 
 /// The target named by controller diagnostics written to `--log-file`. It is
 /// not a tracing target: these lines are written directly, before tracing
@@ -75,6 +78,24 @@ pub struct GlobalOpts {
     /// exactly like a shell redirect, not inside the container the guest runs in.
     #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE")]
     pub log_file: Option<PathBuf>,
+
+    /// Abort the run once hermit's own log output exceeds SIZE bytes in total.
+    ///
+    /// Counts every byte hermit's tracing writes to stderr or to --log-file
+    /// (including `run --verify`'s per-run logs, summed over the runs), measured
+    /// before the HERMIT_LOG_MAX_BYTES file truncation. The guest's own stdout
+    /// and stderr are not counted. When the cap is exceeded hermit prints
+    /// "log output exceeded --max-log-bytes=SIZE", kills the guest process tree
+    /// and exits 123 (class=log-cap). SIZE is a byte count with an optional
+    /// K/M/G/T suffix in powers of 1024, e.g. 8G. Omit the flag for no cap.
+    #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes)]
+    pub max_log_bytes: Option<u64>,
+
+    /// Process-shared byte total for `--max-log-bytes`, created by
+    /// [`GlobalOpts::prepare_log_budget`] before any container fork so the cap
+    /// is one total for the invocation. See [`LogBudget`].
+    #[clap(skip)]
+    pub(crate) log_budget: Option<LogBudget>,
 
     /// The log file, already opened in the HOST's filename namespace.
     ///
@@ -135,6 +156,33 @@ impl GlobalOpts {
             self.log_file_handle = Some(Arc::new(file));
         }
         Ok(())
+    }
+
+    /// Create the shared `--max-log-bytes` counter. Call from `main` before any
+    /// container exists, for the same fork reason as `open_log_file`.
+    pub fn prepare_log_budget(&mut self) -> Result<(), Error> {
+        if let (Some(limit), None) = (self.max_log_bytes, &self.log_budget) {
+            self.log_budget = Some(
+                LogBudget::new(limit).context("cannot map the shared --max-log-bytes counter")?,
+            );
+        }
+        Ok(())
+    }
+
+    /// The budget public log sinks charge, or `None` when uncapped.
+    ///
+    /// A caller that never ran `prepare_log_budget` still gets the cap it asked
+    /// for, counted per process rather than per invocation: silently dropping a
+    /// requested bound is the failure mode this flag exists to remove.
+    pub(crate) fn log_budget(&self) -> Option<LogBudget> {
+        match (&self.log_budget, self.max_log_bytes) {
+            (Some(budget), _) => Some(budget.clone()),
+            (None, Some(limit)) => Some(
+                LogBudget::new(limit)
+                    .unwrap_or_else(|e| panic!("cannot map the --max-log-bytes counter: {e}")),
+            ),
+            (None, None) => None,
+        }
     }
 
     /// Report controller context before tracing starts, using the selected host
@@ -227,7 +275,8 @@ impl GlobalOpts {
                 .try_clone()
                 .expect("cannot duplicate the host log file descriptor");
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer = BoundedWriter::new(file_writer, limit);
+            let file_writer =
+                CappedWriter::new(BoundedWriter::new(file_writer, limit), self.log_budget());
             if let Some(evidence) = self.run_evidence_writer(limit) {
                 Some(init_file_tracing_with_evidence(
                     self.log,
@@ -251,7 +300,8 @@ impl GlobalOpts {
             // typo in the value meant to DISABLE the bound cannot quietly
             // re-enable it.
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer = BoundedWriter::new(file_writer, limit);
+            let file_writer =
+                CappedWriter::new(BoundedWriter::new(file_writer, limit), self.log_budget());
             if let Some(evidence) = self.run_evidence_writer(limit) {
                 Some(init_file_tracing_with_evidence(
                     self.log,
@@ -267,10 +317,13 @@ impl GlobalOpts {
                 .run_evidence_writer(limit)
                 .expect("run-evidence handle was present");
             Some(init_stderr_tracing_with_evidence(
-                self.log, evidence, backend,
+                self.log,
+                evidence,
+                backend,
+                self.log_budget(),
             ))
         } else {
-            init_stderr_tracing(self.log, backend);
+            init_stderr_tracing(self.log, backend, self.log_budget());
             None
         }
     }
@@ -286,6 +339,8 @@ mod tests {
         GlobalOpts {
             log: None,
             log_file: Some(path),
+            max_log_bytes: None,
+            log_budget: None,
             log_file_handle: None,
             run_evidence_log_handle: None,
             run_evidence_write_error: None,

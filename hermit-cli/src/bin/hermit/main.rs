@@ -108,6 +108,7 @@ use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
+use self::container::LogCapExceeded;
 use self::container::PolicyRefusal;
 use self::container::RunTimeoutMarker;
 use self::container::SignalDeath;
@@ -560,7 +561,12 @@ fn main() {
     // exists. This is the moment a shell would perform `> file`, and doing it later
     // -- inside the container, where tracing must be initialized -- resolves the path
     // against the guest's fresh /tmp and silently discards the log.
-    let result = global.open_log_file().and_then(|()| command.main(&global));
+    // The --max-log-bytes counter is mapped here for the same reason: it must
+    // exist before the first container fork to be shared by every run.
+    let result = global
+        .prepare_log_budget()
+        .and_then(|()| global.open_log_file())
+        .and_then(|()| command.main(&global));
 
     // The manifest is the commit marker and is published only after the run
     // result and private log are final. Evidence failure is reported but cannot
@@ -651,6 +657,10 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<RunTimeoutMarker>().is_some() {
         return 124;
     }
+    // The --max-log-bytes cap is a bound working as designed, like the deadline.
+    if error.downcast_ref::<LogCapExceeded>().is_some() {
+        return hermit::HERMIT_LOG_CAP_EXIT;
+    }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
         None => HERMIT_INTERNAL_FAILURE_EXIT,
@@ -686,6 +696,11 @@ fn classify_failure(error: &Error) -> String {
     // out" without the bound it exceeded is the anonymous kill this replaces.
     if error.downcast_ref::<RunTimeoutMarker>().is_some() {
         return "HERMIT_RUN_TIMEOUT class=run-timeout".to_string();
+    }
+    // NOT HERMIT_INTERNAL_FAILURE either: the requested log cap fired and the
+    // writer that crossed it printed the bound before tearing the run down.
+    if error.downcast_ref::<LogCapExceeded>().is_some() {
+        return "HERMIT_LOG_CAP class=log-cap".to_string();
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {

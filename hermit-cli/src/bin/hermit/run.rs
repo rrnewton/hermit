@@ -80,6 +80,7 @@ use super::host_capabilities::exact_branch_counter_verdict;
 use super::host_capabilities::host_inexact_branch_counter;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
+use super::tracing::CappedWriter;
 use super::tracing::init_sync_file_tracing;
 use super::tracing::log_max_bytes;
 use super::verify::ComparedRun;
@@ -567,13 +568,13 @@ const FORWARDING_REFUSED_MARKER: &str = "HERMIT_DETLOG_FORWARDING_REFUSED";
 /// A verification run's log writer, shared between the tracing subscriber and
 /// the coordinator's forwarded records (`detcore::detlog::set_forwarded_source`).
 /// Each write takes the one lock for the whole buffer, so a record and a
-/// tracing event never interleave within a line, and both go through the
-/// log's byte bound.
+/// tracing event never interleave within a line, and both are counted against
+/// `--max-log-bytes` and go through the log's byte bound.
 #[derive(Clone)]
-struct SharedLog(std::sync::Arc<std::sync::Mutex<BoundedWriter<fs::File>>>);
+struct SharedLog(std::sync::Arc<std::sync::Mutex<CappedWriter<BoundedWriter<fs::File>>>>);
 
 impl SharedLog {
-    fn new(writer: BoundedWriter<fs::File>) -> Self {
+    fn new(writer: CappedWriter<BoundedWriter<fs::File>>) -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(writer)))
     }
 
@@ -6672,7 +6673,14 @@ impl RunOpts {
         // `init_sync_file_tracing`.
         // The coordinator writes forwarded records through this same writer, so
         // a record and a tracing event never share a line.
-        let log = SharedLog::new(BoundedWriter::new(log_file, limit));
+        //
+        // `--max-log-bytes` counts these logs too, forwarded records as well
+        // as tracing events, and its counter is shared across the verify runs,
+        // so the cap is a total for the invocation.
+        let log = SharedLog::new(CappedWriter::new(
+            BoundedWriter::new(log_file, limit),
+            global.log_budget(),
+        ));
         let _guard = init_sync_file_tracing(Some(level), log.clone(), self.runtime_backend());
 
         let command = self.guest_command()?;

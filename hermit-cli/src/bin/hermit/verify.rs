@@ -2066,6 +2066,7 @@ mod tests {
             101,
             detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
             hermit::HERMIT_DEADLINE_EXIT,
+            hermit::HERMIT_LOG_CAP_EXIT,
             detcore_model::signal_exit_status(libc::SIGTERM),
         ] {
             write_pending_verification_json(&path).unwrap();
@@ -2103,6 +2104,18 @@ mod tests {
                             .is_some()
                     );
                     assert_eq!(report, VerificationReport::no_result());
+                }
+                123 => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::LogCapExceeded>()
+                            .is_some()
+                    );
+                    assert_eq!(report, VerificationReport::no_result());
+                    assert_eq!(
+                        super::super::failure_exit_code(&error),
+                        hermit::HERMIT_LOG_CAP_EXIT
+                    );
                 }
                 _ => {
                     assert!(
@@ -2271,6 +2284,8 @@ mod tests {
         GlobalOpts {
             log,
             log_file: None,
+            max_log_bytes: None,
+            log_budget: None,
             log_file_handle: None,
             run_evidence_log_handle: None,
             run_evidence_write_error: None,

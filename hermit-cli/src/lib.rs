@@ -149,6 +149,21 @@ pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 /// refusal that arrives as 122 and needs its own arm for the same reason.
 pub const HERMIT_DEADLINE_EXIT: i32 = 124;
 
+/// Hermit's own log output exceeded `--max-log-bytes`: **123**.
+///
+/// The status hermit exits with when the byte budget on its tracing output
+/// (stderr, or `--log-file`) is exhausted and it deliberately tears the run
+/// down. 123 was already reserved below for "a LOG BYTE CAP fired" on behalf of
+/// dev-hermit's `bin/safehermit`; this is the same event enforced one layer
+/// lower, exactly as 124 is shared by hermit's `--timeout` and safehermit's wall
+/// deadline. It is not 125 because the cap working is not hermit breaking, and
+/// not 122 because no fail-closed determinism policy was involved: the remedy
+/// is "lower the log level or raise the cap", not "change the program".
+///
+/// Like 124, it must be read at the container boundary
+/// (`classify_container_result`) or it is rewritten to 125.
+pub const HERMIT_LOG_CAP_EXIT: i32 = 123;
+
 /// The guest program could not be found at all: **127**.
 ///
 /// Exported for the same reason as [`HERMIT_INTERNAL_FAILURE_EXIT`] and with the
@@ -209,9 +224,11 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              bug. Defined in `detcore-model` because `detcore` emits it and
 //              this crate recognises it, and that is the only crate both
 //              depend on.
-//   123        DO NOT USE. dev-hermit's `bin/safehermit` LOG BYTE CAP kill.
-//              It moved here FROM 125 so it would stop colliding with the line
-//              below; taking 123 back would undo that.
+//   123        HERMIT_LOG_CAP_EXIT -- a LOG BYTE CAP fired. Hermit's own
+//              `--max-log-bytes` budget on its tracing output, and the value
+//              reserved for dev-hermit's `bin/safehermit` log-cap kill (which,
+//              as of 2026-09-26, still exits 125 -- see the 125 note below).
+//              Hermit's spelling prints `HERMIT_LOG_CAP class=log-cap`.
 //   124        DO NOT USE. GNU `timeout`'s deadline, and dev-hermit's
 //              `bin/safehermit` WALL DEADLINE kill. `tests/cli.rs` asserts
 //              `assert_ne!(code, Some(124))` on the awk-mincore probe.
@@ -316,7 +333,12 @@ const _: () = assert!(
     "126 is the GNU found-but-not-executable convention and must stay distinct from 125 and 127"
 );
 const _: () = assert!(
-    HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
+    HERMIT_LOG_CAP_EXIT == 123,
+    "123 is the log-byte-cap code shared with bin/safehermit; see the allocation table"
+);
+const _: () = assert!(
+    HERMIT_LOG_CAP_EXIT != 0
+        && HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
         && HERMIT_INTERNAL_FAILURE_EXIT != 0
         && GUEST_PROGRAM_NOT_FOUND_EXIT != 0
         && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
