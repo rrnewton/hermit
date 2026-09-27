@@ -62,10 +62,13 @@ from the base.
   `/proc/uptime` (`calculate_uptime`) is unchanged. The current-source screen
   below reruns all 166 cells at the author base, and reruns these four ten
   times each.
-- **Base of this change.** The branch was rebased onto Hermit `main`
-  `55214f50e4dd` without conflicts, three commits after the author base. That
-  delta was not screened with LiteInst. It contains:
-  - a GDB helper test change (`hermit-cli/src/bin/hermit/gdb_client.rs`);
+- **Base of this change.** The branch is based on Hermit `main`
+  `bffdf33788ca`, two commits after the author base. It was first rebased
+  onto `55214f50e4dd`, which is `bffdf33788ca` plus one unrelated commit that
+  is not on `main` and only touches the GDB helper test
+  (`hermit-cli/src/bin/hermit/gdb_client.rs`); it was then rebased again
+  onto `bffdf33788ca` without conflicts, dropping that commit. The delta from
+  the author base was not screened with LiteInst. It contains:
   - the KVM process-retirement fence in `detcore/src/scheduler/` and
     `detcore/src/tool_global.rs`, with its tests and DAG test counts;
   - a Reverie pin move from `b0ede531` to `a1d07619`. Its changes are in
@@ -75,7 +78,7 @@ from the base.
   The new Detcore retirement fence is only armed when a backend installs
   `BackendSignalControl`. In the pinned Reverie source only `reverie-kvm`
   provides it. That the delta is inert for LiteInst is a reading of the
-  source, not a measurement. `git diff --quiet b63af4583a 55214f50e4 --
+  source, not a measurement. `git diff --quiet b63af4583a bffdf33788 --
   tests/e2e/manifests ci/manifest-plan/src/timeouts.rs` exits 0.
 
 ## What was measured and how
@@ -145,7 +148,7 @@ and `ci/compat-envelope/cells.json` come from `scorecard.rs update`,
 `ci/expected-e2e-plan.json` from `test-harness expected-plan`, and
 `ci/dag/validate.json` from `generate-validation-dag --write`.
 
-| Quantity | Before (55214f50e4) | After |
+| Quantity | Before (bffdf33788) | After |
 | --- | ---: | ---: |
 | LiteInst `verify`: selected / enabled but unselected / disabled (of 361) | 146 / 3 / 212 | 309 / 3 / 49 |
 | LiteInst, all modes: selected / not selected / not applicable (of 1,083) | 146 / 3 / 934 | 309 / 3 / 771 |
@@ -569,8 +572,10 @@ The original reasons remain below and in the immutable base, so selection is
 not read as a claim that an old failure never happened. Most are pending
 qualification.
 
-Four are capability claims the evidence contradicts. They say "preload
-runtime cannot survive … exec", yet the retained logs show
+Four are capability claims the evidence contradicts. Three say "The preload
+runtime cannot survive the … script's post-start exec" and
+`system-utils/clock-exec-continuity` says "The preload runtime does not
+survive the guest's own re-exec", yet the retained logs show
 `libreverie_liteinst.so` re-opened after every `execve`.
 
 One, `c-programs/pipe2-errno-precedence`, says "blocked by guest-visible
@@ -763,18 +768,19 @@ not establish"). The other cell carrying that reason,
   base, which cannot exclude a divergence of similar frequency. Full
   validation runs each selected cell once per run, so such a cell would
   appear as an intermittent red rather than be hidden.
-- **Every selected cell makes the read on which `sort-random` diverged.**
-  All 163 selected cells open and read `/proc/self/maps` between 24 and 327
-  times per run (openat records in the first retained log of each cell's
-  first qualification repetition; the maximum is
-  `system-utils/auxv-loader-dump`). Which component issues these reads was
-  not established. `sort-random` diverged on such a read, so the one known
-  divergence site is present in all selected cells, not in a rare subset. It is tracked as TaskGraph task `liteinst_maps_read_divergence`.
+- **Every selected cell opens the file on which `sort-random` diverged.**
+  All 163 selected cells open `/proc/self/maps` between 24 and 327 times per
+  run (openat records in the first retained log of each cell's first
+  qualification repetition; the maximum is `system-utils/auxv-loader-dump`).
+  Reads were not counted, and which component issues these opens was not
+  established. `sort-random` diverged on a read of this file, so every
+  selected cell opens the file behind the one known divergence site, not
+  only a rare subset. It is tracked as TaskGraph task `liteinst_maps_read_divergence`.
 - **Historical measurement.** The ten-repetition evidence is at `19553a64`.
   The author-base screen is one repetition per cell, plus ten for the four
   sysinfo cells. That screen bounds only a gross regression from the one-commit
   delta. It does not re-derive the calibration, and it does not cover the
-  three commits between the author base and `55214f50e4`.
+  two commits between the author base and `bffdf33788`.
 - **Out of scope.** Nothing here covers replay, chaos, memory determinism,
   arbitrary-program determinism, Linux semantic equivalence on unsupported
   paths, or readiness to replace ptrace.
