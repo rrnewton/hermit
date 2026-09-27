@@ -77,30 +77,56 @@ configuration is never read.
 
 ## DAG wiring
 
-The focused `test.recorded_clocks` node runs six maintained ptrace cases:
-captured clock output/errno replay, uncaptured clock refusal, previous-clock
-format refusal, the existing pre-flock format refusal, exec continuity, and
-thread clock ordering. Its hosted twin is
-assigned to the portable workflow's integration shard; both require exactly
-six executed tests. The `recorder-clock-focused` label prepares only the two
-default-feature harnesses and the 43 source-bound `record_replay` workloads.
-The flock fixture retains its existing runtime `cc` compilation inside the
-unchanged per-test bounds; it is not part of that prepared workload population.
-`build.recorded_clocks` runs before `build.workspace`, so full preparation is
-the last metadata publisher in broad profiles. An explicit focused selection
-must include the focused producer and test, in the same filesystem root;
-selecting only the test does not supply its prepared artifacts. The new
-producer adds a provisional 1200-second cold-build bound to the hosted debug
-job's existing 1800-second critical path. The selected path is now
-`setup.nextest` (600 seconds), focused preparation (1200 seconds), then
-`build.workspace` (1200 seconds). Its 55-minute outer budget covers those 3000
-seconds plus 300 seconds of setup and artifact overhead. The CI audit derives
-this path from the actual selected DAG nodes and compares it with the workflow
-bound; these are declared budgets, not a measured cold-build duration. The
-six tests retain their existing 22-second CPU and 57-second wall limits and
-zero retries. The original exec/thread cases now use the same strict INFO
-comparator as the captured-output replay case, retaining their existing guests
-and success assertions while also requiring canonical parity and nonempty logs.
+The `test.recorded_clocks` node runs six maintained ptrace cases: captured
+clock output/errno replay, uncaptured clock refusal, previous-clock format
+refusal, the existing pre-flock format refusal, exec continuity, and thread
+clock ordering. Its hosted twin is assigned to the portable workflow's
+integration shard; both require exactly six executed tests. Like
+`test.arbitrary_binaries` and `test.hermit_integration`, it has no producer of
+its own and consumes the broad preparation. `build.workspace` runs
+`prepare full` (`prepare hosted-portable` for the hosted twin), which prepares
+this node's exact
+`-p hermit --features third-party-backends --test record_replay --test flock_exclusion`
+selection together with the 43 source-bound `record_replay` workloads, and
+`build.e2e_artifact` orders the node after that producer. The flock fixture
+retains its existing runtime `cc` compilation inside the unchanged per-test
+bounds; it is not part of the prepared workload population.
+
+Every Hermit selection in the `full`, `portable` and `hosted-portable`
+profiles, and in every profile that a `prepare` command names, carries the
+canonical `third-party-backends` feature set. Every selection that builds a
+test target also rebuilds the uplifted `target/debug/hermit` that
+`CARGO_BIN_EXE_hermit` names, so a selection with different features would make
+that binary's code depend on which selection Cargo prepared last. The generator
+therefore refuses a Hermit selection that lacks the canonical feature, one that
+uses `--all-features`, and one that adds an executable-changing feature while
+building a test target. Harness-only `--lib`/`--bins` selections are not
+uplifted and may add test-support features. The invariant fixes the binary's
+code, not its bytes. `kvm-execution-tests`, which `privileged-test.cli_kvm`
+adds to its `--lib --test cli` selection, gates only test code, yet it still
+changes the uplifted file's bytes because Cargo hashes the enabled features into
+the build metadata. Preparation hashes the uplifted file only after its last
+selection, so every prepared record names the bytes its consumers run.
+
+`--only test.recorded_clocks` behaves like `--only` for every other broad
+consumer: it keeps the named node and the manifest-plan producers, drops the
+preparation, and the consumer refuses unless a current prepared record already
+exists. To build and test in one focused command, select the dependency
+closure instead:
+`./scripts/validate.rs portable --selected test.recorded_clocks --allow-local-off-the-record-run`
+runs the full preparation first. That run is off the record and cannot publish
+validation evidence.
+
+The hosted debug job's selected critical path is `setup.nextest` (600
+seconds) then `build.workspace` (1200 seconds): 1800 seconds. Its 35-minute
+outer budget covers those 1800 seconds plus 300 seconds of setup and artifact
+overhead. The CI audit derives this path from the actual selected DAG nodes and
+compares it with the workflow bound; these are declared budgets, not a measured
+cold-build duration. The six tests retain their existing 22-second CPU and
+57-second wall limits and zero retries. The original exec/thread cases now use
+the same strict INFO comparator as the captured-output replay case, retaining
+their existing guests and success assertions while also requiring canonical
+parity and nonempty logs.
 
 The serial consumer has a provisional 180-second CPU / 420-second wall bound.
 Six test CPU allowances total 132 seconds; the remaining 48 seconds account for
