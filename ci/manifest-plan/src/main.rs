@@ -118,6 +118,10 @@ struct PlanRow {
     timeout_seconds: i64,
     cpu_timeout_seconds: i64,
     attempts: Option<i64>,
+    /// The verify cell's declared nonzero guest disposition, verbatim from
+    /// `modes.verify.expected_guest_exit`. Pressure qualification needs it to
+    /// accept a matched comparison that ends with exactly that disposition.
+    expected_guest_exit: Option<ExpectedGuestExit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,6 +420,7 @@ fn main() {
                         "timeout_seconds": row.timeout_seconds,
                         "cpu_timeout_seconds": row.cpu_timeout_seconds,
                         "attempts": row.attempts,
+                        "expected_guest_exit": row.expected_guest_exit,
                     })
                 })
                 .collect();
@@ -1263,6 +1268,7 @@ fn validate_mode_with_cpu(
             .as_str()
             .unwrap_or_else(|| die(format!("{id}: modes.{mode}.workdir must be a string")))
     });
+    let mut expected_guest_exit: Option<ExpectedGuestExit> = None;
     if mode == "verify" {
         if let Some(assert) = spec.get("assert") {
             ensure_keys(
@@ -1324,10 +1330,9 @@ fn validate_mode_with_cpu(
             )),
             (None | Some(true), None) => {}
         }
-        let expected_guest_exit: Option<ExpectedGuestExit> =
-            spec.get("expected_guest_exit").map(|value| {
-                parse_schema_value(value, &format!("{id}: modes.verify.expected_guest_exit"))
-            });
+        expected_guest_exit = spec.get("expected_guest_exit").map(|value| {
+            parse_schema_value(value, &format!("{id}: modes.verify.expected_guest_exit"))
+        });
         validate_expected_guest_exit(id, mode, expected_guest_exit.as_ref())
             .unwrap_or_else(|error| die(error));
     }
@@ -1627,6 +1632,7 @@ fn validate_mode_with_cpu(
             timeout_seconds,
             cpu_timeout_seconds,
             attempts,
+            expected_guest_exit: expected_guest_exit.clone(),
         });
     }
     for (backend, reason) in disabled {
@@ -1646,6 +1652,7 @@ fn validate_mode_with_cpu(
             timeout_seconds: inherited_timeout_seconds,
             cpu_timeout_seconds: inherited_cpu_timeout_seconds,
             attempts,
+            expected_guest_exit: expected_guest_exit.clone(),
         });
     }
 }
@@ -1914,6 +1921,74 @@ liteinst = "unsupported"
             &spec,
             &mut Vec::new(),
         );
+    }
+
+    #[test]
+    fn plan_rows_carry_the_declared_expected_guest_exit() {
+        let declared = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[expected_guest_exit]
+signal = 11
+reason = "the fixture guest dies by SIGSEGV on purpose"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &declared,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 5);
+        let expected = ExpectedGuestExit {
+            code: None,
+            signal: Some(11),
+            reason: "the fixture guest dies by SIGSEGV on purpose".into(),
+        };
+        for row in &rows {
+            assert_eq!(
+                row.expected_guest_exit.as_ref(),
+                Some(&expected),
+                "{}",
+                row.backend
+            );
+        }
+
+        let undeclared = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &undeclared,
+            &mut rows,
+        );
+        assert!(rows.iter().all(|row| row.expected_guest_exit.is_none()));
     }
 
     #[test]
