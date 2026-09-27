@@ -73,7 +73,14 @@ building it also snapshots the canonical `libunwind-ptrace.a`,
 `libunwind-x86_64.so.8`, and transitive `libunwind.so.8` as one
 content-addressed declared Buck package. Their archive/ELF type, SONAME,
 DT_NEEDED closure, hashes, copied bytes, package text, and exact no-extra-file
-population are reverified. The release executable carries only the reviewed
+population are reverified. Exactly two DT_NEEDED profiles are accepted, and
+both libraries must match the same one: the narrow profile (libc and the
+loader beside the libunwind pair, as on CentOS) and the lzma profile, which
+adds `liblzma.so.5` to each library for Ubuntu's MiniDebugInfo support. Like
+libc, `liblzma.so.5` is a host base library rather than part of the copied
+closure; the declared link input above binds that SONAME's build-time bytes,
+not the copy the loader resolves at run time. The package text records which
+profile matched. The release executable carries only the reviewed
 two-component relative DT_RPATH for direct `target/{ci,release}` use and the
 published E2E layout; DT_RUNPATH, absolute, empty, and ambient components
 refuse. Both shared libraries are immutable regular files under
@@ -378,6 +385,12 @@ same content-bound libraries through its relative DT_RPATH. Direct release
 consumers use the strict path; E2E consumers receive the same bytes and runtime
 closure through the existing verified binary-plus-resource publisher. Cargo
 still supplies the remaining complete backend resource bundle in both modes.
+A runtime-only bundle's `install/` holds just that closure, so
+`ci/run-with-hermit-e2e-artifact.sh --require-install` admits only a verified
+`complete` kind rather than any bundle with an `install/` directory. The
+publisher and verifier inventory every entry of a runtime closure, including
+directories and special files, and refuse any special file in a complete
+bundle, which its regular-file manifest could not bind.
 
 ## On a Meta host
 

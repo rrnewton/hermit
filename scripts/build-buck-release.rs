@@ -219,6 +219,47 @@ struct UnwindClosure {
     core_shared: PathBuf,
 }
 
+/// The exact DT_NEEDED closures a libunwind runtime pair may have.
+///
+/// There are exactly two, and both libraries must agree on one of them.
+/// `Narrow` is the CentOS/Fedora build. `Lzma` is the Ubuntu 24.04 build,
+/// whose libunwind is configured with MiniDebugInfo support and so names
+/// `liblzma.so.5` from both libraries. `liblzma.so.5` is a host-provided base
+/// library, like `libc.so.6`: the runtime bundle carries only libunwind, and
+/// the release build already binds the host liblzma by content as its declared
+/// link input. Any other DT_NEEDED set, or a pair that mixes the two profiles,
+/// matches neither and is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnwindProfile {
+    Narrow,
+    Lzma,
+}
+
+const UNWIND_PROFILES: [UnwindProfile; 2] = [UnwindProfile::Narrow, UnwindProfile::Lzma];
+
+impl UnwindProfile {
+    fn name(self) -> &'static str {
+        match self {
+            UnwindProfile::Narrow => "narrow",
+            UnwindProfile::Lzma => "lzma",
+        }
+    }
+
+    fn arch_needed(self) -> &'static [&'static str] {
+        match self {
+            UnwindProfile::Narrow => &[UNWIND_CORE_SONAME, "libc.so.6"],
+            UnwindProfile::Lzma => &[UNWIND_CORE_SONAME, "libc.so.6", LZMA_SONAME],
+        }
+    }
+
+    fn core_needed(self) -> &'static [&'static str] {
+        match self {
+            UnwindProfile::Narrow => &["ld-linux-x86-64.so.2", "libc.so.6"],
+            UnwindProfile::Lzma => &["ld-linux-x86-64.so.2", "libc.so.6", LZMA_SONAME],
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct UnwindBuckInput {
     sources: UnwindClosure,
@@ -1194,6 +1235,23 @@ fn verify_shared_library(
     Ok(())
 }
 
+/// Verify a libunwind architecture/core pair and name the one profile it has.
+fn verify_unwind_shared_pair(arch: &Path, core: &Path) -> Result<UnwindProfile, String> {
+    let mut refusals = Vec::new();
+    for profile in UNWIND_PROFILES {
+        let verdict = verify_shared_library(arch, UNWIND_ARCH_SONAME, profile.arch_needed())
+            .and_then(|()| verify_shared_library(core, UNWIND_CORE_SONAME, profile.core_needed()));
+        match verdict {
+            Ok(()) => return Ok(profile),
+            Err(error) => refusals.push(format!("{}: {error}", profile.name())),
+        }
+    }
+    Err(format!(
+        "libunwind runtime pair matches no reviewed closure profile; {}",
+        refusals.join("; ")
+    ))
+}
+
 fn verify_static_archive(path: &Path) -> Result<(), String> {
     let path = require_nonempty_regular_file(path, "canonical libunwind-ptrace archive")?;
     let mut magic = [0_u8; 8];
@@ -1232,16 +1290,7 @@ fn require_unwind_closure() -> Result<UnwindClosure, String> {
         )?,
     };
     verify_static_archive(&closure.ptrace_archive)?;
-    verify_shared_library(
-        &closure.arch_shared,
-        UNWIND_ARCH_SONAME,
-        &[UNWIND_CORE_SONAME, "libc.so.6"],
-    )?;
-    verify_shared_library(
-        &closure.core_shared,
-        UNWIND_CORE_SONAME,
-        &["ld-linux-x86-64.so.2", "libc.so.6"],
-    )?;
+    verify_unwind_shared_pair(&closure.arch_shared, &closure.core_shared)?;
     Ok(closure)
 }
 
@@ -1268,7 +1317,7 @@ fn unwind_content_identity(hashes: &BTreeMap<String, String>) -> Result<String, 
     sha256_bytes(manifest.as_bytes())
 }
 
-fn verify_unwind_buck_input(input: &UnwindBuckInput) -> Result<(), String> {
+fn verify_unwind_buck_input(input: &UnwindBuckInput) -> Result<UnwindProfile, String> {
     let root_metadata = fs::symlink_metadata(&input.root).map_err(|error| {
         format!(
             "declared libunwind input {} is unreadable: {error}",
@@ -1314,15 +1363,9 @@ fn verify_unwind_buck_input(input: &UnwindBuckInput) -> Result<(), String> {
         }
     }
     verify_static_archive(&input.root.join(UNWIND_PTRACE_ARCHIVE))?;
-    verify_shared_library(
+    let profile = verify_unwind_shared_pair(
         &input.root.join(UNWIND_ARCH_SONAME),
-        UNWIND_ARCH_SONAME,
-        &[UNWIND_CORE_SONAME, "libc.so.6"],
-    )?;
-    verify_shared_library(
         &input.root.join(UNWIND_CORE_SONAME),
-        UNWIND_CORE_SONAME,
-        &["ld-linux-x86-64.so.2", "libc.so.6"],
     )?;
     let buck = fs::read_to_string(require_nonempty_regular_file(
         &input.root.join("BUCK"),
@@ -1335,7 +1378,7 @@ fn verify_unwind_buck_input(input: &UnwindBuckInput) -> Result<(), String> {
     if unwind_content_identity(&input.source_sha256)? != input.identity {
         return Err("declared libunwind input identity does not match its source hashes".into());
     }
-    Ok(())
+    Ok(profile)
 }
 
 fn publish_unwind_buck_input(
@@ -1382,7 +1425,7 @@ fn publish_unwind_buck_input(
                 UNWIND_BUCK_PACKAGE.as_bytes(),
                 "declared libunwind BUCK package",
             )?;
-            verify_unwind_buck_input(&temporary_input)
+            verify_unwind_buck_input(&temporary_input).map(|_profile| ())
         })();
         if let Err(error) = copy_result {
             let _ = fs::remove_dir_all(&temporary);
@@ -1399,7 +1442,7 @@ fn publish_unwind_buck_input(
         }
     }
     let input = make_input(published);
-    verify_unwind_buck_input(&input)?;
+    let profile = verify_unwind_buck_input(&input)?;
     let rows = input
         .source_sha256
         .iter()
@@ -1413,8 +1456,11 @@ fn publish_unwind_buck_input(
     atomic_write_new(
         &evidence_dir.join("unwind-input.tsv"),
         &format!(
-            "schema\thermit-buck-unwind-input/v1\nidentity\t{}\ntarget\t{}\n{}",
-            input.identity, input.target, rows
+            "schema\thermit-buck-unwind-input/v2\nidentity\t{}\ntarget\t{}\nprofile\t{}\n{}",
+            input.identity,
+            input.target,
+            profile.name(),
+            rows
         ),
     )?;
     Ok(input)
@@ -2990,16 +3036,7 @@ fn verify_runtime_directory(
         &runtime.join(UNWIND_CORE_SONAME),
         "installed libunwind core runtime",
     )?;
-    verify_shared_library(
-        &arch,
-        UNWIND_ARCH_SONAME,
-        &[UNWIND_CORE_SONAME, "libc.so.6"],
-    )?;
-    verify_shared_library(
-        &core,
-        UNWIND_CORE_SONAME,
-        &["ld-linux-x86-64.so.2", "libc.so.6"],
-    )?;
+    verify_unwind_shared_pair(&arch, &core)?;
     let actual = BTreeMap::from([
         (UNWIND_ARCH_SONAME.to_owned(), sha256(&arch)?),
         (UNWIND_CORE_SONAME.to_owned(), sha256(&core)?),
@@ -7636,6 +7673,73 @@ mod tests {
         ))
     }
 
+    /// Stub libunwind libraries whose DT_NEEDED sets are exactly the narrow
+    /// profile plus the given extra SONAMEs, built here so the closure
+    /// contract is tested without depending on the host's libunwind package.
+    fn fixture_unwind_closure(dir: &Path, arch_extra: &[&str], core_extra: &[&str]) -> UnwindClosure {
+        let build = dir.join("build");
+        let deps = build.join("deps");
+        fs::create_dir_all(&deps).unwrap();
+        let stub = build.join("stub.c");
+        fs::write(&stub, b"int hermit_fixture_stub(void) { return 0; }\n").unwrap();
+        let shared = |output: &Path, soname: &str, links: &[String]| {
+            let mut command = Command::new("gcc");
+            command
+                .args(["-shared", "-fPIC"])
+                .arg(&stub)
+                .arg(format!("-Wl,-soname,{soname}"))
+                .arg("-Wl,--no-as-needed")
+                .args(links)
+                .arg("-o")
+                .arg(output);
+            checked_output(&mut command, &format!("compile fixture {soname}")).unwrap();
+        };
+        let mut extras = arch_extra.to_vec();
+        extras.extend_from_slice(core_extra);
+        extras.sort_unstable();
+        extras.dedup();
+        for soname in extras {
+            shared(&deps.join(soname), soname, &[]);
+        }
+        let with_extras = |mut links: Vec<String>, extra: &[&str]| {
+            links.push(format!("-L{}", deps.display()));
+            links.extend(extra.iter().map(|soname| format!("-l:{soname}")));
+            links
+        };
+        let core = dir.join(UNWIND_CORE_SONAME);
+        shared(
+            &core,
+            UNWIND_CORE_SONAME,
+            &with_extras(vec!["-l:ld-linux-x86-64.so.2".to_owned()], core_extra),
+        );
+        let arch = dir.join(UNWIND_ARCH_SONAME);
+        shared(
+            &arch,
+            UNWIND_ARCH_SONAME,
+            &with_extras(
+                vec![format!("-L{}", dir.display()), format!("-l:{UNWIND_CORE_SONAME}")],
+                arch_extra,
+            ),
+        );
+        let object = build.join("stub.o");
+        checked_output(
+            Command::new("gcc").args(["-c", "-fPIC"]).arg(&stub).arg("-o").arg(&object),
+            "compile fixture libunwind-ptrace member",
+        )
+        .unwrap();
+        let archive = dir.join(UNWIND_PTRACE_ARCHIVE);
+        checked_output(
+            Command::new("ar").arg("rcs").arg(&archive).arg(&object),
+            "archive fixture libunwind-ptrace",
+        )
+        .unwrap();
+        UnwindClosure {
+            ptrace_archive: archive,
+            arch_shared: arch,
+            core_shared: core,
+        }
+    }
+
     fn gzip_member(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzBuilder::new()
             .mtime(0)
@@ -9245,8 +9349,14 @@ mod tests {
         .unwrap();
         let evidence = root.join("evidence");
         fs::create_dir_all(&evidence).unwrap();
-        let unwind =
-            publish_unwind_buck_input(&root, &evidence, require_unwind_closure().unwrap()).unwrap();
+        let unwind_sources = root.join("unwind-sources");
+        fs::create_dir_all(&unwind_sources).unwrap();
+        let unwind = publish_unwind_buck_input(
+            &root,
+            &evidence,
+            fixture_unwind_closure(&unwind_sources, &[], &[]),
+        )
+        .unwrap();
         let runtime_install = prepare_runtime_install(&evidence, &unwind).unwrap();
         // The caller bundle matches the DAG's prepared install: complete, but
         // without a hermit-runtime closure, which only the overlay supplies.
@@ -9345,9 +9455,14 @@ mod tests {
         .unwrap();
         let unwind_evidence = root.join("unwind-evidence");
         fs::create_dir_all(&unwind_evidence).unwrap();
-        let unwind =
-            publish_unwind_buck_input(&root, &unwind_evidence, require_unwind_closure().unwrap())
-                .unwrap();
+        let unwind_sources = root.join("unwind-sources");
+        fs::create_dir_all(&unwind_sources).unwrap();
+        let unwind = publish_unwind_buck_input(
+            &root,
+            &unwind_evidence,
+            fixture_unwind_closure(&unwind_sources, &[], &[]),
+        )
+        .unwrap();
         let caller = root.join("caller-install");
         write_complete_install(&caller, &"1".repeat(40));
         fs::remove_dir_all(caller.join(UNWIND_RUNTIME_RELATIVE)).unwrap();
@@ -9454,6 +9569,7 @@ esac
         fs::create_dir_all(root.join("ci")).unwrap();
         for name in [
             "publish-hermit-e2e-artifact.sh",
+            "run-with-hermit-e2e-artifact.sh",
             "verify-hermit-e2e-artifact.sh",
         ] {
             fs::copy(
@@ -9469,9 +9585,14 @@ esac
             b"#include <stdio.h>\nint main(void) { puts(\"{}\"); return 0; }\n",
         )
         .unwrap();
+        // Outside the fixture repository, which must stay exactly as staged.
+        let unwind_sources = fixture_root("validate-dag-unwind");
+        fs::create_dir_all(&unwind_sources).unwrap();
+        let unwind_closure = fixture_unwind_closure(&unwind_sources, &[], &[]);
         checked_output(
             Command::new("gcc")
                 .arg(&candidate_source)
+                .arg(format!("-L{}", unwind_sources.display()))
                 .args([
                     "-Wl,--no-as-needed",
                     "-lgcc_s",
@@ -9497,12 +9618,8 @@ esac
         let head = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let pointer = root.join("ignored/buck2-phase2/test-publisher.path");
         fs::create_dir_all(pointer.parent().unwrap()).unwrap();
-        let unwind = publish_unwind_buck_input(
-            &root,
-            pointer.parent().unwrap(),
-            require_unwind_closure().unwrap(),
-        )
-        .unwrap();
+        let unwind =
+            publish_unwind_buck_input(&root, pointer.parent().unwrap(), unwind_closure).unwrap();
         let runtime_install = prepare_runtime_install(pointer.parent().unwrap(), &unwind).unwrap();
         checked_output(
             Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
@@ -9549,6 +9666,53 @@ esac
             runtime_hashes(&unwind),
         );
 
+        let consume = |pointer: &Path, require_install: bool| {
+            let mut command = Command::new(root.join("ci/run-with-hermit-e2e-artifact.sh"));
+            if require_install {
+                command.arg("--require-install");
+            }
+            checked_output(
+                command
+                    .args(["sh", "-c", "printf %s \"$HERMIT_INSTALL_DIR\""])
+                    .env("HERMIT_E2E_ARTIFACT_POINTER", pointer),
+                "fixture artifact consumer",
+            )
+        };
+        let verify = |pointer: &Path| {
+            checked_output(
+                Command::new(root.join("ci/verify-hermit-e2e-artifact.sh")).arg(pointer),
+                "fixture artifact verification",
+            )
+        };
+        // A runtime-only bundle has install/ too, but only the unwind closure.
+        let runtime_failure = consume(&pointer, true).unwrap_err();
+        assert!(
+            runtime_failure.contains("consumer requires a complete resource bundle"),
+            "{runtime_failure}"
+        );
+        assert_eq!(
+            String::from_utf8(consume(&pointer, false).unwrap().stdout).unwrap(),
+            bundle.join("install").display().to_string()
+        );
+        // Every entry of the published closure is inventoried, not only files.
+        let runtime_dir = bundle.join("install").join(UNWIND_RUNTIME_RELATIVE);
+        let fifo = runtime_dir.join("extra.fifo");
+        checked_output(Command::new("mkfifo").arg(&fifo), "make fixture FIFO").unwrap();
+        let fifo_failure = verify(&pointer).unwrap_err();
+        assert!(fifo_failure.contains("outside the exact unwind closure"), "{fifo_failure}");
+        fs::remove_file(&fifo).unwrap();
+        for extra_directory in [runtime_dir.join("extra.d"), bundle.join("install/rsrcs/extra.d")] {
+            fs::create_dir(&extra_directory).unwrap();
+            let directory_failure = verify(&pointer).unwrap_err();
+            assert!(
+                directory_failure.contains("outside the exact unwind closure"),
+                "{}: {directory_failure}",
+                extra_directory.display()
+            );
+            fs::remove_dir(&extra_directory).unwrap();
+        }
+        verify(&pointer).unwrap();
+
         let complete_install = root.join("complete-install");
         write_complete_install(&complete_install, &"1".repeat(40));
         let complete_pointer = root.join("ignored/buck2-phase2/complete-artifact.path");
@@ -9567,6 +9731,32 @@ esac
             fs::read_to_string(complete_bundle.join("runtime-contract")).unwrap(),
             "elf-rpath-v1\n"
         );
+        assert_eq!(
+            String::from_utf8(consume(&complete_pointer, true).unwrap().stdout).unwrap(),
+            complete_bundle.join("install").display().to_string()
+        );
+        // The manifest binds regular files only, so a special file is refused.
+        let complete_fifo = complete_bundle.join("install/rsrcs/extra.fifo");
+        checked_output(Command::new("mkfifo").arg(&complete_fifo), "make fixture FIFO").unwrap();
+        let complete_fifo_failure = consume(&complete_pointer, true).unwrap_err();
+        assert!(
+            complete_fifo_failure.contains("non-regular entry outside its manifest"),
+            "{complete_fifo_failure}"
+        );
+        fs::remove_file(&complete_fifo).unwrap();
+        // A directory is not a special file; only the closure inventory sees it.
+        let complete_runtime_directory = complete_bundle
+            .join("install")
+            .join(UNWIND_RUNTIME_RELATIVE)
+            .join("extra.d");
+        fs::create_dir(&complete_runtime_directory).unwrap();
+        let complete_directory_failure = verify(&complete_pointer).unwrap_err();
+        assert!(
+            complete_directory_failure.contains("outside the exact unwind closure"),
+            "{complete_directory_failure}"
+        );
+        fs::remove_dir(&complete_runtime_directory).unwrap();
+        verify(&complete_pointer).unwrap();
         let extra_runtime = complete_install.join(UNWIND_RUNTIME_RELATIVE).join("extra.so");
         fs::write(&extra_runtime, b"extra runtime\n").unwrap();
         let extra_failure = checked_output(
@@ -9606,6 +9796,26 @@ esac
             "{extra_directory_failure}"
         );
         fs::remove_dir(extra_directory).unwrap();
+        // Refused before anything is moved into the artifact root.
+        let source_fifo = complete_install.join("rsrcs/extra.fifo");
+        checked_output(Command::new("mkfifo").arg(&source_fifo), "make fixture FIFO").unwrap();
+        let fifo_artifacts = root.join("fifo-artifacts");
+        let source_fifo_failure = checked_output(
+            Command::new(root.join("ci/publish-hermit-e2e-artifact.sh")).args([
+                candidate.as_os_str(),
+                fifo_artifacts.as_os_str(),
+                root.join("ignored/buck2-phase2/fifo.path").as_os_str(),
+                complete_install.as_os_str(),
+            ]),
+            "refuse a special file in a complete resource bundle",
+        )
+        .unwrap_err();
+        assert!(
+            source_fifo_failure.contains("non-regular entry outside its manifest"),
+            "{source_fifo_failure}"
+        );
+        assert_eq!(fs::read_dir(&fifo_artifacts).unwrap().count(), 0);
+        fs::remove_file(&source_fifo).unwrap();
         let fake_bin = root.join("fake-readelf-bin");
         fs::create_dir(&fake_bin).unwrap();
         write_executable(&fake_bin.join("readelf"), b"#!/bin/sh\nexit 1\n");
@@ -9665,6 +9875,7 @@ esac
         fs::write(bundle.join("hermit"), b"mutated after publication\n").unwrap();
         assert!(install_validate_dag_artifact(&root).is_err());
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(unwind_sources).unwrap();
     }
 
     #[test]
@@ -9715,15 +9926,7 @@ esac
         let evidence = root.join("ignored/evidence");
         fs::create_dir_all(&source_root).unwrap();
         fs::create_dir_all(&evidence).unwrap();
-        let host = require_unwind_closure().unwrap();
-        for (name, source) in unwind_sources(&host) {
-            fs::copy(source, source_root.join(name)).unwrap();
-        }
-        let sources = UnwindClosure {
-            ptrace_archive: source_root.join(UNWIND_PTRACE_ARCHIVE),
-            arch_shared: source_root.join(UNWIND_ARCH_SONAME),
-            core_shared: source_root.join(UNWIND_CORE_SONAME),
-        };
+        let sources = fixture_unwind_closure(&source_root, &[], &[]);
         let input = publish_unwind_buck_input(&root, &evidence, sources).unwrap();
         assert!(input
             .target
@@ -9803,6 +10006,58 @@ esac
 
         fs::write(&input.sources.core_shared, b"changed source\n").unwrap();
         assert!(verify_unwind_buck_input(&input).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unwind_closure_accepts_exactly_the_two_reviewed_profiles() {
+        let root = fixture_root("unwind-profiles");
+        let closure = |label: &str, arch_extra: &[&str], core_extra: &[&str]| {
+            let dir = root.join(label);
+            fs::create_dir_all(&dir).unwrap();
+            let closure = fixture_unwind_closure(&dir, arch_extra, core_extra);
+            let verdict = verify_unwind_shared_pair(&closure.arch_shared, &closure.core_shared);
+            (closure, verdict)
+        };
+
+        let (_, narrow) = closure("narrow", &[], &[]);
+        assert_eq!(narrow, Ok(UnwindProfile::Narrow));
+        // Ubuntu 24.04's libunwind8 names liblzma.so.5 from both libraries.
+        let (lzma_closure, lzma) = closure("lzma", &[LZMA_SONAME], &[LZMA_SONAME]);
+        assert_eq!(lzma, Ok(UnwindProfile::Lzma));
+
+        // A pair that mixes the profiles, or names anything else, is refused.
+        for (label, arch_extra, core_extra) in [
+            ("arch-only-lzma", &[LZMA_SONAME][..], &[][..]),
+            ("core-only-lzma", &[][..], &[LZMA_SONAME][..]),
+            ("stray", &["libstray.so.1"][..], &["libstray.so.1"][..]),
+            ("lzma-and-stray", &[LZMA_SONAME, "libstray.so.1"][..], &[LZMA_SONAME][..]),
+            ("unversioned-lzma", &["liblzma.so"][..], &["liblzma.so"][..]),
+        ] {
+            let (_, verdict) = closure(label, arch_extra, core_extra);
+            let error = verdict.expect_err(label);
+            assert!(
+                error.contains("matches no reviewed closure profile")
+                    && error.contains("narrow:")
+                    && error.contains("lzma:"),
+                "{label}: {error}"
+            );
+        }
+
+        // The lzma profile travels through publication and the installed
+        // runtime bundle, and the evidence names the profile it matched.
+        let evidence = root.join("ignored/evidence");
+        fs::create_dir_all(&evidence).unwrap();
+        let input = publish_unwind_buck_input(&root, &evidence, lzma_closure).unwrap();
+        assert_eq!(verify_unwind_buck_input(&input), Ok(UnwindProfile::Lzma));
+        let rows = fs::read_to_string(evidence.join("unwind-input.tsv")).unwrap();
+        assert!(rows.starts_with("schema\thermit-buck-unwind-input/v2\n"), "{rows}");
+        assert!(rows.contains("\nprofile\tlzma\n"), "{rows}");
+        let runtime = prepare_runtime_install(&evidence, &input).unwrap();
+        assert_eq!(
+            verify_runtime_install(&runtime, &runtime_hashes(&input)).unwrap(),
+            runtime_hashes(&input)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

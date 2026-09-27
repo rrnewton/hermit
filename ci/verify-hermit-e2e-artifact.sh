@@ -54,7 +54,9 @@ function require_runtime_closure {
         [[ -f $runtime/$path && ! -L $runtime/$path && -s $runtime/$path ]] ||
             fail "runtime bundle is missing, empty, or linked: $runtime/$path"
     done
-    actual=$(cd "$runtime" && find . -type f -o -type l | LC_ALL=C sort)
+    # Every entry, not only files and links: an extra directory, FIFO or
+    # socket is also outside the closure.
+    actual=$(cd "$runtime" && find . -mindepth 1 | LC_ALL=C sort)
     [[ $actual == $'./libunwind-x86_64.so.8\n./libunwind.so.8' ]] ||
         fail "runtime bundle contains files outside the exact unwind closure: $runtime"
 }
@@ -84,8 +86,8 @@ function require_complete_resources {
 function require_runtime_resources {
     local install=$1 actual
     require_runtime_closure "$install/rsrcs/hermit-runtime"
-    actual=$(cd "$install" && find . -type f -o -type l | LC_ALL=C sort)
-    [[ $actual == $'./rsrcs/hermit-runtime/libunwind-x86_64.so.8\n./rsrcs/hermit-runtime/libunwind.so.8' ]] ||
+    actual=$(cd "$install" && find . -mindepth 1 | LC_ALL=C sort)
+    [[ $actual == $'./rsrcs\n./rsrcs/hermit-runtime\n./rsrcs/hermit-runtime/libunwind-x86_64.so.8\n./rsrcs/hermit-runtime/libunwind.so.8' ]] ||
         fail "runtime bundle contains files outside the exact unwind closure: $install"
 }
 
@@ -135,6 +137,10 @@ if [[ $kind == complete ]]; then
         *) fail "unknown complete-artifact runtime contract '$runtime_contract': $bundle" ;;
     esac
     require_complete_resources "$bundle/install" "$declared"
+    # The manifest hashes regular files only, so anything else would ride along
+    # unbound. The publisher copies without links; a special file never belongs.
+    special=$(find "$bundle/install" -mindepth 1 ! -type f ! -type d -print -quit)
+    [[ -z $special ]] || fail "complete artifact contains a non-regular entry outside its manifest: $special"
     [[ -f $bundle/resources.sha256 ]] || fail "complete artifact has no resource manifest: $bundle"
     generated=$(mktemp)
     trap 'rm -f "$generated"' EXIT
