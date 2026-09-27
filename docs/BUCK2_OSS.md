@@ -334,11 +334,17 @@ built with `-Cdebug-assertions=no -Coverflow-checks=no -Copt-level=3`. The
 ledger row records this as `release_builder` (`cargo` or `buck`) and
 `e2e_payload`, which gives the path, profile, and both check settings.
 
-Every consumer reads `release_builder` and `e2e_payload` together. A row
-names a builder only when both fields are present, the builder is `cargo` or
-`buck`, and `e2e_payload` equals exactly that builder's identity. A row with
-neither field predates both and is a Cargo run. Any other combination names no
-builder, so it counts as neither Cargo nor Buck evidence. `e2e_payload` is
+Every consumer reads `release_builder` and `e2e_payload` together. A row that
+carries both keys names a builder only when the builder is `cargo` or `buck`
+and `e2e_payload` equals exactly that builder's identity. A row that carries
+neither key is a Cargo run only when it predates the pair: its
+`schema_version` is an integer in 1 through 7 or 10, and it is either a
+Reverie row (`repo` is `reverie` or `rrnewton/reverie`), which needs no date,
+or a Hermit row (`repo` is `hermit`, `rrnewton/hermit`, absent or null) whose
+`finished_at` is a valid `YYYY-MM-DDTHH:MM:SSZ` instant before
+`2026-09-25T20:42:29Z`. Every other row, including one that carries only one
+of the two keys or a null in either, names no builder, so it counts as neither
+Cargo nor Buck evidence. `e2e_payload` is
 still a label, not a measurement of the binary: it is a constant per builder,
 and unit tests tie it to the checked-in sources that select the payload (the
 release flag list in `shim/BUCK`, no check-class setting in `hermit-cli/BUCK`
