@@ -944,6 +944,14 @@ fn committed_exit_boundary_fences_later_turns_until_exact_terminal_receipt() {
         s.consume_signal_boundary(receipt).unwrap();
         assert!(!s.parked.exit_fences.contains_key(&leader));
         assert!(!s.parked.permits.contains_key(&leader));
+        assert_eq!(s.control_barrier(), group);
+        if group {
+            s.consume_process_retirement(reverie::BackendProcessRetirement {
+                process: task(100, 100).process,
+                status: ExitStatus::Exited(7),
+            })
+            .unwrap();
+        }
         assert!(!s.control_barrier());
         assert!(!s.next_turns.contains_key(&leader));
         assert_eq!(s.next_turns.contains_key(&peer), !group);
@@ -1028,6 +1036,15 @@ fn child_exit_publication_is_two_poll_and_retains_shadow_for_wnowait() {
             s.parked.completed_child_exits[&child_key].completion,
             event.child_exit_completion().unwrap()
         );
+        let retirement = reverie::BackendProcessRetirement {
+            process: event.child,
+            status: ExitStatus::Exited(7),
+        };
+        s.consume_process_retirement(retirement).unwrap();
+        s.consume_process_retirement(retirement).unwrap();
+        assert!(s.parked.process_retirements.is_empty());
+        assert!(!s.control_barrier());
+        assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
 
         let spec = crate::types::ChildWaitSpec {
             selector: crate::types::ChildWaitSelector::Exact(DetPid::from_raw(200)),
@@ -1189,6 +1206,12 @@ fn final_process_classification_uses_live_direct_parent_not_transitive_root() {
         s.parked.terminal_processes[&ProcessGeneration::from_backend(task(100, 100).process)].class,
         FinalProcessClass::Root
     ));
+    assert!(s.control_barrier());
+    s.consume_process_retirement(reverie::BackendProcessRetirement {
+        process: task(100, 100).process,
+        status: ExitStatus::SUCCESS,
+    })
+    .unwrap();
 
     s.reserve_exit_boundary(grandchild, DetPid::from_raw(300), grandchild_mm, true)
         .unwrap();
@@ -1227,6 +1250,12 @@ fn direct_parent_terminal_child_is_classified_and_auto_reaped_without_callback()
         s.parked.terminal_processes[&root_key].class,
         FinalProcessClass::Root
     ));
+    assert!(s.control_barrier());
+    s.consume_process_retirement(reverie::BackendProcessRetirement {
+        process: task(100, 100).process,
+        status: ExitStatus::Exited(4),
+    })
+    .unwrap();
     assert!(!s.control_barrier());
     assert!(backend.child_publications.lock().unwrap().is_empty());
 
@@ -1256,8 +1285,490 @@ fn direct_parent_terminal_child_is_classified_and_auto_reaped_without_callback()
             .contains(&DetPid::from_raw(200))
     );
     assert_eq!(s.thread_tree.parent_process(&DetPid::from_raw(200)), None);
+    assert!(s.control_barrier());
+    s.consume_process_retirement(reverie::BackendProcessRetirement {
+        process: task(200, 200).process,
+        status: ExitStatus::Exited(5),
+    })
+    .unwrap();
     assert!(!s.control_barrier());
     assert!(backend.child_publications.lock().unwrap().is_empty());
+}
+
+#[test]
+fn process_retirement_without_controlled_terminal_preserves_root_and_orphan_state() {
+    for terminal_parent in [false, true] {
+        for tasks_retired in [false, true] {
+            let (mut s, backend) = fixture();
+            let (root, root_mm, _) = add(&mut s, 100, 100);
+            let (leader, mm) = if terminal_parent {
+                let (child, mm, _) = add_process_child(&mut s, 100, 200);
+                s.reserve_exit_boundary(root, root, root_mm, true).unwrap();
+                s.consume_signal_boundary(SignalBoundaryReceipt {
+                    permit: s.parked.exit_fences[&root].permit,
+                    outcome: SignalBoundaryOutcome::Terminated {
+                        group: true,
+                        wait_status: 0,
+                    },
+                })
+                .unwrap();
+                s.consume_process_retirement(reverie::BackendProcessRetirement {
+                    process: task(100, 100).process,
+                    status: ExitStatus::SUCCESS,
+                })
+                .unwrap();
+                (child, mm)
+            } else {
+                (root, root_mm)
+            };
+            let (worker, _, _) = add(&mut s, leader.as_raw(), leader.as_raw() + 1);
+            if tasks_retired {
+                // A previously exited leader can join a final faulting worker
+                // after that worker's consuming hook retired the last task.
+                s.reserve_exit_boundary(leader, leader, mm, false).unwrap();
+                s.consume_signal_boundary(SignalBoundaryReceipt {
+                    permit: s.parked.exit_fences[&leader].permit,
+                    outcome: SignalBoundaryOutcome::Terminated {
+                        group: false,
+                        wait_status: 7 << 8,
+                    },
+                })
+                .unwrap();
+                assert!(s.thread_is_logically_killed(leader));
+                assert!(!s.thread_is_logically_killed(worker));
+                s.logically_kill_thread(&worker, &leader, mm);
+                assert!(s.real_timers.process_identity(leader).is_err());
+            }
+            let (other, other_mm, _) = add(&mut s, 900, 900);
+            s.reserve_exit_boundary(other, other, other_mm, true)
+                .unwrap();
+            let foreign_fence = s.parked.exit_fences[&other];
+            s.drain_control_intents();
+            let waiter = s.control_waiter();
+            assert!(waiter.try_read().is_none());
+            let tasks_before: Vec<_> = s.next_turns.keys().copied().collect();
+            let killed_before = s.logically_killed_threads.clone();
+            let terminal_before = s.parked.terminal_processes.clone();
+            let pending_before = s.parked.process_retirements.clone();
+            let mut completed = s.parked.completed_process_retirements.clone();
+            let event = reverie::BackendProcessRetirement {
+                process: task(leader.as_raw(), leader.as_raw()).process,
+                status: ExitStatus::from_raw(libc::SIGSEGV),
+            };
+            assert!(
+                !s.parked
+                    .terminal_processes
+                    .contains_key(&ProcessGeneration::from_backend(event.process))
+            );
+            s.consume_process_retirement(event).unwrap();
+            completed.insert(ProcessGeneration::from_backend(event.process), event);
+            assert_eq!(s.parked.completed_process_retirements, completed);
+            assert_eq!(s.parked.terminal_processes, terminal_before);
+            assert_eq!(s.parked.process_retirements, pending_before);
+            assert_eq!(
+                s.next_turns.keys().copied().collect::<Vec<_>>(),
+                tasks_before
+            );
+            assert_eq!(s.logically_killed_threads, killed_before);
+            assert_eq!(s.parked.exit_fences[&other], foreign_fence);
+            assert!(s.control_barrier());
+            assert!(waiter.try_read().is_none());
+            assert!(backend.child_publications.lock().unwrap().is_empty());
+            assert!(!s.backend_failed());
+            assert_eq!(s.turn, 0);
+        }
+    }
+}
+
+#[test]
+fn process_retirement_without_controlled_terminal_preserves_duplicate_status_guard() {
+    let (mut s, _) = fixture();
+    let (leader, mm, _) = add(&mut s, 100, 100);
+    let event = reverie::BackendProcessRetirement {
+        process: task(100, 100).process,
+        status: ExitStatus::from_raw(libc::SIGSEGV),
+    };
+    s.consume_process_retirement(event).unwrap();
+    s.logically_kill_thread(&leader, &leader, mm);
+    s.consume_process_retirement(event).unwrap();
+    assert!(!s.backend_failed());
+    let completed = s.parked.completed_process_retirements.clone();
+    assert!(
+        s.consume_process_retirement(reverie::BackendProcessRetirement {
+            status: ExitStatus::from_raw(libc::SIGILL),
+            ..event
+        })
+        .is_err()
+    );
+    assert!(s.backend_failed());
+    assert_eq!(s.parked.completed_process_retirements, completed);
+    assert!(s.parked.terminal_processes.is_empty());
+    assert_eq!(s.turn, 0);
+}
+
+#[test]
+fn process_retirement_without_controlled_terminal_rejects_unknown_and_reused_generation() {
+    for defect in ["unknown", "generation", "reused generation"] {
+        let (mut s, _) = fixture();
+        let (leader, mm, _) = add(&mut s, 100, 100);
+        let mut identity = task(100, 100);
+        let mut event = reverie::BackendProcessRetirement {
+            process: identity.process,
+            status: ExitStatus::from_raw(libc::SIGSEGV),
+        };
+        match defect {
+            "unknown" => event.process.tgid = reverie::Pid::from_raw(999),
+            "generation" => event.process.generation += 1,
+            "reused generation" => {
+                s.logically_kill_thread(&leader, &leader, mm);
+                identity.process.generation += 1;
+                identity.task_generation += 1;
+                s.real_timers.bind(leader, leader, mm, identity).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let (other, other_mm, _) = add(&mut s, 900, 900);
+        s.reserve_exit_boundary(other, other, other_mm, true)
+            .unwrap();
+        let fence = s.parked.exit_fences[&other];
+        assert!(s.consume_process_retirement(event).is_err(), "{defect}");
+        assert!(s.backend_failed(), "{defect}");
+        assert_eq!(s.parked.exit_fences[&other], fence, "{defect}");
+        assert!(s.control_barrier(), "{defect}");
+        assert!(s.parked.completed_process_retirements.is_empty());
+        assert!(s.parked.terminal_processes.is_empty());
+        assert_eq!(s.turn, 0);
+    }
+}
+
+#[test]
+fn process_retirement_without_controlled_terminal_rejects_pending_process_obligations() {
+    for obligation in ["permit", "exit fence", "child publication", "retirement"] {
+        let (mut s, _) = fixture();
+        let (leader, mm, _) = add(&mut s, 100, 100);
+        let event = reverie::BackendProcessRetirement {
+            process: task(100, 100).process,
+            status: ExitStatus::from_raw(libc::SIGSEGV),
+        };
+        let key = ProcessGeneration::from_backend(event.process);
+        match obligation {
+            "permit" => {
+                // Ordinary signal delivery owns a permit without an exit fence.
+                s.parked.running = Some(leader);
+                s.authorize_signal_boundary(task(100, 100))
+                    .unwrap()
+                    .unwrap();
+                assert!(s.parked.exit_fences.is_empty());
+            }
+            "exit fence" => {
+                s.reserve_exit_boundary(leader, leader, mm, true).unwrap();
+            }
+            "child publication" => {
+                s.parked.child_exit_reservations.insert(
+                    key,
+                    ChildExitReservation {
+                        child: event.process,
+                        parent: task(50, 50).process,
+                        phase: ChildExitReservationPhase::AwaitingTerminalStatus,
+                    },
+                );
+            }
+            "retirement" => {
+                s.parked.process_retirements.insert(key, event);
+            }
+            _ => unreachable!(),
+        }
+        let permits = s.parked.permits.clone();
+        let fences = s.parked.exit_fences.clone();
+        let children = s.parked.child_exit_reservations.clone();
+        let retirements = s.parked.process_retirements.clone();
+        let barrier = s.control_barrier();
+        assert!(s.consume_process_retirement(event).is_err(), "{obligation}");
+        assert!(s.backend_failed(), "{obligation}");
+        assert_eq!(s.parked.permits, permits);
+        assert_eq!(s.parked.exit_fences, fences);
+        assert_eq!(s.parked.child_exit_reservations, children);
+        assert_eq!(s.parked.process_retirements, retirements);
+        assert_eq!(s.control_barrier(), barrier);
+        assert!(s.parked.completed_process_retirements.is_empty());
+        assert!(s.parked.terminal_processes.is_empty());
+        assert_eq!(s.turn, 0);
+    }
+}
+
+#[test]
+fn process_retirement_cannot_replace_live_parent_child_publication() {
+    let (mut s, _) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, child, mm, true).unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 7 << 8,
+        },
+    })
+    .unwrap();
+    let key = ProcessGeneration::from_backend(task(200, 200).process);
+    let reservation = s.parked.child_exit_reservations[&key];
+    assert!(
+        s.consume_process_retirement(reverie::BackendProcessRetirement {
+            process: task(200, 200).process,
+            status: ExitStatus::Exited(7),
+        })
+        .is_err()
+    );
+    assert!(s.backend_failed());
+    assert!(s.control_barrier());
+    assert_eq!(s.parked.child_exit_reservations[&key], reservation);
+    assert!(s.parked.completed_process_retirements.is_empty());
+}
+
+#[test]
+fn process_retirement_fences_root_and_orphan_group_exit_after_cancelling_peer_rpc() {
+    use futures::FutureExt;
+
+    for terminal_parent in [false, true] {
+        for fatal in [false, true] {
+            for worker_issuer in [false, true] {
+                let (mut s, backend) = fixture();
+                let (root, root_mm, _) = add(&mut s, 100, 100);
+                let (leader, mm) = if terminal_parent {
+                    let (child, mm, _) = add_process_child(&mut s, 100, 200);
+                    s.reserve_exit_boundary(root, root, root_mm, true).unwrap();
+                    let permit = s.parked.exit_fences[&root].permit;
+                    s.consume_signal_boundary(SignalBoundaryReceipt {
+                        permit,
+                        outcome: SignalBoundaryOutcome::Terminated {
+                            group: true,
+                            wait_status: 0,
+                        },
+                    })
+                    .unwrap();
+                    s.consume_process_retirement(reverie::BackendProcessRetirement {
+                        process: task(100, 100).process,
+                        status: ExitStatus::SUCCESS,
+                    })
+                    .unwrap();
+                    (child, mm)
+                } else {
+                    (root, root_mm)
+                };
+                let pid = leader.as_raw();
+                let (worker, _, _) = add(&mut s, pid, pid + 1);
+                let (issuer, peer) = if worker_issuer {
+                    (worker, leader)
+                } else {
+                    (leader, worker)
+                };
+                let peer_response = s.next_turns[&peer].resp.clone();
+                let mut polling = Resources::new(peer);
+                polling.insert(ResourceID::InternalIOPolling, Permission::W);
+                polling.poll_attempt = 1;
+                s.next_turns[&peer].req.put(Ok(polling));
+                let (other, _, _) = add(&mut s, 900, 900);
+                s.next_turns[&other].req.put(Ok(Resources::new(other)));
+                for tid in [issuer, peer, other] {
+                    s.run_queue.push_back(tid, DEFAULT_PRIORITY);
+                }
+
+                let permit = if fatal {
+                    s.parked.running = Some(issuer);
+                    s.authorize_signal_boundary(task(pid, issuer.as_raw()))
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    s.reserve_exit_boundary(issuer, leader, mm, true).unwrap();
+                    s.parked.exit_fences[&issuer].permit
+                };
+                let status = if fatal {
+                    ExitStatus::from_raw(libc::SIGTERM)
+                } else {
+                    ExitStatus::Exited(7)
+                };
+                s.consume_signal_boundary(SignalBoundaryReceipt {
+                    permit,
+                    outcome: SignalBoundaryOutcome::Terminated {
+                        group: true,
+                        wait_status: if fatal { libc::SIGTERM } else { 7 << 8 },
+                    },
+                })
+                .unwrap();
+                assert!(matches!(
+                    peer_response.try_read(),
+                    Some(SchedResponse::Signaled(None))
+                ));
+                assert!(s.thread_is_logically_killed(issuer));
+                assert!(s.thread_is_logically_killed(peer));
+                assert!(s.control_barrier());
+                assert!(s.parked.exit_fences.is_empty());
+                assert!(s.parked.child_exit_reservations.is_empty());
+                assert!(backend.child_publications.lock().unwrap().is_empty());
+
+                let scheduler = Arc::new(Mutex::new(s));
+                let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+                let before = global.lock().unwrap().as_nanos();
+                let last = Err(SkipTurn);
+                let mut next =
+                    Box::pin(do_a_turn_blocking(scheduler.clone(), global.clone(), &last));
+                assert!(next.as_mut().now_or_never().is_none());
+                assert_eq!(scheduler.lock().unwrap().turn, 0);
+                assert_eq!(global.lock().unwrap().as_nanos(), before);
+                let retirement = reverie::BackendProcessRetirement {
+                    process: task(pid, pid).process,
+                    status,
+                };
+                {
+                    let mut s = scheduler.lock().unwrap();
+                    s.consume_process_retirement(retirement).unwrap();
+                    s.consume_process_retirement(retirement).unwrap();
+                    assert!(!s.control_barrier());
+                    assert!(!s.backend_failed());
+                }
+                let resumed = next
+                    .as_mut()
+                    .now_or_never()
+                    .expect("retirement must release the ready unrelated task")
+                    .unwrap();
+                assert_eq!(resumed.tid, other);
+                assert_eq!(scheduler.lock().unwrap().turn, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn process_retirement_rejects_early_stale_and_conflicting_receipts_before_release() {
+    use futures::FutureExt;
+
+    for defect in ["early", "generation", "status", "unknown", "duplicate"] {
+        let (mut s, _) = fixture();
+        let (leader, mm, _) = add(&mut s, 100, 100);
+        s.reserve_exit_boundary(leader, leader, mm, true).unwrap();
+        let permit = s.parked.exit_fences[&leader].permit;
+        let exact = reverie::BackendProcessRetirement {
+            process: task(100, 100).process,
+            status: ExitStatus::Exited(7),
+        };
+        if defect != "early" {
+            s.consume_signal_boundary(SignalBoundaryReceipt {
+                permit,
+                outcome: SignalBoundaryOutcome::Terminated {
+                    group: true,
+                    wait_status: 7 << 8,
+                },
+            })
+            .unwrap();
+        }
+        if defect == "duplicate" {
+            s.consume_process_retirement(exact).unwrap();
+        }
+        let mut wrong = exact;
+        match defect {
+            "generation" => wrong.process.generation += 1,
+            "status" | "duplicate" => wrong.status = ExitStatus::Exited(8),
+            "unknown" => wrong.process.tgid = reverie::Pid::from_raw(999),
+            "early" => {}
+            _ => unreachable!(),
+        }
+        let pending_before = s.parked.process_retirements.clone();
+        let failure = s.backend_failure_waiter();
+        assert!(s.consume_process_retirement(wrong).is_err(), "{defect}");
+        assert!(s.backend_failed(), "{defect}");
+        assert_eq!(s.parked.process_retirements, pending_before, "{defect}");
+        assert_eq!(s.control_barrier(), defect != "duplicate", "{defect}");
+        assert!(failure.clone().now_or_never().is_none());
+        let wakes = s.take_signal_failure_wakes();
+        assert_eq!(wakes.len(), 1);
+        let scheduler = Arc::new(Mutex::new(s));
+        for wake in wakes {
+            let _ = wake.send(());
+        }
+        assert!(failure.now_or_never().unwrap().is_ok());
+        // Terminal failure abandons the wait, without turning an incomplete
+        // retirement into a successful scheduling continuation.
+        let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        assert!(
+            do_a_turn_blocking(scheduler.clone(), global, &Err(SkipTurn))
+                .now_or_never()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(scheduler.lock().unwrap().turn, 0);
+    }
+}
+
+#[test]
+fn process_retirement_keeps_empty_run_alive_until_cleanup_or_failure() {
+    use futures::FutureExt;
+
+    for fail in [false, true] {
+        for group in [false, true] {
+            let (mut s, _) = fixture();
+            let (leader, mm, _) = add(&mut s, 100, 100);
+            s.started_up.put(());
+            s.reserve_exit_boundary(leader, leader, mm, group).unwrap();
+            let permit = s.parked.exit_fences[&leader].permit;
+            s.consume_signal_boundary(SignalBoundaryReceipt {
+                permit,
+                outcome: SignalBoundaryOutcome::Terminated {
+                    group,
+                    wait_status: 0,
+                },
+            })
+            .unwrap();
+            assert!(s.run_queue.is_empty());
+            assert!(s.blocked.is_empty());
+            let scheduler = Arc::new(Mutex::new(s));
+            let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = events.clone();
+            let mut daemon = Box::pin(sched_loop_external(
+                scheduler.clone(),
+                global,
+                Arc::new(move |event| observed.lock().unwrap().push(event)),
+            ));
+            assert!(daemon.as_mut().now_or_never().is_none());
+            assert!(
+                !events
+                    .lock()
+                    .unwrap()
+                    .contains(&"run queue empty; scheduler completed")
+            );
+            if fail {
+                let wake = scheduler
+                    .lock()
+                    .unwrap()
+                    .report_backend_failure(reverie::BackendFailure {
+                        pid: reverie::Pid::from_raw(100),
+                        tid: reverie::Pid::from_raw(100),
+                        phase: "injected process cleanup failure",
+                    })
+                    .unwrap();
+                let _ = wake.send(());
+            } else {
+                scheduler
+                    .lock()
+                    .unwrap()
+                    .consume_process_retirement(reverie::BackendProcessRetirement {
+                        process: task(100, 100).process,
+                        status: ExitStatus::SUCCESS,
+                    })
+                    .unwrap();
+            }
+            assert!(daemon.as_mut().now_or_never().is_some());
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .contains(&"run queue empty; scheduler completed"),
+                !fail
+            );
+            assert_eq!(scheduler.lock().unwrap().control_barrier(), fail);
+        }
+    }
 }
 
 #[test]

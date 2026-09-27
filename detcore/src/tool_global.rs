@@ -909,6 +909,21 @@ impl GlobalTool for GlobalState {
         self.sched.lock().unwrap().consume_signal_boundary(receipt)
     }
 
+    fn on_backend_process_retired(
+        &self,
+        event: reverie::BackendProcessRetirement,
+    ) -> Result<(), reverie::Error> {
+        let (result, wakes) = {
+            let mut sched = self.sched.lock().unwrap();
+            let result = sched.consume_process_retirement(event);
+            (result, sched.take_signal_failure_wakes())
+        };
+        for wake in wakes {
+            let _ = wake.send(());
+        }
+        result
+    }
+
     fn report_backend_failure(&self, event: reverie::BackendFailure) {
         let (wake, deferred) = {
             let mut sched = self.sched.lock().unwrap();

@@ -235,6 +235,16 @@ impl RealTimers {
         Ok(p.backend)
     }
 
+    /// Authenticate cleanup after the last task's consuming hook. A reused PID
+    /// names only its current generation; archived lifetimes cannot authenticate
+    /// a new retirement notification.
+    pub fn retained_process_identity(&self, pid: DetPid) -> Result<SignalProcessId, TimerFailure> {
+        self.processes
+            .get(&pid)
+            .map(|process| process.backend)
+            .ok_or(TimerFailure::Identity)
+    }
+
     pub fn task_identity(&self, pid: DetPid, tid: DetTid) -> Option<(MmId, SignalTaskIdentity)> {
         self.processes
             .get(&pid)

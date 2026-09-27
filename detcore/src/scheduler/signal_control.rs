@@ -378,8 +378,10 @@ impl Scheduler {
     }
 
     /// Record the exact final process transition before stage 1 is removed.
-    /// A live direct parent installs or advances stage 2 in the same scheduler
-    /// critical section, so the control barrier never opens between the two.
+    /// Install or advance stage 2 in the same scheduler critical section, so
+    /// the control barrier never opens between terminal membership and physical
+    /// cleanup. A live parent's child-publication transaction owns its stage 2;
+    /// roots and children of terminal parents need a separate retirement receipt.
     fn record_final_process_transition(
         &mut self,
         tid: DetTid,
@@ -441,7 +443,129 @@ impl Scheduler {
             Some(existing) if existing == terminal => {}
             Some(_) => return Err(ProtocolFailure::Identity),
         }
+        if matches!(
+            class,
+            FinalProcessClass::Root | FinalProcessClass::DirectParentTerminal { .. }
+        ) {
+            let retirement = reverie::BackendProcessRetirement {
+                process: child,
+                status,
+            };
+            if self.parked.completed_process_retirements.contains_key(&key) {
+                return Err(ProtocolFailure::Phase);
+            }
+            match self.parked.process_retirements.insert(key, retirement) {
+                None => {}
+                Some(existing) if existing == retirement => {}
+                Some(_) => return Err(ProtocolFailure::Identity),
+            }
+        }
         Ok(Some(class))
+    }
+
+    /// Consume physical cleanup without granting a turn or publishing SIGCHLD.
+    /// Validate before removing any barrier; a malformed receipt makes the run
+    /// terminal while the scheduler mutex still excludes ordinary grants.
+    pub(crate) fn consume_process_retirement(
+        &mut self,
+        event: reverie::BackendProcessRetirement,
+    ) -> Result<(), reverie::Error> {
+        if self.parked.control.is_none() || self.backend_failed() {
+            return Ok(());
+        }
+        let result = self.finish_process_retirement(event);
+        if result.is_err()
+            && let Some(wake) =
+                self.report_backend_failure_location(super::BackendFailureLocation {
+                    pid: event.process.tgid,
+                    tid: None,
+                    phase: "KVM process retirement receipt",
+                })
+        {
+            // GlobalTool sends these only after dropping the scheduler mutex.
+            self.parked.failure_wakes.push(wake);
+        }
+        result.map_err(|_| reverie::syscalls::Errno::EINVAL.into())
+    }
+
+    fn finish_process_retirement(
+        &mut self,
+        event: reverie::BackendProcessRetirement,
+    ) -> Result<(), ProtocolFailure> {
+        let key = ProcessGeneration::from_backend(event.process);
+        if let Some(completed) = self.parked.completed_process_retirements.get(&key) {
+            return if *completed == event {
+                Ok(())
+            } else {
+                Err(ProtocolFailure::Identity)
+            };
+        }
+        let Some(terminal) = self.parked.terminal_processes.get(&key) else {
+            // Synchronous faults can retire without a controlled terminal
+            // boundary. Authenticate the current process generation even when
+            // worker hooks already retired its final scheduler task, and do
+            // not mistake an outstanding controlled transition for that case.
+            if self
+                .real_timers
+                .retained_process_identity(key.pid)
+                .map_err(|_| ProtocolFailure::Identity)?
+                != event.process
+            {
+                return Err(ProtocolFailure::Identity);
+            }
+            if self
+                .parked
+                .permits
+                .values()
+                .any(|permit| permit.task.process == event.process)
+                || self
+                    .parked
+                    .exit_fences
+                    .values()
+                    .any(|fence| fence.permit.task.process == event.process)
+                || self.parked.child_exit_reservations.contains_key(&key)
+                || self.parked.process_retirements.contains_key(&key)
+            {
+                return Err(ProtocolFailure::Phase);
+            }
+            // No fence belongs to this notification. Remember only the exact
+            // duplicate/status guard, without waking selection, changing task
+            // membership, or manufacturing a controlled terminal transition.
+            self.parked.completed_process_retirements.insert(key, event);
+            return Ok(());
+        };
+        if terminal.process != event.process || terminal.status != event.status {
+            return Err(ProtocolFailure::Identity);
+        }
+        match terminal.class {
+            FinalProcessClass::Root | FinalProcessClass::DirectParentTerminal { .. } => {
+                if self.parked.process_retirements.get(&key) != Some(&event) {
+                    return Err(ProtocolFailure::Phase);
+                }
+                self.parked.process_retirements.remove(&key);
+            }
+            FinalProcessClass::LiveParent { .. } => {
+                // Its existing child-publication receipt owns the barrier.
+                // Retirement neither replaces that transaction nor emits a
+                // second child event, and must follow its completion.
+                if self.parked.child_exit_reservations.contains_key(&key)
+                    || !self
+                        .parked
+                        .completed_child_exits
+                        .get(&key)
+                        .is_some_and(|exit| {
+                            exit.completion.child == event.process
+                                && exit.completion.status == event.status
+                                && matches!(exit.result, ChildExitPublicationResult::Committed(_))
+                        })
+                {
+                    return Err(ProtocolFailure::Phase);
+                }
+            }
+        }
+        self.parked.completed_process_retirements.insert(key, event);
+        self.wake_control_waiter();
+        Ok(())
     }
 
     fn begin_child_exit_publication(

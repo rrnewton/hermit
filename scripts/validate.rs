@@ -13759,7 +13759,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "31");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "34");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -13785,11 +13785,18 @@ mod nextest_timeout_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            30,
+            33,
             "update the exact CI inventory with new KVM tests"
         );
-        let new_case = "run_kvm_self_sigkill_from_nonleader_is_group_fatal";
-        assert!(names.iter().any(|name| name == new_case));
+        let required_cases = [
+            "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
+            "run_kvm_synchronous_root_segv_preserves_guest_exit",
+            "run_kvm_synchronous_orphan_segv_preserves_root_success",
+            "run_kvm_root_exit_reparents_live_child_and_grandchild",
+        ];
+        for required in required_cases {
+            assert!(names.iter().any(|name| name == required));
+        }
         names.push("kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution".into());
         let cases = names
             .iter()
@@ -13835,13 +13842,15 @@ mod nextest_timeout_tests {
                 "mismatch".into();
             check(&filtered, 1);
         }
-        let mut replacement = inventory.clone();
-        let cases = replacement["rust-suites"]["fixture"]["testcases"]
-            .as_object_mut()
-            .unwrap();
-        let value = cases.remove(new_case).unwrap();
-        cases.insert("run_kvm_unrelated_replacement".into(), value);
-        check(&replacement, 1);
+        for required in required_cases {
+            let mut replacement = inventory.clone();
+            let cases = replacement["rust-suites"]["fixture"]["testcases"]
+                .as_object_mut()
+                .unwrap();
+            let value = cases.remove(required).unwrap();
+            cases.insert("run_kvm_unrelated_replacement".into(), value);
+            check(&replacement, 1);
+        }
         // A same-count duplicate in another suite cannot replace an old case.
         let mut duplicate = inventory.clone();
         duplicate["rust-suites"]["fixture"]["testcases"]
@@ -14743,10 +14752,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 30 run_kvm_ declarations and
-        // the unchanged initialized-VM setup control. The eight-mode timer
-        // and two-role retirement tests each count as one selected test.
-        ("privileged-only-test.cli_kvm", 31usize),
+        // The shipped KVM selection contains 33 run_kvm_ declarations and
+        // the unchanged initialized-VM setup control. The eight-mode timer,
+        // two-role retirement and six-mode reparenting tests each count as
+        // one selected test.
+        ("privileged-only-test.cli_kvm", 34usize),
     ] {
         let step = privileged
             .steps
