@@ -6821,6 +6821,55 @@ mod tests {
         let (a_again, _) = pool.add_inode(host_a, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
     }
+
+    /// Mint maps identities the way `initialize_procfs_snapshot` does: walk the
+    /// pairs in the order `mapping_identities_in_text_order` yields and push
+    /// each through the run-global pools, then render the snapshot.
+    fn render_maps_with_fresh_pools(raw: &str) -> String {
+        let mut inodes = super::InodePool::new();
+        let mut devices = super::DevicePool::new();
+        let t = LogicalTime::from_nanos(0);
+        let mut table = std::collections::BTreeMap::new();
+        for (raw_dev, raw_inode) in crate::procfs::mapping_identities_in_text_order(raw) {
+            let det_inode = inodes.add_inode(raw_inode, t).0;
+            let det_dev = devices.determinize(raw_dev);
+            table.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
+        }
+        String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap()
+    }
+
+    /// Two runs with the same guest-visible maps, where the host numbered the
+    /// two newly seen files in opposite orders (as per-CPU shmem/memfd inode
+    /// batches do), must render identical bytes. Minting in sorted RAW order
+    /// gave the lower deterministic inode to whichever file had the lower host
+    /// inode, so the two snapshots below disagreed on both mapping lines.
+    #[test]
+    fn maps_identities_are_minted_in_text_order_not_raw_order() {
+        let snapshot = |first: u64, second: u64| {
+            format!(
+                "10000000-10001000 r-xp 00000000 00:01 {first:<10}               /memfd:first (deleted)\n\
+                 20000000-20001000 r-xp 00000000 00:01 {second:<10}               /memfd:second (deleted)\n\
+                 30000000-30001000 rw-p 00000000 00:01 {first:<10}               /memfd:first (deleted)\n\
+                 7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n"
+            )
+        };
+        let low = 131_975;
+        let high = 2_196_480;
+        let run_a = render_maps_with_fresh_pools(&snapshot(low, high));
+        let run_b = render_maps_with_fresh_pools(&snapshot(high, low));
+        assert_eq!(
+            run_a, run_b,
+            "host inode numbering order leaked into guest-visible maps"
+        );
+
+        // The first file in address order gets the first minted inode, and the
+        // repeated mapping of it reuses that identity rather than minting again.
+        let inode_column: Vec<&str> = run_a
+            .lines()
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(inode_column, ["1", "2", "1", "0"], "{run_a}");
+    }
 }
 
 #[cfg(test)]
