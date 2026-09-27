@@ -100,14 +100,18 @@ fn uptime_seconds(
     uptime_offset_seconds + (now - boot).as_secs()
 }
 
-/// Whole-second virtual boot time for `/proc/stat` `btime`: the epoch less the configured uptime
-/// offset. Linux reports a fixed boot instant, so this is derived from the epoch alone rather than
-/// as `now - uptime`, which would move by a second whenever the epoch's fraction and the elapsed
-/// fraction together cross a second boundary.
+/// Whole-second virtual boot time for `/proc/stat` `btime`: the epoch's whole seconds less the
+/// configured uptime offset. Linux reports a fixed boot instant, so this is derived from the epoch
+/// alone rather than as `now - uptime`, which would move by a second whenever the epoch's fraction
+/// and the elapsed fraction together cross a second boundary.
+///
+/// The difference is computed exactly, and this returns `None` exactly when it lies outside `i64`,
+/// the range of the kernel's `time64_t`. The epoch's whole seconds are at most
+/// `u64::MAX / 10^9` (about 1.8e10), so the difference never exceeds `i64::MAX`: it is `None`
+/// exactly when the offset exceeds the epoch's whole seconds by more than 2^63. An offset above
+/// `i64::MAX` but within that bound gives a negative boot instant, which is representable.
 fn boot_time_seconds(boot: crate::types::LogicalTime, uptime_offset_seconds: u64) -> Option<i64> {
-    i64::try_from(boot.as_secs())
-        .ok()?
-        .checked_sub(i64::try_from(uptime_offset_seconds).ok()?)
+    i64::try_from(i128::from(boot.as_secs()) - i128::from(uptime_offset_seconds)).ok()
 }
 
 fn prlimit_targets_current_process(
@@ -411,9 +415,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The fixed virtual boot instant in whole seconds, reported as `/proc/stat` `btime`.
     ///
-    /// Fails with `EOVERFLOW` when the configured uptime offset exceeds `i64::MAX`, because the
-    /// boot instant then has no `i64` representation. Only a `/proc/stat` read calls this, so no
-    /// other procfs read can fail on account of the boot instant.
+    /// Fails with `EOVERFLOW` exactly when the boot instant, the epoch's whole seconds less the
+    /// configured uptime offset, lies below `i64::MIN`: that is, when the offset exceeds the
+    /// epoch's whole seconds by more than 2^63. Linux holds the boot instant in a signed 64-bit
+    /// `time64_t`, so no kernel can report such an instant. Offsets above `i64::MAX` but within
+    /// that bound give a negative boot instant, which succeeds. Only a `/proc/stat` read calls
+    /// this, so no other procfs read can fail on account of the boot instant.
     pub(super) fn virtual_boot_time_seconds(&self) -> Result<i64, Error> {
         let boot = crate::types::DetTime::new(&self.cfg).as_nanos();
         boot_time_seconds(boot, self.cfg.sysinfo_uptime_offset)
@@ -670,15 +677,53 @@ mod tests {
     }
 
     #[test]
-    fn boot_time_is_unrepresentable_exactly_when_the_offset_exceeds_i64_max() {
+    fn boot_time_is_unrepresentable_exactly_when_it_falls_below_i64_min() {
         // `/proc/stat` refuses a read exactly when this returns `None`. No other procfs file
         // consults the boot instant, so this boundary cannot fail any other read.
+        //
+        // The boot instant is E - offset for the epoch's whole seconds E, so it reaches
+        // i64::MIN = -2^63 at offset E + 2^63 and leaves time64_t one second later. Offsets
+        // above i64::MAX but at most E + 2^63 give a negative instant that Linux can hold.
+        const E: u64 = 1_790_389_350;
         let boot = LogicalTime::from_nanos(1_790_389_350_900_000_000);
+        assert_eq!(boot.as_secs(), E);
         assert_eq!(
             boot_time_seconds(boot, i64::MAX as u64),
             Some(1_790_389_350 - i64::MAX)
         );
-        assert_eq!(boot_time_seconds(boot, i64::MAX as u64 + 1), None);
+        // E - 2^63, not None: an offset of 2^63 still leaves a representable instant.
+        assert_eq!(
+            boot_time_seconds(boot, i64::MAX as u64 + 1),
+            Some(i64::MIN + 1_790_389_350)
+        );
+        // The last representable offset, E + 2^63 = 9_223_372_038_645_165_158 ...
+        assert_eq!(boot_time_seconds(boot, E + (1 << 63)), Some(i64::MIN));
+        assert_eq!(
+            boot_time_seconds(boot, 9_223_372_038_645_165_158),
+            Some(i64::MIN)
+        );
+        // ... and the first unrepresentable one.
+        assert_eq!(boot_time_seconds(boot, E + (1 << 63) + 1), None);
+        assert_eq!(boot_time_seconds(boot, 9_223_372_038_645_165_159), None);
+        assert_eq!(boot_time_seconds(boot, u64::MAX), None);
+
+        // The boundary moves with the epoch, at both ends of the logical clock.
+        assert_eq!(
+            boot_time_seconds(LogicalTime::ZERO, 1 << 63),
+            Some(i64::MIN)
+        );
+        assert_eq!(boot_time_seconds(LogicalTime::ZERO, (1 << 63) + 1), None);
+        let latest_epoch = LogicalTime::MAX.as_secs();
+        assert_eq!(latest_epoch, 18_446_744_073);
+        assert_eq!(boot_time_seconds(LogicalTime::MAX, 0), Some(18_446_744_073));
+        assert_eq!(
+            boot_time_seconds(LogicalTime::MAX, latest_epoch + (1 << 63)),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            boot_time_seconds(LogicalTime::MAX, latest_epoch + (1 << 63) + 1),
+            None
+        );
     }
 
     #[test]

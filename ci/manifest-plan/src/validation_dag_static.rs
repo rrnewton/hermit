@@ -232,7 +232,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // One epoch-fraction uptime control retains all 797 prior identities:
     // syscalls::sysinfo::tests::uptime_seconds_depend_on_elapsed_time_not_the_epoch_fraction.
     // Three procfs boot-time range controls retain all 798 prior identities.
-    ("test.detcore_unit", 801),
+    // Five btime rendering, boundary and coupling controls, plus one renamed
+    // boundary test, retain the other 800 prior identities.
+    ("test.detcore_unit", 806),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -261,7 +263,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 801),
+    // The host variant selects the same five btime controls and renamed test.
+    ("test.detcore_unit_on_host", 806),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 750),
