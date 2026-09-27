@@ -232,7 +232,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Seven captured-clock output/codec controls retain all 750 prior IDs.
-    ("test.hermit_unit", 757),
+    // Five captured-clock EFAULT/replay-verification controls retain all 757 prior IDs.
+    ("test.hermit_unit", 762),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -282,7 +283,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.recorded_clocks_on_host", 6),
-    ("test.hermit_unit_on_host", 757),
+    ("test.hermit_unit_on_host", 762),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
