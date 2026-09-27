@@ -456,7 +456,7 @@ fi
 # fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-expected_pin=b0ede531e00dd1e068d0e0b1f220edddcf96d4b5
+expected_pin=a1d07619c7c06d3a525a9db5b6f113bb52a4901b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
