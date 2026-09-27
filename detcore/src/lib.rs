@@ -62,6 +62,8 @@ mod stat;
 mod syscall_classification;
 mod syscall_time;
 mod syscalls;
+#[cfg(test)]
+mod test_pages;
 mod tool_global;
 mod tool_local;
 pub mod util;
