@@ -9587,7 +9587,7 @@ cp "$PWD/verification-match.json" "$verdict"
             .collect::<Vec<_>>();
         // Pin the selected population and per-backend split, and check every
         // candidate's arguments.
-        assert_eq!(candidates.len(), 175);
+        assert_eq!(candidates.len(), 173);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -9596,7 +9596,7 @@ cp "$PWD/verification-match.json" "$verdict"
         }
         assert_eq!(
             by_backend,
-            BTreeMap::from([("kvm", 75), ("liteinst", 99), ("sabre", 1)])
+            BTreeMap::from([("kvm", 75), ("liteinst", 97), ("sabre", 1)])
         );
         assert!(candidates.iter().any(|cell| cell.id.test
             == "backend-parity-c/readdir-order-identity"

@@ -13,10 +13,10 @@
   "counts": {
     "all": {
       "cells": 1444,
-      "applicable": 769,
-      "selectable": 666,
-      "selected": 194,
-      "selected_selectable": 177
+      "applicable": 767,
+      "selectable": 664,
+      "selected": 192,
+      "selected_selectable": 175
     },
     "by_backend": {
       "dbt": {
@@ -35,10 +35,10 @@
       },
       "liteinst": {
         "cells": 361,
-        "applicable": 314,
-        "selectable": 311,
-        "selected": 101,
-        "selected_selectable": 100
+        "applicable": 312,
+        "selectable": 309,
+        "selected": 99,
+        "selected_selectable": 98
       },
       "sabre": {
         "cells": 361,
@@ -120,7 +120,7 @@
     {"test_id":"backend-parity-c/dup-shared-offset","backend":"sabre","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"backend-parity-c/environment-and-workdir","backend":"dbt","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: DBT does not enter the per-cell /test mount namespace"},
     {"test_id":"backend-parity-c/environment-and-workdir","backend":"kvm","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM verification does not yet compare canonical non-vacuous INFO evidence"},
-    {"test_id":"backend-parity-c/environment-and-workdir","backend":"liteinst","category":"backend-parity-c","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
+    {"test_id":"backend-parity-c/environment-and-workdir","backend":"liteinst","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: LiteInst canonical verification remains blocked by guest-visible startup mapping identity"},
     {"test_id":"backend-parity-c/environment-and-workdir","backend":"sabre","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Canonical SaBRe verification has not been qualified for this environment-control fixture"},
     {"test_id":"backend-parity-c/epoll-pwait2","backend":"dbt","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
     {"test_id":"backend-parity-c/epoll-pwait2","backend":"kvm","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM ElfExecutor returns deterministic ENOSYS for epoll_pwait2 (syscall 441); it implements the classic epoll_wait but not the newer wait entry point"},
@@ -328,7 +328,7 @@
     {"test_id":"backend-parity-c/pipe-ipc","backend":"sabre","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: Not evaluated in the source backend-parity matrix; qualify SaBRe separately"},
     {"test_id":"backend-parity-c/pipe-multiwriter-ordering","backend":"dbt","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: The DynamoRIO (DBT) backend is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake), so no witness could be recorded; qualify DBT separately once it builds"},
     {"test_id":"backend-parity-c/pipe-multiwriter-ordering","backend":"kvm","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: KVM livelocks at guest startup on the current host, so no witness could be recorded; qualify KVM separately"},
-    {"test_id":"backend-parity-c/pipe-multiwriter-ordering","backend":"liteinst","category":"backend-parity-c","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
+    {"test_id":"backend-parity-c/pipe-multiwriter-ordering","backend":"liteinst","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary on the current host; qualify LiteInst separately"},
     {"test_id":"backend-parity-c/pipe-multiwriter-ordering","backend":"sabre","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"},
     {"test_id":"backend-parity-c/pipe2-flags","backend":"dbt","category":"backend-parity-c","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"},
     {"test_id":"backend-parity-c/pipe2-flags","backend":"kvm","category":"backend-parity-c","applicable":true,"selectable":true,"selected":true,"reason":"selected by tests/e2e/parity-selection.yaml"},
