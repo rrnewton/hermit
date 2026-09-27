@@ -108,6 +108,52 @@ static void timezone_outputs(void) {
     assert(munmap(pages, page * 2) == 0);
     read_clock(CLOCK_MONOTONIC);
   }
+
+  // Linux stores tv_sec, tv_usec, then the timezone, and stops at the first
+  // store that faults. A faulting timeval therefore leaves a writable
+  // timezone untouched; replay must not store the timezone either.
+  struct timezone sentinel;
+  memset(&sentinel, 0xa5, sizeof(sentinel));
+  tz = sentinel;
+  errno = 0;
+  assert(syscall(SYS_gettimeofday, (void*)1, &tz) == -1 && errno == EFAULT);
+  assert(memcmp(&tz, &sentinel, sizeof(tz)) == 0);
+  printf("timeval EFAULT timezone bytes=");
+  for (size_t i = 0; i < sizeof(tz); i++) {
+    printf("%02x", ((unsigned char*)&tz)[i]);
+  }
+  puts("");
+  read_clock(CLOCK_MONOTONIC);
+
+  // tv_sec ends a writable page and tv_usec starts a read-only one: Linux
+  // stores tv_sec, faults on tv_usec, and never reaches the timezone.
+  long page = sysconf(_SC_PAGESIZE);
+  unsigned char* pages = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  assert(pages != MAP_FAILED);
+  unsigned char* output = pages + page - 8;
+  memset(output, 0x5a, sizeof(struct timeval));
+  assert(mprotect(pages + page, page, PROT_READ) == 0);
+  tz = sentinel;
+  errno = 0;
+  assert(syscall(SYS_gettimeofday, output, &tz) == -1 && errno == EFAULT);
+  assert(mprotect(pages + page, page, PROT_READ | PROT_WRITE) == 0);
+  assert(memcmp(output, "ZZZZZZZZ", 8) != 0);
+  for (size_t i = 8; i < sizeof(struct timeval); i++) {
+    assert(output[i] == 0x5a);
+  }
+  assert(memcmp(&tz, &sentinel, sizeof(tz)) == 0);
+  printf("timeval boundary timezone tv=");
+  for (size_t i = 0; i < sizeof(struct timeval); i++) {
+    printf("%02x", output[i]);
+  }
+  printf(" tz=");
+  for (size_t i = 0; i < sizeof(tz); i++) {
+    printf("%02x", ((unsigned char*)&tz)[i]);
+  }
+  puts("");
+  assert(munmap(pages, page * 2) == 0);
+  read_clock(CLOCK_MONOTONIC);
 }
 
 int main(int argc, char** argv) {

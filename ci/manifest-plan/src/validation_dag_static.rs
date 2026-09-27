@@ -242,7 +242,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three logdiff_report schema-2 tests and the bin/hermit matched-prefix
     // report test (d550979ad0) retain all 753 prior identities.
     // Seven captured-clock output/codec controls retain all 757 prior IDs.
-    ("test.hermit_unit", 764),
+    // Five captured-clock EFAULT/replay-verification controls retain all 764 prior IDs.
+    ("test.hermit_unit", 769),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -300,7 +301,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.recorded_clocks_on_host", 6),
-    ("test.hermit_unit_on_host", 764),
+    ("test.hermit_unit_on_host", 769),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
