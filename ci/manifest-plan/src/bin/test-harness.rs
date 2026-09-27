@@ -4235,22 +4235,22 @@ sys.exit(1 if failed else 0)
         super::audit_portable_debug_build_budget(&portable_workflow, &portable, &shards).unwrap();
         let mut short_debug = portable_workflow.clone();
         short_debug["jobs"]["build-debug"]["timeout-minutes"] =
-            serde_yaml::to_value(52_u64).unwrap();
+            serde_yaml::to_value(34_u64).unwrap();
         let error =
             super::audit_portable_debug_build_budget(&short_debug, &portable, &shards).unwrap_err();
         assert!(
             error.contains(
-                "portable build-debug job 3120s must cover its 3000s constructed DAG critical path plus at least 300s"
+                "portable build-debug job 2040s must cover its 1800s constructed DAG critical path plus at least 300s"
             ),
             "{error}"
         );
         // Increasing an actual selected node changes the computed critical path;
-        // the guard must not merely recognize a literal 55-minute workflow value.
+        // the guard must not merely recognize a literal 35-minute workflow value.
         let mut longer_debug = portable.clone();
         longer_debug
             .steps
             .iter_mut()
-            .find(|step| step.tag() == "build.recorded_clocks_on_host")
+            .find(|step| step.tag() == "build.workspace_on_host")
             .unwrap()
             .timeout += 1;
         let error =
@@ -4258,7 +4258,7 @@ sys.exit(1 if failed else 0)
                 .unwrap_err();
         assert!(
             error.contains(
-                "portable build-debug job 3300s must cover its 3001s constructed DAG critical path plus at least 300s"
+                "portable build-debug job 2100s must cover its 1801s constructed DAG critical path plus at least 300s"
             ),
             "{error}"
         );
