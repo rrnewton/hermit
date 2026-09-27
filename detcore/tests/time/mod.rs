@@ -62,6 +62,51 @@ fn tod_from_epoch() {
     );
 }
 
+/// `/proc/stat` `btime` is the fixed boot instant, so a fractional epoch must
+/// not make it move while the guest merely runs and sleeps. Deriving it as
+/// `floor(now) - floor(now - boot)` let the two floors round independently,
+/// and the reviewed reproducer at this epoch printed 1767225480, 1767225481,
+/// ..., 1767225480 across seven samples.
+#[test]
+fn proc_stat_btime_is_fixed_for_a_fractional_epoch() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        epoch: "2026-01-01T00:00:00.750Z".parse().unwrap(),
+        // The scheduler is what turns a sleep into elapsed logical time; the
+        // PMU is not needed for that.
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Default::default()
+    };
+    let expected_btime = config.epoch.timestamp() - config.sysinfo_uptime_offset as i64;
+    check_fn_with_config::<Detcore, _>(
+        move || {
+            let read_btime = || -> i64 {
+                let stat = std::fs::read_to_string("/proc/stat").unwrap();
+                let line = stat
+                    .lines()
+                    .find(|line| line.starts_with("btime "))
+                    .unwrap();
+                line["btime ".len()..].parse().unwrap()
+            };
+            let first_second = Utc::now().timestamp();
+            let samples: Vec<i64> = (0..7)
+                .map(|_| {
+                    let btime = read_btime();
+                    thread::sleep(time::Duration::from_millis(300));
+                    btime
+                })
+                .collect();
+            // The samples must straddle absolute-second boundaries, or this
+            // test could not observe the rounding it guards against.
+            assert!(Utc::now().timestamp() >= first_second + 2);
+            assert_eq!(samples, vec![expected_btime; 7]);
+        },
+        config,
+        true,
+    );
+}
+
 #[test]
 fn tod_is_stable() {
     let config = detcore::Config {

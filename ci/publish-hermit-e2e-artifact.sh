@@ -190,6 +190,8 @@ if [[ $kind == complete ]]; then
     require_complete_resources "$stage/install" "$runtime_required"
     [[ -z $(find "$stage/install" -type l -print -quit) ]] ||
         fail "published resource bundle retained a symlink instead of an immutable copy: $stage/install"
+    special=$(find "$stage/install" -mindepth 1 ! -type f ! -type d -print -quit)
+    [[ -z $special ]] || fail "resource bundle contains a non-regular entry outside its manifest: $special"
     resource_hash=$(sha256sum "$stage/resources.sha256" | cut -d' ' -f1)
 elif [[ $kind == runtime ]]; then
     runtime_contract=runtime-only-v1
