@@ -502,14 +502,14 @@ impl GuardControllerOwner {
                     && !state.spawn_in_flight
                     && state.observer.as_ref().is_none_or(JoinHandle::is_finished)
             };
-            if finished {
-                break;
-            }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 let error = io::Error::new(io::ErrorKind::TimedOut, "guard observer join deadline");
                 self.shared.record("stop_and_join", &error);
                 return Err(error);
             };
+            if finished {
+                break;
+            }
             thread::sleep(remaining.min(Duration::from_millis(5)));
         }
         let (observer, started) = {
@@ -539,7 +539,21 @@ impl GuardControllerOwner {
             }
         };
         let final_outcome = self.shared.publish(next);
+        // The join and the final native snapshot must both be observed within
+        // the original deadline. A late typed denial is still retained/reported;
+        // it cannot become a successful local stop receipt.
+        let expired = Instant::now() >= deadline;
+        if expired {
+            let error = io::Error::new(io::ErrorKind::TimedOut, "guard final observation deadline");
+            self.shared.record("final_snapshot_deadline", &error);
+        }
         self.shared.report_if_terminal(final_outcome);
+        if expired {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "guard final observation deadline",
+            ));
+        }
         if matches!(final_outcome, NetworkGuardOutcome::Pending) {
             let error = io::Error::other("guard final observation still pending");
             self.shared.record("final_snapshot", &error);

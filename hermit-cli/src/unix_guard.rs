@@ -32,7 +32,161 @@ const CREATOR_RECOVERY: u32 = 6;
 const CONTROLLER_CHANNEL: u32 = 7;
 const CONTROLLER_TASK: u32 = 8;
 const TERMINAL: u32 = 9;
-const PIDFD_THREAD: libc::c_uint = 1;
+const TERMINAL_RELEASE: u32 = 10;
+const READBACK_INIT: u32 = 11;
+const READBACK_CHECK: u32 = 12;
+// Linux UAPI pidfd.h: PIDFD_THREAD = O_EXCL, distinct from signal flag 1.
+const PIDFD_THREAD: libc::c_uint = libc::O_EXCL as libc::c_uint;
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GuardPlainId {
+    kind: u32,
+    id: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GuardInventory {
+    magic: u64,
+    incarnation: u64,
+    proof_sequence: u64,
+    record_ordinal: u64,
+    count: u32,
+    maps: u32,
+    programs: u32,
+    links: u32,
+    ids: [GuardPlainId; 72],
+}
+impl GuardInventory {
+    fn read(fd: &OwnedFd) -> io::Result<Self> {
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        let all = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if seals < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if seals & all != all {
+            return Err(io::Error::other("unsealed original ID inventory"));
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_size != std::mem::size_of::<Self>() as i64
+        {
+            return Err(io::Error::other("original ID inventory layout"));
+        }
+        let mut value: Self = unsafe { std::mem::zeroed() };
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                (&mut value as *mut Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        };
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = unsafe {
+                libc::pread(
+                    fd.as_raw_fd(),
+                    bytes[done..].as_mut_ptr().cast(),
+                    bytes.len() - done,
+                    done as i64,
+                )
+            };
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if n == 0 {
+                return Err(io::Error::other("short original ID inventory"));
+            }
+            done += n as usize;
+        }
+        if value.magic != 0x5547_494e_5630_3031
+            || value.incarnation == 0
+            || value.proof_sequence == 0
+            || value.record_ordinal == 0
+            || value.count > 72
+        {
+            return Err(io::Error::other("invalid original ID inventory"));
+        }
+        let mut counts = [0; 3];
+        for (i, id) in value.ids.iter().enumerate() {
+            if i >= value.count as usize {
+                if id.kind != 0 || id.id != 0 {
+                    return Err(io::Error::other("nonempty inventory tail"));
+                }
+                continue;
+            }
+            if id.kind > 2
+                || id.id == 0
+                || value.ids[..i]
+                    .iter()
+                    .any(|old| old.kind == id.kind && old.id == id.id)
+            {
+                return Err(io::Error::other("invalid/duplicate original ID"));
+            }
+            counts[id.kind as usize] += 1;
+        }
+        if counts != [value.maps, value.programs, value.links]
+            || value.maps > 10
+            || value.programs > 31
+            || value.links > 31
+        {
+            return Err(io::Error::other("original inventory population"));
+        }
+        Ok(value)
+    }
+}
+/// Authenticated final object-close API completion. This contains no claim of
+/// ID absence or process/unit drain and cannot be constructed by the caller.
+#[derive(Clone, Copy, Debug)]
+pub struct GuardObjectClose {
+    values: [u64; 8],
+}
+impl GuardObjectClose {
+    fn decode(v: [u64; 8], ids: GuardInventory, deadline: u64) -> io::Result<Self> {
+        let expected = v[3]
+            .checked_add(1_000_000_000)
+            .ok_or_else(|| io::Error::other("close clock overflow"))?
+            .min(deadline);
+        if v[0] != ids.incarnation
+            || v[1] != ids.proof_sequence
+            || v[2] <= ids.record_ordinal
+            || v[3] == 0
+            || v[4] != expected
+            || v[4] <= v[3]
+            || v[5] != u64::from(ids.count)
+            || v[6] > 2
+            || v[7] != 0
+        {
+            return Err(io::Error::other("invalid object-close receipt"));
+        }
+        Ok(Self { values: v })
+    }
+    pub fn closed_ns(&self) -> u64 {
+        self.values[3]
+    }
+    pub fn deadline_ns(&self) -> u64 {
+        self.values[4]
+    }
+}
+fn pidfd_terminal(fd: &OwnedFd) -> io::Result<bool> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut p, 1, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(io::Error::other("pidfd observation failed"));
+    }
+    Ok(p.revents & libc::POLLIN != 0)
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Frame {
@@ -201,6 +355,27 @@ fn raw_request(
     rights: &[BorrowedFd<'_>],
     deadline: Instant,
 ) -> Result<Reply, RequestFailure> {
+    let mut values = [0; 8];
+    values[0] = value;
+    raw_request_values(
+        channel,
+        incarnation,
+        sequence,
+        operation,
+        values,
+        rights,
+        deadline,
+    )
+}
+fn raw_request_values(
+    channel: BorrowedFd<'_>,
+    incarnation: u64,
+    sequence: u64,
+    operation: u32,
+    values: [u64; 8],
+    rights: &[BorrowedFd<'_>],
+    deadline: Instant,
+) -> Result<Reply, RequestFailure> {
     let mut request = Packet {
         frame: Frame {
             magic: MAGIC,
@@ -223,7 +398,7 @@ fn raw_request(
     for (slot, right) in request.fds.iter_mut().zip(rights) {
         *slot = right.as_raw_fd();
     }
-    request.frame.values[0] = value;
+    request.frame.values = values;
     let mut response = Packet {
         frame: Frame::default(),
         fds: [-1; 4],
@@ -290,13 +465,16 @@ fn duplicate_above_stdio(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     }
 }
 fn monotonic_deadline(deadline: Instant) -> io::Result<u64> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "guard startup deadline"))?;
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // Sample CLOCK_MONOTONIC first, then remaining Instant time: any
+    // conversion overhead shortens this deadline instead of renewing it.
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "guard startup deadline"))?;
     (now.tv_sec as u64)
         .checked_mul(1_000_000_000)
         .and_then(|ns| ns.checked_add(now.tv_nsec as u64))
@@ -354,10 +532,15 @@ pub struct ParentGuard {
     keeper_task: Option<OwnedFd>,
     channel: Option<OwnedFd>,
     controller_channel: Option<OwnedFd>,
-    terminal: Option<GuardTerminalReceipt>,
+    terminal: Option<GuardProvisionalReceipt>,
     terminal_sequence: Option<u64>,
     terminal_in_flight: bool,
     terminal_proof: Option<([u64; 8], u64)>,
+    terminal_deadline: Option<(Instant, u64)>,
+    terminal_inventory: Option<OwnedFd>,
+    inventory: Option<GuardInventory>,
+    release_submitted: bool,
+    object_close: Option<GuardObjectClose>,
     last_request_verified: bool,
     parent_pidfd: OwnedFd,
     readers: Vec<OwnedFd>,
@@ -522,6 +705,11 @@ impl ParentGuard {
     pub fn poll_launcher_terminal(&mut self) -> io::Result<Option<i32>> {
         self.launcher.poll_wait()
     }
+    /// The exec stub creates this separate process group before invoking sudo.
+    /// After reaping, the number is for read-only absence observation only.
+    pub fn launcher_group_id(&self) -> i32 {
+        self.launcher.pid
+    }
     /// Read the typed primary before classifying any startup/keeper failure.
     /// Never use wait status 122/125 or a text match to choose Policy.
     pub fn observe_guard(&mut self) -> GuardOutcome {
@@ -562,12 +750,11 @@ impl ParentGuard {
         )
     }
 }
-/// Exact helper-side aggregate proof. It proves terminal membership, no live
-/// owned sockets/namespaces, link-ID absence and removal of the owned pin leaf.
-/// Parent read-only map handles are explicitly closed after final typed read;
-/// process/unit terminal observation is still required by the aggregate caller.
+/// Provisional helper proof of terminal membership and detach/unpin effects.
+/// This is not ID absence, object closure, process/unit drain or guest success.
+/// Only the aggregate finalizer may combine the separate physical receipts.
 #[derive(Clone, Copy, Debug)]
-pub struct GuardTerminalReceipt {
+pub struct GuardProvisionalReceipt {
     pub incarnation: u64,
     pub proof_sequence: u64,
     pub reply_sequence: u64,
@@ -577,15 +764,203 @@ pub struct GuardTerminalReceipt {
     pub initial_tasks: u64,
     pub outcome: GuardOutcome,
 }
+/// Actual authenticated two-pass ID readback, separate from actor/unit cleanup.
+/// Only the aggregate owner may combine it with real owned-child/unit receipts.
+#[derive(Debug)]
+pub struct GuardReadbackCertificate {
+    values: [u64; 8],
+}
+impl GuardReadbackCertificate {
+    pub fn incarnation(&self) -> u64 {
+        self.values[0]
+    }
+    pub fn proof_sequence(&self) -> u64 {
+        self.values[1]
+    }
+    pub fn original_ids(&self) -> u64 {
+        self.values[5]
+    }
+    pub fn observed_ns(&self) -> u64 {
+        self.values[6]
+    }
+    /// Original object-close journal ordinal authenticated by the helper.
+    pub fn record_ordinal(&self) -> u64 {
+        self.values[2]
+    }
+    /// API-completion time of the one submitted final object close.
+    pub fn closed_ns(&self) -> u64 {
+        self.values[3]
+    }
+    /// Fixed min(original terminal deadline, close time plus one second).
+    pub fn deadline_ns(&self) -> u64 {
+        self.values[4]
+    }
+    /// Complete original-ID ENOENT passes; construction requires exactly two.
+    pub fn complete_passes(&self) -> u64 {
+        self.values[7]
+    }
+}
+/// Query-only helper ownership, created outside the guest namespace. Its real
+/// launcher/unit owner stays with the aggregate caller on all paths.
+#[must_use]
+pub struct GuardReadbackClient {
+    channel: OwnedFd,
+    helper: Option<OwnedFd>,
+    rights: Vec<OwnedFd>,
+    inventory: GuardInventory,
+    deadline: Instant,
+    deadline_ns: u64,
+    initialized: bool,
+    submitted: bool,
+}
+#[must_use]
+pub struct GuardReadbackFailure {
+    pub error: io::Error,
+    pub owner: GuardReadbackClient,
+}
+impl GuardReadbackClient {
+    /// # Safety
+    /// `channel` must be the unique private parent endpoint of the maintained
+    /// query-only executable launched by the separately retained bounded unit
+    /// owner. Call after phase1, before final object close; no loader privilege
+    /// is changed. Failure returns every actual received right and endpoint.
+    pub unsafe fn prepare(
+        channel: OwnedFd,
+        guard: &ParentGuard,
+    ) -> Result<Self, GuardReadbackFailure> {
+        use std::os::fd::AsFd;
+        let mut owner = Self {
+            channel,
+            helper: None,
+            rights: Vec::new(),
+            inventory: unsafe { std::mem::zeroed() },
+            deadline: Instant::now(),
+            deadline_ns: 0,
+            initialized: false,
+            submitted: false,
+        };
+        let result = (|| {
+            owner.inventory = guard
+                .inventory
+                .ok_or_else(|| io::Error::other("provisional inventory missing"))?;
+            (owner.deadline, owner.deadline_ns) = guard.terminal_deadline()?;
+            let inventory = guard
+                .terminal_inventory
+                .as_ref()
+                .ok_or_else(|| io::Error::other("inventory capability missing"))?;
+            let mut values = [0; 8];
+            values[0] = owner.inventory.proof_sequence;
+            values[1] = owner.deadline_ns;
+            match raw_request_values(
+                owner.channel.as_fd(),
+                owner.inventory.incarnation,
+                1,
+                READBACK_INIT,
+                values,
+                &[inventory.as_fd(), guard.parent_pidfd.as_fd()],
+                owner.deadline,
+            ) {
+                Ok(mut reply) if reply.rights.len() == 1 => {
+                    owner.helper = Some(reply.rights.remove(0));
+                    owner.initialized = true;
+                    Ok(())
+                }
+                Ok(reply) => {
+                    owner.rights.extend(reply.rights);
+                    Err(io::Error::other("readback helper identity rights"))
+                }
+                Err(failure) => {
+                    owner.rights.extend(failure.rights);
+                    Err(failure.error)
+                }
+            }
+        })();
+        match result {
+            Ok(()) => Ok(owner),
+            Err(error) => Err(GuardReadbackFailure { error, owner }),
+        }
+    }
+    pub fn helper_pidfd(&self) -> Option<BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.helper.as_ref().map(AsFd::as_fd)
+    }
+    /// Issue the actual fixed-window ID query. The aggregate caller must first
+    /// consume the real child/loader/unit drains; this API certifies only IDs.
+    /// It offers no guest-success construction or generic publication switch.
+    pub fn check(&mut self, closed: GuardObjectClose) -> io::Result<GuardReadbackCertificate> {
+        use std::os::fd::AsFd;
+        if !self.initialized || self.submitted || !self.rights.is_empty() {
+            return Err(io::Error::other("readback not ready or already submitted"));
+        }
+        GuardObjectClose::decode(closed.values, self.inventory, self.deadline_ns)?;
+        // Instant sampled before raw clock makes conversion conservative.
+        let instant = Instant::now();
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let now_ns = (now.tv_sec as u64)
+            .checked_mul(1_000_000_000)
+            .and_then(|n| n.checked_add(now.tv_nsec as u64))
+            .ok_or_else(|| io::Error::other("readback clock overflow"))?;
+        let remaining = closed
+            .deadline_ns()
+            .checked_sub(now_ns)
+            .filter(|n| *n != 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "original readback deadline"))?;
+        let deadline = instant
+            .checked_add(Duration::from_nanos(remaining))
+            .ok_or_else(|| io::Error::other("readback deadline overflow"))?
+            .min(self.deadline);
+        self.submitted = true;
+        let reply = match raw_request_values(
+            self.channel.as_fd(),
+            self.inventory.incarnation,
+            2,
+            READBACK_CHECK,
+            closed.values,
+            &[],
+            deadline,
+        ) {
+            Ok(reply) => reply,
+            Err(failure) => {
+                self.rights.extend(failure.rights);
+                return Err(failure.error);
+            }
+        };
+        if !reply.rights.is_empty() {
+            self.rights.extend(reply.rights);
+            return Err(io::Error::other("unexpected readback rights"));
+        }
+        let v = reply.frame.values;
+        if v[..6] != closed.values[..6]
+            || v[6] < closed.closed_ns()
+            || v[6] >= closed.deadline_ns()
+            || v[7] != 2
+            || Instant::now() >= deadline
+        {
+            return Err(io::Error::other("invalid or late original ID readback"));
+        }
+        Ok(GuardReadbackCertificate { values: v })
+    }
+}
 impl ParentGuard {
     /// Issue one bounded parent-lane attempt after finalizing the actual
     /// Container result. Busy/failed proof retains this entire owner and pins.
     /// A later attempt uses a new sequence; it never recreates admission state.
-    pub fn request_terminal(&mut self, deadline: Instant) -> io::Result<GuardTerminalReceipt> {
+    pub fn prepare_terminal(&mut self, deadline: Instant) -> io::Result<GuardProvisionalReceipt> {
         if let Some(receipt) = self.terminal {
             return Ok(receipt);
         }
         self.recover_creator()?;
+        let (deadline, deadline_ns) = match self.terminal_deadline {
+            Some(bound) => bound,
+            None => {
+                let bound = (deadline, monotonic_deadline(deadline)?);
+                self.terminal_deadline = Some(bound);
+                bound
+            }
+        };
         let first = *self.terminal_sequence.get_or_insert(
             self.next_sequence
                 .checked_add(1)
@@ -600,7 +975,7 @@ impl ParentGuard {
                 ));
             }
             self.terminal_in_flight = true;
-            let reply = match self.request(TERMINAL, 0, &[], deadline) {
+            let mut reply = match self.request(TERMINAL, deadline_ns, &[], deadline) {
                 Ok(reply) => reply,
                 Err(error) => {
                     // Only an authenticated negative reply permits a new read/
@@ -611,10 +986,11 @@ impl ParentGuard {
                     return Err(error);
                 }
             };
-            if !reply.rights.is_empty() {
+            if reply.rights.len() != 1 || self.terminal_inventory.is_some() {
                 self.unresolved_rights.extend(reply.rights);
-                return Err(io::Error::other("unexpected terminal rights"));
+                return Err(io::Error::other("unexpected terminal inventory rights"));
             }
+            self.terminal_inventory = Some(reply.rights.remove(0));
             let v = reply.frame.values;
             if v[0] != self.incarnation
                 || v[1] < first
@@ -629,14 +1005,30 @@ impl ParentGuard {
             {
                 return Err(io::Error::other("invalid aggregate guard terminal receipt"));
             }
+            let inventory =
+                GuardInventory::read(self.terminal_inventory.as_ref().expect("inventory owner"))?;
+            if inventory.incarnation != v[0]
+                || inventory.proof_sequence != v[1]
+                || inventory.record_ordinal != v[2]
+                || (self.readers.len() == 3
+                    && (inventory.count != 72
+                        || inventory.maps != 10
+                        || inventory.programs != 31
+                        || inventory.links != 31))
+            {
+                return Err(io::Error::other(
+                    "terminal inventory does not match phase proof",
+                ));
+            }
+            self.inventory = Some(inventory);
             let proof = (v, reply.frame.sequence);
             self.terminal_proof = Some(proof); // before any fallible final read
             self.terminal_in_flight = false;
             proof
         };
-        // The helper may already have exited after its reply. This locked
-        // snapshot preserves the primary without classifying expected exit as
-        // failure. Held maps remain valid after object/link cleanup.
+        // Admissions are closed and the terminal lifetimes are proved; links
+        // are detached, but the helper retains its object until explicit ACK.
+        // Preserve the exact typed final snapshot before closing local readers.
         let outcome = if self.readers.len() == 3 {
             let fds = MonitorFds {
                 config: self.readers[0].as_raw_fd(),
@@ -664,7 +1056,7 @@ impl ParentGuard {
             }
             GuardOutcome::Internal(self.monitor)
         };
-        let receipt = GuardTerminalReceipt {
+        let receipt = GuardProvisionalReceipt {
             incarnation: v[0],
             proof_sequence: v[1],
             reply_sequence,
@@ -674,12 +1066,71 @@ impl ParentGuard {
             initial_tasks: v[5],
             outcome,
         };
-        self.terminal = Some(receipt); // durable before explicit owner closes
+        self.terminal = Some(receipt); // provisional, never guest success
+        Ok(receipt)
+    }
+    /// Retained original map/program/link IDs, copied as evidence only.
+    /// Kinds are 0=map, 1=program, 2=link. These plain numbers never authorize
+    /// attachment, retirement, query privilege or aggregate success.
+    pub fn original_ids(&self) -> Option<Vec<(u32, u32)>> {
+        self.inventory.map(|ids| {
+            ids.ids[..ids.count as usize]
+                .iter()
+                .map(|id| (id.kind, id.id))
+                .collect()
+        })
+    }
+    /// Exact retained population in map/program/link order. A complete loader
+    /// is checked as [10,31,31]; partial-startup populations remain failures.
+    pub fn original_id_counts(&self) -> Option<[u32; 3]> {
+        self.inventory
+            .map(|ids| [ids.maps, ids.programs, ids.links])
+    }
+    /// Original absolute budget shared by both terminal phases and readback.
+    pub fn terminal_deadline(&self) -> io::Result<(Instant, u64)> {
+        self.terminal_deadline
+            .ok_or_else(|| io::Error::other("terminal preparation missing"))
+    }
+    /// Close actual local reader aliases, then ACK the exact provisional proof.
+    /// Unknown ACK completion remains latched; no retry creates a fresh window.
+    pub fn close_terminal(&mut self) -> io::Result<GuardObjectClose> {
+        if let Some(closed) = self.object_close {
+            return Ok(closed);
+        }
+        let provisional = self
+            .terminal
+            .ok_or_else(|| io::Error::other("terminal preparation missing"))?;
+        let inventory = self
+            .inventory
+            .ok_or_else(|| io::Error::other("terminal inventory missing"))?;
+        let (deadline, original_ns) = self.terminal_deadline()?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "terminal deadline"));
+        }
+        if self.release_submitted {
+            return Err(io::Error::other("unknown object close retained"));
+        }
+        if !self.unresolved_rights.is_empty() {
+            return Err(io::Error::other("unclassified received rights retained"));
+        }
+        if let Some(controller) = &self.controller {
+            if !pidfd_terminal(controller)? {
+                return Err(io::Error::other("controller still live"));
+            }
+        }
         self.readers.clear();
         drop(self.creator_map.take());
         drop(self.controller_channel.take());
+        self.release_submitted = true;
+        let reply = self.request(TERMINAL_RELEASE, provisional.record_ordinal, &[], deadline)?;
+        if !reply.rights.is_empty() {
+            self.unresolved_rights.extend(reply.rights);
+            return Err(io::Error::other("unexpected object-close rights"));
+        }
+        let closed = GuardObjectClose::decode(reply.frame.values, inventory, original_ns)?;
+        self.object_close = Some(closed);
         drop(self.channel.take());
-        Ok(receipt)
+        Ok(closed)
     }
     /// Exact helper identity, not launcher MainPID. No blocking wait is hidden
     /// here, and true is not a substitute for request_terminal's policy proof.
@@ -712,6 +1163,7 @@ pub struct PrepareFailure {
 /// preparing on one task and invoking the synchronous clone on another thread.
 pub struct PreparedGuard {
     parent: Cell<Option<ParentGuard>>,
+    deadline: Instant,
     _same_thread: PhantomData<*mut ()>,
 }
 pub struct ControllerGuard {
@@ -898,7 +1350,10 @@ pub unsafe fn prepare_guard(
     // prebuilt CString vectors and raw fork stub retain no Command/Child,
     // dlopen owner, Arc, service thread or runtime mutex across Container clone.
     let exe = CString::new(CAPABILITY_SUDO).expect("constant executable");
-    let args = launch.arguments().map_err(before)?;
+    let bootstrap_deadline_ns = monotonic_deadline(deadline).map_err(before)?;
+    let mut args = launch.arguments().map_err(before)?;
+    args.push("--bootstrap-deadline-ns".into());
+    args.push(bootstrap_deadline_ns.to_string().into());
     let mut arg_strings = Vec::with_capacity(args.len() + 1);
     arg_strings.push(exe.clone());
     for value in &args {
@@ -958,6 +1413,9 @@ pub unsafe fn prepare_guard(
     }
     if pid == 0 {
         unsafe {
+            if libc::setsid() < 0 {
+                libc::_exit(125);
+            }
             libc::close(parent.as_raw_fd());
             if libc::dup2(helper_endpoint.as_raw_fd(), 0) < 0
                 || libc::dup2(out.as_raw_fd(), 1) < 0
@@ -994,6 +1452,11 @@ pub unsafe fn prepare_guard(
         terminal_sequence: None,
         terminal_in_flight: false,
         terminal_proof: None,
+        terminal_deadline: None,
+        terminal_inventory: None,
+        inventory: None,
+        release_submitted: false,
+        object_close: None,
         last_request_verified: false,
         parent_pidfd,
         readers: Vec::new(),
@@ -1037,7 +1500,7 @@ pub unsafe fn prepare_guard(
         let recovery_root = outside.recovery_root.try_clone()?;
         let mut init = owner.request(
             INIT,
-            0,
+            bootstrap_deadline_ns,
             &[
                 elf.as_fd(),
                 bpffs_root.as_fd(),
@@ -1087,6 +1550,7 @@ pub unsafe fn prepare_guard(
     match result {
         Ok(()) => Ok(PreparedGuard {
             parent: Cell::new(Some(owner)),
+            deadline,
             _same_thread: PhantomData,
         }),
         Err(error) => Err(PrepareFailure {
@@ -1137,7 +1601,7 @@ impl PreparedGuard {
             .checked_add(timeout)
             .filter(|_| !timeout.is_zero())
         {
-            Some(deadline) => deadline,
+            Some(deadline) => deadline.min(self.deadline),
             None => {
                 return Err(GuardStartFailure {
                     error: io::Error::other("invalid guard clone timeout"),
@@ -1145,6 +1609,15 @@ impl PreparedGuard {
                 });
             }
         };
+        if Instant::now() >= deadline {
+            return Err(GuardStartFailure {
+                error: io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "guard preparation used startup deadline",
+                ),
+                owner,
+            });
+        }
         if let Err(error) = owner.arm_for_clone(deadline) {
             if let Err(secondary) = owner.recover_creator() {
                 owner.creator_recovery_error = Some(secondary);
@@ -1160,6 +1633,10 @@ impl PreparedGuard {
     }
 }
 impl ArmedGuard {
+    /// The original absolute budget retained before helper launch/ARM.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
     /// The original startup budget, reduced by actual ARM time.
     pub fn remaining(&self) -> io::Result<Duration> {
         self.deadline
@@ -1177,6 +1654,7 @@ impl ArmedGuard {
         transferred_descriptors: usize,
         deadline: Instant,
     ) -> Result<(), StartupError> {
+        let deadline = deadline.min(self.deadline);
         let mut parent = self.state.take().ok_or(StartupError::Protocol)?;
         // Install parent recovery before any fallible receipt or duplicate.
         let admission = (|| {
@@ -1379,5 +1857,69 @@ mod birth_tests {
         }
         assert!(GuardBirth::decode(VALID, 0, 2).is_err());
         assert!(GuardBirth::decode(VALID, 7, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod terminal_receipt_tests {
+    use super::GuardInventory;
+    use super::GuardObjectClose;
+    fn inventory() -> GuardInventory {
+        let mut ids: GuardInventory = unsafe { std::mem::zeroed() };
+        ids.incarnation = 7;
+        ids.proof_sequence = 10;
+        ids.record_ordinal = 100;
+        ids.count = 72;
+        ids
+    }
+    #[test]
+    fn native_inventory_layout_and_original_close_window_match() {
+        assert_eq!(std::mem::size_of::<GuardInventory>(), 624);
+        let closed = GuardObjectClose::decode(
+            [7, 10, 102, 1_000_000_000, 2_000_000_000, 72, 0, 0],
+            inventory(),
+            5_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(closed.closed_ns(), 1_000_000_000);
+        assert_eq!(closed.deadline_ns(), 2_000_000_000);
+    }
+    #[test]
+    fn original_terminal_deadline_can_only_shorten_query_window() {
+        let values = [7, 10, 102, 1_000_000_000, 1_500_000_000, 72, 0, 0];
+        assert!(GuardObjectClose::decode(values, inventory(), 1_500_000_000).is_ok());
+        let mut renewed = values;
+        renewed[4] = 2_000_000_000;
+        assert!(GuardObjectClose::decode(renewed, inventory(), 1_500_000_000).is_err());
+    }
+    #[test]
+    fn mismatched_unknown_or_relabelled_close_receipts_are_rejected() {
+        let values = [7, 10, 102, 1_000_000_000, 2_000_000_000, 72, 0, 0];
+        for (field, bad) in [
+            (0, 8),
+            (1, 11),
+            (2, 100),
+            (3, 0),
+            (4, 2_000_000_001),
+            (5, 0),
+            (6, 3),
+            (7, 1),
+        ] {
+            let mut changed = values;
+            changed[field] = bad;
+            assert!(
+                GuardObjectClose::decode(changed, inventory(), 5_000_000_000).is_err(),
+                "field {field}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pidfd_abi_tests {
+    #[test]
+    fn pidfd_thread_uses_linux_open_flag_not_signal_flag() {
+        assert_eq!(super::PIDFD_THREAD, 0x80);
+        assert_ne!(super::PIDFD_THREAD, 1);
     }
 }

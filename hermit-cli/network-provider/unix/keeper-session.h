@@ -5,6 +5,7 @@
 #ifndef HERMIT_UNIX_KEEPER_SESSION_H
 #define HERMIT_UNIX_KEEPER_SESSION_H
 #include "keeper-monitor.h"
+#include "keeper-readback.h"
 #define UG_LINKS 31
 #define UG_MAPS 10
 struct ug_session;
@@ -43,7 +44,20 @@ struct ug_terminal_receipt {
     u64 incarnation, sequence, record_ordinal, removed_links;
     u64 removed_map_pins, initial_tasks, first_outcome, guard_faults;
 };
+/* Legacy lower-level detach API retained for the unchanged no-ARM controls.
+ * It is not a production aggregate certificate and is not dispatched by keeper. */
 int ug_session_terminal(struct ug_session *, u64 sequence, struct ug_terminal_receipt *);
+/* Production phase1: terminal lifetimes, exact immutable original inventory,
+ * detach/unpin; object FD descriptions remain until explicit parent ACK. */
+int ug_session_prepare_terminal(struct ug_session *, u64 sequence,
+                                struct ug_terminal_receipt *, int *inventory_fd);
+/* Production phase2: exact phase1 ACK after parent/controller readers close.
+ * The result timestamps final object-close API completion and fixes the single
+ * one-second ID readback deadline. It does NOT claim those IDs are absent. */
+int ug_session_close_terminal(struct ug_session *, u64 sequence,
+                              u64 proof_sequence, u64 proof_ordinal,
+                              u64 original_terminal_deadline_ns,
+                              struct ug_object_close *);
 /* Success proves links absent and owned pin directory removed. Read-only map
  * descriptions held by the parent/controller remain their explicit owners;
  * their later close is required before aggregate map-ID absence. */

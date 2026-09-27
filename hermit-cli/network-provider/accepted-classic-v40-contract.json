@@ -1,0 +1,502 @@
+{
+  "schema": 1,
+  "abi_version": "4150525553540007",
+  "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
+  "maps": 23,
+  "programs": 46,
+  "links": 58,
+  "shared_links": [
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "__sys_connect",
+      "offset": 65,
+      "cookie": 3
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "__sys_connect",
+      "offset": 70,
+      "cookie": 5
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "__sys_accept4",
+      "offset": 33,
+      "cookie": 8
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "fdget_raw",
+      "offset": 124,
+      "cookie": 13
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "fdget_raw",
+      "offset": 5,
+      "cookie": 12
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "__x64_sys_read",
+      "offset": 19,
+      "cookie": 14
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "fdget_pos",
+      "offset": 150,
+      "cookie": 15
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "fdget_pos",
+      "offset": 250,
+      "cookie": 16
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "do_epoll_ctl",
+      "offset": 35,
+      "cookie": 18
+    },
+    {
+      "program": "fd_connect_post_fdget",
+      "symbol": "do_epoll_ctl",
+      "offset": 55,
+      "cookie": 19
+    },
+    {
+      "program": "fd_stream_copy_enter",
+      "symbol": "__skb_datagram_iter",
+      "offset": 619,
+      "cookie": 7
+    },
+    {
+      "program": "fd_stream_copy_exit",
+      "symbol": "__skb_datagram_iter",
+      "offset": 624,
+      "cookie": 8
+    }
+  ],
+  "source_files": [
+    "provider.bpf.c",
+    "driver.c",
+    "task-disarm.h",
+    "provider.h",
+    "provider-abi.h",
+    "auth-diagnostic.h",
+    "setter-level.h",
+    "adapter-abi.c",
+    "fd-effects.h",
+    "fd-effects.bpf.h",
+    "fd-effects-driver.h",
+    "retirement-target.h",
+    "fd-enrollment.h",
+    "fd-enrollment-driver.h",
+    "connect-copy.h",
+    "fdupfd.h",
+    "epoll-ctl-copy.h",
+    "epoll-ctl-copy.bpf.h",
+    "epoll-ctl-copy-driver.h",
+    "stream-copy.h",
+    "stream-copy.bpf.h",
+    "stream-copy-driver.h"
+  ],
+  "hooks": {
+    "fdget": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "sk_getsockopt": [
+      [
+        8,
+        4,
+        4,
+        16,
+        16
+      ],
+      7,
+      4
+    ],
+    "sk_setsockopt": [
+      [
+        8,
+        4,
+        4,
+        16,
+        4
+      ],
+      6,
+      4
+    ],
+    "tcp_setsockopt": [
+      [
+        8,
+        4,
+        4,
+        16,
+        4
+      ],
+      6,
+      4
+    ],
+    "tcp_v4_syn_recv_sock": [
+      [
+        8,
+        8,
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      7,
+      8
+    ],
+    "inet_csk_complete_hashdance": [
+      [
+        8,
+        8,
+        8,
+        1
+      ],
+      4,
+      8
+    ],
+    "__sk_free": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "__sys_accept4": [
+      [
+        4,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "inet_accept": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ],
+    "inet_csk_accept": [
+      [
+        8,
+        8
+      ],
+      2,
+      8
+    ],
+    "do_accept": [
+      [
+        8,
+        8,
+        8,
+        8,
+        4
+      ],
+      5,
+      8
+    ],
+    "fd_install": [
+      [
+        4,
+        8
+      ],
+      2,
+      0
+    ],
+    "file_close_fd_locked": [
+      [
+        8,
+        4
+      ],
+      2,
+      8
+    ],
+    "do_dup2": [
+      [
+        8,
+        8,
+        4,
+        4
+      ],
+      4,
+      4
+    ],
+    "filp_close": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "__fput": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "do_close_on_exec": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "dup_fd": [
+      [
+        8,
+        8
+      ],
+      2,
+      8
+    ],
+    "put_files_struct": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "kmem_cache_free": [
+      [
+        8,
+        8
+      ],
+      2,
+      0
+    ],
+    "file_close_fd": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "ptrace_request": [
+      [
+        8,
+        8,
+        8,
+        8
+      ],
+      4,
+      4
+    ],
+    "__sys_connect": [
+      [
+        4,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "_copy_from_user": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      8
+    ],
+    "__audit_sockaddr": [
+      [
+        4,
+        8
+      ],
+      2,
+      4
+    ],
+    "security_socket_connect": [
+      [
+        8,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "kernel_clone": [
+      [
+        8
+      ],
+      1,
+      4
+    ],
+    "copy_process": [
+      [
+        8,
+        4,
+        4,
+        8
+      ],
+      4,
+      8
+    ],
+    "__bpf_trace_sched_process_fork": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      0
+    ],
+    "klp_copy_process": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "__bpf_trace_sys_exit": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      0
+    ],
+    "f_dupfd": [
+      [
+        4,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "alloc_fd": [
+      [
+        4,
+        4,
+        4
+      ],
+      3,
+      4
+    ],
+    "fdget_raw": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "__x64_sys_read": [
+      [
+        8
+      ],
+      1,
+      8
+    ],
+    "fdget_pos": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "do_epoll_ctl": [
+      [
+        4,
+        4,
+        4,
+        8,
+        1
+      ],
+      5,
+      4
+    ],
+    "__bpf_trace_sys_enter": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      0
+    ],
+    "inet_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "inet6_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "unix_stream_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "_copy_to_iter": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      8
+    ],
+    "skb_copy_datagram_iter": [
+      [
+        8,
+        4,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "__skb_datagram_iter": [
+      [
+        8,
+        4,
+        8,
+        4,
+        1,
+        8,
+        8
+      ],
+      7,
+      4
+    ]
+  }
+}

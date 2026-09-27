@@ -17,6 +17,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "grouped_contract.rs"]
+mod grouped_contract;
+pub use grouped_contract::GroupedEvent;
+
 pub const MAX_ARTIFACT: usize = 1024 * 1024;
 pub const MAX_INPUT: usize = 16 * 1024 * 1024;
 
@@ -113,27 +117,63 @@ impl StringBudget {
     }
 }
 
+/// One additional owned attachment of an already loaded program. This is
+/// not a generic count allowance: parse admits only the two reviewed F_GETFL sites.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedLink {
+    pub program: String,
+    pub symbol: String,
+    pub offset: u64,
+    pub cookie: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contract {
     pub schema: u32,
     pub abi_version: String,
+    #[serde(default)]
+    pub copy_version: Option<u64>,
     pub btf_sha256: String,
     pub maps: usize,
     pub programs: usize,
     pub links: usize,
+    #[serde(default)]
+    pub shared_links: Vec<SharedLink>,
+    #[serde(default)]
+    pub grouped_event: Option<GroupedEvent>,
+    #[serde(default)]
+    pub ftrace_only: bool,
     pub source_files: Vec<String>,
     pub hooks: BTreeMap<String, (Vec<usize>, usize, usize)>,
 }
 
 impl Contract {
+    /// Native accepted-provider grammar; old ABI7 absence means exactly V4.
+    /// ABI8 has no implicit grammar and unknown/crossed pairs are refused.
+    pub fn accepted_copy_version(&self) -> Result<u64> {
+        match (self.abi_version.as_str(), self.copy_version) {
+            ("4150525553540007", None | Some(4)) => Ok(4),
+            ("4150525553540008", Some(5)) => Ok(5),
+            _ => anyhow::bail!("unsupported accepted adapter/copy version pair"),
+        }
+    }
+
     pub fn parse(raw: &[u8]) -> Result<Self> {
         let result: Self = serde_json::from_slice(raw)?;
+        // Contracts without shared attachments still require one link per
+        // program. Every additional link is declared and exactly accounted,
+        // with overflow refused.
+        let declared_links = result
+            .programs
+            .checked_add(result.shared_links.len())
+            .context("provider link count overflow")?;
         ensure!(
             result.schema == 1
                 && result.maps > 0
                 && result.programs > 0
-                && result.links == result.programs,
+                && result.links == declared_links,
             "unsupported provider contract"
         );
         ensure!(
@@ -148,6 +188,85 @@ impl Contract {
             !result.hooks.is_empty() && !result.source_files.is_empty(),
             "empty provider contract"
         );
+        if let Some(link) = result.shared_links.first() {
+            // driver.c reuses the original Connect post-selection program at
+            // BOTH actual fdget_raw instruction sites, in owned post/pre link order.
+            // The unpublished single-link sibling-wrapper shape failed native
+            // selection and is deliberately refused, not retained as an ABI.
+            // The two unpublished notrace caller sites are also refused; the
+            // supported pair observes the actual fdget_raw callable body.
+            // All original programs and links remain owned.
+            // Retain all three scalar Read sites. The copy-only epoll command
+            // adds sys_enter plus one site on the existing multi-session link.
+            // No global fdget or notrace copy hook is attached.
+            ensure!(
+                result.shared_links.len() == 12
+                    && result.accepted_copy_version().is_ok()
+                    && result.maps == 23
+                    && result.programs == 46
+                    && result.shared_links.iter().zip([
+                        ("fd_connect_post_fdget", "__sys_connect", 0x41, 3),
+                        ("fd_connect_post_fdget", "__sys_connect", 0x46, 5),
+                        ("fd_connect_post_fdget", "__sys_accept4", 0x21, 8),
+                        ("fd_connect_post_fdget", "fdget_raw", 0x7c, 13),
+                        ("fd_connect_post_fdget", "fdget_raw", 0x5, 12),
+                        ("fd_connect_post_fdget", "__x64_sys_read", 0x13, 14),
+                        ("fd_connect_post_fdget", "fdget_pos", 0x96, 15),
+                        ("fd_connect_post_fdget", "fdget_pos", 0xfa, 16),
+                        ("fd_connect_post_fdget", "do_epoll_ctl", 0x23, 18),
+                        ("fd_connect_post_fdget", "do_epoll_ctl", 0x37, 19),
+                        ("fd_stream_copy_enter", "__skb_datagram_iter", 0x26b, 7),
+                        ("fd_stream_copy_exit", "__skb_datagram_iter", 0x270, 8),
+                    ]).all(|(site, (program, symbol, offset, cookie))| {
+                            site.program == program
+                                && site.symbol == symbol
+                                && site.offset == offset
+                                && site.cookie == cookie
+                        }),
+                "unsupported shared provider attachment"
+            );
+            ensure!(
+                matches!(result.hooks.get("fdget_raw"), Some((widths, 1, 8)) if widths.as_slice() == [4])
+                    && matches!(result.hooks.get(&link.symbol), Some((widths, 3, 4)) if widths.as_slice() == [4,8,4])
+                    && matches!(result.hooks.get("__x64_sys_read"), Some((widths, 1, 8)) if widths.as_slice() == [8])
+                    && matches!(result.hooks.get("fdget_pos"), Some((widths, 1, 8)) if widths.as_slice() == [4])
+                    && matches!(result.hooks.get("do_epoll_ctl"), Some((widths, 5, 4)) if widths.as_slice() == [4,4,4,8,1])
+                    && matches!(result.hooks.get("__bpf_trace_sys_enter"), Some((widths, 3, 0)) if widths.as_slice() == [8,8,8])
+                    && ["inet_recvmsg","inet6_recvmsg","unix_stream_recvmsg"].iter().all(|name|
+                        matches!(result.hooks.get(*name),Some((widths,4,4)) if widths.as_slice()==[8,8,8,4]))
+                    && matches!(result.hooks.get("_copy_to_iter"),Some((widths,3,8)) if widths.as_slice()==[8,8,8])
+                    && matches!(result.hooks.get("__skb_datagram_iter"),Some((widths,7,4)) if widths.as_slice()==[8,4,8,4,1,8,8])
+                    && matches!(result.hooks.get("skb_copy_datagram_iter"),Some((widths,4,4)) if widths.as_slice()==[8,4,8,4])
+                    && [
+                        "stream-copy.h", "stream-copy.bpf.h", "stream-copy-driver.h",
+                        "provider.bpf.c",
+                        "driver.c",
+                        "fd-effects.bpf.h",
+                        "retirement-target.h",
+                        "connect-copy.h",
+                        "epoll-ctl-copy.h",
+                        "epoll-ctl-copy.bpf.h",
+                        "epoll-ctl-copy-driver.h",
+                    ]
+                    .iter()
+                    .all(|name| result.source_files.iter().any(|source| source.as_str() == *name)),
+                "shared provider attachment lacks its source or hook contract"
+            );
+        }
+        if result.ftrace_only && result.grouped_event.is_none() {
+            anyhow::bail!("ftrace topology requires the complete compatibility coverage table");
+        }
+        if result.grouped_event.is_some() {
+            grouped_contract::validate(&result)?;
+        } else {
+            ensure!(
+                !result.source_files.iter().any(|name| {
+                    name.starts_with("grouped")
+                        || matches!(name.as_str(), "provider-grouped.bpf.c" | "driver-grouped.c" | "stream-membership.bpf.h")
+                }),
+                "grouped provider sources require explicit grouped topology"
+            );
+        }
         let mut seen = BTreeSet::new();
         for name in &result.source_files {
             ensure!(
@@ -254,7 +373,9 @@ fn check_btf(raw: &[u8], expected: &BTreeMap<String, (Vec<usize>, usize, usize)>
         );
         let widths = prototype
             .payload
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|parameter| type_width(&types, u32_at(parameter, 4)? as usize))
             .collect::<Result<Vec<_>>>()?;
         let slots = widths.iter().map(|n| n.div_ceil(8)).sum::<usize>();
@@ -349,7 +470,7 @@ impl Elf {
         let mut sections = Vec::new();
         let mut name_offsets = Vec::new();
         let mut copied_bytes = 0usize;
-        for row in headers.chunks_exact(64) {
+        for row in headers.as_chunks::<64>().0 {
             let kind = u32_at(row, 4)?;
             let size = u64_at(row, 32)?;
             let data = if kind == 8 {
@@ -406,7 +527,7 @@ impl Elf {
                 .context("symbol table link outside sections")?;
             ensure!(strings.kind == 3, "symbol names do not link a string table");
             let mut table = Vec::new();
-            for row in section.data.chunks_exact(24) {
+            for row in section.data.as_chunks::<24>().0 {
                 let target = u16_at(row, 6)?;
                 let target = if target >= 0xff00 {
                     // u16 decimal is at most five bytes; reserve the exact
@@ -493,7 +614,7 @@ impl Elf {
         let target = self.section(section.info)?;
         let width = if section.kind == 9 { 16 } else { 24 };
         ensure!(
-            section.entry == width as u64 && section.data.len() % width == 0,
+            section.entry == width as u64 && section.data.len().is_multiple_of(width),
             "malformed relocation table"
         );
         let mut result = Vec::new();
@@ -762,6 +883,59 @@ mod tests {
     }
 
     #[test]
+    fn read_copy_unit_hook_requires_exact_argument_and_return_contract() {
+        let raw = include_bytes!("accepted-classic-v40-contract.json");
+        assert!(Contract::parse(raw).is_ok());
+        let original: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        assert_eq!(original["hooks"]["__skb_datagram_iter"], json!([[8,4,8,4,1,8,8],7,4]));
+        // Build the actual historical population. The current dispatcher
+        // folds three programs and inserts five earlier shared sites; cloning
+        // its new count or truncating its prefix would test a different shape.
+        let mut old126=original.clone();old126["programs"]=json!(49);old126["links"]=json!(54);
+        old126["shared_links"]=Value::Array(original["shared_links"].as_array().unwrap()[3..8].to_vec());
+        assert_eq!(old126["shared_links"].as_array().unwrap().len(),5);
+        assert_eq!(old126["shared_links"][0]["symbol"],json!("fdget_raw"));
+        assert_eq!(old126["shared_links"][4]["symbol"],json!("fdget_pos"));
+        old126["hooks"].as_object_mut().unwrap().remove("__skb_datagram_iter");
+        assert_eq!(old126["maps"].as_u64().unwrap()+old126["programs"].as_u64().unwrap()+old126["links"].as_u64().unwrap(),126);
+        assert!(Contract::parse(&serde_json::to_vec(&old126).unwrap()).is_err());
+        for (site,program,offset,cookie) in [(10,"fd_stream_copy_enter",0x26b,7),
+            (11,"fd_stream_copy_exit",0x270,8)] {
+            assert_eq!(original["shared_links"][site],json!({"program":program,
+                "symbol":"__skb_datagram_iter","offset":offset,"cookie":cookie}));
+            for (field,value) in [("program",json!("fd_connect_post_fdget")),
+                ("symbol",json!("simple_copy_to_iter")),("offset",json!(0x64)),("cookie",json!(5))] {
+                let mut bad=original.clone();bad["shared_links"][site][field]=value;
+                assert!(Contract::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+            }
+        }
+        let mut wrong=original.clone();wrong["hooks"]["__skb_datagram_iter"]=json!([[8,4,8,4,4,8,8],7,4]);
+        assert!(Contract::parse(&serde_json::to_vec(&wrong).unwrap()).is_err());
+        assert_eq!(original["hooks"]["_copy_to_iter"], json!([[8,8,8],3,8]));
+        for prototype in [json!([[8,8,8,8],4,8]), json!([[8,4,8],3,8]),
+                          json!([[8,8,8],2,8]), json!([[8,8,8],3,4])] {
+            let mut bad = original.clone();bad["hooks"]["_copy_to_iter"] = prototype;
+            assert!(Contract::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        // The installed datagram loop inlines this nominal wrapper and calls
+        // _copy_to_iter directly. Its traceability cannot qualify copy coverage.
+        let mut bypassed = original.clone();
+        assert!(bypassed["hooks"].as_object_mut().unwrap().remove("_copy_to_iter").is_some());
+        bypassed["hooks"]["simple_copy_to_iter"] = json!([[8,8,8,8],4,8]);
+        assert!(Contract::parse(&serde_json::to_vec(&bypassed).unwrap()).is_err());
+        assert_eq!(original["hooks"]["skb_copy_datagram_iter"], json!([[8,4,8,4],4,4]));
+        let mut missing = original.clone();
+        missing["hooks"].as_object_mut().unwrap().remove("skb_copy_datagram_iter");
+        assert!(Contract::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+        for prototype in [json!([[8,8,8,4],4,4]), json!([[8,4,8,8],4,4]),
+                          json!([[8,4,8,4],3,4]), json!([[8,4,8,4],4,8])] {
+            let mut bad = original.clone();
+            bad["hooks"]["skb_copy_datagram_iter"] = prototype;
+            assert!(Contract::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn distinct_nobits_suffix_names_share_one_decoded_budget() {
         let names = b"\0.names\0abcdefgh\0";
         let raw = small_elf(names, &[(8, 8, vec![]), (9, 8, vec![]), (10, 8, vec![])]);
@@ -945,6 +1119,321 @@ mod tests {
         }
     }
 
+    fn contract_json() -> Value {
+        json!({
+            "schema":1, "abi_version":"legacy", "btf_sha256":"0".repeat(64),
+            "maps":1, "programs":1, "links":1,
+            "source_files":["test.c"], "hooks":{"hook":[[4],1,4]}
+        })
+    }
+
+    fn parse_contract(value: &Value) -> Result<Contract> {
+        Contract::parse(&serde_json::to_vec(value).unwrap())
+    }
+
+    fn shared_contract_json() -> Value {
+        let value: Value = serde_json::from_str(include_str!("accepted-classic-v40-contract.json")).unwrap();
+        // This preserves the exact historical classic contract and its assertions.
+        assert_eq!(value["maps"], 23);
+        assert_eq!(value["programs"], 46);
+        assert_eq!(value["links"], 58);
+        assert_eq!(value["shared_links"].as_array().unwrap().len(), 12);
+        value
+    }
+
+    // Retired attachment declarations retain their original source/hook set
+    // and inventory, independently of later additions to the current contract.
+    fn pre_copy_contract_json() -> Value {
+        let mut value = shared_contract_json();
+        value["maps"] = json!(22);
+        value["programs"] = json!(45);
+        value["links"] = json!(50);
+        value["shared_links"] = Value::Array(value["shared_links"].as_array().unwrap()[3..8].to_vec());
+        for name in ["stream-copy.h", "stream-copy.bpf.h", "stream-copy-driver.h"] {
+            let sources = value["source_files"].as_array_mut().unwrap();
+            let index = sources.iter().position(|source| source.as_str() == Some(name)).unwrap();
+            sources.remove(index);
+        }
+        for name in ["inet_recvmsg", "inet6_recvmsg", "unix_stream_recvmsg",
+                     "_copy_to_iter", "skb_copy_datagram_iter", "__skb_datagram_iter"] {
+            assert!(value["hooks"].as_object_mut().unwrap().remove(name).is_some());
+        }
+        value
+    }
+
+    #[test]
+    fn contract_legacy_equality_and_exact_shared_attachment_are_admitted() {
+        let legacy = parse_contract(&contract_json()).unwrap();
+        assert!(legacy.shared_links.is_empty());
+        assert_eq!((legacy.maps, legacy.programs, legacy.links), (1, 1, 1));
+        let shared = parse_contract(&shared_contract_json()).unwrap();
+        assert_eq!((shared.maps, shared.programs, shared.links), (23, 46, 58));
+        assert_eq!(shared.maps + shared.programs + shared.links, 127);
+        assert_eq!(shared.shared_links[3].program, "fd_connect_post_fdget");
+        assert_eq!(shared.shared_links[3].symbol, "fdget_raw");
+        assert_eq!((shared.shared_links[3].offset, shared.shared_links[3].cookie), (0x7c, 13));
+        assert_eq!(shared.shared_links.len(), 12);
+        assert_eq!(shared.shared_links[4].program, "fd_connect_post_fdget");
+        assert_eq!(shared.shared_links[4].symbol, "fdget_raw");
+        assert_eq!((shared.shared_links[4].offset, shared.shared_links[4].cookie), (0x5, 12));
+        let mut explicit_empty = contract_json();
+        explicit_empty["shared_links"] = json!([]);
+        assert!(parse_contract(&explicit_empty).is_ok());
+    }
+
+    #[test]
+    fn contract_shared_omitted_mismatched_unknown_and_overflow_refuse() {
+        let original = shared_contract_json();
+        let mut absent = original.clone();
+        absent.as_object_mut().unwrap().remove("shared_links");
+        assert!(parse_contract(&absent).is_err());
+        for (field, value) in [
+            ("shared_links", json!([])),
+            ("shared_links", Value::Null),
+            ("shared_links", json!([original["shared_links"][0], original["shared_links"][0]])),
+            ("links", json!(44)),
+            ("links", json!(47)),
+            ("programs", json!(43)),
+            ("programs", json!(44)),
+            ("links", json!(49)),
+            ("links", json!(51)),
+            ("maps", json!(21)),
+            ("abi_version", json!("other")),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            assert!(parse_contract(&changed).is_err(), "{field}");
+        }
+        for (field, value) in [
+            ("program", json!("fd_accept_post_fdget")),
+            ("symbol", json!("x64_sys_call")),
+            ("offset", json!(0x1c)),
+            ("cookie", json!(9)),
+            ("unknown", json!(true)),
+        ] {
+            let mut changed = original.clone();
+            changed["shared_links"][0][field] = value;
+            assert!(parse_contract(&changed).is_err(), "{field}");
+        }
+        // A correct total cannot admit an unknown or duplicate attachment.
+        let mut duplicate = original.clone();
+        duplicate["shared_links"] = json!([original["shared_links"][0], original["shared_links"][0]]);
+        duplicate["links"] = json!(47);
+        assert!(parse_contract(&duplicate).is_err());
+        let mut overflow = original.clone();
+        overflow["programs"] = json!(usize::MAX);
+        overflow["links"] = json!(usize::MAX);
+        assert_eq!(parse_contract(&overflow).unwrap_err().to_string(), "provider link count overflow");
+        let mut unknown = original.clone();
+        unknown["additional_links"] = json!(1);
+        assert!(parse_contract(&unknown).is_err());
+    }
+
+    #[test]
+    fn contract_shared_attachment_requires_its_source_and_hook() {
+        let original = shared_contract_json();
+        for source in ["provider.bpf.c", "driver.c", "fd-effects.bpf.h", "retirement-target.h", "connect-copy.h"] {
+            let mut changed = original.clone();
+            changed["source_files"].as_array_mut().unwrap().retain(|name| name.as_str() != Some(source));
+            assert!(parse_contract(&changed).is_err(), "{source}");
+        }
+        let mut absent = original.clone();
+        absent["hooks"].as_object_mut().unwrap().remove("fdget_raw");
+        assert!(parse_contract(&absent).is_err());
+        for prototype in [json!([[8],1,8]), json!([[4],2,8]), json!([[4],1,4])] {
+            let mut changed = original.clone();
+            changed["hooks"]["fdget_raw"] = prototype;
+            assert!(parse_contract(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn epoll_copy_requires_entered_wrapper_and_exact_copy_successor_contract() {
+        let original = shared_contract_json();
+        for source in ["epoll-ctl-copy.h", "epoll-ctl-copy.bpf.h", "epoll-ctl-copy-driver.h"] {
+            let mut missing=original.clone();
+            missing["source_files"].as_array_mut().unwrap().retain(|name| name.as_str()!=Some(source));
+            assert!(parse_contract(&missing).is_err());
+        }
+        for (symbol, exact) in [("do_epoll_ctl",json!([[4,4,4,8,1],5,4])),
+                                 ("__bpf_trace_sys_enter",json!([[8,8,8],3,0]))] {
+            assert_eq!(original["hooks"][symbol],exact);
+            let mut missing=original.clone();missing["hooks"].as_object_mut().unwrap().remove(symbol);
+            assert!(parse_contract(&missing).is_err());
+            let mut wrong=original.clone();wrong["hooks"][symbol]=json!([[8],1,8]);
+            assert!(parse_contract(&wrong).is_err());
+        }
+        // Historical115 and an unaccounted extra classic link cannot qualify
+        // the current source prediction. Real ELF/link census is still required.
+        let mut old=pre_copy_contract_json();old["programs"]=json!(44);old["links"]=json!(49);
+        assert!(parse_contract(&old).is_err());
+        let mut extra=original.clone();extra["links"]=json!(51);
+        assert!(parse_contract(&extra).is_err());
+    }
+
+    #[test]
+    fn contract_unpublished_single_wrapper_attachment_refuses() {
+        let mut old = pre_copy_contract_json();
+        old["programs"] = json!(44);
+        old["links"] = json!(45);
+        old["shared_links"] = json!([{
+            "program":"fd_connect_post_fdget", "symbol":"__se_sys_fcntl", "offset":29, "cookie":13
+        }]);
+        old["hooks"].as_object_mut().unwrap().remove("fdget_raw");
+        old["hooks"]["__se_sys_fcntl"] = json!([[8,8,8],3,8]);
+        // Exact old111 declaration, including its old valid prototype. This
+        // is an explicit rejection; historical native evidence is unchanged.
+        assert_eq!(old["maps"].as_u64().unwrap() + old["programs"].as_u64().unwrap()
+            + old["links"].as_u64().unwrap(), 111);
+        assert!(parse_contract(&old).is_err());
+    }
+
+    #[test]
+    fn contract_unpublished_notrace_inline_attachments_refuse() {
+        let mut old = pre_copy_contract_json();
+        // Reconstruct the exact retired ABI6/112 tuple before retargeting it.
+        old["programs"] = json!(44);
+        old["abi_version"] = json!("4150525553540006");
+        old["links"] = json!(46);
+        old["shared_links"].as_array_mut().unwrap().truncate(2);
+        old["hooks"].as_object_mut().unwrap().remove("__x64_sys_read");
+        old["hooks"].as_object_mut().unwrap().remove("fdget_pos");
+        for (index, offset) in [(0, 0x194), (1, 0x182)] {
+            old["shared_links"][index]["symbol"] = json!("x64_sys_call");
+            old["shared_links"][index]["offset"] = json!(offset);
+        }
+        old["hooks"].as_object_mut().unwrap().remove("fdget_raw");
+        old["hooks"]["x64_sys_call"] = json!([[8,4],2,8]);
+        assert_eq!(old["links"], 46);
+        assert!(parse_contract(&old).is_err());
+    }
+
+    #[test]
+    fn contract_inline_missing_reordered_duplicate_or_unknown_site_refuses() {
+        let original = shared_contract_json();
+        for index in 3..5 {
+            let mut missing = original.clone();
+            missing["shared_links"].as_array_mut().unwrap().remove(index);
+            missing["links"] = json!(49);
+            assert!(parse_contract(&missing).is_err());
+            for (field, value) in [
+                ("program", json!("fd_accept_post_fdget")),
+                ("symbol", json!("__x64_sys_fcntl")),
+                ("offset", json!(0x1d)), ("cookie", json!(9)), ("unknown", json!(true)),
+            ] {
+                let mut bad = original.clone();
+                bad["shared_links"][index][field] = value;
+                assert!(parse_contract(&bad).is_err(), "site {index} {field}");
+            }
+        }
+        let mut swapped = original.clone();
+        swapped["shared_links"].as_array_mut().unwrap().swap(3,4);
+        assert!(parse_contract(&swapped).is_err());
+        let mut duplicate = original.clone();
+        duplicate["shared_links"][4] = original["shared_links"][3].clone();
+        assert!(parse_contract(&duplicate).is_err());
+        let mut extra = original.clone();
+        extra["shared_links"].as_array_mut().unwrap().push(original["shared_links"][0].clone());
+        extra["links"] = json!(51);
+        assert!(parse_contract(&extra).is_err());
+        for links in [44,45,47] {
+            let mut bad = original.clone();
+            bad["links"] = json!(links);
+            assert!(parse_contract(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn scalar_read_contract_requires_all_three_exact_sites_and_old_112_refuses() {
+        let original = shared_contract_json();
+        let expected = [("__x64_sys_read", 0x13, 14), ("fdget_pos", 0x96, 15), ("fdget_pos", 0xfa, 16)];
+        let parsed = parse_contract(&original).unwrap();
+        for (i, (symbol, offset, cookie)) in expected.into_iter().enumerate() {
+            let index = i + 5;
+            assert_eq!((&*parsed.shared_links[index].symbol, parsed.shared_links[index].offset,
+                parsed.shared_links[index].cookie), (symbol, offset, cookie));
+            let mut missing = original.clone();
+            missing["shared_links"].as_array_mut().unwrap().remove(index);
+            missing["links"] = json!(49);
+            assert!(parse_contract(&missing).is_err());
+            for (field, value) in [("program", json!("fd_accept_post_fdget")),
+                ("symbol", json!("ksys_read")), ("offset", json!(offset+1)),
+                ("cookie", json!(cookie+1)), ("unknown", json!(true))] {
+                let mut bad = original.clone();bad["shared_links"][index][field] = value;
+                assert!(parse_contract(&bad).is_err(), "Read site {index} {field}");
+            }
+            let mut duplicate = original.clone();
+            duplicate["shared_links"][index] = original["shared_links"][0].clone();
+            assert!(parse_contract(&duplicate).is_err());
+        }
+        for (symbol, valid) in [("__x64_sys_read", json!([[8],1,8])), ("fdget_pos", json!([[4],1,8]))] {
+            assert_eq!(original["hooks"][symbol], valid);
+            let mut missing = original.clone();missing["hooks"].as_object_mut().unwrap().remove(symbol);
+            assert!(parse_contract(&missing).is_err());
+            for prototype in [json!([[8,4],2,8]), json!([[4],1,4]), json!([[16],1,8])] {
+                let mut bad = original.clone();bad["hooks"][symbol] = prototype;
+                assert!(parse_contract(&bad).is_err());
+            }
+        }
+        let mut old = pre_copy_contract_json();old["programs"] = json!(44);
+        old["abi_version"] = json!("4150525553540006");
+        old["shared_links"].as_array_mut().unwrap().truncate(2);old["links"] = json!(46);
+        old["hooks"].as_object_mut().unwrap().remove("__x64_sys_read");
+        old["hooks"].as_object_mut().unwrap().remove("fdget_pos");
+        assert_eq!(old["maps"].as_u64().unwrap()+old["programs"].as_u64().unwrap()+old["links"].as_u64().unwrap(),112);
+        assert!(parse_contract(&old).is_err());
+        for links in [46,47,48,49,51] {
+            let mut bad=original.clone();bad["links"]=json!(links);assert!(parse_contract(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn ctl_dispatcher_keeps_all_old_links_and_both_new_selection_sites_under_fixed_inventory() {
+        let current = shared_contract_json();
+        let parsed = parse_contract(&current).unwrap();
+        assert_eq!((parsed.maps, parsed.programs, parsed.links), (23,46,58));
+        assert_eq!(parsed.maps+parsed.programs+parsed.links,127);
+        for (index,symbol,offset,cookie) in [(0,"__sys_connect",0x41,3),
+            (1,"__sys_connect",0x46,5),(2,"__sys_accept4",0x21,8),
+            (8,"do_epoll_ctl",0x23,18),(9,"do_epoll_ctl",0x37,19)] {
+            let site=&parsed.shared_links[index];
+            assert_eq!((&*site.program,&*site.symbol,site.offset,site.cookie),
+                ("fd_connect_post_fdget",symbol,offset,cookie));
+            let mut missing=current.clone();missing["shared_links"].as_array_mut().unwrap().remove(index);
+            missing["links"]=json!(57); // Cardinality is plausible; exact attachment must still refuse.
+            assert!(parse_contract(&missing).is_err());
+            for (field,value) in [("symbol",json!("fdget")),("offset",json!(offset+1)),
+                ("cookie",json!(cookie+1)),("program",json!("fd_accept_post_fdget"))] {
+                let mut bad=current.clone();bad["shared_links"][index][field]=value;
+                assert!(parse_contract(&bad).is_err(),"{index} {field}");
+            }
+        }
+        let mut old=current.clone();
+        let links=current["shared_links"].as_array().unwrap();
+        old["shared_links"]=Value::Array(links[3..8].iter().chain(&links[10..12]).cloned().collect());
+        old["programs"]=json!(49);old["links"]=json!(56);
+        assert_eq!(old["maps"].as_u64().unwrap()+old["programs"].as_u64().unwrap()+old["links"].as_u64().unwrap(),128);
+        assert!(parse_contract(&old).is_err()); // Historical128 evidence remains separate.
+    }
+
+    #[test]
+    fn contract_original_malformed_inputs_still_refuse() {
+        let original = contract_json();
+        for (field, value) in [
+            ("schema", json!(2)), ("maps", json!(0)), ("programs", json!(0)),
+            ("links", json!(0)), ("links", json!(2)),
+            ("btf_sha256", json!("0".repeat(63))), ("btf_sha256", json!("G".repeat(64))),
+            ("hooks", json!({})), ("source_files", json!([])),
+            ("source_files", json!(["../escape.c"])),
+            ("source_files", json!(["test.c", "test.c"])),
+            ("unknown", json!(true)),
+        ] {
+            let mut changed = original.clone();
+            changed[field] = value;
+            assert!(parse_contract(&changed).is_err(), "{field}");
+        }
+    }
+
     fn btf() -> (Vec<u8>, BTreeMap<String, (Vec<usize>, usize, usize)>) {
         let mut types = Vec::new();
         for word in [
@@ -983,16 +1472,43 @@ mod tests {
     }
 
     #[test]
+    fn accepted_copy_version_requires_exact_adapter_pair() {
+        let mut raw: Value = serde_json::from_slice(include_bytes!("accepted-classic-v40-contract.json")).unwrap();
+        for (abi, copy, expected) in [
+            ("4150525553540007", None, Some(4)),
+            ("4150525553540007", Some(4), Some(4)),
+            ("4150525553540008", Some(5), Some(5)),
+            ("4150525553540008", None, None),
+            ("4150525553540008", Some(4), None),
+            ("4150525553540007", Some(5), None),
+            ("4150525553540009", Some(5), None),
+        ] {
+            raw["abi_version"] = json!(abi);
+            match copy { Some(value) => { raw["copy_version"] = json!(value); },
+                None => { raw.as_object_mut().unwrap().remove("copy_version"); } }
+            let parsed = Contract::parse(&serde_json::to_vec(&raw).unwrap());
+            assert_eq!(parsed.is_ok(), expected.is_some(), "{abi} {copy:?}");
+            if let Some(expected) = expected {
+                assert_eq!(parsed.unwrap().accepted_copy_version().unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn btf_exact_layout_and_digest_are_separate_required_gates() {
         let (raw, hooks) = btf();
         assert!(check_btf(&raw, &hooks).is_ok());
         let contract = Contract {
             schema: 1,
             abi_version: "test".into(),
+            copy_version: None,
             btf_sha256: digest(&raw),
             maps: 1,
             programs: 1,
             links: 1,
+            shared_links: Vec::new(),
+            grouped_event: None,
+            ftrace_only: false,
             source_files: vec!["test.c".into()],
             hooks,
         };

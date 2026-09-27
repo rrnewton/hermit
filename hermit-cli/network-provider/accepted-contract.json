@@ -1,13 +1,16 @@
 {
   "schema": 1,
-  "abi_version": "4150525553540001",
+  "abi_version": "4150525553540008",
   "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
-  "maps": 17,
-  "programs": 25,
-  "links": 25,
+  "maps": 23,
+  "programs": 47,
+  "links": 47,
+  "shared_links": [],
+  "ftrace_only": true,
   "source_files": [
     "provider.bpf.c",
     "driver.c",
+    "task-disarm.h",
     "provider.h",
     "provider-abi.h",
     "auth-diagnostic.h",
@@ -15,9 +18,43 @@
     "adapter-abi.c",
     "fd-effects.h",
     "fd-effects.bpf.h",
-    "fd-effects-driver.h"
+    "fd-effects-driver.h",
+    "retirement-target.h",
+    "fd-enrollment.h",
+    "fd-enrollment-driver.h",
+    "connect-copy.h",
+    "fdupfd.h",
+    "epoll-ctl-copy.h",
+    "epoll-ctl-copy.bpf.h",
+    "epoll-ctl-copy-driver.h",
+    "stream-copy.h",
+    "stream-copy.bpf.h",
+    "stream-copy-driver.h",
+    "ftrace-coverage.h",
+    "driver-grouped.c",
+    "grouped-driver.h",
+    "grouped-io.h",
+    "grouped-owner.h",
+    "grouped-probes.bpf.h",
+    "grouped-probes.h",
+    "grouped-target.h",
+    "provider-grouped.bpf.c",
+    "stream-membership.bpf.h",
+    "grouped_contract.rs",
+    "accepted-classic-v40-contract.json",
+    "accepted-grouped-v4-contract.json",
+    "fd-call-shared.bpf.h",
+    "fd-journal.bpf.h",
+    "stream-frontier.h"
   ],
   "hooks": {
+    "fdget": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
     "sk_getsockopt": [
       [
         8,
@@ -189,6 +226,616 @@
       ],
       2,
       0
+    ],
+    "file_close_fd": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "ptrace_request": [
+      [
+        8,
+        8,
+        8,
+        8
+      ],
+      4,
+      4
+    ],
+    "__sys_connect": [
+      [
+        4,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "_copy_from_user": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      8
+    ],
+    "__audit_sockaddr": [
+      [
+        4,
+        8
+      ],
+      2,
+      4
+    ],
+    "security_socket_connect": [
+      [
+        8,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "kernel_clone": [
+      [
+        8
+      ],
+      1,
+      4
+    ],
+    "copy_process": [
+      [
+        8,
+        4,
+        4,
+        8
+      ],
+      4,
+      8
+    ],
+    "__bpf_trace_sched_process_fork": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      0
+    ],
+    "klp_copy_process": [
+      [
+        8
+      ],
+      1,
+      0
+    ],
+    "__bpf_trace_sys_exit": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      0
+    ],
+    "f_dupfd": [
+      [
+        4,
+        8,
+        4
+      ],
+      3,
+      4
+    ],
+    "alloc_fd": [
+      [
+        4,
+        4,
+        4
+      ],
+      3,
+      4
+    ],
+    "fdget_raw": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "__x64_sys_read": [
+      [
+        8
+      ],
+      1,
+      8
+    ],
+    "fdget_pos": [
+      [
+        4
+      ],
+      1,
+      8
+    ],
+    "do_epoll_ctl": [
+      [
+        4,
+        4,
+        4,
+        8,
+        1
+      ],
+      5,
+      4
+    ],
+    "__bpf_trace_sys_enter": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      0
+    ],
+    "inet_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "inet6_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "unix_stream_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "_copy_to_iter": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      8
+    ],
+    "skb_copy_datagram_iter": [
+      [
+        8,
+        4,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "__skb_datagram_iter": [
+      [
+        8,
+        4,
+        8,
+        4,
+        1,
+        8,
+        8
+      ],
+      7,
+      4
+    ],
+    "tcp_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "unix_stream_read_generic": [
+      [
+        8,
+        1
+      ],
+      2,
+      4
+    ],
+    "tcp_splice_read": [
+      [
+        8,
+        8,
+        8,
+        8,
+        4
+      ],
+      5,
+      8
+    ],
+    "tcp_read_sock": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ],
+    "tcp_read_sock_noack": [
+      [
+        8,
+        8,
+        8,
+        1,
+        8
+      ],
+      5,
+      4
+    ],
+    "__tcp_read_sock": [
+      [
+        8,
+        8,
+        8,
+        1,
+        8
+      ],
+      5,
+      4
+    ],
+    "tcp_read_skb": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "tcp_read_done": [
+      [
+        8,
+        8
+      ],
+      2,
+      0
+    ],
+    "tcp_zerocopy_receive": [
+      [
+        8,
+        8,
+        8
+      ],
+      3,
+      4
+    ],
+    "tcp_bpf_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "tcp_bpf_recvmsg_parser": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
+    ],
+    "unix_stream_splice_read": [
+      [
+        8,
+        8,
+        8,
+        8,
+        4
+      ],
+      5,
+      8
+    ],
+    "unix_stream_read_skb": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "unix_read_skb": [
+      [
+        8,
+        8
+      ],
+      2,
+      4
+    ],
+    "unix_bpf_recvmsg": [
+      [
+        8,
+        8,
+        8,
+        4
+      ],
+      4,
+      4
     ]
-  }
+  },
+  "grouped_event": {
+    "version": 2,
+    "program": "ftrace-replacements-v1",
+    "cookie": 0,
+    "anchor_symbol": "__sys_connect",
+    "anchor_address": 18446744071596064624,
+    "sites": [
+      {
+        "role": 1,
+        "symbol": "__sys_connect",
+        "address": 18446744071596064624,
+        "offset": 28,
+        "cookie": 9
+      },
+      {
+        "role": 2,
+        "symbol": "__sys_connect",
+        "address": 18446744071596064624,
+        "offset": 65,
+        "cookie": 3
+      },
+      {
+        "role": 3,
+        "symbol": "__sys_connect",
+        "address": 18446744071596064624,
+        "offset": 70,
+        "cookie": 5
+      },
+      {
+        "role": 4,
+        "symbol": "__sys_accept4",
+        "address": 18446744071597292976,
+        "offset": 33,
+        "cookie": 8
+      },
+      {
+        "role": 5,
+        "symbol": "fdget_raw",
+        "address": 18446744071595273376,
+        "offset": 124,
+        "cookie": 13
+      },
+      {
+        "role": 6,
+        "symbol": "fdget_raw",
+        "address": 18446744071595273376,
+        "offset": 5,
+        "cookie": 12
+      },
+      {
+        "role": 7,
+        "symbol": "__x64_sys_read",
+        "address": 18446744071595288720,
+        "offset": 19,
+        "cookie": 14
+      },
+      {
+        "role": 8,
+        "symbol": "fdget_pos",
+        "address": 18446744071595290080,
+        "offset": 150,
+        "cookie": 15
+      },
+      {
+        "role": 9,
+        "symbol": "fdget_pos",
+        "address": 18446744071595290080,
+        "offset": 250,
+        "cookie": 16
+      },
+      {
+        "role": 10,
+        "symbol": "do_epoll_ctl",
+        "address": 18446744071595302048,
+        "offset": 35,
+        "cookie": 18
+      },
+      {
+        "role": 11,
+        "symbol": "do_epoll_ctl",
+        "address": 18446744071595302048,
+        "offset": 55,
+        "cookie": 19
+      },
+      {
+        "role": 12,
+        "symbol": "__skb_datagram_iter",
+        "address": 18446744071595329904,
+        "offset": 100,
+        "cookie": 5
+      },
+      {
+        "role": 13,
+        "symbol": "__skb_datagram_iter",
+        "address": 18446744071595329904,
+        "offset": 105,
+        "cookie": 6
+      },
+      {
+        "role": 14,
+        "symbol": "__skb_datagram_iter",
+        "address": 18446744071595329904,
+        "offset": 619,
+        "cookie": 7
+      },
+      {
+        "role": 15,
+        "symbol": "__skb_datagram_iter",
+        "address": 18446744071595329904,
+        "offset": 624,
+        "cookie": 8
+      },
+      {
+        "role": 16,
+        "symbol": "inet_recvmsg",
+        "address": 18446744071599119808,
+        "offset": 27,
+        "cookie": 32
+      },
+      {
+        "role": 17,
+        "symbol": "inet6_recvmsg",
+        "address": 18446744071595959456,
+        "offset": 27,
+        "cookie": 33
+      }
+    ],
+    "receive_entry": [
+      {
+        "cookie": 1,
+        "symbol": "inet_recvmsg",
+        "address": 18446744071599119808
+      },
+      {
+        "cookie": 2,
+        "symbol": "inet6_recvmsg",
+        "address": 18446744071595959456
+      },
+      {
+        "cookie": 3,
+        "symbol": "unix_stream_recvmsg",
+        "address": 18446744071597039888
+      },
+      {
+        "cookie": 4,
+        "symbol": "skb_copy_datagram_iter",
+        "address": 18446744071595328976
+      },
+      {
+        "cookie": 5,
+        "symbol": "tcp_recvmsg",
+        "address": 18446744071595324240
+      },
+      {
+        "cookie": 6,
+        "symbol": "tcp_recvmsg_locked",
+        "address": 18446744071596072928
+      },
+      {
+        "cookie": 7,
+        "symbol": "unix_stream_read_generic",
+        "address": 18446744071597040000
+      },
+      {
+        "cookie": 8,
+        "symbol": "tcp_splice_read",
+        "address": 18446744071593954064
+      },
+      {
+        "cookie": 9,
+        "symbol": "tcp_read_sock",
+        "address": 18446744071593955632
+      },
+      {
+        "cookie": 10,
+        "symbol": "tcp_read_sock_noack",
+        "address": 18446744071593956112
+      },
+      {
+        "cookie": 11,
+        "symbol": "__tcp_read_sock",
+        "address": 18446744071593955664
+      },
+      {
+        "cookie": 12,
+        "symbol": "tcp_read_skb",
+        "address": 18446744071593956128
+      },
+      {
+        "cookie": 13,
+        "symbol": "tcp_read_done",
+        "address": 18446744071593956416
+      },
+      {
+        "cookie": 14,
+        "symbol": "tcp_zerocopy_receive",
+        "address": 18446744071593960160
+      },
+      {
+        "cookie": 15,
+        "symbol": "tcp_bpf_recvmsg",
+        "address": 18446744071594164928
+      },
+      {
+        "cookie": 16,
+        "symbol": "tcp_bpf_recvmsg_parser",
+        "address": 18446744071594165520
+      },
+      {
+        "cookie": 17,
+        "symbol": "unix_stream_splice_read",
+        "address": 18446744071594268368
+      },
+      {
+        "cookie": 18,
+        "symbol": "unix_stream_read_skb",
+        "address": 18446744071594268496
+      },
+      {
+        "cookie": 19,
+        "symbol": "unix_read_skb",
+        "address": 18446744071594270192
+      },
+      {
+        "cookie": 20,
+        "symbol": "unix_bpf_recvmsg",
+        "address": 18446744071594274576
+      }
+    ],
+    "receive_return": [
+      {
+        "cookie": 1,
+        "symbol": "inet_recvmsg",
+        "address": 18446744071599119808
+      },
+      {
+        "cookie": 2,
+        "symbol": "inet6_recvmsg",
+        "address": 18446744071595959456
+      },
+      {
+        "cookie": 3,
+        "symbol": "unix_stream_recvmsg",
+        "address": 18446744071597039888
+      },
+      {
+        "cookie": 4,
+        "symbol": "skb_copy_datagram_iter",
+        "address": 18446744071595328976
+      }
+    ]
+  },
+  "copy_version": 5
 }

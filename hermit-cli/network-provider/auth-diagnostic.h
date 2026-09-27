@@ -1,7 +1,7 @@
 #ifndef AP_AUTH_DIAGNOSTIC_H
 #define AP_AUTH_DIAGNOSTIC_H
 #include "provider.h"
-_Static_assert(sizeof(struct ap_setter_rejection)==sizeof(struct ap_command_result),"reserved slot overlay must stay128B");
+_Static_assert(sizeof(struct ap_setter_rejection)==sizeof(struct ap_command_result),"ABI7 reserved slot overlay must stay136B");
 enum ap_auth_mismatch {
     AP_AUTH_ABSENT=1, AP_AUTH_ZERO_PROVIDER=2, AP_AUTH_PROVIDER=4,
     AP_AUTH_OPERATION=8, AP_AUTH_OBJECT=16, AP_AUTH_LEVEL=32,

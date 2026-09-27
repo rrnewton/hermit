@@ -5,9 +5,13 @@
 #ifndef HERMIT_UNIX_KEEPER_CHANNEL_H
 #define HERMIT_UNIX_KEEPER_CHANNEL_H
 #include "keeper-session.h"
+#include <fcntl.h>
+/* Linux UAPI pidfd.h: PIDFD_THREAD is O_EXCL (0x80 on Linux x86_64),
+ * not PIDFD_SIGNAL_THREAD, which is the distinct send-signal flag 1. */
+#define UG_PIDFD_THREAD ((unsigned int)O_EXCL)
 #define UG_WIRE_MAGIC 0x55474B4545503031ULL
 #define UG_WIRE_RIGHTS 4
-enum ug_operation { UG_INIT=1, UG_ARM, UG_BIRTH, UG_INITIAL, UG_STOP, UG_CREATOR_RECOVERY, UG_CONTROLLER_CHANNEL, UG_CONTROLLER_TASK, UG_TERMINAL,
+enum ug_operation { UG_INIT=1, UG_ARM, UG_BIRTH, UG_INITIAL, UG_STOP, UG_CREATOR_RECOVERY, UG_CONTROLLER_CHANNEL, UG_CONTROLLER_TASK, UG_TERMINAL, UG_TERMINAL_RELEASE, UG_READBACK_INIT, UG_READBACK_CHECK,
                     UG_RESPONSE=0x100, UG_OUTCOME=0x200 };
 struct ug_frame {
     u64 magic, incarnation, sequence;
@@ -51,5 +55,7 @@ int ug_creator_terminalize(int birth_map, int creator_pidfd, int helper_pidfd,
                            struct ug_birth *observed);
 /* Entry only in an exec-created outside helper, stdin is the owned private
  * SEQPACKET endpoint. Never invoked inside the guest namespace/controller. */
-int ug_keeper_main(void);
+/* Exact original parent startup deadline, CLOCK_MONOTONIC nanoseconds. No
+ * no-argument/default-duration entry is provided for ControllerOwned mode. */
+int ug_keeper_main(u64 bootstrap_deadline_ns);
 #endif

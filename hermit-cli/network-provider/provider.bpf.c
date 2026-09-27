@@ -4,10 +4,14 @@
 #pragma clang diagnostic ignored "-Wmicrosoft-anon-tag"
 #include "vmlinux.h"
 #pragma clang diagnostic pop
+/* Keep shared BPF observers compact without changing their semantics or
+ * removing the debug and CO-RE records needed to qualify the object. */
+#pragma clang attribute push(__attribute__((minsize)), apply_to = function)
 #include "provider.h"
 #include "provider-abi.h"
 #include "auth-diagnostic.h"
 #include "setter-level.h"
+#include "retirement-target.h"
 #define SEC(name) __attribute__((section(name), used))
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) typeof(val) *name
@@ -23,7 +27,6 @@ static struct tcp_sock *(*to_tcp)(struct sock *)=(void *)BPF_FUNC_skc_to_tcp_soc
 static void *(*task_storage)(void *, struct task_struct *, void *, u64)=(void *)BPF_FUNC_task_storage_get;
 struct ap_object { u64 object, creation, listener, cookie; };
 struct ap_listener { u64 generation, epoch, active, unresolved, retired; };
-struct ap_invocation_key { u64 sock, request, task, start; };
 struct ap_clone_call { u64 listener, generation, epoch, overlap; struct ap_raw_state before; };
 struct ap_setter_call { u64 listener, command, before, after, authorized; };
 #define ARRAY(name, value_type, limit) struct { __uint(type,BPF_MAP_TYPE_ARRAY); __uint(max_entries,limit); __type(key,u32); __type(value,value_type); } name SEC(".maps")
@@ -38,32 +41,32 @@ HASH(clones,struct ap_invocation_key,struct ap_clone_call,AP_CALLS);
 HASH(setters,struct ap_invocation_key,struct ap_setter_call,AP_CALLS);
 struct { __uint(type,BPF_MAP_TYPE_TASK_STORAGE); __uint(map_flags,BPF_F_NO_PREALLOC);
     __type(key,int); __type(value,struct ap_task_command); } tasks SEC(".maps");
-INLINE struct ap_status *stats(void) { u32 k=0; return lookup(&status,&k); }
-INLINE void ap_fail(u64 reason) { struct ap_status *s=stats(); if(s)__sync_fetch_and_or(&s->fatal,reason); }
-INLINE u64 incarnation(void) { u32 k=0; struct ap_config *c=lookup(&ap_config_map,&k); return c?c->provider:0; }
-INLINE struct ap_task_command *raw_command(void) {
+static __attribute__((noinline)) struct ap_status *stats(void) { u32 k=0; return lookup(&status,&k); }
+static __attribute__((noinline)) void ap_fail(u64 reason) { struct ap_status *s=stats(); if(s)__sync_fetch_and_or(&s->fatal,reason); }
+static __attribute__((noinline)) u64 incarnation(void) { u32 k=0; struct ap_config *c=lookup(&ap_config_map,&k); return c?c->provider:0; }
+static __attribute__((noinline)) struct ap_task_command *raw_command(void) {
     return task_storage(&tasks,current_task(),0,0);
 }
-INLINE struct ap_task_command *authenticated_command(struct ap_task_command *c) {
+static __attribute__((noinline)) struct ap_task_command *authenticated_command(struct ap_task_command *c) {
     return c && c->provider && c->provider==incarnation()?c:0;
 }
-INLINE struct ap_task_command *command(void) { return authenticated_command(raw_command()); }
-INLINE struct ap_object *object(struct sock *sk) {
+static __attribute__((noinline)) struct ap_task_command *command(void) { return authenticated_command(raw_command()); }
+static __attribute__((noinline)) struct ap_object *object(struct sock *sk) {
     u64 k=(u64)sk;struct ap_object *o=lookup(&objects,&k);
     if(o && (!o->cookie || o->cookie!=(u64)CORE(sk->__sk_common.skc_cookie.counter))) {
         ap_fail(AP_WRONG_IDENTITY);return 0;
     }
     return o;
 }
-INLINE struct ap_listener *listener(u64 id) { if(!id||id>=AP_OBJECTS)return 0; u32 k=id; return lookup(&listeners,&k); }
-INLINE struct ap_creation *creation(u64 seq) { if(!seq||seq>=AP_EVENTS)return 0; u32 k=seq; return lookup(&events,&k); }
-INLINE struct ap_command_result *result(u64 ticket) {
+static __attribute__((noinline)) struct ap_listener *listener(u64 id) { if(!id||id>=AP_OBJECTS)return 0; u32 k=id; return lookup(&listeners,&k); }
+static __attribute__((noinline)) struct ap_creation *creation(u64 seq) { if(!seq||seq>=AP_EVENTS)return 0; u32 k=seq; return lookup(&events,&k); }
+static __attribute__((noinline)) struct ap_command_result *result(u64 ticket) {
     if(!ticket)return 0;
     u32 k=ap_command_slot(ticket);
     struct ap_command_result *r=lookup(&commands,&k);
     return r && r->command==ticket?r:0;
 }
-INLINE struct ap_command_result *claim_result(const struct ap_task_command *c) {
+static __attribute__((noinline)) struct ap_command_result *claim_result(const struct ap_task_command *c) {
     struct ap_command_result *r=result(c->command);
     if(!ap_command_reservation_matches(c,r,ap_command_slot(c->command)) ||
        __sync_val_compare_and_swap(&r->phase,AP_COMMAND_READY,AP_COMMAND_RUNNING)!=AP_COMMAND_READY) {
@@ -74,19 +77,23 @@ INLINE struct ap_command_result *claim_result(const struct ap_task_command *c) {
 }
 /* This publication is the producer's FINAL access to the result cell. Userspace
  * may acknowledge and reuse it after observing DONE and retaining its receipt. */
-INLINE void publish_result(struct ap_command_result *r) {
+static __attribute__((noinline)) void publish_result(struct ap_command_result *r) {
     if(__sync_val_compare_and_swap(&r->phase,AP_COMMAND_RUNNING,AP_COMMAND_DONE)!=AP_COMMAND_RUNNING)
         ap_fail(AP_BAD_COMMAND);
 }
-INLINE struct ap_invocation_key invocation(struct sock *sk,u64 extra) {
-    struct ap_invocation_key k={.sock=(u64)sk,.request=extra,.task=pid_tgid(),.start=CORE(current_task()->start_boottime)};
-    return k;
+/* Populate the same caller-owned key through one shared kernel task read.
+ * No task/start cache or registry is introduced; every invocation reads both
+ * actual values afresh, in their original order. */
+static __attribute__((noinline)) void invocation_fields(
+        struct ap_invocation_key *k,struct sock *sk,u64 extra) {
+    k->sock=(u64)sk;k->request=extra;k->task=pid_tgid();k->start=CORE(current_task()->start_boottime);
 }
-INLINE int raw_state(struct sock *sk,struct ap_raw_state *r) {
+INLINE struct ap_invocation_key invocation(struct sock *sk,u64 extra) {
+    struct ap_invocation_key k;invocation_fields(&k,sk,extra);return k;
+}
+static __attribute__((noinline)) int raw_tcp_state(struct sock *sk,struct ap_raw_state *r) {
     struct tcp_sock *tp=to_tcp(sk);
-    if(!tp || CORE(sk->__sk_common.skc_family)!=AP_AF_INET || CORE(sk->sk_protocol)!=AP_IPPROTO_TCP) {
-        ap_fail(AP_NOT_TCP4); return -1;
-    }
+    if(!tp) { ap_fail(AP_NOT_TCP4); return -1; }
     r->receive_timeout_ticks=CORE(sk->sk_rcvtimeo);
     r->send_timeout_ticks=CORE(sk->sk_sndtimeo);
     r->lowat=CORE(sk->sk_rcvlowat);
@@ -100,27 +107,40 @@ INLINE int raw_state(struct sock *sk,struct ap_raw_state *r) {
     r->child_spin_locked=CORE(sk->sk_lock.slock.rlock.raw_lock.locked);
     return 0;
 }
-INLINE struct ap_identity identity(struct sock *sk,u64 id) {
-    struct ap_identity i={.provider=incarnation(),.object=id,.namespace=CORE(sk->__sk_common.skc_net.net->ns.inum)};
-    return i;
+/* The accepted provider retains its original IPv4-only contract. */
+static __attribute__((noinline)) int raw_state(struct sock *sk,struct ap_raw_state *r) {
+    if(CORE(sk->__sk_common.skc_family)!=AP_AF_INET || CORE(sk->sk_protocol)!=AP_IPPROTO_TCP) {
+        ap_fail(AP_NOT_TCP4);return -1;
+    }
+    return raw_tcp_state(sk,r);
 }
-INLINE u64 allocate_object(void) {
+static __attribute__((noinline)) void identity_fields(
+        struct ap_identity *i,struct sock *sk,u64 id) {
+    i->provider=incarnation();i->object=id;i->namespace=CORE(sk->__sk_common.skc_net.net->ns.inum);
+}
+INLINE struct ap_identity identity(struct sock *sk,u64 id) {
+    struct ap_identity i;identity_fields(&i,sk,id);return i;
+}
+static __attribute__((noinline)) u64 allocate_object(void) {
     struct ap_status *s=stats(); if(!s)return 0;
     u64 id=__sync_fetch_and_add(&s->next_object,1)+1;
     if(id>=AP_OBJECTS) { ap_fail(AP_CAPACITY); return 0; } return id;
 }
+static __attribute__((noinline)) int observe_socket_file(
+    struct sock *,const struct ap_task_command *,struct ap_command_result *);
 /* A real held descriptor invokes SO_COOKIE in a TASK_STORAGE-authenticated task.
  * No user-provided numeric fd or pointer is accepted as kernel identity. */
 SEC("fexit/sk_getsockopt")
 int held_fd_probe(u64 *ctx) {
     struct ap_task_command *c=command();
-    if(!c || (c->operation!=AP_ENROLL && c->operation!=AP_MATCH))return 0;
+    if(!c || (c->operation!=AP_ENROLL && c->operation!=AP_MATCH && c->operation!=AP_OBSERVE_SOCKET_FILE))return 0;
     if(ap_socket_semantic_level(ctx[1])!=AP_SOL_SOCKET || (s32)ctx[2]!=AP_SO_COOKIE) { ap_fail(AP_BAD_COMMAND); return 0; }
     struct ap_command_result *r=claim_result(c);
     if(!r)return 0;
     r->returned=ap_getsockopt_result(ctx);
     if(r->returned) { publish_result(r);return 0; }
     struct sock *sk=(struct sock *)ctx[0];
+    if(c->operation==AP_OBSERVE_SOCKET_FILE)return observe_socket_file(sk,c,r);
     if(raw_state(sk,&r->state))return 0;
     struct ap_object *o=object(sk);
     if(c->operation==AP_ENROLL) {
@@ -157,7 +177,7 @@ INLINE void save_setter_rejection(const struct ap_task_command *raw,u64 id,u64 g
     /* Publish after every payload field. No later failure overwrites the first. */
     __sync_val_compare_and_swap(&d->phase,1,2);
 }
-INLINE int setter_enter(struct sock *sk,s32 level,s32 option,u64 hook,s32 raw_level) {
+static __attribute__((noinline)) int setter_enter(struct sock *sk,s32 level,s32 option,u64 hook,s32 raw_level) {
     struct ap_object *o=object(sk); if(!o || o->creation)return 0;
     struct ap_listener *l=listener(o->object); if(!l)return 0;
     struct ap_task_command *raw=raw_command();
@@ -181,7 +201,7 @@ INLINE int setter_enter(struct sock *sk,s32 level,s32 option,u64 hook,s32 raw_le
     struct ap_status *s=stats(); if(s)__sync_fetch_and_add(&s->setters_entered,1);
     return 0;
 }
-INLINE int setter_exit(struct sock *sk,s32 returned,u64 hook) {
+static __attribute__((noinline)) int setter_exit(struct sock *sk,s32 returned,u64 hook) {
     struct ap_object *o=object(sk); if(!o || o->creation)return 0;
     struct ap_listener *l=listener(o->object); if(!l)return 0;
     struct ap_invocation_key k=invocation(sk,hook);
@@ -306,3 +326,6 @@ int socket_retired(u64 *ctx) {
 char LICENSE[] SEC("license")="GPL";
 
 #include "fd-effects.bpf.h"
+#include "stream-copy.bpf.h"
+
+#pragma clang attribute pop

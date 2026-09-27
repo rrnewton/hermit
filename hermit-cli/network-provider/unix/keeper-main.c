@@ -9,19 +9,36 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <time.h>
 /* Exec-created outside helper. Parent and controller have separate actual
  * endpoints and sequence spaces. Only the parent lane can close admissions or
  * release policy after the exact aggregate proof. EOF never supplies proof. */
-int ug_keeper_main(void) {
+/* The deadline is supplied before the launcher is forked. It cannot be renewed
+ * by poll wakeups, channel aliases, EINTR, malformed commands or slow exec. */
+static int bootstrap_remaining(u64 deadline) {
+    struct timespec now;
+    if(clock_gettime(CLOCK_MONOTONIC,&now))return -1;
+    if(now.tv_sec<0 || now.tv_nsec<0 || now.tv_nsec>=1000000000 ||
+       (u64)now.tv_sec>(UINT64_MAX-(u64)now.tv_nsec)/1000000000ULL) {errno=EOVERFLOW;return -1;}
+    u64 current=(u64)now.tv_sec*1000000000ULL+(u64)now.tv_nsec;
+    if(!deadline || current>=deadline) {errno=ETIMEDOUT;return -1;}
+    u64 remaining=deadline-current;
+    /* Round DOWN: the next loop observes the original deadline, never a new
+     * 50ms budget. A sub-millisecond tail uses a nonblocking poll. */
+    return remaining>=50000000ULL?50:(int)(remaining/1000000ULL);
+}
+int ug_keeper_main(u64 bootstrap_deadline_ns) {
+    if(bootstrap_remaining(bootstrap_deadline_ns)<0)return 125;
     int parent=fcntl(STDIN_FILENO,F_DUPFD_CLOEXEC,3);if(parent<0)return 125;
     if(close(STDIN_FILENO))return 125;
     int type=0;socklen_t size=sizeof(type);
     if(getsockopt(parent,SOL_SOCKET,SO_TYPE,&type,&size) || type!=SOCK_SEQPACKET)return 125;
-    int self_pidfd=(int)syscall(SYS_pidfd_open,syscall(SYS_gettid),1U);
+    int self_pidfd=(int)syscall(SYS_pidfd_open,syscall(SYS_gettid),UG_PIDFD_THREAD);
     if(self_pidfd<0)return 125;
     struct ug_session *session=NULL;u64 incarnation=0,last_sequence[2]={0};
     int parent_pidfd=-1,controller=-1;bool controller_registered=false;
     bool outcome_noted=false,controller_closed=false;
+    u64 terminal_deadline=0;struct ug_terminal_receipt terminal_prepared={0};
     struct ug_monitor_result outcome={0};
     int retained[4*(UG_MAX_INITIAL_TASKS+8)];u32 retained_count=0;
     for(;;) {
@@ -34,10 +51,17 @@ int ug_keeper_main(void) {
                  * Independent controller status/pidfd monitor owns abort. */
             }
         }
+        int timeout=50;
+        if(parent_pidfd<0) {
+            timeout=bootstrap_remaining(bootstrap_deadline_ns);
+            if(timeout<0)return 125;
+        }
         struct pollfd ready[3]={{parent,POLLIN,0},{controller,POLLIN,0},
                                {parent_pidfd,POLLIN,0}};
-        int n=poll(ready,3,50);
+        int n=poll(ready,3,timeout);
         if(n<0 && errno==EINTR)continue;
+        /* A ready packet observed after the deadline cannot authorize INIT. */
+        if(parent_pidfd<0 && bootstrap_remaining(bootstrap_deadline_ns)<0)return 125;
         if(n<0 || ready[2].revents&(POLLIN|POLLERR|POLLNVAL|POLLHUP)) {
             if(session)ug_session_note_failure(session,last_sequence[0],n<0?errno:EPIPE);
             return 125; /* Parent lost: pins and durable record remain. */
@@ -67,13 +91,22 @@ int ug_keeper_main(void) {
         response.frame.operation|=UG_RESPONSE;response.frame.rights=0;
         response.frame.error=0;memset(response.frame.values,0,sizeof(response.frame.values));
         int result=-1;errno=EPROTO;
+        /* These are new BPF/metadata descriptions owned by this response.
+         * self_pidfd is borrowed and deliberately excluded. */
+        int response_owned[4]={-1,-1,-1,-1};u32 response_owned_count=0;
         if(!incarnation && !lane && request.frame.operation==UG_INIT && request.frame.sequence==1 && request.count==4) {
+            if(!request.frame.incarnation ||
+               request.frame.values[0]!=bootstrap_deadline_ns ||
+               bootstrap_remaining(bootstrap_deadline_ns)<0)return 125;
             incarnation=request.frame.incarnation;parent_pidfd=request.fds[3];
             response.fds[0]=self_pidfd;response.count=response.frame.rights=1;
             result=ug_session_open(request.fds[0],request.fds[1],request.fds[2],incarnation,&session);
+            if(!result && bootstrap_remaining(bootstrap_deadline_ns)<0)result=-1;
             if(!result) {
                 for(u32 i=1;i<4;i++)response.fds[i]=-1;
                 result=ug_session_readers(session,&response.fds[1]);
+                for(u32 i=1;i<4;i++)if(response.fds[i]>=0)
+                    response_owned[response_owned_count++]=response.fds[i];
                 if(!result)response.count=response.frame.rights=4;
             }
         } else if(incarnation==request.frame.incarnation &&
@@ -83,7 +116,10 @@ int ug_keeper_main(void) {
                 if(!lane && !request.count) {
                     response.fds[0]=-1;
                     result=ug_session_creator_recovery(session,&response.fds[0]);
-                    if(response.fds[0]>=0)response.count=response.frame.rights=1;
+                    if(response.fds[0]>=0) {
+                        response.count=response.frame.rights=1;
+                        response_owned[response_owned_count++]=response.fds[0];
+                    }
                 }
                 break;
             case UG_CONTROLLER_CHANNEL:
@@ -116,10 +152,27 @@ int ug_keeper_main(void) {
                     result=ug_session_register_initial(session,request.fds[0],request.frame.sequence);
                 break;
             case UG_TERMINAL: {
-                struct ug_terminal_receipt terminal;
-                if(!lane && !request.count) {
-                    result=ug_session_terminal(session,request.frame.sequence,&terminal);
-                    if(!result)memcpy(response.frame.values,&terminal,sizeof(terminal));
+                if(!lane && !request.count && request.frame.values[0]) {
+                    if(!terminal_deadline)terminal_deadline=request.frame.values[0];
+                    if(request.frame.values[0]!=terminal_deadline ||
+                       bootstrap_remaining(terminal_deadline)<0)break;
+                    int inventory=-1;
+                    result=ug_session_prepare_terminal(session,request.frame.sequence,&terminal_prepared,&inventory);
+                    if(inventory>=0)response_owned[response_owned_count++]=inventory;
+                    if(!result) {
+                        response.fds[0]=inventory;response.count=response.frame.rights=1;
+                        memcpy(response.frame.values,&terminal_prepared,sizeof(terminal_prepared));
+                    }
+                }
+                break;
+            }
+            case UG_TERMINAL_RELEASE: {
+                struct ug_object_close closed;
+                if(!lane && !request.count && terminal_prepared.record_ordinal &&
+                   request.frame.values[0]==terminal_prepared.record_ordinal) {
+                    result=ug_session_close_terminal(session,request.frame.sequence,
+                        terminal_prepared.sequence,terminal_prepared.record_ordinal,terminal_deadline,&closed);
+                    if(!result)memcpy(response.frame.values,&closed,sizeof(closed));
                 }
                 break;
             }
@@ -129,16 +182,23 @@ int ug_keeper_main(void) {
             default:break;
             }
         }
+        if(request.frame.operation==UG_INIT && !result &&
+           bootstrap_remaining(bootstrap_deadline_ns)<0)result=-1;
         last_sequence[lane]=request.frame.sequence;
         if(result)response.frame.error=errno?errno:EIO;
-        if(ug_channel_send(channel,&response)) {
-            if(session)ug_session_note_failure(session,last_sequence[lane],errno);
+        int sent=ug_channel_send(channel,&response),send_error=errno,close_error=0;
+        /* SCM duplicates are explicit local owners, not transferred originals.
+         * Closing only BPF/immutable metadata descriptions cannot final-fput a
+         * guest socket. Pinned policy/object owners survive until the protocol. */
+        for(u32 i=0;i<response_owned_count;i++)
+            if(close(response_owned[i]) && !close_error)close_error=errno?errno:EIO;
+        if(sent || close_error) {
+            if(session)ug_session_note_failure(session,last_sequence[lane],sent?send_error:close_error);
             return 125; /* Unknown receipt remains in outside recovery. */
         }
-        if(request.frame.operation==UG_TERMINAL) {
-            if(!result)return 0; /* Links/pins released; map readers remain owned. */
-            continue; /* No relaxed proof on busy or unknown terminal state. */
-        }
+        if(request.frame.operation==UG_TERMINAL_RELEASE && !result)return 0;
+        if(request.frame.operation==UG_TERMINAL || request.frame.operation==UG_TERMINAL_RELEASE)
+            continue; /* Provisional phase1 is never a final certificate. */
         if(result || request.frame.operation==UG_STOP) {
             if(session)ug_session_note_failure(session,last_sequence[lane],response.frame.error);
             if(!session || request.frame.operation==UG_STOP)return 125;

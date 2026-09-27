@@ -13,6 +13,8 @@
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <time.h>
+#include <linux/memfd.h>
 
 struct bpf_object; struct bpf_program; struct bpf_map; struct bpf_link;
 extern struct bpf_object *bpf_object__open_file(const char *, const void *);
@@ -23,6 +25,7 @@ extern const char *bpf_program__section_name(const struct bpf_program *);
 extern struct bpf_map *bpf_object__next_map(const struct bpf_object *,const struct bpf_map *);
 extern const char *bpf_map__name(const struct bpf_map *);
 extern int bpf_map__fd(const struct bpf_map *);
+extern int bpf_program__fd(const struct bpf_program *);
 extern struct bpf_link *bpf_program__attach(const struct bpf_program *);
 extern int bpf_link__fd(const struct bpf_link *);
 /* Only the synchronous terminal path below may release these actual handles,
@@ -34,7 +37,8 @@ enum record_phase { RECORD_BEGIN=1, RECORD_PIN_INTENT, RECORD_PINNED,
     RECORD_PREPARED, RECORD_ARM_INTENT, RECORD_ARMED, RECORD_BIRTH,
     RECORD_INITIAL_INTENT, RECORD_INITIAL_LIVE, RECORD_FAILURE,
     RECORD_CONTROLLER, RECORD_ADMISSION_CLOSED, RECORD_TERMINAL,
-    RECORD_UNPIN_INTENT, RECORD_UNPINNED, RECORD_LINK_RELEASED, RECORD_RELEASED };
+    RECORD_UNPIN_INTENT, RECORD_UNPINNED, RECORD_LINK_RELEASED, RECORD_RELEASED, RECORD_ORIGINAL_ID,
+    RECORD_LINK_CLOSED, RECORD_READY_TO_CLOSE, RECORD_OBJECT_CLOSED, RECORD_QUERY_DEADLINE };
 struct recovery_record {
     u64 magic, incarnation, ordinal, sequence, directory_dev, directory_ino;
     u32 abi, phase, kind, id;
@@ -50,6 +54,10 @@ struct ug_session {
     u32 pin_ids[UG_MAPS+UG_LINKS];
     bool unpin_started[UG_MAPS+UG_LINKS], unpinned[UG_MAPS+UG_LINKS];
     bool admissions_closed, terminal_proved, released;
+    bool inventory_complete, close_prepared, close_submitted;
+    int close_error;
+    struct ug_inventory inventory;
+    struct ug_object_close closed;
     int journal_error; /* First uncertain write/sync; never reset by a retry. */
     struct ug_terminal_receipt terminal;
     u64 incarnation, next_record, creator_sequence;
@@ -388,7 +396,7 @@ static int remove_owned_directory(struct ug_session *s) {
     if(!fstatat(s->pin_root,s->directory_name,&leaf,AT_SYMLINK_NOFOLLOW))return fail(EBUSY);
     return errno==ENOENT?0:-1;
 }
-int ug_session_terminal(struct ug_session *s,u64 sequence,struct ug_terminal_receipt *out) {
+static int terminal_core(struct ug_session *s,u64 sequence,struct ug_terminal_receipt *out,bool defer_close) {
     if(!s || !out || !sequence || s->record<0)return fail(EINVAL);
     memset(out,0,sizeof(*out));
     if(s->journal_error)return fail(s->journal_error);
@@ -412,10 +420,21 @@ int ug_session_terminal(struct ug_session *s,u64 sequence,struct ug_terminal_rec
                 int result=bpf_link__destroy(link);
                 if(result)return fail(result<0?-result:result);
             }
-            if(link_absent(s->pin_ids[UG_MAPS+i]))return -1;
-            if(append(s,RECORD_LINK_RELEASED,sequence,1,s->pin_ids[UG_MAPS+i],NULL,0))return -1;
+            if(!defer_close && link_absent(s->pin_ids[UG_MAPS+i]))return -1;
+            if(append(s,defer_close?RECORD_LINK_CLOSED:RECORD_LINK_RELEASED,sequence,1,s->pin_ids[UG_MAPS+i],NULL,0))return -1;
         }
         for(u32 i=0;i<UG_MAPS;i++)if(unpin_exact(s,0,i,sequence))return -1;
+        if(defer_close) {
+            if(!s->close_prepared) {
+                if(append(s,RECORD_READY_TO_CLOSE,sequence,0,0,NULL,0))return -1;
+                s->close_prepared=true;
+                s->terminal.removed_links=s->links_count;
+                s->terminal.removed_map_pins=0;
+                for(u32 i=0;i<UG_MAPS;i++)if(s->pin_ids[i])s->terminal.removed_map_pins++;
+                s->terminal.record_ordinal=s->next_record;
+            }
+            *out=s->terminal;return 0;
+        }
         if(s->object) {bpf_object__close(s->object);s->object=NULL;}
         for(u32 i=0;i<UG_MAPS;i++)s->maps[i]=-1;
         if(s->pin_dir>=0 && remove_owned_directory(s))return -1;
@@ -425,4 +444,97 @@ int ug_session_terminal(struct ug_session *s,u64 sequence,struct ug_terminal_rec
         s->terminal.record_ordinal=s->next_record;s->released=true;
     }
     *out=s->terminal;return 0;
+}
+
+int ug_session_terminal(struct ug_session *s,u64 sequence,struct ug_terminal_receipt *out) {
+    return terminal_core(s,sequence,out,false);
+}
+static int original_id(struct ug_session *s,int fd,u32 kind,u64 sequence) {
+    if(fd<0)return 0;
+    union {struct bpf_map_info map;struct bpf_prog_info program;struct bpf_link_info link;} info={0};
+    union bpf_attr a={0};a.info.bpf_fd=fd;a.info.info=(u64)(uintptr_t)&info;
+    a.info.info_len=kind==0?sizeof(info.map):kind==1?sizeof(info.program):sizeof(info.link);
+    if(bpf_call(BPF_OBJ_GET_INFO_BY_FD,&a))return -1;
+    u32 id=kind==0?info.map.id:kind==1?info.program.id:info.link.id;
+    if(!id || kind>2 || s->inventory.count>=UG_INVENTORY_MAX)return fail(EPROTO);
+    for(u32 i=0;i<s->inventory.count;i++)
+        if(s->inventory.ids[i].kind==kind && s->inventory.ids[i].id==id)return 0;
+    if(append(s,RECORD_ORIGINAL_ID,sequence,kind,id,NULL,0))return -1;
+    s->inventory.ids[s->inventory.count++]=(struct ug_plain_id){kind,id};
+    if(kind==0)s->inventory.maps++;else if(kind==1)s->inventory.programs++;else s->inventory.links++;
+    return 0;
+}
+static int capture_inventory(struct ug_session *s,u64 sequence) {
+    if(s->inventory_complete)return 0;
+    if(s->journal_error)return fail(s->journal_error);
+    if(s->object) {
+        struct bpf_map *map=NULL;
+        while((map=bpf_object__next_map(s->object,map)))
+            if(original_id(s,bpf_map__fd(map),0,sequence))return -1;
+        struct bpf_program *program=NULL;
+        while((program=bpf_object__next_program(s->object,program)))
+            if(original_id(s,bpf_program__fd(program),1,sequence))return -1;
+    }
+    for(u32 i=0;i<s->links_count;i++)
+        if(s->links[i] && original_id(s,bpf_link__fd(s->links[i]),2,sequence))return -1;
+    if(s->prepared && (s->inventory.maps!=UG_MAPS || s->inventory.programs!=UG_LINKS ||
+                       s->inventory.links!=UG_LINKS))return fail(EPROTO);
+    s->inventory.magic=UG_INVENTORY_MAGIC;s->inventory.incarnation=s->incarnation;
+    s->inventory_complete=true;return 0;
+}
+static int export_inventory(struct ug_session *s,int *out) {
+    int fd=(int)syscall(SYS_memfd_create,"hermit-unix-original-ids",MFD_CLOEXEC|MFD_ALLOW_SEALING);
+    if(fd<0)return -1;
+    *out=fd; /* Metadata ownership returned even on a subsequent failure. */
+    const char *bytes=(const char *)&s->inventory;size_t left=sizeof(s->inventory);
+    while(left) {
+        ssize_t n=write(fd,bytes,left);
+        if(n<0 && errno==EINTR)continue;
+        if(n<=0)return n<0?-1:fail(EIO);
+        bytes+=n;left-=(size_t)n;
+    }
+    if(fcntl(fd,F_ADD_SEALS,F_SEAL_SEAL|F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE))return -1;
+    return 0;
+}
+int ug_session_prepare_terminal(struct ug_session *s,u64 sequence,struct ug_terminal_receipt *out,int *inventory_fd) {
+    if(!s || !out || !inventory_fd || !sequence)return fail(EINVAL);
+    *inventory_fd=-1;
+    if(s->close_submitted)return fail(EBUSY);
+    if(capture_inventory(s,sequence))return -1;
+    if(!s->close_prepared && terminal_core(s,sequence,out,true))return -1;
+    *out=s->terminal;
+    s->inventory.proof_sequence=out->sequence;s->inventory.record_ordinal=out->record_ordinal;
+    return export_inventory(s,inventory_fd);
+}
+static int monotonic_ns(u64 *out) {
+    struct timespec now;if(clock_gettime(CLOCK_MONOTONIC,&now))return -1;
+    if(now.tv_sec<0 || now.tv_nsec<0 || now.tv_nsec>=1000000000 ||
+       (u64)now.tv_sec>(UINT64_MAX-(u64)now.tv_nsec)/1000000000ULL)return fail(EOVERFLOW);
+    *out=(u64)now.tv_sec*1000000000ULL+(u64)now.tv_nsec;return 0;
+}
+int ug_session_close_terminal(struct ug_session *s,u64 sequence,u64 proof_sequence,
+                              u64 proof_ordinal,u64 deadline,struct ug_object_close *out) {
+    if(!s || !out || !sequence || !deadline || !s->close_prepared ||
+       proof_sequence!=s->terminal.sequence || proof_ordinal!=s->terminal.record_ordinal)return fail(EINVAL);
+    if(s->journal_error)return fail(s->journal_error);
+    if(s->close_error)return fail(s->close_error);
+    if(s->close_submitted)return fail(EBUSY); /* Unknown/replayed close is not a renewed window. */
+    u64 now;if(monotonic_ns(&now))return -1;
+    if(now>=deadline)return fail(ETIMEDOUT);
+    s->close_submitted=true;
+    if(s->object) {bpf_object__close(s->object);s->object=NULL;}
+    int timed=monotonic_ns(&now),time_error=errno;
+    for(u32 i=0;i<UG_MAPS;i++)s->maps[i]=-1;
+    if(timed) {s->close_error=time_error?time_error:EIO;return fail(s->close_error);}
+    if(now>UINT64_MAX-1000000000ULL) {s->close_error=EOVERFLOW;return fail(EOVERFLOW);}
+    s->closed=(struct ug_object_close){s->incarnation,proof_sequence,0,now,
+        now+1000000000ULL, s->inventory.count,s->terminal.first_outcome,s->terminal.guard_faults};
+    if(s->closed.deadline_ns>deadline)s->closed.deadline_ns=deadline;
+    char stamp[32];snprintf(stamp,sizeof(stamp),"%016llx",(unsigned long long)now);
+    if(append(s,RECORD_OBJECT_CLOSED,sequence,0,0,stamp,0))return -1;
+    snprintf(stamp,sizeof(stamp),"%016llx",(unsigned long long)s->closed.deadline_ns);
+    if(append(s,RECORD_QUERY_DEADLINE,sequence,0,0,stamp,0))return -1;
+    if(s->pin_dir>=0 && remove_owned_directory(s)) {s->close_error=errno;return -1;}
+    s->closed.record_ordinal=s->next_record;
+    *out=s->closed;return 0;
 }

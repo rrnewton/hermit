@@ -5,7 +5,10 @@
 
 use std::fs::File;
 use std::io;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::MetadataExt;
@@ -25,6 +28,7 @@ use crate::network_provider_package::validate_elf;
 const CONTRACT: &str = include_str!("../network-provider/unix-guard-contract.json");
 const OBJECT: &str = "unix-guard.bpf.o";
 const HELPER: &str = "hermit-unix-keeper";
+const READBACK: &str = "hermit-unix-readback";
 
 #[derive(Deserialize)]
 struct Contract {
@@ -45,6 +49,8 @@ struct Manifest {
     helper: String,
     object_sha256: String,
     helper_sha256: String,
+    readback: String,
+    readback_sha256: String,
     btf_sha256: String,
     maps: usize,
     programs: usize,
@@ -58,6 +64,8 @@ struct Manifest {
 pub struct PackagedUnixGuard {
     /// Exact maintained helper executable selected before Container clone.
     pub helper: PathBuf,
+    /// Separate metadata-only helper; the loader never receives its privilege.
+    pub readback: PathBuf,
     /// Sealed BPF bytes transferred over the private startup channel.
     pub object: OwnedFd,
 }
@@ -110,6 +118,7 @@ impl PackagedUnixGuard {
             || manifest.btf_sha256 != contract.btf_sha256
             || manifest.object != OBJECT
             || manifest.helper != HELPER
+            || manifest.readback != READBACK
             || (manifest.maps, manifest.programs, manifest.links)
                 != (contract.maps, contract.programs, contract.links)
             || (contract.maps, contract.programs, contract.links) != (10, 31, 31)
@@ -121,21 +130,26 @@ impl PackagedUnixGuard {
         let object = read_regular(&directory.join(OBJECT), MAX_ARTIFACT_BYTES)?;
         let helper = directory.join(HELPER);
         let helper_bytes = read_regular(&helper, MAX_ARTIFACT_BYTES)?;
+        let readback = directory.join(READBACK);
+        let readback_bytes = read_regular(&readback, MAX_ARTIFACT_BYTES)?;
         validate_elf(&object, 247)?;
         validate_elf(&helper_bytes, 62)?;
+        validate_elf(&readback_bytes, 62)?;
         if *Digest::new(&object) != digest_hex(&manifest.object_sha256)?
             || *Digest::new(&helper_bytes) != digest_hex(&manifest.helper_sha256)?
+            || *Digest::new(&readback_bytes) != digest_hex(&manifest.readback_sha256)?
             || *Digest::digest_path("/sys/kernel/btf/vmlinux")? != digest_hex(&contract.btf_sha256)?
         {
             return Err(io::Error::other(
                 "Unix guard artifact or running kernel identity differs",
             ));
         }
-        if helper.metadata()?.mode() & 0o111 == 0 {
-            return Err(io::Error::other("Unix keeper is not executable"));
+        if helper.metadata()?.mode() & 0o111 == 0 || readback.metadata()?.mode() & 0o111 == 0 {
+            return Err(io::Error::other("Unix policy helper is not executable"));
         }
         Ok(Self {
             helper,
+            readback,
             object: sealed_file(c"hermit-unix-guard-bpf", &object, false)?.into(),
         })
     }
@@ -181,6 +195,25 @@ fn open_private_directory(path: &Path, uid: u32, bpffs: bool) -> io::Result<Owne
 }
 
 impl GuardDeploymentRoots {
+    /// Open explicit deployment roots through the same held-descriptor checks.
+    /// Both directories must already exist. This never creates a mount, changes
+    /// permissions, or turns configuration into a runtime capability.
+    pub fn open_at(bpffs_path: &Path, recovery_path: &Path) -> io::Result<Self> {
+        let uid = unsafe { libc::getuid() };
+        if uid != unsafe { libc::geteuid() } {
+            return Err(io::Error::other(
+                "guard startup requires matching real/effective uid",
+            ));
+        }
+        let bpffs = open_private_directory(bpffs_path, uid, true)?;
+        let recovery = open_private_directory(recovery_path, uid, false)?;
+        Ok(Self {
+            bpffs,
+            recovery,
+            writable_paths: [bpffs_path.to_owned(), recovery_path.to_owned()],
+        })
+    }
+
     /// Open supported deployment roots. This never mounts bpffs or escalates
     /// privilege; missing administrator provisioning is an explicit refusal.
     /// Only the user's normal persistent state directory may be created here.
@@ -193,6 +226,51 @@ impl GuardDeploymentRoots {
         }
         let bpffs_path = PathBuf::from(format!("/sys/fs/bpf/hermit-{uid}"));
         let bpffs = open_private_directory(&bpffs_path, uid, true)?;
+        let recovery = RecoveryDeploymentRoot::open()?;
+        Ok(Self {
+            bpffs,
+            recovery: recovery.directory,
+            writable_paths: [bpffs_path, recovery.writable_path],
+        })
+    }
+}
+
+/// Private persistent receipt directory for a service that owns no bpffs pins.
+/// The descriptor and canonical path remain live through service finalization.
+#[derive(Debug)]
+pub struct RecoveryDeploymentRoot {
+    /// Authenticated private directory retained for the lifetime of the owner.
+    pub directory: OwnedFd,
+    /// Canonical directory used for the bounded recovery receipts and logs.
+    pub writable_path: PathBuf,
+}
+
+impl RecoveryDeploymentRoot {
+    /// Open an existing private recovery directory without requiring bpffs.
+    /// This uses the same identity, canonical-path and no-follow checks as the
+    /// recovery half of `GuardDeploymentRoots`.
+    pub fn open_at(path: &Path) -> io::Result<Self> {
+        let uid = unsafe { libc::getuid() };
+        if uid != unsafe { libc::geteuid() } {
+            return Err(io::Error::other(
+                "guard startup requires matching real/effective uid",
+            ));
+        }
+        let directory = open_private_directory(path, uid, false)?;
+        Ok(Self {
+            directory,
+            writable_path: path.to_owned(),
+        })
+    }
+
+    /// Create only the user's normal state directory and authenticate it.
+    pub fn open() -> io::Result<Self> {
+        let uid = unsafe { libc::getuid() };
+        if uid != unsafe { libc::geteuid() } {
+            return Err(io::Error::other(
+                "guard startup requires matching real/effective uid",
+            ));
+        }
         let state = match std::env::var_os("XDG_STATE_HOME") {
             Some(path) => PathBuf::from(path),
             None => PathBuf::from(
@@ -201,22 +279,260 @@ impl GuardDeploymentRoots {
             )
             .join(".local/state"),
         };
+        Self::open_named_state_directory(&state, "network-guard")
+    }
+
+    /// Create the accepted-provider receipt root separately from the guard's
+    /// exact recovery census. This grants no native provider capability.
+    pub fn open_accepted() -> io::Result<Self> {
+        if unsafe { libc::getuid() } != unsafe { libc::geteuid() } {
+            return Err(io::Error::other("guard startup requires matching real/effective uid"));
+        }
+        let state = match std::env::var_os("XDG_STATE_HOME") {
+            Some(path) => PathBuf::from(path),
+            None => PathBuf::from(
+                std::env::var_os("HOME")
+                    .ok_or_else(|| io::Error::other("no user state directory"))?,
+            )
+            .join(".local/state"),
+        };
+        Self::open_named_state_directory(&state, "network-accepted")
+    }
+
+    /// Revalidate the held directory against its current canonical name. The
+    /// identity is receipt evidence; the retained directory supplies authority.
+    pub fn identity(&self) -> io::Result<RecoveryDirectoryIdentity> {
+        let held = directory_identity(self.directory.as_fd())?;
+        let named = open_private_directory(&self.writable_path, unsafe { libc::getuid() }, false)?;
+        if held != directory_identity(named.as_fd())? {
+            return Err(io::Error::other(
+                "retained recovery root name or identity changed",
+            ));
+        }
+        Ok(held)
+    }
+
+    /// Prove neither actual directory is an alias or ancestor of the other.
+    /// Walk held '..' descriptors to the real root, with a fixed refusal bound;
+    /// pathname prefixes alone cannot supply this proof across mounts/renames.
+    pub fn require_disjoint(&self, other: BorrowedFd<'_>, other_path: &Path) -> io::Result<()> {
+        let this = self.identity()?;
+        let that = directory_identity(other)?;
+        let named = open_private_directory(other_path, unsafe { libc::getuid() }, false)?;
+        if directory_identity(named.as_fd())? != that {
+            return Err(io::Error::other("other deployment root name changed"));
+        }
+        reject_ancestor(self.directory.as_fd(), that)?;
+        reject_ancestor(other, this)?;
+        if self.identity()? != this
+            || directory_identity(other)? != that
+            || directory_identity(
+                open_private_directory(other_path, unsafe { libc::getuid() }, false)?.as_fd(),
+            )? != that
+        {
+            return Err(io::Error::other(
+                "deployment root changed during ancestry proof",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn open_in_state_directory(state: &Path) -> io::Result<Self> {
+        Self::open_named_state_directory(state, "network-guard")
+    }
+    fn open_named_state_directory(state: &Path, purpose: &str) -> io::Result<Self> {
+        if !matches!(purpose, "network-guard" | "network-accepted") {
+            return Err(io::Error::other("unknown recovery directory purpose"));
+        }
         if !state.is_absolute() {
             return Err(io::Error::other(
                 "guard recovery state directory must be absolute",
             ));
         }
-        let recovery_path = state.join("hermit/network-guard");
+        let recovery_path = state.join("hermit").join(purpose);
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&recovery_path)?;
         let recovery_path = recovery_path.canonicalize()?;
-        let recovery = open_private_directory(&recovery_path, uid, false)?;
-        Ok(Self {
-            bpffs,
-            recovery,
-            writable_paths: [bpffs_path, recovery_path],
-        })
+        Self::open_at(&recovery_path)
     }
+}
+
+/// Stable identity of an actual authenticated private recovery directory.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryDirectoryIdentity {
+    /// Kernel filesystem device identifier.
+    pub device: u64,
+    /// Kernel inode identifier.
+    pub inode: u64,
+    /// Actual owning user.
+    pub uid: u32,
+    /// Complete directory mode (including type).
+    pub mode: u32,
+}
+fn directory_identity(fd: BorrowedFd<'_>) -> io::Result<RecoveryDirectoryIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || stat.st_nlink == 0 {
+        return Err(io::Error::other(
+            "held deployment root is not a linked directory",
+        ));
+    }
+    Ok(RecoveryDirectoryIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        uid: stat.st_uid,
+        mode: stat.st_mode,
+    })
+}
+fn reject_ancestor(start: BorrowedFd<'_>, target: RecoveryDirectoryIdentity) -> io::Result<()> {
+    let mut current = start.try_clone_to_owned()?;
+    for _ in 0..1024 {
+        let identity = directory_identity(current.as_fd())?;
+        if (identity.device, identity.inode) == (target.device, target.inode) {
+            return Err(io::Error::other(
+                "accepted and guard deployment roots overlap",
+            ));
+        }
+        let raw = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                c"..".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let parent = unsafe { OwnedFd::from_raw_fd(raw) };
+        let above = directory_identity(parent.as_fd())?;
+        if (identity.device, identity.inode) == (above.device, above.inode) {
+            return Ok(());
+        }
+        current = parent;
+    }
+    Err(io::Error::other(
+        "deployment root ancestry exceeds fixed bound",
+    ))
+}
+
+#[cfg(test)]
+mod recovery_root_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn accepted_recovery_does_not_require_unrelated_bpffs() {
+        let state = tempfile::tempdir().unwrap();
+        let recovery = RecoveryDeploymentRoot::open_in_state_directory(state.path()).unwrap();
+        let missing_bpffs = state.path().join("missing-bpffs");
+        assert!(!missing_bpffs.exists());
+        assert!(GuardDeploymentRoots::open_at(&missing_bpffs, &recovery.writable_path).is_err());
+        let held = File::from(recovery.directory).metadata().unwrap();
+        assert!(held.is_dir());
+        assert_eq!(held.uid(), unsafe { libc::getuid() });
+        assert_eq!(held.mode() & 0o7777, 0o700);
+        assert_eq!(recovery.writable_path, state.path().join("hermit/network-guard"));
+    }
+
+    #[test]
+    fn recovery_only_rejects_invalid_directory_without_changing_permissions() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("hermit/network-guard");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(RecoveryDeploymentRoot::open_in_state_directory(state.path()).is_err());
+        assert_eq!(path.metadata().unwrap().mode() & 0o7777, 0o755);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = state.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(RecoveryDeploymentRoot::open_at(&alias).is_err());
+        assert!(RecoveryDeploymentRoot::open_at(Path::new("relative")).is_err());
+        let file = state.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(RecoveryDeploymentRoot::open_at(&file).is_err());
+        assert!(RecoveryDeploymentRoot::open_at(&state.path().join("absent")).is_err());
+    }    #[test]
+    fn accepted_and_guard_roots_are_actual_disjoint_directories() {
+        let state = tempfile::tempdir().unwrap();
+        let guard =
+            RecoveryDeploymentRoot::open_named_state_directory(state.path(), "network-guard")
+                .unwrap();
+        let accepted =
+            RecoveryDeploymentRoot::open_named_state_directory(state.path(), "network-accepted")
+                .unwrap();
+        assert_ne!(guard.identity().unwrap(), accepted.identity().unwrap());
+        accepted
+            .require_disjoint(guard.directory.as_fd(), &guard.writable_path)
+            .unwrap();
+        assert!(
+            accepted
+                .require_disjoint(accepted.directory.as_fd(), &accepted.writable_path)
+                .is_err()
+        );
+        let nested = accepted.writable_path.join("nested");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&nested)
+            .unwrap();
+        let child = RecoveryDeploymentRoot::open_at(&nested).unwrap();
+        assert!(
+            accepted
+                .require_disjoint(child.directory.as_fd(), &child.writable_path)
+                .is_err()
+        );
+        assert!(
+            child
+                .require_disjoint(accepted.directory.as_fd(), &accepted.writable_path)
+                .is_err()
+        );
+    }
+    #[test]
+    fn retained_recovery_name_replacement_refuses() {
+        let state = tempfile::tempdir().unwrap();
+        let root =
+            RecoveryDeploymentRoot::open_named_state_directory(state.path(), "network-accepted")
+                .unwrap();
+        let moved = state.path().join("retained-original");
+        std::fs::rename(&root.writable_path, &moved).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.writable_path)
+            .unwrap();
+        assert!(root.identity().is_err());
+        assert_eq!(
+            File::from(root.directory).metadata().unwrap().ino(),
+            moved.metadata().unwrap().ino()
+        );
+    }
+    #[test]
+    fn accepted_roots_refuse_symlink_alias_wrong_mode_missing_and_wrong_owner_expectation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RecoveryDeploymentRoot::open_named_state_directory(temp.path(), "network-accepted").unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root.writable_path, &alias).unwrap();
+        assert!(RecoveryDeploymentRoot::open_at(&alias).is_err());
+        assert!(root.require_disjoint(root.directory.as_fd(), &alias).is_err());
+        assert!(RecoveryDeploymentRoot::open_at(&temp.path().join("missing")).is_err());
+        let other_uid = unsafe { libc::getuid() }.wrapping_add(1);
+        assert!(open_private_directory(&root.writable_path, other_uid, false).is_err());
+        std::fs::set_permissions(&root.writable_path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(root.identity().is_err());
+        assert!(RecoveryDeploymentRoot::open_at(&root.writable_path).is_err());
+    }
+
 }

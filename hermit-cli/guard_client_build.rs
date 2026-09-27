@@ -38,6 +38,7 @@ pub fn build() {
         "keeper-channel.h",
         "keeper-monitor.h",
         "keeper-session.h",
+        "keeper-readback.h",
         "unix-guard.h",
     ] {
         println!("cargo:rerun-if-changed={}", source.join(name).display());

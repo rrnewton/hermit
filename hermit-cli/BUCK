@@ -23,6 +23,10 @@ rust_library(
     srcs = glob(
         [
             "src/**/*.rs",
+            "network-provider/accepted-contract.json",
+            "network-provider/unix-guard-contract.json",
+            "src/network_provider_package/classic-v40-contract.json",
+            "src/network_provider_package/grouped-v1-contract.json",
         ],
         exclude = [
             "src/bin/**/*.rs",
@@ -30,6 +34,9 @@ rust_library(
     ),
     crate = "hermit",
     env = hermit_build_env,
+    test_deps = [
+        "fbsource//third-party/rust:futures-util",
+    ],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     deps = [

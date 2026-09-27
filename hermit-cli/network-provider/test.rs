@@ -1,11 +1,11 @@
 #!/usr/bin/env -S rust-script --force
-//! Test the maintained parser against the actual output of package.rs.
+//! Test the maintained parser and required provider controls against package.rs output.
 //!
 //! ```cargo
 //! [package]
 //! edition = "2024"
 //! [dependencies]
-//! anyhow = "=1.0.100"
+//! anyhow = "=1.0.104"
 //! libc = "=0.2.189"
 //! serde_json = "=1.0.149"
 //! sha2 = "=0.10.9"
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -56,7 +56,9 @@ fn sources(source: &Path, manifest: &Value) -> Result<BTreeMap<String, String>> 
         .as_object()
         .context("package source map")?;
     ensure!(
-        expected.contains_key("package.rs") && expected.contains_key("package_support.rs"),
+        expected.contains_key("package.rs")
+            && expected.contains_key("package_support.rs")
+            && expected.contains_key("process_group.rs"),
         "package omitted its maintained producer/parser identity"
     );
     let mut result = BTreeMap::new();
@@ -78,249 +80,119 @@ fn sources(source: &Path, manifest: &Value) -> Result<BTreeMap<String, String>> 
     Ok(result)
 }
 
-fn absent(pid: u32) -> Result<bool> {
-    if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
-        return Ok(false);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(true)
-    } else {
-        Err(error.into())
-    }
-}
-
-fn kill(pid: u32) -> Result<()> {
-    if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-// The explicit supervisor records both the primary error and cleanup evidence.
-// Drop is only a panic/unwind backstop, never a successful cleanup receipt.
-struct OwnedChild {
-    child: std::process::Child,
-    cleanup_attempted: bool,
-    reaped: bool,
-}
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        if !self.cleanup_attempted && !self.reaped {
-            let result = kill(self.child.id());
-            eprintln!(
-                "package test supervisor unwound: pid={}, kill={result:?}, terminal_state=unconfirmed",
-                self.child.id()
-            );
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Limits {
-    wall: Duration,
-    logs: u64,
-    cleanup: Duration,
-}
+#[path = "process_group.rs"]
+mod process_group;
+use process_group::{Limits, OwnedChild, bounds, supervise};
 const LIMITS: Limits = Limits {
     wall: Duration::from_secs(60),
     logs: 4 * MIB,
     cleanup: Duration::from_secs(2),
 };
+#[cfg(test)]
+use process_group::{absent, exited_without_reap, only_terminal_leader};
 
-fn bounds(started: Instant, stdout: &Path, stderr: &Path, limits: Limits) -> Result<(bool, bool)> {
-    let bytes = fs::metadata(stdout)?
-        .len()
-        .checked_add(fs::metadata(stderr)?.len())
-        .context("log size overflow")?;
-    Ok((started.elapsed() >= limits.wall, bytes > limits.logs))
+const ACCEPTED_CONTROLS: &[&str] = &[
+    "ftrace-coverage-test.c",
+    "fd-effects-test.c",
+    "fd-effects-driver-test.c",
+    "fd-table-test.c",
+    "remove-test.c",
+    "retirement-target-test.c",
+    "fd-enrollment-test.c",
+    "fd-enrollment-driver-test.c",
+    "birth-cleanup-driver-test.c",
+    "stream-copy-driver-test.c",
+    "grouped-owner-test.c",
+    "stream-membership-test.c",
+    "grouped-target-test.c",
+    "stream-frontier-test.c",
+    "stream-copy-v5-driver-test.c",
+    "stream-membership-v5-test.c",
+    "fd-journal-publish-test.c",
+    "fd-shared-predicate-test.c",
+    "grouped-recovery-test.c",
+    "grouped-adoption-test.c",
+    "grouped-wire-test.c",
+];
+
+// Test-only channel implementation inputs are not part of the production
+// DSO contract. Hash every separately compiled module/header independently.
+const CHANNEL_CONTROL_INPUTS: &[&str] = &[
+    "grouped-keeper-wire.c", "grouped-keeper-wire.h",
+    "grouped-keeper-dual.c", "grouped-keeper-dual.h",
+    "grouped-guardian-bootstrap.c", "grouped-guardian-bootstrap.h",
+    "grouped-adoption-wire.c", "grouped-adoption-wire.h",
+];
+fn channel_control_inputs(source: &Path, accepted: bool) -> Result<BTreeMap<String, String>> {
+    if !accepted { return Ok(BTreeMap::new()); }
+    CHANNEL_CONTROL_INPUTS.iter().map(|name| {
+        Ok(((*name).to_owned(), digest(&read(&source.join(name), MIB)?)))
+    }).collect()
 }
 
-// Observe, but do not reap, the exact owned child. Its unreaped PID reserves
-// the numeric process-group identity through the last possible group signal.
-fn exited_without_reap(child: &std::process::Child) -> Result<bool> {
-    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id(),
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    ensure!(
-        result == 0,
-        "owned child waitid: {}",
-        std::io::Error::last_os_error()
-    );
-    Ok(unsafe { info.si_pid() } == child.id() as i32)
-}
-
-fn group_members(group: u32) -> Result<Vec<u32>> {
-    let mut members = Vec::new();
-    for entry in fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let raw = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let (_, fields) = raw.rsplit_once(") ").context("invalid process stat")?;
-        let actual = fields
-            .split_whitespace()
-            .nth(2)
-            .context("missing process group")?
-            .parse::<u32>()?;
-        if actual == group {
-            members.push(pid);
-        }
+fn control_sources(source: &Path, accepted: bool) -> Result<BTreeMap<String, String>> {
+    if !accepted {
+        return Ok(BTreeMap::new());
     }
-    members.sort_unstable();
-    Ok(members)
+    ACCEPTED_CONTROLS
+        .iter()
+        .map(|name| Ok(((*name).to_owned(), digest(&read(&source.join(name), MIB)?))))
+        .collect()
 }
 
-fn only_terminal_leader(group: u32, members: &[u32], terminal: bool) -> bool {
-    terminal && members == [group]
-}
-
-fn supervise(
-    mut child: OwnedChild,
-    started: Instant,
-    stdout: &Path,
-    stderr: &Path,
-    limits: Limits,
-) -> Value {
-    let pid = child.child.id();
-    let mut status = None;
-    let mut observed_terminal = false;
-    let mut timed_out = false;
-    let mut log_overflow = false;
-    let primary = (|| -> Result<()> {
-        loop {
-            observed_terminal = exited_without_reap(&child.child)?;
-            // This check is deliberately AFTER observation, including terminal
-            // results. A fast exit must not bypass the wall or log cap.
-            let observed = bounds(started, stdout, stderr, limits)?;
-            timed_out |= observed.0;
-            log_overflow |= observed.1;
-            ensure!(!timed_out && !log_overflow, "test wall/log bound exceeded");
-            if observed_terminal {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    })();
-    let primary_error = primary.err().map(|error| format!("{error:#}"));
-    let mut cleanup_errors = Vec::new();
-    let cleanup_started = Instant::now();
-    let cleanup_deadline = cleanup_started + limits.cleanup;
-    // Retain the old success condition: leader exit with a live descendant
-    // is a failure even when later owned cleanup successfully kills it.
-    let before_members = group_members(pid);
-    let natural_terminal_group = before_members
-        .as_ref()
-        .is_ok_and(|members| only_terminal_leader(pid, members, observed_terminal));
-    let before_members = match before_members {
-        Ok(members) => Some(members),
-        Err(error) => {
-            cleanup_errors.push(format!("pre-kill group census: {error:#}"));
-            None
-        }
-    };
-    // Revalidate that the process is still our unreaped child before signaling.
-    // No code below sends any signal after final reap, including on error.
-    let mut owned_group_kill = false;
-    match exited_without_reap(&child.child) {
-        Ok(_) => match kill(pid) {
-            Ok(()) => owned_group_kill = true,
-            Err(error) => cleanup_errors.push(format!("owned group kill: {error:#}")),
-        },
-        Err(error) => cleanup_errors.push(format!("pre-kill child ownership: {error:#}")),
-    }
-    if owned_group_kill {
-        loop {
-            match exited_without_reap(&child.child) {
-                Ok(true) => {
-                    // waitid retained the exited leader, so this final wait
-                    // cannot wait for a running child. It releases PID ownership.
-                    match child.child.wait() {
-                        Ok(reaped) => {
-                            status = Some(reaped);
-                            child.reaped = true;
-                        }
-                        Err(error) => cleanup_errors.push(format!("reap: {error}")),
+// Every stage shares the original action start and the same append-only logs.
+// A new compiler or test never receives another 60-second or 4-MiB allowance.
+fn execute_stage(command: &mut Command, started: Instant, stdout: &Path, stderr: &Path) -> Value {
+    let admission = (|| -> Result<()> {
+        let current = bounds(started, stdout, stderr, LIMITS)?;
+        ensure!(
+            !current.0 && !current.1,
+            "aggregate wall/log bound before next stage"
+        );
+        process_group::own_descendants()?;
+        command
+            .stdin(Stdio::null())
+            .stdout(File::options().append(true).open(stdout)?)
+            .stderr(File::options().append(true).open(stderr)?);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for (resource, limit) in [
+                    (libc::RLIMIT_CORE, 0),
+                    (libc::RLIMIT_AS, 4 * 1024 * MIB),
+                    (libc::RLIMIT_FSIZE, 64 * MIB),
+                ] {
+                    let value = libc::rlimit {
+                        rlim_cur: limit,
+                        rlim_max: limit,
+                    };
+                    if libc::setrlimit(resource, &value) != 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
-                    break;
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    cleanup_errors.push(format!("terminal observation: {error:#}"));
-                    break;
-                }
-            }
-            if Instant::now() >= cleanup_deadline {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+                Ok(())
+            });
         }
+        Ok(())
+    })();
+    match admission.and_then(|()| command.spawn().map_err(Into::into)) {
+        Ok(child) => supervise(
+            OwnedChild {
+                child,
+                cleanup_attempted: false,
+                reaped: false,
+            },
+            started,
+            stdout,
+            stderr,
+            LIMITS,
+        ),
+        Err(error) => json!({ "pid":null, "raw_status":null, "signal":null,
+            "primary_error":format!("stage admission/spawn: {error:#}"),
+            "cleanup_attempted":false, "cleanup_complete":null, "passed":false }),
     }
-    let mut final_group_absent = None;
-    loop {
-        match absent(pid) {
-            Ok(observed) => final_group_absent = Some(observed),
-            Err(error) => {
-                cleanup_errors.push(format!("terminal group readback: {error:#}"));
-                break;
-            }
-        }
-        if final_group_absent == Some(true) || Instant::now() >= cleanup_deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    child.cleanup_attempted = true;
-    let cleanup_within_bound = Instant::now() < cleanup_deadline;
-    let cleanup_complete =
-        status.is_some() && final_group_absent == Some(true) && cleanup_within_bound;
-    let final_bounds = bounds(started, stdout, stderr, limits);
-    let bounds_error = match final_bounds {
-        Ok(observed) => {
-            timed_out |= observed.0;
-            log_overflow |= observed.1;
-            None
-        }
-        Err(error) => Some(format!("{error:#}")),
-    };
-    let passed = status.is_some_and(|status| status.success())
-        && primary_error.is_none()
-        && bounds_error.is_none()
-        && !timed_out
-        && !log_overflow
-        && natural_terminal_group
-        && cleanup_complete
-        && cleanup_errors.is_empty();
-    json!({
-        "pid":pid, "raw_status":status.and_then(|status|status.code()),
-        "signal":status.and_then(|status|status.signal()),
-        "seconds":started.elapsed().as_secs_f64(),
-        "timed_out":timed_out, "log_overflow":log_overflow,
-        "primary_error":primary_error, "terminal_bounds_error":bounds_error,
-        "terminal_observed_without_reap":observed_terminal,
-        "group_members_before_kill":before_members, "natural_terminal_group":natural_terminal_group,
-        "owned_group_kill_before_reap":owned_group_kill,
-        "cleanup_attempted":true, "cleanup_complete":cleanup_complete,
-        "cleanup_within_bound":cleanup_within_bound,
-        "unreaped_child_retained_until_receipt":!child.reaped,
-        "cleanup_seconds":cleanup_started.elapsed().as_secs_f64(),
-        "cleanup_errors":cleanup_errors, "final_group_absent":final_group_absent,
-        "passed":passed
-    })
 }
 
 fn run() -> Result<()> {
@@ -374,11 +246,15 @@ fn run() -> Result<()> {
         "packaged object hash mismatch"
     );
     let source_hashes = sources(&source, &manifest)?;
+    let accepted = manifest["kind"] == "hermit-accepted-provider";
+    let control_hashes = control_sources(&source, accepted)?;
+    let channel_hashes = channel_control_inputs(&source, accepted)?;
     fs::create_dir(&output).context("test output must be a new directory")?;
     fs::write(
         output.join("inputs.json"),
         serde_json::to_vec_pretty(&json!({
             "manifest_sha256":digest(&manifest_bytes), "source":source, "sources":source_hashes,
+            "required_c_controls":control_hashes, "channel_control_inputs":channel_hashes,
             "before":before, "before_sha256":before_hash, "after":after, "after_sha256":after_hash,
             "new_bpf_load":false, "guest_executed":false
         }))?,
@@ -399,56 +275,161 @@ fn run() -> Result<()> {
         .env("HERMIT_PACKAGE_TEST_AFTER", &after)
         .env("CARGO_BUILD_JOBS", "2")
         .env("CARGO_NET_OFFLINE", "true")
-        .env("DAGRUN_LOG_DIR", &output)
-        .stdin(Stdio::null())
-        .stdout(File::create(&stdout_path)?)
-        .stderr(File::create(&stderr_path)?);
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (resource, limit) in [
-                (libc::RLIMIT_CORE, 0),
-                (libc::RLIMIT_AS, 4 * 1024 * MIB),
-                (libc::RLIMIT_FSIZE, 64 * MIB),
-            ] {
-                let value = libc::rlimit {
-                    rlim_cur: limit,
-                    rlim_max: limit,
-                };
-                if libc::setrlimit(resource, &value) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
+        .env("DAGRUN_LOG_DIR", &output);
+    File::create(&stdout_path)?;
+    File::create(&stderr_path)?;
     let started = Instant::now();
-    let mut receipt = match command.spawn() {
-        Ok(child) => supervise(
-            OwnedChild {
-                child,
-                cleanup_attempted: false,
-                reaped: false,
-            },
-            started,
-            &stdout_path,
-            &stderr_path,
-            LIMITS,
-        ),
-        Err(error) => json!({
-            "pid":null, "raw_status":null, "signal":null,
-            "primary_error":format!("spawn: {error}"),
-            "cleanup_attempted":false, "cleanup_complete":null,
-            "passed":false
-        }),
+    let mut receipt = execute_stage(&mut command, started, &stdout_path, &stderr_path);
+    let mut stages = vec![json!({ "name":"compression-parser", "receipt":receipt })];
+    if receipt["passed"] == true && accepted {
+        for name in ACCEPTED_CONTROLS {
+            let executable = output.join(name.strip_suffix(".c").unwrap());
+            let mut compile = Command::new("clang");
+            if *name == "birth-cleanup-driver-test.c" {
+                // This existing control includes driver.c and mocks only the
+                // reached boundaries. Keep its reviewed standalone flags;
+                // its stages share this action's original aggregate limits.
+                compile.args([
+                    "-std=gnu11",
+                    "-ffunction-sections",
+                    "-fdata-sections",
+                    "-Wl,--gc-sections",
+                ]);
+            }
+            if matches!(*name, "grouped-owner-test.c" | "grouped-recovery-test.c" | "grouped-adoption-test.c") {
+                compile.arg(source.join("grouped-owner.c"));
+            }
+            if *name == "grouped-wire-test.c" {
+                for module in ["grouped-owner.c", "grouped-io.c", "grouped-keeper-wire.c",
+                    "grouped-keeper-dual.c", "grouped-guardian-bootstrap.c", "grouped-adoption-wire.c"] {
+                    compile.arg(source.join(module));
+                }
+                compile.arg("-l:libcrypto.so.3");
+            }
+            compile
+                .args(["-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG"])
+                .arg("-I")
+                .arg(&source)
+                .arg(source.join(name))
+                .arg("-o")
+                .arg(&executable);
+            let compiled = execute_stage(&mut compile, started, &stdout_path, &stderr_path);
+            stages.push(json!({ "name":format!("compile:{name}"), "receipt":compiled }));
+            if compiled["passed"] != true {
+                receipt = compiled;
+                break;
+            }
+            let tested = execute_stage(
+                &mut Command::new(&executable),
+                started,
+                &stdout_path,
+                &stderr_path,
+            );
+            stages.push(json!({ "name":format!("test:{name}"), "receipt":tested }));
+            if tested["passed"] != true {
+                receipt = tested;
+                break;
+            }
+        }
+    }
+    if receipt["passed"] == true && accepted {
+        for (label, name) in [
+            ("fd", "fd-effects-test.c"),
+            ("stream-copy-v5", "stream-copy-v5-driver-test.c"),
+            ("stream-membership-v5", "stream-membership-v5-test.c"),
+        ] {
+            let executable=output.join(format!("ftrace-production-{label}"));
+            let mut compile=Command::new("clang");
+            compile.args(["-O2","-Wall","-Wextra","-Werror","-UNDEBUG",
+                "-DAP_FTRACE_PROVIDER=1"]);
+            if name=="fd-effects-test.c" {compile.arg("-DAP_NATIVE_COPY_VERSION=5ULL");}
+            compile
+                .arg("-I").arg(&source)
+                .arg(source.join(name)).arg("-o").arg(&executable);
+            let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
+            stages.push(json!({"name":format!("compile:ftrace-production-{label}"),"receipt":compiled}));
+            if compiled["passed"]!=true {receipt=compiled;break;}
+            let tested=execute_stage(&mut Command::new(&executable),started,&stdout_path,&stderr_path);
+            stages.push(json!({"name":format!("test:ftrace-production-{label}"),"receipt":tested}));
+            if tested["passed"]!=true {receipt=tested;break;}
+        }
+    }
+    if receipt["passed"] == true && accepted {
+        let executable=output.join("ftrace-link-shape-mutant");
+        let mut compile=Command::new("clang");
+        compile.args(["-O2","-Wall","-Wextra","-Werror","-UNDEBUG",
+            "-DAP_FTRACE_MUTATE_LINK_SHAPE=1"])
+            .arg("-I").arg(&source)
+            .arg(source.join("ftrace-coverage-test.c")).arg("-o").arg(&executable);
+        let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
+        stages.push(json!({"name":"compile:ftrace-link-shape-mutant","receipt":compiled}));
+        if compiled["passed"]==true {
+            let tested=execute_stage(&mut Command::new(&executable),started,&stdout_path,&stderr_path);
+            let refused=tested["passed"]==false &&
+                tested["signal"].as_i64()==Some(libc::SIGABRT as i64) && tested["timed_out"]==false &&
+                tested["log_overflow"]==false && tested["primary_error"].is_null() &&
+                tested["terminal_bounds_error"].is_null() &&
+                tested["natural_terminal_group"]==true && tested["cleanup_complete"]==true &&
+                tested["cleanup_errors"].as_array().is_some_and(|errors| errors.is_empty());
+            let accepted=json!({"passed":refused,"expected_refusal":true,"raw":tested});
+            stages.push(json!({"name":"test:ftrace-link-shape-mutant","receipt":accepted}));
+            if !refused {receipt=accepted;}
+        } else {receipt=compiled;}
+    }
+    if receipt["passed"] == true && accepted {
+        for role in 1..=17 {
+            let source_name=match role {
+                1..=11 => "fd-effects-test.c",
+                12..=15 => "stream-copy-v5-driver-test.c",
+                16..=17 => "stream-membership-v5-test.c",
+                _ => unreachable!(),
+            };
+            let executable=output.join(format!("ftrace-coverage-mutant-{role}"));
+            let mut compile=Command::new("clang");
+            // Each mutant executes the same production helper/header path as
+            // its O2 positive control above. Avoid spending the fixed suite
+            // wall budget re-optimizing the large host fixture 17 times.
+            compile.args(["-O0","-Wall","-Wextra","-Werror","-UNDEBUG",
+                    "-DAP_FTRACE_PROVIDER=1"])
+                .arg(format!("-DAP_FTRACE_MUTATE_ROLE={role}"));
+            if source_name=="fd-effects-test.c" {compile.arg("-DAP_NATIVE_COPY_VERSION=5ULL");}
+            if source_name=="fd-effects-test.c" {compile.arg("-DAP_FTRACE_MUTANT_ONLY=1");}
+            compile
+                .arg("-I").arg(&source)
+                .arg(source.join(source_name)).arg("-o").arg(&executable);
+            let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
+            stages.push(json!({"name":format!("compile:ftrace-mutant-{role}"),"receipt":compiled}));
+            if compiled["passed"]!=true {receipt=compiled;break;}
+            let tested=execute_stage(&mut Command::new(&executable),started,&stdout_path,&stderr_path);
+            let refused=tested["passed"]==false &&
+                tested["signal"].as_i64()==Some(libc::SIGABRT as i64) && tested["timed_out"]==false &&
+                tested["log_overflow"]==false && tested["primary_error"].is_null() &&
+                tested["terminal_bounds_error"].is_null() &&
+                tested["natural_terminal_group"]==true && tested["cleanup_complete"]==true &&
+                tested["cleanup_errors"].as_array().is_some_and(|errors| errors.is_empty());
+            let accepted=json!({"passed":refused,"expected_refusal":true,"raw":tested});
+            stages.push(json!({"name":format!("test:ftrace-mutant-{role}"),"receipt":accepted}));
+            if !refused {receipt=accepted;break;}
+        }
+    }
+    let expected_stages = 1 + if accepted {
+        2 * ACCEPTED_CONTROLS.len()+42
+    } else {
+        0
     };
+    let complete =
+        stages.len() == expected_stages && stages.iter().all(|s| s["receipt"]["passed"] == true);
+    receipt["passed"] = json!(complete);
+    receipt["stages"] = json!(stages);
+    receipt["expected_stages"] = json!(expected_stages);
+    receipt["seconds"] = json!(started.elapsed().as_secs_f64());
     let fence = (|| -> Result<bool> {
         Ok(before_hash == digest(&read(&before, 16 * MIB)?)
             && after_hash == digest(&read(&after, MIB)?)
             && manifest_bytes == read(&package.join("manifest.json"), 32768)?
-            && source_hashes == sources(&source, &manifest)?)
+            && source_hashes == sources(&source, &manifest)?
+            && control_hashes == control_sources(&source, accepted)?
+            && channel_hashes == channel_control_inputs(&source, accepted)?)
     })();
     let unchanged = matches!(fence, Ok(true));
     let input_error = fence.err().map(|error| format!("{error:#}"));
@@ -465,7 +446,7 @@ fn run() -> Result<()> {
     }
     ensure!(
         passed,
-        "package parser test action failed; raw evidence in {}",
+        "package parser/provider test action failed; raw evidence in {}",
         output.display()
     );
     println!("{}", json!({"passed":true,"evidence":output}));
@@ -475,7 +456,7 @@ fn run() -> Result<()> {
 fn main() {
     rust_script_prelude::init();
     if let Err(error) = run() {
-        eprintln!("network provider parser tests failed: {error:#}");
+        eprintln!("network provider tests failed: {error:#}");
         std::process::exit(1);
     }
 }
@@ -548,6 +529,127 @@ mod tests {
         }
         // Repeated WNOWAIT must still return the same exact owned child.
         assert!(exited_without_reap(&child.child).unwrap());
+    }
+
+    #[test]
+    fn accepted_controls_are_required_and_fenced_as_an_exact_population() {
+        let case = Case::new();
+        assert!(control_sources(&case.path, true).is_err());
+        assert_eq!(control_sources(&case.path, false).unwrap(), BTreeMap::new());
+        for name in ACCEPTED_CONTROLS {
+            fs::write(case.path.join(name), name).unwrap();
+        }
+        let before = control_sources(&case.path, true).unwrap();
+        assert_eq!(ACCEPTED_CONTROLS.len(), 21);
+        assert_eq!(before.len(), 21);
+        assert_eq!(
+            before.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "birth-cleanup-driver-test.c",
+                "fd-effects-driver-test.c",
+                "fd-effects-test.c",
+                "fd-enrollment-driver-test.c",
+                "fd-enrollment-test.c",
+                "fd-journal-publish-test.c",
+                "fd-shared-predicate-test.c",
+                "fd-table-test.c",
+                "ftrace-coverage-test.c",
+                "grouped-adoption-test.c",
+                "grouped-owner-test.c",
+                "grouped-recovery-test.c",
+                "grouped-target-test.c",
+                "grouped-wire-test.c",
+                "remove-test.c",
+                "retirement-target-test.c",
+                "stream-copy-driver-test.c",
+                "stream-copy-v5-driver-test.c",
+                "stream-frontier-test.c",
+                "stream-membership-test.c",
+                "stream-membership-v5-test.c"
+            ]
+        );
+        fs::write(case.path.join("grouped-wire-test.c"), "changed actual SCM assertion").unwrap();
+        assert_ne!(before, control_sources(&case.path, true).unwrap());
+        fs::remove_file(case.path.join("grouped-wire-test.c")).unwrap();
+        assert!(control_sources(&case.path, true).is_err());
+        fs::write(case.path.join("grouped-wire-test.c"), "grouped-wire-test.c").unwrap();
+        assert_eq!(before, control_sources(&case.path, true).unwrap());
+        for name in ["grouped-adoption-test.c", "grouped-recovery-test.c"] {
+            fs::write(case.path.join(name), "changed retained adoption or recovery assertion").unwrap();
+            assert_ne!(before, control_sources(&case.path, true).unwrap());
+            fs::remove_file(case.path.join(name)).unwrap();
+            assert!(control_sources(&case.path, true).is_err());
+            fs::write(case.path.join(name), name).unwrap();
+            assert_eq!(before, control_sources(&case.path, true).unwrap());
+        }
+        for name in ["grouped-owner-test.c", "stream-membership-test.c", "grouped-target-test.c"] {
+            fs::write(case.path.join(name), "changed grouped ownership or membership assertion").unwrap();
+            assert_ne!(before, control_sources(&case.path, true).unwrap());
+            fs::remove_file(case.path.join(name)).unwrap();
+            assert!(control_sources(&case.path, true).is_err());
+            fs::write(case.path.join(name), name).unwrap();
+            assert_eq!(before, control_sources(&case.path, true).unwrap());
+        }
+        for name in ["stream-frontier-test.c", "stream-copy-v5-driver-test.c", "stream-membership-v5-test.c"] {
+            fs::write(case.path.join(name), "changed frontier or copy-version assertion").unwrap();
+            assert_ne!(before, control_sources(&case.path, true).unwrap());
+            fs::remove_file(case.path.join(name)).unwrap();
+            assert!(control_sources(&case.path, true).is_err());
+            fs::write(case.path.join(name), name).unwrap();
+            assert_eq!(before, control_sources(&case.path, true).unwrap());
+        }
+        fs::write(case.path.join("fd-shared-predicate-test.c"), "changed shared predicate assertion").unwrap();
+        assert_ne!(before, control_sources(&case.path, true).unwrap());
+        fs::remove_file(case.path.join("fd-shared-predicate-test.c")).unwrap();
+        assert!(control_sources(&case.path, true).is_err());
+        fs::write(case.path.join("fd-shared-predicate-test.c"), "fd-shared-predicate-test.c").unwrap();
+        assert_eq!(before, control_sources(&case.path, true).unwrap());
+        fs::write(case.path.join("fd-journal-publish-test.c"), "changed publication assertion").unwrap();
+        assert_ne!(before, control_sources(&case.path, true).unwrap());
+        fs::remove_file(case.path.join("fd-journal-publish-test.c")).unwrap();
+        assert!(control_sources(&case.path, true).is_err());
+        fs::write(case.path.join("fd-journal-publish-test.c"), "fd-journal-publish-test.c").unwrap();
+        assert_eq!(before, control_sources(&case.path, true).unwrap());
+        fs::write(case.path.join("birth-cleanup-driver-test.c"), "changed ownership assertion")
+            .unwrap();
+        assert_ne!(before, control_sources(&case.path, true).unwrap());
+        fs::remove_file(case.path.join("birth-cleanup-driver-test.c")).unwrap();
+        // Every required control remains part of the exact population.
+        assert!(control_sources(&case.path, true).is_err());
+        fs::write(
+            case.path.join("birth-cleanup-driver-test.c"),
+            "birth-cleanup-driver-test.c",
+        )
+        .unwrap();
+        assert_eq!(before, control_sources(&case.path, true).unwrap());
+        fs::write(case.path.join("fd-enrollment-test.c"), "changed assertion").unwrap();
+        assert_ne!(before, control_sources(&case.path, true).unwrap());
+        fs::remove_file(case.path.join("fd-table-test.c")).unwrap();
+        assert!(control_sources(&case.path, true).is_err());
+    }
+
+    #[test]
+    fn every_channel_module_and_header_is_required_and_fenced() {
+        let case = Case::new();
+        assert!(channel_control_inputs(&case.path, true).is_err());
+        assert_eq!(channel_control_inputs(&case.path, false).unwrap(), BTreeMap::new());
+        for name in CHANNEL_CONTROL_INPUTS { fs::write(case.path.join(name), name).unwrap(); }
+        let before = channel_control_inputs(&case.path, true).unwrap();
+        assert_eq!(before.len(), 8);
+        assert_eq!(before.keys().map(String::as_str).collect::<Vec<_>>(), [
+            "grouped-adoption-wire.c", "grouped-adoption-wire.h",
+            "grouped-guardian-bootstrap.c", "grouped-guardian-bootstrap.h",
+            "grouped-keeper-dual.c", "grouped-keeper-dual.h",
+            "grouped-keeper-wire.c", "grouped-keeper-wire.h",
+        ]);
+        for name in CHANNEL_CONTROL_INPUTS {
+            fs::write(case.path.join(name), "changed actual channel implementation").unwrap();
+            assert_ne!(before, channel_control_inputs(&case.path, true).unwrap());
+            fs::remove_file(case.path.join(name)).unwrap();
+            assert!(channel_control_inputs(&case.path, true).is_err());
+            fs::write(case.path.join(name), name).unwrap();
+            assert_eq!(before, channel_control_inputs(&case.path, true).unwrap());
+        }
     }
 
     #[test]

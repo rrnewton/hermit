@@ -79,3 +79,4 @@ quote = "1.0.47"
 sha2 = "0.10.9"
 # Parse actual container call arguments, including conditional local labels.
 syn = { version = "2.0.119", features = ["full", "visit"] }
+futures-util = "0.3.33"
