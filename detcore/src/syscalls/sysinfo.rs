@@ -74,6 +74,22 @@ fn procfs_uptime_seconds(
     uptime_offset_seconds + (now - boot).as_secs()
 }
 
+/// Render `/proc/stat`'s `btime` from the logical boot instant.
+///
+/// Linux's `show_stat` prints the seconds of `getboottime64`, a fixed instant
+/// that moves only when the realtime clock or time-namespace offset changes.
+/// Derive it from the boot instant itself, never as `floor(now) - uptime`: for
+/// a fractional boot those two floors round independently, so ordinary
+/// elapsed time would move `btime` back and forth by one second.
+fn procfs_boot_time_seconds(
+    boot: crate::types::LogicalTime,
+    uptime_offset_seconds: u64,
+) -> Option<i64> {
+    i64::try_from(boot.as_secs())
+        .ok()?
+        .checked_sub(i64::try_from(uptime_offset_seconds).ok()?)
+}
+
 /// Render `sysinfo(2)`'s `uptime` from an absolute logical clock.
 ///
 /// Linux's `do_sysinfo` reports `tv_sec + (tv_nsec ? 1 : 0)`: any fractional
@@ -392,6 +408,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         ))
     }
 
+    /// Whole-second `/proc/stat` `btime`, fixed for the life of the run.
+    pub(super) fn calculate_procfs_boot_time(&self) -> Result<i64, Error> {
+        procfs_boot_time_seconds(
+            crate::types::DetTime::new(&self.cfg).as_nanos(),
+            self.cfg.sysinfo_uptime_offset,
+        )
+        .ok_or_else(|| Errno::EOVERFLOW.into())
+    }
+
     /// `sysinfo(2)` uptime (ceiling of elapsed logical time, as Linux reports).
     async fn calculate_sysinfo_uptime<G: Guest<Self>>(&self, guest: &mut G) -> Result<u64, Error> {
         let global_time = thread_observe_time(guest).await;
@@ -486,6 +511,36 @@ mod tests {
             procfs_uptime_seconds(boot + LogicalTime::from_secs(1), boot, 120),
             121
         );
+    }
+
+    #[test]
+    fn procfs_boot_time_is_the_boot_instant_not_now_minus_uptime() {
+        // The reviewed reproducer: boot 1000.75s, offset 120s. Linux reports
+        // the seconds of the fixed boot instant, 880, for every sample.
+        let boot = LogicalTime::from_nanos(1_000_750_000_000);
+        assert_eq!(procfs_boot_time_seconds(boot, 120), Some(880));
+
+        // `floor(now) - uptime` is what the fix replaced: at these samples it
+        // yields 880, 881, 880. Pin that the old derivation really did move,
+        // so this test keeps meaning something if the helpers change.
+        let old_btime =
+            |now: LogicalTime| now.as_secs() as i64 - procfs_uptime_seconds(now, boot, 120) as i64;
+        let samples = [100, 400, 1_100].map(|millis| boot + LogicalTime::from_millis(millis));
+        assert_eq!(samples.map(old_btime), [880, 881, 880]);
+
+        // For an integral boot the two derivations agree, so whole-second
+        // epochs render exactly what they rendered before.
+        let integral_boot = LogicalTime::from_secs(1_000);
+        let integral_now = integral_boot + LogicalTime::from_millis(1_400);
+        assert_eq!(
+            procfs_boot_time_seconds(integral_boot, 120),
+            Some(
+                integral_now.as_secs() as i64
+                    - procfs_uptime_seconds(integral_now, integral_boot, 120) as i64
+            )
+        );
+
+        assert_eq!(procfs_boot_time_seconds(boot, u64::MAX), None);
     }
 
     #[test]

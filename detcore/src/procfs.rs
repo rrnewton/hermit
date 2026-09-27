@@ -616,6 +616,8 @@ impl MountInfoSnapshot {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_uptime_seconds: u64,
+    /// `/proc/stat` `btime`: the boot instant, independent of elapsed time.
+    pub(crate) virtual_boot_time_seconds: i64,
     pub(crate) virtual_realtime_seconds: i64,
     pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
@@ -881,6 +883,7 @@ impl ProcfsFile {
     pub(crate) fn initialize(&mut self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
         let ProcfsSnapshotContext {
             virtual_uptime_seconds,
+            virtual_boot_time_seconds,
             virtual_realtime_seconds,
             virtual_memory_kb,
             virtual_pid,
@@ -915,12 +918,9 @@ impl ProcfsFile {
             ProcfsKind::TimerSlack(_) => {
                 unreachable!("timer-slack procfs content is generated from ThreadState")
             }
-            ProcfsKind::SystemStat => sanitize_system_stat(
-                &contents,
-                virtual_uptime_seconds,
-                virtual_realtime_seconds
-                    .saturating_sub(i64::try_from(virtual_uptime_seconds).unwrap_or(i64::MAX)),
-            ),
+            ProcfsKind::SystemStat => {
+                sanitize_system_stat(&contents, virtual_uptime_seconds, virtual_boot_time_seconds)
+            }
             ProcfsKind::Cpuinfo => sanitize_cpuinfo(&contents),
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::Loadavg => sanitize_loadavg(&contents),
