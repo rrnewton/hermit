@@ -2996,6 +2996,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 thread_state.thread_logical_time.clone(),
                 global_state,
                 deregistration,
+                exit_status.signal().is_some(),
             )
             .await?;
         } else {

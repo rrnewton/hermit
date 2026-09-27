@@ -977,9 +977,15 @@ impl GlobalTool for GlobalState {
                     .recv_exec_transfer(from, guest_time, request_mm, *former, *process)
                     .await;
             }
-            GlobalRequest::RetireExec(thread) => {
+            GlobalRequest::RetireExec { thread, signaled } => {
                 return self
-                    .recv_retire_exec_transfer(from, guest_time, request_mm, thread.clone())
+                    .recv_retire_exec_transfer(
+                        from,
+                        guest_time,
+                        request_mm,
+                        thread.clone(),
+                        *signaled,
+                    )
                     .await;
             }
             _ => {}
@@ -993,6 +999,51 @@ impl GlobalTool for GlobalState {
             return self
                 .recv_signal_dequeued(dtid, request_mm, guest_time, *detpid, *identity, *dequeue)
                 .await;
+        }
+
+        // A vfork child registers itself while the parent is kernel-blocked.
+        // Reopening a former exec worker's TID requires that exact pending
+        // parent grant and its address-space lineage, not an ordinary RPC.
+        if let GlobalRequest::CreateVforkChildThread(parent, process, child, _, flags, ..) =
+            &request
+        {
+            let mut sched = self.lock_rpc_scheduler(false).await;
+            if sched.transferred_exec_tid_requires_registration(dtid) {
+                if *child != dtid
+                    || !(flags.contains(CloneFlags::CLONE_VFORK)
+                        || (self.cfg.backend_serializes_fork_children
+                            && !flags.contains(CloneFlags::CLONE_THREAD)))
+                    || !sched.pending_vfork_registration_matches(
+                        *parent,
+                        *process,
+                        *child,
+                        request_mm,
+                        flags.contains(CloneFlags::CLONE_VM),
+                    )
+                {
+                    return (None, R::ThreadExited);
+                }
+                sched.register_reused_transferred_exec_tid(dtid, request_mm);
+            }
+        }
+
+        // Ptrace may deliver a newborn's startup before the parent's clone
+        // callback registers it. A former exec worker's reused Linux TID must
+        // wait for that authenticated registration, not inherit the old
+        // incarnation or turn a premature refusal into a silent exit(0).
+        // No clock or scheduler request is published while it waits.
+        if matches!(&request, GlobalRequest::StartNewThread(child, ..) if *child == dtid) {
+            loop {
+                {
+                    let sched = self.lock_rpc_scheduler(false).await;
+                    if !sched.transferred_exec_tid_requires_registration(dtid)
+                        || sched.thread_is_logically_killed(dtid)
+                    {
+                        break;
+                    }
+                }
+                yield_once().await;
+            }
         }
 
         let is_deregister = matches!(&request, GlobalRequest::DeregisterThread(_));
@@ -1015,9 +1066,10 @@ impl GlobalTool for GlobalState {
             (reconnect, is_exec_caller_after_local_mm_swap)
         };
 
-        // Tombstones reject raw Linux TID reuse except for the kernel-defined leader-TID takeover
-        // recorded by a successful non-leader exec. Hold the scheduler admission lock through
-        // clock accounting so logical teardown cannot linearize between the two.
+        // Retired incarnations cannot publish clocks. A transferred former TID
+        // reopens only through fresh child registration; successful exec binds
+        // the surviving leader separately. Hold admission through clock
+        // accounting so logical teardown cannot linearize between the two.
         let mut tombstoned_deregistration = None;
         {
             let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
@@ -1122,7 +1174,7 @@ impl GlobalTool for GlobalState {
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
         let resp = match request {
-            GlobalRequest::ReconnectExec { .. } | GlobalRequest::RetireExec(_) => {
+            GlobalRequest::ReconnectExec { .. } | GlobalRequest::RetireExec { .. } => {
                 unreachable!("exec transfer handled before ordinary admission")
             }
             GlobalRequest::ResumeExec(process) => {
@@ -1224,8 +1276,12 @@ impl GlobalTool for GlobalState {
                 R::ReportUnsupportedSyscall(())
             }
             GlobalRequest::PrepareExec(process, mm, fd_blocking) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+                let mut sched = self.lock_rpc_scheduler(false).await;
                 if mm != request_mm {
+                    return (None, R::ThreadExited);
+                }
+                if self.cfg.sequentialize_threads && !sched.prepare_exec_teardown(dtid, process, mm)
+                {
                     return (None, R::ThreadExited);
                 }
                 trace!(
@@ -1244,18 +1300,23 @@ impl GlobalTool for GlobalState {
                 R::PrepareExec(())
             }
             GlobalRequest::CancelExec(process) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+                let mut sched = self.lock_rpc_scheduler(false).await;
                 let mut pending = self.pending_exec_states.lock().unwrap();
                 if pending
                     .get(&process)
                     .is_some_and(|state| state.caller == dtid)
                 {
-                    pending.remove(&process);
+                    let prepared = pending.remove(&process).unwrap();
+                    sched.finish_exec_teardown(prepared.caller, process, prepared.mm, false);
                 }
                 R::CancelExec(())
             }
             GlobalRequest::MarkPastFirstExecve(detpid, signal_identity) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
+                // A backend preserving the leader's ThreadState does not use
+                // the identity-transfer RPC. This successful-exec edge still
+                // commits the frozen sibling cohort in scheduler order.
+                let prepared = self.pending_exec_states.lock().unwrap().get(&dtid).cloned();
                 if self.cfg.kvm_shared_dequeue_timers {
                     let result = (|| {
                         let identity = signal_identity.ok_or(ProtocolFailure::Identity)?;
@@ -1294,6 +1355,26 @@ impl GlobalTool for GlobalState {
                 // POSIX deadlines before the replacement image can yield or run.
                 // Failed exec takes CancelExec and never reaches this point.
                 sched.blocked.timed_waiters.remove_posix_timers(detpid);
+                // Reloading backends consumed the preparation in their
+                // registration reconnect; state-preserving leaders consume it
+                // here after the terminal exec notification was authenticated.
+                if let Some(prepared) = &prepared
+                    && self.cfg.sequentialize_threads
+                    && prepared.caller == dtid
+                    && prepared.process == dtid
+                    && prepared.mm.for_exec(dtid) == request_mm
+                {
+                    sched.reconnect_after_exec(ExecReconnect {
+                        caller: dtid,
+                        new_leader: dtid,
+                        detpid: dtid,
+                        pre_exec_mm: prepared.mm,
+                        post_exec_mm: request_mm,
+                        child_tid_addr: 0,
+                        reconnect_priority: None,
+                    });
+                    self.pending_exec_states.lock().unwrap().remove(&dtid);
+                }
                 self.past_first_execve.store(true, SeqCst);
                 let overrides = self
                     .post_exec_fd_blocking
@@ -1938,6 +2019,13 @@ impl GlobalState {
                 sched.complete_vfork_registration(parent_dettid, child_dettid);
             }
 
+            let child_mm = MmId::for_clone(
+                request_mm,
+                child_dettid,
+                flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
+            );
+            sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
+
             // Don't fill in the request, as the child will do it:
             let _entry = sched
                 .next_turns
@@ -1973,11 +2061,6 @@ impl GlobalState {
                 } else {
                     child_dettid
                 };
-                let child_mm = MmId::for_clone(
-                    request_mm,
-                    child_dettid,
-                    flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
-                );
                 if let Err(open_error) = sched.register_physical_thread(
                     child_dettid,
                     child_mm,
@@ -2238,7 +2321,9 @@ impl GlobalState {
 
     /// Warning: this happens completely asynchronously, whenever the guest exit hook fires.
     /// Its timing is not coordinated by the scheduler.
-    async fn recv_deregister_thread(&self, _from: Tid, deregistration: ThreadDeregistration) {
+    async fn recv_deregister_thread(&self, _from: Tid, mut deregistration: ThreadDeregistration) {
+        // Keep the same scheduler -> pending-exec lock order as reconnect.
+        let mut sched = self.sched.lock().unwrap();
         let ThreadDeregistration {
             dettid, detpid, mm, ..
         } = &deregistration;
@@ -2250,13 +2335,18 @@ impl GlobalState {
         if pending.get(detpid).is_some_and(|state| {
             state.caller == *dettid && (*mm == state.mm || *mm == state.mm.for_exec(state.process))
         }) {
-            pending.remove(detpid);
+            let prepared = pending.remove(detpid).unwrap();
+            sched.finish_exec_teardown(prepared.caller, *detpid, prepared.mm, false);
+            // The local caller can have installed its candidate exec MmId
+            // before cancellation. It still owns the original registration;
+            // consume that exact prepared incarnation rather than discarding
+            // cleanup as a stale request after removing the preparation.
+            deregistration.mm = prepared.mm;
         }
         drop(pending);
 
         // Invariant: will only be called when sequentialize-threads is on.
         assert!(self.cfg.sequentialize_threads);
-        let mut sched = self.sched.lock().unwrap();
         self.account_deregistered_thread(&mut sched, deregistration);
     }
 
@@ -2298,7 +2388,9 @@ impl GlobalState {
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         sched.record_syscall_count(dettid, syscall_count);
-        if !sched.thread_is_logically_killed(dettid) {
+        if !sched.defer_exec_sibling_retirement(dettid, detpid, mm)
+            && !sched.thread_is_logically_killed(dettid)
+        {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
         trace!(
@@ -2800,8 +2892,13 @@ pub enum GlobalRequest {
     },
     /// Acquire the replacement's first turn without newborn state initialization.
     ResumeExec(DetPid),
-    /// Consume a transferred owner if exec cleanup interrupts local rebinding.
-    RetireExec(ThreadDeregistration),
+    /// Consume a transferred owner if genuine cancellation interrupts local
+    /// rebinding. The Tool copies `signaled` from the backend's exit status;
+    /// ordinary exit requires a separately recorded backend failure.
+    RetireExec {
+        thread: ThreadDeregistration,
+        signaled: bool,
+    },
 
     /// Complete a successful image transition, including the initial image, and
     /// delete the process's POSIX timer deadlines before the new image runs.
@@ -3130,6 +3227,16 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // The successful exec callback must bind a surviving worker to its new
+    // backend TID before issuing ordinary replacement-image requests. In
+    // particular, a missed reconnect must not turn ThreadExited into exit(0).
+    // Consuming cancellation and the reconnect itself use their authenticated
+    // direct RPC paths instead of this ordinary-request helper.
+    assert_eq!(
+        DetTid::from_raw(guest.tid().as_raw()),
+        guest.thread_state().dettid,
+        "replacement image must reconnect before ordinary RPCs"
+    );
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let resp = guest.send_rpc((mytime, mm, request)).await;
@@ -4303,6 +4410,7 @@ mod tests {
 
     mod backend_failure_tests;
     mod exec_identity_tests;
+    mod exec_teardown_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;

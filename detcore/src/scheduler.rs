@@ -8,6 +8,8 @@
 
 //! Deterministic scheduling algorithm.
 
+#[cfg(test)]
+mod exec_teardown_tests;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
@@ -186,6 +188,16 @@ pub(crate) struct ExecReconnect {
     pub post_exec_mm: MmId,
     pub child_tid_addr: usize,
     pub reconnect_priority: Option<Priority>,
+}
+
+/// Membership is fixed before the caller enters exec. Exit hooks may consume
+/// their owners in any order, but cannot choose scheduler teardown order.
+#[derive(Debug)]
+struct ExecTeardown {
+    caller: DetTid,
+    mm: MmId,
+    siblings: BTreeSet<DetTid>,
+    observed: BTreeSet<DetTid>,
 }
 
 /// Request for resources when the thread next parks.
@@ -556,6 +568,11 @@ pub struct Scheduler {
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
 
+    /// Exact parent address space captured when BlockingVfork is granted.
+    /// A child self-registration can use this one-shot causal authority even
+    /// when Linux reused a TID retired by an earlier transferred exec.
+    vfork_registration_origins: BTreeMap<DetTid, MmId>,
+
     /// Threads whose run-queue admission was recorded by a global-request
     /// handler while a `tentative_pop` transaction was live, deferred to the
     /// next deterministic drain point (`step2`) so it cannot mutate the run
@@ -640,9 +657,14 @@ pub struct Scheduler {
     exec_incarnations: BTreeMap<DetTid, MmId>,
 
     /// A transferred non-leader has no remaining incarnation under its former
-    /// TID. This also rejects late consuming RPCs on ptrace, where ordinary
-    /// logical teardown does not use killed-thread cancellation tombstones.
+    /// TID until an authenticated new child registration reuses it. This also
+    /// rejects late consuming RPCs on ptrace, where ordinary logical teardown
+    /// does not use killed-thread cancellation tombstones.
     retired_transferred_exec_callers: BTreeSet<DetTid>,
+
+    /// In-flight exec attempts whose sibling exit hooks must leave retirement
+    /// to the successful exec edge (or the failed attempt's observed subset).
+    exec_teardowns: BTreeMap<DetPid, ExecTeardown>,
 
     /// Tombstoned SaBRe threads whose final asynchronous deregistration statistics were merged.
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
@@ -1685,6 +1707,7 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
+            vfork_registration_origins: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
@@ -1707,6 +1730,7 @@ impl Scheduler {
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             retired_transferred_exec_callers: Default::default(),
+            exec_teardowns: Default::default(),
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
@@ -2098,6 +2122,107 @@ impl Scheduler {
         true
     }
 
+    /// Freeze the live sibling set at the caller's deterministic exec boundary.
+    /// A failed exec must not kill these threads; only successful exec, or an
+    /// actual exit receipt for a sibling, authorizes its eventual retirement.
+    pub(crate) fn prepare_exec_teardown(
+        &mut self,
+        caller: DetTid,
+        process: DetPid,
+        mm: MmId,
+    ) -> bool {
+        if self.registered_process(caller) != Some(process)
+            || !self.next_turns.contains_key(&caller)
+            || !self.rpc_incarnation_matches(caller, mm)
+            || self.exec_teardowns.contains_key(&process)
+        {
+            return false;
+        }
+        let siblings = self
+            .thread_tree
+            .my_thread_group(&process)
+            .into_iter()
+            .filter(|tid| *tid != caller && self.next_turns.contains_key(tid))
+            .collect();
+        self.exec_teardowns.insert(
+            process,
+            ExecTeardown {
+                caller,
+                mm,
+                siblings,
+                observed: BTreeSet::new(),
+            },
+        );
+        true
+    }
+
+    /// Account a physical exit without letting host callback order mutate the
+    /// scheduler. The hook must return promptly: ptrace awaits the displaced
+    /// leader's hook before invoking the survivor's successful exec callback.
+    pub(crate) fn defer_exec_sibling_retirement(
+        &mut self,
+        tid: DetTid,
+        process: DetPid,
+        mm: MmId,
+    ) -> bool {
+        let Some(teardown) = self.exec_teardowns.get_mut(&process) else {
+            return false;
+        };
+        if teardown.mm != mm || !teardown.siblings.contains(&tid) {
+            return false;
+        }
+        teardown.observed.insert(tid);
+        true
+    }
+
+    /// The exact old-image receipt replaces absence of a scheduler registration
+    /// as proof that a transferred exec's displaced leader was consumed.
+    pub(crate) fn exec_sibling_retirement_observed(
+        &self,
+        tid: DetTid,
+        process: DetPid,
+        mm: MmId,
+    ) -> bool {
+        self.exec_teardowns
+            .get(&process)
+            .is_some_and(|teardown| teardown.mm == mm && teardown.observed.contains(&tid))
+    }
+
+    /// Apply retirement in sorted order at the successful exec edge, or retire
+    /// just physically consumed owners when an exec attempt fails. The caller
+    /// remains registered with its empty request, so no turn can overtake the
+    /// complete replacement registration. The ordinary removal path retains
+    /// its INFO event, futex wakes and tentative-safe run-queue buffering.
+    pub(crate) fn finish_exec_teardown(
+        &mut self,
+        caller: DetTid,
+        process: DetPid,
+        mm: MmId,
+        succeeded: bool,
+    ) -> Vec<DetTid> {
+        if !self
+            .exec_teardowns
+            .get(&process)
+            .is_some_and(|teardown| teardown.caller == caller && teardown.mm == mm)
+        {
+            return Vec::new();
+        }
+        let teardown = self.exec_teardowns.remove(&process).unwrap();
+        let retired: Vec<_> = if succeeded {
+            teardown.siblings
+        } else {
+            teardown.observed
+        }
+        .into_iter()
+        .collect();
+        for tid in &retired {
+            self.logically_kill_thread(tid, &process, mm);
+            self.timeslices.remove(tid);
+        }
+        self.remove_exec_vfork_barriers(&retired);
+        retired
+    }
+
     /// Remove a thread from the deterministic scheduler.  In order to call this, the precondition
     /// is that this thread will execute no further (visible) instructions.
     ///
@@ -2117,6 +2242,7 @@ impl Scheduler {
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
         self.remove_physical_thread(dtid, mm);
+        self.vfork_registration_origins.remove(dtid);
         self.real_timers.retire_task(*detpid, *dtid);
         self.retire_parked_requests(*dtid);
 
@@ -2225,17 +2351,28 @@ impl Scheduler {
         // old POSIX deadlines before admitting the replacement's first turn.
         self.blocked.timed_waiters.remove_posix_timers(detpid);
 
+        let siblings = if self.exec_teardowns.contains_key(&detpid) {
+            let teardown = &self.exec_teardowns[&detpid];
+            assert_eq!((teardown.caller, teardown.mm), (caller, pre_exec_mm));
+            self.finish_exec_teardown(caller, detpid, pre_exec_mm, true)
+        } else {
+            // Reloading backends and older callers may already have retired
+            // their siblings; retain their existing idempotent reconciliation.
+            let mut siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
+            siblings.sort();
+            for sibling in &siblings {
+                self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
+                self.timeslices.remove(sibling);
+            }
+            siblings
+        };
+
         if caller == new_leader {
             self.next_turns
                 .get_mut(&caller)
                 .expect("exec caller must retain a scheduler registration")
                 .child_tid_addr = child_tid_addr;
 
-            let siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
-            for sibling in &siblings {
-                self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
-                self.timeslices.remove(sibling);
-            }
             self.remove_exec_vfork_barriers(&siblings);
             return siblings;
         }
@@ -2250,12 +2387,7 @@ impl Scheduler {
                 .or(reconnect_priority)
                 .expect("exec caller must have a scheduler priority"),
         };
-        let mut retired = Vec::new();
-        for old_tid in group.into_iter().filter(|tid| *tid != caller) {
-            self.logically_kill_thread(&old_tid, &detpid, pre_exec_mm);
-            self.timeslices.remove(&old_tid);
-            retired.push(old_tid);
-        }
+        let mut retired = siblings;
 
         // The leader identity was occupied by a thread the kernel destroyed as
         // part of this exec. This is the one intentional exception to permanent
@@ -2331,6 +2463,8 @@ impl Scheduler {
         self.vfork_barriers.retain(|parent, child| {
             !retired.contains(parent) && !child.is_some_and(|tid| retired.contains(&tid))
         });
+        self.vfork_registration_origins
+            .retain(|parent, _| self.vfork_barriers.contains_key(parent));
     }
 
     #[cfg(test)]
@@ -2368,6 +2502,31 @@ impl Scheduler {
                 .exec_incarnations
                 .get(&dettid)
                 .is_none_or(|expected| *expected == mm)
+    }
+
+    /// A newborn may reach StartNewThread before its parent registers it. It
+    /// must wait without publishing a clock until registration consumes this
+    /// marker; ordinary messages cannot use startup as authority to clear it.
+    pub(crate) fn transferred_exec_tid_requires_registration(&self, tid: DetTid) -> bool {
+        self.retired_transferred_exec_callers.contains(&tid)
+    }
+
+    /// Called only by authenticated fresh child registration. A raw Linux TID
+    /// can be reused after exec retired its former owner; an ordinary RPC
+    /// cannot reopen it. Bind the new address space in the same transaction so
+    /// delayed messages from a different old image remain rejected.
+    pub(crate) fn register_reused_transferred_exec_tid(&mut self, tid: DetTid, mm: MmId) {
+        if !self.retired_transferred_exec_callers.contains(&tid) {
+            return;
+        }
+        assert!(
+            !self.next_turns.contains_key(&tid),
+            "a reused exec caller must not have a live registration"
+        );
+        self.exec_incarnations.insert(tid, mm);
+        self.deregistration_accounted.remove(&tid);
+        self.transferred_exec_syscall_offsets.remove(&tid);
+        self.retired_transferred_exec_callers.remove(&tid);
     }
 
     pub(crate) fn backend_failed(&self) -> bool {
@@ -2817,6 +2976,7 @@ impl Scheduler {
             .collect();
         for parent in completed_parents {
             self.vfork_barriers.remove(&parent);
+            self.vfork_registration_origins.remove(&parent);
         }
 
         if self.vfork_barriers.values().all(Option::is_some) {
@@ -4140,6 +4300,9 @@ impl Scheduler {
             | ResourceID::BlockingRtSigsuspend(op_id) => {
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     assert!(self.vfork_barriers.insert(dettid, None).is_none());
+                    if let Some(origin) = self.next_turns[&dettid].protocol.origin {
+                        self.vfork_registration_origins.insert(dettid, origin.mm);
+                    }
                 }
                 if enabled!(Level::INFO) {
                     let record_suffix = scheduler_commit_record_suffix(
@@ -4335,6 +4498,32 @@ impl Scheduler {
             .get_mut(&parent)
             .unwrap_or_else(|| panic!("vfork child registered without a pending parent {parent}"));
         assert!(registered_child.replace(child).is_none());
+        self.vfork_registration_origins.remove(&parent);
+    }
+
+    /// Authenticate the child address space against the exact parent grant,
+    /// before a reused child TID has a registration of its own. The caller also
+    /// checks the immutable RPC sender and the backend's vfork/serialized-fork
+    /// mode; this predicate neither consumes the barrier nor opens admission.
+    pub(crate) fn pending_vfork_registration_matches(
+        &self,
+        parent: DetTid,
+        process: DetPid,
+        child: DetTid,
+        child_mm: MmId,
+        shares_vm: bool,
+    ) -> bool {
+        let Some(parent_mm) = self.vfork_registration_origins.get(&parent).copied() else {
+            return false;
+        };
+        parent != child
+            && self.registered_process(parent) == Some(process)
+            && self.next_turns.contains_key(&parent)
+            && !self.next_turns.contains_key(&child)
+            && !self.thread_is_logically_killed(parent)
+            && self.rpc_incarnation_matches(parent, parent_mm)
+            && self.vfork_barriers.get(&parent) == Some(&None)
+            && MmId::for_clone(parent_mm, child, shares_vm) == child_mm
     }
 
     /// Inner helper for just the core priority changing.

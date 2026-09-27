@@ -174,13 +174,19 @@ fn child_wait() -> ChildWaitSpec {
 }
 
 async fn consume(state: &GlobalState, tool: &Detcore, sender: DetTid, thread: ThreadState<()>) {
+    consume_with_status(state, tool, sender, thread, ExitStatus::Exited(73)).await;
+}
+
+async fn consume_with_status(
+    state: &GlobalState,
+    tool: &Detcore,
+    sender: DetTid,
+    thread: ThreadState<()>,
+    status: ExitStatus,
+) {
     let rpc = ExecRpc::new(state, sender, Gate::None);
-    let mut exit = Box::pin(tool.on_exit_thread(
-        Tid::from_raw(sender.as_raw()),
-        &rpc,
-        thread,
-        ExitStatus::Exited(73),
-    ));
+    let mut exit =
+        Box::pin(tool.on_exit_thread(Tid::from_raw(sender.as_raw()), &rpc, thread, status));
     assert!(
         matches!(futures::poll!(&mut exit), Poll::Ready(Ok(()))),
         "consuming cleanup must finish without a scheduler grant"
@@ -194,9 +200,14 @@ impl Fixture {
     }
 
     async fn with_leader_retired(retire_leader: bool) -> Self {
+        Self::configured(retire_leader, false).await
+    }
+
+    async fn configured(retire_leader: bool, backend_serializes_fork_children: bool) -> Self {
         let config = Config {
             sequentialize_threads: true,
             cancel_killed_thread_rpcs: false,
+            backend_serializes_fork_children,
             max_timeslice: std::num::NonZeroU64::new(200_000_000),
             ..Config::default()
         };
@@ -284,6 +295,7 @@ impl Fixture {
             worker,
             before_tail,
         };
+        fixture.assert_displaced_leader_receipt(retire_leader);
         fixture.assert_running();
         fixture
     }
@@ -296,6 +308,27 @@ impl Fixture {
         );
         assert_eq!(sched.ready_child_wait(PARENT, child_wait()), None);
         assert_eq!(sched.turn, 0, "identity transfer cannot grant a guest turn");
+    }
+
+    fn assert_displaced_leader_receipt(&self, observed: bool) {
+        let sched = self.state.sched.lock().unwrap();
+        let old_mm = MmId::initial(LEADER);
+        // Physical consumption is authenticated separately from canonical
+        // scheduler retirement. Its original registration remains in place
+        // until the complete exec teardown can retire siblings in fixed order.
+        assert!(sched.next_turns.contains_key(&LEADER));
+        assert!(sched.next_turns[&LEADER].req.try_read().is_none());
+        assert!(sched.rpc_incarnation_matches(LEADER, old_mm));
+        assert_eq!(
+            sched.exec_sibling_retirement_observed(LEADER, LEADER, old_mm),
+            observed
+        );
+        assert!(!sched.exec_sibling_retirement_observed(LEADER, PARENT, old_mm));
+        assert!(!sched.exec_sibling_retirement_observed(LEADER, LEADER, old_mm.for_exec(LEADER)));
+        assert_eq!(
+            sched.per_thread_syscalls.get(&LEADER),
+            if observed { Some(&3) } else { None }
+        );
     }
 
     fn guest(&self, gate: Gate) -> ExecGuest<'_> {
@@ -452,15 +485,7 @@ async fn cancelled_transfer(gate: Gate, backend_failed: bool) {
             fixture.state.global_time.lock().unwrap().as_nanos(),
             fixture.before_tail
         );
-        assert!(
-            !fixture
-                .state
-                .sched
-                .lock()
-                .unwrap()
-                .next_turns
-                .contains_key(&LEADER)
-        );
+        fixture.assert_displaced_leader_receipt(true);
     }
     let duplicate = deregistration(&guest.thread);
     if backend_failed {
@@ -472,7 +497,14 @@ async fn cancelled_transfer(gate: Gate, backend_failed: bool) {
                 phase: "exec transport cancellation control",
             });
     }
-    consume(&fixture.state, &fixture.tool, LEADER, guest.thread).await;
+    let status = if backend_failed {
+        // A failure can race a task's actual normal exit. The published global
+        // failure, rather than this numeric status, authorizes cleanup.
+        ExitStatus::Exited(73)
+    } else {
+        ExitStatus::Signaled(Signal::SIGKILL, false)
+    };
+    consume_with_status(&fixture.state, &fixture.tool, LEADER, guest.thread, status).await;
     let owner = if committed { LEADER } else { WORKER };
     fixture.assert_final_clock(owner);
     assert!(fixture.state.pending_exec_states.lock().unwrap().is_empty());
@@ -509,7 +541,10 @@ async fn cancelled_transfer(gate: Gate, backend_failed: bool) {
             (
                 forged_time,
                 duplicate.mm,
-                GlobalRequest::RetireExec(duplicate),
+                GlobalRequest::RetireExec {
+                    thread: duplicate,
+                    signaled: true,
+                },
             ),
         )
         .await;
@@ -543,6 +578,125 @@ async fn backend_failure_before_exec_commit_still_consumes_original_owner() {
 #[tokio::test]
 async fn backend_failure_after_exec_commit_still_consumes_replacement() {
     cancelled_transfer(Gate::AfterCommit, true).await;
+}
+
+#[tokio::test]
+async fn unbound_exec_ordinary_rpc_fails_before_sending_or_retiring() {
+    let fixture = Fixture::prepared().await;
+    let mut guest = fixture.guest(Gate::None);
+    let before = serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
+    // This is the first ordinary helper reached if handle_post_exec omits its
+    // reconnect. Catching just any panic would also accept the mock's forbidden
+    // tail-injection panic, so require the protocol diagnostic AND no RPC.
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        super::super::send_and_update_time(&mut guest, GlobalRequest::GlobalTimeLowerBound),
+    ))
+    .await;
+    let panic = result.expect_err("an unbound survivor must not request ordinary work");
+    let diagnostic = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("identity assertion must provide a diagnostic");
+    assert!(diagnostic.contains("replacement image must reconnect before ordinary RPCs"));
+    assert!(guest.rpc.requests.lock().unwrap().is_empty());
+    assert_eq!(guest.thread.dettid, WORKER);
+    assert_eq!(
+        serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        fixture
+            .state
+            .pending_exec_states
+            .lock()
+            .unwrap()
+            .contains_key(&LEADER)
+    );
+    assert!(
+        fixture
+            .state
+            .completed_exec_transfers
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    fixture.assert_running();
+}
+
+#[tokio::test]
+async fn unbound_exec_normal_exit_cannot_consume_pending_or_completed_transfer() {
+    for committed in [false, true] {
+        for status in [0, 73] {
+            let fixture = Fixture::prepared().await;
+            if committed {
+                commit_without_acknowledgment(&fixture).await;
+            }
+            let before = serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
+            let (syscalls, timeslices) = {
+                let sched = fixture.state.sched.lock().unwrap();
+                (
+                    sched.per_thread_syscalls.clone(),
+                    sched.per_thread_timeslice.clone(),
+                )
+            };
+            let rpc = ExecRpc::new(&fixture.state, LEADER, Gate::None);
+            let mut exit = Box::pin(fixture.tool.on_exit_thread(
+                Tid::from_raw(LEADER.as_raw()),
+                &rpc,
+                fixture.worker.clone(),
+                ExitStatus::Exited(status),
+            ));
+            let error = match futures::poll!(&mut exit) {
+                Poll::Ready(Err(error)) => error,
+                result => panic!("normal exit {status} must reject unbound cleanup: {result:?}"),
+            };
+            assert!(error.to_string().contains("EINVAL"));
+            let requests = rpc.requests.lock().unwrap();
+            assert!(matches!(
+                requests.as_slice(),
+                [GlobalRequest::RetireExec {
+                    signaled: false,
+                    ..
+                }]
+            ));
+            assert_eq!(
+                serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap(),
+                before
+            );
+            {
+                let sched = fixture.state.sched.lock().unwrap();
+                assert!(!sched.backend_failed());
+                assert_eq!(sched.per_thread_syscalls, syscalls);
+                assert_eq!(sched.per_thread_timeslice, timeslices);
+                assert!(sched.next_turns.contains_key(&LEADER));
+                assert_eq!(sched.next_turns.contains_key(&WORKER), !committed);
+                assert_eq!(
+                    sched.exec_sibling_retirement_observed(LEADER, LEADER, MmId::initial(LEADER)),
+                    !committed
+                );
+            }
+            assert_eq!(
+                fixture
+                    .state
+                    .pending_exec_states
+                    .lock()
+                    .unwrap()
+                    .contains_key(&LEADER),
+                !committed
+            );
+            assert_eq!(
+                fixture
+                    .state
+                    .completed_exec_transfers
+                    .lock()
+                    .unwrap()
+                    .contains_key(&LEADER),
+                committed
+            );
+            fixture.assert_running();
+        }
+    }
 }
 
 #[tokio::test]
@@ -596,6 +750,17 @@ async fn transferred_exec_waits_for_real_grant_and_preserves_clock_and_deadlines
             .lock()
             .unwrap()
             .is_empty()
+    );
+    // The same ordinary helper is legal as soon as acknowledgment has bound
+    // the carried state to the backend's current identity.
+    assert_eq!(
+        super::super::send_and_update_time(&mut guest, GlobalRequest::GlobalTimeLowerBound).await,
+        (
+            None,
+            GlobalResponse::GlobalTimeLowerBound(
+                fixture.before_tail + LogicalTime::from_nanos(497)
+            )
+        )
     );
     consume(&fixture.state, &fixture.tool, LEADER, guest.thread).await;
     fixture.assert_final_clock(LEADER);
@@ -717,16 +882,7 @@ async fn exec_transfer_rejects_queued_former_and_live_displaced_leader() {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            fixture
-                .state
-                .sched
-                .lock()
-                .unwrap()
-                .next_turns
-                .contains_key(&LEADER),
-            !queued_former
-        );
+        fixture.assert_displaced_leader_receipt(queued_former);
         if !queued_former {
             let payload = deregistration(&fixture.worker);
             let retired = fixture
@@ -736,7 +892,10 @@ async fn exec_transfer_rejects_queued_former_and_live_displaced_leader() {
                     (
                         fixture.worker.thread_logical_time.clone(),
                         payload.mm,
-                        GlobalRequest::RetireExec(payload),
+                        GlobalRequest::RetireExec {
+                            thread: payload,
+                            signaled: true,
+                        },
                     ),
                 )
                 .await;
@@ -821,7 +980,14 @@ async fn malformed_exec_retirement_cannot_consume_pending_or_completed_transfer(
                 .state
                 .receive_rpc(
                     Tid::from_raw(sender.as_raw()),
-                    (forged_time, header_mm, GlobalRequest::RetireExec(payload)),
+                    (
+                        forged_time,
+                        header_mm,
+                        GlobalRequest::RetireExec {
+                            thread: payload,
+                            signaled: true,
+                        },
+                    ),
                 )
                 .await;
             assert_eq!(
@@ -1001,4 +1167,405 @@ async fn exec_continuation_applies_relative_grant_once_at_the_carried_current_cl
             .contains_key(&LEADER)
     );
     fixture.assert_final_clock(LEADER);
+}
+
+#[tokio::test]
+async fn reused_exec_worker_start_waits_for_parent_registration_before_clock_or_grant() {
+    let fixture = Fixture::prepared().await;
+    let mut parent = fixture.guest(Gate::None);
+    {
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut parent));
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        let turn = crate::scheduler::do_a_turn_blocking(
+            fixture.state.sched.clone(),
+            fixture.state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.tid, LEADER);
+        assert_eq!(reconnect.await, Ok(()));
+    }
+    assert_eq!(parent.thread.dettid, LEADER);
+    let old_mm = MmId::initial(LEADER);
+    let new_mm = parent.thread.mm_id;
+    assert_ne!(old_mm, new_mm);
+    let before = serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
+    for mm in [old_mm, new_mm] {
+        let rejected = fixture
+            .state
+            .receive_rpc(
+                Tid::from_raw(WORKER.as_raw()),
+                (
+                    parent.thread.thread_logical_time.clone(),
+                    mm,
+                    GlobalRequest::GlobalTimeLowerBound,
+                ),
+            )
+            .await;
+        assert_eq!(rejected, (None, GlobalResponse::ThreadExited));
+        assert_eq!(
+            serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    // Construct the new child through the Tool's real inheritance path. Its
+    // reused numeric TID does not authorize either clock publication or startup.
+    let flags = CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM;
+    parent.thread.clone_flags = Some(flags);
+    let mut child = fixture.tool.init_thread_state(
+        Tid::from_raw(WORKER.as_raw()),
+        Some((Tid::from_raw(LEADER.as_raw()), &parent.thread)),
+    );
+    parent.thread.clone_flags = None;
+    child.detpid = Some(LEADER);
+    child.thread_start_entered = true;
+    assert_eq!(child.mm_id, new_mm);
+    let mut startup = Box::pin(fixture.state.receive_rpc(
+        Tid::from_raw(WORKER.as_raw()),
+        (
+            child.thread_logical_time.clone(),
+            new_mm,
+            GlobalRequest::StartNewThread(WORKER, LEADER, None, None),
+        ),
+    ));
+    for _ in 0..2 {
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap(),
+            before
+        );
+        assert!(
+            !fixture
+                .state
+                .global_time
+                .lock()
+                .unwrap()
+                .contains_thread(WORKER)
+        );
+        let sched = fixture.state.sched.lock().unwrap();
+        assert!(sched.transferred_exec_tid_requires_registration(WORKER));
+        assert!(!sched.next_turns.contains_key(&WORKER));
+        assert_eq!(sched.turn, 1);
+    }
+
+    // The authenticated parent registers the actual clone and then parks on
+    // ParentContinue. A higher child priority makes the next grant unambiguous.
+    let mut registration = Box::pin(fixture.state.receive_rpc(
+        Tid::from_raw(LEADER.as_raw()),
+        (
+            parent.thread.thread_logical_time.clone(),
+            new_mm,
+            GlobalRequest::CreateChildThread(
+                WORKER,
+                LEADER,
+                0,
+                Some(flags),
+                0,
+                None,
+                Some(DEFAULT_PRIORITY - 1),
+            ),
+        ),
+    ));
+    assert!(futures::poll!(&mut registration).is_pending());
+    {
+        let sched = fixture.state.sched.lock().unwrap();
+        assert!(!sched.transferred_exec_tid_requires_registration(WORKER));
+        assert!(sched.next_turns.contains_key(&WORKER));
+        assert!(sched.rpc_incarnation_matches(WORKER, new_mm));
+        assert!(!sched.rpc_incarnation_matches(WORKER, old_mm));
+        assert_eq!(sched.turn, 1);
+    }
+    assert!(
+        !fixture
+            .state
+            .global_time
+            .lock()
+            .unwrap()
+            .contains_thread(WORKER)
+    );
+    assert!(futures::poll!(&mut startup).is_pending());
+    assert!(futures::poll!(&mut startup).is_pending());
+    assert!(
+        fixture.state.sched.lock().unwrap().next_turns[&WORKER]
+            .req
+            .try_read()
+            .is_some()
+    );
+    let child_turn = crate::scheduler::do_a_turn_blocking(
+        fixture.state.sched.clone(),
+        fixture.state.global_time.clone(),
+        &Err(crate::scheduler::SkipTurn),
+    )
+    .await
+    .expect("registered reused newborn must receive a real grant");
+    assert_eq!(child_turn.tid, WORKER);
+    assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+    assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
+    let total = fixture.before_tail + LogicalTime::from_nanos(497);
+    assert_eq!(fixture.state.global_time.lock().unwrap().as_nanos(), total);
+    let allowed = fixture
+        .state
+        .receive_rpc(
+            Tid::from_raw(WORKER.as_raw()),
+            (
+                child.thread_logical_time.clone(),
+                new_mm,
+                GlobalRequest::GlobalTimeLowerBound,
+            ),
+        )
+        .await;
+    assert_eq!(allowed, (None, GlobalResponse::GlobalTimeLowerBound(total)));
+
+    let registered_clock =
+        serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
+    for request in [
+        GlobalRequest::StartNewThread(WORKER, LEADER, None, None),
+        GlobalRequest::GlobalTimeLowerBound,
+    ] {
+        let mut forged_time = child.thread_logical_time.clone();
+        forged_time.add_syscall_with_cost(999_999);
+        let mut stale = Box::pin(fixture.state.receive_rpc(
+            Tid::from_raw(WORKER.as_raw()),
+            (forged_time, old_mm, request),
+        ));
+        assert_eq!(
+            futures::poll!(&mut stale),
+            Poll::Ready((None, GlobalResponse::ThreadExited))
+        );
+        assert_eq!(
+            serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap(),
+            registered_clock
+        );
+        assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
+    }
+
+    // Complete both genuine owners so this test does not abandon the parent's
+    // parked registration future after observing the child's successful start.
+    consume(&fixture.state, &fixture.tool, WORKER, child).await;
+    let parent_turn = crate::scheduler::do_a_turn_blocking(
+        fixture.state.sched.clone(),
+        fixture.state.global_time.clone(),
+        &Err(crate::scheduler::SkipTurn),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parent_turn.tid, LEADER);
+    assert_eq!(
+        registration.await,
+        (None, GlobalResponse::CreateChildThread(None))
+    );
+    assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);
+    assert_eq!(fixture.state.global_time.lock().unwrap().as_nanos(), total);
+
+    for flags in [
+        CloneFlags::CLONE_VFORK,
+        CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+    ] {
+        reused_exec_worker_vfork_registration_requires_creation_mode(flags, false).await;
+    }
+    reused_exec_worker_vfork_registration_requires_creation_mode(CloneFlags::empty(), true).await;
+}
+
+async fn reused_exec_worker_vfork_registration_requires_creation_mode(
+    valid_flags: CloneFlags,
+    backend_serializes_fork_children: bool,
+) {
+    let fixture = Fixture::configured(true, backend_serializes_fork_children).await;
+    let mut parent = fixture.guest(Gate::None);
+    {
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut parent));
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        let turn = crate::scheduler::do_a_turn_blocking(
+            fixture.state.sched.clone(),
+            fixture.state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.tid, LEADER);
+        assert_eq!(reconnect.await, Ok(()));
+    }
+    let parent_mm = parent.thread.mm_id;
+    let child_mm = MmId::for_clone(
+        parent_mm,
+        WORKER,
+        valid_flags.contains(CloneFlags::CLONE_VM),
+    );
+    let child_time = parent.thread.thread_logical_time.clone_for_child();
+    let mut resources = Resources::new(LEADER);
+    resources.insert(
+        ResourceID::BlockingVfork(ExternalOpId::new(LEADER, 1)),
+        Permission::RW,
+    );
+    let mut blocking = Box::pin(fixture.state.receive_rpc(
+        Tid::from_raw(LEADER.as_raw()),
+        (
+            parent.thread.thread_logical_time.clone(),
+            parent_mm,
+            GlobalRequest::RequestResources(resources, LEADER),
+        ),
+    ));
+    assert!(futures::poll!(&mut blocking).is_pending());
+    let background = crate::scheduler::do_a_turn_blocking(
+        fixture.state.sched.clone(),
+        fixture.state.global_time.clone(),
+        &Err(crate::scheduler::SkipTurn),
+    )
+    .await;
+    assert!(background.is_err());
+    assert_eq!(
+        blocking.await,
+        (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
+    );
+    let before = serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
+    let before_total = fixture.state.global_time.lock().unwrap().as_nanos();
+    assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
+
+    // The parent/mm proof is genuinely valid here. Only the creation mode is
+    // wrong: ordinary clones cannot borrow a vfork grant, and a backend that
+    // serializes process forks does not thereby authorize thread clones.
+    let wrong_flags = if backend_serializes_fork_children {
+        CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM
+    } else {
+        valid_flags & !CloneFlags::CLONE_VFORK
+    };
+    let wrong_mm = MmId::for_clone(
+        parent_mm,
+        WORKER,
+        wrong_flags.contains(CloneFlags::CLONE_VM),
+    );
+    {
+        let sched = fixture.state.sched.lock().unwrap();
+        assert!(sched.pending_vfork_registration_matches(
+            LEADER,
+            LEADER,
+            WORKER,
+            wrong_mm,
+            wrong_flags.contains(CloneFlags::CLONE_VM),
+        ));
+        assert!(sched.transferred_exec_tid_requires_registration(WORKER));
+    }
+    let mut forged_time = child_time.clone();
+    forged_time.add_syscall_with_cost(999_999);
+    let rejected = fixture
+        .state
+        .receive_rpc(
+            Tid::from_raw(WORKER.as_raw()),
+            (
+                forged_time,
+                wrong_mm,
+                GlobalRequest::CreateVforkChildThread(
+                    LEADER,
+                    LEADER,
+                    WORKER,
+                    0,
+                    wrong_flags,
+                    libc::SIGCHLD,
+                    Some(DEFAULT_PRIORITY),
+                ),
+            ),
+        )
+        .await;
+    assert_eq!(rejected, (None, GlobalResponse::ThreadExited));
+    assert_eq!(
+        serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        !fixture
+            .state
+            .global_time
+            .lock()
+            .unwrap()
+            .contains_thread(WORKER)
+    );
+    {
+        let sched = fixture.state.sched.lock().unwrap();
+        assert!(sched.transferred_exec_tid_requires_registration(WORKER));
+        assert!(!sched.next_turns.contains_key(&WORKER));
+        assert_eq!(sched.turn, 2);
+        assert!(sched.pending_vfork_registration_matches(
+            LEADER,
+            LEADER,
+            WORKER,
+            child_mm,
+            valid_flags.contains(CloneFlags::CLONE_VM),
+        ));
+    }
+
+    // The same, still-unconsumed grant admits the valid raw-vfork mode or the
+    // configured serialized-process-fork mode, without double-counting ancestry.
+    let created = fixture
+        .state
+        .receive_rpc(
+            Tid::from_raw(WORKER.as_raw()),
+            (
+                child_time.clone(),
+                child_mm,
+                GlobalRequest::CreateVforkChildThread(
+                    LEADER,
+                    LEADER,
+                    WORKER,
+                    0,
+                    valid_flags,
+                    libc::SIGCHLD,
+                    Some(DEFAULT_PRIORITY),
+                ),
+            ),
+        )
+        .await;
+    assert_eq!(created, (None, GlobalResponse::CreateChildThread(None)));
+    assert_eq!(
+        fixture.state.global_time.lock().unwrap().as_nanos(),
+        before_total
+    );
+    assert_eq!(
+        fixture
+            .state
+            .global_time
+            .lock()
+            .unwrap()
+            .threads_time(WORKER),
+        child_time.as_nanos()
+    );
+    {
+        let sched = fixture.state.sched.lock().unwrap();
+        assert!(!sched.transferred_exec_tid_requires_registration(WORKER));
+        assert_eq!(sched.registered_process(WORKER), Some(WORKER));
+        assert!(sched.rpc_incarnation_matches(WORKER, child_mm));
+        assert!(!sched.pending_vfork_registration_matches(
+            LEADER,
+            LEADER,
+            WORKER,
+            child_mm,
+            valid_flags.contains(CloneFlags::CLONE_VM),
+        ));
+        assert_eq!(sched.turn, 2);
+    }
+    let mut startup = Box::pin(fixture.state.receive_rpc(
+        Tid::from_raw(WORKER.as_raw()),
+        (
+            child_time,
+            child_mm,
+            GlobalRequest::StartNewThread(WORKER, WORKER, None, None),
+        ),
+    ));
+    assert!(futures::poll!(&mut startup).is_pending());
+    assert!(futures::poll!(&mut startup).is_pending());
+    let turn = crate::scheduler::do_a_turn_blocking(
+        fixture.state.sched.clone(),
+        fixture.state.global_time.clone(),
+        &background,
+    )
+    .await
+    .expect("authorized reused vfork child must receive its first turn");
+    assert_eq!(turn.tid, WORKER);
+    assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+    assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);
+    assert_eq!(
+        fixture.state.global_time.lock().unwrap().as_nanos(),
+        before_total
+    );
 }

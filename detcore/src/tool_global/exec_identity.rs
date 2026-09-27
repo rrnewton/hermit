@@ -49,7 +49,8 @@ impl GlobalState {
             || !sched.next_turns.contains_key(&former)
             || (self.cfg.sequentialize_threads
                 && (sched.next_turns[&former].req.try_read().is_some()
-                    || sched.next_turns.contains_key(&current)))
+                    || (sched.next_turns.contains_key(&current)
+                        && !sched.exec_sibling_retirement_observed(current, process, prepared.mm))))
             || !self.global_time.lock().unwrap().contains_thread(former)
             || self
                 .completed_exec_transfers
@@ -112,12 +113,18 @@ impl GlobalState {
         time: DetTime,
         mm: MmId,
         mut thread: ThreadDeregistration,
+        signaled: bool,
     ) -> <Self as GlobalTool>::Response {
         let current = DetTid::from_raw(from.as_raw());
         let former = thread.dettid;
         let process = thread.detpid;
         let mut sched = self.lock_rpc_scheduler(true).await;
-        if current != process
+        // A surviving image cannot voluntarily exit before its post-exec
+        // callback binds the transferred state. Ptrace cancellation supplies
+        // a signal exit or a separately published backend failure. A pending
+        // exec record alone cannot authorize an injected ordinary exit(0).
+        if (!signaled && !sched.backend_failed())
+            || current != process
             || former == current
             || thread.mm != mm
             || sched.registered_process(former) != Some(process)
@@ -143,7 +150,9 @@ impl GlobalState {
                 || prepared.process != process
                 || prepared.mm.for_exec(process) != mm
                 || !sched.rpc_incarnation_matches(former, prepared.mm)
-                || (self.cfg.sequentialize_threads && sched.next_turns.contains_key(&current))
+                || (self.cfg.sequentialize_threads
+                    && sched.next_turns.contains_key(&current)
+                    && !sched.exec_sibling_retirement_observed(current, process, prepared.mm))
             {
                 return (None, GlobalResponse::RetireExec(false));
             }
@@ -157,7 +166,13 @@ impl GlobalState {
         if !self.global_time.lock().unwrap().contains_thread(owner) {
             return (None, GlobalResponse::RetireExec(false));
         }
-        pending.remove(&process);
+        if let Some(prepared) = pending.remove(&process) {
+            // The authenticated backend sender has already taken over the
+            // leader TID: kernel exec succeeded even if cancellation prevented
+            // the reconnect reply. Retire the complete proven-dead cohort,
+            // including peers whose physical cleanup callbacks arrive later.
+            sched.finish_exec_teardown(prepared.caller, process, prepared.mm, true);
+        }
         completed.remove(&process);
         self.global_time.lock().unwrap().update_global_time(
             owner,
@@ -218,9 +233,14 @@ pub(crate) async fn retire_exec<R: GlobalRPC<GlobalState>>(
     time: DetTime,
     rpc: &R,
     thread: ThreadDeregistration,
+    signaled: bool,
 ) -> Result<(), Errno> {
     let response = rpc
-        .send_rpc((time, thread.mm, GlobalRequest::RetireExec(thread)))
+        .send_rpc((
+            time,
+            thread.mm,
+            GlobalRequest::RetireExec { thread, signaled },
+        ))
         .await;
     if response == (None, GlobalResponse::RetireExec(true)) {
         Ok(())
