@@ -1520,7 +1520,9 @@ mod tests {
         let Error::Tool(error) = error else {
             panic!("post-commit allocation failure must not become guest errno");
         };
-        assert!(error.to_string().contains("after cursor commit"));
+        assert!(error.to_string().contains(
+            "RNG vector observation after output commit: cannot reserve digest payload:"
+        ));
         assert!(error.to_string().contains("digest payload"));
     }
 
