@@ -1694,10 +1694,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     stdio_by_raw_inode.insert(raw, det);
                 }
             }
-            let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)
-                .lines()
-                .filter_map(crate::procfs::mapping_header_identity)
-                .collect();
+            // Mint in maps-TEXT order (guest address order), not sorted raw
+            // order: a file first seen here gets the next deterministic inode,
+            // so the order must not depend on host inode numbering.
+            let raw_pairs = crate::procfs::mapping_identities_in_text_order(
+                &String::from_utf8_lossy(&contents),
+            );
             for (raw_dev, raw_inode) in raw_pairs {
                 let det_inode = match stdio_by_raw_inode.get(&raw_inode) {
                     Some(inode) => *inode,
@@ -5842,6 +5844,29 @@ mod procfs_wiring_guard {
             fdinfo_capture < parse,
             "MISSING MECHANISM: the fdinfo mnt_id capture parses mountinfo before \
              dropping host seed rows"
+        );
+    }
+
+    #[test]
+    fn maps_identities_are_minted_in_text_order() {
+        // `tool_global::tests::maps_identities_are_minted_in_text_order_not_raw_order`
+        // proves the helper's order is host-independent. This binds the
+        // snapshot initialiser to that helper, so reintroducing a local
+        // sorted-raw collection here cannot pass silently.
+        let body = handler_body("initialize_procfs_snapshot");
+        assert!(
+            body.len() > 200 && body.contains("needs_mapping_identities"),
+            "guard extractor did not find a real body for `initialize_procfs_snapshot` \
+             (len {}), so the order assertion would be vacuous",
+            body.len()
+        );
+        assert!(
+            body.contains("crate::procfs::mapping_identities_in_text_order("),
+            "MISSING MECHANISM: `initialize_procfs_snapshot` no longer mints /proc/*/maps \
+             identities through `mapping_identities_in_text_order`. Minting in any \
+             host-derived order (for example a sorted set of raw (dev, inode) pairs) lets \
+             host inode numbering decide which newly seen file gets the lower \
+             deterministic inode."
         );
     }
 
