@@ -245,7 +245,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
-    ("test.detcore_unit", 807),
+    ("test.detcore_unit", 825),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -257,7 +257,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
-    ("test.cli", 88),
+    ("test.cli", 89),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -268,7 +268,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("privileged-test.pmu_buck_chaos_cases", 6),
     // One exec timer regression extends 33 KVM cases plus the setup control.
     ("privileged-test.cli_kvm", 35),
-    ("test.cli_on_host", 88),
+    ("test.cli_on_host", 89),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 35),
@@ -279,7 +279,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 807),
+    ("test.detcore_unit_on_host", 825),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 753),

@@ -33,6 +33,9 @@ mod liteinst_runtime;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[path = "common/nonleader_exec.rs"]
+mod nonleader_exec;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -5008,6 +5011,11 @@ fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
         "expected a determinism verdict from --verify:\n{}",
         stderr(&output),
     );
+}
+
+#[test]
+fn run_ptrace_nonleader_exec_preserves_identity_and_time() {
+    nonleader_exec::run();
 }
 
 /// `--log-file` must resolve on the HOST, exactly like a shell redirect.
