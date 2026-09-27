@@ -622,6 +622,85 @@ fn resource_syscalls_are_deterministic_across_five_runs() {
     }
 }
 
+#[test]
+fn resource_syscalls_are_independent_of_epoch_fraction() {
+    let _guard = hermit_run_lock();
+    let workload = &workloads().resource_determinism;
+    let mut baseline = None;
+
+    for epoch in [
+        "2026-01-01T00:00:00.000001000Z",
+        "2026-01-01T00:00:00.999999000Z",
+    ] {
+        for run in 1..=2 {
+            let mut command = hermit_command("minimal");
+            command
+                .args(["--strict", "--seed=0", "--epoch", epoch, "--"])
+                .arg(&workload.path);
+            let output = command_output(
+                command,
+                &format!("resource determinism epoch {epoch} run {run}"),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("sysinfo memory matches configured memory"),
+                "the resource workload did not complete its sysinfo checks"
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(
+                    &output.stdout, expected,
+                    "complete resource output changed at epoch {epoch} run {run}"
+                );
+            } else {
+                baseline = Some(output.stdout);
+            }
+        }
+    }
+}
+
+#[test]
+fn sysinfo_uptime_follows_thread_join_and_exec() {
+    let _guard = hermit_run_lock();
+    let workload = workloads()
+        .default_only
+        .iter()
+        .find(|workload| workload.name == "sysinfo_uptime")
+        .expect("sysinfo_uptime workload must be compiled");
+    let mut baseline = None;
+    for run in 1..=2 {
+        let mut command = hermit_command("minimal");
+        command
+            .args([
+                "--strict",
+                "--seed=0",
+                "--epoch=2026-01-01T00:00:00.000001000Z",
+                "--",
+            ])
+            .arg(&workload.path)
+            .arg("--observe-thread-exec");
+        let output = command_output(command, &format!("sysinfo thread/exec run {run}"));
+        let stdout = String::from_utf8(output.stdout).expect("sysinfo output should be UTF-8");
+        for expected in [
+            "sysinfo observation parent before thread uptime=",
+            "sysinfo observation worker before work uptime=",
+            "sysinfo observation worker after work uptime=",
+            "sysinfo observation parent after join uptime=",
+            "sysinfo observation after exec uptime=",
+            "sysinfo thread join and exec continuity checked",
+        ] {
+            assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
+        }
+        if let Some(expected) = &baseline {
+            assert_eq!(
+                &stdout, expected,
+                "complete sysinfo thread/exec output changed on run {run}"
+            );
+        } else {
+            baseline = Some(stdout);
+        }
+    }
+}
+
 fn run_default_workload(name: &str) {
     let _guard = hermit_run_lock();
     let workload = workloads()
