@@ -674,6 +674,9 @@ mod event_tests {
     #[derive(Default)]
     struct MemoryReads {
         imported_entries: usize,
+        import_error: Option<(usize, Errno)>,
+        import_failed: bool,
+        after_import_error: Vec<&'static str>,
         observer_reads: Vec<(usize, usize)>,
         digest_error: Option<Errno>,
         user_copy_audit: bool,
@@ -727,6 +730,9 @@ mod event_tests {
             let (written, outcome) = {
                 let mut audit = self.1.lock().unwrap();
                 audit.copy_lengths.push(buf.len());
+                if audit.import_failed {
+                    audit.after_import_error.push("user-write");
+                }
                 audit
                     .copy_actions
                     .pop_front()
@@ -768,6 +774,9 @@ mod event_tests {
             let start = addr.into().as_raw();
             let mut reads = self.1.lock().unwrap();
             reads.observer_reads.push((start, buf.len()));
+            if reads.import_failed {
+                reads.after_import_error.push("memory-read");
+            }
             if reads.user_copy_audit && reads.copy_done {
                 reads.after_copy.push("memory-read");
             }
@@ -790,6 +799,15 @@ mod event_tests {
                 reads.imported_entries += 1;
                 if reads.user_copy_audit && reads.copy_done {
                     reads.after_copy.push("user-read");
+                }
+                if reads.import_failed {
+                    reads.after_import_error.push("user-read");
+                }
+                if let Some((attempt, error)) = reads.import_error
+                    && reads.imported_entries == attempt
+                {
+                    reads.import_failed = true;
+                    return Err(error);
                 }
             }
             self.copy_read(addr.into().as_raw(), buf)
@@ -829,6 +847,9 @@ mod event_tests {
             let mut audit = self.memory.1.lock().unwrap();
             if audit.user_copy_audit && audit.copy_done {
                 audit.after_copy.push(operation);
+            }
+            if audit.import_failed {
+                audit.after_import_error.push(operation);
             }
             audit.user_copy_audit
         }

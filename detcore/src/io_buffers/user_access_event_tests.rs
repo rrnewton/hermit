@@ -175,6 +175,93 @@ mod user_access_event_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn central_random_readv_import_failure_stops_continuation_and_observers() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for error in [Errno::EPERM, Errno::EIO, Errno::ENOMEM, Errno::ENOSYS] {
+                for attempt in [1, 2] {
+                    let logs = AllInfo::default();
+                    let _subscriber = tracing::subscriber::set_default(logs.clone());
+                    assert!(tracing::enabled!(Level::INFO));
+                    let (tool, mut guest, syscall, alias) = configured(Call::Readv, vec![]);
+                    guest.memory.1.lock().unwrap().import_error = Some((attempt, error));
+                    let before = guest.memory.0.lock().unwrap().clone();
+                    let result = tool.handle_syscall_event(&mut guest, syscall).await;
+                    let Err(Error::Tool(failure)) = result else {
+                        panic!("backend import failure became a guest result: {result:?}");
+                    };
+                    assert_eq!(
+                        failure.downcast_ref::<crate::random::RandomCopyFailure>().unwrap().errno(),
+                        error
+                    );
+                    assert_eq!(*guest.memory.0.lock().unwrap(), before);
+                    bytes_and_state(&guest, Call::Readv, 0);
+                    assert_eq!(alias.random_device_offset(), 7);
+                    let audit = guest.memory.1.lock().unwrap();
+                    assert_eq!(audit.imported_entries, attempt);
+                    assert!(audit.import_failed);
+                    assert!(audit.copy_lengths.is_empty());
+                    assert!(audit.observer_reads.is_empty());
+                    assert_eq!(audit.after_import_error, ["release"]);
+                    assert_eq!(*guest.releases.lock().unwrap(), 1);
+                    assert!(guest.polls.lock().unwrap().is_empty());
+                    assert!(guest.injected_iovecs.is_empty());
+                    assert_eq!(guest.injected_zero_reads, 0);
+                    assert!(logs.0.lock().unwrap().iter().all(|message| {
+                        !message.contains("finish syscall")
+                            && !message.contains("[registers]")
+                            && !message.contains("[memory]")
+                            && !message.contains("[iobuf]")
+                    }));
+                    assert_eq!(guest.thread.stats.regs_sample_index, 0);
+                    assert_eq!(guest.thread.last_rcb_timer, None);
+                }
+            }
+        })
+        .await
+        .expect("central import-failure cases exceeded original deadline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn central_random_readv_import_guest_fault_keeps_observers_and_timer() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            for attempt in [1, 2] {
+                let logs = AllInfo::default();
+                let _subscriber = tracing::subscriber::set_default(logs.clone());
+                assert!(tracing::enabled!(Level::INFO));
+                let (tool, mut guest, syscall, alias) = configured(Call::Readv, vec![]);
+                guest.memory.1.lock().unwrap().import_error = Some((attempt, Errno::EFAULT));
+                let before = guest.memory.0.lock().unwrap().clone();
+                let result = tool.handle_syscall_event(&mut guest, syscall).await;
+                assert!(matches!(result, Err(Error::Errno(Errno::EFAULT))));
+                assert_eq!(*guest.memory.0.lock().unwrap(), before);
+                bytes_and_state(&guest, Call::Readv, 0);
+                assert_eq!(alias.random_device_offset(), 7);
+                let audit = guest.memory.1.lock().unwrap();
+                assert_eq!(audit.imported_entries, attempt);
+                assert!(audit.import_failed);
+                assert!(audit.copy_lengths.is_empty());
+                assert_eq!(audit.observer_reads, [(FIRST_DEST, 8), (RETRY_DEST, 8)]);
+                for operation in ["release", "regs", "memory-regions", "memory-read", "timer", "set-regs"] {
+                    assert!(audit.after_import_error.contains(&operation));
+                }
+                assert!(!audit.after_import_error.contains(&"user-read"));
+                assert_eq!(*guest.releases.lock().unwrap(), 1);
+                assert!(guest.injected_iovecs.is_empty());
+                assert_eq!(guest.injected_zero_reads, 0);
+                assert_eq!(guest.thread.stats.regs_sample_index, 1);
+                assert!(guest.thread.last_rcb_timer.is_some());
+                let messages = logs.0.lock().unwrap();
+                assert_eq!(messages.iter().filter(|m| m.contains("finish syscall")).count(), 1);
+                assert_eq!(messages.iter().filter(|m| m.contains("[registers]")).count(), 1);
+                assert_eq!(messages.iter().filter(|m| m.contains("[memory]")).count(), 2);
+                assert!(!messages.iter().any(|m| m.contains("[iobuf]")));
+            }
+        })
+        .await
+        .expect("central import guest faults exceeded original deadline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn central_random_success_and_guest_fault_keep_observers_and_timer() {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             for call in [Call::Getrandom, Call::Read, Call::Readv] {
