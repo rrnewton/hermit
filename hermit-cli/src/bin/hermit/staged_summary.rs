@@ -49,6 +49,20 @@ pub(crate) fn private_output(directory: &Path) -> Result<File, Error> {
     Ok(file)
 }
 
+/// The controller-local proc-fd path through which a library that accepts
+/// only a path writes into a [`private_output`]. Construct it inside the
+/// container process that performs the write; it names no directory entry, so
+/// a guest listing any directory cannot see the file.
+pub(crate) fn private_output_writer(file: &File) -> Result<PathBuf, Error> {
+    writer_path(file)
+}
+
+/// Read back a [`private_output`] that this process kept open across the run,
+/// with the same size bound and identity checks as captured publication.
+pub(crate) fn read_private_output(file: &File) -> Result<Vec<u8>, Error> {
+    read_output(file, MAX_SUMMARY_BYTES, &mut NativeIo)
+}
+
 /// Run the library with a controller-local proc-fd path, then publish in that
 /// same namespace before returning success to the parent's capture.finish.
 pub(crate) fn with_published_summary<T>(

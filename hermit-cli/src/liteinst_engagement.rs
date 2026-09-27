@@ -14,10 +14,13 @@
 //! when a sink is installed and writes them to it after the tracer finishes.
 //! Collection is host-side bookkeeping in the tracer and does not change what
 //! the guest observes.
+//!
+//! The sink is an open file, not a path, so the CLI can hand over an unlinked
+//! file that no guest can list. It is written at offset zero, independent of
+//! the descriptor's shared file offset.
 
-use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 
 use anyhow::Context;
@@ -26,7 +29,7 @@ use detcore_model::backend_engagement::LiteinstHostHybridCounters;
 use reverie_liteinst::LiteinstBackendStatsSource;
 use reverie_liteinst::LiteinstDispatchPath;
 
-static SINK: Mutex<Option<PathBuf>> = Mutex::new(None);
+static SINK: Mutex<Option<File>> = Mutex::new(None);
 
 /// While alive, LiteInst runs started by this process publish their counters to
 /// one file. At most one sink may be installed at a time.
@@ -37,16 +40,13 @@ pub struct LiteinstCountersSink {
 }
 
 impl LiteinstCountersSink {
-    /// Install `path` as the destination for the next LiteInst run's counters.
-    pub fn install(path: PathBuf) -> Result<Self, Error> {
+    /// Install `file` as the destination for the next LiteInst run's counters.
+    pub fn install(file: File) -> Result<Self, Error> {
         let mut sink = SINK.lock().unwrap();
-        if let Some(existing) = sink.as_ref() {
-            anyhow::bail!(
-                "a LiteInst counters sink is already installed at {}",
-                existing.display()
-            );
+        if sink.is_some() {
+            anyhow::bail!("a LiteInst counters sink is already installed");
         }
-        *sink = Some(path);
+        *sink = Some(file);
         Ok(Self { _private: () })
     }
 }
@@ -57,9 +57,16 @@ impl Drop for LiteinstCountersSink {
     }
 }
 
-/// The installed sink, if any.
-pub(crate) fn requested_sink() -> Option<PathBuf> {
-    SINK.lock().unwrap().clone()
+/// The installed sink, if any, as a separate descriptor for the same file.
+pub(crate) fn requested_sink() -> Result<Option<File>, Error> {
+    SINK.lock()
+        .unwrap()
+        .as_ref()
+        .map(|file| {
+            file.try_clone()
+                .context("duplicating the LiteInst counters sink")
+        })
+        .transpose()
 }
 
 /// In-guest dispatch paths. The host hybrid never populates them: each one
@@ -112,11 +119,13 @@ pub(crate) fn host_hybrid_counters(
     })
 }
 
-/// Write the counters of a finished run to `path`.
-pub(crate) fn publish(path: &Path, source: &LiteinstBackendStatsSource) -> Result<(), Error> {
+/// Write the counters of a finished run to `sink`, replacing its contents.
+pub(crate) fn publish(sink: &File, source: &LiteinstBackendStatsSource) -> Result<(), Error> {
     let counters = host_hybrid_counters(source)?;
     let mut bytes = serde_json::to_vec(&counters)?;
     bytes.push(b'\n');
-    fs::write(path, bytes)
-        .with_context(|| format!("publishing LiteInst counters to {}", path.display()))
+    sink.set_len(0)
+        .context("truncating the LiteInst counters sink")?;
+    sink.write_all_at(&bytes, 0)
+        .context("publishing LiteInst counters")
 }
