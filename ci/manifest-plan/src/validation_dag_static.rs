@@ -233,7 +233,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Four process-retirement fence controls and four uncontrolled-retirement
     // controls retain all 783 prior identities.
     // Three captured-clock routing controls retain all 797 prior identities.
-    ("test.detcore_unit", 800),
+    // The futex-deadline clock-refusal control retains all 800 prior identities.
+    ("test.detcore_unit", 801),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -265,7 +266,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 800),
+    ("test.detcore_unit_on_host", 801),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.recorded_clocks_on_host", 6),
