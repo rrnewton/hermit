@@ -18,6 +18,9 @@ mod kvm_cancellation;
 #[path = "common/kvm_itimer.rs"]
 mod kvm_itimer;
 
+#[path = "common/kvm_nonleader_exec.rs"]
+mod kvm_nonleader_exec;
+
 #[path = "common/kvm_orphan_reparenting.rs"]
 mod kvm_orphan_reparenting;
 
@@ -5021,6 +5024,11 @@ fn run_ptrace_nonleader_exec_preserves_identity_and_time() {
 #[test]
 fn run_ptrace_nonleader_exec_exit_only() {
     nonleader_exec::run_exit_only();
+}
+
+#[test]
+fn run_kvm_nonleader_exec_is_policy_refusal() {
+    kvm_nonleader_exec::run();
 }
 
 /// `--log-file` must resolve on the HOST, exactly like a shell redirect.
