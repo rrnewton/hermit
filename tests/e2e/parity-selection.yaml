@@ -47,6 +47,8 @@ cells:
     backends: [kvm, liteinst]
   - test: backend-parity-c/dup-shared-offset
     backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/environment-and-workdir
+    backends: [liteinst]
   - test: backend-parity-c/epoll-pwait2
     backends: [liteinst]
   - test: backend-parity-c/epoll-readiness
@@ -149,6 +151,8 @@ cells:
     backends: [kvm, liteinst]
   - test: backend-parity-c/pipe-ipc
     backends: [kvm, liteinst]
+  - test: backend-parity-c/pipe-multiwriter-ordering
+    backends: [liteinst]
   - test: backend-parity-c/pipe2-flags
     backends: [kvm, liteinst]
   - test: backend-parity-c/poll-readiness
