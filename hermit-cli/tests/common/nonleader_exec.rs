@@ -10,8 +10,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use detcore::Digest;
+use detcore::preemptions::PreemptionRecord;
+use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::RecordEnvelopeReport;
+use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 use regex::Regex;
 
@@ -382,4 +385,329 @@ fn run_fixture(scenario: Scenario) {
         previous_stdout = Some(output);
         eprintln!("ptrace nonleader exec pair {pair}: two full canonical executions");
     }
+}
+
+const PREEMPTION_REFUSAL: &str =
+    "unsupported: preemption recording and replay across nonleader exec";
+
+fn preemption_artifact_case(
+    directory: &Path,
+    guest: &Path,
+    target: &Path,
+    artifact_option: &str,
+    refused: bool,
+    expected_identity: Option<(&str, &str)>,
+    timeout: Duration,
+) -> String {
+    let logs = directory.join("verify-logs");
+    fs::create_dir_all(&logs).unwrap();
+    let report_path = directory.join("verification.json");
+    let args = [
+        "--log=trace",
+        "run",
+        "--backend=ptrace",
+        "--base-env=minimal",
+        "--tmp=/tmp",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00.123456789+00:00",
+        "--max-timeslice=1000000",
+        // Earlier PMU notification, never permission to deliver past target.
+        "--skid-margin=3072",
+        "--chaos",
+        "--seed=2",
+        artifact_option,
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_path.to_str().unwrap(),
+        "--keep-logs",
+        "--verify-log-dir",
+        logs.to_str().unwrap(),
+        "--",
+        guest.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ];
+    let mut command = super::hermit_command(&args);
+    command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+    let status = bounded_command_with_timeout(&mut command, directory, timeout);
+    let stderr = String::from_utf8(bounded_read(&directory.join("stderr"), 16 * MIB)).unwrap();
+    let stdout = String::from_utf8(bounded_read(&directory.join("stdout"), MIB)).unwrap();
+    let report = VerificationReport::from_current_json_slice(&bounded_read(&report_path, MIB))
+        .expect("complete current typed verification receipt");
+    if refused {
+        // EXIT-CLASS: hermit
+        assert_eq!(status.code(), Some(HERMIT_POLICY_REFUSAL_EXIT), "{stderr}");
+        assert!(stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"));
+        assert_eq!(report.verdict, Verdict::NoResult);
+        assert!(report.guest_exit_code.is_none());
+        assert!(report.guest_signal.is_none());
+        assert!(!report.verified);
+        assert!(!report.bitwise_parity);
+        assert!(report.compared_outputs.is_none());
+        assert!(report.compared_log_messages.is_none());
+        assert!(report.require_canonical_match().is_err());
+        assert!(
+            stdout.is_empty(),
+            "verification does not publish rejected output"
+        );
+    } else {
+        // EXIT-CLASS: guest
+        assert_eq!(status.code(), Some(0), "{stderr}");
+        report.require_canonical_match().unwrap();
+        report.require_exact_output_match().unwrap();
+        assert_eq!(report.guest_exit_code, Some(0));
+        assert!(report.guest_signal.is_none());
+        assert!(stdout.ends_with("failed-exec-preserved\nfailed-exec-control-ok\n"));
+        let counts = report.compared_log_messages.as_ref().unwrap();
+        assert_eq!(counts.left, counts.right);
+        for operand in [
+            &report.compared_outputs.as_ref().unwrap().left,
+            &report.compared_outputs.as_ref().unwrap().right,
+        ] {
+            assert_eq!(operand.exit_code, Some(0));
+            assert!(operand.signal.is_none());
+            assert_eq!(operand.stdout_bytes, stdout.len() as u64);
+            assert_eq!(
+                operand.stdout_sha256,
+                Digest::new(stdout.as_bytes()).to_string()
+            );
+            assert_eq!(operand.stderr_bytes, 0);
+        }
+    }
+    assert!(!stdout.contains("replacement-image-ran"));
+    assert!(
+        !Path::new(&format!("{}.ran", target.display())).exists(),
+        "replacement code must not run, even when policy shutdown discards captured stdout"
+    );
+    let identity = Regex::new(r"(?m)^prefix sample=0 pid=(\d+) worker=(\d+) nanos=").unwrap();
+    let identity = identity.captures(&stdout);
+    let (leader, worker) = if refused {
+        expected_identity.expect("refusal must use the positive control's process and worker")
+    } else {
+        let identity = identity
+            .as_ref()
+            .expect("worker completed the shared prefix");
+        let actual = (&identity[1], &identity[2]);
+        if let Some(expected) = expected_identity {
+            assert_eq!(actual, expected);
+        }
+        actual
+    };
+    let mut diagnostic = stderr.contains(PREEMPTION_REFUSAL);
+    for prefix in ["run1_log_", "run2_log_"] {
+        let paths: Vec<_> = fs::read_dir(&logs)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(prefix)
+            })
+            .collect();
+        let expected = usize::from(!refused || prefix == "run1_log_");
+        assert_eq!(
+            paths.len(),
+            expected,
+            "refusal cannot produce a second verified run"
+        );
+        for path in paths {
+            let log = String::from_utf8(bounded_read(&path, 64 * MIB)).unwrap();
+            let exec = log
+                .find(&format!(
+                    "[detcore, dtid {worker}] inbound syscall: execve("
+                ))
+                .expect("the identified worker attempted the same exec path");
+            if refused {
+                assert!(
+                    !log[exec..].contains(&format!("[detcore, dtid {leader}] inbound syscall:")),
+                    "the replacement must not enter ordinary syscall handling"
+                );
+            }
+            assert!(
+                log[..exec].contains(&format!(
+                    "[detcore, dtid {worker}] inbound timer preemption event"
+                )),
+                "the recorded and replayed prefix contains actual PMU preemption"
+            );
+            if let Some(path) = artifact_option.strip_prefix("--replay-preemptions-from=") {
+                let history: PreemptionRecord =
+                    serde_json::from_slice(&bounded_read(Path::new(path), 4 * MIB)).unwrap();
+                history.validate().unwrap();
+                let (_, history) = history
+                    .extract_all()
+                    .into_iter()
+                    .find(|(tid, _)| tid.to_string() == worker)
+                    .expect("replay contains the actual worker");
+                let mut expected = history.into_iter();
+                let consumed: Vec<_> = log[..exec]
+                    .lines()
+                    .filter(|line| {
+                        line.contains(&format!("[dtid {worker}] next timeslice (T"))
+                            && line.contains("set by recording to ")
+                    })
+                    .collect();
+                assert!(
+                    !consumed.is_empty(),
+                    "replay must actually consume worker history"
+                );
+                for line in consumed {
+                    let (deadline, priority, rcbs) = expected
+                        .next_with_rcbs()
+                        .expect("each consumed boundary belongs to the recording");
+                    assert!(rcbs.is_some(), "the recording contains exact PMU targets");
+                    assert!(
+                        line.contains(&format!("set by recording to {deadline:?} ")),
+                        "{line}"
+                    );
+                    assert!(line.ends_with(&format!(", priority {priority}")), "{line}");
+                }
+            }
+            diagnostic |= log.contains(PREEMPTION_REFUSAL);
+        }
+    }
+    assert_eq!(
+        diagnostic, refused,
+        "specific transfer refusal only on successful exec"
+    );
+    stdout
+}
+
+pub(super) fn run_preemption_artifacts() {
+    let _lock = super::hermit_run_guard();
+    let start = Instant::now();
+    let remaining = || {
+        Duration::from_secs(55)
+            .checked_sub(start.elapsed())
+            .expect("record/replay controls must fit the existing 57-second budget")
+    };
+    fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let root = tempfile::Builder::new()
+        .prefix("ptrace-nonleader-exec-preemption-artifacts-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap()
+        .keep();
+    eprintln!("nonleader exec preemption artifacts: {}", root.display());
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nonleader_exec_preemptions.c");
+    fs::copy(&fixture, root.join("guest.c")).unwrap();
+    let guest = root.join("program");
+    let status = bounded_command_with_timeout(
+        Command::new("cc")
+            .args([
+                "-std=gnu11",
+                "-O0",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+            ])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest),
+        &root.join("compile"),
+        remaining(),
+    );
+    assert!(status.success(), "fixture compilation");
+    let target = root.join("replacement");
+    assert!(!target.exists());
+    let recording = root.join("failed-exec-preemptions.json");
+    let record_option = format!("--record-preemptions-to={}", recording.display());
+    let replay_option = format!("--replay-preemptions-from={}", recording.display());
+    let recorded_stdout = preemption_artifact_case(
+        &root.join("record-failed-exec"),
+        &guest,
+        &target,
+        &record_option,
+        false,
+        None,
+        remaining(),
+    );
+    let recorded_bytes = bounded_read(&recording, 4 * MIB);
+    let history: PreemptionRecord = serde_json::from_slice(&recorded_bytes).unwrap();
+    history
+        .validate()
+        .expect("real completed recording is well formed");
+    let identity = Regex::new(r"(?m)^prefix sample=0 pid=(\d+) worker=(\d+) nanos=").unwrap();
+    let identity = identity.captures(&recorded_stdout).unwrap();
+    let worker = &identity[2];
+    let expected_identity = Some((&identity[1], worker));
+    assert!(
+        history
+            .as_vecs()
+            .iter()
+            .any(|(tid, points)| { tid.to_string() == worker && points.len() > 1 }),
+        "the actual exec worker has a nonempty recorded preemption history"
+    );
+    let replayed_stdout = preemption_artifact_case(
+        &root.join("replay-failed-exec"),
+        &guest,
+        &target,
+        &replay_option,
+        false,
+        expected_identity,
+        remaining(),
+    );
+    assert_eq!(
+        recorded_stdout, replayed_stdout,
+        "full prefix clocks survive replay"
+    );
+
+    // This is an intentional filesystem-compatibility negative: the exact
+    // recorded prefix now reaches successful exec at the same pathname/argv.
+    // It must refuse; it is not a claim of parity across changed filesystem state.
+    fs::copy(&guest, &target).unwrap();
+    let marker = root.join("replacement.ran");
+    let native = root.join("native-replacement-marker");
+    let status = bounded_command_with_timeout(
+        Command::new(&target).args(["replacement", "image"]),
+        &native,
+        remaining(),
+    );
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(bounded_read(&marker, 1), b"1");
+    assert_eq!(
+        bounded_read(&native.join("stdout"), MIB),
+        b"replacement-image-ran\n"
+    );
+    fs::remove_file(&marker).unwrap();
+    preemption_artifact_case(
+        &root.join("refuse-replay-transfer"),
+        &guest,
+        &target,
+        &replay_option,
+        true,
+        expected_identity,
+        remaining(),
+    );
+    let refused_recording = root.join("refused-preemptions.json");
+    let option = format!("--record-preemptions-to={}", refused_recording.display());
+    preemption_artifact_case(
+        &root.join("refuse-record-transfer"),
+        &guest,
+        &target,
+        &option,
+        true,
+        expected_identity,
+        remaining(),
+    );
+    assert!(
+        !refused_recording.exists(),
+        "refused transfer cannot publish a replay artifact"
+    );
+    preemption_artifact_case(
+        &root.join("refuse-memory-record-transfer"),
+        &guest,
+        &target,
+        "--record-preemptions",
+        true,
+        expected_identity,
+        remaining(),
+    );
+    assert_eq!(
+        bounded_read(&recording, 4 * MIB),
+        recorded_bytes,
+        "replay retains its input"
+    );
 }

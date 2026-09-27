@@ -5037,6 +5037,11 @@ fn run_ptrace_nonleader_exec_displaces_runnable_leader() {
 }
 
 #[test]
+fn run_ptrace_nonleader_exec_refuses_preemption_artifacts() {
+    nonleader_exec::run_preemption_artifacts();
+}
+
+#[test]
 fn run_kvm_nonleader_exec_is_policy_refusal() {
     kvm_nonleader_exec::run();
 }
