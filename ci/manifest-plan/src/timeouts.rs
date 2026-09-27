@@ -93,9 +93,10 @@ pub const LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT: usize =
 /// independently audited. The author base's one-commit sysinfo uptime change is
 /// disclosed in the dated qualification report with its current-source screen.
 /// The calibration was measured at 19553a64 and committed on the author base
-/// b63af4583a. The branch is now based on main bffdf33788, which differs from
-/// the author base by the KVM process-retirement fence (detcore scheduler and
-/// tool_global) and the Reverie pin move b0ede531 -> a1d07619; that delta is
+/// b63af4583a. The branch is now based on main e63236584625, which differs
+/// from the author base by the KVM process-retirement fence (detcore scheduler
+/// and tool_global) and the Reverie pin moves b0ede531 -> a1d07619 -> 6297f715
+/// (reverie-kvm and one default no-op GlobalTool callback); that delta is
 /// disclosed in the report and was not measured with LiteInst.
 pub const LITEINST_2026_09_27_EVIDENCE_SHA: &str = "19553a64308ca123bbde7cc3d7720e0aa72e795a";
 pub const LITEINST_2026_09_27_EVIDENCE_DETCORE_TREE: &str =
