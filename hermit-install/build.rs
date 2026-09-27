@@ -125,10 +125,21 @@ fn stage_sabre(resources: &Path, expected_reverie_revision: &str) {
             .args(["rev-parse", "HEAD"]),
         "read the bundled SaBRe source's Reverie revision",
     );
-    assert_eq!(
-        revision, expected_reverie_revision,
-        "bundled SaBRe does not match the selected Reverie revision"
-    );
+    // ab1 A/B ONLY (local commit, never pushed): Cargo.toml [patch]es every
+    // Reverie crate to the unmerged ERESTART* fix 2befc2ca while detcore's
+    // recorded dependency rev stays b0ede531, so the bundled SaBRe source is
+    // the 2befc2ca checkout. Accept exactly that one revision, loudly.
+    const AB1_PATCHED_REVERIE: &str = "2befc2ca278ded82c3ced965b2df1d740088f10b";
+    if revision == AB1_PATCHED_REVERIE {
+        println!(
+            "cargo:warning=AB1 A/B LOCAL COMMIT: bundled SaBRe is from the [patch]ed Reverie {revision}, recorded pin {expected_reverie_revision}"
+        );
+    } else {
+        assert_eq!(
+            revision, expected_reverie_revision,
+            "bundled SaBRe does not match the selected Reverie revision"
+        );
+    }
     copy_file(
         reverie_sabre::bundled_sabre_path(),
         &resources.join("sabre"),
