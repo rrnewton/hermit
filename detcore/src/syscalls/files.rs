@@ -1288,7 +1288,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Read,
     ) -> Result<(), Error> {
         // Only `/proc/stat` renders the boot instant (`btime`), and an uptime
-        // offset above `i64::MAX` leaves that instant without a representation.
+        // offset more than 2^63 seconds beyond the epoch's whole seconds puts
+        // that instant below `i64::MIN`, outside the kernel's `time64_t`.
         // Resolve it before the host snapshot, so such a read fails with
         // `EOVERFLOW` without touching the host descriptor or the guest buffer,
         // as a failed Linux read leaves the file offset where it was. Every
@@ -4890,8 +4891,9 @@ mod test {
 #[cfg(test)]
 mod procfs_boot_time_range {
     //! Only `/proc/stat` consumes the virtual boot instant (`btime`), so only
-    //! `/proc/stat` may fail when an uptime offset leaves that instant without an
-    //! `i64` representation.
+    //! `/proc/stat` may fail when an uptime offset puts that instant below
+    //! `i64::MIN`, outside the kernel's `time64_t`: that is, when the offset
+    //! exceeds the epoch's whole seconds by more than 2^63.
     //!
     //! These tests drive the production read path -- `handle_read` ->
     //! `initialize_procfs_snapshot` -> `snapshot_procfs` -> `ProcfsFile::initialize`
@@ -4927,8 +4929,21 @@ mod procfs_boot_time_range {
     /// Fills the guest buffer before each read, so a test can tell whether any
     /// byte was written to it.
     const UNTOUCHED: u8 = 0xa5;
-    /// The smallest offset whose boot instant has no `i64` representation.
-    const UNREPRESENTABLE_OFFSET: u64 = i64::MAX as u64 + 1;
+    /// `2026-01-01T00:00:00Z`, the epoch pinned by `test_config`, in whole
+    /// seconds since the Unix epoch.
+    const EPOCH_SECONDS: u64 = 1_767_225_600;
+    /// The largest offset whose boot instant is representable: the instant is
+    /// `EPOCH_SECONDS - LAST_REPRESENTABLE_OFFSET = -2^63 = i64::MIN`.
+    /// 1_767_225_600 + 9_223_372_036_854_775_808 = 9_223_372_038_622_001_408.
+    const LAST_REPRESENTABLE_OFFSET: u64 = EPOCH_SECONDS + (1 << 63);
+    /// The smallest offset whose boot instant lies below `i64::MIN`:
+    /// 9_223_372_038_622_001_409.
+    const UNREPRESENTABLE_OFFSET: u64 = LAST_REPRESENTABLE_OFFSET + 1;
+    // `/proc/uptime` reports the offset plus the whole seconds elapsed on the
+    // logical clock. A `LogicalTime` holds at most `u64::MAX / 10^9` whole
+    // seconds, so neither that sum nor the expectation built from it below can
+    // overflow at this offset.
+    const _: () = assert!(u64::MAX - UNREPRESENTABLE_OFFSET > u64::MAX / 1_000_000_000);
     /// `2026-01-01T00:00:00Z`, the epoch pinned by `test_config`, less the
     /// default 120-second uptime offset.
     const DEFAULT_BTIME: &str = "\nbtime 1767225480\n";
@@ -5220,5 +5235,35 @@ mod procfs_boot_time_range {
         let text = rendered.result.unwrap();
         assert!(text.contains(DEFAULT_BTIME), "{text:?}");
         assert!(!text.contains("1700000000"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn proc_stat_renders_the_last_representable_boot_time_unsigned() {
+        // The offsets above are derived from the epoch `test_config` pins.
+        assert_eq!(
+            crate::types::DetTime::new(&test_config(120))
+                .as_nanos()
+                .as_secs(),
+            EPOCH_SECONDS
+        );
+
+        // One second before the refused offset, the boot instant is exactly i64::MIN.
+        // Linux prints btime as (unsigned long long)boottime.tv_sec, which is 2^63.
+        let last = read_procfs("/proc/stat", PROC_STAT, LAST_REPRESENTABLE_OFFSET).await;
+        assert!(
+            last.injected
+                .starts_with(&[Sysno::lseek, Sysno::read, Sysno::read]),
+            "the read must snapshot through the scripted kernel: {:?}",
+            last.injected
+        );
+        let text = last.result.unwrap();
+        assert!(text.contains("\nbtime 9223372036854775808\n"), "{text:?}");
+        assert!(!text.contains("1700000000"), "{text:?}");
+
+        // An offset of 2^63, above i64::MAX, leaves the instant EPOCH_SECONDS - 2^63,
+        // printed as 2^64 + EPOCH_SECONDS - 2^63 = 9_223_372_038_622_001_408.
+        let above_i64_max = read_procfs("/proc/stat", PROC_STAT, 1 << 63).await;
+        let text = above_i64_max.result.unwrap();
+        assert!(text.contains("\nbtime 9223372038622001408\n"), "{text:?}");
     }
 }
