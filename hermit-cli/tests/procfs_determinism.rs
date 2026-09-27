@@ -1634,3 +1634,549 @@ fn sysfs_hwmon_input_is_deterministic_when_available() {
     let path = path.to_str().expect("hwmon path should be UTF-8");
     assert_deterministic(path, |contents| assert_eq!(contents, b"0\n"));
 }
+
+// Two epochs that differ only in their sub-second fraction. Virtual time starts
+// at the epoch truncated to microseconds, so under FRACTION_EPOCH the virtual
+// boot instant lies 0.999999 s past a whole second. Uptime computed by rounding
+// now and boot separately, as floor(now) - floor(boot), gains a second there as
+// soon as one microsecond of virtual time has elapsed. Uptime rounded once,
+// from the elapsed time now - boot, does not, and is the same under both
+// epochs: /proc/uptime and the /proc/stat CPU counters truncate it, as Linux
+// truncates /proc/uptime, and sysinfo(2) rounds it up, as Linux does.
+const WHOLE_SECOND_EPOCH: &str = "2026-01-01T00:00:00Z";
+const FRACTION_EPOCH: &str = "2026-01-01T00:00:00.999999999Z";
+// Hermit's announcement on stderr for an explicit WHOLE_SECOND_EPOCH.
+const WHOLE_SECOND_EPOCH_ANNOUNCEMENT: &str = "hermit: virtual-time epoch=2026-01-01T00:00:00+00:00 \
+     source=explicit; reproduce with --epoch=2026-01-01T00:00:00+00:00\n";
+// The whole seconds of both epochs, and Hermit's default --sysinfo-uptime-offset.
+const EPOCH_SECONDS: u64 = 1_767_225_600;
+const DEFAULT_UPTIME_OFFSET: u64 = 120;
+// /proc/stat btime under both epochs at the default offset.
+const DEFAULT_BOOT_TIME: u64 = EPOCH_SECONDS - DEFAULT_UPTIME_OFFSET;
+// The last uptime offset whose boot instant, EPOCH_SECONDS less the offset,
+// fits the kernel's signed 64-bit time64_t. There the boot instant is exactly
+// i64::MIN, which fs/proc/stat.c prints through "%llu" as 2^63.
+const LAST_REPRESENTABLE_UPTIME_OFFSET: u64 = EPOCH_SECONDS + (1_u64 << 63);
+const _: () = assert!(DEFAULT_BOOT_TIME == 1_767_225_480);
+const _: () = assert!(LAST_REPRESENTABLE_UPTIME_OFFSET == 9_223_372_038_622_001_408);
+const UPTIME_SEQUENCE_PHASES: [&str; 5] = ["start", "exec", "thread", "child", "end"];
+
+/// Compile `tests/c/{source}` into this target's temporary directory as `name`.
+/// Nextest runs each test in its own process, so every test passes its own name
+/// and never rewrites a binary that a concurrent test is executing.
+fn compile_named_guest(source: &str, name: &str, extra_args: &[&str]) -> PathBuf {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository")
+        .to_path_buf();
+    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let compile = Command::new("cc")
+        .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .args(extra_args)
+        .arg(repository.join("tests/c").join(source))
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run cc for {source}: {error}"));
+    assert!(
+        compile.status.success(),
+        "failed to compile {source}:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    output
+}
+
+/// Run `program` with `args` under Hermit at `epoch` and `uptime_offset`, with
+/// the options the procfs readers above use, and return its output.
+fn run_at_uptime_offset(
+    program: &Path,
+    args: &[&str],
+    epoch: &str,
+    uptime_offset: u64,
+) -> std::process::Output {
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--tmp=/tmp",
+    ]);
+    command.arg(format!("--epoch={epoch}"));
+    command.arg(format!("--sysinfo-uptime-offset={uptime_offset}"));
+    command.arg("--").arg(program).args(args);
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"))
+}
+
+/// Like `run_at_uptime_offset`, but require success and return standard output.
+fn stdout_at_uptime_offset(
+    program: &Path,
+    args: &[&str],
+    epoch: &str,
+    uptime_offset: u64,
+) -> String {
+    let output = run_at_uptime_offset(program, args, epoch, uptime_offset);
+    assert!(
+        output.status.success(),
+        "{} {args:?} at {epoch} with uptime offset {uptime_offset} failed: {}\nstdout:\n{}\nstderr:\n{}",
+        program.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout).expect("guest output should be UTF-8")
+}
+
+/// Check that `/proc/stat` reports `uptime_seconds` of CPU accounting and has
+/// exactly one btime line, of `boot_time`. Every per-CPU line carries the
+/// uptime in clock ticks as its first counter and zero in every other; the
+/// aggregate line carries that first counter times the number of per-CPU lines.
+fn assert_proc_stat_accounting(contents: &[u8], uptime_seconds: u64, boot_time: u64) {
+    let text = std::str::from_utf8(contents).expect("stat should be UTF-8");
+    let cpu_lines = text
+        .lines()
+        .filter(|line| line.starts_with("cpu"))
+        .collect::<Vec<_>>();
+    assert!(
+        cpu_lines.len() >= 2 && cpu_lines[0].starts_with("cpu "),
+        "/proc/stat should begin its CPU lines with the aggregate and list at least one CPU:\n{text}"
+    );
+    let cpu_count = cpu_lines.len() as u64 - 1;
+    for line in &cpu_lines {
+        let mut fields = line.split_whitespace();
+        let name = fields.next().expect("CPU line has no name");
+        let counters = fields
+            .map(|field| field.parse::<u64>().expect("CPU counter should be numeric"))
+            .collect::<Vec<_>>();
+        let mut expected = vec![0; counters.len().max(1)];
+        expected[0] = if name == "cpu" {
+            uptime_seconds * 100 * cpu_count
+        } else {
+            uptime_seconds * 100
+        };
+        assert_eq!(counters, expected, "/proc/stat {name} counters");
+    }
+    let boot_lines = text
+        .lines()
+        .filter(|line| line.starts_with("btime "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        boot_lines,
+        [format!("btime {boot_time}")],
+        "/proc/stat btime lines"
+    );
+}
+
+/// One line of `tests/c/uptime_read_sequence.c` output.
+struct UptimeReport<'a> {
+    phase: &'a str,
+    sysinfo: u64,
+    uptime: u64,
+    idle: &'a str,
+    boot_time: u64,
+    cpu0: u64,
+}
+
+fn uptime_report_field<'a>(
+    fields: &mut std::str::Split<'a, char>,
+    key: &str,
+) -> Result<&'a str, String> {
+    let field = fields.next().ok_or_else(|| format!("no {key} field"))?;
+    field
+        .strip_prefix(key)
+        .and_then(|value| value.strip_prefix('='))
+        .ok_or_else(|| format!("expected {key}=, found {field:?}"))
+}
+
+fn uptime_report_number(value: &str, key: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|error| format!("{key}={value:?}: {error}"))
+}
+
+fn parse_uptime_report(line: &str) -> Result<UptimeReport<'_>, String> {
+    let mut fields = line.split(' ');
+    let phase = fields.next().unwrap_or_default();
+    let sysinfo = uptime_report_number(uptime_report_field(&mut fields, "sysinfo")?, "sysinfo")?;
+    let uptime_field = uptime_report_field(&mut fields, "uptime")?;
+    let uptime = uptime_report_number(
+        uptime_field
+            .strip_suffix(".00")
+            .ok_or_else(|| format!("uptime={uptime_field:?} is not whole seconds"))?,
+        "uptime",
+    )?;
+    let idle = uptime_report_field(&mut fields, "idle")?;
+    let boot_time = uptime_report_number(uptime_report_field(&mut fields, "btime")?, "btime")?;
+    let cpu0 = uptime_report_number(uptime_report_field(&mut fields, "cpu0")?, "cpu0")?;
+    if let Some(extra) = fields.next() {
+        return Err(format!("unexpected field {extra:?}"));
+    }
+    Ok(UptimeReport {
+        phase,
+        sysinfo,
+        uptime,
+        idle,
+        boot_time,
+        cpu0,
+    })
+}
+
+/// Every way `output`, one run of `tests/c/uptime_read_sequence.c` at `epoch`
+/// with the default uptime offset, departs from the uptime Linux would report
+/// from a boot `DEFAULT_UPTIME_OFFSET` seconds before the program started.
+fn uptime_sequence_violations(epoch: &str, output: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut reports = Vec::new();
+    for line in output.lines() {
+        match parse_uptime_report(line) {
+            Ok(report) => reports.push(report),
+            Err(error) => violations.push(format!("{epoch}: {error} in line {line:?}")),
+        }
+    }
+    let phases = reports
+        .iter()
+        .map(|report| report.phase)
+        .collect::<Vec<_>>();
+    if phases != UPTIME_SEQUENCE_PHASES || !output.ends_with('\n') {
+        violations.push(format!(
+            "{epoch}: expected one newline-terminated line for each phase in \
+             {UPTIME_SEQUENCE_PHASES:?}, found {output:?}"
+        ));
+        return violations;
+    }
+    // Values in read order: sysinfo(2), /proc/uptime, then /proc/stat, phase
+    // after phase. Each read happens after the one before it, including across
+    // the exec, the thread join and the child that waitpid reaps, so the exact
+    // elapsed time t cannot decrease along this order. sysinfo(2) reports the
+    // offset plus ceil(t) and the other two the offset plus floor(t), as Linux
+    // does. So for any read after another: two floors or two ceilings cannot
+    // decrease, a ceiling is never below an earlier floor, and a floor is never
+    // more than one second below an earlier ceiling. Each read is checked
+    // against the highest earlier floor and the highest earlier ceiling.
+    let mut highest_floor: Option<(String, u64)> = None;
+    let mut highest_ceiling: Option<(String, u64)> = None;
+    for report in &reports {
+        let phase = report.phase;
+        if report.idle != "0.00" {
+            violations.push(format!(
+                "{epoch}: {phase}: /proc/uptime idle is {:?}, expected \"0.00\"",
+                report.idle
+            ));
+        }
+        if report.boot_time != DEFAULT_BOOT_TIME {
+            violations.push(format!(
+                "{epoch}: {phase}: btime is {}, expected {DEFAULT_BOOT_TIME}",
+                report.boot_time
+            ));
+        }
+        if report.cpu0 % 100 != 0 {
+            violations.push(format!(
+                "{epoch}: {phase}: cpu0 counter {} is not a whole number of seconds in clock ticks",
+                report.cpu0
+            ));
+        }
+        for (source, seconds, rounds_up) in [
+            ("sysinfo(2)", report.sysinfo, true),
+            ("/proc/uptime", report.uptime, false),
+            ("/proc/stat cpu0", report.cpu0 / 100, false),
+        ] {
+            if let Some((earlier_source, earlier_seconds)) = &highest_floor
+                && seconds < *earlier_seconds
+            {
+                violations.push(format!(
+                    "{epoch}: {phase}: {source} uptime {seconds} s is below the {earlier_source} \
+                     uptime {earlier_seconds} s read before it"
+                ));
+            }
+            if let Some((earlier_source, earlier_seconds)) = &highest_ceiling {
+                if rounds_up && seconds < *earlier_seconds {
+                    violations.push(format!(
+                        "{epoch}: {phase}: {source} uptime {seconds} s is below the \
+                         {earlier_source} uptime {earlier_seconds} s read before it"
+                    ));
+                } else if !rounds_up && seconds.saturating_add(1) < *earlier_seconds {
+                    violations.push(format!(
+                        "{epoch}: {phase}: {source} uptime {seconds} s is more than a second \
+                         below the {earlier_source} uptime {earlier_seconds} s read before it"
+                    ));
+                }
+            }
+            let highest = if rounds_up {
+                &mut highest_ceiling
+            } else {
+                &mut highest_floor
+            };
+            if highest
+                .as_ref()
+                .is_none_or(|(_, highest_seconds)| seconds > *highest_seconds)
+            {
+                *highest = Some((format!("{phase} {source}"), seconds));
+            }
+        }
+    }
+    // The start report is read within the first second of the run, after some
+    // virtual time has elapsed: sysinfo(2) rounds that up to one second, and
+    // /proc/uptime and /proc/stat truncate it to none.
+    let start = &reports[0];
+    let expected_start = (
+        DEFAULT_UPTIME_OFFSET + 1,
+        DEFAULT_UPTIME_OFFSET,
+        DEFAULT_UPTIME_OFFSET * 100,
+    );
+    if (start.sysinfo, start.uptime, start.cpu0) != expected_start {
+        violations.push(format!(
+            "{epoch}: start: sysinfo(2), /proc/uptime and /proc/stat cpu0 report {} s, {} s and \
+             {} ticks, expected {} s, {} s and {} ticks",
+            start.sysinfo,
+            start.uptime,
+            start.cpu0,
+            expected_start.0,
+            expected_start.1,
+            expected_start.2
+        ));
+    }
+    // The program sleeps for one second between its start report and the exec,
+    // so every exec read is at least one second past every start read of the
+    // same rounding, and sysinfo(2) also one second past the last start read.
+    let exec = &reports[1];
+    if exec.sysinfo < start.cpu0 / 100 + 1 {
+        violations.push(format!(
+            "{epoch}: exec: sysinfo(2) uptime {} s is not a second past the start report's last \
+             read, {} s, across a one-second sleep",
+            exec.sysinfo,
+            start.cpu0 / 100
+        ));
+    }
+    if exec.sysinfo < start.sysinfo + 1 {
+        violations.push(format!(
+            "{epoch}: exec: sysinfo(2) uptime {} s is not a second past the start report's \
+             sysinfo(2) uptime, {} s, across a one-second sleep",
+            exec.sysinfo, start.sysinfo
+        ));
+    }
+    if exec.uptime < start.cpu0 / 100 + 1 {
+        violations.push(format!(
+            "{epoch}: exec: /proc/uptime {} s is not a second past the start report's last read, \
+             {} s, across a one-second sleep",
+            exec.uptime,
+            start.cpu0 / 100
+        ));
+    }
+    violations
+}
+
+// The expectations of proc_system_cpu_accounting_is_deterministic, at an epoch
+// whose fraction separates floor(now - boot) from floor(now) - floor(boot).
+#[test]
+fn proc_system_cpu_accounting_ignores_the_epoch_fraction() {
+    assert_deterministic_at_epoch("/proc/stat", Some(FRACTION_EPOCH), |contents| {
+        assert_proc_stat_accounting(contents, DEFAULT_UPTIME_OFFSET, DEFAULT_BOOT_TIME);
+    });
+}
+
+// The expectation of proc_uptime_uses_virtual_time, at an epoch whose fraction
+// separates floor(now - boot) from floor(now) - floor(boot).
+#[test]
+fn proc_uptime_ignores_the_epoch_fraction() {
+    assert_deterministic_at_epoch("/proc/uptime", Some(FRACTION_EPOCH), |contents| {
+        assert_eq!(
+            String::from_utf8_lossy(contents),
+            "120.00 0.00\n",
+            "/proc/uptime under {FRACTION_EPOCH}"
+        );
+    });
+}
+
+// sysinfo(2) uptime, read before the program makes any other system call of
+// its own, is the same whether the epoch lies on a whole second or a
+// nanosecond short of the next one. Some virtual time has elapsed by then, and
+// sysinfo(2) rounds it up as Linux does, so it reports one second past the
+// offset.
+#[test]
+fn sysinfo_uptime_ignores_the_epoch_fraction() {
+    let _guard = hermit_run_lock();
+    let guest = compile_named_guest(
+        "uptime_read_sequence.c",
+        "uptime-read-sequence-sysinfo",
+        &["-pthread"],
+    );
+    let whole_second = stdout_at_uptime_offset(
+        &guest,
+        &["sysinfo"],
+        WHOLE_SECOND_EPOCH,
+        DEFAULT_UPTIME_OFFSET,
+    );
+    let fraction =
+        stdout_at_uptime_offset(&guest, &["sysinfo"], FRACTION_EPOCH, DEFAULT_UPTIME_OFFSET);
+    assert_eq!(
+        whole_second, "sysinfo=121\n",
+        "sysinfo(2) uptime under {WHOLE_SECOND_EPOCH}"
+    );
+    assert_eq!(
+        fraction, whole_second,
+        "sysinfo(2) uptime under {FRACTION_EPOCH} and under {WHOLE_SECOND_EPOCH}"
+    );
+}
+
+// The uptime a program reads through sysinfo(2), /proc/uptime and /proc/stat
+// across a one-second sleep, an exec, a second thread and a forked child
+// advances by at least the second slept, keeps one boot time, and is the same
+// whether the epoch lies on a whole second or a nanosecond short of the next.
+#[test]
+fn uptime_reads_across_sleep_exec_thread_and_fork_ignore_the_epoch_fraction() {
+    let _guard = hermit_run_lock();
+    let guest = compile_named_guest(
+        "uptime_read_sequence.c",
+        "uptime-read-sequence",
+        &["-pthread"],
+    );
+    let mut violations = Vec::new();
+    let mut outputs = Vec::new();
+    for epoch in [WHOLE_SECOND_EPOCH, FRACTION_EPOCH] {
+        let first = stdout_at_uptime_offset(&guest, &[], epoch, DEFAULT_UPTIME_OFFSET);
+        let second = stdout_at_uptime_offset(&guest, &[], epoch, DEFAULT_UPTIME_OFFSET);
+        if first != second {
+            violations.push(format!(
+                "{epoch}: two runs differ:\n{first}--- versus ---\n{second}"
+            ));
+        }
+        violations.extend(uptime_sequence_violations(epoch, &first));
+        outputs.push(first);
+    }
+    if outputs[0] != outputs[1] {
+        violations.push(format!(
+            "the read sequence under {FRACTION_EPOCH} differs from the one under \
+             {WHOLE_SECOND_EPOCH}:\n{}--- versus ---\n{}",
+            outputs[1], outputs[0]
+        ));
+    }
+    assert!(
+        violations.is_empty(),
+        "{} violation(s):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+// At the first uptime offset whose boot instant no time64_t can hold, reading
+// /proc/stat fails with EOVERFLOW through read(2) and pread64(2), on the same
+// and on fresh descriptors, without moving the file offset. The refusal is
+// confined to /proc/stat: /proc/meminfo is unchanged and /proc/uptime reports
+// the offset plus the elapsed time.
+#[test]
+fn proc_stat_refuses_a_boot_time_below_time64_min_without_side_effects() {
+    let _guard = hermit_run_lock();
+    let offset = LAST_REPRESENTABLE_UPTIME_OFFSET + 1;
+    let guest = compile_named_guest(
+        "proc_stat_boot_time_refusal.c",
+        "proc-stat-boot-time-refusal",
+        &[],
+    );
+    assert_eq!(
+        stdout_at_uptime_offset(&guest, &[], WHOLE_SECOND_EPOCH, offset),
+        "read result=-1 errno=EOVERFLOW buffer=unchanged\n\
+         lseek result=0 errno=0\n\
+         read result=-1 errno=EOVERFLOW buffer=unchanged\n\
+         pread64 result=-1 errno=EOVERFLOW buffer=unchanged\n\
+         fresh-pread64 result=-1 errno=EOVERFLOW buffer=unchanged\n\
+         whole-file result=-1 errno=EOVERFLOW\n",
+        "/proc/stat operations at uptime offset {offset}"
+    );
+
+    let cat = Path::new("/bin/cat");
+    let stat = run_at_uptime_offset(cat, &["/proc/stat"], WHOLE_SECOND_EPOCH, offset);
+    assert_eq!(
+        stat.status.code(),
+        Some(1),
+        "cat /proc/stat at uptime offset {offset}: {stat:?}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stat.stdout),
+        "",
+        "cat /proc/stat stdout at uptime offset {offset}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stat.stderr),
+        format!(
+            "{WHOLE_SECOND_EPOCH_ANNOUNCEMENT}/bin/cat: /proc/stat: Value too large for defined data type\n"
+        ),
+        "cat /proc/stat stderr at uptime offset {offset}"
+    );
+
+    let meminfo = stdout_at_uptime_offset(
+        cat,
+        &["/proc/meminfo"],
+        WHOLE_SECOND_EPOCH,
+        DEFAULT_UPTIME_OFFSET,
+    );
+    assert!(
+        meminfo.starts_with("MemTotal:"),
+        "/proc/meminfo at the default uptime offset:\n{meminfo}"
+    );
+    assert_eq!(
+        stdout_at_uptime_offset(cat, &["/proc/meminfo"], WHOLE_SECOND_EPOCH, offset),
+        meminfo,
+        "/proc/meminfo at uptime offset {offset} and at the default offset"
+    );
+
+    let default_uptime = stdout_at_uptime_offset(
+        cat,
+        &["/proc/uptime"],
+        WHOLE_SECOND_EPOCH,
+        DEFAULT_UPTIME_OFFSET,
+    );
+    let elapsed = default_uptime
+        .strip_suffix(".00 0.00\n")
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .and_then(|seconds| seconds.checked_sub(DEFAULT_UPTIME_OFFSET))
+        .unwrap_or_else(|| panic!("/proc/uptime at the default uptime offset: {default_uptime:?}"));
+    assert_eq!(
+        stdout_at_uptime_offset(cat, &["/proc/uptime"], WHOLE_SECOND_EPOCH, offset),
+        format!("{}.00 0.00\n", offset + elapsed),
+        "/proc/uptime at uptime offset {offset}"
+    );
+}
+
+// At the last uptime offset whose boot instant a time64_t can hold, the boot
+// instant is i64::MIN, and /proc/stat succeeds and prints it the way
+// fs/proc/stat.c does, through "%llu".
+#[test]
+fn proc_stat_renders_the_last_representable_boot_time() {
+    let _guard = hermit_run_lock();
+    let offset = LAST_REPRESENTABLE_UPTIME_OFFSET;
+    let guest = compile_named_guest(
+        "proc_stat_boot_time_refusal.c",
+        "proc-stat-boot-time-last-representable",
+        &[],
+    );
+    assert_eq!(
+        stdout_at_uptime_offset(&guest, &[], WHOLE_SECOND_EPOCH, offset),
+        "read result=64 errno=0 buffer=written\n\
+         lseek result=64 errno=0\n\
+         read result=64 errno=0 buffer=written\n\
+         pread64 result=64 errno=0 buffer=written\n\
+         fresh-pread64 result=64 errno=0 buffer=written\n\
+         btime 9223372036854775808\n",
+        "/proc/stat operations at uptime offset {offset}"
+    );
+    let stat = stdout_at_uptime_offset(
+        Path::new("/bin/cat"),
+        &["/proc/stat"],
+        WHOLE_SECOND_EPOCH,
+        offset,
+    );
+    let boot_lines = stat
+        .lines()
+        .filter(|line| line.starts_with("btime "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        boot_lines,
+        ["btime 9223372036854775808"],
+        "/proc/stat btime lines at uptime offset {offset}"
+    );
+}
