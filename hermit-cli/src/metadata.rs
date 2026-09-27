@@ -142,7 +142,14 @@ impl RecordVersion {
 // recording/replay, even with virtualize_time=false; replaying an older stream
 // under the new projection could change guest control flow and event consumption.
 // Sysinfo remains determinized rather than gaining a recorded event.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11b);
+// 0x11b -> 0x11c: /proc/uptime renders the floor of exact elapsed logical time
+// instead of the difference of the separately truncated clock and epoch, so a
+// fractional epoch no longer moves it (or /proc/stat's idle ticks derived from
+// it) by one second. /proc/stat btime is now derived from the fixed boot
+// instant rather than from the clock minus uptime. Detcore recomputes these
+// fields over the recorded procfs bytes during recording and replay, so an older
+// stream replayed under the new projection could show the guest different bytes.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -167,7 +174,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
