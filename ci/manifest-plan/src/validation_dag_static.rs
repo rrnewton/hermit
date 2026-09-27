@@ -658,7 +658,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities.
     // Two smaps page-accounting controls (procfs::tests) retain all 853 prior
     // identities: 853 + 2 = 855.
-    ("test.detcore_unit", 855),
+    // Seven failed-syscall display controls retain all 855 prior identities:
+    // 855 + 7 = 862.
+    ("test.detcore_unit", 862),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -838,7 +840,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 850 prior
     // identities.
     // The host node carries the identical library/binary selection.
-    ("test.detcore_unit_on_host", 855),
+    ("test.detcore_unit_on_host", 862),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
