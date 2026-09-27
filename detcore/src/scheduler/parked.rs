@@ -251,6 +251,12 @@ pub(super) struct ParkedRequests {
     pub exit_fences: BTreeMap<DetTid, ExitBoundaryFence>,
     pub child_exit_reservations: BTreeMap<ProcessGeneration, ChildExitReservation>,
     pub completed_child_exits: BTreeMap<ProcessGeneration, CompletedChildExit>,
+    /// Final processes without a live parent have no child-publication callback.
+    /// Keep their descriptor cleanup fenced after the terminal boundary has
+    /// cancelled peer RPCs, until the backend reports successful retirement.
+    pub process_retirements: BTreeMap<ProcessGeneration, reverie::BackendProcessRetirement>,
+    pub completed_process_retirements:
+        BTreeMap<ProcessGeneration, reverie::BackendProcessRetirement>,
     pub terminal_processes: BTreeMap<ProcessGeneration, TerminalProcess>,
     pub completed: BTreeMap<DetTid, reverie::SignalBoundaryReceipt>,
     pub running: Option<DetTid>,
@@ -601,6 +607,7 @@ impl Scheduler {
     pub(super) fn control_barrier(&self) -> bool {
         !self.parked.exit_fences.is_empty()
             || !self.parked.child_exit_reservations.is_empty()
+            || !self.parked.process_retirements.is_empty()
             || self
                 .parked
                 .requests

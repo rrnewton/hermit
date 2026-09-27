@@ -1202,6 +1202,7 @@ async fn sched_loop_inner(
                 && sched.pending_physical_process_exits.is_empty()
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
+                && !sched.control_barrier()
             {
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {

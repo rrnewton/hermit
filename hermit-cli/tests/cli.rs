@@ -15,8 +15,14 @@ mod kvm_cancellation;
 #[path = "common/kvm_itimer.rs"]
 mod kvm_itimer;
 
+#[path = "common/kvm_orphan_reparenting.rs"]
+mod kvm_orphan_reparenting;
+
 #[path = "common/kvm_signal_retirement.rs"]
 mod kvm_signal_retirement;
+
+#[path = "common/kvm_synchronous_fault.rs"]
+mod kvm_synchronous_fault;
 
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
@@ -7578,6 +7584,21 @@ fn run_kvm_itimer_real_interrupts_sleep_in_all_eight_modes() {
 }
 
 #[test]
+fn run_kvm_root_exit_reparents_live_child_and_grandchild() {
+    kvm_orphan_reparenting::run();
+}
+
+#[test]
 fn run_kvm_process_timer_signal_and_sibling_group_exit_retire_both_roles() {
     kvm_signal_retirement::run();
+}
+
+#[test]
+fn run_kvm_synchronous_root_segv_preserves_guest_exit() {
+    kvm_synchronous_fault::run_root();
+}
+
+#[test]
+fn run_kvm_synchronous_orphan_segv_preserves_root_success() {
+    kvm_synchronous_fault::run_orphan();
 }
