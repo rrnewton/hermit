@@ -150,13 +150,22 @@ impl RecordVersion {
 // fields over the recorded procfs bytes during recording and replay, so an older
 // stream replayed under the new projection could show the guest different bytes.
 // 0x11c -> 0x11d: captured clock events retain output bytes even on EFAULT.
+// For each destination (clock_gettime's tp, time's tloc, gettimeofday's tv and
+// tz) an event records whether the pointer was present and the readable prefix
+// of the destination after the call. An EFAULT event also records the same
+// prefix's pre-call bytes: a byte that differs is one Linux stored before it
+// faulted, and replay writes only those bytes, after proving that guest memory
+// still holds the pre-call bytes.
 // Older event variants remain structurally decodable, but their errno-only
 // clock failures cannot establish replay fidelity and are refused at admission.
 // Unlanded development heads of https://github.com/rrnewton/hermit/pull/3212
 // stamped 0x11c, 0x11b, 0x11a and, earlier, 0x117 on their clock-event schema.
 // A recording from one of those heads is not main's random-preadv 0x11a,
 // sysinfo-uptime 0x11b or /proc/uptime 0x11c format; do not reinterpret that
-// identity.
+// identity. Intermediate commits of that pull request also stamped 0x11d
+// before EFAULT events carried pre-call bytes; the whole pull request shares
+// this one version, so a recording from such an intermediate commit is not
+// this format either.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
