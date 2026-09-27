@@ -131,7 +131,13 @@ impl RecordVersion {
 // events. Old event streams cannot be replayed under this routing.
 // 0x117 and 0x118 identify incompatible retained RNG, clock, and network
 // recordings from parallel development; do not reinterpret those identities.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x119);
+// 0x119 -> 0x11a: random-device preadv/preadv2 now use Detcore's canonical
+// generator, including the shared cursor for preadv2(-1). They no longer emit
+// or consume ReadvV2 events; accepting an older recording would desynchronize
+// the event stream and replace its recorded random bytes.
+// Early rejection of invalid negative offsets also stops emitting ReadvV2
+// error events for non-random descriptors.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x11a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -156,7 +162,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x119);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x119;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x11a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

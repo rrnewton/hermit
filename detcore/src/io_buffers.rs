@@ -87,14 +87,14 @@ pub(crate) fn rng_readv_extents(
     Ok(output)
 }
 
-/// RNG observation happens after the output and cursor have committed. A
+/// RNG observation happens after output and any shared-cursor commit. A
 /// recoverable reservation failure must stop the tool, not become guest errno.
 /// This does not promise to catch physical OOM or other logging allocations.
 fn rng_observation_vec<T>(capacity: usize, purpose: &str) -> Result<Vec<T>, Error> {
     let mut output = Vec::new();
     output.try_reserve_exact(capacity).map_err(|error| {
         Error::Tool(anyhow::anyhow!(
-            "RNG readv observation after cursor commit: cannot reserve {purpose}: {error}"
+            "RNG vector observation after output commit: cannot reserve {purpose}: {error}"
         ))
     })?;
     Ok(output)
@@ -593,7 +593,7 @@ where
                 |error| {
                     if rng_output.is_some() {
                         Error::Tool(anyhow::Error::new(error).context(format!(
-                            "RNG readv observation after cursor commit: digest read at {:#x}+{}",
+                            "RNG vector observation after output commit: digest read at {:#x}+{}",
                             extent.addr, extent.len
                         )))
                     } else {
@@ -1159,8 +1159,12 @@ mod event_tests {
     }
 
     fn assert_extent(message: &str, address: usize, bytes: &[u8]) {
+        assert_named_extent(message, "readv", address, bytes);
+    }
+
+    fn assert_named_extent(message: &str, name: &str, address: usize, bytes: &[u8]) {
         let expected = format!(
-            "[iobuf][dtid 1] readv in fd={FD} {address:#x}+{}->{}",
+            "[iobuf][dtid 1] {name} in fd={FD} {address:#x}+{}->{}",
             bytes.len(),
             Digest::new(bytes)
         );
@@ -1168,6 +1172,28 @@ mod event_tests {
             message.contains(&expected),
             "expected {expected}, got {message}"
         );
+    }
+
+    fn rng_vector_calls(count: usize) -> [(&'static str, Syscall, bool); 4] {
+        let preadv = reverie::syscalls::Preadv::new()
+            .with_fd(FD)
+            .with_iov(Addr::from_raw(IOV))
+            .with_iov_len(count)
+            .with_pos_l(19)
+            .with_pos_h(u64::MAX);
+        let preadv2 = reverie::syscalls::Preadv2::new()
+            .with_fd(FD)
+            .with_iov(Addr::from_raw(IOV))
+            .with_iov_len(count as u64)
+            .with_pos_l(19)
+            .with_pos_h(u64::MAX)
+            .with_flags(0);
+        [
+            ("readv", readv(count), true),
+            ("preadv", preadv.into(), false),
+            ("preadv2", preadv2.into(), false),
+            ("preadv2", preadv2.with_pos_l(u64::MAX).into(), true),
+        ]
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1213,132 +1239,159 @@ mod event_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rng_readv_event_observes_imported_array_after_output_overwrites_it() {
-        let logs = BufferLog::default();
-        let _subscriber = tracing::subscriber::set_default(logs.clone());
-        let (tool, mut guest) = event_guest(FdType::Rng, None);
-        let memory = guest.memory.clone();
-        let second_iovec = IOV + std::mem::size_of::<libc::iovec>();
-        memory.put_iovec(0, second_iovec, 16);
-        memory.put_iovec(1, FIRST_DEST, 4);
-        let original_second_iovec = memory.bytes(second_iovec, 16);
-
-        let result = tool.handle_syscall_event(&mut guest, readv(2)).await;
-        assert_eq!(result.unwrap(), 20);
-        let expected = [
-            41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112, 185, 2, 75, 148,
-        ];
-        assert_eq!(memory.bytes(second_iovec, 16), expected[..16]);
-        assert_ne!(memory.bytes(second_iovec, 16), original_second_iovec);
-        assert_eq!(memory.bytes(FIRST_DEST, 4), expected[16..]);
-        assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4]);
-        assert!(guest.injected_iovecs.is_empty());
-        assert!(guest.polls.lock().unwrap().is_empty());
-        assert_eq!(*guest.releases.lock().unwrap(), 1);
-        assert_eq!(guest.thread.stats.syscall_count, 1);
-        assert_eq!(
-            guest
-                .thread
-                .with_detfd(FD, |fd| fd.random_device_offset())
-                .unwrap(),
-            20
-        );
-        let messages = logs.0.lock().unwrap();
-        assert_eq!(messages.len(), 2, "{messages:?}");
-        assert_extent(&messages[0], second_iovec, &expected[..16]);
-        assert_extent(&messages[1], FIRST_DEST, &expected[16..]);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn rng_readv_event_digest_failure_is_terminal_after_bytes_and_cursor_commit() {
-        for fault in [Errno::EFAULT, Errno::EIO] {
+        for (name, call, advances) in rng_vector_calls(2) {
             let logs = BufferLog::default();
             let _subscriber = tracing::subscriber::set_default(logs.clone());
             let (tool, mut guest) = event_guest(FdType::Rng, None);
             let memory = guest.memory.clone();
-            memory.put_iovec(0, RETRY_DEST, 3);
-            memory.put_iovec(1, FIRST_DEST, 5);
-            memory.1.lock().unwrap().digest_error = Some(fault);
+            let second_iovec = IOV + std::mem::size_of::<libc::iovec>();
+            memory.put_iovec(0, second_iovec, 16);
+            memory.put_iovec(1, FIRST_DEST, 4);
+            let original_second_iovec = memory.bytes(second_iovec, 16);
 
-            let result = tool.handle_syscall_event(&mut guest, readv(2)).await;
-            let Err(Error::Tool(error)) = result else {
-                panic!("completed RNG readv digest failure became guest result: {result:?}");
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 20);
+            let expected = if advances {
+                [
+                    41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112, 185, 2,
+                    75, 148,
+                ]
+            } else {
+                // Literal seed0 stream at explicit offset19, distinct from cursor0.
+                [
+                    148, 221, 38, 111, 184, 1, 74, 147, 220, 37, 110, 183, 0, 73, 146, 219, 36,
+                    109, 182, 255,
+                ]
             };
-            assert!(
-                error
-                    .to_string()
-                    .contains("RNG readv observation after cursor commit")
-            );
-            assert!(error.chain().any(|cause| {
-                matches!(cause.downcast_ref::<Error>(), Some(Error::Errno(error)) if *error == fault)
-            }));
-            assert_eq!(memory.bytes(RETRY_DEST, 4), [41, 114, 187, CANARY]);
-            assert_eq!(memory.bytes(FIRST_DEST, 6), [4, 77, 150, 223, 40, CANARY]);
+            assert_eq!(memory.bytes(second_iovec, 16), expected[..16]);
+            assert_ne!(memory.bytes(second_iovec, 16), original_second_iovec);
+            assert_eq!(memory.bytes(FIRST_DEST, 4), expected[16..]);
+            assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4]);
+            assert!(guest.injected_iovecs.is_empty());
+            assert!(guest.polls.lock().unwrap().is_empty());
+            assert_eq!(*guest.releases.lock().unwrap(), 1);
+            assert_eq!(guest.thread.stats.syscall_count, 1);
             assert_eq!(
                 guest
                     .thread
                     .with_detfd(FD, |fd| fd.random_device_offset())
                     .unwrap(),
-                8
+                if advances { 20 } else { 0 }
             );
-            assert_eq!(*guest.releases.lock().unwrap(), 1);
-            assert!(guest.injected_iovecs.is_empty());
-            let reads = memory.1.lock().unwrap();
-            assert_eq!(reads.imported_entries, 2);
-            assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
             let messages = logs.0.lock().unwrap();
-            assert_eq!(messages.len(), 1);
-            assert_extent(&messages[0], RETRY_DEST, &[41, 114, 187]);
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], name, second_iovec, &expected[..16]);
+            assert_named_extent(&messages[1], name, FIRST_DEST, &expected[16..]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_digest_failure_is_terminal_after_bytes_and_cursor_commit() {
+        for (name, call, advances) in rng_vector_calls(2) {
+            for fault in [Errno::EFAULT, Errno::EIO] {
+                let logs = BufferLog::default();
+                let _subscriber = tracing::subscriber::set_default(logs.clone());
+                let (tool, mut guest) = event_guest(FdType::Rng, None);
+                let memory = guest.memory.clone();
+                memory.put_iovec(0, RETRY_DEST, 3);
+                memory.put_iovec(1, FIRST_DEST, 5);
+                memory.1.lock().unwrap().digest_error = Some(fault);
+
+                let result = tool.handle_syscall_event(&mut guest, call).await;
+                let Err(Error::Tool(error)) = result else {
+                    panic!("completed RNG readv digest failure became guest result: {result:?}");
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("RNG vector observation after output commit")
+                );
+                assert!(error.chain().any(|cause| {
+                matches!(cause.downcast_ref::<Error>(), Some(Error::Errno(error)) if *error == fault)
+            }));
+                let expected = if advances {
+                    [41, 114, 187, 4, 77, 150, 223, 40]
+                } else {
+                    [148, 221, 38, 111, 184, 1, 74, 147]
+                };
+                assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
+                assert_eq!(memory.bytes(RETRY_DEST + 3, 1), [CANARY]);
+                assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
+                assert_eq!(memory.bytes(FIRST_DEST + 5, 1), [CANARY]);
+                assert_eq!(
+                    guest
+                        .thread
+                        .with_detfd(FD, |fd| fd.random_device_offset())
+                        .unwrap(),
+                    if advances { 8 } else { 0 }
+                );
+                assert_eq!(*guest.releases.lock().unwrap(), 1);
+                assert!(guest.injected_iovecs.is_empty());
+                let reads = memory.1.lock().unwrap();
+                assert_eq!(reads.imported_entries, 2);
+                assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+                let messages = logs.0.lock().unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+            }
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn rng_readv_event_observer_configuration_and_subscription_are_inert() {
-        for (configured, subscribed) in [(true, true), (false, true), (true, false)] {
-            let logs = BufferLog::default();
-            let dispatch = if subscribed {
-                tracing::Dispatch::new(logs.clone())
-            } else {
-                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
-            };
-            let _subscriber = tracing::dispatcher::set_default(&dispatch);
-            let (mut tool, mut guest) = event_guest(FdType::Rng, None);
-            tool.cfg.detlog_io_buffers = configured;
-            guest.config.detlog_io_buffers = configured;
-            let memory = guest.memory.clone();
-            memory.put_iovec(0, FIRST_DEST, 3);
-            memory.put_iovec(1, RETRY_DEST, 5);
+        for (name, call, advances) in rng_vector_calls((1_usize << 32) | 2) {
+            for (configured, subscribed) in [(true, true), (false, true), (true, false)] {
+                let logs = BufferLog::default();
+                let dispatch = if subscribed {
+                    tracing::Dispatch::new(logs.clone())
+                } else {
+                    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+                };
+                let _subscriber = tracing::dispatcher::set_default(&dispatch);
+                let (mut tool, mut guest) = event_guest(FdType::Rng, None);
+                tool.cfg.detlog_io_buffers = configured;
+                guest.config.detlog_io_buffers = configured;
+                let memory = guest.memory.clone();
+                memory.put_iovec(0, FIRST_DEST, 3);
+                memory.put_iovec(1, RETRY_DEST, 5);
 
-            // Import and evidence must narrow the same raw count. In particular,
-            // the observer must not fetch 1024 descriptors after a two-entry read.
-            let result = tool
-                .handle_syscall_event(&mut guest, readv((1_usize << 32) | 2))
-                .await;
-            assert_eq!(result.unwrap(), 8);
-            assert_eq!(memory.bytes(FIRST_DEST, 4), [41, 114, 187, CANARY]);
-            assert_eq!(memory.bytes(RETRY_DEST, 6), [4, 77, 150, 223, 40, CANARY]);
-            assert_eq!(
-                guest
-                    .thread
-                    .with_detfd(FD, |fd| fd.random_device_offset())
-                    .unwrap(),
-                8
-            );
-            assert_eq!(*guest.releases.lock().unwrap(), 1);
-            assert!(guest.injected_iovecs.is_empty());
-            let reads = memory.1.lock().unwrap();
-            assert_eq!(reads.imported_entries, 2);
-            let messages = logs.0.lock().unwrap();
-            if configured && subscribed {
-                assert_eq!(reads.observer_reads, [(FIRST_DEST, 3), (RETRY_DEST, 5)]);
-                assert_eq!(messages.len(), 2);
-                assert_extent(&messages[0], FIRST_DEST, &[41, 114, 187]);
-                assert_extent(&messages[1], RETRY_DEST, &[4, 77, 150, 223, 40]);
-            } else {
-                assert!(
-                    reads.observer_reads.is_empty(),
-                    "disabled observer read guest bytes"
+                // Import and evidence must narrow the same raw count. In particular,
+                // the observer must not fetch 1024 descriptors after a two-entry read.
+                let result = tool.handle_syscall_event(&mut guest, call).await;
+                assert_eq!(result.unwrap(), 8);
+                let expected = if advances {
+                    [41, 114, 187, 4, 77, 150, 223, 40]
+                } else {
+                    [148, 221, 38, 111, 184, 1, 74, 147]
+                };
+                assert_eq!(memory.bytes(FIRST_DEST, 3), expected[..3]);
+                assert_eq!(memory.bytes(FIRST_DEST + 3, 1), [CANARY]);
+                assert_eq!(memory.bytes(RETRY_DEST, 5), expected[3..]);
+                assert_eq!(memory.bytes(RETRY_DEST + 5, 1), [CANARY]);
+                assert_eq!(
+                    guest
+                        .thread
+                        .with_detfd(FD, |fd| fd.random_device_offset())
+                        .unwrap(),
+                    if advances { 8 } else { 0 }
                 );
-                assert!(messages.is_empty(), "disabled observer emitted hashes");
+                assert_eq!(*guest.releases.lock().unwrap(), 1);
+                assert!(guest.injected_iovecs.is_empty());
+                let reads = memory.1.lock().unwrap();
+                assert_eq!(reads.imported_entries, 2);
+                let messages = logs.0.lock().unwrap();
+                if configured && subscribed {
+                    assert_eq!(reads.observer_reads, [(FIRST_DEST, 3), (RETRY_DEST, 5)]);
+                    assert_eq!(messages.len(), 2);
+                    assert_named_extent(&messages[0], name, FIRST_DEST, &expected[..3]);
+                    assert_named_extent(&messages[1], name, RETRY_DEST, &expected[3..]);
+                } else {
+                    assert!(
+                        reads.observer_reads.is_empty(),
+                        "disabled observer read guest bytes"
+                    );
+                    assert!(messages.is_empty(), "disabled observer emitted hashes");
+                }
             }
         }
     }
@@ -1350,29 +1403,31 @@ mod event_tests {
             (1025, 3, Err(Errno::EINVAL), 0),
             (1, usize::MAX, Err(Errno::EINVAL), 1),
         ] {
-            let logs = BufferLog::default();
-            let _subscriber = tracing::subscriber::set_default(logs.clone());
-            let (tool, mut guest) = event_guest(FdType::Rng, None);
-            let memory = guest.memory.clone();
-            memory.put_iovec(0, FIRST_DEST, length);
-            let result = tool.handle_syscall_event(&mut guest, readv(count)).await;
-            assert_eq!(
-                result.map_err(|error| error.into_errno().unwrap()),
-                expected
-            );
-            assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
-            assert_eq!(
-                guest
-                    .thread
-                    .with_detfd(FD, |fd| fd.random_device_offset())
-                    .unwrap(),
-                0
-            );
-            assert_eq!(*guest.releases.lock().unwrap(), 1);
-            let reads = memory.1.lock().unwrap();
-            assert_eq!(reads.imported_entries, imports);
-            assert!(reads.observer_reads.is_empty());
-            assert!(logs.0.lock().unwrap().is_empty());
+            for (_, call, _) in rng_vector_calls(count) {
+                let logs = BufferLog::default();
+                let _subscriber = tracing::subscriber::set_default(logs.clone());
+                let (tool, mut guest) = event_guest(FdType::Rng, None);
+                let memory = guest.memory.clone();
+                memory.put_iovec(0, FIRST_DEST, length);
+                let result = tool.handle_syscall_event(&mut guest, call).await;
+                assert_eq!(
+                    result.map_err(|error| error.into_errno().unwrap()),
+                    expected
+                );
+                assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+                assert_eq!(
+                    guest
+                        .thread
+                        .with_detfd(FD, |fd| fd.random_device_offset())
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(*guest.releases.lock().unwrap(), 1);
+                let reads = memory.1.lock().unwrap();
+                assert_eq!(reads.imported_entries, imports);
+                assert!(reads.observer_reads.is_empty());
+                assert!(logs.0.lock().unwrap().is_empty());
+            }
         }
     }
 

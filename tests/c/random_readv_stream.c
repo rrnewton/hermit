@@ -414,6 +414,184 @@ static void import_and_faults(const char* path) {
   CHECK(close(stream.fd) == 0);
 }
 
+/* x86-64 uses a full signed offset in arg3; arg4 is ignored padding. */
+static void positioned_result(int version2, int fd, const void* iov,
+                              unsigned long count, int64_t offset, int flags,
+                              long expected, int expected_errno) {
+  errno = 0;
+  long actual = syscall(version2 ? SYS_preadv2 : SYS_preadv, fd, iov, count,
+                        (uint64_t)offset, 0x123456789abcdef0UL, flags);
+  CHECK(actual == expected);
+  CHECK(errno == expected_errno);
+}
+
+static void positioned_stream(const char* path) {
+  uint8_t expected[16] = {0};
+  uint8_t actual[16] = {0};
+  control(path, expected, sizeof(expected));
+  int fd = open(path, O_RDONLY);
+  CHECK(fd >= 0);
+  int alias = dup(fd);
+  CHECK(alias >= 0);
+  CHECK(read(fd, actual, 3) == 3);
+  struct iovec iov[] = {{actual + 3, 1}, {actual + 4, 1}};
+  positioned_result(1, alias, iov, 2, -1, 0, 2, 0);
+  CHECK(read(fd, actual + 5, 2) == 2);
+  equal(actual, expected, 7);
+  dump("positioned-mixed", actual, 7);
+
+  const int64_t offsets[] = {5, 65536, 0x100000005LL, INT64_MAX - 1};
+  /* Independent literal seed0/17 values, including the former carrier EOF. */
+  const uint8_t values[] = {150, expected_seed == 17 ? 56 : 41, 150, 151};
+  for (int version2 = 0; version2 <= 1; ++version2) {
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+      uint8_t guarded[] = {0xa5, 0xa5, 0xa5};
+      struct iovec one = {guarded + 1, 1};
+      positioned_result(version2, alias, &one, 1, offsets[i], 0, 1, 0);
+      CHECK(guarded[0] == 0xa5 && guarded[2] == 0xa5);
+      equal(guarded + 1, values + i, 1);
+      dump("positioned-byte", guarded + 1, 1);
+    }
+  }
+  CHECK(read(fd, actual + 7, 3) == 3);
+  equal(actual, expected, 10);
+  dump("positioned-cursor", actual, 10);
+  CHECK(close(alias) == 0);
+  CHECK(close(fd) == 0);
+}
+
+static void positioned_errors(const char* path) {
+  struct stream stream = {.fd = open(path, O_RDONLY)};
+  CHECK(stream.fd >= 0);
+  control(path, stream.expected, sizeof(stream.expected));
+  const void* invalid = (const void*)UINTPTR_MAX;
+  uint8_t guarded[3] = {0xa5, 0xa5, 0xa5};
+  struct iovec one = {guarded + 1, 1};
+  struct iovec empty[2] = {{NULL, 0}, {NULL, 0}};
+  for (int version2 = 0; version2 <= 1; ++version2) {
+    positioned_result(version2, -1, invalid, 1025, -2, 0, -1, EINVAL);
+    positioned_result(version2, -1, invalid, 1025, -1, 0, -1,
+                      version2 ? EBADF : EINVAL);
+    positioned_result(version2, -1, invalid, 1025, 0, 0, -1, EBADF);
+    const int modes[] = {O_WRONLY, O_PATH};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+      int fd = open(path, modes[i]);
+      CHECK(fd >= 0);
+      positioned_result(version2, fd, invalid, 1, 0, 0, -1, EBADF);
+      positioned_result(version2, fd, invalid, 0, 0, 0, -1, EBADF);
+      CHECK(close(fd) == 0);
+    }
+    positioned_result(version2, stream.fd, invalid, 0, 0, 0, 0, 0);
+    positioned_result(version2, stream.fd, invalid, 1UL << 32, 0, 0, 0, 0);
+    positioned_result(version2, stream.fd, invalid, 1025, 0, 0, -1, EINVAL);
+    positioned_result(version2, stream.fd, invalid, ~0UL, 0, 0, -1, EINVAL);
+    positioned_result(version2, stream.fd, invalid, 1, 0, 0, -1, EFAULT);
+    positioned_result(version2, stream.fd, empty, 2, INT64_MAX, 0, 0, 0);
+    positioned_result(version2, stream.fd, &one, 1, INT64_MAX, 0, -1, EINVAL);
+    CHECK(guarded[0] == 0xa5 && guarded[1] == 0xa5 && guarded[2] == 0xa5);
+    positioned_result(version2, stream.fd, &one, (1UL << 32) | 1, 0, 0, 1, 0);
+    equal(guarded + 1, stream.expected, 1);
+    CHECK(guarded[0] == 0xa5 && guarded[2] == 0xa5);
+    guarded[1] = 0xa5;
+    next_scalar(&stream);
+  }
+
+  /* Observed random-device flag policy. 0x100 is Linux 7.1 RWF_NOSIGNAL. */
+  const struct {
+    int flags;
+    int error;
+  } cases[] = {
+      {1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {32, 0}, {256, 0},
+      {256 | 8, 0}, {64, EOPNOTSUPP}, {128, EOPNOTSUPP},
+      {0x40000000, EOPNOTSUPP}, {16 | 32, EINVAL},
+      {0x40000000 | 16 | 32, EOPNOTSUPP}, {64 | 16 | 32, EINVAL},
+      {256 | 16 | 32, EINVAL}, {256 | 0x40000000, EOPNOTSUPP},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    int flags = cases[i].flags, error = cases[i].error;
+    guarded[1] = 0xa5;
+    positioned_result(1, stream.fd, &one, 1, 0, flags, error ? -1 : 1, error);
+    if (error) {
+      CHECK(guarded[1] == 0xa5);
+    } else {
+      equal(guarded + 1, stream.expected, 1);
+    }
+    CHECK(guarded[0] == 0xa5 && guarded[2] == 0xa5);
+    positioned_result(1, stream.fd, invalid, 1, 0, flags, -1, EFAULT);
+    positioned_result(1, stream.fd, invalid, 0, 0, flags, 0, 0);
+    positioned_result(1, stream.fd, empty, 2, INT64_MAX, flags, 0, 0);
+    struct iovec bad = {(void*)1, 1};
+    positioned_result(1, stream.fd, &bad, 1, 0, flags, -1,
+                      error ? error : EFAULT);
+    next_scalar(&stream);
+  }
+  struct iovec noncanonical = {(void*)UINTPTR_MAX, 0};
+  positioned_result(1, stream.fd, &noncanonical, 1, 0, 0x40000000, -1, EFAULT);
+  noncanonical.iov_len = 1;
+  positioned_result(1, stream.fd, &noncanonical, 1, 0, 0x40000000, -1, EFAULT);
+  positioned_result(1, stream.fd, &one, 1, INT64_MAX, 0x40000000, -1, EINVAL);
+  next_scalar(&stream);
+  CHECK(close(stream.fd) == 0);
+}
+
+static void positioned_faults(const char* path) {
+  struct stream stream = {.fd = open(path, O_RDONLY)};
+  CHECK(stream.fd >= 0);
+  control(path, stream.expected, sizeof(stream.expected));
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  CHECK(page >= 4096);
+  uint8_t* mapping = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  CHECK(mapping != MAP_FAILED);
+  CHECK(mprotect(mapping + page, page, PROT_NONE) == 0);
+  for (int mode = 0; mode < 3; ++mode) {
+    int current = mode == 2;
+    int64_t offset = current ? -1 : 19;
+    int version2 = mode != 0;
+    uint8_t good[8];
+    memset(good, 0xa5, sizeof(good));
+    struct iovec iov[] = {{good, 3}, {mapping + page, 5}};
+    size_t start = current ? stream.offset : 19;
+    positioned_result(version2, stream.fd, iov, 2, offset, 0, 3, 0);
+    equal(good, stream.expected + start, 3);
+    CHECK(good[3] == 0xa5);
+    stream.offset += current ? 3 : 0;
+    next_scalar(&stream);
+
+    mapping[page - 2] = mapping[page - 1] = 0xa5;
+    iov[0] = (struct iovec){mapping + page - 1, 2};
+    start = current ? stream.offset : 19;
+    positioned_result(version2, stream.fd, iov, 1, offset, 0, 1, 0);
+    equal(mapping + page - 1, stream.expected + start, 1);
+    CHECK(mapping[page - 2] == 0xa5);
+    stream.offset += current ? 1 : 0;
+    next_scalar(&stream);
+
+    memset(good, 0xa5, sizeof(good));
+    iov[0] = (struct iovec){good, 3};
+    iov[1] = (struct iovec){(void*)UINTPTR_MAX, 1};
+    positioned_result(version2, stream.fd, iov, 2, offset, 0, -1, EFAULT);
+    for (size_t i = 0; i < sizeof(good); ++i) {
+      CHECK(good[i] == 0xa5);
+    }
+    next_scalar(&stream);
+
+    /* Segment zero overwrites segment one's descriptor before its copyout. */
+    iov[0] = (struct iovec){&iov[1], sizeof(iov[1])};
+    iov[1] = (struct iovec){good, 3};
+    start = current ? stream.offset : 19;
+    positioned_result(version2, stream.fd, iov, 2, offset, 0,
+                      sizeof(iov[1]) + 3, 0);
+    equal((const uint8_t*)&iov[1], stream.expected + start, sizeof(iov[1]));
+    equal(good, stream.expected + start + sizeof(iov[1]), 3);
+    CHECK(good[3] == 0xa5);
+    stream.offset += current ? sizeof(iov[1]) + 3 : 0;
+    next_scalar(&stream);
+  }
+  CHECK(munmap(mapping, 2 * page) == 0);
+  CHECK(close(stream.fd) == 0);
+}
+
 int main(int argc, char** argv) {
   if (argc == 4 && strcmp(argv[1], "--exec-child") == 0) {
     child_read(atoi(argv[2]), atoi(argv[3]));
@@ -437,7 +615,8 @@ int main(int argc, char** argv) {
   }
   CHECK(strcmp(selected, "all") == 0 || strcmp(selected, "mixed") == 0 ||
         strcmp(selected, "long") == 0 || strcmp(selected, "faults") == 0 ||
-        strcmp(selected, "aliases") == 0 || strcmp(selected, "access") == 0);
+        strcmp(selected, "aliases") == 0 || strcmp(selected, "access") == 0 ||
+        strcmp(selected, "positioned") == 0);
   CHECK(strcmp(device, "all") == 0 || strcmp(device, "random") == 0 ||
         strcmp(device, "urandom") == 0);
   const char* devices[] = {"/dev/random", "/dev/urandom"};
@@ -457,6 +636,11 @@ int main(int argc, char** argv) {
     }
     if (strcmp(selected, "all") == 0 || strcmp(selected, "access") == 0) {
       access_modes(devices[i]);
+    }
+    if (strcmp(selected, "all") == 0 || strcmp(selected, "positioned") == 0) {
+      positioned_stream(devices[i]);
+      positioned_errors(devices[i]);
+      positioned_faults(devices[i]);
     }
     if (strcmp(selected, "all") == 0 || strcmp(selected, "aliases") == 0) {
       inherited_stream(devices[i], argv[0], 0);

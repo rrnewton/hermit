@@ -141,6 +141,52 @@ fn vectored_offset(low: u64, high: u64) -> i64 {
     }
 }
 
+/// RNG vectors use either the shared stream or an independent explicit offset.
+struct RandomVectoredRead {
+    address: usize,
+    count: usize,
+    offset: Option<u64>,
+    flags: i32,
+}
+
+/// Apply Linux's checks after complete iovec import, before touching output.
+fn validate_random_vector_read(offset: Option<u64>, total: usize, flags: i32) -> Result<(), Errno> {
+    if total == 0 {
+        return Ok(());
+    }
+    if let Some(offset) = offset
+        && offset
+            .checked_add(total as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+    {
+        return Err(Errno::EINVAL);
+    }
+    // Linux 7.1's RWF_NOSIGNAL is newer than the pinned libc crate. Native
+    // random-device controls accept it, including with RWF_NOWAIT.
+    const RWF_NOSIGNAL: i32 = 0x100;
+    const KNOWN: i32 = libc::RWF_HIPRI
+        | libc::RWF_DSYNC
+        | libc::RWF_SYNC
+        | libc::RWF_NOWAIT
+        | libc::RWF_APPEND
+        | libc::RWF_NOAPPEND
+        | libc::RWF_ATOMIC
+        | libc::RWF_DONTCACHE
+        | RWF_NOSIGNAL;
+    // Unknown flags win over conflicting recognized flags, while recognized
+    // but unsupported ATOMIC/DONTCACHE are rejected after APPEND/NOAPPEND.
+    if flags & !KNOWN != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & libc::RWF_APPEND != 0 && flags & libc::RWF_NOAPPEND != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & (libc::RWF_ATOMIC | libc::RWF_DONTCACHE) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
 fn read_iovecs<M: MemoryAccess>(
     memory: &M,
     address: Option<Addr<libc::iovec>>,
@@ -2276,6 +2322,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.handle_readv_with_output(guest, call, &mut None).await
     }
 
+    /// Import after the resource wait and retain that geometry through copyout.
+    /// The shared-cursor closure is synchronous and takes no metadata locks.
+    fn read_random_vectors<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        detfd: &DetFd,
+        request: RandomVectoredRead,
+        rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
+    ) -> Result<i64, Error> {
+        require_random_device_read_access(detfd.status_flags())?;
+        let policy = if guest.config().backend_is_kvm {
+            crate::iovecs::UserAddressPolicy::Kvm
+        } else {
+            crate::iovecs::UserAddressPolicy::Native
+        };
+        let iovecs = crate::iovecs::import_read_iovecs(
+            &guest.memory(),
+            request.address,
+            request.count,
+            policy,
+        )?;
+        let total = iovecs.iter().map(|iov| iov.len).sum();
+        validate_random_vector_read(request.offset, total, request.flags)?;
+        let written = if let Some(offset) = request.offset {
+            self.fill_random_device_iovecs(guest, &iovecs, offset)?
+        } else {
+            detfd.with_random_device_stream(|offset| {
+                self.fill_random_device_iovecs(guest, &iovecs, offset)
+            })?
+        };
+        if written > 0 && self.cfg.detlog_io_buffers && crate::detlog_observed!() {
+            *rng_output = Some(crate::io_buffers::rng_readv_extents(&iovecs, written)?);
+        }
+        Ok(written as i64)
+    }
+
     pub(crate) async fn handle_readv_with_output<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2322,29 +2404,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let res = if fd_type == FdType::Rng {
-            // This import and cursor transaction are synchronous. In particular,
-            // evidence belongs to these descriptors, not a pre-await snapshot.
-            (|| {
-                require_random_device_read_access(detfd.status_flags())?;
-                let policy = if guest.config().backend_is_kvm {
-                    crate::iovecs::UserAddressPolicy::Kvm
-                } else {
-                    crate::iovecs::UserAddressPolicy::Native
-                };
-                let iovecs = crate::iovecs::import_read_iovecs(
-                    &guest.memory(),
-                    call.iov().map_or(0, |addr| addr.as_raw()),
-                    call.len(),
-                    policy,
-                )?;
-                let written = detfd.with_random_device_stream(|offset| {
-                    self.fill_random_device_iovecs(guest, &iovecs, offset)
-                })?;
-                if written > 0 && self.cfg.detlog_io_buffers && crate::detlog_observed!() {
-                    *rng_output = Some(crate::io_buffers::rng_readv_extents(&iovecs, written)?);
-                }
-                Ok(written as i64)
-            })()
+            self.read_random_vectors(
+                guest,
+                &detfd,
+                RandomVectoredRead {
+                    address: call.iov().map_or(0, |addr| addr.as_raw()),
+                    count: call.len(),
+                    offset: None,
+                    flags: 0,
+                },
+                rng_output,
+            )
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
@@ -2362,19 +2432,28 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(#794)
     /// SYS_preadv system call: the vectored form of `pread64`.
     ///
-    /// Positioned reads target seekable files and do not block, so this mirrors
-    /// [`Self::handle_pread64`]'s ordering and records/replays the single kernel
-    /// operation.
+    /// RNG reads use the canonical stream at the explicit offset without
+    /// advancing its shared cursor. Other files retain their kernel operation.
     pub async fn handle_preadv<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Preadv,
     ) -> Result<i64, Error> {
+        self.handle_preadv_with_output(guest, call, &mut None).await
+    }
+
+    pub(crate) async fn handle_preadv_with_output<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv,
+        rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
+    ) -> Result<i64, Error> {
+        // Linux rejects negative offsets before descriptor lookup or import.
+        let offset = vectored_offset(call.pos_l(), call.pos_h());
+        if offset < 0 {
+            return Err(Errno::EINVAL.into());
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
-            let offset = vectored_offset(call.pos_l(), call.pos_h());
-            if offset < 0 {
-                return Err(Errno::EINVAL.into());
-            }
             self.require_timer_slack_access(guest, call.fd(), false)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), call.iov_len())?;
             return self
@@ -2389,36 +2468,59 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let resource = guest
+        let detfd = guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+            .with_detfd(call.fd(), |detfd| detfd.clone())?;
 
-        if let Some(resource) = resource {
+        if let Some(resource) = detfd.resource() {
             let request = guest.thread_state().mk_request(resource, Permission::R);
             resource_request(guest, request).await;
         }
 
-        let res = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
+        let res = if detfd.ty() == FdType::Rng {
+            self.read_random_vectors(
+                guest,
+                &detfd,
+                RandomVectoredRead {
+                    address: call.iov().map_or(0, |addr| addr.as_raw()),
+                    count: call.iov_len(),
+                    offset: Some(offset as u64),
+                    flags: 0,
+                },
+                rng_output,
+            )
+        } else {
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
+        };
         resource_release_all(guest).await;
         res
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#794)
-    /// SYS_preadv2 system call: `preadv` with a trailing per-call flags argument,
-    /// which record/replay forwards unchanged.
+    /// SYS_preadv2 system call: positioned vectors, or the shared stream when
+    /// offset is -1. RNG flag validation precedes output copying.
     pub async fn handle_preadv2<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Preadv2,
     ) -> Result<i64, Error> {
+        self.handle_preadv2_with_output(guest, call, &mut None)
+            .await
+    }
+
+    pub(crate) async fn handle_preadv2_with_output<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv2,
+        rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
+    ) -> Result<i64, Error> {
+        let offset = vectored_offset(call.pos_l(), call.pos_h());
+        if offset < -1 {
+            return Err(Errno::EINVAL.into());
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
-            let offset = vectored_offset(call.pos_l(), call.pos_h());
-            if offset < -1 {
-                return Err(Errno::EINVAL.into());
-            }
             self.require_timer_slack_access(guest, call.fd(), false)?;
             let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
@@ -2438,18 +2540,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let resource = guest
+        let detfd = guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+            .with_detfd(call.fd(), |detfd| detfd.clone())?;
 
-        if let Some(resource) = resource {
+        if let Some(resource) = detfd.resource() {
             let request = guest.thread_state().mk_request(resource, Permission::R);
             resource_request(guest, request).await;
         }
 
-        let res = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
+        let res = if detfd.ty() == FdType::Rng {
+            self.read_random_vectors(
+                guest,
+                &detfd,
+                RandomVectoredRead {
+                    address: call.iov().map_or(0, |addr| addr.as_raw()),
+                    count: call.iov_len() as usize,
+                    offset: (offset != -1).then_some(offset as u64),
+                    flags: call.flags(),
+                },
+                rng_output,
+            )
+        } else {
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
+        };
         resource_release_all(guest).await;
         res
     }

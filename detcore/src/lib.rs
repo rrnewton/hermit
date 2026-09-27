@@ -2290,8 +2290,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_readv_with_output(guest, s, &mut rng_readv_output)
                         .await
                 }
-                Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
-                Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
+                Syscall::Preadv(s) => {
+                    self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
+                        .await
+                }
+                Syscall::Preadv2(s) => {
+                    self.handle_preadv2_with_output(guest, s, &mut rng_readv_output)
+                        .await
+                }
                 Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
                 Syscall::Pwritev2(s) => self.handle_pwritev2(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2770,7 +2776,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A copy may already have changed guest memory before reporting a
         // terminal backend error. Do not perform even the syscall-result
         // display's memory reads, or later observers/posthooks/timer effects.
-        // Read/readv have completed their existing release RPC before returning;
+        // Random-device reads have completed their release RPC before returning;
         // getrandom acquired no file resource. Physical cleanup belongs to the
         // backend failure owner, not to this observer fence.
         if res.as_ref().is_err_and(crate::random::is_copy_failure) {
