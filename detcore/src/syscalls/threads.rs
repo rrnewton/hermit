@@ -75,6 +75,9 @@ use crate::types::ExactChildWaitState;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
 
+#[path = "kvm_waitid.rs"]
+mod kvm_waitid;
+
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
 const VIRTUAL_CPUSET_BYTES: usize = 16;
@@ -1769,6 +1772,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Waitid,
     ) -> Result<i64, Error> {
+        // The serial KVM path can delegate ordered user copyout to its backend.
+        // Enter before the legacy NULL rejection and whole-siginfo writes;
+        // ptrace, DBT and nonsequential execution retain their existing path.
+        if guest.config().backend_is_kvm && guest.config().sequentialize_threads {
+            return kvm_waitid::handle(guest, call).await;
+        }
         let dettid = guest.thread_state().dettid;
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
