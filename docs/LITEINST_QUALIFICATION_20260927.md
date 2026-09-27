@@ -598,6 +598,7 @@ The two stderr captures are byte-identical (SHA256
 `45bd138a1faacc4da6110112367c69c0b97e6b07a6d41e8b4d625acc4b68c5fc`):
 
 ```
+...
 hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host
 :: Run1...
 First run errored during --verify, not continuing to a second.
@@ -609,8 +610,14 @@ HERMIT_INTERNAL_FAILURE class=cli-error
 Error: First run during --verify exited with code 255
 ```
 
-The first run stopped, so no second run and no `verify-1.json` comparison
-were produced. Line 28 of the Perl program is
+The first `...` stands for the `hermit: virtual-time epoch=...` line, and the
+second for the lines between the exit status and the Perl error. Each
+attempt's cell directory (`language-runtimes-perl-io-subprocess-time-verify-liteinst`
+and `...-verify-liteinst-attempt-2`) holds a `verify-1.json` with the typed
+failure record: `"verdict": "no_result"`, `"no_result_reason": {"kind":
+"first_run_rejected", "exit_code": 255, ...}`, `"comparison": null` and
+`"guest_exit_code": 255`. The first run was rejected, so no second run and no
+comparison were produced. Line 28 of the Perl program is
 `close $child_output or die "close child stdout: $!"`, the `close()` of the
 pipe that carries `tr`'s output back from `IPC::Open2`. Errno 512 is
 `ERESTARTSYS`, a kernel-internal restart code that must never reach a guest.
