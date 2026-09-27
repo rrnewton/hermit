@@ -47,6 +47,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         "test.recorded_clocks" => Some(&[
             "-p",
             "hermit",
+            "--features",
+            "third-party-backends",
             "--test",
             "record_replay",
             "--test",
@@ -541,6 +543,143 @@ pub(super) fn assert_preparation_dependencies(
     Ok(())
 }
 
+/// The feature every Cargo selection that builds the hermit package enables.
+const CANONICAL_HERMIT_FEATURE: &str = "third-party-backends";
+
+/// Features that leave the code of the uplifted hermit executable unchanged:
+/// the members of the canonical feature, and `kvm-execution-tests`, which
+/// gates only `#[cfg(all(test, feature = "kvm-execution-tests"))]` code in
+/// hermit-cli/src/lib.rs that a normal binary build never compiles.
+/// `kvm-execution-tests` still changes the executable's bytes, because Cargo
+/// hashes the enabled feature list into the crate's build metadata. The
+/// preparation hashes each uplifted file only after its last Cargo selection
+/// (`nextest_binaries::prepare`), so every prepared record still names the
+/// bytes its consumers run.
+const EXECUTABLE_NEUTRAL_HERMIT_FEATURES: &[&str] = &[
+    CANONICAL_HERMIT_FEATURE,
+    "dbt",
+    "sabre",
+    "e9patch",
+    "kvm-execution-tests",
+];
+
+/// Every prepared or official profile must compile the same hermit code into
+/// its uplifted executable.
+///
+/// A preparation builds its selections one after another. Every selection
+/// with an integration-test target also builds the hermit binary, and Cargo
+/// uplifts each such build to the single `target/debug/hermit` path that
+/// `CARGO_BIN_EXE_hermit` names. If two such selections enabled different
+/// executable features, the code every harness runs would depend on which
+/// selection happened to build last. Every hermit selection therefore enables
+/// the canonical feature. Any further feature that changes the executable's
+/// code is accepted only in a selection limited to `--lib`/`--bins` test
+/// harnesses, which Cargo never uplifts. This fixes the code, not the bytes:
+/// see `EXECUTABLE_NEUTRAL_HERMIT_FEATURES`.
+pub(super) fn assert_hermit_selections_carry_canonical_features(
+    cfg: &dagrun::model::DagConfig,
+) -> Result<(), String> {
+    use std::collections::BTreeSet;
+
+    use crate::nextest_binaries::SELECTION_ENV;
+    let mut profiles = BTreeSet::from([
+        "full".to_string(),
+        "portable".to_string(),
+        crate::validation_dag::HOSTED_PORTABLE_LABEL.to_string(),
+    ]);
+    for step in &cfg.steps {
+        let command = execution_command(step)?;
+        if let Some((_, profile)) = command.split_once("./ci/nextest-binaries.rs prepare ") {
+            profiles.insert(profile.to_string());
+        }
+    }
+    for profile in &profiles {
+        let selected = dagrun::select_steps_by_labels(cfg, std::slice::from_ref(profile))
+            .map_err(|error| format!("profile {profile}: {error}"))?;
+        for step in &selected.steps {
+            let Some(raw) = step.env.get(SELECTION_ENV) else {
+                continue;
+            };
+            let args: Vec<String> =
+                serde_json::from_str(raw).map_err(|error| format!("{}: {error}", step.tag()))?;
+            hermit_selection_features(&args).map_err(|reason| {
+                format!(
+                    "{} in profile {profile} {reason}; selection {args:?}",
+                    step.tag()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn hermit_selection_features(args: &[String]) -> Result<(), String> {
+    use std::collections::BTreeSet;
+
+    let values = |options: &[&str]| {
+        args.windows(2)
+            .filter(|pair| options.contains(&pair[0].as_str()))
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>()
+    };
+    let packages = values(&["-p", "--package"]);
+    let builds_hermit = if packages.is_empty() {
+        !values(&["--exclude"]).contains(&"hermit")
+    } else {
+        packages.contains(&"hermit")
+    };
+    if !builds_hermit {
+        return Ok(());
+    }
+    // --all-features would also enable kvm-native-test-support, which
+    // rebuilds reverie-kvm and therefore changes the uplifted executable.
+    if args.iter().any(|arg| arg == "--all-features") {
+        return Err("enables every hermit feature instead of the canonical feature".into());
+    }
+    let features = values(&["-F", "--features"])
+        .into_iter()
+        .flat_map(|value| value.split([',', ' ']))
+        .filter(|feature| !feature.is_empty())
+        .map(|feature| feature.strip_prefix("hermit/").unwrap_or(feature))
+        .collect::<BTreeSet<_>>();
+    if !features.contains(CANONICAL_HERMIT_FEATURE) {
+        return Err(format!(
+            "builds hermit without the canonical {CANONICAL_HERMIT_FEATURE} feature"
+        ));
+    }
+    let executable_features = features
+        .iter()
+        .filter(|feature| !EXECUTABLE_NEUTRAL_HERMIT_FEATURES.contains(feature))
+        .collect::<Vec<_>>();
+    let harness_only = args
+        .iter()
+        .filter(|arg| {
+            matches!(
+                arg.as_str(),
+                "--lib"
+                    | "--bins"
+                    | "--bin"
+                    | "--test"
+                    | "--tests"
+                    | "--all-targets"
+                    | "--example"
+                    | "--examples"
+                    | "--bench"
+                    | "--benches"
+            )
+        })
+        .fold(None, |only, arg| {
+            Some(only.unwrap_or(true) && matches!(arg.as_str(), "--lib" | "--bins" | "--bin"))
+        })
+        .unwrap_or(false);
+    if !executable_features.is_empty() && !harness_only {
+        return Err(format!(
+            "enables executable-changing features {executable_features:?} while building the uplifted hermit binary"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,20 +799,39 @@ mod tests {
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }
-        // The focused preparation remains an ordinary committed producer.
-        // Full preparation must publish last because both use current.json.
-        let focused =
-            crate::nextest_binaries::config_selections(&graph, "recorder-clock-focused").unwrap();
+        // The recorder-clock consumers read the broad preparation, exactly
+        // like the other hermit integration consumers, and their selection
+        // carries the canonical executable feature.
         let clock_args = for_step("test.recorded_clocks")
             .unwrap()
             .iter()
             .map(|arg| (*arg).to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(focused.len(), 1);
-        assert_eq!(focused.values().next(), Some(&clock_args));
-        assert!(!clock_args.iter().any(|arg| arg == "--features"));
-        for suffix in ["", "_in_pinned_root", "_on_host"] {
-            let producer_tag = format!("build.recorded_clocks{suffix}");
+        assert!(
+            clock_args
+                .windows(2)
+                .any(|pair| pair == ["--features", "third-party-backends"])
+        );
+        assert_hermit_selections_carry_canonical_features(&graph).unwrap();
+        for profile in ["full", "portable", "hosted-portable"] {
+            let prepared = crate::nextest_binaries::config_selections(&graph, profile).unwrap();
+            assert_eq!(
+                prepared.get(&crate::nextest_binaries::selection_key(&clock_args)),
+                Some(&clock_args),
+                "{profile} preparation omits the recorder-clock selection"
+            );
+        }
+        // RUN1900 appended the inherited -j flag to the strict prepare
+        // PROFILE interface of a resizable producer. The broad producers that
+        // now prepare these consumers are resizable too, so keep that
+        // regression observable and refused for host, pinned-root and hosted
+        // commands.
+        for (suffix, profile) in [
+            ("", "full"),
+            ("_in_pinned_root", "full"),
+            ("_on_host", "hosted-portable"),
+        ] {
+            let producer_tag = format!("build.workspace{suffix}");
             let producer = graph
                 .steps
                 .iter()
@@ -702,12 +860,8 @@ mod tests {
                         "./ci/nextest-binaries.rs ",
                     )
                     .unwrap(),
-                    ["prepare", "recorder-clock-focused"],
+                    ["prepare", profile],
                 );
-
-                // RUN1900 appended the inherited -j flag to the strict
-                // prepare PROFILE interface. Keep that regression observable
-                // and refused for both host and pinned-root commands.
                 let mut inherited = graph.clone();
                 let changed = inherited
                     .steps
@@ -729,26 +883,10 @@ mod tests {
                 };
                 assert_eq!(error, format!("{producer_tag} {reason}"));
             }
-            let workspace = graph
-                .steps
-                .iter()
-                .find(|step| step.tag() == format!("build.workspace{suffix}"))
-                .unwrap();
-            assert!(
-                workspace
-                    .deps
-                    .contains(&format!("build.recorded_clocks{suffix}"))
-            );
         }
         for (consumer, producer) in [
-            (
-                "test.recorded_clocks",
-                "build.recorded_clocks_in_pinned_root",
-            ),
-            (
-                "test.recorded_clocks_on_host",
-                "build.recorded_clocks_on_host",
-            ),
+            ("test.recorded_clocks", "build.e2e_artifact_in_pinned_root"),
+            ("test.recorded_clocks_on_host", "build.e2e_artifact_on_host"),
         ] {
             let step = graph
                 .steps
@@ -758,6 +896,12 @@ mod tests {
             assert_command_selection(step).unwrap();
             assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "6");
             assert!(step.deps.iter().any(|dependency| dependency == producer));
+            assert!(
+                !step
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency.starts_with("build.recorded_clocks"))
+            );
             let args: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
             assert_eq!(args, clock_args);
             assert!(!dagrun::model::step_width_is_resizable(
@@ -820,18 +964,88 @@ mod tests {
                 }
             }
         }
-        // A consumer with only the focused producer must be covered. Removing
-        // that edge refuses even while broad producers exist elsewhere.
-        // Keep the committed graph here: preparation resolves its label there,
-        // independently of the execution-time --only subgraph.
-        let mut focused_only = graph.clone();
-        focused_only
+        // Dropping the canonical feature from both the declared selection and
+        // the command keeps the command audit and the preparation edge
+        // consistent, so only the executable-feature invariant refuses it.
+        for (replacement, reason) in [
+            (
+                "-p hermit --test record_replay",
+                "builds hermit without the canonical third-party-backends feature",
+            ),
+            (
+                "-p hermit --features third-party-backends,kvm-native-test-support --test record_replay",
+                "enables executable-changing features [\"kvm-native-test-support\"] while building the uplifted hermit binary",
+            ),
+            (
+                "-p hermit --all-features --test record_replay",
+                "enables every hermit feature instead of the canonical feature",
+            ),
+        ] {
+            let mut changed = graph.clone();
+            let step = changed
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == "test.recorded_clocks")
+                .unwrap();
+            let authored = "-p hermit --features third-party-backends --test record_replay";
+            assert_eq!(step.cmd.matches(authored).count(), 1);
+            step.cmd = step.cmd.replace(authored, replacement);
+            let args = shell_words::split(replacement)
+                .unwrap()
+                .into_iter()
+                .chain(["--test".into(), "flock_exclusion".into()])
+                .collect::<Vec<String>>();
+            step.env
+                .insert(SELECTION_ENV.into(), serde_json::to_string(&args).unwrap());
+            assert_command_selection(step).unwrap();
+            assert_preparation_dependencies(&changed).unwrap();
+            assert_eq!(
+                assert_hermit_selections_carry_canonical_features(&changed).unwrap_err(),
+                format!("test.recorded_clocks in profile full {reason}; selection {args:?}"),
+            );
+        }
+        let selection = |args: &[&str]| {
+            hermit_selection_features(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+        };
+        selection(&["-p", "hermit-detcore", "--lib", "--bins"]).unwrap();
+        selection(&["--workspace", "--exclude", "hermit"]).unwrap();
+        selection(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends,kvm-execution-tests",
+            "--lib",
+            "--test",
+            "cli",
+        ])
+        .unwrap();
+        selection(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends,kvm-native-test-support",
+            "--lib",
+            "--bins",
+        ])
+        .unwrap();
+        selection(&["--workspace"]).unwrap_err();
+        selection(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends,kvm-native-test-support",
+        ])
+        .unwrap_err();
+        // Removing the only edge to the broad producer refuses even while that
+        // producer exists elsewhere in the committed graph.
+        let mut unprepared = graph.clone();
+        unprepared
             .steps
             .sort_by_key(|step| step.tag() != "test.recorded_clocks_on_host");
-        focused_only.steps[0].deps = vec!["build.recorded_clocks_on_host".into()];
-        assert_preparation_dependencies(&focused_only).unwrap();
-        focused_only.steps[0].deps.clear();
-        let error = assert_preparation_dependencies(&focused_only).unwrap_err();
+        unprepared.steps[0].deps = vec!["build.e2e_artifact_on_host".into()];
+        assert_preparation_dependencies(&unprepared).unwrap();
+        unprepared.steps[0].deps.clear();
+        let error = assert_preparation_dependencies(&unprepared).unwrap_err();
         assert!(
             error.starts_with("test.recorded_clocks_on_host")
                 && error.contains("same filesystem root"),
