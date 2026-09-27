@@ -60,22 +60,22 @@ repository = "https://github.com/facebookexperimental/hermit"
 opt-level = 3
 
 # ab1 A/B ONLY (local, never pushed): build the reverie crates from the
-# unmerged ERESTART* fix c838d5d0 (ab4: b0ede531 + cherry-pick of 7a505332..54961963).
+# unmerged ERESTART* fix 67b9688e (ab3-round3: b0ede531 + cherry-pick of 6297f715..40bbccbe).
 [patch."https://github.com/rrnewton/reverie.git"]
-nostd-print = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-core = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-dbt = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-kvm = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-liteinst = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-memory = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-preload = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-process = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-ptrace = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-rpc = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-rpc-macros = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-rpc-transport = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-sabre = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-sabre-macros = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-sabre-stats = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-reverie-syscalls = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
-safeptrace = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "c838d5d02a9ed5619e814e1d706b9e60d26a7ad6" }
+nostd-print = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-core = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-dbt = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-kvm = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-liteinst = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-memory = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-preload = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-process = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-ptrace = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-rpc = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-rpc-macros = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-rpc-transport = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-sabre = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-sabre-macros = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-sabre-stats = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+reverie-syscalls = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
+safeptrace = { git = "file:///home/newton/work/dev-hermit/hermit/.git/worktrees/liteinst-restart-19553a64/modules/reverie", rev = "67b9688e3094bf796b7ce12c0761453dd4d21d9f" }
