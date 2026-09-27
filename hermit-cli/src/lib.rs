@@ -2541,18 +2541,18 @@ async fn run_with_backend_inner(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
-    with_run_deadline(timeout, async {
-        dispatch_backend(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            backend,
-            None,
-        )
-        .await
-    })
-    .await
+    // Keep the large backend future off the container supervisor's stack
+    // before the deadline and Tokio wrappers capture it. Polling and dropping
+    // stay inline, including the backend teardown on timeout.
+    let guest = Box::pin(dispatch_backend(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    ));
+    with_run_deadline(timeout, guest).await
 }
 
 async fn dispatch_backend(
