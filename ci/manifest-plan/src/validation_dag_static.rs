@@ -269,7 +269,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 810 + 2 = 812.
     // Seven failed-syscall display controls retain all 812 prior identities:
     // 812 + 7 = 819.
-    ("test.detcore_unit", 819),
+    // Five failed-gettimeofday tv-store tests retain all 819 prior identities:
+    // 819 + 5 = 824.
+    ("test.detcore_unit", 824),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -303,7 +305,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 819),
+    ("test.detcore_unit_on_host", 824),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 757),
