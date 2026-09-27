@@ -490,6 +490,13 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
+        self.record_read_result(guest, syscall, result);
+        result
+    }
+
+    pub(super) fn record_read_result<G: Guest<Self>>(
+        &self, guest: &mut G, syscall: Read, result: Result<i64, Errno>,
+    ) {
         self.record_event(
             guest,
             result.and_then(|length| {
@@ -508,7 +515,6 @@ impl Recorder {
             }),
         );
 
-        result
     }
 
     pub(super) async fn handle_pread64<G: Guest<Self>>(

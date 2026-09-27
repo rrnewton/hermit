@@ -763,6 +763,12 @@ impl Replayer {
         syscall: Read,
     ) -> Result<i64, Error> {
         let event = next_event!(guest, ReadV2)?;
+        self.apply_read_event(guest, syscall, event).await
+    }
+
+    pub(super) async fn apply_read_event<G: Guest<Self>>(
+        &self, guest: &mut G, syscall: Read, event: crate::event::ReadEvent,
+    ) -> Result<i64, Error> {
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
                 let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
