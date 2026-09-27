@@ -9,7 +9,7 @@
 //! Deterministic scheduling algorithm.
 
 #[cfg(test)]
-mod exec_teardown_tests;
+pub(crate) mod exec_teardown_tests;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;

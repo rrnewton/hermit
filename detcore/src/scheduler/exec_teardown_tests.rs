@@ -104,6 +104,34 @@ fn retirement_records(tids: &[DetTid], process: DetPid) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn in_isolated_log_test(module: &str, name: &str) -> bool {
+    const CHILD_TEST: &str = "HERMIT_EXEC_TEARDOWN_LOG_TEST";
+    let module = module.split_once("::").unwrap().1;
+    let test = format!("{module}::{name}");
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test.as_str()) {
+        return true;
+    }
+    // Tracing caches callsite interest process-wide. Parallel tests can visit
+    // the same scheduler callsite with NoSubscriber while our thread-local
+    // capture is being registered, caching `never` and losing real records.
+    // Run this exact oracle once in its own process; do not serialize the
+    // library suite, retry it, or replace the production INFO event with a
+    // test-only observation.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture"])
+        .env(CHILD_TEST, &test)
+        .output()
+        .expect("launch isolated exec teardown log test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "isolated test {test} did not pass exactly once: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    false
+}
+
 #[test]
 fn nonleader_exec_transfers_child_wait_owner_without_changing_wait_class() {
     for preserves_state in [false, true] {
@@ -254,6 +282,12 @@ fn exec_wait_owner_transfer_preserves_other_parents_and_creation_lineage() {
 
 #[test]
 fn exec_teardown_orders_real_retirements_for_all_hook_permutations() {
+    if !in_isolated_log_test(
+        module_path!(),
+        "exec_teardown_orders_real_retirements_for_all_hook_permutations",
+    ) {
+        return;
+    }
     for caller in [DetTid::from_raw(17), DetTid::from_raw(19)] {
         for order in [
             [0, 1, 2],
@@ -321,6 +355,12 @@ fn exec_teardown_orders_real_retirements_for_all_hook_permutations() {
 
 #[test]
 fn exec_teardown_abort_retires_only_observed_siblings_in_fixed_order() {
+    if !in_isolated_log_test(
+        module_path!(),
+        "exec_teardown_abort_retires_only_observed_siblings_in_fixed_order",
+    ) {
+        return;
+    }
     for order in [[18, 23], [23, 18]] {
         let (mut sched, process, mm) = group();
         assert!(sched.prepare_exec_teardown(process, process, mm));

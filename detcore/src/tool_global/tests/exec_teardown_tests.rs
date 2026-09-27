@@ -171,6 +171,12 @@ impl tracing::Subscriber for InfoRecords {
 
 #[tokio::test]
 async fn cancelled_transferred_exec_retires_unobserved_peer_before_late_callback() {
+    if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+        module_path!(),
+        "cancelled_transferred_exec_retires_unobserved_peer_before_late_callback",
+    ) {
+        return;
+    }
     let early_peer = DetTid::from_raw(23);
     let late_peer = DetTid::from_raw(18);
     let (state, time) = state(&[LEADER, WORKER, early_peer, late_peer]);
