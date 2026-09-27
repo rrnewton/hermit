@@ -20,6 +20,14 @@ use super::kvm_cancellation::bounded_read;
 
 const MIB: u64 = 1024 * 1024;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Scenario {
+    Original,
+    ExitOnly,
+    Preempted,
+    RunnableLeader,
+}
+
 fn assert_pmu_handoffs(log: &str, stdout: &str) {
     let identity =
         Regex::new(r"(?m)^before round=(\d+) pid=(\d+) worker=(\d+) peer=(\d+)$").unwrap();
@@ -81,14 +89,110 @@ fn assert_pmu_handoffs(log: &str, stdout: &str) {
 }
 
 pub(super) fn run() {
-    run_fixture(false);
+    run_fixture(Scenario::Original);
 }
 
 pub(super) fn run_exit_only() {
-    run_fixture(true);
+    run_fixture(Scenario::ExitOnly);
 }
 
-fn run_fixture(exit_only: bool) {
+pub(super) fn run_preempted() {
+    run_fixture(Scenario::Preempted);
+}
+
+pub(super) fn run_runnable_leader() {
+    run_fixture(Scenario::RunnableLeader);
+}
+
+fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
+    let identity =
+        Regex::new(r"(?m)^before round=(\d+) pid=(\d+) worker=(\d+) peer=(\d+)$").unwrap();
+    let identities: Vec<_> = identity.captures_iter(stdout).collect();
+    assert_eq!(identities.len(), 2);
+    let lines: Vec<_> = log.lines().collect();
+    let mut previous_handoff = 0;
+    for identity in identities {
+        let leader = &identity[2];
+        let worker = &identity[3];
+        let exec = lines
+            .iter()
+            .position(|line| {
+                line.contains(&format!(
+                    "[detcore, dtid {worker}] inbound syscall: execve("
+                ))
+            })
+            .expect("the identified worker actually execs");
+        let after_clock = exec
+            + 1
+            + lines[exec + 1..]
+                .iter()
+                .position(|line| line.contains(&format!("[dtid {leader}] updated rcb clock,")))
+                .expect("replacement starts accounting the survivor's clock");
+        let ending = |tid: &str| format!("[detcore, dtid {tid}] ending timeslice T");
+        let number = |line: &str, tid: &str| {
+            line.split_once(&ending(tid))
+                .unwrap()
+                .1
+                .split_once('.')
+                .unwrap()
+                .0
+                .parse::<u64>()
+                .unwrap()
+        };
+        let before = lines[..after_clock]
+            .iter()
+            .rfind(|line| line.contains(&ending(worker)))
+            .expect("worker ends a real timeslice before takeover");
+        let after = lines[after_clock..]
+            .iter()
+            .find(|line| line.contains(&ending(leader)))
+            .expect("replacement ends the next timeslice");
+        assert_eq!(
+            number(after, leader),
+            number(before, worker) + 1,
+            "timeslice numbering survives takeover: {before}\n{after}"
+        );
+        let timer = |tid: &str| format!("[detcore, dtid {tid}] inbound timer preemption event");
+        assert!(
+            lines[previous_handoff..exec]
+                .iter()
+                .any(|line| line.contains(&timer(worker))),
+            "worker must receive an actual PMU timer before exec"
+        );
+        let next_exec = lines[after_clock..]
+            .iter()
+            .position(|line| line.contains("inbound syscall: execve("))
+            .map_or(lines.len(), |offset| after_clock + offset);
+        assert!(
+            lines[after_clock..next_exec]
+                .iter()
+                .any(|line| line.contains(&timer(leader))),
+            "replacement must receive an actual PMU timer after exec"
+        );
+        if runnable_leader {
+            let spin_start = previous_handoff
+                + lines[previous_handoff..exec]
+                    .iter()
+                    .position(|line| {
+                        line.contains(&format!(
+                            "[detcore, dtid {leader}] inbound syscall: getppid("
+                        ))
+                    })
+                    .expect("the displaced leader actually entered its runnable spin");
+            assert!(
+                lines[spin_start..exec]
+                    .iter()
+                    .any(|line| line.contains(&timer(leader))),
+                "the displaced leader's spin must be preempted"
+            );
+        }
+        previous_handoff = after_clock;
+    }
+}
+
+fn run_fixture(scenario: Scenario) {
+    let exit_only = scenario == Scenario::ExitOnly;
+    let preempted = matches!(scenario, Scenario::Preempted | Scenario::RunnableLeader);
     let _lock = super::hermit_run_guard();
     let start = Instant::now();
     let remaining = || {
@@ -97,10 +201,11 @@ fn run_fixture(exit_only: bool) {
             .expect("the complete regression must fit the existing 57-second test budget")
     };
     fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).expect("fixture parent");
-    let prefix = if exit_only {
-        "ptrace-nonleader-exec-exit-"
-    } else {
-        "ptrace-nonleader-exec-"
+    let prefix = match scenario {
+        Scenario::Original => "ptrace-nonleader-exec-",
+        Scenario::ExitOnly => "ptrace-nonleader-exec-exit-",
+        Scenario::Preempted => "ptrace-nonleader-exec-preempted-",
+        Scenario::RunnableLeader => "ptrace-nonleader-exec-runnable-",
     };
     let root = tempfile::Builder::new()
         .prefix(prefix)
@@ -122,23 +227,24 @@ fn run_fixture(exit_only: bool) {
     fs::copy(&fixture, root.join("guest.c")).expect("retain exact fixture");
     let guest = root.join("program");
     let compile = root.join("compile");
-    let status = bounded_command_with_timeout(
-        Command::new("cc")
-            .args([
-                "-std=gnu11",
-                "-O0",
-                "-g",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-pthread",
-            ])
-            .arg(&fixture)
-            .arg("-o")
-            .arg(&guest),
-        &compile,
-        remaining(),
-    );
+    let mut compiler = Command::new("cc");
+    compiler.args([
+        "-std=gnu11",
+        "-O0",
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-pthread",
+    ]);
+    if preempted {
+        compiler.arg("-DNONLEADER_EXEC_PREEMPT");
+    }
+    if scenario == Scenario::RunnableLeader {
+        compiler.arg("-DNONLEADER_EXEC_RUNNABLE_LEADER");
+    }
+    compiler.arg(&fixture).arg("-o").arg(&guest);
+    let status = bounded_command_with_timeout(&mut compiler, &compile, remaining());
     assert!(
         status.success(),
         "fixture compilation failed: {}",
@@ -150,7 +256,7 @@ fn run_fixture(exit_only: bool) {
         let logs = directory.join("verify-logs");
         fs::create_dir_all(&logs).unwrap();
         let report_path = directory.join("verification.json");
-        let args = [
+        let mut args = vec![
             "--log=trace",
             "run",
             "--backend=ptrace",
@@ -160,7 +266,11 @@ fn run_fixture(exit_only: bool) {
             "--tmp=/tmp",
             "--strict",
             "--epoch=2026-01-01T00:00:00.123456789+00:00",
-            "--max-timeslice=200000000",
+            if preempted {
+                "--max-timeslice=1000000"
+            } else {
+                "--max-timeslice=200000000"
+            },
             "--verify",
             "--verify-strict",
             "--verify-json",
@@ -171,6 +281,13 @@ fn run_fixture(exit_only: bool) {
             "--",
             guest.to_str().unwrap(),
         ];
+        if preempted {
+            // The default 1k margin saw 1,440 branches of total skid here;
+            // 10k exceeded the TRACE cap, and 4k left no log headroom. Notify
+            // 3,072 branches early (>2.1x that observation). This changes
+            // neither the exact target nor refusal of any future overshoot.
+            args.insert(8, "--skid-margin=3072");
+        }
         let mut command = super::hermit_command(&args);
         command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
         let status = bounded_command_with_timeout(&mut command, &directory, remaining());
@@ -257,6 +374,9 @@ fn run_fixture(exit_only: bool) {
             let log = String::from_utf8(bounded_read(&matches[0], 64 * MIB)).unwrap();
             if !exit_only {
                 assert_pmu_handoffs(&log, stdout);
+            }
+            if preempted {
+                assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
             }
         }
         previous_stdout = Some(output);

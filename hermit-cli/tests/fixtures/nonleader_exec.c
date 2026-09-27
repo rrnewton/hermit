@@ -32,6 +32,9 @@ static int round_number, ready_fd, ack_fd;
 static pid_t peer_tid;
 static uint64_t previous_time;
 static int leader_waiting;
+#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
+static int leader_spinning;
+#endif
 
 static pid_t my_tid(void) { return (pid_t)syscall(SYS_gettid); }
 static pid_t my_pid(void) { return (pid_t)syscall(SYS_getpid); }
@@ -59,12 +62,26 @@ static unsigned char byte_read(int fd) {
 static uint64_t samples(const char *phase, int round, uint64_t previous) {
   for (unsigned index = 0; index < SAMPLES; ++index) {
     volatile uint64_t work = 1;
+#ifdef NONLEADER_EXEC_PREEMPT
+    /* The small-timeslice variants must execute enough actual branches for a
+     * PMU timer, not merely yield when a syscall advances logical time. */
+    /* A branch costs 10ns: 120k actual branches exceed the 100k-RCB timer at
+     * 1ms. Compact work bounds precise-timer single-step TRACE output. */
+    uint64_t iterations = index == 0 ? 120000 : 2000 + index * 200;
+    uint64_t remaining = iterations;
+    /* LOOP decrements RCX and conditionally branches in one instruction. The
+     * read/write RCX constraint makes the finite counter visible to C. */
+    __asm__ volatile("1: loop 1b" : "+c"(remaining));
+    CHECK(remaining == 0);
+    work += 3 * (iterations - remaining);
+#else
     for (unsigned i = 0; i < 10000 + index * 1000; ++i) {
       if (i & 1)
         work = work * 3 + i;
       else
         work ^= i + 17;
     }
+#endif
     struct timespec now;
     CHECK(syscall(SYS_clock_gettime, CLOCK_REALTIME, &now) == 0);
     CHECK(now.tv_sec >= 0 && now.tv_nsec >= 0 && now.tv_nsec < 1000000000);
@@ -93,9 +110,16 @@ static void *exec_worker(void *unused) {
   CHECK(pthread_mutex_lock(&mutex) == 0);
   while (!peer_tid)
     CHECK(pthread_cond_wait(&ready, &mutex) == 0);
+  CHECK(leader_waiting);
+#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
+  /* The leader first executes a branch-heavy spin, then releases this worker.
+   * After that release it remains runnable until the kernel destroys it. */
+  while (!leader_spinning)
+    CHECK(pthread_cond_wait(&ready, &mutex) == 0);
+#else
   /* Obtaining this mutex proves the leader and peer released it in cond_wait.
    * Keep it locked through exec, so even a spurious wake cannot let either run. */
-  CHECK(leader_waiting);
+#endif
   pid_t pid = my_pid(), worker = my_tid();
   CHECK(pid != worker && pid != peer_tid && worker != peer_tid);
   CHECK(syscall(SYS_tgkill, pid, pid, 0) == 0);
@@ -126,8 +150,28 @@ static void start_round(void) {
   CHECK(pthread_create(&peer, NULL, park_peer, NULL) == 0);
   CHECK(pthread_create(&worker, NULL, exec_worker, NULL) == 0);
   leader_waiting = 1;
+#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
+  CHECK(pthread_mutex_unlock(&mutex) == 0);
+  int announced = 0;
+  CHECK(syscall(SYS_getppid) > 0);
+  for (;;) {
+    /* Compact actual branches keep precise-timer single-step TRACE output
+     * bounded. After the one release this leader executes no blocking calls. */
+    uint64_t iterations = 120000;
+    __asm__ volatile("1: loop 1b" : "+c"(iterations));
+    CHECK(iterations == 0);
+    if (!announced) {
+      CHECK(pthread_mutex_lock(&mutex) == 0);
+      leader_spinning = 1;
+      CHECK(pthread_cond_signal(&ready) == 0);
+      CHECK(pthread_mutex_unlock(&mutex) == 0);
+      announced = 1;
+    }
+  }
+#else
   for (;;)
     CHECK(pthread_cond_wait(&parked, &mutex) == 0);
+#endif
 }
 
 int main(int argc, char **argv) {
