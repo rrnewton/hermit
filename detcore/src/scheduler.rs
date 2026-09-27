@@ -1033,6 +1033,19 @@ impl ThreadTree {
         self.process_parent.get(pid).copied()
     }
 
+    /// Preserve a surviving exec task's children when Linux replaces its TID
+    /// with the process leader's. The creation tree remains historical; only
+    /// the current task identity used by `__WNOTHREAD` changes. Scope the move
+    /// to this effective parent so retained records from an older use of the
+    /// same raw TID and `CLONE_PARENT` children keep their own wait identities.
+    fn transfer_exec_wait_owner(&mut self, process: DetPid, former: DetTid, leader: DetTid) {
+        for metadata in self.process_wait.values_mut() {
+            if metadata.wait_parent == Some(process) && metadata.wait_owner == former {
+                metadata.wait_owner = leader;
+            }
+        }
+    }
+
     pub fn process_group(&self, pid: DetPid) -> Option<DetPid> {
         self.process_wait
             .get(&pid)
@@ -2376,6 +2389,9 @@ impl Scheduler {
             self.remove_exec_vfork_barriers(&siblings);
             return siblings;
         }
+
+        self.thread_tree
+            .transfer_exec_wait_owner(detpid, caller, new_leader);
 
         let survivor_priority = match replay_resume {
             Some((next_tid, _)) if next_tid == new_leader => REPLAY_FOREGROUND_PRIORITY,

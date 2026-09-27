@@ -105,6 +105,154 @@ fn retirement_records(tids: &[DetTid], process: DetPid) -> Vec<String> {
 }
 
 #[test]
+fn nonleader_exec_transfers_child_wait_owner_without_changing_wait_class() {
+    for preserves_state in [false, true] {
+        let (mut sched, process, mm) = group();
+        let caller = DetTid::from_raw(19);
+        let normal = DetPid::from_raw(41);
+        let clone_child = DetPid::from_raw(42);
+        let leader_child = DetPid::from_raw(31);
+        for (child, exit_signal) in [(normal, libc::SIGCHLD), (clone_child, 0)] {
+            sched
+                .thread_tree
+                .add_child_with_wait_metadata(caller, child, true, false, exit_signal);
+            sched.logically_exited_processes.insert(child);
+        }
+        let wait = |child, owner, exit_class| ChildWaitSpec {
+            selector: ChildWaitSelector::Exact(child),
+            owner,
+            exit_class,
+        };
+        for child in [normal, clone_child] {
+            assert_eq!(
+                sched
+                    .ready_child_wait(process, wait(child, Some(caller), ChildWaitExitClass::Any),),
+                Some(child),
+            );
+            assert!(!sched.has_child_wait_target(
+                process,
+                wait(child, Some(process), ChildWaitExitClass::Any),
+            ));
+        }
+
+        assert!(sched.prepare_exec_teardown(caller, process, mm));
+        let args = ExecReconnect {
+            caller,
+            new_leader: process,
+            detpid: process,
+            pre_exec_mm: mm,
+            post_exec_mm: mm.for_exec(process),
+            child_tid_addr: 0,
+            reconnect_priority: None,
+        };
+        let before = (sched.turn, sched.committed_time);
+        if preserves_state {
+            sched.reconnect_transferred_exec(args);
+        } else {
+            sched.reconnect_after_exec(args);
+        }
+        assert_eq!((sched.turn, sched.committed_time), before);
+
+        for (child, class, excluded) in [
+            (
+                normal,
+                ChildWaitExitClass::Sigchld,
+                ChildWaitExitClass::Clone,
+            ),
+            (
+                clone_child,
+                ChildWaitExitClass::Clone,
+                ChildWaitExitClass::Sigchld,
+            ),
+        ] {
+            assert_eq!(
+                sched.ready_child_wait(process, wait(child, Some(process), class)),
+                Some(child),
+                "the replacement task retains the survivor's waitable child",
+            );
+            assert_eq!(
+                sched.ready_child_wait(process, wait(child, None, class)),
+                Some(child),
+                "process-wide wait selection remains unchanged",
+            );
+            assert!(!sched.has_child_wait_target(process, wait(child, Some(caller), class)));
+            assert!(!sched.has_child_wait_target(process, wait(child, Some(process), excluded),));
+            assert_eq!(sched.thread_tree.parent_process(&child), Some(process));
+        }
+        assert!(sched.has_child_wait_target(
+            process,
+            wait(leader_child, Some(process), ChildWaitExitClass::Sigchld),
+        ));
+        assert_eq!(
+            sched.ready_child_wait(
+                process,
+                wait(leader_child, Some(process), ChildWaitExitClass::Sigchld),
+            ),
+            None,
+            "changing ownership must not make a live child ready",
+        );
+    }
+}
+
+#[test]
+fn exec_wait_owner_transfer_preserves_other_parents_and_creation_lineage() {
+    let mut tree = ThreadTree::default();
+    let root = DetPid::from_raw(1);
+    let process = DetPid::from_raw(17);
+    let former = DetTid::from_raw(19);
+    let leader_child = DetPid::from_raw(31);
+    let own_child = DetPid::from_raw(41);
+    let grandchild = DetPid::from_raw(42);
+    let clone_parent_child = DetPid::from_raw(43);
+    let other_parent = DetPid::from_raw(51);
+    let older_child = DetPid::from_raw(52);
+    tree.add_child(root, root, true);
+    tree.add_child(root, other_parent, true);
+    tree.add_child(other_parent, former, false);
+    tree.add_child(former, older_child, true);
+    // ThreadTree retains old creation edges when a raw TID is registered in
+    // another process. Its earlier child's effective parent remains distinct.
+    tree.add_child(root, process, true);
+    tree.add_child(process, former, false);
+    tree.add_child(process, leader_child, true);
+    tree.add_child(former, own_child, true);
+    tree.add_child(own_child, grandchild, true);
+    tree.add_child_with_wait_metadata(former, clone_parent_child, true, true, libc::SIGCHLD);
+    assert!(tree.set_process_group(own_child, DetPid::from_raw(77)));
+    assert!(tree.create_session(clone_parent_child));
+    let before = tree.clone();
+
+    tree.transfer_exec_wait_owner(process, former, process);
+
+    assert_eq!(tree.process_wait[&own_child].wait_owner, process);
+    assert_eq!(tree.process_wait[&leader_child].wait_owner, process);
+    assert_eq!(tree.process_wait[&older_child].wait_owner, former);
+    assert_eq!(tree.process_wait[&clone_parent_child].wait_owner, root);
+    assert_eq!(tree.process_wait[&grandchild].wait_owner, own_child);
+    assert_eq!(tree.process_parent, before.process_parent);
+    assert_eq!(tree.tree, before.tree);
+    assert_eq!(tree.thread_to_leader, before.thread_to_leader);
+    assert_eq!(tree.process_wait.len(), before.process_wait.len());
+    for (child, metadata) in &tree.process_wait {
+        let previous = before.process_wait[child];
+        assert_eq!(
+            (
+                metadata.wait_parent,
+                metadata.exit_signal,
+                metadata.process_group,
+                metadata.session,
+            ),
+            (
+                previous.wait_parent,
+                previous.exit_signal,
+                previous.process_group,
+                previous.session,
+            ),
+        );
+    }
+}
+
+#[test]
 fn exec_teardown_orders_real_retirements_for_all_hook_permutations() {
     for caller in [DetTid::from_raw(17), DetTid::from_raw(19)] {
         for order in [
