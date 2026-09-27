@@ -30,6 +30,9 @@ mod kvm_signal_retirement;
 #[path = "common/kvm_synchronous_fault.rs"]
 mod kvm_synchronous_fault;
 
+#[path = "common/kvm_waitid_copyout.rs"]
+mod kvm_waitid_copyout;
+
 // Its runtime-staging helpers are used only by the LiteInst run tests, which
 // a build without the `liteinst` feature leaves out.
 #[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
@@ -13508,4 +13511,14 @@ fn run_kvm_synchronous_root_segv_preserves_guest_exit() {
 #[test]
 fn run_kvm_synchronous_orphan_segv_preserves_root_success() {
     kvm_synchronous_fault::run_orphan();
+}
+
+#[test]
+fn run_kvm_waitid_terminal_copyout_preserves_arenas_and_child_lifecycle() {
+    kvm_waitid_copyout::run("terminal");
+}
+
+#[test]
+fn run_kvm_waitid_error_copyout_preserves_arenas_and_interrupt_precedence() {
+    kvm_waitid_copyout::run("errors");
 }
