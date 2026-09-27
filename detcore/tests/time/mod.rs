@@ -110,6 +110,169 @@ fn tod_gettimeofday() {
     );
 }
 
+// Distinct from every virtual or host time these tests can observe (2020-06-20).
+const SENTINEL_TV: libc::timeval = libc::timeval {
+    tv_sec: 0x5eed_5eed,
+    tv_usec: 424_242,
+};
+
+// Upper bound on how far past the epoch the virtual clock may be during the
+// faulting-gettimeofday tests. Host wall-clock time is months past the default
+// epoch, so this only has to separate virtual from host time.
+const MAX_VIRTUAL_OFFSET_MICROS: i64 = 1_000_000;
+
+fn timeval_micros(tv: &libc::timeval) -> i64 {
+    tv.tv_sec * 1_000_000 + tv.tv_usec
+}
+
+/// Issues the raw syscall, so no vDSO path can bypass the tracer, and returns
+/// its result with `errno` (zero on success).
+fn raw_gettimeofday(tv: *mut libc::timeval, tz: *mut libc::c_void) -> (i64, i32) {
+    let ret = unsafe { libc::syscall(libc::SYS_gettimeofday, tv, tz) };
+    let errno = if ret == -1 {
+        unsafe { *libc::__errno_location() }
+    } else {
+        0
+    };
+    (ret, errno)
+}
+
+fn successful_gettimeofday() -> libc::timeval {
+    let mut tv = SENTINEL_TV;
+    assert_eq!(raw_gettimeofday(&mut tv, ptr::null_mut()), (0, 0));
+    tv
+}
+
+/// Maps `count` fresh read-write anonymous pages and returns their base and
+/// the page size.
+fn map_pages(count: usize) -> (*mut u8, usize) {
+    let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let base = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            count * page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(base, libc::MAP_FAILED);
+    (base.cast(), page_size)
+}
+
+#[test]
+/// Linux copies `tv` to user memory before `tz` and reports EFAULT if the `tz`
+/// copy faults, so the host has already stored its wall clock in `tv` when the
+/// call fails. The guest must still observe virtual time there: each failed
+/// call's `tv` must lie between the successful virtual reads around it.
+fn tod_gettimeofday_faulting_tz_writes_virtual_tv() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch_micros = config.epoch.timestamp_micros();
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let (readonly, page_size) = map_pages(1);
+            assert_eq!(
+                unsafe { libc::mprotect(readonly.cast(), page_size, libc::PROT_READ) },
+                0
+            );
+            // Address 1 is below mmap_min_addr, so it can never be mapped.
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+
+            let mut unmapped_tz_tv = SENTINEL_TV;
+            let mut readonly_tz_tv = SENTINEL_TV;
+            let before = successful_gettimeofday();
+            let unmapped_tz = raw_gettimeofday(&mut unmapped_tz_tv, unmapped);
+            let between = successful_gettimeofday();
+            let readonly_tz = raw_gettimeofday(&mut readonly_tz_tv, readonly.cast());
+            let after = successful_gettimeofday();
+
+            assert_eq!(unmapped_tz, (-1, libc::EFAULT));
+            assert_eq!(readonly_tz, (-1, libc::EFAULT));
+            let offsets = [before, unmapped_tz_tv, between, readonly_tz_tv, after]
+                .map(|tv| timeval_micros(&tv) - epoch_micros);
+            assert!(
+                offsets.is_sorted() && offsets[0] >= 0 && offsets[4] < MAX_VIRTUAL_OFFSET_MICROS,
+                "microseconds past the virtual epoch for [ok, unmapped tz, ok, read-only tz, ok]: \
+                 {offsets:?}"
+            );
+
+            // A faulting `tv` fails before anything is stored.
+            assert_eq!(
+                raw_gettimeofday(unmapped.cast(), ptr::null_mut()),
+                (-1, libc::EFAULT)
+            );
+            assert_eq!(unsafe { libc::munmap(readonly.cast(), page_size) }, 0);
+        },
+        config,
+        true,
+    );
+}
+
+#[test]
+/// When `tv` itself faults, Linux stores whole words up to the first unwritable
+/// one: a `tv` on a read-only page is left untouched, and a `tv` whose
+/// `tv_usec` lies on a read-only page receives only `tv_sec`. That `tv_sec`
+/// must be virtual, and nothing may be stored in the read-only page.
+fn tod_gettimeofday_faulting_tv_respects_page_protection() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let (pages, page_size) = map_pages(2);
+            let readonly = unsafe { pages.add(page_size) };
+            let readonly_tv = readonly.cast::<libc::timeval>();
+            // `tv_sec` is the last word of the writable page and `tv_usec` the
+            // first word of the read-only page, i.e. `readonly_tv.tv_sec`.
+            let straddling_tv = unsafe { readonly.sub(8) }.cast::<libc::timeval>();
+            unsafe {
+                readonly_tv.write(SENTINEL_TV);
+                (*straddling_tv).tv_sec = SENTINEL_TV.tv_sec;
+            }
+            assert_eq!(
+                unsafe { libc::mprotect(readonly.cast(), page_size, libc::PROT_READ) },
+                0
+            );
+            let readonly_page = || {
+                let tv = unsafe { readonly_tv.read() };
+                (tv.tv_sec, tv.tv_usec)
+            };
+            let sentinel = (SENTINEL_TV.tv_sec, SENTINEL_TV.tv_usec);
+
+            assert_eq!(
+                raw_gettimeofday(readonly_tv, ptr::null_mut()),
+                (-1, libc::EFAULT)
+            );
+            assert_eq!(readonly_page(), sentinel, "read-only tv was written");
+
+            let before = successful_gettimeofday();
+            let straddling = raw_gettimeofday(straddling_tv, ptr::null_mut());
+            let after = successful_gettimeofday();
+            assert_eq!(straddling, (-1, libc::EFAULT));
+            let stored_sec = unsafe { (*straddling_tv).tv_sec };
+            assert!(
+                (before.tv_sec..=after.tv_sec).contains(&stored_sec),
+                "straddling tv_sec {stored_sec} is outside the virtual seconds {}..={}",
+                before.tv_sec,
+                after.tv_sec,
+            );
+            assert_eq!(
+                readonly_page(),
+                sentinel,
+                "straddling tv wrote into the read-only page"
+            );
+            assert_eq!(unsafe { libc::munmap(pages.cast(), 2 * page_size) }, 0);
+        },
+        config,
+        true,
+    );
+}
+
 fn raw_getimeofday_delta() {
     let dt1 = {
         let mut tp: MaybeUninit<libc::timeval> = MaybeUninit::uninit();
