@@ -18,11 +18,14 @@ fi
 pointer=${HERMIT_E2E_ARTIFACT_POINTER:-$ROOT_DIR/target/ci/hermit-e2e-artifact.path}
 bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")
 export HERMIT_BIN="$bundle/hermit"
-if [[ -d $bundle/install ]]; then
-    export HERMIT_INSTALL_DIR="$bundle/install"
-elif ((require_install)); then
+# A runtime-only bundle also has install/, holding just the unwind closure, so
+# the verified kind (bound into the identity) decides, not the directory.
+if ((require_install)) && [[ $(<"$bundle/kind") != complete ]]; then
     echo "run-with-hermit-e2e-artifact.sh: consumer requires a complete resource bundle: $bundle" >&2
     exit 2
+fi
+if [[ -d $bundle/install ]]; then
+    export HERMIT_INSTALL_DIR="$bundle/install"
 else
     unset HERMIT_INSTALL_DIR
 fi
