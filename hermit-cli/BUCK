@@ -96,6 +96,7 @@ rust_binary(
     ]),
     deps = [
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
@@ -201,6 +202,7 @@ rust_binary(
     # target. CI resolves the default declared pkg-config dependency.
     deps = [release_lzma_target, release_unwind_target] + [
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
