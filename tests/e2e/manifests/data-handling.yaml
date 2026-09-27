@@ -26,10 +26,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
           sabre: The exec socket is fixed, but SaBRe strict verification intermittently diverges in shell PATH lookup and multi-exec DETLOG ordering
       replay:
         ci: false
@@ -145,13 +145,14 @@ test:
         ci:
           ptrace: true
           kvm: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe jq qualification is tracked by backend compatibility
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []

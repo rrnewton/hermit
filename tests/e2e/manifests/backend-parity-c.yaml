@@ -5426,6 +5426,7 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         guest_args:
           ptrace:
             - workdir
@@ -5439,7 +5440,6 @@ test:
           dbt: DBT does not enter the per-cell /test mount namespace
           kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
           sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
-          liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: native execution cannot apply Hermit environment or mount controls.'
@@ -6389,11 +6389,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: The DynamoRIO (DBT) backend is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake), so no witness could be recorded; qualify DBT separately once it builds
           kvm: KVM livelocks at guest startup on the current host, so no witness could be recorded; qualify KVM separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
-          liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary on the current host; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: "NOT-EXERCISED (by design): native variation is the premise measured by this guest, not a stable naked-mode oracle that the guest asserts."
