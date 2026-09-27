@@ -231,7 +231,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Three captured-clock routing controls retain all 789 prior identities.
-    ("test.detcore_unit", 792),
+    // The futex-deadline clock-refusal control retains all 792 prior identities.
+    ("test.detcore_unit", 793),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -263,7 +264,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 792),
+    ("test.detcore_unit_on_host", 793),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.recorded_clocks_on_host", 6),
