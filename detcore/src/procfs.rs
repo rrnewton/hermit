@@ -619,9 +619,10 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_realtime_seconds: i64,
     /// Fixed whole-second virtual boot time reported as `/proc/stat` `btime`.
     ///
-    /// Present exactly when `ProcfsFile::needs_boot_time` holds. No other file
-    /// consults the boot instant, so an uptime offset that leaves it without an
-    /// `i64` representation cannot fail any other procfs read.
+    /// Present exactly when `ProcfsFile::needs_boot_time` holds, which
+    /// `ProcfsFile::initialize` asserts. No other file consults the boot
+    /// instant, so an uptime offset that leaves it without an `i64`
+    /// representation cannot fail any other procfs read.
     pub(crate) virtual_boot_time_seconds: Option<i64>,
     pub(crate) virtual_memory_kb: u64,
     pub(crate) virtual_pid: i32,
@@ -883,14 +884,105 @@ impl ProcfsFile {
 
     /// Returns true when this snapshot renders the virtual boot instant, which
     /// only `/proc/stat` does (its `btime` line).
+    ///
+    /// The caller computes the boot instant before the host snapshot exactly
+    /// when this holds, and `initialize` asserts that it received the instant
+    /// exactly when this holds. The match names every kind, with no wildcard,
+    /// so a new kind cannot compile until its author decides whether it
+    /// renders the boot instant. The test
+    /// `boot_time_is_supplied_to_exactly_the_procfs_files_that_render_it`
+    /// checks each decision against what `initialize` actually renders.
     pub(crate) fn needs_boot_time(&self) -> bool {
-        self.kind == ProcfsKind::SystemStat
+        match self.kind {
+            ProcfsKind::SystemStat => true,
+            ProcfsKind::Stat
+            | ProcfsKind::Status
+            | ProcfsKind::ThreadStat
+            | ProcfsKind::ThreadStatus
+            | ProcfsKind::ProcessStat
+            | ProcfsKind::Statm
+            | ProcfsKind::ProcessStatus
+            | ProcfsKind::TimerSlack(_)
+            | ProcfsKind::Cpuinfo
+            | ProcfsKind::Diskstats
+            | ProcfsKind::Loadavg
+            | ProcfsKind::ProcessIo
+            | ProcfsKind::Uptime
+            | ProcfsKind::Meminfo
+            | ProcfsKind::BlockStat
+            | ProcfsKind::NodeMeminfo
+            | ProcfsKind::NodeNumastat
+            | ProcfsKind::HwmonInput
+            | ProcfsKind::ScalingCurFreq
+            | ProcfsKind::Sockstat
+            | ProcfsKind::PtyNr
+            | ProcfsKind::SelfSched
+            | ProcfsKind::Fdinfo
+            | ProcfsKind::AioNr
+            | ProcfsKind::AioMaxNr
+            | ProcfsKind::PipeMaxSize
+            | ProcfsKind::NumaMaps
+            | ProcfsKind::SmapsRollup
+            | ProcfsKind::ArchStatus
+            | ProcfsKind::CpuidleCounter
+            | ProcfsKind::Smaps
+            | ProcfsKind::Maps
+            | ProcfsKind::KeyUsers
+            | ProcfsKind::Pressure
+            | ProcfsKind::Buddyinfo
+            | ProcfsKind::Schedstat
+            | ProcfsKind::SelfSchedstat
+            | ProcfsKind::SoftnetStat
+            | ProcfsKind::FileNr
+            | ProcfsKind::FileMax
+            | ProcfsKind::Zoneinfo
+            | ProcfsKind::InodeNr
+            | ProcfsKind::InodeState
+            | ProcfsKind::Protocols
+            | ProcfsKind::BtrfsBytesReserved
+            | ProcfsKind::BtrfsBytesPinned
+            | ProcfsKind::Rtc
+            | ProcfsKind::DentryState
+            | ProcfsKind::Mountinfo
+            | ProcfsKind::RandomUuid
+            | ProcfsKind::Swaps
+            | ProcfsKind::Locks
+            | ProcfsKind::ThpCounter
+            | ProcfsKind::NodeVmstat
+            | ProcfsKind::CppcFeedback
+            | ProcfsKind::UnixSockets
+            | ProcfsKind::InetSockets
+            | ProcfsKind::BtrfsCommitStats
+            | ProcfsKind::SysfsRtcDate
+            | ProcfsKind::SysfsRtcTime
+            | ProcfsKind::SysfsRtcEpoch
+            | ProcfsKind::NetlinkSockets
+            | ProcfsKind::IrqPerCpuCount
+            | ProcfsKind::InterruptCounters
+            | ProcfsKind::Modules
+            | ProcfsKind::ModuleRefcnt(_)
+            | ProcfsKind::UeventSeqnum
+            | ProcfsKind::BtrfsBytesMayUse
+            | ProcfsKind::BlockInflight
+            | ProcfsKind::Vmstat => false,
+        }
     }
 
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
     pub(crate) fn initialize(&mut self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
+        // A boot instant supplied to a file that does not render it was computed
+        // for nothing, and computing it can refuse the read with EOVERFLOW, so an
+        // unrelated read would fail on account of `btime`. One omitted for a file
+        // that renders it cannot be rendered. Refuse both at the entry.
+        assert_eq!(
+            context.virtual_boot_time_seconds.is_some(),
+            self.needs_boot_time(),
+            "procfs {:?} snapshot: the virtual boot time must be supplied exactly when the file \
+             renders it",
+            self.kind
+        );
         let ProcfsSnapshotContext {
             virtual_uptime_seconds,
             virtual_realtime_seconds,
@@ -1854,7 +1946,12 @@ fn sanitize_system_stat(
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
         if body.starts_with(b"btime ") {
-            normalized.extend_from_slice(format!("btime {virtual_boot_time_seconds}").as_bytes());
+            // fs/proc/stat.c prints the signed time64_t boot instant with "%llu"
+            // after casting it to unsigned long long, so an instant before the
+            // Unix epoch appears as 2^64 plus the instant. For every instant at
+            // or after the epoch this matches the signed rendering byte for byte.
+            let btime = virtual_boot_time_seconds.cast_unsigned();
+            normalized.extend_from_slice(format!("btime {btime}").as_bytes());
         } else {
             normalized.extend_from_slice(body);
         }
@@ -5419,6 +5516,251 @@ Rss:                   4 kB\n" as &[u8];
                 1_767_225_480,
             ),
             b"cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nintr 0 0 0\nbtime 1767225480\nprocesses 0\n"
+        );
+    }
+
+    #[test]
+    fn system_stat_renders_a_negative_boot_time_unsigned_like_linux() {
+        // fs/proc/stat.c (show_stat) formats "btime %llu\n" with the argument
+        // (unsigned long long)boottime.tv_sec, where tv_sec is a signed time64_t. An offset
+        // larger than the epoch's whole seconds puts the boot instant before 1970, and Linux
+        // prints 2^64 plus that instant.
+        let render = |boot_time| {
+            String::from_utf8(sanitize_system_stat(
+                b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nbtime 1234\nprocesses 55\n",
+                120,
+                boot_time,
+            ))
+            .unwrap()
+        };
+        let expected = |btime: &str| {
+            format!(
+                "cpu 12000 0 0 0 0 0 0 0 0 0\ncpu0 12000 0 0 0 0 0 0 0 0 0\nbtime {btime}\n\
+                 processes 0\n"
+            )
+        };
+        // Five seconds after the Unix epoch less the default 120-second offset.
+        assert_eq!(render(-115), expected("18446744073709551501"));
+        assert_eq!(render(-1), expected("18446744073709551615"));
+        // The earliest time64_t, reached at an offset of the epoch's whole seconds plus 2^63.
+        assert_eq!(render(i64::MIN), expected("9223372036854775808"));
+        // Every instant at or after the Unix epoch renders exactly as before.
+        assert_eq!(render(0), expected("0"));
+        assert_eq!(render(1_767_225_480), expected("1767225480"));
+        assert_eq!(render(i64::MAX), expected("9223372036854775807"));
+    }
+
+    /// Every `ProcfsKind` variant name, taken from the derived `Deserialize`
+    /// implementation, which hands serde the complete list of variant names. A
+    /// variant added later is enumerated here without editing this function.
+    fn procfs_kind_variant_names() -> &'static [&'static str] {
+        struct VariantNames<'a>(&'a mut Option<&'static [&'static str]>);
+
+        impl<'de> serde::Deserializer<'de> for VariantNames<'_> {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom(
+                    "ProcfsKind must deserialize as an enum",
+                ))
+            }
+
+            fn deserialize_enum<V: serde::de::Visitor<'de>>(
+                self,
+                _name: &'static str,
+                variants: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                *self.0 = Some(variants);
+                Err(serde::de::Error::custom("variant names captured"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+                struct identifier ignored_any
+            }
+        }
+
+        let mut names = None;
+        let _ = ProcfsKind::deserialize(VariantNames(&mut names));
+        names.expect("ProcfsKind's Deserialize implementation did not list its variants")
+    }
+
+    /// Builds `ProcfsKind::<name>` through serde: as a unit variant, or else as a
+    /// newtype variant carrying the first of a few payloads that fits. Panics,
+    /// naming the variant, when none fits, so a variant with a new payload type
+    /// fails the tests that enumerate kinds instead of escaping them.
+    fn procfs_kind_named(name: &str) -> ProcfsKind {
+        std::iter::once(serde_json::json!(name))
+            .chain(
+                [
+                    serde_json::Value::Null,
+                    serde_json::json!(0),
+                    serde_json::json!(""),
+                ]
+                .into_iter()
+                .map(|payload| serde_json::json!({ name: payload })),
+            )
+            .find_map(|value| serde_json::from_value(value).ok())
+            .unwrap_or_else(|| panic!("no probe payload constructs ProcfsKind::{name}"))
+    }
+
+    #[test]
+    fn boot_time_is_supplied_to_exactly_the_procfs_files_that_render_it() {
+        // The read path computes the boot instant before the host snapshot exactly when
+        // `needs_boot_time` holds, and that computation is what refuses an out-of-range
+        // instant with EOVERFLOW. Check each kind's answer against what `initialize`
+        // actually does with the instant:
+        // - a kind that needs it must render different bytes for two different instants,
+        //   so no kind computes the instant (and risks the refusal) only to discard it;
+        // - a kind that does not need it must initialize without it, so no kind consumes
+        //   an instant the read path never computed.
+        // A kind whose rendering of the instant needs a different input than these probes
+        // fails the first check; extend the probes rather than the exemptions. The probes
+        // are an empty snapshot, a /proc/stat sample carrying a btime line, and one
+        // mountinfo row so that the mountinfo kind renders a non-empty snapshot too.
+        const PROBES: [&[u8]; 3] = [
+            b"",
+            b"cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 9 8 7\nbtime 1234\n\
+              processes 55\n",
+            b"20 10 8:1 / /a rw - ext4 /dev/a rw\n",
+        ];
+        let names = procfs_kind_variant_names();
+        for expected in [
+            "Stat",
+            "SystemStat",
+            "Meminfo",
+            "Uptime",
+            "TimerSlack",
+            "ModuleRefcnt",
+            "Vmstat",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "the enumeration missed {expected}: {names:?}"
+            );
+        }
+
+        let unopened = |kind: &ProcfsKind| ProcfsFile {
+            kind: kind.clone(),
+            target_fd: None,
+            bound_thread_identity: None,
+            timer_slack_identity: None,
+            contents: None,
+            offset: 0,
+        };
+        // Supplies the other context the way the read path does. That path parses the same
+        // host bytes into the mountinfo snapshot and refuses the read before `initialize`
+        // when they are not mountinfo, so such a probe never reaches that kind: `None`.
+        let initialize = |kind: &ProcfsKind, contents: &[u8], boot_time: Option<i64>| {
+            let mut file = unopened(kind);
+            if file.needs_bound_thread_identity() {
+                file.bind_thread_identity(3, 4, 1);
+            }
+            let mountinfo = if file.needs_mountinfo_identities() {
+                let rows = parse_mountinfo(contents)?;
+                Some(
+                    MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new())
+                        .expect("a parsed mountinfo probe forms a snapshot"),
+                )
+            } else {
+                None
+            };
+            let random_uuid = file.needs_random_uuid().then_some([0x5a; 16]);
+            file.initialize(
+                contents.to_vec(),
+                ProcfsSnapshotContext {
+                    virtual_uptime_seconds: 120,
+                    virtual_boot_time_seconds: boot_time,
+                    mountinfo,
+                    random_uuid,
+                    ..ProcfsSnapshotContext::default()
+                },
+            );
+            Some(
+                file.take(usize::MAX)
+                    .expect("an initialized snapshot is readable"),
+            )
+        };
+
+        let mut rendering = Vec::new();
+        let mut not_rendering = Vec::new();
+        for &name in names {
+            let kind = procfs_kind_named(name);
+            let probe = unopened(&kind);
+            if !probe.needs_snapshot() {
+                // Never snapshotted, so never initialized: the read path must not
+                // compute a boot instant for it either.
+                assert!(
+                    !probe.needs_boot_time(),
+                    "{kind:?} is never snapshotted but needs the boot time"
+                );
+                continue;
+            }
+            if probe.needs_boot_time() {
+                assert!(
+                    PROBES.iter().any(|contents| {
+                        let before_epoch = initialize(&kind, contents, Some(-115));
+                        before_epoch.is_some()
+                            && before_epoch != initialize(&kind, contents, Some(1_767_225_480))
+                    }),
+                    "{kind:?} needs the boot time but renders the same bytes for two \
+                     different boot instants"
+                );
+                rendering.push(name);
+            } else {
+                let reached = PROBES
+                    .iter()
+                    .filter_map(|contents| initialize(&kind, contents, None))
+                    .count();
+                assert!(reached > 0, "no probe reaches {kind:?}");
+                not_rendering.push(name);
+            }
+        }
+        // Among the files modelled here, Linux renders the boot instant only in
+        // /proc/stat's btime line. A new consumer must be added here deliberately.
+        assert_eq!(rendering, ["SystemStat"]);
+        // Both branches above ran, over real kinds.
+        assert!(
+            not_rendering.contains(&"Meminfo") && not_rendering.contains(&"Uptime"),
+            "{not_rendering:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "procfs Meminfo snapshot: the virtual boot time must be supplied exactly when \
+                    the file renders it"
+    )]
+    fn initialize_refuses_a_boot_time_for_a_file_that_does_not_render_it() {
+        let mut meminfo = ProcfsFile::from_path(Path::new("/proc/meminfo")).unwrap();
+        meminfo.initialize(
+            b"MemTotal:       65536000 kB\n".to_vec(),
+            ProcfsSnapshotContext {
+                virtual_memory_kb: 1_048_576,
+                virtual_boot_time_seconds: Some(1_767_225_480),
+                ..ProcfsSnapshotContext::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "procfs SystemStat snapshot: the virtual boot time must be supplied exactly \
+                    when the file renders it"
+    )]
+    fn initialize_refuses_a_proc_stat_snapshot_without_a_boot_time() {
+        let mut stat = ProcfsFile::from_path(Path::new("/proc/stat")).unwrap();
+        stat.initialize(
+            b"btime 1234\n".to_vec(),
+            ProcfsSnapshotContext {
+                virtual_uptime_seconds: 120,
+                ..ProcfsSnapshotContext::default()
+            },
         );
     }
 
