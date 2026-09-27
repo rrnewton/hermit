@@ -9,6 +9,7 @@
 //! Detcore tool global state, and centralized methods corresponding to the centralized portion of
 //! the Detcore tool.
 
+mod exec_identity;
 mod parked;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -37,6 +38,8 @@ use chrono::Utc;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+pub(crate) use exec_identity::reconnect_exec;
+pub(crate) use exec_identity::retire_exec;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -462,9 +465,11 @@ pub struct GlobalState {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
-    /// Pre-exec identity and descriptor state awaiting a SaBRe exec reload.
+    /// Pre-exec identity and descriptor state awaiting a successful image transition.
     // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
     pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
+    /// Successful identity transfers whose RPC acknowledgment may still be in flight.
+    completed_exec_transfers: Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
     post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
@@ -598,6 +603,7 @@ impl GlobalState {
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             pending_exec_states: Mutex::new(BTreeMap::new()),
+            completed_exec_transfers: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -643,6 +649,10 @@ impl GlobalState {
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
+        self.completed_exec_transfers
+            .lock()
+            .unwrap()
+            .remove(&detpid);
         self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
         if self
             .sched
@@ -661,6 +671,7 @@ impl GlobalState {
     /// tracee and no guest thread can race another lifecycle event.
     pub fn release_all_physical_process_exits(&self) {
         self.pending_exec_states.lock().unwrap().clear();
+        self.completed_exec_transfers.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
         let released = self
             .sched
@@ -957,6 +968,22 @@ impl GlobalTool for GlobalState {
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
         let time_from_guest = guest_time.as_nanos();
+        // Exec transfer messages authenticate both incarnations before ordinary
+        // sender-clock accounting. The carried clock still belongs to the former
+        // thread until the successful reconnect commits.
+        match &request {
+            GlobalRequest::ReconnectExec { former, process } => {
+                return self
+                    .recv_exec_transfer(from, guest_time, request_mm, *former, *process)
+                    .await;
+            }
+            GlobalRequest::RetireExec(thread) => {
+                return self
+                    .recv_retire_exec_transfer(from, guest_time, request_mm, thread.clone())
+                    .await;
+            }
+            _ => {}
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -1053,6 +1080,18 @@ impl GlobalTool for GlobalState {
                 return (None, R::ThreadExited);
             }
 
+            if let GlobalRequest::ResumeExec(process) = &request
+                && (dtid != *process
+                    || sched.registered_process(dtid) != Some(*process)
+                    || !sched.next_turns.contains_key(&dtid))
+            {
+                return (None, R::ThreadExited);
+            }
+
+            // An admitted ordinary request under the new identity proves the
+            // Tool received the transfer acknowledgment and rebound its state.
+            self.acknowledge_exec_transfer(dtid, request_mm);
+
             let is_thread_reconnect = matches!(
                 &request,
                 GlobalRequest::StartNewThread(child_dettid, ..) if *child_dettid == dtid
@@ -1083,6 +1122,20 @@ impl GlobalTool for GlobalState {
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
         let resp = match request {
+            GlobalRequest::ReconnectExec { .. } | GlobalRequest::RetireExec(_) => {
+                unreachable!("exec transfer handled before ordinary admission")
+            }
+            GlobalRequest::ResumeExec(process) => {
+                let mut resources = Resources::new(dtid);
+                resources.insert(ResourceID::MemAddrSpace(process), Permission::RW);
+                let (response, duration) = self
+                    .recv_request_resources(from, process, resources, Some(request_mm))
+                    .await;
+                match response {
+                    SchedulerRpcResult::Continue(status) => R::ResumeExec(status, duration),
+                    SchedulerRpcResult::ThreadExited => R::ThreadExited,
+                }
+            }
             GlobalRequest::SignalDequeued { .. } => {
                 unreachable!("consuming path handled before ordinary cancellation")
             }
@@ -2187,6 +2240,34 @@ impl GlobalState {
     /// Its timing is not coordinated by the scheduler.
     async fn recv_deregister_thread(&self, _from: Tid, deregistration: ThreadDeregistration) {
         let ThreadDeregistration {
+            dettid, detpid, mm, ..
+        } = &deregistration;
+        // A fatal signal can tear down the caller after its local state has advanced to the
+        // candidate exec image but before the successful reconnect (or failed-exec cancel).
+        // Retire that one-shot preparation before scheduler-incarnation admission rejects the
+        // candidate image's final cleanup RPC.
+        let mut pending = self.pending_exec_states.lock().unwrap();
+        if pending.get(detpid).is_some_and(|state| {
+            state.caller == *dettid && (*mm == state.mm || *mm == state.mm.for_exec(state.process))
+        }) {
+            pending.remove(detpid);
+        }
+        drop(pending);
+
+        // Invariant: will only be called when sequentialize-threads is on.
+        assert!(self.cfg.sequentialize_threads);
+        let mut sched = self.sched.lock().unwrap();
+        self.account_deregistered_thread(&mut sched, deregistration);
+    }
+
+    /// Consume final statistics and registration while holding admission closed.
+    /// Authenticated exec cleanup uses this same once-only accounting path.
+    fn account_deregistered_thread(
+        &self,
+        sched: &mut Scheduler,
+        deregistration: ThreadDeregistration,
+    ) {
+        let ThreadDeregistration {
             dettid,
             detpid,
             mm,
@@ -2195,21 +2276,6 @@ impl GlobalState {
             syscall_count,
             chaos_epochs,
         } = deregistration;
-        // A fatal signal can tear down the caller after its local state has advanced to the
-        // candidate exec image but before the successful reconnect (or failed-exec cancel).
-        // Retire that one-shot preparation before scheduler-incarnation admission rejects the
-        // candidate image's final cleanup RPC.
-        let mut pending = self.pending_exec_states.lock().unwrap();
-        if pending.get(&detpid).is_some_and(|state| {
-            state.caller == dettid && (mm == state.mm || mm == state.mm.for_exec(state.process))
-        }) {
-            pending.remove(&detpid);
-        }
-        drop(pending);
-
-        // Invariant: will only be called when sequentialize-threads is on.
-        assert!(self.cfg.sequentialize_threads);
-        let mut sched = self.sched.lock().unwrap();
         if !sched.rpc_incarnation_matches(dettid, mm) {
             debug!(
                 "[detcore, dtid {}] ignoring deregistration from retired exec incarnation {:?}",
@@ -2235,7 +2301,6 @@ impl GlobalState {
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
-        drop(sched);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -2721,12 +2786,22 @@ pub enum GlobalRequest {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
-    /// Save the caller, address-space identity, and logically blocking descriptors before a
-    /// backend reloads its tool across exec.
+    /// Save the caller, address-space identity, and logically blocking descriptors before exec.
+    /// A successful backend may reload the Tool or preserve and transfer its thread state.
     PrepareExec(DetPid, MmId, ExecFdBlockingOverrides),
 
     /// Clear the saved transition after an exec attempt returns with an error.
     CancelExec(DetPid),
+
+    /// Authenticate the preserved exec caller taking over its process leader's TID.
+    ReconnectExec {
+        former: DetTid,
+        process: DetPid,
+    },
+    /// Acquire the replacement's first turn without newborn state initialization.
+    ResumeExec(DetPid),
+    /// Consume a transferred owner if exec cleanup interrupts local rebinding.
+    RetireExec(ThreadDeregistration),
 
     /// Complete a successful image transition, including the initial image, and
     /// delete the process's POSIX timer deadlines before the new image runs.
@@ -2895,6 +2970,9 @@ pub enum GlobalResponse {
     ReportUnsupportedSyscall(()),
     PrepareExec(()),
     CancelExec(()),
+    ReconnectExec(bool),
+    ResumeExec(ResumeStatus, Option<LogicalTime>),
+    RetireExec(bool),
     MarkPastFirstExecve(ExecFdBlockingOverrides),
     CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread.
@@ -4224,6 +4302,7 @@ mod tests {
     }
 
     mod backend_failure_tests;
+    mod exec_identity_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
