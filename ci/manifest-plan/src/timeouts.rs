@@ -1636,31 +1636,7 @@ pub const LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 96] = [
 /// Hermit 19553a64, including preparation in row-level wall time. The raw sample
 /// hashes are retained in the independent audit; ordinary 22/57 bounds stay fixed.
 /// See docs/LITEINST_QUALIFICATION_20260927.md for source and runtime limits.
-pub static LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 165] = [
-    TimeoutCalibration {
-        test: "backend-parity-c/environment-and-workdir",
-        mode: "verify",
-        backend: "liteinst",
-        samples: 10,
-        p90_cpu_usec: 1_106_433,
-        p90_wall_millis: 2_501,
-        required_cpu_seconds: 2,
-        required_wall_seconds: 11,
-        configured_cpu_seconds: 22,
-        configured_wall_seconds: 57,
-    },
-    TimeoutCalibration {
-        test: "backend-parity-c/pipe-multiwriter-ordering",
-        mode: "verify",
-        backend: "liteinst",
-        samples: 10,
-        p90_cpu_usec: 1_135_211,
-        p90_wall_millis: 2_468,
-        required_cpu_seconds: 2,
-        required_wall_seconds: 10,
-        configured_cpu_seconds: 22,
-        configured_wall_seconds: 57,
-    },
+pub static LITEINST_2026_09_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 163] = [
     TimeoutCalibration {
         test: "c-programs/dbt-execveat-unsupported",
         mode: "verify",

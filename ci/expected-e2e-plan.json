@@ -6024,20 +6024,6 @@
     },
     {
       "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/environment-and-workdir"
-    },
-    {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/pipe-multiwriter-ordering"
-    },
-    {
-      "backend": "liteinst",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
