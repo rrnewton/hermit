@@ -211,6 +211,19 @@ where
     // There is no await between the acknowledgment and local binding. If the
     // transport loses the reply, consuming cleanup uses the completed receipt.
     guest.thread_state_mut().dettid = current;
+    // Preemption artifacts have one history per raw TID, with no exec
+    // incarnation. Appending this worker's PMU targets to the displaced
+    // leader's history is invalid; replay would still read the worker's tail.
+    // Complete the authenticated identity/accounting handoff so shutdown owns
+    // the right task, but refuse before requesting a replacement-image turn.
+    // Ordinary chaos execution without these artifact modes still requests
+    // its normal continuation below.
+    if guest.config().record_preemptions
+        || guest.config().record_preemptions_to.is_some()
+        || guest.config().replay_preemptions_from.is_some()
+    {
+        return Err(Errno::EOPNOTSUPP);
+    }
     if guest.config().sequentialize_threads {
         let (_, response) = send_and_update_time(guest, GlobalRequest::ResumeExec(process)).await;
         let GlobalResponse::ResumeExec(_, duration) = response else {

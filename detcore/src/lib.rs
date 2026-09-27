@@ -1720,7 +1720,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         // A nonleader exec preserves the survivor's state and PMU counter, but
         // Linux changes its TID. Bind that state before any image callback RPC.
-        tool_global::reconnect_exec(guest).await?;
+        match tool_global::reconnect_exec(guest).await {
+            Err(Errno::EOPNOTSUPP) => {
+                let message = "unsupported: preemption recording and replay across nonleader exec";
+                error!("{message}");
+                // Report even when logging is disabled or redirected. The
+                // ordinary refusal helper preserves the policy exit class;
+                // reconnect already bound identity, so its diagnostic RPC is
+                // authenticated and cannot silently retire an unbound owner.
+                let _ = writeln!(crate::util::RetryingStderr, "{message}");
+                tool_global::unrecoverable_shutdown(
+                    guest,
+                    detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+                )
+                .await;
+            }
+            result => result?,
+        }
         guest.thread_state_mut().past_global_first_execve = true;
         // Only a successful exec reaches this callback. Delete the old image's
         // POSIX timer IDs while exec still owns its scheduler turn; the global

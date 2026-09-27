@@ -469,6 +469,9 @@ pub struct GlobalState {
     // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
     pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
     /// Successful identity transfers whose RPC acknowledgment may still be in flight.
+    /// Nesting either exec map with global_time requires holding sched first;
+    /// the scheduler mutex serializes their inner lock orders. Standalone
+    /// process cleanup drops each map guard before acquiring sched.
     completed_exec_transfers: Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.

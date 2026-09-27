@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
 
+use reverie::Errno;
 use reverie::ExitStatus;
 use reverie::Tool;
 
@@ -430,6 +431,99 @@ fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
         syscall_count: thread.stats.syscall_count,
         chaos_epochs: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn transferred_exec_preemption_artifacts_refuse_before_replacement_turn() {
+    for mode in 0..3 {
+        let mut fixture = Fixture::prepared().await;
+        // Exercise each public configuration spelling independently. The
+        // artifact reader/writer's real file lifecycle is covered by the CLI
+        // record-then-replay control; here the actual reconnect RPC must keep
+        // its identity and clock invariants without granting replacement work.
+        match mode {
+            0 => fixture.state.cfg.record_preemptions = true,
+            1 => fixture.state.cfg.record_preemptions_to = Some("record.json".into()),
+            2 => fixture.state.cfg.replay_preemptions_from = Some("record.json".into()),
+            _ => unreachable!(),
+        }
+        let mut guest = fixture.guest(Gate::None);
+        let clock = guest.thread.thread_logical_time.clone();
+        let deadline = clock.as_nanos() + LogicalTime::from_nanos(123_456);
+        guest.thread.last_rcb_timer = Some(98_765);
+        guest.thread.end_of_timeslice = Some(deadline);
+        guest.thread.max_timeslice_end = Some(deadline);
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+        assert_eq!(
+            futures::poll!(&mut reconnect),
+            Poll::Ready(Err(Errno::EOPNOTSUPP))
+        );
+        drop(reconnect);
+        assert_eq!(guest.thread.dettid, LEADER);
+        assert_eq!(
+            guest.thread.thread_logical_time.as_nanos(),
+            clock.as_nanos()
+        );
+        assert_eq!(guest.thread.last_rcb_timer, Some(98_765));
+        assert_eq!(guest.thread.end_of_timeslice, Some(deadline));
+        assert_eq!(guest.thread.max_timeslice_end, Some(deadline));
+        assert_eq!(
+            *guest.rpc.requests.lock().unwrap(),
+            [GlobalRequest::ReconnectExec {
+                former: WORKER,
+                process: LEADER,
+            }],
+            "refusal must precede ResumeExec or any replacement-image RPC"
+        );
+        fixture.assert_running();
+        fixture.assert_final_clock(LEADER);
+        let sched = fixture.state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&WORKER));
+        assert!(sched.next_turns[&LEADER].req.try_read().is_none());
+        assert!(sched.next_turns[&LEADER].resp.try_read().is_none());
+        assert!(fixture.state.pending_exec_states.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .state
+                .completed_exec_transfers
+                .lock()
+                .unwrap()
+                .contains_key(&LEADER)
+        );
+    }
+}
+
+#[tokio::test]
+async fn preemption_artifact_refusal_is_specific_to_transferred_exec() {
+    let mut fixture = Fixture::prepared().await;
+    fixture.state.cfg.record_preemptions = true;
+    fixture.state.cfg.record_preemptions_to = Some("record.json".into());
+    fixture.state.cfg.replay_preemptions_from = Some("record.json".into());
+    let mut same_tid = ExecGuest {
+        rpc: ExecRpc::new(&fixture.state, WORKER, Gate::None),
+        thread: fixture.worker.clone(),
+    };
+    assert_eq!(super::super::reconnect_exec(&mut same_tid).await, Ok(()));
+    assert!(same_tid.rpc.requests.lock().unwrap().is_empty());
+    fixture.assert_displaced_leader_receipt(true);
+
+    // Ordinary chaos execution without artifact flags still reaches its real
+    // continuation request. Do not globally disable preemption or exec.
+    let mut ordinary = Fixture::prepared().await;
+    ordinary.state.cfg.chaos = true;
+    let mut guest = ordinary.guest(Gate::None);
+    {
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+        assert!(futures::poll!(&mut reconnect).is_pending());
+    }
+    assert_eq!(guest.thread.dettid, LEADER);
+    assert!(matches!(
+        guest.rpc.requests.lock().unwrap().as_slice(),
+        [
+            GlobalRequest::ReconnectExec { .. },
+            GlobalRequest::ResumeExec(LEADER)
+        ]
+    ));
 }
 
 async fn cancelled_transfer(gate: Gate, backend_failed: bool) {
