@@ -819,7 +819,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // previous run's clock and turn a short timeout into an arbitrary long one.
                     guest.inject(Syscall::from(clock_call)).await?;
                 } else {
-                    self.record_or_replay(guest, clock_call).await?;
+                    // Record and replay reach this branch (`virtualize_time: false`). Their
+                    // clock handlers refuse an output they cannot capture or reproduce with
+                    // `Error::Tool`; keep that typed error instead of unwrapping it into a
+                    // panic, and keep a syscall failure as its errno.
+                    self.record_or_replay_preserving_tool_errors(guest, clock_call)
+                        .await?;
                 }
                 let clock_now = match parse_futex_timeout(
                     libc::FUTEX_WAIT_BITSET,
@@ -3324,5 +3329,237 @@ mod tests {
             "handle_sched_getattr writes SCHED_OTHER into sched_policy for every thread; \
              KEEP_POLICY must substitute that same value"
         );
+    }
+
+    /// `hermit record` and `hermit replay` run with `virtualize_time: false`
+    /// and `detect_host_clock_futex_timeouts: false`
+    /// (`hermit::metadata::record_or_replay_config`), so an absolute
+    /// `FUTEX_WAIT_BITSET` deadline measures its clock through the nested
+    /// record/replay tool. The recorder and replayer refuse a clock output they
+    /// cannot capture or reproduce with `Error::Tool`. That refusal must reach
+    /// the backend as a typed error: `Detcore::record_or_replay` unwraps
+    /// `into_errno()`, which panics on every error that is not an errno.
+    mod futex_deadline_clock_refusal {
+        use reverie::GlobalRPC;
+        use reverie::GlobalTool;
+        use reverie::Subscription;
+        use reverie::Tool;
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        use super::*;
+        use crate::config::Config;
+        use crate::tool_global::GlobalState;
+
+        const REFUSAL: &str = "the recording cannot supply this clock_gettime output";
+
+        /// Room for the clock output the deadline reserves on the guest stack.
+        const CLOCK_SLOT_WORDS: usize = 4;
+
+        /// A nested record/replay tool whose clock handler fails the way the
+        /// recorder and replayer refuse an output: with a non-errno tool error.
+        #[derive(Debug, Default, Serialize, Deserialize)]
+        struct RefusingClockTool;
+
+        #[reverie::tool]
+        impl Tool for RefusingClockTool {
+            type GlobalState = GlobalState;
+            type ThreadState = ();
+
+            fn subscriptions(_config: &Config) -> Subscription {
+                let mut subscription = Subscription::none();
+                subscription.syscalls([reverie::syscalls::Sysno::clock_gettime]);
+                subscription
+            }
+
+            async fn handle_syscall_event<G: Guest<Self>>(
+                &self,
+                _guest: &mut G,
+                call: Syscall,
+            ) -> Result<i64, Error> {
+                assert!(
+                    matches!(call, Syscall::ClockGettime(_)),
+                    "the deadline must forward only its clock read, got {call:?}"
+                );
+                Err(Error::Tool(anyhow::anyhow!(REFUSAL)))
+            }
+        }
+
+        struct DeadlineGuest {
+            config: Config,
+            thread: crate::ThreadState<()>,
+            clock_slot: Box<[u64; CLOCK_SLOT_WORDS]>,
+            stacks: usize,
+        }
+
+        struct DeadlineStack {
+            slot: usize,
+            reserved: bool,
+        }
+
+        struct DeadlineStackGuard;
+
+        impl Drop for DeadlineStackGuard {
+            fn drop(&mut self) {}
+        }
+
+        impl Stack for DeadlineStack {
+            type StackGuard = DeadlineStackGuard;
+
+            fn size(&self) -> usize {
+                panic!("the deadline must only reserve its clock output")
+            }
+
+            fn capacity(&self) -> usize {
+                panic!("the deadline must only reserve its clock output")
+            }
+
+            fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
+                panic!("the deadline must only reserve its clock output")
+            }
+
+            fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+                assert!(
+                    !self.reserved,
+                    "the deadline reserves exactly one clock output"
+                );
+                assert!(std::mem::size_of::<T>() <= CLOCK_SLOT_WORDS * 8);
+                self.reserved = true;
+                AddrMut::from_raw(self.slot).unwrap()
+            }
+
+            fn commit(self) -> Result<Self::StackGuard, Errno> {
+                assert!(self.reserved, "the clock output is reserved before commit");
+                Ok(DeadlineStackGuard)
+            }
+        }
+
+        #[reverie::tool]
+        impl GlobalRPC<GlobalState> for DeadlineGuest {
+            async fn send_rpc(
+                &self,
+                message: <GlobalState as GlobalTool>::Request,
+            ) -> <GlobalState as GlobalTool>::Response {
+                panic!(
+                    "a refused deadline clock must not reach the scheduler: {:?}",
+                    message.2
+                )
+            }
+
+            fn config(&self) -> &Config {
+                &self.config
+            }
+        }
+
+        #[reverie::tool]
+        impl Guest<Detcore<RefusingClockTool>> for DeadlineGuest {
+            type Memory = reverie::syscalls::LocalMemory;
+            type Stack = DeadlineStack;
+
+            fn tid(&self) -> Pid {
+                Pid::from_raw(self.thread.dettid.as_raw())
+            }
+
+            fn pid(&self) -> Pid {
+                Pid::from_raw(self.thread.detpid.unwrap().as_raw())
+            }
+
+            fn ppid(&self) -> Option<Pid> {
+                None
+            }
+
+            fn memory(&self) -> Self::Memory {
+                reverie::syscalls::LocalMemory::new()
+            }
+
+            fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+                &mut self.thread
+            }
+
+            fn thread_state(&self) -> &crate::ThreadState<()> {
+                &self.thread
+            }
+
+            async fn regs(&mut self) -> libc::user_regs_struct {
+                panic!("the deadline must not read guest registers")
+            }
+
+            async fn stack(&mut self) -> Self::Stack {
+                self.stacks += 1;
+                DeadlineStack {
+                    slot: self.clock_slot.as_mut_ptr() as usize,
+                    reserved: false,
+                }
+            }
+
+            async fn daemonize(&mut self) {
+                panic!("the deadline must not daemonize")
+            }
+
+            async fn inject<S: SyscallInfo>(&mut self, _syscall: S) -> Result<i64, Errno> {
+                panic!("record/replay owns this clock read; Detcore must not inject it")
+            }
+
+            async fn tail_inject<S: SyscallInfo>(&mut self, _syscall: S) -> reverie::Never {
+                panic!("the deadline must return to its futex handler")
+            }
+
+            fn set_timer(&mut self, _schedule: reverie::TimerSchedule) -> Result<(), Error> {
+                panic!("the deadline must not set a timer")
+            }
+
+            fn set_timer_precise(
+                &mut self,
+                _schedule: reverie::TimerSchedule,
+            ) -> Result<(), Error> {
+                panic!("the deadline must not set a timer")
+            }
+
+            fn read_clock(&mut self) -> Result<u64, Error> {
+                panic!("the deadline must not read the backend clock")
+            }
+        }
+
+        #[tokio::test]
+        async fn a_refused_deadline_clock_is_a_typed_tool_error_not_a_panic() {
+            let config = Config {
+                virtualize_time: false,
+                detect_host_clock_futex_timeouts: false,
+                recordreplay_modes: true,
+                replay_data: Some("recording".into()),
+                ..Config::default()
+            };
+            let pid = DetPid::from_raw(1);
+            let mut thread = crate::ThreadState::new(pid, &config, ());
+            thread.detpid = Some(pid);
+            let tool = <Detcore<RefusingClockTool> as Tool>::new(Pid::from_raw(1), &config);
+            let mut guest = DeadlineGuest {
+                config,
+                thread,
+                clock_slot: Box::new([0; CLOCK_SLOT_WORDS]),
+                stacks: 0,
+            };
+            let deadline = Timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
+
+            let result = tool
+                .futex_timeout_deadline(
+                    &mut guest,
+                    libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    Some(Addr::from(&deadline)),
+                )
+                .await;
+
+            match result {
+                Err(Error::Tool(error)) => assert_eq!(error.to_string(), REFUSAL),
+                other => panic!("expected the nested tool's own refusal, got {other:?}"),
+            }
+            assert_eq!(
+                guest.stacks, 1,
+                "the deadline reserves its clock output once"
+            );
+        }
     }
 }
