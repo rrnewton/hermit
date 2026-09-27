@@ -6,9 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use clap::Parser;
 use hermit::Context;
@@ -69,7 +67,7 @@ impl ReplayOpts {
                 .last_id()
                 .context("Failed to find last recording ID")?,
         };
-        let mut prepared_replay = Some(hermit.prepare_replay(id)?);
+        let prepared_replay = Some(hermit.prepare_replay(id)?);
         let gdb_listener = if self.autopilot {
             None
         } else {

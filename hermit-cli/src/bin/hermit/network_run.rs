@@ -420,7 +420,7 @@ impl UnpublishedChildResult {
 }
 
 /// Existing authenticated deployment roots shared by full record and replay.
-#[derive(Debug, Default, clap::Args)]
+#[derive(Debug, Default, Clone, clap::Args)]
 pub(super) struct DeploymentOpts {
     /// Existing private bpffs directory for network isolation during replay.
     #[arg(long, value_name = "DIRECTORY", requires = "network_guard_recovery")]
@@ -645,7 +645,7 @@ pub(super) fn run_record_at_owned<G, F>(
     roots: Option<(&Path, &Path)>,
     accepted_root: Option<&Path>,
     site: &'static str,
-    work: F,
+    mut work: F,
 ) -> Result<(RunValue, G), Error>
 where
     G: 'static,
@@ -701,7 +701,7 @@ pub(super) fn run_at_owned<G, F>(
     roots: Option<(&Path, &Path)>,
     accepted_root: Option<&Path>,
     site: &'static str,
-    work: F,
+    mut work: F,
 ) -> Result<(RunValue, G), Error>
 where
     G: 'static,
@@ -1133,7 +1133,13 @@ fn run_owned(
         (None, None) => None,
         (None, Some(_)) => unreachable!("accepted-only startup cannot launch a guard"),
     };
-    finalize_owned(container_result, guard, accepted, primary)
+    finalize_owned(
+        container_result,
+        guard,
+        accepted,
+        primary,
+        failed_backing,
+    )
 }
 
 /// The exact child terminal precedes both service drains: the provider lifetime
@@ -1146,6 +1152,7 @@ fn finalize_owned(
     mut guard: Option<GuardFinalization>,
     mut accepted: Option<AcceptedStartup>,
     mut primary: Option<Error>,
+    mut failed_backing: Option<Box<dyn Any>>,
 ) -> Result<RunValue, Error> {
     let deadline = Instant::now() + TERMINAL;
     let mut child_cleanup = None;
@@ -1408,7 +1415,7 @@ mod tests {
             &mut |_| Ok(()),
             &mut |_| -> (Wire, ()) { unsafe { libc::_exit(124) } },
         );
-        let error = finalize_owned(Some(started), None, None, None).unwrap_err();
+        let error = finalize_owned(Some(started), None, None, None, None).unwrap_err();
         assert!(
             error
                 .downcast_ref::<super::super::container::RunTimeoutMarker>()

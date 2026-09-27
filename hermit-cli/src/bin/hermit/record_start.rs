@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::cell::RefCell;
 #[cfg(test)]
 use std::ffi::OsStr;
 use std::fs;
@@ -14,7 +13,6 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
-use std::rc::Rc;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -467,7 +465,7 @@ impl StartOpts {
             let epoch = detcore_model::config::capture_current_epoch();
             let data = hermit.create_recording_dir()?;
             let data_path = data.path().to_path_buf();
-            let mut prepared_trace = Some(hermit::PreparedFullRecordTrace::reserve(&data_path)?);
+            let prepared_trace = Some(hermit::PreparedFullRecordTrace::reserve(&data_path)?);
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
