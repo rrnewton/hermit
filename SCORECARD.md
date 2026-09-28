@@ -75,10 +75,10 @@ The count table includes all **5744** tracked cells; no row is omitted. The curr
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 301 | 0 | 3 | 0 | 304 |
+| `green` | 0 | 300 | 0 | 3 | 1 | 304 |
 | `red` | 362 | 2 | 0 | 0 | 8 | 372 |
 | `not-applicable` | 5067 | 0 | 0 | 0 | 1 | 5068 |
-| **Total** | **5429** | **303** | **0** | **3** | **9** | **5744** |
+| **Total** | **5429** | **302** | **0** | **3** | **10** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -220,7 +220,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/keyctl-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/keyctl-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/keyctl-passthrough` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `c-programs/keyctl-passthrough` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/keyctl-passthrough` | `verify` | `sabre` | `green` | `diverged` |
 | `c-programs/listmount-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/listmount-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/liteinst-advanced` | `verify` | `ptrace` | `green` | `measured-and-passed` |
