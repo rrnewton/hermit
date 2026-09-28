@@ -55,9 +55,9 @@
 //! explicitly asked for by name.
 //!
 //! Scope is derived with `git ls-files`: every tracked `Cargo.toml` and
-//! `Cargo.lock` is inspected, including tracked vendored paths. Untracked or
-//! generated files and files inside nested submodules are outside this check;
-//! their contents are not tracked by the Hermit repository.
+//! `Cargo.lock` present in the candidate worktree is inspected, including
+//! tracked vendored paths. Tracked deletions, untracked or generated files, and
+//! files inside nested submodules are outside this check.
 //!
 //! Every reported pin carries the commit it was read from. The checker reads
 //! the *working tree*, so in a checkout that sits behind `main` it faithfully
@@ -167,7 +167,7 @@ fn usage() -> &'static str {
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
      \n\
-     Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
+     Scope: every tracked Cargo.toml and Cargo.lock present in the worktree.\n\
      Excludes non-Cargo files, untracked/generated files, and nested submodule contents."
 }
 
@@ -333,6 +333,11 @@ fn tracked_cargo_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
         .split('\0')
         .filter(|path| !path.is_empty())
         .map(|path| root.join(path))
+        // A tracked deletion is not part of the candidate worktree's Cargo
+        // graph. `git ls-files` still reports its index entry until commit, so
+        // skip only paths that are absent from the worktree; a referenced
+        // deletion will still be rejected by Cargo metadata.
+        .filter(|path| path.exists())
         .collect();
     paths.sort();
     paths.dedup();
@@ -2033,8 +2038,7 @@ fn check_liteinst_cache_keys(root: &Path, pin: &str) -> Result<i32, String> {
 
 /// Every 40-hex revision that appears as CODE (not prose) in one of these
 /// files is a DBT budget calibration binding and must equal the canonical pin.
-const DBT_BUDGET_BINDING_FILES: [&str; 2] =
-    [BUDGET_CALIBRATION_SITE, "ci/configure-build-jobs.sh"];
+const DBT_BUDGET_BINDING_FILES: [&str; 2] = [BUDGET_CALIBRATION_SITE, "ci/configure-build-jobs.sh"];
 
 /// Exactly-40-hex tokens on a line, ignoring longer hex runs.
 ///
@@ -2044,7 +2048,11 @@ const DBT_BUDGET_BINDING_FILES: [&str; 2] =
 /// accepting shorter tokens would match ordinary hex in a message.
 fn exact_40_hex_tokens(line: &str) -> Vec<String> {
     line.split(|c: char| !c.is_ascii_hexdigit())
-        .filter(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()))
+        .filter(|t| {
+            t.len() == 40
+                && t.chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        })
         .map(str::to_string)
         .collect()
 }
@@ -2205,7 +2213,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let tracked_locks = scan.tracked_files.len() - tracked_manifests;
     let pinned_file_count: BTreeSet<&Path> = pins.iter().map(|item| item.path.as_path()).collect();
     eprintln!(
-        "Scope: scanned {tracked_manifests} tracked Cargo.toml and {tracked_locks} tracked Cargo.lock files; {} files contain {} Reverie revision entries.",
+        "Scope: scanned {tracked_manifests} tracked Cargo.toml and {tracked_locks} tracked Cargo.lock files present in the worktree; {} files contain {} Reverie revision entries.",
         pinned_file_count.len(),
         pins.len()
     );
@@ -3732,6 +3740,33 @@ mod tests {
 
         fs::remove_dir_all(root).expect("remove fixture repository");
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    #[test]
+    fn tracked_deletion_is_absent_from_the_candidate_graph() {
+        let root = temp_path("tracked-deletion");
+        init_fixture_repo(&root);
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let manifest = |rev: &str| {
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{rev}\" }}\n"
+            )
+        };
+        fs::write(root.join("Cargo.toml"), manifest(pin)).expect("write root manifest");
+        fs::create_dir_all(root.join("removed")).expect("create removed manifest directory");
+        fs::write(root.join("removed/Cargo.toml"), manifest(pin)).expect("write removed manifest");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml", "removed/Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::remove_file(root.join("removed/Cargo.toml")).expect("delete tracked manifest");
+
+        let scan = read_pins(&root).expect("scan candidate worktree");
+        assert_eq!(scan.tracked_files, [root.join("Cargo.toml")]);
+        assert_eq!(unique_pin(&scan).unwrap(), pin);
+        fs::remove_dir_all(root).expect("remove fixture repository");
     }
 
     #[test]

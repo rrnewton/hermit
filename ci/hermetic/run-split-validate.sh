@@ -126,6 +126,7 @@ EXPECTED_E2E_PLAN="$ROOT/ci/expected-e2e-plan.json"
 FETCH_MANIFESTS=(
     Cargo.toml
     liteinst-runtime-build/Cargo.toml
+    liteinst-runtime-build/detcore-runtime/Cargo.toml
 )
 [[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
 [[ -f "$EXPECTED_E2E_PLAN" ]] || {

@@ -17,6 +17,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "../hermit-cli/src/liteinst_artifact.rs"]
+// The install builder reuses only provenance validation; the shared module's
+// source-capture and staging entry points belong to the producer build script.
+#[allow(dead_code)]
+mod liteinst_artifact;
+mod liteinst_inputs;
+
 const DYNAMORIO_FILES: &[&str] = &[
     "bin64/drrun",
     "lib64/release/libdynamorio.so",
@@ -265,80 +272,144 @@ fn replace_symlink(destination: &Path, target: &Path) -> io::Result<()> {
     symlink(target, destination)
 }
 
-fn replace_copy(source: &Path, destination: &Path) {
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.is_dir() => {
-            panic!(
-                "refusing to replace directory {} with a runtime file",
-                destination.display()
-            )
-        }
-        Ok(_) => fs::remove_file(destination)
-            .unwrap_or_else(|error| panic!("failed to remove {}: {error}", destination.display())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => panic!("failed to inspect {}: {error}", destination.display()),
-    }
-    copy_file(source, destination);
-}
-
 fn build_liteinst_runtime(
     repository: &Path,
+    reverie_root: &Path,
+    source_record: &Path,
+    caller_source_identity: &str,
     build_root: &Path,
     profile_dir: &Path,
     resources: &Path,
 ) {
-    // stage-liteinst-runtime.sh appends the canonical Reverie pin to this stable
-    // root, so cache invalidation has the same source of truth as the pin gate.
+    assert!(
+        env::var("HERMIT_LITEINST_DIAGNOSTIC").as_deref() != Ok("1"),
+        "diagnostic LiteInst artifacts must not be installed as product resources"
+    );
+    let runtime_name = match env::var("HERMIT_LITEINST_RUNTIME_KIND").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("preload") => "libhermit_liteinst_detcore.so",
+        Ok("private-crt") => "hermit_liteinst_detcore_private.elf",
+        Ok(other) => panic!("unsupported LiteInst runtime build kind {other}"),
+        Err(error) => panic!("cannot read LiteInst runtime build kind: {error}"),
+    };
+    // stage-liteinst-runtime.sh appends the canonical Reverie pin to this
+    // target root, so cache invalidation has the same source of truth as the
+    // source and dependency checks.
     let target = build_root.join("liteinst-runtime");
-    let runtime = profile_dir.join("libreverie_liteinst.so");
+    let runtime = profile_dir.join(runtime_name);
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)
+            .env("HERMIT_LITEINST_HERMIT_ROOT", repository)
+            .env("HERMIT_LITEINST_REVERIE_ROOT", reverie_root)
+            .env("HERMIT_LITEINST_SOURCE_RECORD", source_record)
             .arg("release")
             .arg(&runtime)
             .arg(&target),
-        "build the constructor-enabled LiteInst runtime",
+        "build the shared Detcore LiteInst runtime",
     );
+    let provenance = PathBuf::from(format!("{}.provenance.json", runtime.display()));
     assert!(
-        runtime.is_file(),
-        "standalone build did not stage {}",
-        runtime.display()
+        runtime.is_file() && provenance.is_file(),
+        "standalone build did not stage the runtime/provenance pair at {}",
+        runtime.display(),
     );
-    replace_copy(&runtime, &resources.join("libreverie_liteinst.so"));
-    // RECORD THE PIN THE ARTIFACT WAS BUILT FROM, AND MEAN IT.
-    //
-    // `sabre.revision` established this shape and is read by nothing, so it is
-    // provenance rather than authority. This one IS read: hermit compares it
-    // against the pin compiled into the binary when it resolves the staged
-    // runtime, and refuses a mismatch. That is what makes staleness loud instead
-    // of silent -- see the loader in hermit-cli/src/lib.rs.
-    //
-    // ⚠️ WRITE IT BESIDE **EVERY** STAGED COPY, NOT JUST THIS ONE. The runtime is
-    // staged twice -- once at `profile_dir` by the script above and once here in
-    // `resources` -- and the loader reads `<the path it resolved>.revision`. When
-    // the sidecar existed only here, a correct restage produced a correct pin in
-    // `rsrcs/` while the loader resolved `target/release/libreverie_liteinst.so`,
-    // found no sidecar beside it, and refused with "records no Reverie revision".
-    // The artifact was never stale; only one of its two homes carried provenance.
-    // That made the printed remedy -- `cargo build --release -p hermit-install` --
-    // regenerate exactly the state that was already failing, so following the
-    // error message looped instead of resolving.
     let pin = reverie_pin(repository);
-    for staged in [&runtime, &resources.join("libreverie_liteinst.so")] {
-        let marker = PathBuf::from(format!("{}.revision", staged.display()));
-        fs::write(&marker, format!("{pin}\n")).unwrap_or_else(|error| {
-            panic!(
-                "failed to record the LiteInst runtime revision at {}: {error}",
-                marker.display()
-            )
-        });
-    }
+    let validate = |bytes: &[u8], provenance: &[u8]| {
+        liteinst_artifact::validate_provenance(
+            bytes,
+            provenance,
+            &pin,
+            caller_source_identity,
+            false,
+        )
+    };
+    let pair = liteinst_inputs::RuntimePair::read(&runtime, validate)
+        .expect("staged LiteInst runtime/provenance validation failed");
+    let installed = resources.join(runtime_name);
+    pair.install(&installed, validate)
+        .expect("failed to install exact validated LiteInst runtime/provenance bytes");
+}
+
+fn required_path(name: &str) -> PathBuf {
+    PathBuf::from(env::var_os(name).unwrap_or_else(|| {
+        panic!(
+            "{name} is required; stage the LiteInst source record before building the Hermit caller"
+        )
+    }))
+}
+
+fn validate_liteinst_caller(
+    repository: &Path,
+    reverie_root: &Path,
+    profile_dir: &Path,
+) -> (PathBuf, String) {
+    assert!(
+        env::var("HERMIT_LITEINST_DIAGNOSTIC").as_deref() != Ok("1"),
+        "diagnostic LiteInst artifacts must not be installed as product resources"
+    );
+    let source_record = required_path("HERMIT_LITEINST_SOURCE_RECORD");
+    assert!(
+        fs::symlink_metadata(&source_record).is_ok_and(|metadata| metadata.file_type().is_file()),
+        "HERMIT_LITEINST_SOURCE_RECORD must name an existing regular file before building hermit-install: {}",
+        source_record.display()
+    );
+    println!("cargo:rerun-if-changed={}", source_record.display());
+    let configured_hermit = required_path("HERMIT_LITEINST_HERMIT_ROOT")
+        .canonicalize()
+        .expect("canonicalize HERMIT_LITEINST_HERMIT_ROOT");
+    let configured_reverie = required_path("HERMIT_LITEINST_REVERIE_ROOT")
+        .canonicalize()
+        .expect("canonicalize HERMIT_LITEINST_REVERIE_ROOT");
+    assert_eq!(
+        configured_hermit,
+        repository.canonicalize().expect("canonicalize Hermit root"),
+        "HERMIT_LITEINST_HERMIT_ROOT differs from the repository being installed"
+    );
+    assert_eq!(
+        configured_reverie,
+        reverie_root
+            .canonicalize()
+            .expect("canonicalize Reverie root"),
+        "HERMIT_LITEINST_REVERIE_ROOT differs from the resolved Reverie source"
+    );
+
+    let source_bytes = fs::read(&source_record).expect("read HERMIT_LITEINST_SOURCE_RECORD");
+    let source_identity = liteinst_artifact::digest(&source_bytes);
+    let caller = profile_dir.join("hermit");
+    let caller_bytes = fs::read(&caller).unwrap_or_else(|error| {
+        panic!(
+            "Hermit caller must be built with the LiteInst source record before hermit-install: {}: {error}",
+            caller.display()
+        )
+    });
+    assert!(
+        caller_bytes
+            .windows(source_identity.len())
+            .any(|window| window == source_identity.as_bytes()),
+        "Hermit caller was not built with HERMIT_LITEINST_SOURCE_RECORD {}; rebuild it with the same source record and both source roots before hermit-install",
+        source_record.display()
+    );
+    (source_record, source_identity)
 }
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
+    for name in [
+        "HERMIT_LITEINST_DIAGNOSTIC",
+        "HERMIT_LITEINST_RUNTIME_KIND",
+        "HERMIT_LITEINST_SOURCE_RECORD",
+        "HERMIT_LITEINST_CARGO_CONFIG",
+        "HERMIT_LITEINST_HERMIT_ROOT",
+        "HERMIT_LITEINST_REVERIE_ROOT",
+        "HERMIT_LITEINST_CLI_MANIFEST",
+        "HERMIT_LITEINST_DSO_MANIFEST",
+        "HERMIT_LITEINST_PRIVATE_INPUTS",
+        "CARGO",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
     println!("cargo:rerun-if-changed=native-client/detcore_dbt_link_stub.c");
@@ -349,7 +420,14 @@ fn main() {
     // pin.
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.lock");
-    println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/build.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/artifact.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/private_build.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/detcore-runtime/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/detcore-runtime/Cargo.lock");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/detcore-runtime/src");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/private-native");
 
     let profile = env::var("PROFILE");
     if profile.as_deref() != Ok("release")
@@ -372,6 +450,16 @@ fn main() {
     let target_dir = profile_dir
         .parent()
         .expect("Cargo profile directory has no target parent");
+    let repository = manifest_dir
+        .parent()
+        .expect("hermit-install is not inside the Hermit repository");
+    let reverie_root = reverie_dbt::native_client_source_dir()
+        .parent()
+        .and_then(Path::parent)
+        .expect("reverie-dbt source is not inside the Reverie repository");
+    let (source_record, caller_source_identity) =
+        validate_liteinst_caller(repository, reverie_root, &profile_dir);
+
     let install = target_dir.join("install_pkg");
     let resources = install.join("rsrcs");
     let build_root = target_dir.join("install-build");
@@ -396,15 +484,16 @@ fn main() {
     let dynamorio_cmake = copy_dynamorio(&resources);
     build_dbt_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
 
-    let repository = manifest_dir
-        .parent()
-        .expect("hermit-install is not inside the Hermit repository");
-    build_liteinst_runtime(repository, &build_root, &profile_dir, &resources);
+    build_liteinst_runtime(
+        repository,
+        reverie_root,
+        &source_record,
+        &caller_source_identity,
+        &build_root,
+        &profile_dir,
+        &resources,
+    );
 
-    let reverie_root = reverie_dbt::native_client_source_dir()
-        .parent()
-        .and_then(Path::parent)
-        .expect("reverie-dbt source is not inside the Reverie repository");
     build_sabre(reverie_root, &build_root, &resources);
     build_e9patch(reverie_root, &build_root, &resources);
     copy_licenses(repository, reverie_root, &install);
@@ -420,10 +509,8 @@ fn main() {
 
 include!("../hermit-cli/reverie_pin.rs");
 
-/// The Reverie revision this tree pins, read from the canonical manifest.
 fn reverie_pin(repository: &Path) -> String {
-    let Ok(text) = fs::read_to_string(repository.join("detcore/Cargo.toml")) else {
-        return "unknown".into();
-    };
-    parse_reverie_pin(&text).unwrap_or_else(|| "unknown".into())
+    let text = fs::read_to_string(repository.join("detcore/Cargo.toml"))
+        .expect("failed to read canonical Reverie pin manifest");
+    parse_reverie_pin(&text).expect("canonical Reverie pin is missing or ambiguous")
 }

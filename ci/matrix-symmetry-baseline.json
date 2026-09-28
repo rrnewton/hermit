@@ -30,7 +30,6 @@
     "tests/backend-parity/fixtures/sigaltstack_state.c",
     "tests/backend-parity/fixtures/sigprocmask_state.c",
     "tests/c/liteinst_host_activation.c",
-    "tests/c/liteinst_inert_runtime.c",
     "tests/c/sabre_exit_group_parked.c",
     "tests/c/signal_disposition.c"
   ]

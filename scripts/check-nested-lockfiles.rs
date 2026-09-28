@@ -9,13 +9,12 @@
 //! Fail fast when a *nested* Cargo workspace's `Cargo.lock` is stale relative to
 //! its own manifest, before the opaque `--locked` build failure downstream.
 //!
-//! `liteinst-runtime-build/` is a SEPARATE nested Cargo workspace
-//! (`[workspace] members = ["runtime"]` in its own `Cargo.toml`); it is NOT a
-//! member of the root Hermit workspace. Its inner `runtime` crate has a git
-//! dependency on Reverie pinned by `rev`. Because it is a distinct workspace, a
-//! root-level `cargo update` — or a Reverie-pin bump — refreshes the root
-//! `Cargo.lock` but NOT `liteinst-runtime-build/Cargo.lock`. When the pin moves
-//! and the nested lock is left behind, the staged build
+//! `liteinst-runtime-build/` and `liteinst-runtime-build/detcore-runtime/` are
+//! separate nested Cargo workspaces and are not members of the root Hermit
+//! workspace. Both carry lockfiles for pinned Reverie dependencies. Because
+//! they are distinct workspaces, a root-level `cargo update` — or a Reverie-pin
+//! bump — refreshes neither nested lockfile. When the pin moves and either lock
+//! is left behind, the staged build
 //! (`scripts/stage-liteinst-runtime.sh` via `hermit-install/build.rs`) runs
 //! `cargo build --locked` and fails ~78s in with the cryptic:
 //!
@@ -53,7 +52,10 @@ use std::process::Stdio;
 /// its own `[workspace]` table and a sibling `Cargo.lock`) that the root
 /// workspace does NOT include as members. Add one line per future nested
 /// workspace.
-const NESTED_WORKSPACES: &[&str] = &["liteinst-runtime-build"];
+const NESTED_WORKSPACES: &[&str] = &[
+    "liteinst-runtime-build",
+    "liteinst-runtime-build/detcore-runtime",
+];
 
 #[derive(Default)]
 struct Config {
@@ -260,6 +262,10 @@ mod tests {
         assert!(
             NESTED_WORKSPACES.contains(&"liteinst-runtime-build"),
             "the known nested workspace must be checked"
+        );
+        assert!(
+            NESTED_WORKSPACES.contains(&"liteinst-runtime-build/detcore-runtime"),
+            "the Detcore runtime nested workspace must be checked"
         );
     }
 

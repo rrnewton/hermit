@@ -48,6 +48,7 @@
       "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",
@@ -96,6 +97,7 @@
       "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",
@@ -147,6 +149,7 @@
         "dbt"
       ],
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",
@@ -177,6 +180,7 @@
       "_why": "@generated: Cargo package `detcore-model`; reverse-dependent closure: detcore-dbt, detcore-model, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify.",
       "e2e_all": true,
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",
@@ -246,6 +250,7 @@
       "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
       "e2e_all": true,
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",
@@ -313,6 +318,7 @@
       "_why": "@generated: Cargo package `hermit`; reverse-dependent closure: hermit.",
       "e2e_all": true,
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",
@@ -358,7 +364,7 @@
       "_why": "@generated: Cargo package `hermit-install`; reverse-dependent closure: hermit-install.",
       "e2e_all": true,
       "nodes": [
-        "build.runtime_release",
+        "build.liteinst_runtime_release",
         "build.workspace",
         "doc.doctests",
         "doc.rustdoc",
@@ -404,6 +410,7 @@
       "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, hermit, hermit-resources.",
       "e2e_all": true,
       "nodes": [
+        "build.liteinst_runtime_release",
         "build.runtime_release",
         "build.workspace",
         "doc.doctests",

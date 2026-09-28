@@ -983,6 +983,7 @@ dependencies = [
  "reverie-rpc-transport",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "tempfile",
  "tokio",
@@ -1037,7 +1038,11 @@ dependencies = [
 name = "hermit-install"
 version = "0.2.0"
 dependencies = [
+ "goblin",
  "reverie-dbt",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

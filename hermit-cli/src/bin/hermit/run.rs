@@ -1710,7 +1710,7 @@ fn skid_margin_override_parses_and_round_trips() {
 
 #[test]
 fn skid_margin_override_rejects_non_ptrace_backed_backends() {
-    for backend in ["dbt", "kvm", "sabre"] {
+    for backend in ["dbt", "liteinst", "kvm", "sabre"] {
         let mut opts = RunOpts::parse_from([
             "fakehermit",
             &format!("--backend={backend}"),
@@ -1725,22 +1725,6 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
             "unexpected {backend} error: {error}"
         );
     }
-}
-
-#[test]
-fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
-    let mut opts = RunOpts::parse_from([
-        "fakehermit",
-        "--backend=liteinst",
-        "--skid-margin=500",
-        "fakeprog",
-    ]);
-    opts.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(opts.skid_margin, Some(500));
-    assert_eq!(
-        format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 -- fakeprog"
-    );
 }
 
 #[test]
@@ -2611,31 +2595,6 @@ impl RunOpts {
         }
     }
 
-    fn verify_liteinst_activation(&self) -> Result<(), Error> {
-        let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
-        let mut command = Command::new(executable);
-        command
-            .env_clear()
-            .env(super::LITEINST_ACTIVATION_PROBE_ENV, "1");
-        let output = hermit::run_with_output_backend(
-            command,
-            self.effective_det_config(),
-            false,
-            &None,
-            Backend::Liteinst,
-        )?;
-        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=31\n";
-        if output.status != ExitStatus::Exited(0) || output.stdout != expected {
-            anyhow::bail!(
-                "LiteInst activation probe failed closed: status={:?}, stdout={:?}, stderr={:?}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        Ok(())
-    }
-
     /// The `--verify-json` path this invocation will publish a verdict to, if
     /// any. Exposed so the top-level dispatcher can stamp the invocation-bound
     /// NO-RESULT record before ANY fallible preflight runs — several of this
@@ -2778,8 +2737,10 @@ impl RunOpts {
         };
         // });
 
-        // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
-        // e9patch, and ptrace use the common container and run/verify machinery.
+        // DBT uses its dedicated CLI launch adapter. SaBRe, KVM, e9patch, and
+        // ptrace use the common container and run/verify machinery. The CLI
+        // refuses LiteInst before this point because it does not own a capture
+        // session.
         match backend {
             Backend::Ptrace
             | Backend::Liteinst
@@ -2813,13 +2774,6 @@ impl RunOpts {
             }
         }
 
-        if backend == Backend::Liteinst {
-            self.verify_liteinst_activation()?;
-            eprintln!(
-                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
-            );
-        }
-
         if self.no_namespace {
             eprintln!(
                 "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
@@ -2845,10 +2799,9 @@ impl RunOpts {
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
         let perf_supported = match self.selected_backend() {
-            Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
-                reverie_ptrace::is_perf_supported()
-            }
+            Backend::Ptrace | Backend::E9patch => reverie_ptrace::is_perf_supported(),
             Backend::Dbt | Backend::Sabre | Backend::Kvm => true,
+            Backend::Liteinst => false,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
@@ -2856,11 +2809,7 @@ impl RunOpts {
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let backend = self.selected_backend();
         if self.skid_margin.is_some()
-            && (self.namespace_only
-                || !matches!(
-                    backend,
-                    Backend::Ptrace | Backend::Liteinst | Backend::E9patch
-                ))
+            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
         {
             anyhow::bail!(
                 "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
@@ -4138,10 +4087,11 @@ impl RunOpts {
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
-            Backend::Liteinst => {
-                Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
-            }
-            Backend::Ptrace | Backend::Dbt | Backend::Sabre | Backend::E9patch => None,
+            Backend::Ptrace
+            | Backend::Dbt
+            | Backend::Liteinst
+            | Backend::Sabre
+            | Backend::E9patch => None,
         };
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
@@ -4420,10 +4370,13 @@ impl RunOpts {
     /// | backend    | elapsed | marker                        |
     /// |------------|---------|-------------------------------|
     /// | `ptrace`   | 3s      | `class=run-timeout`           |
-    /// | `liteinst` | 3s      | `class=run-timeout`           |
     /// | `kvm`      | 13s     | `HERMIT_RUN_TIMEOUT_FALLBACK` |
     /// | `sabre`    | 40s     | none -- killed by the harness |
     /// | `dbt`      | 20s     | none -- killed by the harness |
+    ///
+    /// The old LiteInst timeout result came from the removed ptrace-host path,
+    /// not the public caller-owned session path, so it is not qualifying
+    /// evidence for LiteInst.
     ///
     /// ⚠️ `sabre` AND `dbt` ARE NOT MERELY UNTESTED -- THEY STRUCTURALLY CANNOT
     /// HONOUR THE FLAG TODAY, and the difference decides what fixing them means.
@@ -4457,15 +4410,16 @@ impl RunOpts {
             return Ok(());
         }
         let backend = self.runtime_backend();
-        if matches!(backend, Backend::Ptrace | Backend::Liteinst) {
+        if backend == Backend::Ptrace {
             return Ok(());
         }
         Err(Error::new(PolicyRefusal).context(format!(
             "--timeout is not qualified on the `{backend:?}` backend and hermit will not \
              accept a bound it cannot enforce. Measured 2026-08-26 with `--timeout 3` on a \
-             guest that never exits: ptrace and liteinst stopped at 3s and reported \
-             `class=run-timeout`; kvm stopped only via the hard fallback at 13s; sabre and \
-             dbt did not stop the run at all. Use an outer bound (the cell's \
+             guest that never exits: ptrace stopped at 3s and reported `class=run-timeout`; \
+             kvm stopped only via the hard fallback at 13s; sabre and dbt did not stop the run \
+             at all; LiteInst has no qualifying execution evidence for its public session path. \
+             Use an outer bound (the cell's \
              `timeout_seconds`, or `bin/safehermit --sh-deadline`) on this backend, and see \
              docs/TIMEOUT_LADDER.md."
         )))

@@ -69,7 +69,7 @@ determinism curve:
 | Backend | Mechanism | Status | Trade-off |
 | --- | --- | --- | --- |
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
-| **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamically linked scope, and hook installation is single-task only |
+| **LiteInst** | In-guest syscall user dispatch without patching, loading the shared Detcore tool through Reverie | Implemented; execution qualification pending | Caller-owned capture session and a runtime/provenance pair with the same source identity are required; ordinary CLI dispatch refuses |
 | **DBT** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
 | **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
@@ -80,19 +80,18 @@ backend the rest of this document describes. It is complete (it sees every
 subscribed event from every thread) and integrates with the PMU for RCB-based
 preemption, at the cost of a context switch per intercepted event.
 
-**LiteInst host hybrid.** Ptrace owns the sole Detcore Tool and GlobalTool from
-the initial exec, including PMU scheduling and CPUID/RDTSC handling. A preload
-DSO contains only LiteInst patch/helper state. The first eligible syscall site
-is validated by the tracer and may be patched; later invocations enter the
-trampoline but preserve the same ptrace-owned lifecycle. The current scope is
-dynamically linked. Threads and child processes run under the ordinary ptrace
-lifecycle, but **hook installation is single-task only**: the patch helper runs
-on a process-global stack and the installer is not re-entrant across tasks, so
-the hook set freezes at the first `clone`/`clone3`/`fork`/`vfork`. A
-task-creating syscall site is never patched, because the kernel starts the new
-task at the instruction after the `syscall` and that address must still be an
-instruction boundary. A `vfork` child and an exec after start both still fail
-closed, because neither can preserve the preload runtime.
+**LiteInst.** The in-guest runtime loads the same shared Detcore tool through
+Reverie and selects syscall user dispatch without patching. Its public library
+entry point requires the caller to create the capture `Session` and `LogInput`,
+run through the session-aware wrapper, and call `Session::finish`. The runtime
+and adjacent provenance file bind their bytes to the exact Hermit and Reverie
+sources; staging must create that source record before the caller is compiled.
+The ordinary command-line dispatcher refuses because it does not own that
+capture lifetime. The current Reverie pin lacks the split runtime package and
+session APIs, so normal locked, offline staging also refuses until a genuine
+commit containing them is pinned. Native child lifecycle and signal paths have
+compile/link evidence only; guest execution and backend qualification remain
+pending.
 
 **e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
 the main executable and invokes `e9tool -O0` with an exact file-offset matcher.

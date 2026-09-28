@@ -6,11 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::ffi::OsStr;
-use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::OnceLock;
 
 static LITEINST_RUNTIME: OnceLock<()> = OnceLock::new();
@@ -25,61 +21,19 @@ pub(super) fn liteinst_runtime_library() -> PathBuf {
     hermit_binary()
         .parent()
         .expect("Hermit test binary should have a profile directory")
-        .join("libreverie_liteinst.so")
-}
-
-pub(super) fn staged_runtime_matches_current_pin(runtime: &Path) -> bool {
-    if !runtime.is_file() {
-        return false;
-    }
-    let revision = PathBuf::from(format!("{}.revision", runtime.display()));
-    fs::read_to_string(revision).is_ok_and(|staged| staged.trim() == env!("HERMIT_REVERIE_PIN"))
+        .join(hermit::liteinst_artifact::RUNTIME_NAME)
 }
 
 pub(super) fn ensure_liteinst_runtime() {
     LITEINST_RUNTIME.get_or_init(|| {
-        let hermit = hermit_binary();
-        let profile_dir = hermit
-            .parent()
-            .expect("Hermit test binary should have a profile directory");
-        let profile = profile_dir
-            .file_name()
-            .expect("Hermit profile directory should have a name");
-        let cargo_profile = if profile == OsStr::new("debug") {
-            OsStr::new("dev")
-        } else {
-            profile
-        };
-        let target_dir = profile_dir
-            .parent()
-            .expect("Hermit profile should be inside a target directory");
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        // stage-liteinst-runtime.sh appends the current Reverie pin itself, so
-        // cache invalidation has the same source of truth as the pin gate.
-        let runtime_target = target_dir.join("liteinst-runtime-build");
         let runtime = liteinst_runtime_library();
-        if staged_runtime_matches_current_pin(&runtime) {
-            return;
-        }
-        let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
-            .current_dir(repository)
-            .arg(cargo_profile)
-            .arg(&runtime)
-            .arg(&runtime_target)
-            .output()
-            .expect("failed to build the LiteInst runtime");
-        assert!(
-            output.status.success(),
-            "LiteInst runtime build failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        assert!(
-            runtime.is_file(),
-            "standalone LiteInst runtime build did not stage {}",
-            runtime.display(),
-        );
+        hermit::validate_liteinst_detcore_runtime_library(&runtime).unwrap_or_else(|error| {
+            panic!(
+                "LiteInst tests require a runtime staged before the Hermit caller is built; \
+                 stage the runtime with HERMIT_LITEINST_SOURCE_RECORD, then rebuild this test \
+                 with that same record and both source roots: {}: {error}",
+                runtime.display()
+            )
+        });
     });
 }

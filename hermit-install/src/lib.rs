@@ -7,3 +7,7 @@
  */
 
 //! Build-only crate that assembles Hermit's release installation package.
+
+#[cfg(test)]
+#[path = "../liteinst_inputs.rs"]
+mod liteinst_inputs;

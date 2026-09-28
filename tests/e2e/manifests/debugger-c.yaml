@@ -23,8 +23,8 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:

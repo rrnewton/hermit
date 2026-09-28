@@ -316,13 +316,6 @@
       "test": "backend-parity-c/mmap-layout-pointer-order"
     },
     {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/mmap-layout-pointer-order"
-    },
-    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -548,13 +541,6 @@
     },
     {
       "backend": "ptrace",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/stat-metadata-identity"
-    },
-    {
-      "backend": "liteinst",
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
@@ -1079,13 +1065,6 @@
       "test": "c-programs/netns-cookie-udp4"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/name-to-handle-regular-eopnotsupp"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -1569,13 +1548,6 @@
       "test": "c-programs/uname"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/unix-autobind-stream"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -1658,13 +1630,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "data-handling/zstd-multithread"
-    },
-    {
-      "backend": "liteinst",
-      "category": "debugger-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "debugger-c/debuggee"
     },
     {
       "backend": "ptrace",
@@ -1896,13 +1861,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/auxv-loader-dump"
-    },
-    {
-      "backend": "liteinst",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "custom",
-      "test": "system-utils/clock-determinism"
     },
     {
       "backend": "ptrace",
@@ -2146,13 +2104,6 @@
       "test": "backend-parity-c/cpuid-probe"
     },
     {
-      "backend": "liteinst",
-      "category": "bin-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "bin-c/posix-timer-test"
-    },
-    {
       "backend": "ptrace",
       "category": "bin-c",
       "lane": "portable",
@@ -2181,13 +2132,6 @@
       "test": "c-programs/dbt-prlimit-self"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/name-to-handle-at-eopnotsupp"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2200,13 +2144,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/name-to-handle-at-eopnotsupp"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/name-to-handle-directory-eopnotsupp"
     },
     {
       "backend": "ptrace",
@@ -2223,13 +2160,6 @@
       "test": "c-programs/name-to-handle-directory-eopnotsupp"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/name-to-handle-empty-path-eopnotsupp"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2242,13 +2172,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/name-to-handle-empty-path-eopnotsupp"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/proc-fd-link-aliases"
     },
     {
       "backend": "ptrace",
@@ -2279,13 +2202,6 @@
       "test": "c-programs/procfs-identity-agreement"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/so-incoming-cpu-tcp6"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2298,13 +2214,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/so-incoming-cpu-tcp6"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/so-incoming-cpu-udp4"
     },
     {
       "backend": "ptrace",
@@ -2321,13 +2230,6 @@
       "test": "c-programs/so-incoming-cpu-udp4"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-cookie-tcp"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2340,13 +2242,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/socket-cookie-tcp"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-cookie-udp"
     },
     {
       "backend": "ptrace",
@@ -2363,13 +2258,6 @@
       "test": "c-programs/socket-cookie-udp"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-cookie-unix"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2384,7 +2272,7 @@
       "test": "c-programs/socket-cookie-unix"
     },
     {
-      "backend": "liteinst",
+      "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
@@ -2395,13 +2283,6 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
-      "test": "c-programs/socket-ioctl-timestamp"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
       "test": "c-programs/socket-timestamp-timespec"
     },
     {
@@ -2409,28 +2290,7 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
-      "test": "c-programs/socket-timestamp-timespec"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
       "test": "c-programs/socket-timestamp-timeval"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-timestamp-timeval"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/unix-autobind-dgram"
     },
     {
       "backend": "ptrace",
@@ -2445,13 +2305,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/unix-autobind-dgram"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/unix-autobind-seqpacket"
     },
     {
       "backend": "ptrace",
@@ -2522,13 +2375,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/numa-node-identity"
-    },
-    {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/pid-probe"
     },
     {
       "backend": "ptrace",
@@ -2699,13 +2545,6 @@
       "test": "c-programs/dbt-wait-lifecycle"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/epoll-determinism"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2853,13 +2692,6 @@
       "test": "c-programs/memfd-secret-enosys"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/mmap-determinism"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2881,13 +2713,6 @@
       "test": "c-programs/nanosleep-threads-nocrash"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-generic"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2902,13 +2727,6 @@
       "test": "c-programs/netlink-autobind-generic"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-route"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -2921,13 +2739,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/netlink-autobind-route"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/netlink-autobind-usersock"
     },
     {
       "backend": "ptrace",
@@ -3189,13 +3000,6 @@
       "test": "c-programs/sigtimedwait-timeout-0s"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/so-incoming-cpu-tcp4"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -3393,13 +3197,6 @@
     },
     {
       "backend": "kvm",
-      "category": "language-runtimes",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "language-runtimes/example-python-random"
-    },
-    {
-      "backend": "liteinst",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",

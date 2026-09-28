@@ -40,7 +40,6 @@
 //!
 //! ```text
 //! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,ptrace -- /bin/true
-//! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,liteinst --detlog-heap -- ./guest arg
 //! ./scripts/cross-backend-detlog-diff.rs --normalize host-addresses,virtual-time -- ./guest
 //! ./scripts/cross-backend-detlog-diff.rs --self-test
 //! ./scripts/cross-backend-detlog-diff.rs --list-normalizations
@@ -126,12 +125,11 @@ fn backend_description(backend: &str) -> Result<&'static str, String> {
     match backend {
         "ptrace" => Ok("ptrace backend"),
         "dbt" => Ok("DynamoRIO DBT backend"),
-        "liteinst" => Ok("ptrace-hosted LiteInst backend"),
         "sabre" => Ok("SaBRe backend"),
         "kvm" => Ok("KVM backend"),
         "e9patch" => Ok("e9patch preprocessing with the ptrace backend"),
         _ => Err(format!(
-            "unknown backend {backend:?}; expected ptrace, dbt, liteinst, sabre, kvm, or e9patch"
+            "unknown backend {backend:?}; expected ptrace, dbt, sabre, kvm, or e9patch"
         )),
     }
 }
@@ -159,7 +157,7 @@ fn usage() -> String {
          \x20 --keep DIR              keep the raw captured streams in DIR\n\
          \x20 --self-test             run inert parser/normalization/selection checks\n\
          \x20 --list-normalizations   describe every normalization and exit\n\n\
-         Backends: ptrace, dbt, liteinst, sabre, kvm. `e9patch` means\n\
+         Backends: ptrace, dbt, sabre, kvm. `e9patch` means\n\
          preprocessing followed by the ptrace runtime; it is not a backend.\n\
          DBT currently refuses because its one-run stderr is guest-controllable.\n\
          SaBRe also refuses: its Detcore records use raw guest-controllable\n\
@@ -889,7 +887,7 @@ fn run_self_test() {
         }
     };
 
-    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+    for backend in ["ptrace", "dbt", "sabre", "kvm", "e9patch"] {
         check(
             backend_description(backend).is_ok(),
             &format!("known execution path {backend} was rejected"),
@@ -898,6 +896,10 @@ fn run_self_test() {
     check(
         backend_description("dbi").is_err(),
         "obsolete dbi spelling was accepted",
+    );
+    check(
+        backend_description("liteinst").is_err(),
+        "ordinary LiteInst command-line execution was accepted without a caller-owned capture session",
     );
     check(
         !has_authoritative_complete_single_run_log_file("dbt")

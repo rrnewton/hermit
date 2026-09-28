@@ -27,7 +27,8 @@ function tree_manifest {
 function require_complete_resources {
     local install=$1 path
     [[ -d $install/rsrcs ]] || fail "resource bundle has no rsrcs directory: $install"
-    for path in libdetcore_dbt.so libdetcore_sabre.so libreverie_dbt_client.so libreverie_liteinst.so; do
+    for path in libdetcore_dbt.so libdetcore_sabre.so libreverie_dbt_client.so \
+        libhermit_liteinst_detcore.so libhermit_liteinst_detcore.so.provenance.json; do
         [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||
             fail "resource bundle is missing or empty: $install/rsrcs/$path"
     done
