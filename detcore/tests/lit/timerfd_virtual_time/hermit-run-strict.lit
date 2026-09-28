@@ -1,6 +1,6 @@
-# timerfd_settime currently arms a host-kernel timer while CLOCK_MONOTONIC is
-# virtualized. The blocking read therefore completes after host time passes,
-# before the guest's virtual deadline. A timerfd virtual-time implementation
-# should turn this XPASS, at which point this marker must be removed.
-XFAIL: *
+# timerfd is virtualized against the deterministic clock: the host timerfd
+# is a never-armed vessel and the blocking read completes at the guest's
+# virtual deadline, not after host time passes. (This test was XFAIL while
+# timerfd_settime armed a host-kernel timer; the virtual-time implementation
+# turned it XPASS and the marker was removed, as that comment required.)
 RUN: %hermit run --strict -- %me

@@ -1499,6 +1499,24 @@ impl GlobalTool for GlobalState {
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
+            GlobalRequest::RegisterTimerFd(dpid, dtid, fd, deadline, interval) => {
+                match self
+                    .recv_register_timerfd(
+                        dpid,
+                        RpcIncarnation {
+                            dettid: dtid,
+                            mm: request_mm,
+                        },
+                        fd,
+                        deadline,
+                        interval,
+                    )
+                    .await
+                {
+                    SchedulerRpcResult::Continue(()) => R::RegisterTimerFd(()),
+                    SchedulerRpcResult::ThreadExited => R::ThreadExited,
+                }
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
             GlobalRequest::ResolveKillTargets(dpid) => R::ResolveKillTargets(
@@ -2657,6 +2675,24 @@ impl GlobalState {
         );
         SchedulerRpcResult::Continue(())
     }
+
+    /// Register, re-arm, or disarm a virtual timerfd in the global scheduler.
+    async fn recv_register_timerfd(
+        &self,
+        detpid: DetPid,
+        caller: RpcIncarnation,
+        fd: i32,
+        deadline: Option<LogicalTime>,
+        interval: LogicalTime,
+    ) -> SchedulerRpcResult<()> {
+        let RpcIncarnation { dettid, mm } = caller;
+        let mut sched = self.lock_rpc_scheduler(false).await;
+        if sched.thread_is_logically_killed(dettid) || !sched.rpc_incarnation_matches(dettid, mm) {
+            return SchedulerRpcResult::ThreadExited;
+        }
+        sched.register_timerfd(detpid, fd, deadline, interval);
+        SchedulerRpcResult::Continue(())
+    }
 }
 
 /// Identity and final accounting for an asynchronous scheduler deregistration.
@@ -2820,6 +2856,9 @@ pub enum GlobalRequest {
         SigWrapper,
     ),
 
+    /// Register, re-arm, or disarm one virtual timerfd deadline.
+    RegisterTimerFd(DetPid, DetTid, i32, Option<LogicalTime>, LogicalTime),
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     /// Return the logical time remaining on a process's one-shot alarm.
@@ -2909,6 +2948,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     RegisterPosixTimer(()),
+    RegisterTimerFd(()),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     ReadyChildWait((Option<DetPid>, bool)),
@@ -3788,6 +3828,29 @@ pub async fn register_posix_timer<G, T>(
     .await;
     match resp.1 {
         GlobalResponse::RegisterPosixTimer(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// Register, re-arm, or disarm a virtual timerfd with the global scheduler.
+pub async fn register_timerfd<G, T>(
+    guest: &mut G,
+    fd: i32,
+    deadline: Option<LogicalTime>,
+    interval: LogicalTime,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::RegisterTimerFd(detpid, dettid, fd, deadline, interval),
+    )
+    .await;
+    match resp.1 {
+        GlobalResponse::RegisterTimerFd(()) => {}
         _ => unreachable!(),
     }
 }

@@ -27,6 +27,8 @@ pub struct TimedEvents {
 
     // Keep one alarm(2)/setitimer(2) event per process and one event per POSIX timer id.
     signal_timers: BTreeMap<SignalTimerId, SignalTimerState>,
+    // One pending expiry event per virtual timerfd, keyed (process, guest fd).
+    timerfd_timers: BTreeMap<(DetPid, i32), SignalTimerState>,
     // KVM real timers recur only after an actual shared SIGALRM dequeue.
     kvm_real_deadlines: BTreeMap<DetPid, LogicalTime>,
 }
@@ -76,6 +78,13 @@ pub enum TimedEvent {
 
     /// A timed event on a particular thread (sleep, timeout, etc)
     ThreadEvt(DetTid),
+
+    /// A virtual timerfd expiry for (process, guest fd). Declared last so the
+    /// canonical same-deadline pop order is SignalEvt, ThreadEvt, TimerFdEvt.
+    /// Popping wakes no thread: guest-visible readiness is a pure function of
+    /// virtual time computed by detcore; this event exists so the deadline is
+    /// a fast-forward target and periodic re-arm has a scheduler owner.
+    TimerFdEvt(DetPid, i32),
 }
 
 impl fmt::Display for TimedEvent {
@@ -85,6 +94,7 @@ impl fmt::Display for TimedEvent {
             TimedEvent::SignalEvt(id, dt, sig) => {
                 write!(f, "SignalEvt({:?},{},{})", id, dt, sig)
             }
+            TimedEvent::TimerFdEvt(dp, fd) => write!(f, "TimerFdEvt({},{})", dp, fd),
         }
     }
 }
@@ -271,6 +281,47 @@ impl TimedEvents {
         self.remove_signal_timer(SignalTimerId::Posix(dp, timer_id));
     }
 
+    /// Arm or re-arm a virtual timerfd. Returns the replaced state, mirroring
+    /// the signal-timer bookkeeping so re-arm/disarm never leaves a stale event.
+    pub fn insert_timerfd(
+        &mut self,
+        ns: LogicalTime,
+        dp: DetPid,
+        fd: i32,
+        interval: LogicalTime,
+    ) -> Option<(LogicalTime, LogicalTime)> {
+        let old = self.timerfd_timers.insert(
+            (dp, fd),
+            SignalTimerState {
+                deadline: ns,
+                interval,
+            },
+        );
+        self.clear_old_timerfd((dp, fd), old);
+        self.map
+            .entry(ns)
+            .or_default()
+            .insert(TimedEvent::TimerFdEvt(dp, fd));
+        old.map(|state| (state.deadline, state.interval))
+    }
+
+    pub fn remove_timerfd(&mut self, dp: DetPid, fd: i32) -> Option<(LogicalTime, LogicalTime)> {
+        let old = self.timerfd_timers.remove(&(dp, fd));
+        self.clear_old_timerfd((dp, fd), old);
+        old.map(|state| (state.deadline, state.interval))
+    }
+
+    fn clear_old_timerfd(&mut self, key: (DetPid, i32), old: Option<SignalTimerState>) {
+        if let Some(state) = old {
+            let Some(set) = self.map.get_mut(&state.deadline) else {
+                return;
+            };
+            if set.remove(&TimedEvent::TimerFdEvt(key.0, key.1)) && set.is_empty() {
+                self.map.remove(&state.deadline);
+            }
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     fn remove_signal_timer(&mut self, id: SignalTimerId) -> Option<SignalTimerState> {
@@ -304,6 +355,15 @@ impl TimedEvents {
             .collect();
         for id in ids {
             self.remove_signal_timer(id);
+        }
+        let fd_keys: Vec<_> = self
+            .timerfd_timers
+            .keys()
+            .copied()
+            .filter(|(pid, _)| *pid == dp)
+            .collect();
+        for (pid, fd) in fd_keys {
+            self.remove_timerfd(pid, fd);
         }
     }
 
@@ -354,6 +414,35 @@ impl TimedEvents {
                 state.deadline = time_ns + state.interval;
                 let next_deadline = state.deadline;
                 self.map.entry(next_deadline).or_default().insert(evt);
+            }
+        }
+        if let TimedEvent::TimerFdEvt(dp, fd) = evt
+            && self
+                .timerfd_timers
+                .get(&(dp, fd))
+                .is_some_and(|state| state.deadline == time_ns)
+        {
+            let key = (dp, fd);
+            let interval = self.timerfd_timers[&key].interval;
+            if interval == LogicalTime::ZERO {
+                self.timerfd_timers.remove(&key);
+            } else {
+                // Coalesced re-arm: jump to the first deadline after
+                // current_time in one step, however many intervals elapsed.
+                // An indefinite current_time is the unconditional `pop()`
+                // sentinel, not a real instant: the caller has just advanced
+                // the clock to `time_ns`, so re-arm exactly one interval
+                // (evaluating the coalesce arithmetic at MAX overflows u64).
+                let mut next = time_ns + interval;
+                if next <= current_time && !current_time.is_indefinite() {
+                    let missed = (current_time.as_nanos() - next.as_nanos()) / interval.as_nanos();
+                    next = LogicalTime::from_nanos(
+                        (next.as_nanos() as u128 + (missed as u128 + 1) * interval.as_nanos() as u128)
+                            .min(u64::MAX as u128) as u64,
+                    );
+                }
+                self.timerfd_timers.get_mut(&key).unwrap().deadline = next;
+                self.map.entry(next).or_default().insert(evt);
             }
         }
         Some((time_ns, evt))
@@ -667,6 +756,76 @@ mod test {
                 tid(100),
                 Signal::SIGCHLD
             )));
+    }
+
+    /// Same-deadline canonical order: SignalEvt, ThreadEvt, TimerFdEvt.
+    #[test]
+    fn timerfd_sorts_after_signal_and_thread_at_same_deadline() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_timerfd(at(500), p, 9, LogicalTime::ZERO);
+        ev.insert(at(500), tid(100));
+        ev.insert_alarm(at(500), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO);
+        assert_eq!(
+            ev.pop(),
+            Some((
+                at(500),
+                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM)
+            ))
+        );
+        assert_eq!(ev.pop(), Some((at(500), TimedEvent::ThreadEvt(tid(100)))));
+        assert_eq!(ev.pop(), Some((at(500), TimedEvent::TimerFdEvt(p, 9))));
+        assert!(ev.is_empty());
+    }
+
+    /// Re-arm replaces the pending event; disarm and process cleanup remove it.
+    #[test]
+    fn timerfd_rearm_disarm_and_process_cleanup() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_timerfd(at(500), p, 9, LogicalTime::ZERO);
+        assert_eq!(
+            ev.insert_timerfd(at(900), p, 9, LogicalTime::ZERO),
+            Some((at(500), LogicalTime::ZERO))
+        );
+        assert_eq!(ev.next_deadline(), Some(at(900)));
+        assert_eq!(ev.remove_timerfd(p, 9), Some((at(900), LogicalTime::ZERO)));
+        assert!(ev.is_empty());
+        ev.insert_timerfd(at(700), p, 9, LogicalTime::ZERO);
+        ev.remove_process_timers(p);
+        assert!(ev.is_empty());
+    }
+
+    /// Periodic re-arm coalesces: popping far past multiple intervals inserts
+    /// exactly one future event at the first deadline after `now`.
+    #[test]
+    fn timerfd_periodic_rearm_coalesces() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_timerfd(at(100), p, 9, at(50));
+        let (t, evt) = ev.pop_if_before(at(430)).expect("pops");
+        assert_eq!((t, evt), (at(100), TimedEvent::TimerFdEvt(p, 9)));
+        // Next deadline is 450 (first > 430), not 150/200/.../400.
+        assert_eq!(ev.next_deadline(), Some(at(450)));
+        assert_eq!(ev.iter().count(), 1);
+    }
+
+    /// Unconditional `pop()` (the empty-queue fast-forward path) on a periodic
+    /// timerfd re-arms exactly one interval. Regression: `pop()` is
+    /// `pop_if_before(LogicalTime::MAX)`, and the coalesced re-arm used to
+    /// evaluate its missed-interval arithmetic at `MAX`, overflowing u64 and
+    /// panicking the scheduler — a periodic timerfd plus a sleeping thread
+    /// (empty run queue) hung the guest.
+    #[test]
+    fn timerfd_periodic_pop_unconditional_rearms_one_interval() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_timerfd(at(100), p, 9, at(50));
+        assert_eq!(ev.pop(), Some((at(100), TimedEvent::TimerFdEvt(p, 9))));
+        assert_eq!(ev.next_deadline(), Some(at(150)));
+        assert_eq!(ev.iter().count(), 1);
+        assert_eq!(ev.pop(), Some((at(150), TimedEvent::TimerFdEvt(p, 9))));
+        assert_eq!(ev.next_deadline(), Some(at(200)));
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
