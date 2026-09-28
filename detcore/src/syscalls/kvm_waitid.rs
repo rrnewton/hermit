@@ -158,9 +158,6 @@ async fn wait_terminal<G, T>(
     guest: &mut G,
     call: syscalls::Waitid,
     spec: ChildWaitSpec,
-    info: AddrMut<'_, libc::siginfo_t>,
-    mask: &KernelSigset,
-    action: AddrMut<'_, KernelSigaction>,
     rsrc: Resources,
 ) -> Result<i64, Error>
 where
@@ -177,13 +174,17 @@ where
             } else {
                 // Retain one ordinary WaitChild request for each blocking wait,
                 // rather than adding a preliminary polling turn.
-                wait_for_child_lifecycle(guest, spec).await
+                crate::tool_global::child_wait_request(guest, spec).await
             };
             request_turn = false;
+            if !nonblocking && matches!(status, ResumeStatus::Signaled(None)) {
+                // The scheduler checked ready/no-child precedence before the
+                // actual caught selection. Complete that interrupted attempt
+                // before its handler; a later child event cannot undo it.
+                return finish_without_event(guest, call, Err(Errno::ERESTARTSYS)).await;
+            }
             if !nonblocking && pending_signal.is_none() {
-                pending_signal = wait_signal_disposition(guest, status, mask, action, false)
-                    .await
-                    .map_err(|error| failure(format!("signal disposition: {error}")))?;
+                pending_signal = signal_after_wait(guest, status).await?;
             }
         }
         let (ready, has_child) = ready_child_wait(guest, spec).await;
@@ -196,13 +197,21 @@ where
             Decision::Ready(child) => child,
         };
         let _ = await_exact_child_physical_exit(guest, child).await;
-        // WaitPhysicalChild really requests a scheduler turn. Another waiter
-        // may have reaped the child or group/owner eligibility may have changed.
-        // Revalidate the complete original spec; no broad backend selector is used.
+        // Actual KVM does not request WaitPhysicalChild: its physical-exit
+        // reporting flag is false. Keep this full-spec recheck defensive if
+        // that helper gains a resource wait; no broad backend selector is used.
         let (current, _) = ready_child_wait(guest, spec).await;
         if current != Some(child) {
             continue;
         }
+        // A live KvmStackGuard excludes parked signal observations, including
+        // their nested Tool callbacks. Borrow scratch only after the wait has
+        // completed, never while its resource request can observe a signal.
+        let mut stack = guest.stack().await;
+        let info = stack.reserve::<libc::siginfo_t>();
+        let _guard = stack
+            .commit()
+            .map_err(|error| failure(format!("private stack: {error}")))?;
         let probe = call
             .with_which(libc::P_PID as i32)
             .with_pid(child.as_raw())
@@ -236,6 +245,54 @@ where
     }
 }
 
+async fn signal_after_wait<G, T>(
+    guest: &mut G,
+    status: ResumeStatus,
+) -> Result<Option<WaitSignalDisposition>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match status {
+        ResumeStatus::Normal => Ok(None),
+        // The capable resource protocol has already selected a real caught
+        // signal. Its returning gate protects copyout through frame delivery.
+        ResumeStatus::Signaled(None) => Ok(Some(WaitSignalDisposition::Interrupt)),
+        ResumeStatus::Signaled(Some(_)) => {
+            // Legacy scheduler wakes may name blocked signals. Read, but do
+            // not replace, the application mask. This scratch guard dies
+            // before any subsequent child-wait resource request.
+            let mut stack = guest.stack().await;
+            let old_mask = stack.reserve::<KernelSigset>();
+            let action = stack.reserve::<KernelSigaction>();
+            let _guard = stack
+                .commit()
+                .map_err(|error| failure(format!("mask-query stack: {error}")))?;
+            guest
+                .inject(
+                    syscalls::RtSigprocmask::new()
+                        .with_how(libc::SIG_SETMASK)
+                        .with_set(None)
+                        .with_oldset(Some(old_mask.cast()))
+                        .with_sigsetsize(KERNEL_SIGSET_SIZE),
+                )
+                .await
+                .map_err(|error| failure(format!("mask query: {error}")))?;
+            let mask: KernelSigset = guest
+                .memory()
+                .read_value(old_mask)
+                .map_err(|error| failure(format!("mask-query read: {error}")))?;
+            // A successful sibling send can name a blocked or ignored signal
+            // without leaving an interrupting event. Inspect its real action;
+            // both caught Restart and Interrupt still require zero copyout and
+            // ERESTARTSYS, letting the backend's return boundary decide restart.
+            wait_signal_disposition(guest, status, &mask, action, true)
+                .await
+                .map_err(|error| failure(format!("signal disposition: {error}")))
+        }
+    }
+}
+
 pub(super) async fn handle<G, T>(guest: &mut G, call: syscalls::Waitid) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
@@ -265,30 +322,9 @@ where
         Selector::Group(group) => ChildWaitSelector::ProcessGroup(DetPid::from_raw(group)),
     };
     let spec = terminal_child_wait_spec(selector, dettid, call.options());
-    let mut stack = guest.stack().await;
-    let info = stack.reserve::<libc::siginfo_t>();
-    let blocked = stack.push(blocked_signal_mask());
-    let old_mask = stack.reserve::<KernelSigset>();
-    let action = stack.reserve::<KernelSigaction>();
-    let _guard = stack
-        .commit()
-        .map_err(|error| failure(format!("private stack: {error}")))?;
-    if call.options() & libc::WNOHANG != 0 {
-        return wait_terminal(guest, call, spec, info, &0, action, rsrc).await;
-    }
-    let mask = block_signals_for_disposition(guest, blocked, old_mask)
-        .await
-        .map_err(|error| failure(format!("signal mask setup: {error}")))?;
-    let result = wait_terminal(guest, call, spec, info, &mask, action, rsrc).await;
-    // Ordinary errno completion, including EFAULT, must restore the mask. A
-    // typed invariant/backend failure is terminal; do not inject after it.
-    if matches!(&result, Err(Error::Tool(_) | Error::Io(_))) {
-        return result;
-    }
-    restore_signals_after_disposition(guest, old_mask)
-        .await
-        .map_err(|error| failure(format!("signal mask restoration: {error}")))?;
-    result
+    // KVM's exact callback boundary supplies disposition exclusion. Preserve
+    // the application's mask so a process alarm can interrupt a parked wait.
+    wait_terminal(guest, call, spec, rsrc).await
 }
 
 #[cfg(test)]

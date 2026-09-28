@@ -37,6 +37,8 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::tool_global::ResumeStatus;
+use crate::types::ChildWaitExitClass;
+use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
@@ -85,6 +87,10 @@ pub enum ControlCapability {
     PolledRead {
         site: CallbackSignalSite,
     },
+    /// A serial terminal wait whose complete selector remains scheduler-owned.
+    ChildWait {
+        site: CallbackSignalSite,
+    },
     PublishOnly {
         lease: ParkedObservationLease,
         site: CallbackSignalSite,
@@ -96,6 +102,7 @@ impl ControlCapability {
             Self::None => None,
             Self::ParkedWait { site, .. }
             | Self::PolledRead { site }
+            | Self::ChildWait { site }
             | Self::PublishOnly { site, .. } => Some(site),
         }
     }
@@ -205,6 +212,7 @@ impl From<TimerFailure> for ProtocolFailure {
 enum SavedMembership {
     Timed(LogicalTime),
     Queued(SuspendedRunQueueEntry),
+    ChildWait { parent: DetPid, spec: ChildWaitSpec },
 }
 #[derive(Clone, Copy, Debug)]
 enum ContinuationPhase {
@@ -433,7 +441,9 @@ impl Scheduler {
             self.real_timers.validate_site(pid, tid, origin.mm, site)?;
             match (origin.control, turn.protocol.owner) {
                 (
-                    ControlCapability::ParkedWait { .. } | ControlCapability::PolledRead { .. },
+                    ControlCapability::ParkedWait { .. }
+                    | ControlCapability::PolledRead { .. }
+                    | ControlCapability::ChildWait { .. },
                     NextTurnOwner::Ordinary | NextTurnOwner::ReturningCaught { .. },
                 ) => {}
                 (
@@ -733,6 +743,39 @@ impl Scheduler {
                         ParkedWaitPolicy::PauseNoHandlerRestart => LogicalTime::INDEFINITE,
                     },
                     ControlCapability::PolledRead { .. } => LogicalTime::INDEFINITE,
+                    ControlCapability::ChildWait { .. } => {
+                        let Some(Ok(resources)) = turn.req.try_read() else {
+                            continue;
+                        };
+                        let (parent, spec) = self
+                            .validate_child_wait_resources(tid, &resources)
+                            .map_err(|failure| SelectionFailure {
+                                pid,
+                                tid: Some(tid),
+                                failure,
+                            })?;
+                        self.validate_membership(tid, Some((parent, spec)))
+                            .map_err(|failure| SelectionFailure {
+                                pid,
+                                tid: Some(tid),
+                                failure,
+                            })?;
+                        // Selection and readiness are tested under the same
+                        // scheduler lock, before reserving/dequeuing a signal.
+                        // A ready child or ECHILD wins this wait's completion.
+                        if self.ready_child_wait(parent, spec).is_some()
+                            || !self.has_child_wait_target(parent, spec)
+                        {
+                            // A selector change can leave a blocked waiter
+                            // without a matching child. Admit its original
+                            // request so ordinary completion can actually win.
+                            if self.blocked.child_waiters.remove(&tid).is_some() {
+                                self.runqueue_push_back(tid);
+                            }
+                            continue;
+                        }
+                        LogicalTime::INDEFINITE
+                    }
                     _ => continue,
                 };
                 if deadline <= self.committed_time
@@ -755,9 +798,50 @@ impl Scheduler {
         Ok(())
     }
 
-    fn validate_membership(&self, tid: DetTid) -> Result<(), ProtocolFailure> {
+    fn validate_child_wait_resources(
+        &self,
+        tid: DetTid,
+        resources: &Resources,
+    ) -> Result<(DetPid, ChildWaitSpec), ProtocolFailure> {
+        if resources.tid != tid || resources.poll_attempt != 0 || resources.resources.len() != 1 {
+            return Err(ProtocolFailure::Unsupported);
+        }
+        let Some((ResourceID::WaitChild { parent, spec }, Permission::R)) =
+            resources.resources.iter().next()
+        else {
+            return Err(ProtocolFailure::Unsupported);
+        };
+        if self.registered_process(tid) != Some(*parent)
+            || spec.owner.is_some_and(|owner| owner != tid)
+            || spec.exit_class != ChildWaitExitClass::Sigchld
+        {
+            return Err(ProtocolFailure::Identity);
+        }
+        Ok((*parent, *spec))
+    }
+
+    fn validate_membership(
+        &self,
+        tid: DetTid,
+        child_wait: Option<(DetPid, ChildWaitSpec)>,
+    ) -> Result<(), ProtocolFailure> {
         let timed = self.blocked.timed_waiters.thread_deadline(tid).is_some();
         let queued = self.run_queue.contains_tid(tid);
+        if let Some(blocked) = self.blocked.child_waiters.get(&tid) {
+            return if child_wait == Some(*blocked) && !timed && !queued {
+                Ok(())
+            } else {
+                Err(ProtocolFailure::Phase)
+            };
+        }
+        if child_wait.is_some() {
+            // A child exit or another waiter can have just woken this request.
+            return if queued && !timed {
+                Ok(())
+            } else {
+                Err(ProtocolFailure::Phase)
+            };
+        }
         match (timed, queued) {
             (true, false) | (false, true) => Ok(()),
             (true, true) => Err(ProtocolFailure::Phase),
@@ -768,6 +852,9 @@ impl Scheduler {
     /// The daemon validates membership before changing the timer phase. It
     /// holds exclusive scheduler access through this infallible removal.
     fn take_validated_membership(&mut self, tid: DetTid) -> SavedMembership {
+        if let Some((parent, spec)) = self.blocked.child_waiters.remove(&tid) {
+            return SavedMembership::ChildWait { parent, spec };
+        }
         if let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) {
             self.blocked.timed_waiters.remove(tid);
             return SavedMembership::Timed(deadline);
@@ -834,6 +921,11 @@ impl Scheduler {
         {
             return Err(ProtocolFailure::Unsupported);
         }
+        let child_wait = if matches!(origin.control, ControlCapability::ChildWait { .. }) {
+            Some(self.validate_child_wait_resources(tid, &resources)?)
+        } else {
+            None
+        };
         let existing = self
             .parked
             .requests
@@ -875,7 +967,7 @@ impl Scheduler {
             .nonce
             .checked_add(if existing.is_some() { 1 } else { 2 })
             .ok_or(ProtocolFailure::Overflow)?;
-        self.validate_membership(tid)?;
+        self.validate_membership(tid, child_wait)?;
         let lease = ParkedObservationLease {
             nonce: self
                 .parked
@@ -1121,6 +1213,24 @@ impl Scheduler {
                     self.run_queue.suspend(tid, priority);
                     self.run_queue.restore(entry, priority);
                 }
+                SavedMembership::ChildWait { parent, spec } => {
+                    if self.blocked.child_waiters.contains_key(&tid)
+                        || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+                        || !self.run_queue.contains_tid(tid)
+                    {
+                        return Err(ProtocolFailure::Phase);
+                    }
+                    // Nested signal hooks can publish an exit, consume a child,
+                    // or change group/owner matching while this waiter is an
+                    // observation gate. Recheck the full selector before
+                    // blocking again; that gate already supplies its wakeup.
+                    if self.ready_child_wait(parent, spec).is_none()
+                        && self.has_child_wait_target(parent, spec)
+                    {
+                        self.run_queue.remove_tid(tid);
+                        self.blocked.child_waiters.insert(tid, (parent, spec));
+                    }
+                }
             }
             owned.origin.rpc = RpcOrigin::ResumeParkedRequest {
                 continuation: owned.id,
@@ -1209,6 +1319,75 @@ impl Scheduler {
         };
         let req = turn.req.clone();
         self.parked.requests.retain(|_, owned| owned.request != req);
+    }
+
+    /// A real cross-task notification replaces a child-wait request with the
+    /// legacy WaitidSignals grant. Its original capability cannot describe
+    /// that replacement, and an ignored observation may have retained an owned
+    /// request for the old transport. Retire only that exact waiting ownership.
+    pub(super) fn retire_child_wait_signal_request(
+        &mut self,
+        tid: DetTid,
+    ) -> Result<(), ProtocolFailure> {
+        let Some(turn) = self.next_turns.get(&tid) else {
+            return Ok(());
+        };
+        let Some(origin) = turn.protocol.origin else {
+            return Ok(());
+        };
+        if !matches!(origin.control, ControlCapability::ChildWait { .. }) {
+            return Ok(());
+        }
+        if turn.protocol.owner != NextTurnOwner::Ordinary
+            || self.parked.permits.contains_key(&tid)
+            || turn.resp.try_read().is_some()
+        {
+            return Err(ProtocolFailure::Phase);
+        }
+        let resources = turn
+            .req
+            .try_read()
+            .ok_or(ProtocolFailure::Phase)?
+            .map_err(|_| ProtocolFailure::Phase)?;
+        let spec = self.validate_child_wait_resources(tid, &resources)?;
+        if let Some(admission) = self.pending_run_queue_admissions.get(&tid) {
+            // Signal notifications drain before queued admissions. A genuine
+            // child wake can therefore be between its blocked and queued
+            // states here; force_unblock_thread consumes this pending entry.
+            if !matches!(admission, super::AdmitIntent::Fixed(super::AdmitSide::Back))
+                || self.blocked.child_waiters.contains_key(&tid)
+                || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+                || self.run_queue.contains_tid(tid)
+            {
+                return Err(ProtocolFailure::Phase);
+            }
+        } else {
+            self.validate_membership(tid, Some(spec))?;
+        }
+        for owned in self
+            .parked
+            .requests
+            .values()
+            .filter(|owned| owned.request == turn.req)
+        {
+            if !matches!(owned.phase, ContinuationPhase::Waiting)
+                || owned.response != turn.resp
+                || owned.origin != origin
+            {
+                return Err(ProtocolFailure::Identity);
+            }
+        }
+        self.settle_parked_grant(tid);
+        let turn = self
+            .next_turns
+            .get_mut(&tid)
+            .expect("validated child-wait owner");
+        turn.protocol
+            .origin
+            .as_mut()
+            .expect("validated child-wait origin")
+            .control = ControlCapability::None;
+        Ok(())
     }
 
     /// Normal polling replaces a request without completing its logical
