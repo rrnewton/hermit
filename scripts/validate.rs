@@ -24729,12 +24729,13 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany all 189 cases: {stdout}"
                 );
             } else {
-                // 252 until backend-parity-c was folded into c-programs, which
+                // 251 after backend-parity-c was folded into c-programs, which
                 // removed e2e.manifest_backend_parity_c_on_host
-                // (https://github.com/rrnewton/hermit/issues/3301).
+                // (https://github.com/rrnewton/hermit/issues/3301); enrolling
+                // test.detcore_time added test.detcore_time_on_host.
                 assert!(
                     stdout.contains(
-                        "251 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "252 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -24853,7 +24854,7 @@ mod committed_selection_preservation_tests {
         let public = [
             "test.app_strict_verify", "test.applications_e2e", "test.arbitrary_binaries",
             "test.command_strict_verify", "test.dbt_parity", "test.detcore_misc",
-            "test.detcore_parallel", "test.detcore_unit", "test.envelope_levels",
+            "test.detcore_parallel", "test.detcore_time", "test.detcore_unit", "test.envelope_levels",
             "test.hermit_integration", "test.hermit_unit", "test.ignored_syscall_regressions",
             "test.liteinst_strict", "test.regular_crates", "test.rr_suite_contract",
             "test.sabre_examples",
@@ -24865,7 +24866,7 @@ mod committed_selection_preservation_tests {
         assert_eq!(compat.len(), 189);
         expected.extend(compat);
         expected.insert("compatprep.fixtures_on_host".into());
-        assert_eq!(expected.len(), 206);
+        assert_eq!(expected.len(), 207);
         let requested = [public.join(","), STRICT_COMPAT_SELECTION_ALIAS.into()].join(",");
         for only in [false, true] {
             let mut argv = if only {
