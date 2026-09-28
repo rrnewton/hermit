@@ -38,8 +38,8 @@ fn diff_millis(t1: DateTime<Utc>, t2: DateTime<Utc>) -> i64 {
 }
 
 fn diff_nanos(t1: DateTime<Utc>, t2: DateTime<Utc>) -> i64 {
-    let m1 = t1.timestamp() * 1_000_000 + t1.timestamp_subsec_nanos() as i64;
-    let m2 = t2.timestamp() * 1_000_000 + t2.timestamp_subsec_nanos() as i64;
+    let m1 = t1.timestamp() * 1_000_000_000 + t1.timestamp_subsec_nanos() as i64;
+    let m2 = t2.timestamp() * 1_000_000_000 + t2.timestamp_subsec_nanos() as i64;
     m2 - m1
 }
 
@@ -53,9 +53,13 @@ fn tod_from_epoch() {
     check_fn_with_config::<Detcore, _>(
         || {
             let now = Utc::now();
+            let delta_ms = diff_millis(epoch, now);
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
-            assert!(diff_millis(now, epoch) < 100);
+            assert!(
+                (0..100).contains(&delta_ms),
+                "observed time {now} is not within 100 ms after epoch {epoch}: difference {delta_ms} ms"
+            );
         },
         config,
         true,
@@ -194,9 +198,13 @@ fn tod_gettimeofday() {
             );
             let tp = unsafe { tp.assume_init() };
             let dt = DateTime::from_timestamp(tp.tv_sec, 1000 * tp.tv_usec as u32).unwrap();
+            let delta_ms = diff_millis(epoch, dt);
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
-            assert!(diff_millis(dt, epoch) < 100);
+            assert!(
+                (0..100).contains(&delta_ms),
+                "gettimeofday time {dt} is not within 100 ms after epoch {epoch}: difference {delta_ms} ms"
+            );
         },
         config,
         true,
@@ -892,9 +900,13 @@ fn tod_clock_gettime() {
             );
             let tp = unsafe { tp.assume_init() };
             let dt = DateTime::from_timestamp(tp.tv_sec, tp.tv_nsec as u32).unwrap();
+            let delta_ms = diff_millis(epoch, dt);
             // However exactly we compute logical time, this should be within a small
             // fraction of a (logical) second of epoch:
-            assert!(diff_millis(dt, epoch) < 100);
+            assert!(
+                (0..100).contains(&delta_ms),
+                "clock_gettime time {dt} is not within 100 ms after epoch {epoch}: difference {delta_ms} ms"
+            );
         },
         config,
         true,
