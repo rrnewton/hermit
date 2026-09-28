@@ -23,7 +23,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-const CONTROLLER_WALL_SECONDS: u64 = 10;
+const CONTROLLER_WALL_SECONDS: u64 = 32;
+const NATIVE_CLIENT_WALL_SECONDS: u64 = 10;
 const SAFEHERMIT_WALL_SECONDS: u64 = 30;
 const OUTER_WALL_SECONDS: u64 = 45;
 const SAFEHERMIT_MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -385,7 +386,7 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     let output = bounded_command(
         fixture,
         &[OsStr::new("client"), OsStr::new(&port), OsStr::new("match")],
-        CONTROLLER_WALL_SECONDS,
+        NATIVE_CLIENT_WALL_SECONDS,
     );
     assert_success(&output, "native TCP bracket client");
     assert_guest_invariants(&output.stdout, "native TCP bracket client");

@@ -27,6 +27,7 @@
 
 #define PAYLOAD_SIZE 3
 #define FIXTURE_DEADLINE_SECONDS 8
+#define CONTROLLER_ACCEPT_DEADLINE_SECONDS 30
 
 static const char REQUEST[] = "request\n";
 static const char PROGRESS[] = "next\n";
@@ -131,7 +132,8 @@ static void publish_text(const char *path, const char *text) {
 
 static int run_controller(const char *port_path, const char *report_path,
                           const char *contact_path) {
-  set_deadline();
+  signal(SIGPIPE, SIG_IGN);
+  alarm(CONTROLLER_ACCEPT_DEADLINE_SECONDS);
   int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listener < 0)
     fail("socket controller");
@@ -159,6 +161,9 @@ static int run_controller(const char *port_path, const char *report_path,
   int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (client < 0)
     fail("accept controller");
+  // Provider startup happens before the guest can connect. Once accepted, the
+  // exact stream protocol retains its original, shorter wall bound.
+  alarm(FIXTURE_DEADLINE_SECONDS);
   publish_text(contact_path, "accepted\n");
   set_socket_timeouts(client);
   close(listener);
