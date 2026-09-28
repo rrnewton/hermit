@@ -69,6 +69,8 @@ const ERROR_CASES: &[&str] = &[
     "live-high-options",
     "live-p-all-ignores-id",
     "interrupted-protected-info",
+    "interrupted-writable-info",
+    "restarted-writable-info",
 ];
 
 fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u64) {
@@ -98,6 +100,40 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                 }
                 assert!(row["rc"].is_i64());
                 assert!(row["errno"].is_i64());
+                if matches!(
+                    name,
+                    "interrupted-writable-info" | "restarted-writable-info"
+                ) {
+                    let before = row["info_before"].as_str().unwrap();
+                    let mut zero_fields = before.as_bytes().to_vec();
+                    for offset in [0, 4, 8, 16, 20, 24] {
+                        zero_fields[2 * (64 + offset)..2 * (68 + offset)].fill(b'0');
+                    }
+                    assert_eq!(row["alarms"], 1);
+                    assert_eq!(row["aux_after"], row["aux_before"]);
+                    if name == "interrupted-writable-info" {
+                        assert_eq!(row["rc"], -1);
+                        assert_eq!(row["errno"], libc::EINTR);
+                        assert_eq!(
+                            row["info_after"].as_str().unwrap().as_bytes(),
+                            zero_fields.as_slice()
+                        );
+                    } else {
+                        assert_eq!(row["rc"], 0);
+                        assert_eq!(row["errno"], 0);
+                        assert_eq!(row["null_usage"], 1);
+                        assert_eq!(row["info_offset"], 64);
+                        assert_eq!(row["sa_restart"], true);
+                        assert_eq!(row["wait_calls"], 1);
+                        assert_eq!(row["handler_seen"], 1);
+                        assert_eq!(row["release_rc"], 1);
+                        assert_eq!(row["release_errno"], 0);
+                        assert_eq!(
+                            row["handler_info"].as_str().unwrap().as_bytes(),
+                            zero_fields.as_slice()
+                        );
+                    }
+                }
             }
             "check" => {
                 checks += 1;
@@ -137,7 +173,7 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
 pub(super) fn run(mode: &str) {
     let (expected, children) = match mode {
         "terminal" => (TERMINAL_CASES, 23),
-        "errors" => (ERROR_CASES, 2),
+        "errors" => (ERROR_CASES, 4),
         _ => panic!("unknown waitid fixture mode"),
     };
     let _lock = super::hermit_run_guard();

@@ -214,6 +214,27 @@ where
     .await
 }
 
+/// The serial KVM waitid handler lends its complete child selector while it
+/// has no checked-out scratch or modified application signal mask.
+pub(crate) async fn child_wait_request<G, T>(guest: &mut G, spec: ChildWaitSpec) -> ResumeStatus
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.config().backend_is_kvm || !guest.config().kvm_shared_dequeue_timers {
+        terminate_protocol(guest, ProtocolFailure::Unsupported).await;
+    }
+    let Some(site) = guest.parked_signal_site() else {
+        terminate_protocol(guest, ProtocolFailure::Unsupported).await;
+    };
+    let state = guest.thread_state();
+    let parent = state.detpid.expect("registered process");
+    let mut resources = Resources::new(state.dettid);
+    resources.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+    resources.fyi("wait-child-lifecycle");
+    capable_resource_request(guest, resources, ControlCapability::ChildWait { site }).await
+}
+
 /// Only an actual original scalar read with a witnessed zero-effect EAGAIN
 /// may lend its queued polling request to the parked signal protocol.
 pub(crate) async fn polled_read_request<G, T>(
@@ -257,6 +278,15 @@ where
     };
     loop {
         let control = match reply {
+            ResourceReply::Grant(ResumeStatus::Signaled(None))
+                if matches!(capability, ControlCapability::ChildWait { .. }) =>
+            {
+                // The ordinary None constructor is task cancellation; the
+                // RPC's incarnation/tombstone checks must consume it as
+                // ThreadExited. Only a real caught observation may return
+                // None to this child-wait caller as an interrupted syscall.
+                terminate_protocol(guest, ProtocolFailure::UnexpectedControl).await
+            }
             ResourceReply::Grant(status) => return status,
             ResourceReply::ObserveSignal(control) => *control,
         };
