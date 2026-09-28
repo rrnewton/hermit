@@ -242,7 +242,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The every-representable-offset btime regression and the btime-only-for-
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
-    ("test.detcore_unit", 820),
+    // The rebased waitid/CPU-publication controls retain the prior 820 names;
+    // the five upstream procfs/sysinfo controls bring the measured combined
+    // `cargo nextest list --lib --bins` inventory to 825 (2026-09-28).
+    ("test.detcore_unit", 825),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -271,7 +274,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 820),
+    ("test.detcore_unit_on_host", 825),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 750),
