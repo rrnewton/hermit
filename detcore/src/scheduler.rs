@@ -3504,13 +3504,30 @@ impl Scheduler {
             })
     }
 
+    /// Whether `dettid` is asleep in a precise-mode futex wait: its request is the
+    /// bare `FutexWait` park and it is still registered as a waiter. A waiter that
+    /// a `FUTEX_WAKE` or its timeout already requeued is not: that outcome was
+    /// committed first, so the wait completes with it and the kernel delivers the
+    /// pending signal when the syscall returns, as Linux does after a wakeup.
+    fn is_parked_futex_waiter(&self, dettid: DetTid) -> bool {
+        let parked = self.next_turns.get(&dettid).is_some_and(is_futex_request);
+        parked
+            && self
+                .blocked
+                .futex_waiters
+                .values()
+                .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == dettid))
+    }
+
     /// Record an unambiguous cross-task signal that was physically queued while
-    /// its target was parked in waitid or restartable internal IO polling. The
+    /// its target was parked in waitid, restartable internal IO polling, or a
+    /// precise-mode futex wait. The
     /// request rewrite is deferred to step2 so an asynchronous backend cannot
     /// mutate beneath a tentative selection.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
         if self.waitid_signal_request(dettid).is_some()
             || self.restartable_internal_io_signals(dettid).is_some()
+            || self.is_parked_futex_waiter(dettid)
         {
             let signals = self.pending_cross_task_signals.entry(dettid).or_default();
             if !signals.contains(&signal) {
@@ -5305,6 +5322,23 @@ impl Scheduler {
                         continue;
                     };
                     next_turn.req = Ivar::full(Ok(resources));
+                }
+                None if self.is_parked_futex_waiter(dettid) => {
+                    // A precise-mode futex waiter sleeps in `futex_waiters`, outside
+                    // the run queue, so nothing else would ever let the physically
+                    // pending signal interrupt it
+                    // (https://github.com/rrnewton/hermit/issues/3146). Take it out
+                    // of the futex and requeue it with the signal set, exactly as a
+                    // scheduler-sent signal does in `wake_signaled_guest`: its turn
+                    // answers `Signaled`, which the futex handler reports as the
+                    // wait's restart errno, and the kernel then applies the guest's
+                    // disposition. `WaitidSignals` is the one-resource form for a
+                    // signal set, and later batches merge into it before it runs.
+                    signals.sort_by_key(SigWrapper::raw);
+                    signals.dedup();
+                    let mut resources = Resources::new(dettid);
+                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
+                    self.force_unblock_thread(dettid, resources);
                 }
                 None => {
                     let Some(existing) = self.restartable_internal_io_signals(dettid) else {
@@ -7709,6 +7743,62 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    /// A cross-task signal must interrupt a precise-mode futex waiter, which sleeps
+    /// outside the run queue (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn pending_signal_interrupts_a_parked_futex_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX);
+        assert!(scheduler.is_parked_futex_waiter(target));
+        assert!(!scheduler.run_queue.contains_tid(target));
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        // Nothing moves until the deterministic step2 drain.
+        assert!(scheduler.is_parked_futex_waiter(target));
+        assert!(!scheduler.run_queue.contains_tid(target));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(!scheduler.is_parked_futex_waiter(target));
+        assert!(scheduler.blocked.no_futex_waiters());
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![
+                SigWrapper::from(Signal::SIGUSR1),
+                SigWrapper::from(Signal::SIGUSR2)
+            ]
+        );
+        // A futex wake that arrives afterwards finds no waiter to take.
+        assert_eq!(scheduler.wake_futex_waiters(target, futex, 1, u32::MAX), 0);
+    }
+
+    /// A futex waiter that a wake already requeued completes as woken; the signal
+    /// does not rewrite its request.
+    #[test]
+    fn pending_signal_does_not_rewrite_a_woken_futex_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        let waker = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, target);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX);
+        assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
+        assert!(!scheduler.is_parked_futex_waiter(target));
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+        assert!(is_futex_request(&scheduler.next_turns[&target]));
     }
 
     #[test]

@@ -2500,7 +2500,13 @@ impl GlobalState {
                     "[detcore, dtid {}] Unblocked from futex_wait! ({})",
                     &dettid, &response_iv
                 );
-                answer
+                // A wakeup's `Go` carries the next timeslice in nanoseconds, which is
+                // meaningless to a futex waiter and could collide with the EINTR value
+                // that reports a signal below. Only a timeout is information here.
+                match answer {
+                    Some(SchedValue::TimeOut) => Some(SchedValue::TimeOut),
+                    Some(SchedValue::Value(_)) | None => Some(SchedValue::Value(0)),
+                }
             }
             SchedResponse::Signaled(_) => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
             SchedResponse::ObserveSignal(_) => {
