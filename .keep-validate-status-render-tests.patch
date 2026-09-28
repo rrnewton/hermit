@@ -1,0 +1,144 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -13118,6 +13118,127 @@ mod tests {
+             ..attempt
+         }));
+     }
++
++    fn command_from_next_line(line: &str) -> &str {
++        line.split('`')
++            .nth(1)
++            .expect("NEXT line contains one runnable command")
++    }
++
++    fn parse_printed_ci_hub_command(command: &str) -> Cli {
++        let mut words = command.split_whitespace();
++        assert_eq!(words.next(), Some("./ci-hub/ci-hub"));
++        Cli::try_parse_from(std::iter::once("ci-hub").chain(words))
++            .expect("printed command parses through the public CLI")
++    }
++
++    #[test]
++    fn current_main_default_bounds_unreadable_records_and_diagnostic_shows_all() {
++        let sha = "b".repeat(40);
++        let unreadable = (0..477)
++            .map(|index| validate_run_handle::UnreadableRecord {
++                path: PathBuf::from(format!("/state/ignored/validate/runs/broken-{index}.json")),
++                error: format!("fixture parse error {index}"),
++            })
++            .collect::<Vec<_>>();
++
++        let default = current_main_status_lines(&sha, 0, false, &[], &unreadable, None, false);
++        assert_eq!(
++            default[0],
++            format!("CURRENT-MAIN {sha} VALIDATE-IN-PROGRESS=unknown")
++        );
++        assert_eq!(default.len(), 3, "477 records must still produce bounded output");
++        assert!(default[1].contains("RUN-HANDLES UNREADABLE=477"));
++        assert!(default[1].contains("--show-unreadable-handles"));
++        assert!(!default.iter().any(|line| line.contains("broken-0.json")));
++        let fallback = command_from_next_line(default.last().unwrap());
++        let parsed = parse_printed_ci_hub_command(fallback);
++        let HubCommand::ValidateStatus(args) = parsed.command else {
++            panic!("agent-free remedy did not parse as validate-status")
++        };
++        assert!(args.current_main);
++        assert!(args.show_unreadable_handles);
++
++        let diagnostic =
++            current_main_status_lines(&sha, 0, false, &[], &unreadable, None, true);
++        assert_eq!(diagnostic.len(), 480);
++        assert_eq!(
++            diagnostic
++                .iter()
++                .filter(|line| line.starts_with("RUN-HANDLE UNAVAILABLE "))
++                .count(),
++            477
++        );
++        assert!(diagnostic.iter().any(|line| line.contains("broken-0.json")));
++        assert!(diagnostic
++            .iter()
++            .any(|line| line.contains("broken-476.json")));
++    }
++
++    #[test]
++    fn current_main_text_keeps_yes_no_unknown_and_renders_actionable_remedies() {
++        let sha = "c".repeat(40);
++        let attempt = ValidateRunAttempt {
++            unit: "validate-current.service".into(),
++            state: "launching".into(),
++            sha: sha.clone(),
++            agent: Some("recorded-agent".into()),
++            started_at: "2026-09-11T17:00:00Z".into(),
++            slot: Some("validate-current".into()),
++            log_file: Some("/state/ignored/validate/current.log".into()),
++            process_verified: false,
++            admission: None,
++            finished_at: None,
++            result: None,
++            detail: None,
++            exit_code: None,
++        };
++
++        let yes = current_main_status_lines(&sha, 1, true, &[], &[], None, false);
++        assert_eq!(
++            yes,
++            vec![format!("CURRENT-MAIN {sha} VALIDATE-IN-PROGRESS=yes COUNT=1")]
++        );
++        let no = current_main_status_lines(&sha, 0, true, &[], &[], None, false);
++        assert_eq!(
++            no,
++            vec![format!("CURRENT-MAIN {sha} VALIDATE-IN-PROGRESS=no COUNT=0")]
++        );
++
++        let unknown = current_main_status_lines(
++            &sha,
++            0,
++            false,
++            std::slice::from_ref(&attempt),
++            &[],
++            Some("codex-status"),
++            false,
++        );
++        assert_eq!(
++            unknown[0],
++            format!("CURRENT-MAIN {sha} VALIDATE-IN-PROGRESS=unknown")
++        );
++        assert!(unknown[1].contains("agent=recorded-agent"));
++        let command = command_from_next_line(unknown.last().unwrap());
++        assert!(command.contains("--agent codex-status"));
++        let parsed = parse_printed_ci_hub_command(command);
++        assert!(matches!(parsed.command, HubCommand::ValidateLock(_)));
++
++        let invalid_agent = current_main_status_lines(
++            &sha,
++            0,
++            false,
++            &[attempt],
++            &[],
++            Some("not a shell-safe agent"),
++            false,
++        );
++        let fallback = command_from_next_line(invalid_agent.last().unwrap());
++        assert_eq!(fallback, current_main_diagnostic_command());
++        let parsed = parse_printed_ci_hub_command(fallback);
++        assert!(matches!(parsed.command, HubCommand::ValidateStatus(_)));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn printed_current_main_remedy_entrypoint_exists_and_is_executable() {
++        use std::os::unix::fs::PermissionsExt;
++
++        let metadata = std::fs::metadata("./ci-hub/ci-hub")
++            .expect("printed remedy must not fail with command-not-found (127)");
++        assert_ne!(
++            metadata.permissions().mode() & 0o111,
++            0,
++            "printed remedy must not fail as unexecutable (126)"
++        );
++    }
++
+     #[test]
+     fn python_allocator_warning_filter_removes_only_the_exact_line() {

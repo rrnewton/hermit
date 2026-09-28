@@ -1,0 +1,6 @@
+diff --git a/ci-hub/health/tests/test_integration_tip_validate_fetch.py b/ci-hub/health/tests/test_integration_tip_validate_fetch.py
+--- a/ci-hub/health/tests/test_integration_tip_validate_fetch.py
++++ b/ci-hub/health/tests/test_integration_tip_validate_fetch.py
+@@ -139 +139 @@
+-    assert status_targets == [CURRENT_SHA]
++    assert status_targets == [CURRENT_SHA, CURRENT_SHA]

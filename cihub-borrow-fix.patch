@@ -1,0 +1,23 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -7684,9 +7684,12 @@ fn include_unverified_attempts(
+ ) {
+     let already_listed = scan
+         .entries
+         .iter()
+-        .filter_map(|entry| entry.sha.as_deref().zip(entry.started_at.as_deref()))
++        .filter_map(|entry| {
++            entry.sha.as_ref().zip(entry.started_at.as_ref())
++                .map(|(sha, started_at)| (sha.clone(), started_at.clone()))
++        })
+         .collect::<BTreeSet<_>>();
+     scan.entries.extend(
+         scan.attempts
+@@ -7694,7 +7697,7 @@ fn include_unverified_attempts(
+             .filter(|attempt| {
+                 !attempt.process_verified
+                     && validate_attempt_is_in_flight(attempt)
+-                    && !already_listed.contains(&(attempt.sha.as_str(), attempt.started_at.as_str()))
++                    && !already_listed.contains(&(attempt.sha.clone(), attempt.started_at.clone()))
+             })

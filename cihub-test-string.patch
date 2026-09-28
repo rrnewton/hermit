@@ -1,0 +1,9 @@
+diff --git a/ci-hub/health/tests/test_integration_tip_validate.py b/ci-hub/health/tests/test_integration_tip_validate.py
+--- a/ci-hub/health/tests/test_integration_tip_validate.py
++++ b/ci-hub/health/tests/test_integration_tip_validate.py
+@@ -258,7 +258,7 @@ def test_absent_record_and_run_launches_exactly_once_across_two_readings(
+     assert output.count("state=launched") == 1
+     assert authorities.status_reads >= 3
+     assert output.count("launched=1") == 1
+-    assert output.count("no second validate started") == 1
++    assert output.count("no validate started") == 1

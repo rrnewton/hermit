@@ -1,0 +1,28 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -14760,4 +14760,24 @@
+         };
+         assert!(args.log_paths);
+ 
++        let cli = Cli::try_parse_from(["ci-hub", "validate-status", "--current-main"])
++            .unwrap();
++        let HubCommand::ValidateStatus(args) = cli.command else {
++            panic!("wrong command variant")
++        };
++        assert!(args.current_main);
++        assert!(Cli::try_parse_from([
++            "ci-hub",
++            "validate-status",
++            "--current-main",
++            "--sha",
++            RECEIPT_SHA,
++        ])
++        .is_err());
++        for help in ["-h", "--help"] {
++            let error = Cli::try_parse_from(["ci-hub", "validate-status", help]).unwrap_err();
++            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
++            assert!(error.to_string().contains("--current-main"));
++        }
++
+         for (value, expected) in [

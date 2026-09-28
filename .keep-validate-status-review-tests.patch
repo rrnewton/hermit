@@ -1,0 +1,78 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -13209,7 +13209,6 @@ mod tests {
+         );
+         assert_eq!(default.len(), 3, "477 records must still produce bounded output");
+         assert!(default[1].contains("RUN-HANDLES UNREADABLE=477"));
+-        assert!(default[1].contains("--show-unreadable-handles"));
+         assert!(!default.iter().any(|line| line.contains("broken-0.json")));
+         let fallback = command_from_next_line(default.last().unwrap());
++        assert_eq!(fallback, current_main_diagnostic_command());
+         let parsed = parse_printed_ci_hub_command(fallback);
+@@ -13222,7 +13222,7 @@ mod tests {
+ 
+         let diagnostic =
+             current_main_status_lines(&sha, 0, false, &[], &unreadable, None, true);
+-        assert_eq!(diagnostic.len(), 480);
++        assert_eq!(diagnostic.len(), 479);
+@@ -13283,15 +13283,53 @@ mod tests {
+         let parsed = parse_printed_ci_hub_command(command);
+         assert!(matches!(parsed.command, HubCommand::ValidateLock(_)));
+ 
+-        let invalid_agent = current_main_status_lines(
++        let unverified_without_agent = current_main_status_lines(
+             &sha,
+             0,
+             false,
+-            &[attempt],
++            std::slice::from_ref(&attempt),
+             &[],
+             Some("not a shell-safe agent"),
+             false,
+         );
+-        let fallback = command_from_next_line(invalid_agent.last().unwrap());
+-        assert_eq!(fallback, current_main_diagnostic_command());
++        assert_eq!(unverified_without_agent.len(), 3);
++        let fallback = command_from_next_line(unverified_without_agent.last().unwrap());
++        assert_eq!(fallback, current_main_lock_status_command());
+         let parsed = parse_printed_ci_hub_command(fallback);
+-        assert!(matches!(parsed.command, HubCommand::ValidateStatus(_)));
++        let HubCommand::ValidateLock(args) = parsed.command else {
++            panic!("unverified-handle remedy did not parse as validate-lock")
++        };
++        assert!(matches!(args.command, validate_lock::ValidateLockCommand::Status));
++
++        let unreadable = validate_run_handle::UnreadableRecord {
++            path: PathBuf::from("/state/ignored/validate/runs/broken.json"),
++            error: "fixture parse error".into(),
++        };
++        let both = current_main_status_lines(
++            &sha,
++            0,
++            false,
++            &[attempt],
++            &[unreadable],
++            None,
++            false,
++        );
++        let commands = both
++            .iter()
++            .filter(|line| line.starts_with("NEXT run `"))
++            .map(|line| command_from_next_line(line))
++            .collect::<Vec<_>>();
++        assert_eq!(
++            commands,
++            [
++                current_main_diagnostic_command(),
++                current_main_lock_status_command()
++            ]
++        );
++        let first = parse_printed_ci_hub_command(commands[0]);
++        assert!(matches!(first.command, HubCommand::ValidateStatus(_)));
++        let second = parse_printed_ci_hub_command(commands[1]);
++        let HubCommand::ValidateLock(args) = second.command else {
++            panic!("second combined remedy did not parse as validate-lock")
++        };
++        assert!(matches!(args.command, validate_lock::ValidateLockCommand::Status));
+     }

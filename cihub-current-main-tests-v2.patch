@@ -1,0 +1,57 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -510 +510 @@
+-    /// Do not include process-verified validation runs that are still executing.
++    /// Do not include validation runs that are still launching or executing.
+@@ -517 +517 @@
+-    /// Show only process-verified validation runs that are still executing.
++    /// Show only validation runs that are still launching or executing.
+@@ -7689,3 +7689,10 @@ fn unverified_attempt_entry(
+     }
+ }
+ 
++fn exact_in_progress_count(entries: &[ValidateStatusEntry], sha: &str) -> usize {
++    entries
++        .iter()
++        .filter(|entry| entry.in_progress && entry.sha.as_deref() == Some(sha))
++        .count()
++}
++
+ fn include_unverified_attempts(
+@@ -8876,3 +8883,3 @@ fn print_recent_validate_history(
+-    let current_main_in_progress_count = current_main_sha.as_deref().map(|main_sha| {
+-        current.iter().filter(|entry| entry.in_progress && entry.sha.as_deref() == Some(main_sha)).count()
+-    });
++    let current_main_in_progress_count = current_main_sha
++        .as_deref()
++        .map(|main_sha| exact_in_progress_count(&current, main_sha));
+@@ -14745,2 +14752,3 @@ fn validate_status_without_a_target_lists_recent_runs() {
+         assert_eq!(args.times, ValidateStatusTimes::Relative);
+         assert!(!args.log_paths);
++        assert!(!args.current_main);
+@@ -14752,4 +14760,23 @@ fn validate_status_without_a_target_lists_recent_runs() {
+         };
+         assert!(args.log_paths);
+ 
++        let cli = Cli::try_parse_from(["ci-hub", "validate-status", "--current-main"])
++            .unwrap();
++        let HubCommand::ValidateStatus(args) = cli.command else {
++            panic!("wrong command variant")
++        };
++        assert!(args.current_main);
++        assert!(Cli::try_parse_from([
++            "ci-hub",
++            "validate-status",
++            "--current-main",
++            "--sha",
++            RECEIPT_SHA,
++        ])
++        .is_err());
++        for help in ["-h", "--help"] {
++            let error = Cli::try_parse_from(["ci-hub", "validate-status", help]).unwrap_err();
++            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
++            assert!(error.to_string().contains("--current-main"));
++        }
++
+         for (value, expected) in [

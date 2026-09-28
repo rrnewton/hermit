@@ -1,0 +1,81 @@
+diff --git a/ci-hub/health/tests/test_integration_tip_validate.py b/ci-hub/health/tests/test_integration_tip_validate.py
+--- a/ci-hub/health/tests/test_integration_tip_validate.py
++++ b/ci-hub/health/tests/test_integration_tip_validate.py
+@@ -61,6 +61,7 @@ class Authorities:
+         self.in_progress = in_progress
+         self.admissible = admissible
+         self.launches: list[str] = []
++        self.status_reads = 0
+ 
+     def fetch(self, _settings: object, _timeout: float) -> str:
+@@ -68,6 +69,7 @@ class Authorities:
+     def run(
+         self, command: list[str] | tuple[str, ...], _cwd: Path, _timeout: float
+     ) -> subprocess.CompletedProcess[str]:
+         if "validate-status" in command and "--sha" in command:
++            self.status_reads += 1
+             in_progress = [
+@@ -154,6 +156,7 @@ class Authorities:
+     ) -> dict[str, object]:
+         assert target == SHA
+         self.launches.append(attempt_id)
++        self.in_progress = 1
+         return {"pid": 123, "start_ticks": 456, "boot_id": "boot-fixture"}
+@@ -199,6 +202,44 @@ def test_two_in_progress_readings_launch_nothing(tmp_path: Path, capsys) -> None:
+     assert output.count("in_progress_count=1") == 2
+ 
+ 
++def test_launching_handle_appearing_between_reads_suppresses_launch(
++    tmp_path: Path, capsys
++) -> None:
++    authorities = Authorities()
++
++    def launching_between_reads(command, cwd, timeout):
++        result = authorities.run(command, cwd, timeout)
++        if "validate-status" not in command or authorities.status_reads != 2:
++            return result
++        value = json.loads(result.stdout)
++        value["run_handles"] = [
++            {
++                "unit": "validate-current-main.service",
++                "state": "launching",
++                "sha": SHA,
++                "started_at": "2026-09-11T17:00:00Z",
++                "slot": "validate-current-main",
++                "log_file": "/state/ignored/validate/current-main.log",
++                "process_verified": False,
++                "admission": None,
++                "finished_at": None,
++                "result": None,
++                "detail": None,
++                "exit_code": None,
++            }
++        ]
++        return subprocess.CompletedProcess(command, result.returncode, json.dumps(value), "")
++
++    assert (
++        driver.run_tick(
++            settings(tmp_path),
++            fetch=authorities.fetch,
++            run=launching_between_reads,
++            spawn=authorities.spawn,
++        )
++        == 0
++    )
++    assert authorities.status_reads == 2
++    assert authorities.launches == []
++    output = capsys.readouterr().out
++    assert "state=in-progress" in output
++    assert "head=" + SHA in output
++    assert "slot=validate-current-main" in output
++    assert "log=/state/ignored/validate/current-main.log" in output
++    assert "process_verified=False" in output
++
++
+ def test_absent_record_and_run_launches_exactly_once_across_two_readings(
+@@ -210,6 +251,7 @@ def test_absent_record_and_run_launches_exactly_once_across_two_readings(
+     assert len(authorities.launches) == 1
+     output = capsys.readouterr().out
+     assert output.count("state=launched") == 1
++    assert authorities.status_reads >= 3
+     assert output.count("launched=1") == 1

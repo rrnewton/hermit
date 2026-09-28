@@ -1,0 +1,15 @@
+diff --git a/ci-hub/README.md b/ci-hub/README.md
+--- a/ci-hub/README.md
++++ b/ci-hub/README.md
+@@ -171,8 +171,11 @@ reports their count without printing every path and parse error; use
+ `validate-status --current-main --show-unreadable-handles` for those individual
+ details. When `DG_AGENT_NAME` is a valid agent identity, the unknown result also
+-prints a complete read-only `validate-lock admission-status` command. Otherwise
+-it prints the agent-free command that shows the unreadable records.
++prints a complete read-only `validate-lock admission-status` command for an
++unverified handle. Without that identity, it prints the agent-free
++`validate-lock status` command and keeps the handle's state, unit, head, slot,
++log, and start time in the report. When unreadable records and an unverified
++handle both prevent a yes/no answer, the output gives both applicable commands.
++
+ The periodic integration-tip

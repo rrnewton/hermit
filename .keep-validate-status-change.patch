@@ -1,0 +1,114 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -556,6 +556,11 @@ struct ValidateStatusArgs {
+     /// Show the worktree slot and full producer-recorded log file path.
+     #[arg(long, help_heading = "HOW RENDERED")]
+     log_paths: bool,
++    /// Show every unreadable validation run-record path and parse error.
++    /// `--current-main` reports only a count by default so its yes/no/unknown
++    /// answer remains concise.
++    #[arg(long, help_heading = "HOW RENDERED")]
++    diagnostic: bool,
+     /// Repository whose validation runs to report; also resolves --pr head SHAs.
+     #[arg(
+         long,
+@@ -7125,6 +7130,7 @@ struct ValidateRunAttempt {
+     unit: String,
+     state: String,
+     sha: String,
++    agent: Option<String>,
+     started_at: String,
+     slot: Option<String>,
+     log_file: Option<String>,
+@@ -7144,6 +7150,83 @@ fn unreadable_run_handle_line(unreadable: &validate_run_handle::UnreadableRecor
+     )
+ }
+ 
++fn shell_single_quote(value: &str) -> String {
++    format!("'{}'", value.replace('\'', "'\\''"))
++}
++
++fn current_main_diagnostic_command() -> &'static str {
++    "ci-hub validate-status --current-main --diagnostic"
++}
++
++fn current_main_admission_command(
++    sha: &str,
++    run_handles: &[ValidateRunAttempt],
++) -> Option<String> {
++    let agent = run_handles
++        .iter()
++        .find_map(|attempt| attempt.agent.as_deref().filter(|agent| !agent.is_empty()))?;
++    Some(format!(
++        "ci-hub validate-lock admission-status --agent {} --kind validate --target {sha} --target-was-fetched-main --json",
++        shell_single_quote(agent)
++    ))
++}
++
++fn current_main_status_lines(
++    sha: &str,
++    in_progress_count: usize,
++    answer_known: bool,
++    run_handles: &[ValidateRunAttempt],
++    unreadable_handles: &[validate_run_handle::UnreadableRecord],
++    diagnostic: bool,
++) -> Vec<String> {
++    let answer = if answer_known {
++        if in_progress_count > 0 { "yes" } else { "no" }
++    } else {
++        "unknown"
++    };
++    let mut lines = vec![format!(
++        "CURRENT-MAIN {sha} VALIDATE-IN-PROGRESS={answer}{}",
++        answer_known
++            .then(|| format!(" COUNT={in_progress_count}"))
++            .unwrap_or_default()
++    )];
++
++    if !unreadable_handles.is_empty() {
++        lines.push(format!(
++            "RUN-HANDLES UNREADABLE={} -- {}",
++            unreadable_handles.len(),
++            if diagnostic {
++                "individual records follow"
++            } else {
++                "individual records hidden; run `ci-hub validate-status --current-main --diagnostic`"
++            }
++        ));
++    }
++
++    for attempt in run_handles {
++        lines.push(format!(
++            "RUN-HANDLE unit={} state={} head={} agent={} slot={} log={} started={} process_verified={}",
++            attempt.unit,
++            attempt.state,
++            attempt.sha,
++            attempt.agent.as_deref().unwrap_or("?"),
++            attempt.slot.as_deref().unwrap_or("?"),
++            attempt.log_file.as_deref().unwrap_or("?"),
++            attempt.started_at,
++            attempt.process_verified,
++        ));
++    }
++
++    if diagnostic {
++        lines.extend(unreadable_handles.iter().map(unreadable_run_handle_line));
++    }
++
++    if !answer_known {
++        let (command, purpose) = current_main_admission_command(sha, run_handles).map_or_else(
++            || (
++                current_main_diagnostic_command().to_string(),
++                "identify the unreadable run records",
++            ),
++            |command| (command, "inspect admission for this exact commit"),
++        );
++        lines.push(format!("NEXT run `{command}` to {purpose}."));
++    }
++    lines
++}
++
+ fn live_validate_runs_from(
+     tool_root: &Path,
+     state_root: &Path,

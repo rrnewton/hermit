@@ -1,0 +1,19 @@
+diff --git a/ci-hub/README.md b/ci-hub/README.md
+--- a/ci-hub/README.md
++++ b/ci-hub/README.md
+@@ -164,6 +164,12 @@ count as a validation of the current main tip. The report reads ci-hub's durabl
+ run records twice before it says no current-main validation is in progress. A
+ `preparing`, `launching`, or `running` handle without a process/cgroup identity
+ that can still be verified is reported with its exact state and
++`process_verified=false`; the current-main answer is `unknown`, never `yes` or
++`no`. Unreadable run records also keep the answer `unknown`. The default output
++reports their count without printing every path and parse error; use
++`validate-status --current-main --show-unreadable-handles` for those individual
++details. When `DG_AGENT_NAME` is a valid agent identity, the unknown result also
++prints a complete read-only `validate-lock admission-status` command. Otherwise
++it prints the agent-free command that shows the unreadable records.
+-`process_verified=false`; the current-main answer is `unknown`, never `yes` or
+-`no`. Inspect that handle and `validate-lock admission-status` for the exact SHA,
+-then repair or finish the handle before retrying. The periodic integration-tip
++The periodic integration-tip
+ check uses the same two run-record reads with the exact-target validate-lock
