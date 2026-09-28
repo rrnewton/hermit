@@ -63,6 +63,63 @@ const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
 const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
+/// Hermit backends the GitHub-hosted portable profile omits.
+///
+/// GitHub-hosted runners expose `/dev/kvm` through nested virtualization but
+/// provide no PMU, so every KVM guest fails when its clock opens the retired
+/// branch counter (`perf_event_open` returns ENOENT). The local `full` and
+/// `portable` profiles still select every KVM cell. The hosted E2E commands,
+/// their result ownership, the hosted expected population, and the hosted
+/// scorecard verification all omit the same backends, so an omitted cell is
+/// never reported as a pass. `.github/workflows/ci-portable.yml`,
+/// `ci/check-shard-coverage.sh`, and `ci/hermetic/run-split-validate.sh`
+/// apply the same filter to `ci/expected-e2e-plan.json`; a test below keeps
+/// them in agreement with this list.
+pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
+
+fn hosted_portable_excludes(cell: &DagManifest) -> bool {
+    cell.backend
+        .as_deref()
+        .is_some_and(|backend| HOSTED_PORTABLE_EXCLUDED_BACKENDS.contains(&backend))
+}
+
+/// Whether constructed `step` omits `backend`'s cells under the hosted-portable
+/// exclusion. Only a hosted-portable step whose harness selector carries the
+/// exact exclusion flags omits them; a plan retained before the exclusion has
+/// neither the flags nor the omission, and keeps reading as before.
+pub(crate) fn hosted_step_omits_backend(step: &Step, backend: &str) -> bool {
+    step.labels == [HOSTED_PORTABLE_LABEL]
+        && HOSTED_PORTABLE_EXCLUDED_BACKENDS.contains(&backend)
+        && carries_hosted_exclusion_once(&step.cmd, "--prebuilt", " ")
+}
+
+/// Whether `cmd` carries the hosted-portable exclusion flags exactly once,
+/// directly after `anchor` and followed by `after`, and no other
+/// `--exclude-backend` word. `test-harness` refuses a repeated
+/// `--exclude-backend`, so a command that repeats the flags would fail when
+/// run; a substring check alone cannot see the repeat.
+fn carries_hosted_exclusion_once(cmd: &str, anchor: &str, after: &str) -> bool {
+    let exclusion = hosted_portable_exclusion_flags();
+    let anchored = format!("{anchor}{exclusion}{after}");
+    let anchored_count = if after.is_empty() {
+        usize::from(cmd.ends_with(&anchored))
+    } else {
+        cmd.matches(&anchored).count()
+    };
+    anchored_count == 1
+        && cmd
+            .split_whitespace()
+            .filter(|word| *word == "--exclude-backend")
+            .count()
+            == HOSTED_PORTABLE_EXCLUDED_BACKENDS.len()
+}
+
+fn hosted_portable_exclusion_flags() -> String {
+    HOSTED_PORTABLE_EXCLUDED_BACKENDS
+        .iter()
+        .map(|backend| format!(" --exclude-backend {backend}"))
+        .collect()
+}
 const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 8),
     ("e2e.manifest_backend_parity_c", "manifest_guest", 8, 8),
@@ -1193,10 +1250,12 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
             .into_iter()
             .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
             .collect::<Vec<_>>();
+        let hosted_portable = step.labels == [HOSTED_PORTABLE_LABEL];
         let mut owned = if let Some(selector) = &step.manifest {
             cells
                 .iter()
                 .filter(|cell| cell.lane == selector.lane && cell.category == selector.category)
+                .filter(|cell| !(hosted_portable && hosted_portable_excludes(cell)))
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
@@ -1397,7 +1456,7 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
         .filter(|cell| match label {
             "full" => true,
             "portable" => cell.lane == "portable",
-            HOSTED_PORTABLE_LABEL => cell.lane == "portable",
+            HOSTED_PORTABLE_LABEL => cell.lane == "portable" && !hosted_portable_excludes(cell),
             HOSTED_PRIVILEGED_LABEL => cell.lane == "privileged",
             "privileged" => cell.lane == "privileged",
             "quick" => {
@@ -2125,6 +2184,31 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 return Err(format!(
                     "{HOSTED_PORTABLE_LABEL} selection contains local pinned-root step(s): {}",
                     pinned.join(", ")
+                ));
+            }
+            // The owned results above omit the excluded backends, so each
+            // command that produces or verifies them must omit the same ones,
+            // exactly once: `test-harness` refuses a repeated exclusion.
+            let exclusion = hosted_portable_exclusion_flags();
+            let unfiltered = selected
+                .steps
+                .iter()
+                .filter(|step| {
+                    if step.manifest.is_some() {
+                        !carries_hosted_exclusion_once(&step.cmd, "--prebuilt", " ")
+                    } else if step.tag() == "scorecard.compatibility_on_host" {
+                        !carries_hosted_exclusion_once(&step.cmd, "--lanes portable", "")
+                    } else {
+                        false
+                    }
+                })
+                .map(Step::tag)
+                .collect::<Vec<_>>();
+            if !unfiltered.is_empty() {
+                return Err(format!(
+                    "{HOSTED_PORTABLE_LABEL} step(s) do not carry the backend exclusion `{}` exactly once: {}",
+                    exclusion.trim(),
+                    unfiltered.join(", ")
                 ));
             }
             let expected_resources = HOSTED_RESOURCE_TUPLES
@@ -2919,15 +3003,21 @@ sys.exit(37)
         );
         // The two former parity selectors keep their population, width and
         // resources; only the reference flag is gone.
+        // The hosted selector also omits KVM cells: GitHub-hosted runners
+        // have no PMU (HOSTED_PORTABLE_EXCLUDED_BACKENDS).
         let selectors = [
-            "e2e.manifest_backend_parity_c",
-            "e2e.manifest_backend_parity_c_on_host",
+            (
+                "e2e.manifest_backend_parity_c",
+                "--category backend-parity-c --ci-only --allow-empty --prebuilt --results",
+            ),
+            (
+                "e2e.manifest_backend_parity_c_on_host",
+                "--category backend-parity-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results",
+            ),
         ];
-        for tag in selectors {
+        for (tag, selector_argv) in selectors {
             let step = dag.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert!(step.cmd.contains(
-                "--category backend-parity-c --ci-only --allow-empty --prebuilt --results"
-            ));
+            assert!(step.cmd.contains(selector_argv), "{tag}");
             assert_eq!(step.jobs_flag.as_deref(), Some("--jobs"));
             assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             let selector = step.manifest.as_ref().unwrap();
@@ -2943,23 +3033,188 @@ sys.exit(37)
         // generator's own invariants, with the reason named.
         let cells = expected_cells(&root).unwrap();
         assert_invariants(&dag, &cells).unwrap();
-        for tag in selectors {
+        for (tag, _) in selectors {
             let mut planted = dag.clone();
             let step = planted
                 .steps
                 .iter_mut()
                 .find(|step| step.tag() == tag)
                 .unwrap();
-            assert_eq!(step.cmd.matches("--prebuilt --results").count(), 1);
-            step.cmd = step.cmd.replace(
-                "--prebuilt --results",
-                "--prebuilt --parity-reference ptrace --results",
-            );
+            assert_eq!(step.cmd.matches(" --results ").count(), 1);
+            step.cmd = step
+                .cmd
+                .replace(" --results ", " --parity-reference ptrace --results ");
             assert_eq!(
                 assert_invariants(&planted, &cells).unwrap_err(),
                 format!(
                     "{tag} passes --parity-reference; backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
                 )
+            );
+        }
+    }
+
+    /// GitHub-hosted runners have no PMU, so the hosted-portable profile omits
+    /// KVM cells from every command, owned result, and expected population,
+    /// while the local profiles keep requiring them.
+    #[test]
+    fn hosted_portable_omits_the_excluded_backends_everywhere_and_locally_keeps_them() {
+        assert_eq!(HOSTED_PORTABLE_EXCLUDED_BACKENDS, ["kvm"]);
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let excluded = |cell: &DagManifest| hosted_portable_excludes(cell);
+        let portable = expected_for_label("portable", &cells);
+        let hosted = expected_for_label(HOSTED_PORTABLE_LABEL, &cells);
+        let omitted = portable.iter().filter(|cell| excluded(cell)).count();
+        assert!(omitted > 0, "the corpus has no portable KVM cell to omit");
+        assert_eq!(hosted.len() + omitted, portable.len());
+        assert!(hosted.iter().all(|cell| !excluded(cell)));
+        assert!(
+            expected_for_label("full", &cells)
+                .iter()
+                .any(|cell| excluded(cell)),
+            "the local full profile must still require KVM cells"
+        );
+
+        let owned = |step: &Step| {
+            step.effective_result_manifests()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut hosted_owned = 0;
+        let mut local_omitted = 0;
+        for step in committed
+            .steps
+            .iter()
+            .filter(|step| step.manifest.is_some() && step.labels == [HOSTED_PORTABLE_LABEL])
+        {
+            assert!(
+                step.cmd.contains("--prebuilt --exclude-backend kvm "),
+                "{}: {}",
+                step.tag(),
+                step.cmd
+            );
+            assert_eq!(
+                step.cmd.matches("--exclude-backend").count(),
+                1,
+                "{}: {}",
+                step.tag(),
+                step.cmd
+            );
+            let local_tag = step.tag().strip_suffix(HOSTED_VARIANT_SUFFIX).unwrap().to_string();
+            let local = committed
+                .steps
+                .iter()
+                .find(|candidate| candidate.tag() == local_tag)
+                .unwrap();
+            assert!(!local.cmd.contains("--exclude-backend"), "{local_tag}");
+            let hosted_cells = owned(step);
+            let local_cells = owned(local);
+            assert!(hosted_cells.iter().all(|cell| !excluded(cell)), "{}", step.tag());
+            assert_eq!(
+                hosted_cells,
+                local_cells
+                    .iter()
+                    .filter(|cell| !excluded(cell))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                "{}",
+                step.tag()
+            );
+            hosted_owned += hosted_cells.len();
+            local_omitted += local_cells.len() - hosted_cells.len();
+        }
+        assert_eq!(hosted_owned, hosted.len());
+        assert_eq!(local_omitted, omitted);
+        let scorecard = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .cmd
+                .clone()
+        };
+        assert!(scorecard("scorecard.compatibility_on_host")
+            .ends_with("verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-backend kvm"));
+        assert!(scorecard("scorecard.compatibility").ends_with("--lanes portable"));
+
+        let mut planted = committed.clone();
+        let step = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_c_programs_on_host")
+            .unwrap();
+        step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+        assert_eq!(
+            assert_invariants(&planted, &cells).unwrap_err(),
+            "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm` exactly once: e2e.manifest_c_programs_on_host"
+        );
+        let mut planted = committed.clone();
+        let step = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "scorecard.compatibility_on_host")
+            .unwrap();
+        step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+        assert_eq!(
+            assert_invariants(&planted, &cells).unwrap_err(),
+            "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm` exactly once: scorecard.compatibility_on_host"
+        );
+
+        // A repeated exclusion still contains the anchored substring, but
+        // `test-harness` refuses it ("--exclude-backend kvm was given twice"),
+        // so the step would fail when run. The invariant counts the flag.
+        for (tag, anchor) in [
+            ("e2e.manifest_bin_c_on_host", "--prebuilt --exclude-backend kvm"),
+            ("scorecard.compatibility_on_host", "--lanes portable --exclude-backend kvm"),
+        ] {
+            let mut planted = committed.clone();
+            let step = planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            assert_eq!(step.cmd.matches(anchor).count(), 1, "{tag}");
+            step.cmd = step
+                .cmd
+                .replace(anchor, &format!("{anchor} --exclude-backend kvm"));
+            assert_eq!(step.cmd.matches("--exclude-backend kvm").count(), 2, "{tag}");
+            assert_eq!(
+                assert_invariants(&planted, &cells).unwrap_err(),
+                format!(
+                    "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm` exactly once: {tag}"
+                )
+            );
+        }
+
+        // The shell consumers of ci/expected-e2e-plan.json apply the same list.
+        let filter = format!(
+            "select(.lane == \"portable\"{})",
+            HOSTED_PORTABLE_EXCLUDED_BACKENDS
+                .iter()
+                .map(|backend| format!(" and .backend != \"{backend}\""))
+                .collect::<String>()
+        );
+        for (path, text) in [
+            (
+                ".github/workflows/ci-portable.yml",
+                include_str!("../../../.github/workflows/ci-portable.yml"),
+            ),
+            (
+                "ci/check-shard-coverage.sh",
+                include_str!("../../check-shard-coverage.sh"),
+            ),
+            (
+                "ci/hermetic/run-split-validate.sh",
+                include_str!("../../hermetic/run-split-validate.sh"),
+            ),
+        ] {
+            assert_eq!(text.matches(&filter).count(), 1, "{path} must apply `{filter}` once");
+            assert!(
+                !text.contains("[.cells[] | select(.lane == \"portable\")]")
+                    && !text.contains("[.cells[] | select(.lane == \"portable\")\n"),
+                "{path} still counts the unfiltered portable population"
             );
         }
     }

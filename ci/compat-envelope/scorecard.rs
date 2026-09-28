@@ -155,8 +155,13 @@ Commands:
       bind their finalized ledger row and retained raw-input census before
       reporting writeback completion.
   verify-results --results DIR [--lanes portable,privileged]
+                 [--exclude-backend BACKEND]...
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
+      --exclude-backend omits one Hermit backend's cells (ptrace, dbt, kvm,
+      sabre, or liteinst) from the required population and reports how many
+      were omitted; it must match at least one selected cell. The hosted
+      portable profile uses it for kvm because GitHub-hosted runners have no PMU.
   self-test
       Exercise accepting and refusing result sets without running a guest.
       Requires the pinned full-corpus archive in hermit_test_ledger; use
@@ -3473,8 +3478,25 @@ fn run() -> Result<(), String> {
         "verify-results" => {
             let mut result_root = None;
             let mut lanes = BTreeSet::from(["portable".to_string(), "privileged".to_string()]);
+            let mut excluded_backends = BTreeSet::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
+                    "--exclude-backend" => {
+                        let backend = args
+                            .next()
+                            .ok_or("--exclude-backend requires a Hermit backend")?;
+                        if !matches!(
+                            backend.as_str(),
+                            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"
+                        ) {
+                            return Err(format!(
+                                "--exclude-backend accepts ptrace, dbt, kvm, sabre, or liteinst; got `{backend}`"
+                            ));
+                        }
+                        if !excluded_backends.insert(backend.clone()) {
+                            return Err(format!("--exclude-backend {backend} was given twice"));
+                        }
+                    }
                     "--results" => {
                         result_root = Some(PathBuf::from(
                             args.next().ok_or("--results requires a directory")?,
@@ -3501,7 +3523,7 @@ fn run() -> Result<(), String> {
             }
             let result_root = result_root.ok_or("verify-results requires --results DIR")?;
             check_tracked(&root)?;
-            verify_results(&root, &result_root, &lanes)?;
+            verify_results(&root, &result_root, &lanes, &excluded_backends)?;
         }
         "observe-results" => {
             let mut result_root = None;
@@ -12195,18 +12217,16 @@ fn collect_shards(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> Result<(), String> {
+fn verify_results(
+    root: &Path,
+    result_root: &Path,
+    lanes: &BTreeSet<String>,
+    excluded_backends: &BTreeSet<String>,
+) -> Result<(), String> {
     let derived = derive(root)?;
     let head = git_head(root)?;
-    let expected: BTreeSet<_> = derived
-        .selected
-        .iter()
-        .filter(|id| lanes.contains(&id.lane))
-        .cloned()
-        .collect();
-    if expected.is_empty() {
-        return Err("selected lanes contain no regression cells".into());
-    }
+    let (expected, omitted) =
+        select_verified_cells(&derived.selected, lanes, excluded_backends)?;
     let candidates = read_result_candidates(result_root, &head)?;
     let admitted = verify_candidate_set(&expected, candidates)?;
     if admitted != expected.len() {
@@ -12235,8 +12255,45 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
             custom_checked,
         )
     );
+    if !excluded_backends.is_empty() {
+        println!(
+            "Omitted by --exclude-backend {}: {omitted} selected cells were not required and are not counted as passed.",
+            excluded_backends.iter().cloned().collect::<Vec<_>>().join(",")
+        );
+    }
     println!("Result directory: {}", result_root.display());
     Ok(())
+}
+
+/// Split the selected cells in `lanes` into the required population and the
+/// number omitted by `excluded_backends`. Each excluded backend must name at
+/// least one selected cell, so a stale exclusion cannot linger unnoticed.
+fn select_verified_cells(
+    selected: &BTreeSet<CellId>,
+    lanes: &BTreeSet<String>,
+    excluded_backends: &BTreeSet<String>,
+) -> Result<(BTreeSet<CellId>, usize), String> {
+    let in_lanes = selected
+        .iter()
+        .filter(|id| lanes.contains(&id.lane))
+        .collect::<Vec<_>>();
+    for backend in excluded_backends {
+        if !in_lanes.iter().any(|id| id.backend == *backend) {
+            return Err(format!(
+                "--exclude-backend {backend} matches no selected cell in the named lanes"
+            ));
+        }
+    }
+    let expected = in_lanes
+        .iter()
+        .filter(|id| !excluded_backends.contains(&id.backend))
+        .map(|id| (*id).clone())
+        .collect::<BTreeSet<_>>();
+    if expected.is_empty() {
+        return Err("selected lanes contain no regression cells".into());
+    }
+    let omitted = in_lanes.len() - expected.len();
+    Ok((expected, omitted))
 }
 
 fn fresh_result_summary(
@@ -29982,5 +30039,57 @@ Earlier validate runs still supplying comparisons: `run-older` current (1), \
         assert!(notice.contains("and 3 more."), "{notice}");
         assert!(notice.contains("`run-00` current (1)"), "{notice}");
         assert!(!notice.contains("`run-10`"), "{notice}");
+    }
+}
+
+#[cfg(test)]
+mod verify_results_exclusion_tests {
+    use super::*;
+
+    fn cell(lane: &str, test: &str, backend: &str) -> CellId {
+        CellId {
+            lane: lane.into(),
+            category: "c-programs".into(),
+            test: test.into(),
+            mode: "verify".into(),
+            backend: backend.into(),
+        }
+    }
+
+    fn lanes(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn an_excluded_backend_is_omitted_and_counted_not_passed() {
+        let selected = BTreeSet::from([
+            cell("portable", "a", "ptrace"),
+            cell("portable", "a", "kvm"),
+            cell("portable", "b", "kvm"),
+            cell("privileged", "c", "kvm"),
+        ]);
+        let (expected, omitted) =
+            select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["kvm"])).unwrap();
+        assert_eq!(expected, BTreeSet::from([cell("portable", "a", "ptrace")]));
+        assert_eq!(omitted, 2, "only the two portable kvm cells are omitted");
+
+        let (unfiltered, none) =
+            select_verified_cells(&selected, &lanes(&["portable"]), &BTreeSet::new()).unwrap();
+        assert_eq!(unfiltered.len(), 3);
+        assert_eq!(none, 0);
+    }
+
+    #[test]
+    fn an_exclusion_that_matches_nothing_or_everything_is_refused() {
+        let selected = BTreeSet::from([cell("portable", "a", "ptrace")]);
+        let stale = select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["kvm"]))
+            .unwrap_err();
+        assert_eq!(
+            stale,
+            "--exclude-backend kvm matches no selected cell in the named lanes"
+        );
+        let empty = select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["ptrace"]))
+            .unwrap_err();
+        assert_eq!(empty, "selected lanes contain no regression cells");
     }
 }

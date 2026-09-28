@@ -16,6 +16,11 @@ pub(crate) const PORTABLE_PARITY_COMMAND: &str = r########"./ci/hermetic/run-in-
 pub(crate) const PORTABLE_ORDINARY_COMMAND: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
 pub(crate) const HOSTED_PARITY_COMMAND: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
 pub(crate) const HOSTED_ORDINARY_COMMAND: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
+/// The hosted ordinary command the generator emits since GitHub-hosted runners
+/// were found to have no PMU for KVM guests: the hosted-portable profile omits
+/// KVM cells (`HOSTED_PORTABLE_EXCLUDED_BACKENDS`). `HOSTED_ORDINARY_COMMAND`
+/// stays readable for plans retained before that change.
+pub(crate) const HOSTED_ORDINARY_EXCLUDING_KVM_COMMAND: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
 
 /// Pinned-root names forwarded since the Buck release build joined validate.
 pub(crate) const RELEASE_BUILD_ENV: &str =
@@ -103,6 +108,12 @@ pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
     let legacy_parity = previous_parity.replacen(" --results ", " --jobs 8 --results ", 1);
     let legacy_ordinary = previous_ordinary.replacen(" --results ", " --jobs 8 --results ", 1);
     let selects_parity = match step.cmd.as_str() {
+        command
+            if step.tag() == "e2e.manifest_backend_parity_c_on_host"
+                && command == HOSTED_ORDINARY_EXCLUDING_KVM_COMMAND =>
+        {
+            false
+        }
         command if command == parity => true,
         command if command == ordinary => false,
         command if command == pre_epoch_parity => true,

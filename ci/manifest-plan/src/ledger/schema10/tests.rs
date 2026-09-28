@@ -729,6 +729,37 @@ fn exact_rng_population(cells: &[CellIdentity], count: usize) -> bool {
 /// These are retained bytes rather than a derivation from the reader's constants.
 const PRE_RELEASE_ENV_PARITY_COMMAND: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra '\'' %q'\'' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
 
+/// Give each hosted-portable manifest step its local twin's manifest cells,
+/// as every hosted plan constructed before the hosted KVM exclusion did.
+fn restore_pre_exclusion_ownership(cfg: &mut DagConfig, generated: &DagConfig) {
+    for step in &mut cfg.steps {
+        if step.manifest.is_none() || step.labels != ["hosted-portable"] {
+            continue;
+        }
+        let local_tag = step.tag().strip_suffix("_on_host").unwrap().to_owned();
+        let local = generated
+            .steps
+            .iter()
+            .find(|candidate| candidate.tag() == local_tag)
+            .unwrap();
+        let mut manifests = local
+            .result_manifests
+            .iter()
+            .flatten()
+            .filter(|manifest| matches!(manifest, dagrun::model::ResultManifest::ManifestCell(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        manifests.extend(
+            step.result_manifests
+                .iter()
+                .flatten()
+                .filter(|manifest| !matches!(manifest, dagrun::model::ResultManifest::ManifestCell(_)))
+                .cloned(),
+        );
+        step.result_manifests = Some(manifests);
+    }
+}
+
 // Use the real generated graph and label selection, including the pinned-root
 // wrapper additions. The small report fixture above intentionally remains a
 // synthetic single-cell input; it does not cover generated command bytes.
@@ -767,6 +798,53 @@ fn generated_plan_populations_preserve_command_policy() {
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
     assert!(!exact_rng_population(&missing, 859));
+    // Today's hosted-portable plan omits the KVM cells, because GitHub-hosted
+    // runners have no PMU; its commands carry the exclusion and its steps own
+    // exactly the remaining portable cells.
+    let hosted_now = dagrun::select_steps_by_labels(&generated, &["hosted-portable".to_owned()])
+        .unwrap();
+    let current_hosted = ConstructedValidationPlanV10 {
+        schema: 1,
+        run_id: "generated-hosted-portable-current".into(),
+        hermit_sha: "a".repeat(40),
+        path: ValidatePath::Full,
+        compatibility_selected: true,
+        dag_json: dag_to_json(&hosted_now),
+        expected_e2e_plan_json: expected_json.clone(),
+    };
+    let hosted_cells = expected_cells
+        .iter()
+        .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(hosted_cells.len(), 855 - 242);
+    assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
+    assert_eq!(
+        current_hosted.planned_backend_parity_relations().unwrap(),
+        Vec::new()
+    );
+    // A hosted step that keeps the exclusion flag but owns the KVM cells, or
+    // drops the flag but still omits them, no longer matches its selector.
+    for strip_flag in [false, true] {
+        let mut changed = hosted_now.clone();
+        if strip_flag {
+            for step in &mut changed.steps {
+                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+            }
+        } else {
+            restore_pre_exclusion_ownership(&mut changed, &generated);
+        }
+        let plan = ConstructedValidationPlanV10 {
+            dag_json: dag_to_json(&changed),
+            ..current_hosted.clone()
+        };
+        assert!(
+            plan.planned_cells()
+                .unwrap_err()
+                .ends_with("result ownership differs from its expected manifest selection"),
+            "strip_flag={strip_flag}"
+        );
+    }
     for (label, tag, cell_count) in [
         ("full", "e2e.manifest_backend_parity_c", 859),
         (
@@ -785,6 +863,14 @@ fn generated_plan_populations_preserve_command_policy() {
         assert!(exact_rng_population(&expected_selected, cell_count));
         for active in [false, true] {
             let mut cfg = selected.clone();
+            if label == "hosted-portable" {
+                // Plans retained before the hosted KVM exclusion: every hosted
+                // manifest step owned its local twin's cells, KVM included.
+                restore_pre_exclusion_ownership(&mut cfg, &generated);
+                for step in &mut cfg.steps {
+                    step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+                }
+            }
             let index = cfg.steps.iter().position(|step| step.tag() == tag).unwrap();
             assert_eq!(cfg.steps[index].jobs_flag.as_deref(), Some("--jobs"));
             let command = &mut cfg.steps[index].cmd;
@@ -1417,7 +1503,8 @@ fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
         );
     }
     // Today's hosted command is the last parity spelling minus exactly the
-    // removed flag, so a plan carrying that spelling is a pre-change plan.
+    // removed flag, plus exactly the hosted KVM exclusion, so a plan carrying
+    // the parity spelling is a pre-change plan.
     let hosted = generated
         .steps
         .iter()
@@ -1425,7 +1512,7 @@ fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
         .unwrap();
     assert_eq!(
         hosted.cmd,
-        crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND
+        crate::backend_parity_policy::HOSTED_ORDINARY_EXCLUDING_KVM_COMMAND
     );
     assert_eq!(
         crate::backend_parity_policy::HOSTED_PARITY_COMMAND.replacen(
@@ -1433,8 +1520,19 @@ fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
             "",
             1
         ),
+        crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND
+    );
+    assert_eq!(
+        crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND.replacen(
+            " --prebuilt --results ",
+            " --prebuilt --exclude-backend kvm --results ",
+            1
+        ),
         hosted.cmd
     );
+    let mut retained_ordinary = hosted.clone();
+    retained_ordinary.cmd = crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND.into();
+    assert!(!crate::backend_parity_policy::selects_ptrace_parity(&retained_ordinary).unwrap());
     let relation = vec![BackendParityRelation::ptrace(identity())];
 
     let (row, plan, cells, tests) =

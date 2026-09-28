@@ -5309,7 +5309,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: applications"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category applications --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_applications/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_applications/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category applications --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_applications/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_applications/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5348,7 +5348,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: backend-parity-c"########,
         description: r########"WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB."########,
         labels: &[r########"hosted-portable"########],
-        cmd: crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND,
+        cmd: crate::backend_parity_policy::HOSTED_ORDINARY_EXCLUDING_KVM_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5387,7 +5387,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: bin-c"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_bin_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_bin_c/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_bin_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_bin_c/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5426,7 +5426,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: c-programs"########,
         description: r########"WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5465,7 +5465,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: chaos-c"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_chaos_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_chaos_c/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_chaos_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_chaos_c/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5504,7 +5504,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: data-handling"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_data_handling/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_data_handling/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_data_handling/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_data_handling/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5543,7 +5543,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: debugger-c"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_debugger_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_debugger_c/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_debugger_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_debugger_c/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5582,7 +5582,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: determinism-stress-c"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5621,7 +5621,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: determinism-stress"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_determinism_stress/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_determinism_stress/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_determinism_stress/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_determinism_stress/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5660,7 +5660,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: language-runtimes"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_language_runtimes/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_language_runtimes/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_language_runtimes/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_language_runtimes/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5699,7 +5699,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: shared-futex-c"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5738,7 +5738,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: system-utils"########,
         description: r########"WORKER-WIDTH DERIVATION 2026-08-24: a current-main sweep of the 28 ptrace cells found 0 failures at --jobs 1 and 2, then rotating failures at every wider sampled setting: 2 at 8, 2 at 16, 6 at 28, and 3 at 64; system-utils/mktemp-name failed in the 28- and 64-wide buckets and passed alone at width 1. The counts are intentionally not treated as monotonic or stable; the durable fact is that widening manufactures contention-sensitive reds while the production width of 1 is clean. Keep --jobs 1 explicit until the cells are made concurrency-safe; system-utils/harness-width-contract reads the exact parsed worker capacity and fails if this control changes without a new measurement."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --jobs 1 --results "$E2E_RESULT_ROOT/portable/manifest_system_utils/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_system_utils/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --exclude-backend kvm --jobs 1 --results "$E2E_RESULT_ROOT/portable/manifest_system_utils/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_system_utils/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5777,7 +5777,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: util-c"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category util-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_util_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_util_c/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category util-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_util_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_util_c/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5816,7 +5816,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Verify fresh per-cell results and print the compatibility table"########,
         description: r########""########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results "$E2E_RESULT_ROOT" --lanes portable"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results "$E2E_RESULT_ROOT" --lanes portable --exclude-backend kvm"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
