@@ -90,7 +90,7 @@ fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
 }
 
 fn mountinfo_root_for_id(raw_mount_id: u64) -> io::Result<Vec<u8>> {
-    let contents = fs::read("/proc/self/mountinfo")?;
+    let contents = fs::read("/proc/thread-self/mountinfo")?;
     let rows = detcore_model::procfs::parse_mountinfo(&contents).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "mountinfo has a malformed row")
     })?;
@@ -120,6 +120,17 @@ fn mountinfo_escape_path(path: &Path) -> Vec<u8> {
 }
 
 impl MountInfoRootSource {
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            source: self.source.as_ref().map(File::try_clone).transpose()?,
+            target: self.target.clone(),
+            deterministic_root: self.deterministic_root.clone(),
+            rewrite_descendant_roots: self.rewrite_descendant_roots,
+            raw_mountpoint_prefix: self.raw_mountpoint_prefix.clone(),
+            deterministic_mountpoint_prefix: self.deterministic_mountpoint_prefix.clone(),
+        })
+    }
+
     fn new(source: &Path, target: &Path, deterministic_root: &[u8]) -> Result<Self, Error> {
         Ok(Self {
             source: Some(open_path(source).with_context(|| {
@@ -237,6 +248,30 @@ pub(super) struct IdentityGuard {
 }
 
 impl IdentityGuard {
+    pub(super) fn liteinst_configuration(
+        &self,
+    ) -> Result<hermit::liteinst::NamespaceConfigurator, Error> {
+        let sources = self
+            .mountinfo_roots
+            .iter()
+            .map(MountInfoRootSource::try_clone)
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Box::new(move |config| {
+            let roots = sources
+                .iter()
+                .map(MountInfoRootSource::resolve)
+                .collect::<Result<Vec<_>, _>>()?;
+            let order = capture_mountinfo_identity_order()?;
+            if roots.iter().any(|root| !order.contains(&root.raw_mount_id)) {
+                return Err(Error::msg("proven root absent from final launch namespace"));
+            }
+            config.mountinfo_root_rewrites = roots;
+            config.mountinfo_mount_ids = order;
+            config.mountinfo_mount_ids_captured = true;
+            Ok(Box::new(sources) as Box<dyn Send>)
+        }))
+    }
+
     /// A guard that owns no backing temp files, for container configurations
     /// (e.g. `--image`) that supply their filesystem from another source and do
     /// not use the frozen-identity bind mounts.
@@ -1065,6 +1100,29 @@ where
     }))
 }
 
+pub fn with_owned_liteinst_container<F, T>(
+    container: &mut Container,
+    mut body: F,
+) -> Result<T, Error>
+where
+    F: FnMut(hermit::liteinst::startup::kernel_binding::EnteredContainer) -> Result<T, Error>,
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    classify_container_result(
+        hermit::liteinst::startup::kernel_binding::run_owned_container(container, |entered| {
+            let mut entered = Some(entered);
+            catch_child_panic(&mut || {
+                arm_container_init_guards()?;
+                body(
+                    entered
+                        .take()
+                        .ok_or_else(|| Error::msg("container capability already consumed"))??,
+                )
+            })
+        })?,
+    )
+}
+
 /// Turn a `Container::run` / [`RunGuarded::run_guarded`] outcome into an error
 /// whose CLASS is still readable by `classify_failure`.
 ///
@@ -1174,6 +1232,41 @@ impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn liteinst_final_namespace_configuration_resolves_owned_roots_and_preserves_fd_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("proven-source");
+        std::fs::write(&path, b"ordinary unmounted source").unwrap();
+        let mut guard = super::IdentityGuard::empty();
+        guard
+            .mountinfo_roots
+            .push(super::MountInfoRootSource::new(&path, &path, b"/fixture").unwrap());
+        let configure = guard.liteinst_configuration().unwrap();
+        let replaced = guard.liteinst_configuration().unwrap();
+        drop(guard);
+        let mut config = hermit::DetConfig::default();
+        config.mountinfo_mount_ids = vec![u64::MAX];
+        config.fdinfo_unlisted_mount_ids = vec![100, 200];
+        let owner = configure(&mut config).unwrap();
+        assert!(config.mountinfo_mount_ids_captured);
+        assert_eq!(
+            config.mountinfo_mount_ids,
+            hermit::capture_mountinfo_identity_order().unwrap()
+        );
+        assert_eq!(config.fdinfo_unlisted_mount_ids, [100, 200]);
+        assert_eq!(config.mountinfo_root_rewrites.len(), 1);
+        assert!(
+            config
+                .mountinfo_mount_ids
+                .contains(&config.mountinfo_root_rewrites[0].raw_mount_id)
+        );
+        drop(owner);
+
+        std::fs::rename(&path, directory.path().join("held-old-source")).unwrap();
+        std::fs::write(&path, b"replaced source").unwrap();
+        assert!(replaced(&mut config).is_err());
+    }
+
     use super::*;
 
     /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for

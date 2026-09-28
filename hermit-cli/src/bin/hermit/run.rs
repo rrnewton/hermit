@@ -42,6 +42,7 @@ use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::resolve_program;
+use hermit::liteinst::startup::kernel_binding::EnteredContainer;
 use reverie::Errno;
 use reverie::process::Bind;
 use reverie::process::Command;
@@ -59,6 +60,7 @@ use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::container::with_container;
+use super::container::with_owned_liteinst_container;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
@@ -1710,7 +1712,7 @@ fn skid_margin_override_parses_and_round_trips() {
 
 #[test]
 fn skid_margin_override_rejects_non_ptrace_backed_backends() {
-    for backend in ["dbt", "kvm", "sabre"] {
+    for backend in ["dbt", "liteinst", "kvm", "sabre"] {
         let mut opts = RunOpts::parse_from([
             "fakehermit",
             &format!("--backend={backend}"),
@@ -1728,19 +1730,108 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
 }
 
 #[test]
-fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
+fn skid_margin_round_trip_does_not_admit_liteinst_sud() {
     let mut opts = RunOpts::parse_from([
         "fakehermit",
         "--backend=liteinst",
         "--skid-margin=500",
         "fakeprog",
     ]);
+    let margin = opts.skid_margin.take();
     opts.validate_args_with_perf_support(true).unwrap();
+    opts.skid_margin = margin;
+    assert!(
+        opts.validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string()
+            .contains("ptrace PMU")
+    );
     assert_eq!(opts.skid_margin, Some(500));
     assert_eq!(
         format!("{opts}"),
         " --backend=liteinst --skid-margin=500 -- fakeprog"
     );
+}
+
+#[test]
+fn liteinst_cli_source_routes_both_stdio_modes_and_verification_to_sessions() {
+    let source = include_str!("run.rs");
+    let ordinary = source
+        .split("\n    fn run_in_container(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn run_verify_in_container(")
+        .next()
+        .unwrap();
+    let verify = source
+        .split("\n    fn run_verify_in_container(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn container_command(")
+        .next()
+        .unwrap();
+    assert!(ordinary.contains("global.init_liteinst_capture()?"));
+    assert!(ordinary.contains("hermit::run_with_output_backend_timeout_and_log("));
+    assert!(ordinary.contains("hermit::run_with_backend_timeout_and_log("));
+    assert!(ordinary.contains("capture.run(|log|"));
+    assert!(verify.contains("super::tracing::capture::Capture::install("));
+    assert!(verify.contains("hermit::run_with_output_backend_timeout_and_log("));
+    assert!(verify.contains("capture.run(|log|"));
+    for route in [ordinary, verify] {
+        assert!(route.contains("sources.liteinst_configuration()?"));
+        assert!(route.contains("log.with_namespace_configuration("));
+        assert!(!route.contains("run_host_with"));
+        assert!(!route.contains("DetlogForwarder"));
+    }
+}
+
+#[test]
+fn liteinst_verify_timeout_is_forwarded_for_each_execution() {
+    let source = include_str!("run.rs");
+    let verify = source
+        .split("\n    fn run_verify_in_container(")
+        .nth(1)
+        .unwrap()
+        .split("\n    fn container_command(")
+        .next()
+        .unwrap();
+    let logged_arguments = verify
+        .split("hermit::run_with_output_backend_timeout_and_log(")
+        .nth(1)
+        .unwrap()
+        .split(".map(|output|")
+        .next()
+        .unwrap();
+    assert!(logged_arguments.contains("self.run_timeout(),"));
+    for run in ["run1_options", "run2_options"] {
+        assert!(source.contains(&format!("let mut {run} = self.clone();")));
+        assert!(source.contains(&format!("{run}.run_verify(")));
+    }
+}
+
+#[test]
+fn liteinst_verify_timeout_options_remain_per_run() {
+    for seconds in [None, Some(1), Some(20)] {
+        let mut arguments = vec![
+            "fakehermit".to_owned(),
+            "--backend=liteinst".to_owned(),
+            "--verify".to_owned(),
+        ];
+        if let Some(seconds) = seconds {
+            arguments.push(format!("--timeout={seconds}"));
+        }
+        arguments.push("fakeprog".to_owned());
+        let options = RunOpts::parse_from(arguments);
+        let mut first = options.clone();
+        first.summary_json = Some(PathBuf::from("first-summary.json"));
+        let mut second = options.clone();
+        second.summary_json = Some(PathBuf::from("second-summary.json"));
+        for run in [first, second] {
+            assert_eq!(run.run_timeout(), seconds.map(Duration::from_secs));
+            assert!(run.verify);
+            assert_eq!(run.runtime_backend(), Backend::Liteinst);
+        }
+    }
 }
 
 #[test]
@@ -2611,31 +2702,6 @@ impl RunOpts {
         }
     }
 
-    fn verify_liteinst_activation(&self) -> Result<(), Error> {
-        let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
-        let mut command = Command::new(executable);
-        command
-            .env_clear()
-            .env(super::LITEINST_ACTIVATION_PROBE_ENV, "1");
-        let output = hermit::run_with_output_backend(
-            command,
-            self.effective_det_config(),
-            false,
-            &None,
-            Backend::Liteinst,
-        )?;
-        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=31\n";
-        if output.status != ExitStatus::Exited(0) || output.stdout != expected {
-            anyhow::bail!(
-                "LiteInst activation probe failed closed: status={:?}, stdout={:?}, stderr={:?}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        Ok(())
-    }
-
     /// The `--verify-json` path this invocation will publish a verdict to, if
     /// any. Exposed so the top-level dispatcher can stamp the invocation-bound
     /// NO-RESULT record before ANY fallible preflight runs — several of this
@@ -2814,9 +2880,8 @@ impl RunOpts {
         }
 
         if backend == Backend::Liteinst {
-            self.verify_liteinst_activation()?;
             eprintln!(
-                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+                "hermit: LiteInst selects shared Detcore in-guest with SUD only; runtime capability checks remain required"
             );
         }
 
@@ -2845,10 +2910,8 @@ impl RunOpts {
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
         let perf_supported = match self.selected_backend() {
-            Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
-                reverie_ptrace::is_perf_supported()
-            }
-            Backend::Dbt | Backend::Sabre | Backend::Kvm => true,
+            Backend::Ptrace | Backend::E9patch => reverie_ptrace::is_perf_supported(),
+            Backend::Dbt | Backend::Liteinst | Backend::Sabre | Backend::Kvm => true,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
@@ -2856,11 +2919,7 @@ impl RunOpts {
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
         let backend = self.selected_backend();
         if self.skid_margin.is_some()
-            && (self.namespace_only
-                || !matches!(
-                    backend,
-                    Backend::Ptrace | Backend::Liteinst | Backend::E9patch
-                ))
+            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
         {
             anyhow::bail!(
                 "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
@@ -3695,7 +3754,7 @@ impl RunOpts {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return with_container(&mut process, || {
-                self.run_in_container(global, capture_output, None)
+                self.run_in_container(global, capture_output, None, None)
             });
         }
 
@@ -3703,8 +3762,18 @@ impl RunOpts {
 
         let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
+        if self.runtime_backend() == Backend::Liteinst {
+            return with_owned_liteinst_container(&mut container, |entered| {
+                self.run_in_container(
+                    global,
+                    capture_output,
+                    Some(&identity_sources),
+                    Some(entered),
+                )
+            });
+        }
         with_container(&mut container, || {
-            self.run_in_container(global, capture_output, Some(&identity_sources))
+            self.run_in_container(global, capture_output, Some(&identity_sources), None)
         })
     }
 
@@ -4139,7 +4208,7 @@ impl RunOpts {
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
             Backend::Liteinst => {
-                Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
+                Some("LiteInst SUD-only shared Detcore in-guest (no ptrace fallback)")
             }
             Backend::Ptrace | Backend::Dbt | Backend::Sabre | Backend::E9patch => None,
         };
@@ -4295,7 +4364,7 @@ impl RunOpts {
             apply_affinity(&mut process, self.pin_threads);
             let mut log_file = Some(log_file);
             return with_container(&mut process, || {
-                self.run_verify_in_container(&mut log_file, global, None)
+                self.run_verify_in_container(&mut log_file, global, None, None)
             });
         }
 
@@ -4304,8 +4373,18 @@ impl RunOpts {
         let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
         let mut log_file = Some(log_file);
+        if self.runtime_backend() == Backend::Liteinst {
+            return with_owned_liteinst_container(&mut container, |entered| {
+                self.run_verify_in_container(
+                    &mut log_file,
+                    global,
+                    Some(&identity_sources),
+                    Some(entered),
+                )
+            });
+        }
         with_container(&mut container, || {
-            self.run_verify_in_container(&mut log_file, global, Some(&identity_sources))
+            self.run_verify_in_container(&mut log_file, global, Some(&identity_sources), None)
         })
     }
 
@@ -4476,7 +4555,41 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
         identity_sources: Option<&IdentityGuard>,
+        entered: Option<EnteredContainer>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        if self.runtime_backend() == Backend::Liteinst {
+            let capture = global.init_liteinst_capture()?;
+            return capture.run(|log| {
+                let log = log.with_entered_container(entered);
+                let log = if let Some(sources) = identity_sources {
+                    log.with_namespace_configuration(sources.liteinst_configuration()?)
+                } else {
+                    log
+                };
+                let (command, config) = self.container_command(identity_sources)?;
+                if capture_output {
+                    Ok(hermit::run_with_output_backend_timeout_and_log(
+                        command,
+                        config,
+                        self.summary,
+                        &self.summary_json,
+                        self.run_timeout(),
+                        log,
+                    )
+                    .map(|output| (output.status, Some(output))))
+                } else {
+                    Ok(hermit::run_with_backend_timeout_and_log(
+                        command,
+                        config,
+                        self.summary,
+                        &self.summary_json,
+                        self.run_timeout(),
+                        log,
+                    )
+                    .map(|status| (status, None)))
+                }
+            });
+        }
         let _guard = global.init_tracing();
 
         let command = self.guest_command()?;
@@ -4524,6 +4637,7 @@ impl RunOpts {
         log_file: &mut Option<fs::File>,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
+        entered: Option<EnteredContainer>,
     ) -> Result<(Output, u64), Error> {
         // HACK: Use interior mutability to workaround not being able to pass
         // `log_file` by value. Guaranteed by caller to never panic.
@@ -4531,6 +4645,32 @@ impl RunOpts {
 
         let strictness = self.verification_strictness();
         let level = verification_log_level(global.log, strictness, self.verify_verbose);
+
+        if self.runtime_backend() == Backend::Liteinst {
+            let capture = super::tracing::capture::Capture::install(
+                log_file,
+                log_max_bytes().map_err(Error::msg)?,
+                super::tracing::effective_filter(Some(level)),
+            )?;
+            return capture.run(|log| {
+                let log = log.with_entered_container(entered);
+                let log = if let Some(sources) = identity_sources {
+                    log.with_namespace_configuration(sources.liteinst_configuration()?)
+                } else {
+                    log
+                };
+                let (command, config) = self.container_command(identity_sources)?;
+                Ok(hermit::run_with_output_backend_timeout_and_log(
+                    command,
+                    config,
+                    self.summary,
+                    &self.summary_json,
+                    self.run_timeout(),
+                    log,
+                )
+                .map(|output| (output, 0)))
+            });
+        }
 
         // Bound this log too. `hermit run --verify` opens its own file and
         // calls `init_file_tracing` directly instead of going through
@@ -4570,6 +4710,26 @@ impl RunOpts {
             self.runtime_backend(),
             None,
         )
+    }
+
+    fn container_command(
+        &self,
+        identity_sources: Option<&IdentityGuard>,
+    ) -> Result<(Command, DetConfig), Error> {
+        let command = self.guest_command()?;
+        let mut config = self.effective_det_config();
+        config.mountinfo_root_rewrites = identity_sources
+            .map(IdentityGuard::mountinfo_root_rewrites)
+            .transpose()?
+            .unwrap_or_default();
+        config.mountinfo_mount_ids = identity_sources
+            .map(IdentityGuard::mountinfo_identity_order)
+            .transpose()?
+            .unwrap_or_default();
+        config.mountinfo_mount_ids_captured = identity_sources.is_some();
+        config.fdinfo_unlisted_mount_ids.clear();
+        self.save_config_to_disk()?;
+        Ok((command, config))
     }
 }
 

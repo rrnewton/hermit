@@ -10,6 +10,7 @@
 
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,8 +31,39 @@ fn invoked_executable(argv0: Option<&OsStr>, current_dir: &Path) -> Option<PathB
     })
 }
 
-fn has_resources(directory: &Path) -> bool {
-    directory.join("rsrcs").is_dir()
+fn directory_present(path: &Path) -> io::Result<bool> {
+    let inspect = || {
+        let entry = match fs::symlink_metadata(path) {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let metadata = if entry.file_type().is_symlink() {
+            fs::metadata(path)?
+        } else {
+            entry
+        };
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "resource directory is not a directory",
+            ));
+        }
+        Ok(true)
+    };
+    inspect().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot inspect resource directory {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn has_resources(directory: &Path) -> io::Result<bool> {
+    Ok(directory_present(directory)? && directory_present(&directory.join("rsrcs"))?)
 }
 
 fn discover_install_dir_from(
@@ -47,7 +79,9 @@ fn discover_install_dir_from(
                 format!("{INSTALL_DIR_ENV} is empty"),
             ));
         }
-        return Ok(Some(PathBuf::from(explicit)));
+        let directory = PathBuf::from(explicit);
+        has_resources(&directory)?;
+        return Ok(Some(directory));
     }
 
     let invoked = invoked_executable(argv0, current_dir);
@@ -57,15 +91,19 @@ fn discover_install_dir_from(
         .and_then(Path::parent)
         .map(|target| target.join("install_pkg"));
 
-    Ok(invoked_directory
-        .filter(|directory| has_resources(directory))
-        .map(Path::to_path_buf)
-        .or_else(|| {
-            executable_directory
-                .filter(|directory| has_resources(directory))
-                .map(Path::to_path_buf)
-        })
-        .or_else(|| built_in_place.filter(|directory| has_resources(directory))))
+    for directory in [
+        invoked_directory,
+        executable_directory,
+        built_in_place.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if has_resources(directory)? {
+            return Ok(Some(directory.to_path_buf()));
+        }
+    }
+    Ok(None)
 }
 
 /// Returns the selected installation directory, if a packaged installation is available.
@@ -89,7 +127,175 @@ pub fn resource(relative: impl AsRef<Path>) -> io::Result<Option<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
+
     use super::*;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = env::temp_dir().join(format!(
+                "hermit-resource-root-{name}-{}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::create_dir_all(root.join("target/release")).unwrap();
+            Self(root)
+        }
+
+        fn discover(&self) -> io::Result<Option<PathBuf>> {
+            discover_install_dir_from(
+                None,
+                Some(self.0.join("invoked/hermit").as_os_str()),
+                &self.0.join("target/release/hermit"),
+                &self.0,
+            )
+        }
+
+        fn locations(&self) -> [PathBuf; 3] {
+            [
+                self.0.join("invoked"),
+                self.0.join("target/release"),
+                self.0.join("target/install_pkg"),
+            ]
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    struct RestorePermissions(PathBuf, fs::Permissions);
+
+    impl RestorePermissions {
+        fn deny_search(path: &Path) -> Self {
+            let permissions = fs::metadata(path).unwrap().permissions();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+            Self(path.to_path_buf(), permissions)
+        }
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.0, self.1.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_resource_roots_are_absent() {
+        let fixture = Fixture::new("missing");
+        assert_eq!(fixture.discover().unwrap(), None);
+        fs::create_dir(fixture.0.join("target/install_pkg")).unwrap();
+        assert_eq!(fixture.discover().unwrap(), None);
+    }
+
+    #[test]
+    fn directory_symlinks_keep_the_selected_path() {
+        for location in ["root", "rsrcs"] {
+            let fixture = Fixture::new(&format!("symlink-{location}"));
+            let real = fixture.0.join("real");
+            let selected = fixture.0.join("invoked");
+            fs::create_dir_all(real.join("rsrcs")).unwrap();
+            if location == "root" {
+                symlink(&real, &selected).unwrap();
+            } else {
+                fs::create_dir(&selected).unwrap();
+                symlink(real.join("rsrcs"), selected.join("rsrcs")).unwrap();
+            }
+            assert_eq!(fixture.discover().unwrap(), Some(selected));
+        }
+    }
+
+    #[test]
+    fn malformed_resources_never_fall_through() {
+        for index in 0..3 {
+            for kind in ["file", "dangling-symlink"] {
+                let fixture = Fixture::new(&format!("malformed-{index}-{kind}"));
+                let locations = fixture.locations();
+                fs::create_dir_all(&locations[index]).unwrap();
+                if let Some(fallback) = locations.get(index + 1) {
+                    fs::create_dir_all(fallback.join("rsrcs")).unwrap();
+                }
+                let resources = locations[index].join("rsrcs");
+                let expected = if kind == "file" {
+                    fs::write(&resources, b"not a directory").unwrap();
+                    io::ErrorKind::NotADirectory
+                } else {
+                    symlink("missing-target", &resources).unwrap();
+                    io::ErrorKind::NotFound
+                };
+                let error = fixture.discover().unwrap_err();
+                assert_eq!(error.kind(), expected);
+                assert!(error.to_string().contains(resources.to_str().unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_install_root_is_not_absence() {
+        for kind in ["file", "dangling-symlink"] {
+            let fixture = Fixture::new(&format!("malformed-root-{kind}"));
+            let root = fixture.0.join("target/install_pkg");
+            let expected = if kind == "file" {
+                fs::write(&root, b"not a directory").unwrap();
+                io::ErrorKind::NotADirectory
+            } else {
+                symlink("missing-target", &root).unwrap();
+                io::ErrorKind::NotFound
+            };
+            assert_eq!(fixture.discover().unwrap_err().kind(), expected);
+        }
+    }
+
+    #[test]
+    fn real_permission_errors_propagate_at_every_default_root() {
+        for index in 0..3 {
+            let fixture = Fixture::new(&format!("permission-{index}"));
+            let locations = fixture.locations();
+            fs::create_dir_all(locations[index].join("rsrcs")).unwrap();
+            if let Some(fallback) = locations.get(index + 1) {
+                fs::create_dir_all(fallback.join("rsrcs")).unwrap();
+            }
+            let _restore = RestorePermissions::deny_search(&locations[index]);
+            let error = fixture.discover().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                error
+                    .to_string()
+                    .contains(locations[index].to_str().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_valid_root_does_not_inspect_later_invalid_root() {
+        let fixture = Fixture::new("priority");
+        fs::create_dir_all(fixture.0.join("invoked/rsrcs")).unwrap();
+        fs::write(fixture.0.join("target/install_pkg"), b"not a directory").unwrap();
+        assert_eq!(fixture.discover().unwrap(), Some(fixture.0.join("invoked")));
+    }
+
+    #[test]
+    fn explicit_absence_keeps_priority_but_malformed_root_refuses() {
+        let fixture = Fixture::new("explicit-contract");
+        let selected = fixture.0.join("explicit");
+        let discover = || {
+            discover_install_dir_from(
+                Some(selected.as_os_str()),
+                None,
+                &fixture.0.join("target/release/hermit"),
+                &fixture.0,
+            )
+        };
+        fs::create_dir_all(fixture.0.join("target/install_pkg/rsrcs")).unwrap();
+        assert_eq!(discover().unwrap(), Some(selected.clone()));
+        fs::write(&selected, b"not a directory").unwrap();
+        assert_eq!(discover().unwrap_err().kind(), io::ErrorKind::NotADirectory);
+    }
 
     fn test_directory(name: &str) -> PathBuf {
         let directory =

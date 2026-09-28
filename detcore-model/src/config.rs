@@ -684,12 +684,10 @@ pub struct Config {
     /// Resolved happens-before program: deterministic ordering edges between
     /// anchored events (see `detcore_model::happens_before`). This is populated
     /// programmatically by hermit-cli after loading and resolving a
-    /// `--happens-before` spec against the guest binary; it is not a direct CLI
-    /// flag and is not serialized (it is reconstructed from the spec file each
-    /// run, so `#[serde(skip)]` avoids requiring serde on `Sysno`-bearing
-    /// positions and keeps save-config output stable). The scheduler enforces
-    /// these edges only when `sequentialize_threads` is set.
-    #[serde(skip)]
+    /// `--happens-before` spec against the guest binary and serialized to guest
+    /// tools so they issue the matching scheduler checkpoints. The scheduler
+    /// enforces these edges only when `sequentialize_threads` is set.
+    #[serde(default)]
     #[clap(skip)]
     pub happens_before: Option<HappensBeforeProgram>,
 }
@@ -1375,6 +1373,166 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn happens_before_config() -> Config {
+        let program = crate::happens_before::HappensBeforeSpec::from_json(
+            r#"{
+                "version": 1,
+                "threads": {
+                    "worker": {"label": "writer", "dettid": 7},
+                    "child": {"spawn_ordinal": 2}
+                },
+                "events": {
+                    "before": {"thread": "worker", "syscalls": 3},
+                    "after": {"thread": "child", "syscalls": 5},
+                    "rcb": {"thread": "child", "rcbs": 123456},
+                    "call": {"thread": "worker", "syscall": "futex", "phase": "posthook", "nth": 2},
+                    "resolved": {"thread": "worker", "rip": "0x401234", "func": "publish", "line": 13, "nth": 4},
+                    "unresolved": {"thread": "child", "func": "consume", "nth": 3},
+                    "marker": {"thread": "7", "mark": "ready", "nth": 2}
+                },
+                "edges": [
+                    {"before": "before", "after": "after", "strength": "hard"},
+                    {"before": "after", "after": "rcb", "strength": "soft"}
+                ]
+            }"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        Config {
+            happens_before: Some(program),
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn happens_before_config_json_round_trip() {
+        let config = happens_before_config();
+        let encoded = serde_json::to_vec(&config).unwrap();
+        let restored: Config = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.happens_before, config.happens_before);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn happens_before_config_rpc_round_trip() {
+        let config = happens_before_config();
+        let encoded = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        let (restored, consumed): (Config, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(restored.happens_before, config.happens_before);
+        assert_eq!(
+            bincode::serde::encode_to_vec(&restored, bincode::config::legacy()).unwrap(),
+            encoded
+        );
+    }
+
+    fn malformed_happens_before_configs() -> Vec<(&'static str, Config)> {
+        use crate::happens_before::CodeLocation;
+        use crate::happens_before::HappensBeforeEdge;
+        use crate::happens_before::Strength;
+
+        let mut cases = Vec::new();
+        for endpoint in ["before", "after"] {
+            let mut config = happens_before_config();
+            let program = config.happens_before.as_mut().unwrap();
+            program.anchors.remove(endpoint);
+            cases.push(("references unknown event", config));
+        }
+        for (before, after, strength) in [
+            ("before", "before", Strength::Hard),
+            ("after", "before", Strength::Hard),
+            ("rcb", "before", Strength::Soft),
+        ] {
+            let mut config = happens_before_config();
+            let program = config.happens_before.as_mut().unwrap();
+            program.edges.push(HappensBeforeEdge {
+                before: before.into(),
+                after: after.into(),
+                strength,
+            });
+            cases.push(("contain a cycle", config));
+        }
+        let mut config = happens_before_config();
+        let program = config.happens_before.as_mut().unwrap();
+        program.anchors.get_mut("before").unwrap().name = "different".into();
+        cases.push(("does not match anchor name", config));
+
+        let mut config = happens_before_config();
+        let program = config.happens_before.as_mut().unwrap();
+        program.anchors.get_mut("unresolved").unwrap().location = CodeLocation::default();
+        cases.push(("must specify a position", config));
+        cases
+    }
+
+    #[test]
+    fn happens_before_config_json_rejects_malformed_programs() {
+        for (expected, config) in malformed_happens_before_configs() {
+            let encoded = serde_json::to_vec(&config).unwrap();
+            let error = serde_json::from_slice::<Config>(&encoded).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn happens_before_config_rpc_rejects_malformed_programs() {
+        for (expected, config) in malformed_happens_before_configs() {
+            let encoded =
+                bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let error =
+                bincode::serde::decode_from_slice::<Config, _>(&encoded, bincode::config::legacy())
+                    .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn happens_before_config_rpc_preserves_checkpoint_eligibility() {
+        let config = happens_before_config();
+        let mut without_counts = config.clone();
+        let program = without_counts.happens_before.as_mut().unwrap();
+        program.anchors.retain(|_, anchor| {
+            !matches!(
+                anchor.position,
+                crate::happens_before::Position::SyscallCount(_)
+            )
+        });
+        program.edges.clear();
+        for (config, expected) in [
+            (config, true),
+            (without_counts, false),
+            (Config::default(), false),
+        ] {
+            let encoded =
+                bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (restored, consumed): (Config, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(restored.sequentialize_threads, config.sequentialize_threads);
+            assert_eq!(
+                restored
+                    .happens_before
+                    .as_ref()
+                    .is_some_and(HappensBeforeProgram::has_syscall_count_anchors),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn happens_before_config_missing_json_field_defaults_to_none() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value.as_object_mut().unwrap().remove("happens_before");
+        let restored: Config = serde_json::from_value(value).unwrap();
+        assert!(restored.happens_before.is_none());
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(Config::default()).unwrap()
+        );
+    }
 
     #[test]
     fn default_epoch_is_2026() {

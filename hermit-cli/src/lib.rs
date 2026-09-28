@@ -16,6 +16,9 @@ pub mod canonical_verdict;
 mod chroot;
 mod consts;
 mod desync;
+pub mod liteinst;
+pub mod liteinst_artifact;
+pub mod liteinst_bootstrap;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
 pub mod e9patch;
 mod error;
@@ -844,6 +847,17 @@ fn liteinst_runtime_pin_matches(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn validate_liteinst_detcore_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    liteinst_artifact::validate_file_identity(
+        path,
+        env!("HERMIT_REVERIE_PIN"),
+        option_env!("HERMIT_LITEINST_SOURCE_SHA256").unwrap_or("unknown"),
+        option_env!("HERMIT_LITEINST_DIAGNOSTIC_BUILD") == Some("1"),
+        option_env!("HERMIT_LITEINST_RESOLVED_REVERIE_REV").unwrap_or("unknown"),
+    )?;
+    path.canonicalize()
+}
+
 fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
     liteinst_runtime_pin_matches(path)?;
     let bytes = fs::read(path).map_err(|error| {
@@ -1000,9 +1014,9 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
 }
 
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
-    liteinst_runtime_library_path().err().map(|error| {
+    liteinst::runtime_library_path().err().map(|error| {
         format!(
-            "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
+            "the actual LiteInst Detcore runtime is unavailable: {error}; stage the descriptor/provenance-validated libhermit_liteinst_detcore.so"
         )
     })
 }
@@ -1030,7 +1044,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbt,
-    /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
+    /// Use shared Detcore in-guest with SUD only and no ptrace fallback.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -1105,7 +1119,7 @@ impl Backend {
     }
 
     fn uses_ptrace_pmu_timers(self) -> bool {
-        matches!(self, Self::Ptrace | Self::Liteinst | Self::E9patch)
+        matches!(self, Self::Ptrace | Self::E9patch)
     }
 
     /// Returns backends whose Hermit integration prerequisites are met.
@@ -2320,6 +2334,60 @@ pub fn run_with_backend_timeout(
     skid_overshoot_report.finish(result)
 }
 
+pub fn run_legacy_liteinst_host(command: Command, config: DetConfig) -> Result<ExitStatus, Error> {
+    let report = SkidOvershootReport::begin(true);
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let (status, mut global) =
+                reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                    command,
+                    prepare_backend_config(config, Backend::Liteinst),
+                    liteinst_runtime_library_path()?,
+                )
+                .await?;
+            if liteinst_requires_forced_shutdown(status) {
+                global.force_shutdown_with_error();
+                global.cancel_internal_scheduler().await;
+            }
+            global.clean_up(false, &None).await;
+            Ok(status)
+        });
+    report.finish(result)
+}
+
+pub fn run_legacy_liteinst_host_with_output(
+    mut command: Command,
+    config: DetConfig,
+) -> Result<Output, Error> {
+    let report = SkidOvershootReport::begin(true);
+    command.stdin(output_backend_stdin()?);
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let (output, mut global) =
+                reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+                    command,
+                    prepare_backend_config(config, Backend::Liteinst),
+                    liteinst_runtime_library_path()?,
+                )
+                .await?;
+            if liteinst_requires_forced_shutdown(output.status) {
+                global.force_shutdown_with_error();
+                global.cancel_internal_scheduler().await;
+            }
+            global.clean_up(false, &None).await;
+            Ok(Output {
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        });
+    report.finish(result)
+}
+
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
 pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
@@ -2454,9 +2522,9 @@ const RUN_TIMEOUT_UNWIND_GRACE: Duration = Duration::from_secs(10);
 /// works only when the run was healthy enough not to need it is the inert
 /// mechanism this exists to remove, so the alarm below is armed FIRST and is
 /// disarmed by RAII only once the unwind has finished.
-async fn with_run_deadline<F>(timeout: Option<Duration>, guest: F) -> Result<ExitStatus, Error>
+async fn with_run_deadline<F, T>(timeout: Option<Duration>, guest: F) -> Result<T, Error>
 where
-    F: std::future::Future<Output = Result<ExitStatus, Error>>,
+    F: std::future::Future<Output = Result<T, Error>>,
 {
     let Some(limit) = timeout else {
         return guest.await;
@@ -2677,20 +2745,9 @@ async fn dispatch_backend(
         .status);
     }
     if backend == Backend::Liteinst {
-        let preload = liteinst_runtime_library_path()?;
-        let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                command, config, preload,
-            )
-            .await?;
-        if liteinst_requires_forced_shutdown(exit_status) {
-            global_state.force_shutdown_with_error();
-            global_state.cancel_internal_scheduler().await;
-        }
-        global_state
-            .clean_up(print_summary, print_summary_to_json_file)
-            .await;
-        return Ok(exit_status);
+        anyhow::bail!(
+            "LiteInst requires a caller-owned capture session; use run_with_backend_timeout_and_log"
+        );
     }
     ensure_backend_dispatch(backend)?;
 
@@ -2730,6 +2787,45 @@ pub fn run_with_output(
         print_summary,
         print_summary_to_json_file,
         Backend::Ptrace,
+    )
+}
+
+pub fn run_with_backend_timeout_and_log(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    summary_json: &Option<PathBuf>,
+    timeout: Option<Duration>,
+    log: liteinst::LogInput,
+) -> liteinst::PendingRun<ExitStatus> {
+    liteinst::run(
+        command,
+        config,
+        print_summary,
+        summary_json,
+        timeout,
+        log,
+        false,
+    )
+    .map(|output| output.status)
+}
+
+pub fn run_with_output_backend_timeout_and_log(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    summary_json: &Option<PathBuf>,
+    timeout: Option<Duration>,
+    log: liteinst::LogInput,
+) -> liteinst::PendingRun<Output> {
+    liteinst::run(
+        command,
+        config,
+        print_summary,
+        summary_json,
+        timeout,
+        log,
+        true,
     )
 }
 
@@ -2890,26 +2986,9 @@ async fn dispatch_output_backend(
         .await;
     }
     if backend == Backend::Liteinst {
-        command.stdin(output_backend_stdin()?);
-        let preload = liteinst_runtime_library_path()?;
-        let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                command, config, preload,
-            )
-            .await?;
-        let status = output.status;
-        if liteinst_requires_forced_shutdown(status) {
-            global_state.force_shutdown_with_error();
-            global_state.cancel_internal_scheduler().await;
-        }
-        global_state
-            .clean_up(print_summary, print_summary_to_json_file)
-            .await;
-        return Ok(Output {
-            status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        });
+        anyhow::bail!(
+            "LiteInst requires a caller-owned capture session; use run_with_output_backend_timeout_and_log"
+        );
     }
     ensure_backend_dispatch(backend)?;
 
@@ -3175,11 +3254,14 @@ impl HermitData {
 /// Capture the current mount namespace's raw IDs in the exact row/parent order
 /// used by Detcore's canonical mountinfo mapping.
 pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
+    mountinfo_identity_order(&fs::read("/proc/thread-self/mountinfo")?)
+}
+
+fn mountinfo_identity_order(contents: &[u8]) -> Result<Vec<u64>, Error> {
     use std::collections::BTreeSet;
 
-    let contents = fs::read("/proc/self/mountinfo")?;
-    let rows = detcore_model::procfs::parse_mountinfo(&contents)
-        .ok_or_else(|| anyhow!("malformed /proc/self/mountinfo"))?;
+    let rows = detcore_model::procfs::parse_mountinfo(contents)
+        .ok_or_else(|| anyhow!("malformed /proc/thread-self/mountinfo"))?;
     let mut visible = Vec::new();
     let mut parents = Vec::new();
     let mut seen = BTreeSet::new();
@@ -3194,6 +3276,13 @@ pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
         }
     }
     Ok(visible)
+}
+
+#[test]
+fn final_namespace_mount_order_preserves_stacked_rows_and_unlisted_parents() {
+    let rows = b"81 80 8:1 /lower /stack rw - ext4 /dev/root rw\n82 81 8:1 /upper /stack rw - ext4 /dev/root rw\n";
+    assert_eq!(mountinfo_identity_order(rows).unwrap(), [81, 82, 80]);
+    assert!(mountinfo_identity_order(b"malformed\n").is_err());
 }
 
 impl<'a> From<Option<&'a PathBuf>> for HermitData {
@@ -3437,10 +3526,15 @@ mod tests {
 
     #[test]
     fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
-        for backend in [Backend::Ptrace, Backend::Liteinst, Backend::E9patch] {
+        for backend in [Backend::Ptrace, Backend::E9patch] {
             assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
         }
-        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
+        for backend in [
+            Backend::Dbt,
+            Backend::Liteinst,
+            Backend::Sabre,
+            Backend::Kvm,
+        ] {
             assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
         }
     }
@@ -3950,7 +4044,7 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_host_backend_preserves_ptrace_rcb_timeslices() {
+    fn liteinst_preserves_requested_rcb_timeslices() {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
         assert!(
@@ -4040,30 +4134,22 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_public_dispatch_runs_ptrace_host_hybrid() {
-        if Backend::Liteinst.ensure_available().is_err() {
+    fn liteinst_explicit_legacy_dispatch_runs_ptrace_host_hybrid() {
+        if super::liteinst_runtime_library_path().is_err() {
             return;
         }
 
         let mut command = super::Command::new("/bin/echo");
         command.arg("hello");
-        let output = super::run_with_output_backend(
-            command,
-            super::DetConfig::default(),
-            false,
-            &None,
-            Backend::Liteinst,
-        )
-        .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
+        let output =
+            super::run_legacy_liteinst_host_with_output(command, super::DetConfig::default())
+                .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
         assert_eq!(output.status, super::ExitStatus::Exited(0));
         assert_eq!(output.stdout, b"hello\n");
 
-        let status = super::run_with_backend(
+        let status = super::run_legacy_liteinst_host(
             super::Command::new("/bin/true"),
             super::DetConfig::default(),
-            false,
-            &None,
-            Backend::Liteinst,
         )
         .expect("run /bin/true through the ptrace-hosted LiteInst hybrid");
         assert_eq!(status, super::ExitStatus::Exited(0));

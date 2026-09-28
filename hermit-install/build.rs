@@ -17,6 +17,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod liteinst_inputs;
+
 const DYNAMORIO_FILES: &[&str] = &[
     "bin64/drrun",
     "lib64/release/libdynamorio.so",
@@ -290,52 +292,46 @@ fn build_liteinst_runtime(
     // stage-liteinst-runtime.sh appends the canonical Reverie pin to this stable
     // root, so cache invalidation has the same source of truth as the pin gate.
     let target = build_root.join("liteinst-runtime");
-    let runtime = profile_dir.join("libreverie_liteinst.so");
+    liteinst_inputs::require_normal_mode().expect("normal LiteInst resource installation");
+    let name =
+        liteinst_inputs::runtime_name(env::var_os("HERMIT_LITEINST_RUNTIME_KIND").as_deref())
+            .expect("LiteInst runtime build kind");
+    let runtime = profile_dir.join(name);
     run(
         Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
             .current_dir(repository)
             .arg("release")
             .arg(&runtime)
             .arg(&target),
-        "build the constructor-enabled LiteInst runtime",
+        "build the shared Detcore LiteInst runtime",
     );
     assert!(
         runtime.is_file(),
         "standalone build did not stage {}",
         runtime.display()
     );
-    replace_copy(&runtime, &resources.join("libreverie_liteinst.so"));
-    // RECORD THE PIN THE ARTIFACT WAS BUILT FROM, AND MEAN IT.
-    //
-    // `sabre.revision` established this shape and is read by nothing, so it is
-    // provenance rather than authority. This one IS read: hermit compares it
-    // against the pin compiled into the binary when it resolves the staged
-    // runtime, and refuses a mismatch. That is what makes staleness loud instead
-    // of silent -- see the loader in hermit-cli/src/lib.rs.
-    //
-    // ⚠️ WRITE IT BESIDE **EVERY** STAGED COPY, NOT JUST THIS ONE. The runtime is
-    // staged twice -- once at `profile_dir` by the script above and once here in
-    // `resources` -- and the loader reads `<the path it resolved>.revision`. When
-    // the sidecar existed only here, a correct restage produced a correct pin in
-    // `rsrcs/` while the loader resolved `target/release/libreverie_liteinst.so`,
-    // found no sidecar beside it, and refused with "records no Reverie revision".
-    // The artifact was never stale; only one of its two homes carried provenance.
-    // That made the printed remedy -- `cargo build --release -p hermit-install` --
-    // regenerate exactly the state that was already failing, so following the
-    // error message looped instead of resolving.
-    let pin = reverie_pin(repository);
-    for staged in [&runtime, &resources.join("libreverie_liteinst.so")] {
-        let marker = PathBuf::from(format!("{}.revision", staged.display()));
-        fs::write(&marker, format!("{pin}\n")).unwrap_or_else(|error| {
-            panic!(
-                "failed to record the LiteInst runtime revision at {}: {error}",
-                marker.display()
-            )
-        });
-    }
+    let installed = resources.join(name);
+    let provenance = runtime.with_file_name(format!("{name}.provenance.json"));
+    let installed_provenance = resources.join(format!("{name}.provenance.json"));
+    replace_copy(&runtime, &installed);
+    replace_copy(&provenance, &installed_provenance);
+    assert_eq!(
+        fs::read(&runtime).unwrap(),
+        fs::read(&installed).unwrap(),
+        "installed DSO differs"
+    );
+    assert_eq!(
+        fs::read(&provenance).unwrap(),
+        fs::read(&installed_provenance).unwrap(),
+        "installed provenance differs"
+    );
+    liteinst_inputs::emit(repository).expect("watch generated LiteInst source identity");
 }
 
 fn main() {
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    liteinst_inputs::emit(manifest_dir.parent().expect("hermit-install repository"))
+        .expect("watch LiteInst artifact identity inputs");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
@@ -349,7 +345,6 @@ fn main() {
     // pin.
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.lock");
-    println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
 
     let profile = env::var("PROFILE");
     if profile.as_deref() != Ok("release")

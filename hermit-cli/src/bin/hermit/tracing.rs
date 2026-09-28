@@ -11,12 +11,30 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::io::stderr;
 
+use hermit::liteinst_bootstrap::EffectiveFilter;
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 
+#[path = "../../liteinst_record.rs"]
+pub mod liteinst;
+
+#[path = "tracing/capture.rs"]
+pub mod capture;
+
 const DEFAULT_TRACE_LEVEL: LevelFilter = LevelFilter::WARN;
+
+pub fn effective_filter(level: Option<LevelFilter>) -> EffectiveFilter {
+    with_cli_directives(
+        &std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_default(),
+        level,
+    )
+}
+
+fn with_cli_directives(raw: &str, level: Option<LevelFilter>) -> EffectiveFilter {
+    EffectiveFilter::from_directives_lossy(raw, level.unwrap_or(DEFAULT_TRACE_LEVEL))
+}
 
 /// Environment override for [`DEFAULT_LOG_MAX_BYTES`]; `0` disables the bound.
 pub const LOG_MAX_BYTES_ENV: &str = "HERMIT_LOG_MAX_BYTES";
@@ -155,14 +173,12 @@ fn file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
 ) -> (impl Subscriber, impl Drop) {
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = effective_filter(Some(level));
 
     let (writer, guard) = tracing_appender::non_blocking(f);
 
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(filter.into_filter())
         .with_writer(writer)
         .with_ansi(false)
         .finish();
@@ -195,12 +211,10 @@ fn sync_file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
 ) -> (impl Subscriber, impl Drop) {
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = effective_filter(Some(level));
 
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(filter.into_filter())
         .with_writer(std::sync::Mutex::new(f))
         .with_ansi(false)
         .finish();
@@ -248,13 +262,9 @@ pub fn init_file_tracing<W: Write + Send + 'static>(level: Option<LevelFilter>, 
 ///
 /// NOTE: Writes to stderr are unbuffered, so this may be slow.
 pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
-    let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
-
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = effective_filter(level);
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(filter.into_filter())
         // NOT `io::stderr`: a guest can set O_NONBLOCK on the inherited fd 2,
         // after which a full pipe makes these writes fail with EAGAIN. The fmt
         // layer discards the write error, so log lines would vanish with no
@@ -280,6 +290,7 @@ pub fn init_stderr_tracing(level: Option<LevelFilter>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     use super::*;
@@ -287,6 +298,168 @@ mod tests {
     /// `log_max_bytes` reads the process environment, which libtest's threads
     /// share.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn recorded_events(filter: EnvFilter, emit: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || writer.clone())
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, emit);
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    }
+
+    fn recorded_messages(filter: EnvFilter) -> String {
+        recorded_events(filter, || {
+            tracing::info!(target: "other", "default-info");
+            tracing::warn!(target: "other", "default-warn");
+            tracing::debug!(target: "tokio", "tokio-debug");
+            tracing::trace!(target: "tokio", "tokio-trace");
+            tracing::debug!(target: "detcore", "detcore-debug");
+            tracing::trace!(target: "detcore", "outside-trace");
+            let span = tracing::info_span!(target: "detcore", "work", task = 7);
+            let _entered = span.enter();
+            tracing::trace!(target: "detcore", "inside-trace");
+        })
+    }
+
+    fn recorded_numeric_messages(filter: EnvFilter) -> String {
+        recorded_events(filter, || {
+            tracing::info_span!(target: "detcore", "work", task = 1.0_f64)
+                .in_scope(|| tracing::info!("float-one"));
+            tracing::info_span!(target: "detcore", "work", task = 1_u64)
+                .in_scope(|| tracing::info!("unsigned-one"));
+            tracing::info_span!(target: "detcore", "work", task = 1_i64)
+                .in_scope(|| tracing::info!("signed-one"));
+            tracing::info_span!(target: "detcore", "work", task = -1.0_f64)
+                .in_scope(|| tracing::info!("float-negative"));
+            tracing::info_span!(target: "detcore", "work", task = -1_i64)
+                .in_scope(|| tracing::info!("signed-negative"));
+            tracing::info_span!(target: "detcore", "work", task = 1.5_f64)
+                .in_scope(|| tracing::info!("float-fraction"));
+        })
+    }
+
+    #[test]
+    fn sealed_numeric_predicates_preserve_selected_records() {
+        for (predicate, selected) in [
+            ("1.0", &["float-one"][..]),
+            ("1e0", &["float-one"][..]),
+            ("1", &["unsigned-one", "signed-one"][..]),
+            ("-1.0", &["float-negative"][..]),
+            ("-1", &["signed-negative"][..]),
+            ("1.5", &["float-fraction"][..]),
+        ] {
+            let raw = format!("detcore[work{{task={predicate}}}]=info,tokio=invalid");
+            let original = EnvFilter::new(&raw)
+                .add_directive("tokio=debug".parse().unwrap())
+                .add_directive(LevelFilter::WARN.into());
+            let expected = recorded_numeric_messages(original);
+            assert_eq!(
+                expected.lines().count(),
+                selected.len(),
+                "{predicate}: {expected}"
+            );
+            for message in selected {
+                assert!(expected.contains(message), "{predicate}: {expected}");
+            }
+            let filter = with_cli_directives(&raw, None);
+            let encoded = hermit::liteinst_bootstrap::encode("numeric-test", &filter).unwrap();
+            let decoded = hermit::liteinst_bootstrap::decode(&encoded, "numeric-test").unwrap();
+            assert_eq!(
+                recorded_numeric_messages(filter.into_filter()),
+                expected,
+                "{predicate}"
+            );
+            assert_eq!(
+                recorded_numeric_messages(decoded.into_filter()),
+                expected,
+                "{predicate}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_precedence_and_payload_round_trip_preserve_event_selection() {
+        let raw = "error,tokio=off,detcore=debug,detcore[work{task=7}]=trace";
+        for level in [None, Some(LevelFilter::INFO), Some(LevelFilter::TRACE)] {
+            let filter = with_cli_directives(raw, level);
+            let encoded = hermit::liteinst_bootstrap::encode("filter-test", &filter).unwrap();
+            let decoded = hermit::liteinst_bootstrap::decode(&encoded, "filter-test").unwrap();
+            let original = EnvFilter::new(raw)
+                .add_directive("tokio=debug".parse().unwrap())
+                .add_directive(level.unwrap_or(LevelFilter::WARN).into());
+            let expected = recorded_messages(original);
+            assert_eq!(recorded_messages(filter.into_filter()), expected);
+            assert_eq!(recorded_messages(decoded.into_filter()), expected);
+            assert_eq!(expected.contains("default-info"), level.is_some());
+            for present in [
+                "default-warn",
+                "tokio-debug",
+                "detcore-debug",
+                "inside-trace",
+            ] {
+                assert!(expected.contains(present), "{expected}");
+            }
+            for absent in ["tokio-trace", "outside-trace"] {
+                assert!(!expected.contains(absent), "{expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn effective_environment_filter_matches_original_resolution() {
+        for level in [None, Some(LevelFilter::INFO), Some(LevelFilter::DEBUG)] {
+            let original = EnvFilter::from_default_env()
+                .add_directive("tokio=debug".parse().unwrap())
+                .add_directive(level.unwrap_or(LevelFilter::WARN).into());
+            assert_eq!(
+                recorded_messages(effective_filter(level).into_filter()),
+                recorded_messages(original)
+            );
+            let original = EnvFilter::from_default_env()
+                .add_directive("tokio=debug".parse().unwrap())
+                .add_directive(level.unwrap_or(LevelFilter::WARN).into());
+            let expected = recorded_numeric_messages(original);
+            let effective = effective_filter(level);
+            let encoded =
+                hermit::liteinst_bootstrap::encode("environment-test", &effective).unwrap();
+            let decoded = hermit::liteinst_bootstrap::decode(&encoded, "environment-test").unwrap();
+            assert_eq!(recorded_numeric_messages(effective.into_filter()), expected);
+            assert_eq!(recorded_numeric_messages(decoded.into_filter()), expected);
+        }
+    }
+
+    #[test]
+    fn lossy_environment_directives_remain_lossy_only_before_sealing() {
+        let filter = with_cli_directives("detcore=debug,tokio=invalid", None);
+        let encoded = hermit::liteinst_bootstrap::encode("filter-test", &filter).unwrap();
+        let decoded = hermit::liteinst_bootstrap::decode(&encoded, "filter-test").unwrap();
+        assert_eq!(
+            recorded_messages(decoded.into_filter()),
+            recorded_messages(filter.into_filter())
+        );
+        let invalid = String::from_utf8(encoded)
+            .unwrap()
+            .replace("tokio=debug", "tokio=invalid");
+        assert!(hermit::liteinst_bootstrap::decode(invalid.as_bytes(), "filter-test").is_err());
+    }
 
     /// Bracketed both ways on purpose: a bound that always fires would silently
     /// truncate ordinary diagnostic logs, which is the failure mode opposite to
