@@ -74,6 +74,9 @@ impl Record {
             .spawn()
             .await?;
 
+        metadata.proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
+        crate::proc_mount::report_proc_mode(None, metadata.proc_readonly);
+
         Ok(Self {
             tracer,
             metadata,
@@ -81,7 +84,7 @@ impl Record {
         })
     }
 
-    fn persist_mount_identity_provenance(
+    fn persist_completed_metadata(
         metadata: &mut Metadata,
         metadata_path: &Path,
         provenance: Option<(Vec<u64>, Vec<u64>)>,
@@ -90,17 +93,20 @@ impl Record {
             metadata.mountinfo_mount_ids = mountinfo_order;
             metadata.mountinfo_mount_ids_captured = true;
             metadata.fdinfo_unlisted_mount_ids = unlisted_order;
-            let directory = metadata_path
-                .parent()
-                .ok_or_else(|| Error::msg("recording metadata path has no parent"))?;
-            let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-            serde_json::to_writer_pretty(temporary.as_file_mut(), metadata)
-                .context("Failed to serialize final recording metadata")?;
-            temporary
-                .persist(metadata_path)
-                .map_err(|error| error.error)
-                .context("Failed to persist final recording metadata")?;
         }
+        // Also persist the proc mode observed after guest setup, even when no
+        // mount-identity provenance was collected. Do this only after joining
+        // the recording, so a metadata write failure cannot abandon a tracee.
+        let directory = metadata_path
+            .parent()
+            .ok_or_else(|| Error::msg("recording metadata path has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer_pretty(temporary.as_file_mut(), metadata)
+            .context("Failed to serialize final recording metadata")?;
+        temporary
+            .persist(metadata_path)
+            .map_err(|error| error.error)
+            .context("Failed to persist final recording metadata")?;
         Ok(())
     }
 
@@ -118,7 +124,7 @@ impl Record {
             .map_err(Error::msg);
         global_state.clean_up(false, &None).await;
         // Publish final metadata only after the original successful state joined.
-        Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, provenance?)?;
+        Self::persist_completed_metadata(&mut metadata, &metadata_path, provenance?)?;
         Ok(exit_status)
     }
 
@@ -136,7 +142,7 @@ impl Record {
             .map_err(Error::msg);
         global_state.clean_up(false, &None).await;
         // Publish final metadata only after the original successful state joined.
-        Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, provenance?)?;
+        Self::persist_completed_metadata(&mut metadata, &metadata_path, provenance?)?;
         Ok(output)
     }
 }
