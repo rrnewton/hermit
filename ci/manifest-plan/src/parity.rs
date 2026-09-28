@@ -346,9 +346,13 @@ fn configured_selection(recipe: &ModeRecipe) -> Result<CiSelection, String> {
 ///
 /// `credit = matched_prefix / max(left_len, right_len)`, clamped to
 /// `[0.0, 1.0]`, where `matched_prefix` counts the leading compared messages
-/// that are equal on both sides. With `first_divergent_record` taken as the
-/// 1-based position of the first differing message in the compared stream,
-/// this is `(first_divergent_record - 1) / max(left_len, right_len)`.
+/// that are equal on both sides. In compared-message units the first
+/// difference is at 1-based position `matched_prefix + 1`.
+///
+/// That position is not [`ParityRecord::first_divergent_record`]. That field
+/// is the log-diff report's raw log-record index, which also counts records
+/// the comparison did not select, so `(first_divergent_record - 1) /
+/// max(left_len, right_len)` is not this credit and can exceed 1.
 ///
 /// - 1.0 only for a full-length match, meaning both sides have the same
 ///   length and every message matched. A partial match never rounds up to 1.0.
@@ -485,6 +489,11 @@ impl ParityRecord {
     /// It never becomes a zero-credit divergence. A backend that cannot be
     /// given the reference's inputs becomes `inputs-not-equalized` whatever the
     /// report says, and claiming equal inputs for it is an error.
+    ///
+    /// A matched or diverged report that passes the evidence policy but still
+    /// contradicts its verdict, for example a match that names a first
+    /// divergent record, is an error rather than an `unavailable` row: the
+    /// built record must pass [`ParityRecord::validate`].
     ///
     /// `inputs_equalized` must come from how the two cells were launched, not
     /// from the comparison.
@@ -703,6 +712,19 @@ impl ParityRecord {
             if self.reference_log.is_none() || self.candidate_log.is_none() {
                 return Err(format!("{at}: a measured verdict needs both log paths"));
             }
+            // `credit` clamps the prefix to the shorter side, so without this a
+            // prefix no side could have matched would still agree with it.
+            if let Some(prefix) = self.matched_prefix.filter(|&p| p > left.min(right)) {
+                return Err(format!(
+                    "{at}: matched prefix {prefix} exceeds the shorter compared stream of \
+                     {left} | {right}"
+                ));
+            }
+            if self.verdict == ParityVerdict::Matched
+                && (self.first_divergent_record.is_some() || self.first_difference.is_some())
+            {
+                return Err(format!("{at}: a match carries no divergence position"));
+            }
             let expected = self
                 .matched_prefix
                 .and_then(|prefix| credit(prefix, left, right));
@@ -739,6 +761,12 @@ impl ParityRecord {
             {
                 return Err(format!(
                     "{at}: {:?} is unmeasured and carries no credit or divergence",
+                    self.verdict
+                ));
+            }
+            if self.left_len.is_some() || self.right_len.is_some() {
+                return Err(format!(
+                    "{at}: {:?} is unmeasured and carries no compared lengths",
                     self.verdict
                 ));
             }
@@ -1063,10 +1091,13 @@ pub fn snapshot(matrix: &ParityMatrix, selection: &ParitySelection) -> Result<Pa
             .add(&cell);
         cells.push(cell);
     }
-    if all.cells == 0 || all.selected == 0 {
+    // A selection may name a cell that is not selectable; the snapshot keeps
+    // it and says why. A selection made ONLY of such cells has nothing a run
+    // could measure, yet would still be written as a parity population.
+    if all.cells == 0 || all.selected == 0 || all.selected_selectable == 0 {
         return Err(format!(
-            "parity snapshot would be vacuous: {} cells, {} selected",
-            all.cells, all.selected
+            "parity snapshot would be vacuous: {} cells, {} selected, {} of them selectable",
+            all.cells, all.selected, all.selected_selectable
         ));
     }
     Ok(ParityCells {
@@ -1249,26 +1280,84 @@ mod tests {
     #[test]
     fn every_cell_carries_a_reason_matching_its_status() {
         let snapshot = generate(&repo_root()).unwrap();
+        // `Exact` reasons carry no per-cell detail, so they must be the
+        // whole text. A `Detail` reason must name why after its prefix.
+        enum Expected {
+            Exact(&'static str),
+            Detail(&'static str),
+        }
         for cell in &snapshot.cells {
-            let expected_prefix = match (cell.applicable, cell.selectable, cell.selected) {
-                (false, false, false) => "not applicable: ",
-                (true, false, false) => "not selectable: ",
-                (true, false, true) => {
-                    "selected by tests/e2e/parity-selection.yaml, but not selectable: "
+            let expected = match (cell.applicable, cell.selectable, cell.selected) {
+                (false, false, false) => Expected::Detail("not applicable: "),
+                (true, false, false) => Expected::Detail("not selectable: "),
+                (true, false, true) => Expected::Detail(
+                    "selected by tests/e2e/parity-selection.yaml, but not selectable: ",
+                ),
+                (true, true, false) => Expected::Exact(
+                    "selectable, not selected: not listed in tests/e2e/parity-selection.yaml",
+                ),
+                (true, true, true) => {
+                    Expected::Exact("selected by tests/e2e/parity-selection.yaml")
                 }
-                (true, true, false) => "selectable, not selected: ",
-                (true, true, true) => "selected by tests/e2e/parity-selection.yaml",
                 other => panic!("impossible status {other:?} for {}", cell.test_id),
             };
+            let matches = match expected {
+                Expected::Exact(text) => cell.reason == text,
+                Expected::Detail(prefix) => cell
+                    .reason
+                    .strip_prefix(prefix)
+                    .is_some_and(|detail| !detail.trim().is_empty()),
+            };
             assert!(
-                cell.reason.starts_with(expected_prefix)
-                    && cell.reason.len() >= expected_prefix.len(),
+                matches,
                 "{}@{}: {}",
-                cell.test_id,
-                cell.backend,
-                cell.reason
+                cell.test_id, cell.backend, cell.reason
             );
         }
+    }
+
+    /// A selection may keep a cell that is not selectable, but a selection of
+    /// ONLY such cells gives a population no run can measure. The shipped
+    /// selection's not-selectable members (the 14 dbt cells among them) are
+    /// that selection.
+    #[test]
+    fn a_selection_with_nothing_selectable_is_a_vacuous_snapshot() {
+        let root = repo_root();
+        let matrix = shipped_matrix();
+        let shipped = ParitySelection::load(&root, &matrix).unwrap();
+        let availability: BTreeMap<&ParityCellId, &ParityAvailability> = matrix.cells().collect();
+        let (selectable, not_selectable): (BTreeSet<_>, BTreeSet<_>) = shipped
+            .cells
+            .iter()
+            .cloned()
+            .partition(|id| availability[id].selectable());
+        assert!(!not_selectable.is_empty());
+        assert!(
+            not_selectable
+                .iter()
+                .any(|id| id.backend == ParityBackend::Dbt)
+        );
+        let unmeasurable = ParitySelection {
+            rule: "fixture rule".into(),
+            cells: not_selectable.clone(),
+        };
+        assert_eq!(
+            snapshot(&matrix, &unmeasurable).unwrap_err(),
+            format!(
+                "parity snapshot would be vacuous: {} cells, {} selected, 0 of them selectable",
+                matrix.cells().count(),
+                not_selectable.len()
+            )
+        );
+
+        // One selectable cell is enough to make it a population.
+        let mut one_measurable = unmeasurable;
+        one_measurable
+            .cells
+            .insert(selectable.first().unwrap().clone());
+        let counts = snapshot(&matrix, &one_measurable).unwrap().counts;
+        assert_eq!(counts.all.selected, not_selectable.len() + 1);
+        assert_eq!(counts.all.selected_selectable, 1);
     }
 
     #[test]
@@ -1476,13 +1565,23 @@ mod tests {
         };
         parsed.matched_prefix_records = prefix;
         if verdict == LogDiffVerdict::Diverged {
-            parsed.first_divergent_record = Some(prefix.unwrap_or(0) + 1);
+            // A raw log-record index, as the producer writes it: it also counts
+            // records the comparison did not select, so it is NOT
+            // `matched_prefix + 1`. Keeping them apart here is what lets the
+            // tests below tell a credit derived from the prefix from one
+            // derived from this index.
+            parsed.first_divergent_record =
+                Some(prefix.unwrap_or(0) + 1 + UNSELECTED_RECORDS_BEFORE_DIVERGENCE);
             parsed.first_divergent_syscall = Some(1);
             parsed.first_divergent_left_message = Some("DETLOG syscall nr=0 ret=3".into());
             parsed.first_divergent_right_message = Some("DETLOG syscall nr=0 ret=4".into());
         }
         parsed
     }
+
+    /// Unselected raw records the [`report`] fixture places before the first
+    /// difference. Nonzero, so `first_divergent_record != matched_prefix + 1`.
+    const UNSELECTED_RECORDS_BEFORE_DIVERGENCE: usize = 4;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1515,10 +1614,15 @@ mod tests {
             credit_from_report(&report(current, LogDiffVerdict::Diverged, 4, 4, Some(0))),
             Some(0.0)
         );
-        assert_eq!(
-            credit_from_report(&report(current, LogDiffVerdict::Diverged, 2, 5, Some(2))),
-            Some(0.4)
-        );
+        // Unequal lengths with an equal prefix: 2 of 5.
+        let shorter_side = report(current, LogDiffVerdict::Diverged, 2, 5, Some(2));
+        assert_eq!(credit_from_report(&shorter_side), Some(0.4));
+        // Credit comes from the prefix (1 of 8), not from the raw record index
+        // 6: `6 - 1` is below the shorter side, so credit() would not clamp it
+        // and a credit taken from the index would be 5 / 8.
+        let early = report(current, LogDiffVerdict::Diverged, 6, 8, Some(1));
+        assert_eq!(early.first_divergent_record, Some(6));
+        assert_eq!(credit_from_report(&early), Some(0.125));
         // Schema 1: a match is still full credit; a divergence is unmeasured.
         assert_eq!(
             credit_from_report(&report(1, LogDiffVerdict::Matched, 3, 3, None)),
@@ -1550,8 +1654,12 @@ mod tests {
 
         let diverged = record_for(&report(current, LogDiffVerdict::Diverged, 4, 4, Some(2)));
         assert_eq!(diverged.verdict, ParityVerdict::Diverged);
+        // The record carries the report's raw index (2 matched + 1 + 4
+        // unselected) and its credit follows the matched prefix, 2 of 4.
+        // Derived from the raw index it would be (7 - 1) / 4 = 1.5.
+        assert_eq!(diverged.first_divergent_record, Some(7));
+        assert_eq!(diverged.matched_prefix, Some(2));
         assert_eq!(diverged.credit, Some(0.5));
-        assert_eq!(diverged.first_divergent_record, Some(3));
         let difference = diverged.first_difference.as_ref().unwrap();
         assert_eq!(
             difference.field.as_deref(),
@@ -1684,6 +1792,8 @@ mod tests {
                     reason: Some("no log".into()),
                     credit: None,
                     matched_prefix: None,
+                    left_len: None,
+                    right_len: None,
                     ..matched.clone()
                 },
             ),
@@ -1691,6 +1801,93 @@ mod tests {
         for (label, record) in cases {
             assert!(record.validate().is_err(), "{label} must be refused");
         }
+    }
+
+    /// Contradictions the credit check alone cannot see: `credit` clamps a
+    /// prefix to the shorter side, a match has no divergence to locate, and an
+    /// unmeasured verdict compared nothing.
+    #[test]
+    fn a_parity_record_with_fields_its_verdict_cannot_have_is_refused() {
+        let current = LOG_DIFF_REPORT_SCHEMA;
+        let matched = record_for(&report(current, LogDiffVerdict::Matched, 3, 3, Some(3)));
+        let diverged = record_for(&report(current, LogDiffVerdict::Diverged, 2, 5, Some(2)));
+        let unavailable = record_for(&report(current, LogDiffVerdict::Refused, 0, 0, None));
+        assert_eq!(unavailable.verdict, ParityVerdict::Unavailable);
+        let at = "parity record fixture/parity@kvm";
+        let cases: Vec<(&str, ParityRecord, String)> = vec![
+            (
+                "a match whose prefix exceeds both sides",
+                ParityRecord {
+                    matched_prefix: Some(4),
+                    ..matched.clone()
+                },
+                format!("{at}: matched prefix 4 exceeds the shorter compared stream of 3 | 3"),
+            ),
+            (
+                "a divergence whose prefix exceeds the shorter side",
+                ParityRecord {
+                    matched_prefix: Some(3),
+                    ..diverged.clone()
+                },
+                format!("{at}: matched prefix 3 exceeds the shorter compared stream of 2 | 5"),
+            ),
+            (
+                "a match with a divergent record",
+                ParityRecord {
+                    first_divergent_record: Some(1),
+                    ..matched.clone()
+                },
+                format!("{at}: a match carries no divergence position"),
+            ),
+            (
+                "a match with a first difference",
+                ParityRecord {
+                    first_difference: diverged.first_difference.clone(),
+                    ..matched.clone()
+                },
+                format!("{at}: a match carries no divergence position"),
+            ),
+            (
+                "an unmeasured verdict with a reference length",
+                ParityRecord {
+                    left_len: Some(3),
+                    ..unavailable.clone()
+                },
+                format!("{at}: Unavailable is unmeasured and carries no compared lengths"),
+            ),
+            (
+                "an unmeasured verdict with a candidate length",
+                ParityRecord {
+                    right_len: Some(0),
+                    ..unavailable.clone()
+                },
+                format!("{at}: Unavailable is unmeasured and carries no compared lengths"),
+            ),
+        ];
+        for (label, record, expected) in cases {
+            assert_eq!(record.validate().unwrap_err(), expected, "{label}");
+        }
+        for record in [&matched, &diverged, &unavailable] {
+            record.validate().unwrap();
+        }
+
+        // A report that contradicts itself this way is refused when recorded,
+        // not turned into a row.
+        let mut located_match = report(current, LogDiffVerdict::Matched, 3, 3, Some(3));
+        located_match.first_divergent_record = Some(2);
+        assert_eq!(
+            ParityRecord::from_comparison(
+                &cell(),
+                &located_match,
+                true,
+                "ref.log",
+                "cand.log",
+                "run-1",
+                SHA
+            )
+            .unwrap_err(),
+            format!("{at}: a match carries no divergence position")
+        );
     }
 
     /// The first divergences S0 measured on c-programs/add-key-enosys

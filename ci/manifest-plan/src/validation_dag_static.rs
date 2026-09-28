@@ -230,7 +230,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 24 tests (15 parity, 3 logdiff_report, 2 runner, one each in schema10,
     // validation_dag, test-harness and cli_help) and removes 9 ptrace
     // parity-rerun tests: 625 + 24 - 9 = 640 in `cargo nextest list`.
-    ("test.regular_crates", 640),
+    // The parity review follow-ups add 5 tests (2 parity, 1 runner, 2 cli_help)
+    // and retain all 640 prior identities (`cargo nextest list` measured 645).
+    ("test.regular_crates", 645),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -253,7 +255,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
-    ("test.detcore_unit", 808),
+    // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
+    ("test.detcore_unit", 810),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -287,14 +290,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 808),
+    ("test.detcore_unit_on_host", 810),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 757),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 640),
+    ("test.regular_crates_on_host", 645),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

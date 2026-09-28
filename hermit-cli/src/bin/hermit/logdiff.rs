@@ -653,10 +653,12 @@ fn json_report(
         follow_stopped_because: None,
         first_divergent_record: summary.first_divergent_record,
         // A refused or empty comparison measured no prefix at all; report that
-        // as absent rather than as a zero-length match.
-        matched_prefix_records: summary
-            .matched_prefix_messages
-            .filter(|_| summary.compared_left > 0 || summary.compared_right > 0),
+        // as absent rather than as a zero-length match. Both conditions are
+        // checked: a refusal is absent whatever counts it carries.
+        matched_prefix_records: summary.matched_prefix_messages.filter(|_| {
+            summary.refusal_reason.is_none()
+                && (summary.compared_left > 0 || summary.compared_right > 0)
+        }),
         first_divergent_syscall: summary.first_divergent_syscall,
         comparison: LogDiffComparison {
             stream: stream.to_owned(),
@@ -1443,6 +1445,33 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
         assert_eq!(refused["verdict"], "refused");
         assert_eq!(refused["refusal"], "the first log was truncated");
         assert_eq!(refused.get("matched_prefix_records"), None);
+
+        // The case above has 0 | 0 counts, so the empty-comparison rule alone
+        // would drop its prefix. A refusal that still carries nonzero counts
+        // and a prefix must drop it for being a refusal.
+        let refused_with_counts = logdiff::LogDiffSummary {
+            diff_found: true,
+            compared_left: 8,
+            compared_right: 8,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            matched_prefix_messages: Some(8),
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+            refusal_reason: Some("the first log was truncated".into()),
+        };
+        let refused_with_counts = serde_json::to_value(json_report(
+            &refused_with_counts,
+            &options,
+            no_records(),
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
+        assert_eq!(refused_with_counts["verdict"], "refused");
+        assert_eq!(refused_with_counts["selected_messages"]["left"], 8);
+        assert_eq!(refused_with_counts.get("matched_prefix_records"), None);
     }
 
     /// The matched prefix reaches the JSON report from the real one-shot

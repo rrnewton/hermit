@@ -15198,6 +15198,34 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
         }
     }
+    // The missing-value and repeated-option refusals were bracketed through
+    // `--parity-reference` until it stopped being modeled. Keep both covered
+    // through options the policy still models, on the same accepted control.
+    for (suffix, expected) in [
+        (" --mode", "retry bounds: parity-control lacks a value for --mode"),
+        (
+            " --backend kvm --backend kvm",
+            "retry bounds: parity-control supplies --backend more than once",
+        ),
+        (
+            " --lane privileged",
+            "retry bounds: parity-control supplies --lane more than once",
+        ),
+    ] {
+        match manifest_command_policy("parity-control", &format!("{parity_command}{suffix}")) {
+            Err(refusal) if refusal == expected => {}
+            Err(refusal) => {
+                return Err(format!(
+                    "retry bounds: planted{suffix} was refused for the wrong reason: {refusal}"
+                ))
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "retry bounds: planted{suffix} was accepted as a manifest command"
+                ))
+            }
+        }
+    }
     for tag in [
         "e2e.manifest_backend_parity_c",
         "e2e.manifest_backend_parity_c_on_host",
