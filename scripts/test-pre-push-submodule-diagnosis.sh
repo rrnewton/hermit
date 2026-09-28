@@ -67,11 +67,9 @@ hook_status=$?
 # ---- mixed direction: an OPTIONAL uninitialised submodule must not hide a
 # ---- genuine checker failure. third-party/rr is not needed by the default
 # ---- workspace clippy command.
-cat > "$repo/.gitmodules" <<'MODULES'
-[submodule "third-party/rr"]
-	path = third-party/rr
-	url = https://example.invalid/rr.git
-MODULES
+printf '%s\n' '[submodule "third-party/rr"]' \
+    $'\tpath = third-party/rr' \
+    $'\turl = https://example.invalid/rr.git' >"$repo/.gitmodules"
 git -C "$repo" add .gitmodules
 git -C "$repo" update-index --add --cacheinfo "160000,$head,third-party/rr"
 git -C "$repo" commit -qm "record an optional uninitialised submodule"
@@ -88,11 +86,9 @@ hook_status=$?
 # ---- This is exactly what `git submodule status` prefixes with '-' in a fresh
 # ---- worktree. Keep optional rr absent too so this case proves the diagnosis
 # ---- names only the required submodule.
-cat >> "$repo/.gitmodules" <<'MODULES'
-[submodule "agent-utils"]
-	path = agent-utils
-	url = https://example.invalid/agent-utils.git
-MODULES
+printf '%s\n' '[submodule "agent-utils"]' \
+    $'\tpath = agent-utils' \
+    $'\turl = https://example.invalid/agent-utils.git' >>"$repo/.gitmodules"
 git -C "$repo" add .gitmodules
 git -C "$repo" update-index --add --cacheinfo "160000,$head,agent-utils"
 git -C "$repo" commit -qm "record a required uninitialised submodule"

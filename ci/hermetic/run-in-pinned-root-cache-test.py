@@ -696,7 +696,7 @@ class CargoCacheMounts(unittest.TestCase):
                             "/src/" + path,
                         )
 
-                        def other_values(config):
+                        def other_values(config, source=source):
                             values = git(
                                 source,
                                 "config",
@@ -1075,7 +1075,7 @@ class CargoCacheMounts(unittest.TestCase):
                         "/src",
                     )
 
-                    def non_worktree(config):
+                    def non_worktree(config, source=source):
                         values = git(
                             source, "config", "--file", str(config), "--null", "--list"
                         ).split(b"\0")

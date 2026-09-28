@@ -343,7 +343,7 @@ def measure_benchmark(
     native = modes["native"]
     assert isinstance(native, dict)
     native_median = float(native["median_seconds"])
-    for backend, mode in modes.items():
+    for mode in modes.values():
         assert isinstance(mode, dict)
         if mode["status"] != "ok":
             continue

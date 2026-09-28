@@ -27,8 +27,9 @@ from gdb.dap.state import set_thread
 
 server = importlib.import_module("gdb.dap.server")
 
-_replay_command = HERMIT_REPLAY_COMMAND
-_replay_target = HERMIT_REPLAY_TARGET
+# hermit-dap.rs defines both names before it execs this script.
+_replay_command = HERMIT_REPLAY_COMMAND  # noqa: F821
+_replay_target = HERMIT_REPLAY_TARGET  # noqa: F821
 _replay_process = None
 _history = []
 _line_breakpoints = []

@@ -169,7 +169,8 @@ def check_wait_for_text(
                     "REFUSAL-CHECK-READY-MARKER",
                     ExitedProcess(returncode),
                 )
-            except BaseException as exc:  # target exit 0 must not bypass the gate
+            except BaseException as exc:  # noqa: B036
+                # target exit 0 must not bypass the gate
                 if isinstance(exc, refusal_type):
                     got = True
                 elif isinstance(exc, AssertionError):
@@ -199,7 +200,8 @@ def check_target(path: Path) -> None:
         namespace = runpy.run_path(str(path), run_name="validate_stop_paths_check")
     except (OSError, SyntaxError) as exc:
         raise RuntimeError(f"could not load {path}: {exc}") from exc
-    except BaseException as exc:  # target exit 0 must not bypass the gate
+    except BaseException as exc:  # noqa: B036
+        # target exit 0 must not bypass the gate
         raise RuntimeError(
             f"{path}: loading the stop-path test raised {type(exc).__name__}: {exc}"
         ) from exc
@@ -282,7 +284,8 @@ def self_test() -> None:
     ) -> Callable[[Path, str, object], None]:
         def wait(log: Path, _text: str, process: object) -> None:
             if predicate(
-                log.read_text(encoding="utf-8"), int(getattr(process, "returncode"))
+                log.read_text(encoding="utf-8"),
+                int(getattr(process, "returncode")),  # noqa: B009
             ):
                 raise Refused("refused")
             raise AssertionError("ordinary failure")

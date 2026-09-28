@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-# shellcheck source=tests/e2e/lib/determinism-stress/common.sh
+# shellcheck source=common.sh source-path=SCRIPTDIR
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 # Expansion is intentionally deferred to the guest Bash process.

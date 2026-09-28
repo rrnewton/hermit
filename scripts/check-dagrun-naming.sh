@@ -113,7 +113,7 @@ elif [[ -z $exported ]]; then
     echo "check-dagrun-naming: $EXPORTER no longer exports a width-channel variable" >&2
     echo "  set to CARGO_BUILD_JOBS. A DAG node's declared width can no longer reach Cargo." >&2
     status=1
-elif [[ $pinned_py != "$pinned_rs" || $pinned_py != "$exported" ]]; then
+elif [[ $pinned_py != "$pinned_rs" || $pinned_rs != "$exported" ]]; then
     echo "check-dagrun-naming: the build-width channel is broken." >&2
     echo "  $MODEL_PY reads:   $pinned_py" >&2
     echo "  $MODEL_RS reads:   $pinned_rs" >&2

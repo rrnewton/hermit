@@ -234,7 +234,7 @@ from run_matrix import run_case_verify  # noqa: E402
 
 for process_status in (0, 1, 126, 127):
 
-    def infrastructure_transport(command):
+    def infrastructure_transport(command, *, process_status=process_status):
         report_path = next(
             arg.split("=", 1)[1] for arg in command if arg.startswith("--verify-json=")
         )

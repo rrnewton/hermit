@@ -431,7 +431,7 @@ PY
         echo "run-in-pinned-root: invalid proc-locks mount identity" >&2
         exit 2
     }
-    extra_mounts+=(--tmpfs /run/hermit-proc-locks:rw,nosuid,nodev,noexec,mode=0700)
+    extra_mounts+=(--tmpfs "/run/hermit-proc-locks:rw,nosuid,nodev,noexec,mode=0700")
     extra_mounts+=(--mount "type=bind,source=$proc_locks_file,destination=/run/hermit-proc-locks/hermit-proc-locks-determinism.lock")
     env_args+=(-e XDG_RUNTIME_DIR=/run/hermit-proc-locks)
     env_args+=(-e "HERMIT_PROC_LOCKS_LEASE_ID=$proc_locks_identity")
