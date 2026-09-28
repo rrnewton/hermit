@@ -27,6 +27,11 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 shards="ci/portable-shards.json"
+# The hosted-portable E2E population: portable cells minus the backends that
+# HOSTED_PORTABLE_EXCLUDED_BACKENDS (ci/manifest-plan/src/validation_dag.rs)
+# omits because GitHub-hosted runners have no PMU for KVM guests. The workflow
+# reducer must apply this exact filter; a generator test keeps it in sync.
+hosted_e2e_cell_filter='select(.lane == "portable" and .backend != "kvm")'
 workflow=".github/workflows/ci-portable.yml"
 hosted_runner="ci/run-hosted-node.sh"
 command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required" >&2; exit 2; }
@@ -443,6 +448,7 @@ workflow_e2e_verdict_contract() {
         grep -Fq '.repository_sha == $sha' <<<"$reducer_step" &&
         grep -Fq '.hermit_sha == $sha' <<<"$reducer_step" &&
         grep -Fq '.lane == "portable"' <<<"$reducer_step" &&
+        grep -Fq "$hosted_e2e_cell_filter" <<<"$reducer_step" &&
         grep -Fq '.source_tree_dirty == false' <<<"$reducer_step" &&
         grep -Fq '[.lane, .category, .test, .mode, .backend]' <<<"$reducer_step" &&
         grep -Fq 'ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json' <<<"$reducer_step" &&
@@ -785,7 +791,7 @@ fi
 
 if ((status == 0)); then
     n=$(printf '%s\n' "$assigned_unique" | grep -c . || true)
-    cell_count=$(jq '[.cells[] | select(.lane == "portable")] | length' ci/expected-e2e-plan.json)
+    cell_count=$(jq "[.cells[] | $hosted_e2e_cell_filter] | length" ci/expected-e2e-plan.json)
     ((cell_count > 0)) || {
         echo "check-shard-coverage.sh: FAIL — committed hosted-portable cell population is empty" >&2
         exit 1

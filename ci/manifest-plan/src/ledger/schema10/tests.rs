@@ -876,6 +876,37 @@ fn pre_fold_dag(live: &DagConfig, tag: &str, command: &str) -> DagConfig {
     cfg
 }
 
+/// Give each hosted-portable manifest step its local twin's manifest cells,
+/// as every hosted plan constructed before the hosted KVM exclusion did.
+fn restore_pre_exclusion_ownership(cfg: &mut DagConfig, generated: &DagConfig) {
+    for step in &mut cfg.steps {
+        if step.manifest.is_none() || step.labels != ["hosted-portable"] {
+            continue;
+        }
+        let local_tag = step.tag().strip_suffix("_on_host").unwrap().to_owned();
+        let local = generated
+            .steps
+            .iter()
+            .find(|candidate| candidate.tag() == local_tag)
+            .unwrap();
+        let mut manifests = local
+            .result_manifests
+            .iter()
+            .flatten()
+            .filter(|manifest| matches!(manifest, dagrun::model::ResultManifest::ManifestCell(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        manifests.extend(
+            step.result_manifests
+                .iter()
+                .flatten()
+                .filter(|manifest| !matches!(manifest, dagrun::model::ResultManifest::ManifestCell(_)))
+                .cloned(),
+        );
+        step.result_manifests = Some(manifests);
+    }
+}
+
 // Use the real generated graph and label selection, including the pinned-root
 // wrapper additions. The small report fixture above intentionally remains a
 // synthetic single-cell input; it does not cover generated command bytes.
@@ -924,6 +955,53 @@ fn generated_plan_populations_preserve_command_policy() {
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
     assert!(!exact_rng_population(&missing, 900));
+    // Today's hosted-portable plan omits the KVM cells, because GitHub-hosted
+    // runners have no PMU; its commands carry the exclusion and its steps own
+    // exactly the remaining portable cells.
+    let hosted_now = dagrun::select_steps_by_labels(&generated, &["hosted-portable".to_owned()])
+        .unwrap();
+    let current_hosted = ConstructedValidationPlanV10 {
+        schema: 1,
+        run_id: "generated-hosted-portable-current".into(),
+        hermit_sha: "a".repeat(40),
+        path: ValidatePath::Full,
+        compatibility_selected: true,
+        dag_json: dag_to_json(&hosted_now),
+        expected_e2e_plan_json: expected_json.clone(),
+    };
+    let hosted_cells = expected_cells
+        .iter()
+        .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(hosted_cells.len(), 895 - 242);
+    assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
+    assert_eq!(
+        current_hosted.planned_backend_parity_relations().unwrap(),
+        Vec::new()
+    );
+    // A hosted step that keeps the exclusion flag but owns the KVM cells, or
+    // drops the flag but still omits them, no longer matches its selector.
+    for strip_flag in [false, true] {
+        let mut changed = hosted_now.clone();
+        if strip_flag {
+            for step in &mut changed.steps {
+                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+            }
+        } else {
+            restore_pre_exclusion_ownership(&mut changed, &generated);
+        }
+        let plan = ConstructedValidationPlanV10 {
+            dag_json: dag_to_json(&changed),
+            ..current_hosted.clone()
+        };
+        assert!(
+            plan.planned_cells()
+                .unwrap_err()
+                .ends_with("result ownership differs from its expected manifest selection"),
+            "strip_flag={strip_flag}"
+        );
+    }
     let pre_fold_json = pre_fold_expected_json(&expected_json);
     let pre_fold_cells = crate::validation_dag::expected_cells_from_json(&pre_fold_json)
         .unwrap()
@@ -946,7 +1024,18 @@ fn generated_plan_populations_preserve_command_policy() {
             895,
         ),
     ] {
-        let live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
+        let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
+        if label == "hosted-portable" {
+            // The current hosted plan, which omits KVM cells, is read above.
+            // Every hosted plan published before that exclusion had each
+            // hosted manifest step own its local twin's cells, KVM included,
+            // and carried no exclusion flag; the fold-era plans below are
+            // rebuilt from that shape.
+            restore_pre_exclusion_ownership(&mut live, &generated);
+            for step in &mut live.steps {
+                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+            }
+        }
         let live_selected = expected_cells
             .iter()
             .filter(|cell| label == "full" || cell.lane == "portable")
