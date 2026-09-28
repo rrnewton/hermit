@@ -241,6 +241,7 @@ fn run_service(service: &mut AcceptedProviderService) -> ! {
                 }
             }
         }
+        let maintenance = service.maintenance_interval();
         if service.failure.is_some() {
             // The parent is waiting for this exact bootstrap response before
             // it can take its existing owned Container cancellation path.
@@ -268,10 +269,8 @@ fn run_service(service: &mut AcceptedProviderService) -> ! {
             std::thread::sleep(Duration::from_millis(10));
         } else if service.run_peer_ended() {
             // Nothing remains to receive; wait only for the pidfd proof.
-            std::thread::sleep(super::OBSERVATION_MAINTENANCE);
-        } else if let Err(error) =
-            service.wait_transport(Instant::now() + super::OBSERVATION_MAINTENANCE)
-        {
+            std::thread::sleep(maintenance);
+        } else if let Err(error) = service.wait_transport(Instant::now() + maintenance) {
             service.failure.get_or_insert_with(|| error.to_string());
         }
     }

@@ -253,6 +253,15 @@ fn validate_observation(envelope: &Envelope, rights: usize) -> io::Result<()> {
 // This is service maintenance, not a guest scheduling quantum, deadline or
 // recorded release time. The service can process every other request meanwhile.
 const OBSERVATION_MAINTENANCE: Duration = Duration::from_millis(10);
+const ACTIVE_OBSERVATION_MAINTENANCE: Duration = Duration::from_millis(1);
+
+fn observation_maintenance(active: bool) -> Duration {
+    if active {
+        ACTIVE_OBSERVATION_MAINTENANCE
+    } else {
+        OBSERVATION_MAINTENANCE
+    }
+}
 #[derive(Debug)]
 struct PendingObservation {
     request: u64,
@@ -1310,11 +1319,37 @@ impl AcceptedProviderService {
             _ => self.bootstrap.wait_transport(deadline),
         }
     }
+
+    /// Map-backed provider completion has no transport readiness edge. Poll it
+    /// promptly only while an authenticated transaction is outstanding; an
+    /// idle provider retains the lower-frequency controller-liveness cadence.
+    pub(super) fn maintenance_interval(&self) -> Duration {
+        let active = self.bootstrap_reply.is_some_and(|_| !self.bootstrap_sent)
+            || !self.run_replies.is_empty()
+            || self.observation.is_some()
+            || self.fd_observation.is_some()
+            || self
+                .run
+                .as_ref()
+                .is_some_and(|session| !session.pending_original_selections().is_empty());
+        observation_maintenance(active)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_maintenance_is_fast_only_for_active_transactions() {
+        assert_eq!(observation_maintenance(false), OBSERVATION_MAINTENANCE);
+        assert_eq!(
+            observation_maintenance(true),
+            ACTIVE_OBSERVATION_MAINTENANCE
+        );
+        assert!(ACTIVE_OBSERVATION_MAINTENANCE < OBSERVATION_MAINTENANCE);
+    }
+
     #[test]
     fn run_peer_end_of_stream_stops_receipt_without_failure_but_invalid_packet_fails() {
         let pair = || {
