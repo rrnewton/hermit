@@ -102,14 +102,9 @@ where
     guest.thread_state().observe_guest_clock(raw)
 }
 
-/// Every page boundary is a multiple of 4 KiB, and an eight-byte word crosses
-/// at most one such multiple, so this locates the only point where a
-/// page-granular store of a `timeval` word can stop partway through it.
-const TV_WORD_PAGE_GRANULE: usize = 4096;
-
 /// Replacing host time in the `tv` of a `gettimeofday` that failed with EFAULT
-/// could not finish. `tv` may still hold host wall-clock time or part of a
-/// word, so this is a failed run, not a guest errno.
+/// could not finish. `tv` may still hold host wall-clock time, so this is a
+/// failed run, not a guest errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TvRepairFailure {
     /// The word being stored: `tv_sec` or `tv_usec`.
@@ -119,26 +114,19 @@ struct TvRepairFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TvRepairFailureKind {
-    /// A user-access copy failed with an errno other than EFAULT: the read or
-    /// unchanged rewrite that checks whether one page of a word crossing a
-    /// page boundary is writable, or a write of the word or of one of its two
-    /// parts.
-    Failed {
-        operation: &'static str,
-        errno: Errno,
-    },
-    /// A user-access copy reported zero bytes without EFAULT, or more bytes
-    /// than it was given. No supported backend does either.
-    ImpossibleCount {
-        operation: &'static str,
-        requested: usize,
-        reported: usize,
-    },
-    /// Some of the word's bytes were stored and then a byte faulted. This
-    /// happens when `tv_sec` crosses from a write-only page into an
-    /// inaccessible or unmapped one, and otherwise only if a page's
-    /// writability changed during the repair.
-    PartlyStored { stored: usize },
+    /// The backend could not execute the `time(2)` probe. EFAULT is not a
+    /// failure: it means Linux stopped before storing this word.
+    ProbeFailed(Errno),
+    /// The exact overwrite after a successful probe failed. The probe just
+    /// stored host seconds, so the run cannot safely continue.
+    OverwriteFailed(Errno),
+    /// The one-shot overwrite reported a count other than the whole word.
+    OverwriteCount { expected: usize, reported: usize },
+    /// Adding the field offset to the guest's `timeval` address overflowed.
+    AddressOverflow,
+    /// A recorded EFAULT does not prove that this replay execution performed
+    /// the original stores, so live probing would mix replayed and host state.
+    ReplayMode,
 }
 
 impl std::fmt::Display for TvRepairFailure {
@@ -149,281 +137,147 @@ impl std::fmt::Display for TvRepairFailure {
             self.field
         )?;
         match self.kind {
-            TvRepairFailureKind::Failed { operation, errno } => {
-                write!(f, "user-access {operation} failed: {errno}")
+            TvRepairFailureKind::ProbeFailed(errno) => {
+                write!(f, "time(2) store probe failed: {errno}")
             }
-            TvRepairFailureKind::ImpossibleCount {
-                operation,
-                requested,
-                reported,
-            } => write!(
+            TvRepairFailureKind::OverwriteFailed(errno) => {
+                write!(f, "virtual-time overwrite failed: {errno}")
+            }
+            TvRepairFailureKind::OverwriteCount { expected, reported } => write!(
                 f,
-                "user-access {operation} reported {reported} of {requested} bytes"
+                "virtual-time overwrite reported {reported} of {expected} bytes"
             ),
-            TvRepairFailureKind::PartlyStored { stored } => write!(
-                f,
-                "stored {stored} of its 8 bytes before a fault, leaving it partly stored"
-            ),
+            TvRepairFailureKind::AddressOverflow => f.write_str("field address overflowed"),
+            TvRepairFailureKind::ReplayMode => {
+                f.write_str("cannot probe a recorded or replayed EFAULT")
+            }
         }
     }
 }
 
 impl std::error::Error for TvRepairFailure {}
 
-/// Writes `bytes` at `addr` with user access, continuing after a short count
-/// (which does not by itself mean the next byte is unwritable), and returns how
-/// many bytes were written before a byte faulted.
-fn write_user_prefix<M: MemoryAccess>(
-    memory: &mut M,
-    addr: AddrMut<u8>,
-    bytes: &[u8],
-    operation: &'static str,
-) -> Result<usize, TvRepairFailureKind> {
-    let mut written = 0;
-    while written < bytes.len() {
-        let Some(next) = addr
-            .as_raw()
-            .checked_add(written)
-            .and_then(AddrMut::<u8>::from_raw)
-        else {
-            break;
-        };
-        let requested = bytes.len() - written;
-        match memory.write_with_user_access(next, &bytes[written..]) {
-            Ok(copied) if (1..=requested).contains(&copied) => written += copied,
-            Ok(reported) => {
-                return Err(TvRepairFailureKind::ImpossibleCount {
-                    operation,
-                    requested,
-                    reported,
-                });
-            }
-            Err(Errno::EFAULT) => break,
-            Err(errno) => return Err(TvRepairFailureKind::Failed { operation, errno }),
-        }
-    }
-    Ok(written)
+fn tv_repair_error(field: &'static str, kind: TvRepairFailureKind) -> Error {
+    Error::Tool(anyhow::Error::new(TvRepairFailure { field, kind }))
 }
 
-/// Names for the read and the unchanged rewrite that check whether a word
-/// crossing a page boundary can be written on its first page.
-const FIRST_PAGE_CHECK: [&str; 2] = ["first-page read", "first-page rewrite"];
-/// Names for the same check of the part on the word's second page.
-const SECOND_PAGE_CHECK: [&str; 2] = ["second-page read", "second-page rewrite"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeStoreProbe {
+    Stored,
+    Stopped,
+}
 
-/// Rewrites the `len` bytes at `addr`, which lie on one page, with their own
-/// contents, to learn whether they can be written without changing them.
-/// Returns `None` if they cannot be read, and otherwise whether every byte was
-/// written.
-fn rewrite_in_place<M: MemoryAccess>(
-    memory: &mut M,
-    addr: AddrMut<u8>,
-    len: usize,
-    [read, rewrite]: [&'static str; 2],
-) -> Result<Option<bool>, TvRepairFailureKind> {
-    let mut current = [0; 8];
-    let current = &mut current[..len];
-    match memory.read_exact_with_user_access(addr, current) {
-        Ok(()) => Ok(Some(
-            write_user_prefix(memory, addr, current, rewrite)? == len,
+fn classify_time_store_probe(
+    field: &'static str,
+    result: Result<i64, Errno>,
+) -> Result<TimeStoreProbe, Error> {
+    match result {
+        Ok(_) => Ok(TimeStoreProbe::Stored),
+        Err(Errno::EFAULT) => Ok(TimeStoreProbe::Stopped),
+        Err(errno) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::ProbeFailed(errno),
         )),
-        Err(Errno::EFAULT) => Ok(None),
-        Err(errno) => Err(TvRepairFailureKind::Failed {
-            operation: read,
-            errno,
-        }),
     }
 }
 
-/// Writes `bytes`, which are the whole word or its part on one page, after
-/// `stored` of the word's other bytes were written, and returns whether all of
-/// them were written. Writing none of them leaves the word as it was only if
-/// none of its bytes were written before.
-fn write_tv_bytes<M: MemoryAccess>(
-    memory: &mut M,
-    addr: AddrMut<u8>,
-    bytes: &[u8],
-    stored: usize,
-    operation: &'static str,
-) -> Result<bool, TvRepairFailureKind> {
-    let written = write_user_prefix(memory, addr, bytes, operation)?;
-    if written == bytes.len() {
-        Ok(true)
-    } else if written == 0 && stored == 0 {
-        Ok(false)
-    } else {
-        Err(TvRepairFailureKind::PartlyStored {
-            stored: stored + written,
-        })
+fn timeval_word_addr<'a>(
+    field: &'static str,
+    tv_addr: AddrMut<'a, Timeval>,
+    offset: usize,
+) -> Result<AddrMut<'a, libc::time_t>, Error> {
+    tv_addr
+        .as_raw()
+        .checked_add(offset)
+        .and_then(AddrMut::<libc::time_t>::from_raw)
+        .ok_or_else(|| tv_repair_error(field, TvRepairFailureKind::AddressOverflow))
+}
+
+fn require_complete_time_word_overwrite(
+    field: &'static str,
+    expected: usize,
+    result: Result<usize, Errno>,
+) -> Result<(), Error> {
+    match result {
+        Ok(reported) if reported == expected => Ok(()),
+        Ok(reported) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::OverwriteCount { expected, reported },
+        )),
+        Err(errno) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::OverwriteFailed(errno),
+        )),
     }
 }
 
-/// Stores one eight-byte `timeval` word completely or not at all, as the
-/// kernel's `put_user` does, and returns whether it was stored.
-/// `writable_page` is the index of a 4 KiB granule already known to be
-/// writable, because the previous word was stored and ended on it.
-fn store_tv_word<M: MemoryAccess>(
-    memory: &mut M,
-    addr: AddrMut<u8>,
-    word: [u8; 8],
-    writable_page: Option<usize>,
-) -> Result<bool, TvRepairFailureKind> {
-    let first_page_len = word
-        .len()
-        .min(TV_WORD_PAGE_GRANULE - addr.as_raw() % TV_WORD_PAGE_GRANULE);
-    let second_page = if first_page_len < word.len() {
-        addr.as_raw()
-            .checked_add(first_page_len)
-            .and_then(AddrMut::<u8>::from_raw)
+fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error> {
+    if replay_data_is_some {
+        Err(tv_repair_error("tv", TvRepairFailureKind::ReplayMode))
     } else {
-        None
-    };
-    let Some(later) = second_page else {
-        // A word on one page is written by one copy, which stores all of it
-        // or nothing.
-        return write_tv_bytes(memory, addr, &word, 0, "write");
-    };
-    let (first, second) = word.split_at(first_page_len);
-    // A copy of a word crossing a page boundary stores the part on its first
-    // page even when the second page is not writable, so the pages are checked
-    // before the word is written. A part that can be read is checked by
-    // rewriting it with its own bytes, which changes nothing.
-    match rewrite_in_place(memory, later, second.len(), SECOND_PAGE_CHECK)? {
-        Some(false) => return Ok(false),
-        // This write stores nothing if the first page is not writable.
-        Some(true) => return write_tv_bytes(memory, addr, &word, 0, "write"),
-        // The second page is inaccessible, unmapped or write-only.
-        None => {}
-    }
-    let first_page_writable = if writable_page == Some(addr.as_raw() / TV_WORD_PAGE_GRANULE) {
-        Some(true)
-    } else {
-        rewrite_in_place(memory, addr, first.len(), FIRST_PAGE_CHECK)?
-    };
-    match first_page_writable {
-        Some(false) => Ok(false),
-        // The word is now stored exactly when its second-page part can be
-        // written, so that part is written first.
-        Some(true) => Ok(
-            write_tv_bytes(memory, later, second, 0, "second-page write")?
-                && write_tv_bytes(memory, addr, first, second.len(), "first-page write")?,
-        ),
-        // Neither part can be read, and nothing that does not write shows
-        // whether either page is writable. Writing the word in order stores
-        // nothing if the first page is not writable and all of it if both
-        // are, but only its first part if only the first page is.
-        None => write_tv_bytes(memory, addr, &word, 0, "write"),
+        Ok(())
     }
 }
 
 /// Replaces the host wall-clock time that a `gettimeofday` failing with EFAULT
 /// may have stored in `tv` with virtual time, in exactly the words Linux
-/// stored, wherever the backend's view of writability matches the kernel's,
-/// except in one layout, described below, that returns a Tool error.
+/// stored.
 ///
 /// Linux stores `tv_sec`, then `tv_usec`, each with one eight-byte `put_user`,
 /// and only then copies `tz`; the first fault ends the call with EFAULT. A
 /// store that faults on either page it touches commits nothing, so each word
 /// is stored whole or not at all, and nothing after an unstored word is
-/// attempted. This repeats those stores with virtual time: a word keeps
-/// virtual time only if all eight of its bytes can be written, and the first
-/// word that cannot ends the repair.
+/// attempted. `time(2)` uses the same eight-byte `put_user` store for its
+/// `tloc`, so the repair injects it at each word in kernel order. EFAULT means
+/// the original call stopped at that word too. Success means the probe itself
+/// just stored host seconds in those exact bytes; only then does Hermit replace
+/// the word with its virtual value. Other probe errors and overwrite failures
+/// fail closed because host time may remain.
 ///
-/// Writability is what `MemoryAccess::write_with_user_access` reports. On
-/// ptrace, SaBRe and DBT (whose guest memory is `LocalMemory`) that is one
-/// `process_vm_writev`, which stops at the first page without write
-/// permission. KVM stops at the first page its user-access tracker does not
-/// mark writable; while tracking is disabled it checks only that the bytes lie
-/// in guest memory, and installed ELF guests enable tracking before they run.
-/// Either way, a copy of a word that crosses into an unwritable page stores
-/// the part on its first page before the fault is seen, which the kernel's
-/// store never does, and no user-access copy reports whether memory is
-/// writable without writing it. So a word crossing a page boundary is stored
-/// as follows:
-///
-/// - If its part on the second page can be read, that part is rewritten with
-///   its own bytes. A rewrite that stops short means the word is left alone,
-///   and a complete one means the whole word is then written, which stores
-///   nothing if the first page is not writable.
-/// - Otherwise, if its first page is known to be writable, the part on the
-///   second page is written, and then, only if that succeeded, the part on
-///   the first page. The first page is known to be writable if the previous
-///   word was stored and ended on it, which always holds when `tv_usec` is
-///   reached and crosses a page boundary, because `tv_sec` then lies wholly on
-///   that page. It is also known to be writable if its part can be read and
-///   rewritten with its own bytes; a rewrite there that stops short means the
-///   word is left alone.
-/// - Otherwise neither part can be read, and the whole word is written, which
-///   stores nothing if the first page is not writable and all of the word if
-///   both pages are. If only the first page is writable, as when `tv_sec`
-///   crosses from a write-only page into an inaccessible or unmapped one, the
-///   word's first part is left stored where Linux stores nothing, and a Tool
-///   error is returned. Writing the second part first would fail the same way
-///   for a write-only second page after an inaccessible first one.
-///
-/// A rewrite stores the bytes that were already there, so the contents
-/// afterwards are what Linux leaves, but the page has been written: it is
-/// dirty, a copy-on-write page has been copied, and a shared file page may be
-/// written back and have its file's modification time updated. That also
-/// happens to a page Linux did not write, when the word is then left alone
-/// because its other page is not writable. A store to the rewritten bytes by
-/// another process, or by another guest thread when threads are not
-/// sequentialized, between their read and their rewrite is undone. Between
-/// the two writes of a word written in two parts, it holds virtual time on
-/// its second page and host time on its first. None of the copies are atomic
-/// with respect to other guest threads, other processes using the same
-/// memory, or mapping changes.
-///
-/// `write_with_user_access` adds no protection-key (PKRU) emulation, and the
-/// `process_vm_writev` copies ignore protection keys, while the kernel's own
-/// store honours them. A `tv` on a page whose protection key disables writes
-/// therefore receives virtual time where Linux stored nothing.
-///
-/// EFAULT is an ordinary outcome of each copy. Any other error, an impossible
-/// count, or a partly stored word is returned as a Tool error, because `tv`
-/// may then hold host time or part of a word.
-fn overwrite_failed_gettimeofday_tv<M: MemoryAccess>(
-    memory: &mut M,
-    tv_addr: AddrMut<Timeval>,
+/// This deliberately performs no read or rewrite probe, and never writes a
+/// word the kernel could not store. The host seconds written by a successful
+/// probe exist transiently until the overwrite. Default thread
+/// sequentialization prevents another guest thread from observing that
+/// interval, but another process sharing the page can observe it; such
+/// external shared state is outside Hermit's determinism guarantee.
+/// Standard record/replay disables time virtualization, so this handler is not
+/// used there. A custom configuration that combines replay data with virtual
+/// time fails closed before probing: a recorded EFAULT does not establish that
+/// this execution performed any stores for a live `time(2)` to reproduce.
+async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
+    guest: &mut G,
+    tv_addr: AddrMut<'a, Timeval>,
     tv: &Timeval,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let words = [
         (
             "tv_sec",
             std::mem::offset_of!(Timeval, tv_sec),
-            tv.tv_sec.to_ne_bytes(),
+            tv.tv_sec as libc::time_t,
         ),
         (
             "tv_usec",
             std::mem::offset_of!(Timeval, tv_usec),
-            tv.tv_usec.to_ne_bytes(),
+            tv.tv_usec as libc::time_t,
         ),
     ];
-    // The granule holding the last byte of the word stored before, which has
-    // just been written and so is known to be writable.
-    let mut writable_page = None;
-    for (field, offset, word) in words {
-        let Some(addr) = tv_addr
-            .as_raw()
-            .checked_add(offset)
-            .and_then(AddrMut::<u8>::from_raw)
-        else {
-            break;
-        };
-        match store_tv_word(memory, addr, word, writable_page) {
-            Ok(true) => {
-                writable_page = addr
-                    .as_raw()
-                    .checked_add(word.len() - 1)
-                    .map(|last| last / TV_WORD_PAGE_GRANULE);
+    for (field, offset, value) in words {
+        let addr = timeval_word_addr(field, tv_addr, offset)?;
+        let probe = syscalls::Time::new().with_tloc(Some(addr));
+        match classify_time_store_probe(field, guest.inject(probe).await) {
+            Ok(TimeStoreProbe::Stored) => {
+                let bytes = value.to_ne_bytes();
+                let overwrite = guest
+                    .memory()
+                    .write_with_user_access(addr.cast::<u8>(), &bytes);
+                require_complete_time_word_overwrite(field, bytes.len(), overwrite)?;
             }
-            Ok(false) => break,
-            Err(kind) => {
-                return Err(Error::Tool(anyhow::Error::new(TvRepairFailure {
-                    field,
-                    kind,
-                })));
-            }
+            Ok(TimeStoreProbe::Stopped) => break,
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -505,20 +359,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             .record_or_replay_preserving_tool_errors(guest, call)
             .await;
 
-        let mut memory = guest.memory();
-
         let tv: Timeval = time_ns.into();
 
         if let Some(tp) = call.tv() {
             match &result {
-                Ok(_) => memory.write_value(tp, &tv)?,
+                Ok(_) => guest.memory().write_value(tp, &tv)?,
                 // Linux's gettimeofday fails only with EFAULT, which is taken
                 // to be its own even when a seccomp filter returned it without
                 // running the call. Any other error came from the backend, the
                 // tool, a seccomp filter or a replayed log, and says nothing
                 // about what reached `tv`, so memory is left alone.
                 Err(Error::Errno(Errno::EFAULT)) => {
-                    overwrite_failed_gettimeofday_tv(&mut memory, tp.into(), &tv)?
+                    require_live_time_store_probe(self.cfg.replay_data.is_some())?;
+                    overwrite_failed_gettimeofday_tv(guest, tp.into(), &tv).await?
                 }
                 Err(_) => {}
             }
@@ -1025,776 +878,113 @@ mod tests {
         );
     }
 
-    /// `overwrite_failed_gettimeofday_tv` against a model of two guest pages
-    /// whose protections are set independently.
     mod failed_gettimeofday_tv {
-        use std::cell::RefCell;
-        use std::io::IoSlice;
-        use std::io::IoSliceMut;
-
-        use reverie::syscalls::Addr;
-
         use super::*;
 
-        const BASE: usize = 0x10_0000;
-        const PAGE: usize = TV_WORD_PAGE_GRANULE;
-        /// The boundary between the two modelled pages.
-        const BOUNDARY: usize = BASE + PAGE;
-        const FILL: u8 = 0xa5;
-        /// What the host stored in each word.
-        const HOST_WORDS: [[u8; 8]; 2] = [[0x48; 8], [0x68; 8]];
-        const VIRTUAL_TV: Timeval = Timeval {
-            tv_sec: 0x5656_5656_5656_5656,
-            tv_usec: 0x7575_7575_7575_7575,
-        };
-
-        fn virtual_words() -> [[u8; 8]; 2] {
-            [
-                VIRTUAL_TV.tv_sec.to_ne_bytes(),
-                VIRTUAL_TV.tv_usec.to_ne_bytes(),
-            ]
-        }
-
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum Prot {
-            ReadWrite,
-            ReadOnly,
-            WriteOnly,
-            NoAccess,
-        }
-
-        impl Prot {
-            const ALL: [Self; 4] = [
-                Self::ReadWrite,
-                Self::ReadOnly,
-                Self::WriteOnly,
-                Self::NoAccess,
-            ];
-
-            fn readable(self) -> bool {
-                matches!(self, Self::ReadWrite | Self::ReadOnly)
-            }
-
-            fn writable(self) -> bool {
-                matches!(self, Self::ReadWrite | Self::WriteOnly)
-            }
-        }
-
-        /// Replaces the outcome of one user-access copy.
-        #[derive(Clone, Copy, Debug)]
-        enum Inject {
-            /// Fail with this errno, copying nothing.
-            Fail(Errno),
-            /// Copy up to this many bytes, ignoring protections, and report
-            /// this count.
-            Count(usize),
-        }
-
-        /// Two guest pages. User-access copies behave like one single-iovec
-        /// `process_vm_readv` or `process_vm_writev`: a read copies only if
-        /// every byte is readable, and a write stores the prefix that lies on
-        /// writable pages and fails with EFAULT if that prefix is empty.
-        /// Debugger reads and writes panic.
-        struct PageMemory {
-            bytes: Vec<u8>,
-            pages: [Prot; 2],
-            /// Which bytes a write has stored, whether or not that changed
-            /// them.
-            written: Vec<bool>,
-            /// Which bytes a write has ever given a different value.
-            changed: Vec<bool>,
-            /// Every user-access copy, in order: its kind, address and length.
-            copies: RefCell<Vec<(&'static str, usize, usize)>>,
-            /// The copy, by index into `copies`, whose outcome is replaced.
-            inject: Option<(usize, Inject)>,
-        }
-
-        impl PageMemory {
-            fn new(pages: [Prot; 2], bytes: Vec<u8>) -> Self {
-                Self {
-                    written: vec![false; bytes.len()],
-                    changed: vec![false; bytes.len()],
-                    bytes,
-                    pages,
-                    copies: RefCell::default(),
-                    inject: None,
-                }
-            }
-
-            fn record(&self, kind: &'static str, addr: usize, len: usize) -> Option<Inject> {
-                let mut copies = self.copies.borrow_mut();
-                copies.push((kind, addr, len));
-                let index = copies.len() - 1;
-                self.inject
-                    .filter(|&(at, _)| at == index)
-                    .map(|(_, inject)| inject)
-            }
-
-            /// How many bytes from `addr` lie on pages that `allowed` accepts.
-            fn prefix(&self, addr: usize, len: usize, allowed: fn(Prot) -> bool) -> usize {
-                (addr..addr + len)
-                    .take_while(|byte| {
-                        byte.checked_sub(BASE)
-                            .and_then(|offset| self.pages.get(offset / PAGE))
-                            .is_some_and(|&prot| allowed(prot))
-                    })
-                    .count()
-            }
-
-            /// The pages that writes stored bytes on without changing any.
-            fn rewritten_pages(&self) -> Vec<usize> {
-                (0..self.pages.len())
-                    .filter(|&page| {
-                        let bytes = page * PAGE..(page + 1) * PAGE;
-                        self.written[bytes.clone()].contains(&true)
-                            && !self.changed[bytes].contains(&true)
-                    })
-                    .collect()
-            }
-        }
-
-        impl MemoryAccess for PageMemory {
-            fn read_vectored(&self, _: &[IoSlice], _: &mut [IoSliceMut]) -> Result<usize, Errno> {
-                panic!("the repair attempted a debugger read")
-            }
-
-            fn write_vectored(
-                &mut self,
-                _: &[IoSlice],
-                _: &mut [IoSliceMut],
-            ) -> Result<usize, Errno> {
-                panic!("the repair attempted a debugger write")
-            }
-
-            fn read_exact_with_user_access<'a, A>(
-                &self,
-                addr: A,
-                buf: &mut [u8],
-            ) -> Result<(), Errno>
-            where
-                A: Into<Addr<'a, u8>>,
-            {
-                let addr = addr.into().as_raw();
-                match self.record("read", addr, buf.len()) {
-                    Some(Inject::Fail(errno)) => return Err(errno),
-                    Some(Inject::Count(_)) => panic!("an exact read reports no count"),
-                    None => {}
-                }
-                if self.prefix(addr, buf.len(), Prot::readable) < buf.len() {
-                    return Err(Errno::EFAULT);
-                }
-                let offset = addr - BASE;
-                buf.copy_from_slice(&self.bytes[offset..offset + buf.len()]);
-                Ok(())
-            }
-
-            fn write_with_user_access(
-                &mut self,
-                addr: AddrMut<u8>,
-                buf: &[u8],
-            ) -> Result<usize, Errno> {
-                let addr = addr.as_raw();
-                let (copied, reported) = match self.record("write", addr, buf.len()) {
-                    Some(Inject::Fail(errno)) => return Err(errno),
-                    Some(Inject::Count(count)) => (count.min(buf.len()), count),
-                    None => {
-                        let copied = self.prefix(addr, buf.len(), Prot::writable);
-                        if copied == 0 && !buf.is_empty() {
-                            return Err(Errno::EFAULT);
-                        }
-                        (copied, copied)
-                    }
-                };
-                for (at, &byte) in (addr - BASE..).zip(&buf[..copied]) {
-                    self.written[at] = true;
-                    self.changed[at] |= self.bytes[at] != byte;
-                    self.bytes[at] = byte;
-                }
-                Ok(reported)
-            }
-        }
-
-        /// The two pages as Linux leaves them when `tz` faults: each word is
-        /// stored by one eight-byte store, which commits only if every byte it
-        /// touches is on a writable page, and the first word that does not
-        /// commit ends the call.
-        fn linux(pages: [Prot; 2], tv_addr: usize, words: [[u8; 8]; 2]) -> Vec<u8> {
-            let mut bytes = vec![FILL; 2 * PAGE];
-            for (index, word) in words.into_iter().enumerate() {
-                let start = tv_addr - BASE + 8 * index;
-                if !(pages[start / PAGE].writable() && pages[(start + 7) / PAGE].writable()) {
-                    break;
-                }
-                bytes[start..start + 8].copy_from_slice(&word);
-            }
-            bytes
-        }
-
-        /// The first word that Linux does not store: its index, its offset
-        /// from `BASE`, and the protections of the pages holding its first and
-        /// last bytes.
-        fn first_unstored(pages: [Prot; 2], tv_addr: usize) -> Option<(usize, usize, Prot, Prot)> {
-            (0..2).find_map(|index| {
-                let start = tv_addr - BASE + 8 * index;
-                let (first, last) = (pages[start / PAGE], pages[(start + 7) / PAGE]);
-                (!(first.writable() && last.writable())).then_some((index, start, first, last))
-            })
-        }
-
-        /// How many bytes of `tv_sec` the repair leaves stored where Linux
-        /// stores none: those on its first page when it crosses from a
-        /// write-only page into an inaccessible one. Neither part can be
-        /// read, and no earlier word shows the first page writable, so the
-        /// whole word is written, and that stops at the second page.
-        fn partly_stored(pages: [Prot; 2], tv_addr: usize) -> Option<usize> {
-            match first_unstored(pages, tv_addr)? {
-                (0, start, Prot::WriteOnly, Prot::NoAccess) => Some(PAGE - start % PAGE),
-                _ => None,
-            }
-        }
-
-        /// The pages the repair writes only with their own bytes, although
-        /// Linux does not write them: a page holding part of `tv_sec` that is
-        /// rewritten to check it, when `tv_sec` is then left alone because
-        /// its other page is not writable.
-        fn rewritten_only(pages: [Prot; 2], tv_addr: usize) -> Vec<usize> {
-            match first_unstored(pages, tv_addr) {
-                // The readable second page is rewritten, and then the whole
-                // word is written, which the first page refuses.
-                Some((0, _, Prot::ReadOnly | Prot::NoAccess, Prot::ReadWrite)) => vec![1],
-                // The second page cannot be read, so the first is rewritten,
-                // and then the second refuses its part.
-                Some((0, _, Prot::ReadWrite, Prot::NoAccess)) => vec![0],
-                _ => Vec::new(),
-            }
-        }
-
-        fn repair(memory: &mut PageMemory, tv_addr: usize) -> Result<(), Error> {
-            overwrite_failed_gettimeofday_tv(
-                memory,
-                AddrMut::from_raw(tv_addr).unwrap(),
-                &VIRTUAL_TV,
-            )
-        }
-
-        fn failure(result: Result<(), Error>) -> TvRepairFailure {
-            match result {
-                Err(Error::Tool(error)) => *error
+        fn failure(error: Error) -> TvRepairFailure {
+            match error {
+                Error::Tool(error) => *error
                     .downcast_ref::<TvRepairFailure>()
                     .expect("a typed repair failure"),
                 other => panic!("expected a Tool error, got {other:?}"),
             }
         }
 
-        fn window(bytes: &[u8]) -> &[u8] {
-            &bytes[PAGE - 24..PAGE + 24]
+        #[test]
+        fn successful_time_store_probe_requires_an_overwrite() {
+            assert_eq!(
+                classify_time_store_probe("tv_sec", Ok(1)).unwrap(),
+                TimeStoreProbe::Stored
+            );
         }
 
         #[test]
-        fn stores_virtual_time_in_exactly_the_words_linux_stored() {
-            for first in Prot::ALL {
-                for second in Prot::ALL {
-                    // `tv` wholly on the first page, `tv_usec` straddling, one
-                    // word on each page, `tv_sec` straddling, and wholly on the
-                    // second page.
-                    for back in [16, 12, 8, 4, 0] {
-                        let pages = [first, second];
-                        let tv_addr = BOUNDARY - back;
-                        let case = format!("pages {pages:?}, tv at boundary - {back}");
-                        let host = linux(pages, tv_addr, HOST_WORDS);
-                        let mut memory = PageMemory::new(pages, host.clone());
-                        let result = repair(&mut memory, tv_addr);
+        fn efault_time_store_probe_stops_without_an_overwrite() {
+            assert_eq!(
+                classify_time_store_probe("tv_usec", Err(Errno::EFAULT)).unwrap(),
+                TimeStoreProbe::Stopped
+            );
+        }
 
-                        let mut expected = linux(pages, tv_addr, virtual_words());
-                        match partly_stored(pages, tv_addr) {
-                            None => assert!(result.is_ok(), "{case}: {result:?}"),
-                            Some(stored) => {
-                                let start = tv_addr - BASE;
-                                expected[start..start + stored]
-                                    .copy_from_slice(&virtual_words()[0][..stored]);
-                                assert_eq!(
-                                    failure(result),
-                                    TvRepairFailure {
-                                        field: "tv_sec",
-                                        kind: TvRepairFailureKind::PartlyStored { stored },
-                                    },
-                                    "{case}"
-                                );
-                            }
-                        }
-                        assert!(
-                            memory.bytes == expected,
-                            "{case}: bytes around the boundary are {:02x?}, expected {:02x?}",
-                            window(&memory.bytes),
-                            window(&expected),
-                        );
-                        let put_back: Vec<usize> = (0..host.len())
-                            .filter(|&at| memory.changed[at] && memory.bytes[at] == host[at])
-                            .collect();
-                        assert!(
-                            put_back.is_empty(),
-                            "{case}: bytes changed and then put back at offsets {put_back:?}"
-                        );
-                        assert_eq!(
-                            memory.rewritten_pages(),
-                            rewritten_only(pages, tv_addr),
-                            "{case}: pages written only with their own bytes"
-                        );
-                        for &(kind, addr, len) in memory.copies.borrow().iter() {
-                            assert!(
-                                addr >= tv_addr && addr + len <= tv_addr + 16,
-                                "{case}: {kind} of {len} bytes at {addr:#x} is outside tv"
-                            );
-                        }
+        #[test]
+        fn other_time_store_probe_errors_fail_closed() {
+            for errno in [Errno::ENOSYS, Errno::EPERM, Errno::EIO] {
+                let error = classify_time_store_probe("tv_sec", Err(errno))
+                    .expect_err("a non-EFAULT probe error must fail the repair");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_sec",
+                        kind: TvRepairFailureKind::ProbeFailed(errno),
                     }
+                );
+            }
+        }
+
+        #[test]
+        fn overwrite_errors_and_nonexact_counts_fail_closed() {
+            assert_eq!(
+                failure(
+                    require_complete_time_word_overwrite("tv_usec", 8, Err(Errno::EFAULT),)
+                        .unwrap_err()
+                ),
+                TvRepairFailure {
+                    field: "tv_usec",
+                    kind: TvRepairFailureKind::OverwriteFailed(Errno::EFAULT),
                 }
-            }
-        }
-
-        #[test]
-        fn reports_every_other_copy_failure_as_a_typed_tool_error() {
-            use TvRepairFailureKind::Failed;
-            use TvRepairFailureKind::ImpossibleCount;
-            use TvRepairFailureKind::PartlyStored;
-
-            // An aligned `tv` on writable memory takes two copies: write
-            // `tv_sec`, then write `tv_usec`.
-            let aligned = ([Prot::ReadWrite; 2], BOUNDARY - 16);
-            // `tv_sec` crossing into a readable page first checks that page:
-            // it reads the four bytes there and writes them back unchanged.
-            // Then it writes all eight, and `tv_usec` takes one more write.
-            let checked = ([Prot::ReadWrite; 2], BOUNDARY - 4);
-            // `tv_sec` crossing into an inaccessible page cannot read its
-            // four second-page bytes (EFAULT), so it reads its four
-            // first-page bytes and writes them back unchanged, and then
-            // writes the second-page bytes (EFAULT), which ends the repair.
-            let first_checked = ([Prot::ReadWrite, Prot::NoAccess], BOUNDARY - 4);
-            // The same with a write-only second page, whose four bytes are
-            // written, then the four first-page bytes; `tv_usec` takes one
-            // more write.
-            let two_parts = ([Prot::ReadWrite, Prot::WriteOnly], BOUNDARY - 4);
-            // `tv_usec` crossing into an inaccessible page after `tv_sec` was
-            // written wholly on its first page: write `tv_sec`, read the four
-            // second-page bytes (EFAULT), write them (EFAULT).
-            let known_page = ([Prot::WriteOnly, Prot::NoAccess], BOUNDARY - 12);
-            // `tv_sec` crossing from a write-only page into an inaccessible
-            // one: read both parts (EFAULT each), write all eight (four are
-            // stored), and write the last four (EFAULT).
-            let unknown = ([Prot::WriteOnly, Prot::NoAccess], BOUNDARY - 4);
-            let cases = [
-                (
-                    aligned,
-                    0,
-                    Inject::Fail(Errno::ENOSYS),
-                    "tv_sec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::ENOSYS,
-                    },
-                ),
-                (
-                    aligned,
-                    1,
-                    Inject::Fail(Errno::EIO),
-                    "tv_usec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::EIO,
-                    },
-                ),
-                (
-                    aligned,
-                    0,
-                    Inject::Count(9),
-                    "tv_sec",
-                    ImpossibleCount {
-                        operation: "write",
-                        requested: 8,
-                        reported: 9,
-                    },
-                ),
-                (
-                    aligned,
-                    1,
-                    Inject::Count(0),
-                    "tv_usec",
-                    ImpossibleCount {
-                        operation: "write",
-                        requested: 8,
-                        reported: 0,
-                    },
-                ),
-                (
-                    checked,
-                    0,
-                    Inject::Fail(Errno::ENOSYS),
-                    "tv_sec",
-                    Failed {
-                        operation: "second-page read",
-                        errno: Errno::ENOSYS,
-                    },
-                ),
-                (
-                    checked,
-                    1,
-                    Inject::Fail(Errno::EIO),
-                    "tv_sec",
-                    Failed {
-                        operation: "second-page rewrite",
-                        errno: Errno::EIO,
-                    },
-                ),
-                (
-                    checked,
-                    1,
-                    Inject::Count(5),
-                    "tv_sec",
-                    ImpossibleCount {
-                        operation: "second-page rewrite",
-                        requested: 4,
-                        reported: 5,
-                    },
-                ),
-                (
-                    checked,
-                    1,
-                    Inject::Count(0),
-                    "tv_sec",
-                    ImpossibleCount {
-                        operation: "second-page rewrite",
-                        requested: 4,
-                        reported: 0,
-                    },
-                ),
-                (
-                    checked,
-                    2,
-                    Inject::Fail(Errno::EPERM),
-                    "tv_sec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::EPERM,
-                    },
-                ),
-                (
-                    checked,
-                    3,
-                    Inject::Fail(Errno::ESRCH),
-                    "tv_usec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::ESRCH,
-                    },
-                ),
-                (
-                    first_checked,
-                    1,
-                    Inject::Fail(Errno::ENOSYS),
-                    "tv_sec",
-                    Failed {
-                        operation: "first-page read",
-                        errno: Errno::ENOSYS,
-                    },
-                ),
-                (
-                    first_checked,
-                    2,
-                    Inject::Fail(Errno::EIO),
-                    "tv_sec",
-                    Failed {
-                        operation: "first-page rewrite",
-                        errno: Errno::EIO,
-                    },
-                ),
-                (
-                    first_checked,
-                    2,
-                    Inject::Count(5),
-                    "tv_sec",
-                    ImpossibleCount {
-                        operation: "first-page rewrite",
-                        requested: 4,
-                        reported: 5,
-                    },
-                ),
-                (
-                    first_checked,
-                    3,
-                    Inject::Fail(Errno::EPERM),
-                    "tv_sec",
-                    Failed {
-                        operation: "second-page write",
-                        errno: Errno::EPERM,
-                    },
-                ),
-                (
-                    first_checked,
-                    3,
-                    Inject::Count(0),
-                    "tv_sec",
-                    ImpossibleCount {
-                        operation: "second-page write",
-                        requested: 4,
-                        reported: 0,
-                    },
-                ),
-                (
-                    two_parts,
-                    4,
-                    Inject::Fail(Errno::EIO),
-                    "tv_sec",
-                    Failed {
-                        operation: "first-page write",
-                        errno: Errno::EIO,
-                    },
-                ),
-                (
-                    two_parts,
-                    4,
-                    Inject::Count(9),
-                    "tv_sec",
-                    ImpossibleCount {
-                        operation: "first-page write",
-                        requested: 4,
-                        reported: 9,
-                    },
-                ),
-                (
-                    two_parts,
-                    4,
-                    Inject::Fail(Errno::EFAULT),
-                    "tv_sec",
-                    PartlyStored { stored: 4 },
-                ),
-                (
-                    two_parts,
-                    5,
-                    Inject::Fail(Errno::ESRCH),
-                    "tv_usec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::ESRCH,
-                    },
-                ),
-                (
-                    known_page,
-                    1,
-                    Inject::Fail(Errno::ENOSYS),
-                    "tv_usec",
-                    Failed {
-                        operation: "second-page read",
-                        errno: Errno::ENOSYS,
-                    },
-                ),
-                (
-                    known_page,
-                    2,
-                    Inject::Fail(Errno::EIO),
-                    "tv_usec",
-                    Failed {
-                        operation: "second-page write",
-                        errno: Errno::EIO,
-                    },
-                ),
-                (
-                    unknown,
-                    1,
-                    Inject::Fail(Errno::EPERM),
-                    "tv_sec",
-                    Failed {
-                        operation: "first-page read",
-                        errno: Errno::EPERM,
-                    },
-                ),
-                (
-                    unknown,
-                    2,
-                    Inject::Fail(Errno::EIO),
-                    "tv_sec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::EIO,
-                    },
-                ),
-                (
-                    unknown,
-                    3,
-                    Inject::Fail(Errno::ENOSYS),
-                    "tv_sec",
-                    Failed {
-                        operation: "write",
-                        errno: Errno::ENOSYS,
-                    },
-                ),
-            ];
-            for ((pages, tv_addr), index, inject, field, kind) in cases {
-                let case =
-                    format!("{inject:?} at copy {index} for tv at {tv_addr:#x} in {pages:?}");
-                let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-                memory.inject = Some((index, inject));
+            );
+            for reported in [0, 3, 7, 9] {
                 assert_eq!(
-                    failure(repair(&mut memory, tv_addr)),
-                    TvRepairFailure { field, kind },
-                    "{case}"
-                );
-                assert_eq!(
-                    memory.copies.borrow().len(),
-                    index + 1,
-                    "{case}: a copy followed the failure"
+                    failure(
+                        require_complete_time_word_overwrite("tv_sec", 8, Ok(reported))
+                            .unwrap_err()
+                    ),
+                    TvRepairFailure {
+                        field: "tv_sec",
+                        kind: TvRepairFailureKind::OverwriteCount {
+                            expected: 8,
+                            reported,
+                        },
+                    }
                 );
             }
-        }
+            require_complete_time_word_overwrite("tv_sec", 8, Ok(8)).unwrap();
 
-        #[test]
-        fn a_crossing_word_rewrites_its_readable_second_page_part_first() {
-            let tv_addr = BOUNDARY - 4;
-
-            // A read-only second page stops the unchanged rewrite, so the first
-            // page is never written.
-            let pages = [Prot::ReadWrite, Prot::ReadOnly];
-            let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-            repair(&mut memory, tv_addr).unwrap();
+            require_live_time_store_probe(false).unwrap();
             assert_eq!(
-                memory.copies.borrow()[..],
-                [("read", BOUNDARY, 4), ("write", BOUNDARY, 4)]
-            );
-
-            // A writable one lets `tv_sec` be written, and `tv_usec`, wholly on
-            // the second page, needs no check.
-            let pages = [Prot::ReadWrite; 2];
-            let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-            repair(&mut memory, tv_addr).unwrap();
-            assert_eq!(
-                memory.copies.borrow()[..],
-                [
-                    ("read", BOUNDARY, 4),
-                    ("write", BOUNDARY, 4),
-                    ("write", tv_addr, 8),
-                    ("write", tv_addr + 8, 8),
-                ]
-            );
-        }
-
-        #[test]
-        fn a_crossing_word_writes_an_unreadable_second_page_part_first() {
-            let tv_addr = BOUNDARY - 4;
-
-            // A readable first page is checked by an unchanged rewrite, and
-            // then an inaccessible second page refuses its part, so the word
-            // is left alone and no byte changes.
-            let pages = [Prot::ReadWrite, Prot::NoAccess];
-            let host = linux(pages, tv_addr, HOST_WORDS);
-            let mut memory = PageMemory::new(pages, host.clone());
-            repair(&mut memory, tv_addr).unwrap();
-            assert_eq!(
-                memory.copies.borrow()[..],
-                [
-                    ("read", BOUNDARY, 4),
-                    ("read", tv_addr, 4),
-                    ("write", tv_addr, 4),
-                    ("write", BOUNDARY, 4),
-                ]
-            );
-            assert!(memory.bytes == host && !memory.changed.contains(&true));
-
-            // A write-only second page takes its part, and then the first
-            // part is written.
-            let pages = [Prot::ReadWrite, Prot::WriteOnly];
-            let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-            repair(&mut memory, tv_addr).unwrap();
-            assert_eq!(
-                memory.copies.borrow()[..],
-                [
-                    ("read", BOUNDARY, 4),
-                    ("read", tv_addr, 4),
-                    ("write", tv_addr, 4),
-                    ("write", BOUNDARY, 4),
-                    ("write", tv_addr, 4),
-                    ("write", tv_addr + 8, 8),
-                ]
-            );
-            assert!(memory.bytes == linux(pages, tv_addr, virtual_words()));
-
-            // `tv_usec` crossing after `tv_sec` was written wholly on the same
-            // first page needs no first-page check, even though that page
-            // cannot be read.
-            let tv_addr = BOUNDARY - 12;
-            for (second, both) in [(Prot::NoAccess, false), (Prot::WriteOnly, true)] {
-                let pages = [Prot::WriteOnly, second];
-                let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-                repair(&mut memory, tv_addr).unwrap();
-                let mut copies = vec![
-                    ("write", tv_addr, 8),
-                    ("read", BOUNDARY, 4),
-                    ("write", BOUNDARY, 4),
-                ];
-                if both {
-                    copies.push(("write", BOUNDARY - 4, 4));
+                failure(require_live_time_store_probe(true).unwrap_err()),
+                TvRepairFailure {
+                    field: "tv",
+                    kind: TvRepairFailureKind::ReplayMode,
                 }
-                assert_eq!(memory.copies.borrow()[..], copies[..], "{pages:?}");
-                assert!(
-                    memory.bytes == linux(pages, tv_addr, virtual_words()),
-                    "{pages:?}: {:02x?}",
-                    window(&memory.bytes)
-                );
-            }
-
-            // When neither part of `tv_sec` can be read, the whole word is
-            // written, and a write-only first page keeps its part when the
-            // second page refuses the rest.
-            let tv_addr = BOUNDARY - 4;
-            let pages = [Prot::WriteOnly, Prot::NoAccess];
-            let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-            assert_eq!(
-                failure(repair(&mut memory, tv_addr)).kind,
-                TvRepairFailureKind::PartlyStored { stored: 4 }
-            );
-            assert_eq!(
-                memory.copies.borrow()[..],
-                [
-                    ("read", BOUNDARY, 4),
-                    ("read", tv_addr, 4),
-                    ("write", tv_addr, 8),
-                    ("write", BOUNDARY, 4),
-                ]
             );
         }
 
         #[test]
-        fn a_short_count_does_not_stop_the_store() {
-            // A short count does not mean that the next byte is unwritable.
-            let pages = [Prot::ReadWrite; 2];
-            let tv_addr = BOUNDARY - 16;
-            let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-            memory.inject = Some((0, Inject::Count(3)));
-            repair(&mut memory, tv_addr).unwrap();
-            assert!(
-                memory.bytes == linux(pages, tv_addr, virtual_words()),
-                "{:02x?}",
-                window(&memory.bytes)
+        fn timeval_word_addresses_follow_kernel_order_and_overflow_fails_closed() {
+            let tv_addr = AddrMut::<Timeval>::from_raw(0x10_0000).unwrap();
+            assert_eq!(
+                timeval_word_addr("tv_sec", tv_addr, std::mem::offset_of!(Timeval, tv_sec))
+                    .unwrap()
+                    .as_raw(),
+                tv_addr.as_raw()
             );
             assert_eq!(
-                memory.copies.borrow()[..],
-                [
-                    ("write", tv_addr, 8),
-                    ("write", tv_addr + 3, 5),
-                    ("write", tv_addr + 8, 8),
-                ]
+                timeval_word_addr("tv_usec", tv_addr, std::mem::offset_of!(Timeval, tv_usec))
+                    .unwrap()
+                    .as_raw(),
+                tv_addr.as_raw() + 8
             );
 
-            // A fault after one leaves the bytes before it stored, which is a
-            // partly stored word, not an unstored one.
-            let pages = [Prot::ReadWrite, Prot::NoAccess];
-            let tv_addr = BOUNDARY - 4;
-            let mut memory = PageMemory::new(pages, linux(pages, tv_addr, HOST_WORDS));
-            memory.inject = Some((3, Inject::Count(3)));
+            let overflowing = AddrMut::<Timeval>::from_raw(usize::MAX - 3).unwrap();
+            let error = timeval_word_addr("tv_usec", overflowing, 8)
+                .expect_err("overflowing field address must fail the repair");
             assert_eq!(
-                failure(repair(&mut memory, tv_addr)).kind,
-                TvRepairFailureKind::PartlyStored { stored: 3 }
-            );
-            assert_eq!(
-                memory.copies.borrow()[3..],
-                [("write", BOUNDARY, 4), ("write", BOUNDARY + 3, 1)]
+                failure(error),
+                TvRepairFailure {
+                    field: "tv_usec",
+                    kind: TvRepairFailureKind::AddressOverflow,
+                }
             );
         }
     }
