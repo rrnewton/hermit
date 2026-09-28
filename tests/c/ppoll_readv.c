@@ -22,7 +22,9 @@
  * the readv output bytes so replay reproduces them without touching live fds.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>

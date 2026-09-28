@@ -498,7 +498,7 @@ impl HeldObject {
             }
             let mut candidates = BTreeSet::new();
             for segment in elf.segments() {
-                let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
+                let object::SegmentFlags::Elf { p_flags, .. } = segment.flags() else {
                     continue;
                 };
                 if p_flags & object::elf::PF_X == 0 {
@@ -552,7 +552,7 @@ impl HeldObject {
             let elf = object::File::parse(self.bytes.as_slice())?;
             let mut candidates = BTreeSet::new();
             for segment in elf.segments() {
-                let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
+                let object::SegmentFlags::Elf { p_flags, .. } = segment.flags() else {
                     continue;
                 };
                 if p_flags & object::elf::PF_X == 0 {
@@ -634,7 +634,7 @@ impl HeldObject {
                 let page = bias
                     .checked_add(usize::try_from(first.address())? & !(PAGE - 1))
                     .ok_or_else(|| anyhow!("copied ELF page address overflow"))?;
-                let object::SegmentFlags::Elf { p_flags } = first.flags() else {
+                let object::SegmentFlags::Elf { p_flags, .. } = first.flags() else {
                     return Err(anyhow!("missing first ELF load flags"));
                 };
                 let permissions = format!(
@@ -709,7 +709,7 @@ impl HeldObject {
                 .checked_add(size as usize)
                 .ok_or_else(|| anyhow!("ELF segment overflow"))?;
             if address >= lo && end <= hi {
-                let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
+                let object::SegmentFlags::Elf { p_flags, .. } = segment.flags() else {
                     continue;
                 };
                 ensure!(
