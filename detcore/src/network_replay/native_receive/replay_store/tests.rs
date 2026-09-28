@@ -161,6 +161,10 @@ fn observation(channel: u64, length: u64) -> NetworkNativeReceiveObservationV4 {
 }
 
 fn fixture() -> (NetworkReplayEngine, NetworkStreamOwner, NetworkStreamCallId) {
+    fixture_with_eof(false)
+}
+
+fn fixture_with_eof(eof: bool) -> (NetworkReplayEngine, NetworkStreamOwner, NetworkStreamCallId) {
     let mut trace = empty();
     add_channel(&mut trace, 1, false);
     input(
@@ -196,6 +200,17 @@ fn fixture() -> (NetworkReplayEngine, NetworkStreamOwner, NetworkStreamCallId) {
         &[1],
     );
     trace.native_receive_observations.push(observation(1, 8));
+    if eof {
+        input(
+            &mut trace,
+            1,
+            NetworkInputKindV2::PeerShutdown {
+                stream_offset: 8,
+                direction: NetworkShutdownV2::Write,
+            },
+            &[1],
+        );
+    }
     trace.validate().unwrap();
     let thread = crate::types::DetTid::from_raw(7);
     let owner = NetworkStreamOwner {
@@ -231,6 +246,93 @@ fn replay_store_selects_across_trace_fragments_without_native_receipts() {
     assert!(engine.begin_stream_call_release(owner, call).is_err());
     assert!(engine.reserve_replay_store_source(owner, call, 5).is_err());
     assert_eq!(format!("{engine:?}"), before);
+}
+
+#[test]
+fn replay_store_refuses_unqualified_profiles_before_selection_or_reservation() {
+    // These are model-admission controls, not Linux SO_RCVLOWAT/timeout
+    // qualification. In particular, queued EOF must not turn an unsupported
+    // partial-receive policy into a successful or indefinitely waiting call.
+    for (low_water, timeout) in [
+        (9, ReceiveTimeoutV3::Infinite),
+        (1, ReceiveTimeoutV3::FiniteTicks(5_000)),
+        (9, ReceiveTimeoutV3::FiniteTicks(5_000)),
+    ] {
+        for eof in [false, true] {
+            for nonblocking in [false, true] {
+                for maximum in [1, 16] {
+                    let (mut engine, owner, call) = fixture_with_eof(eof);
+                    let open_file = engine.stream_calls[&call].open_file.unwrap();
+                    let options = &mut engine
+                        .shadow
+                        .as_mut()
+                        .unwrap()
+                        .sockets
+                        .get_mut(&open_file)
+                        .unwrap()
+                        .options;
+                    options.receive_low_water = low_water;
+                    options.receive_timeout = timeout;
+                    let before = format!("{engine:?}");
+                    let error = engine
+                        .plan_replay_receive(owner, call, maximum, nonblocking)
+                        .expect_err(
+                            "unqualified profile must refuse before selecting bytes or wait",
+                        );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("qualified low-water/timeout profile")
+                    );
+                    assert_eq!(format!("{engine:?}"), before);
+                    let error = engine
+                        .reserve_replay_store_source(owner, call, maximum)
+                        .expect_err("direct reservation must enforce the same profile");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("qualified low-water/timeout profile")
+                    );
+                    assert_eq!(format!("{engine:?}"), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn replay_store_rechecks_profile_after_selection_without_consuming() {
+    for timeout in [false, true] {
+        let (mut engine, owner, call) = fixture_with_eof(true);
+        let open_file = engine.stream_calls[&call].open_file.unwrap();
+        let ReplayReceivePlan::Bytes(plan) =
+            engine.plan_replay_receive(owner, call, 16, false).unwrap()
+        else {
+            panic!("qualified profile must select the complete prefix before EOF");
+        };
+        assert_eq!(plan.bytes, b"abcdefgh");
+        let options = &mut engine
+            .shadow
+            .as_mut()
+            .unwrap()
+            .sockets
+            .get_mut(&open_file)
+            .unwrap()
+            .options;
+        if timeout {
+            options.receive_timeout = ReceiveTimeoutV3::FiniteTicks(5_000);
+        } else {
+            options.receive_low_water = 9;
+        }
+        let before = format!("{engine:?}");
+        let error = engine.reserve_replay_planned_store(&plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("qualified low-water/timeout profile")
+        );
+        assert_eq!(format!("{engine:?}"), before);
+    }
 }
 
 #[test]

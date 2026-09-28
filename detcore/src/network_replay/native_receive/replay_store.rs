@@ -136,6 +136,10 @@ impl NetworkReplayEngine {
         if self.stream_role(channel)? == NetworkEndpointRoleV2::Listener {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
+        // General low-water/timeout handling needs a partial-completion
+        // transaction for EOF, error, deadline and signal, not just a readiness
+        // threshold. Until that is qualified, refuse before selecting or
+        // reserving a source (including direct reservation and revalidation).
         let socket = self.stream_call_socket_state(owner, call)?;
         if socket.options.receive_low_water != 1
             || socket.options.receive_timeout
