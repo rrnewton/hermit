@@ -456,7 +456,8 @@ fi
 # fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a. CMAKE/CMAKE_GENERATOR selection,
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
-expected_pin=6297f7154299e30bed97e6aead6ae7f5e1fc45ed
+# Source-identical DBT recipe carry is documented in ci/configure-build-jobs.sh.
+expected_pin=547278b9b5e9a205c92e40c9e6f189beb8a3ddd7
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
