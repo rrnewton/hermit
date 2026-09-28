@@ -97,7 +97,7 @@ bundle_root=$2
 pointer=$3
 source_install=""
 runtime_overlay=""
-kind=binary-only
+kind="binary-only"
 if [[ $# == 4 ]]; then
     source_install=$4
     kind=complete
@@ -194,7 +194,7 @@ if [[ $kind == complete ]]; then
     [[ -z $special ]] || fail "resource bundle contains a non-regular entry outside its manifest: $special"
     resource_hash=$(sha256sum "$stage/resources.sha256" | cut -d' ' -f1)
 elif [[ $kind == runtime ]]; then
-    runtime_contract=runtime-only-v1
+    runtime_contract="runtime-only-v1"
     require_runtime_resources "$source_install"
     tree_manifest "$source_install" >"$before_manifest"
     mkdir -p "$stage/install"

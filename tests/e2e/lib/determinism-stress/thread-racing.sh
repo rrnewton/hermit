@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-# shellcheck source=tests/e2e/lib/determinism-stress/common.sh
+# shellcheck source=common.sh source-path=SCRIPTDIR
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
 sync_guest=$(compile_c tests/c/thread_sync_determinism.c thread-sync)

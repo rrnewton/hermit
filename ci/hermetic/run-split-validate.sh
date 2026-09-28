@@ -205,7 +205,6 @@ fi
 
 build_node_count=$(tr ',' '\n' <<<"$build_nodes" | wc -l)
 test_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
-total_node_count=$((build_node_count + test_node_count))
 if [[ -z "$shards" ]]; then
     plan_out=$(mktemp)
     ./scripts/validate.rs --hosted-portable-only --show-plan-json \
@@ -245,7 +244,6 @@ if [[ -z "$shards" ]]; then
     duplicate_nodes=$(LC_ALL=C uniq -d <<<"$selected_list" || true)
     strict_compat_node_count=$(wc -l <<<"$compat_expansion")
     test_node_count=$((test_node_count - 1 + strict_compat_node_count))
-    total_node_count=$((build_node_count + test_node_count))
     expected_list=$(jq -r '.dags[].steps[].tag' <<<"$plan_json" | LC_ALL=C sort)
     duplicate_dag_nodes=$(LC_ALL=C uniq -d <<<"$expected_list" || true)
     selected_unique=$(LC_ALL=C uniq <<<"$selected_list")

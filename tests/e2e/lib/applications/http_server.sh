@@ -88,7 +88,7 @@ if [[ ${1:-} == --guest ]]; then
     exit
 fi
 
-# shellcheck source=tests/e2e/lib/applications/common.sh
+# shellcheck source=common.sh source-path=SCRIPTDIR
 source "$(dirname -- "$0")/common.sh"
 require_commands curl python3 sed seq sha256sum timeout
 

@@ -68,7 +68,7 @@ class HostedAdapterTests(unittest.TestCase):
             )
         for fault in ("parent", "hermit", "gitlink", "dirty", "ledger"):
 
-            def wrong(root, *args):
+            def wrong(root, *args, fault=fault):
                 result = self.source_git(root, *args)
                 if (
                     fault == "parent"

@@ -37,7 +37,12 @@ report=()
 # non-loopback interface. Read /proc and /sys directly: `ip` is not in the
 # pinned root, and depending on it would make the probe untestable there.
 routes=$(awk 'NR>1 && $1!="lo" {n++} END{print n+0}' /proc/net/route 2>/dev/null || echo 0)
-ifaces=$(ls /sys/class/net 2>/dev/null | grep -cv '^lo$' || true)
+ifaces=0
+for iface in /sys/class/net/*; do
+    if [[ -e $iface && ${iface##*/} != lo ]]; then
+        ifaces=$((ifaces + 1))
+    fi
+done
 if [[ ${routes:-0} -gt 0 || ${ifaces:-0} -gt 0 ]]; then
     reachable=1
     report+=("route-table: REACHABLE (${routes} non-loopback route(s), ${ifaces} non-loopback interface(s))")

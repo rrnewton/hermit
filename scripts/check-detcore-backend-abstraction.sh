@@ -92,7 +92,8 @@ fi
 
 readonly DETCORE_MANIFEST="$REPO_ROOT/detcore/Cargo.toml"
 readonly DETCORE_SRC="$REPO_ROOT/detcore/src"
-readonly SOURCE_CHECKER="$(script_dir)/detcore-backend-source.rs"
+SOURCE_CHECKER="$(script_dir)/detcore-backend-source.rs"
+readonly SOURCE_CHECKER
 
 if [[ ! -f $DETCORE_MANIFEST ]]; then
     err "detcore manifest not found: $DETCORE_MANIFEST"

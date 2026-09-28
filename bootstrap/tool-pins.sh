@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034 # bootstrap/run-pinned-tool sources these pins.
 
 # Source revision used when the public Buck2 build ladder was established.
 # Keep a full commit ID here: branch names and live tips are not reproducible.

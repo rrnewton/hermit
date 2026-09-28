@@ -21,12 +21,10 @@ function run_build_workload {
     cat >"$work_dir/Generate.cmake" <<'EOF'
 file(WRITE "${OUTPUT}" "${STAMP}\n")
 EOF
-    cat >"$work_dir/Makefile" <<'EOF'
-.PHONY: all
-all:
-	mkdir -p build
-	cmake -DOUTPUT=build/application.txt -DSTAMP="$(BUILD_STAMP)" -P Generate.cmake
-EOF
+    printf '%s\n' '.PHONY: all' 'all:' \
+        $'\tmkdir -p build' \
+        $'\tcmake -DOUTPUT=build/application.txt -DSTAMP="$(BUILD_STAMP)" -P Generate.cmake' \
+        >"$work_dir/Makefile"
 
     BUILD_STAMP=$stamp make --silent -C "$work_dir" >"$work_dir/build.log"
     artifact="$work_dir/build/application.txt"
@@ -40,7 +38,7 @@ if [[ ${1:-} == --guest ]]; then
     exit
 fi
 
-# shellcheck source=tests/e2e/lib/applications/common.sh
+# shellcheck source=common.sh source-path=SCRIPTDIR
 source "$(dirname -- "$0")/common.sh"
 require_commands cmake date make od sha256sum timeout tr
 

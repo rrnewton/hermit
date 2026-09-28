@@ -250,7 +250,7 @@ run_scenario() {
 }
 
 build_hello_initramfs() {
-  local run_dir root init image
+  local run_dir root image
   run_dir=$(mktemp -d "$output_dir/build.hello.XXXXXX")
   root=$run_dir/root
   image=$run_dir/initramfs.cpio.gz
