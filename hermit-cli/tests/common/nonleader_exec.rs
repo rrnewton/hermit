@@ -166,8 +166,19 @@ fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
             .iter()
             .position(|line| line.contains("inbound syscall: execve("))
             .map_or(lines.len(), |offset| after_clock + offset);
+        // In the runnable case the replacement later becomes the next round's
+        // spinning leader. Its spin must not satisfy the replacement timer
+        // check: require the timer before the next leader-spin phase.
+        let replacement_end = lines[after_clock..next_exec]
+            .iter()
+            .position(|line| {
+                line.contains(&format!(
+                    "[detcore, dtid {leader}] inbound syscall: getppid("
+                ))
+            })
+            .map_or(next_exec, |offset| after_clock + offset);
         assert!(
-            lines[after_clock..next_exec]
+            lines[after_clock..replacement_end]
                 .iter()
                 .any(|line| line.contains(&timer(leader))),
             "replacement must receive an actual PMU timer after exec"
@@ -182,11 +193,13 @@ fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
                         ))
                     })
                     .expect("the displaced leader actually entered its runnable spin");
+            let leader_preemptions = lines[spin_start..exec]
+                .iter()
+                .filter(|line| line.contains(&timer(leader)))
+                .count();
             assert!(
-                lines[spin_start..exec]
-                    .iter()
-                    .any(|line| line.contains(&timer(leader))),
-                "the displaced leader's spin must be preempted"
+                leader_preemptions >= 3,
+                "the displaced leader's spin needs several PMU preemptions, got {leader_preemptions}"
             );
         }
         previous_handoff = after_clock;
@@ -285,12 +298,11 @@ fn run_fixture(scenario: Scenario) {
             guest.to_str().unwrap(),
         ];
         if scenario == Scenario::RunnableLeader {
-            // PAUSE slows branch retirement in both hot loops. Use a 1,536-RCB
-            // early notification (still above the 1,440-RCB total skid seen
-            // here). This budgets the two-instruction correction tail within
-            // the existing CPU and TRACE caps. It changes neither the precise
-            // target nor refusal of any future overshoot.
-            args.insert(8, "--skid-margin=1536");
+            // PAUSE slows branch retirement in both hot loops. A 768-RCB early
+            // notification shortens each single-step correction tail while
+            // retaining the same workload and repeated leader preemptions.
+            // The precise target and refusal of every overshoot are unchanged.
+            args.insert(8, "--skid-margin=768");
         } else if preempted {
             // Keep the blocked-leader cell's existing early notification.
             args.insert(8, "--skid-margin=3072");
