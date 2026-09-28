@@ -43,12 +43,14 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 // Alarm is virtualized by the deterministic scheduler and has
                 // no native descriptor or network-provider side effect.
                 | Sysno::alarm
-                // Access and pread64 have no descriptor-table effect and are
-                // carried by the recorder/replayer's ordinary effect stream.
+                // Access, newfstatat and pread64 have no descriptor-table
+                // effect and are carried by the recorder/replayer's ordinary
+                // effect stream. Metadata virtualization still owns the
+                // newfstatat result and guest-memory copy.
                 // Openat is the one admitted filesystem allocator: its handler
                 // joins the native/recorded allocator protocol and requires the
                 // exact published descriptor binding before it can return.
-                | Sysno::access | Sysno::openat
+                | Sysno::access | Sysno::newfstatat | Sysno::openat
                 // Neither touches the descriptor table: strict rseq returns
                 // ENOSYS without entering Linux, and readlink reads a path.
                 | Sysno::rseq | Sysno::readlink
@@ -109,7 +111,12 @@ mod tests {
     }
     #[test]
     fn initial_record_admits_recorded_loader_reads_and_exactly_joined_openat() {
-        for number in [Sysno::access, Sysno::pread64, Sysno::openat] {
+        for number in [
+            Sysno::access,
+            Sysno::newfstatat,
+            Sysno::pread64,
+            Sysno::openat,
+        ] {
             assert!(initial_record_call_supported(raw(number)), "{number:?}");
         }
 
