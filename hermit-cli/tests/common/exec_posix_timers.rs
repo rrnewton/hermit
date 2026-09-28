@@ -10,14 +10,21 @@ use std::process::Command;
 use std::time::Duration;
 
 use detcore::Digest;
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use hermit::canonical_verdict::ComparedLogScope;
+use hermit::canonical_verdict::ContainerDisposition;
+use hermit::canonical_verdict::ContainerFailure;
+use hermit::canonical_verdict::NoResultReason;
+use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
+use hermit::canonical_verdict::VerificationRun;
 
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
 
 const MIB: u64 = 1024 * 1024;
 const EXPECTED: &[u8] = b"PASS exec deleted POSIX timers; failed exec retained timers; ITIMER_REAL survived; clock advanced\n";
+const FAILED_EXEC_MARKER: &[u8] = b"failed exec returned ENOENT\n";
 
 pub(super) fn run(backend: &str) {
     let _lock = super::hermit_run_guard();
@@ -144,4 +151,91 @@ pub(super) fn run(backend: &str) {
         assert_eq!(matches.len(), 1, "one retained log per actual guest");
         assert!(!bounded_read(&matches[0], 64 * MIB).is_empty());
     }
+    run_failed_exec_expiry(backend, &guest, &root);
+}
+
+/// This is a deadline-liveness control, separate from the survivor's L2 proof.
+/// The default fatal signal intentionally prevents verification from finishing;
+/// a matching signal and the persisted post-exec marker are required together.
+fn run_failed_exec_expiry(backend: &str, guest: &Path, root: &Path) {
+    let directory = root.join("failed-exec-expiry");
+    let logs = directory.join("verify-logs");
+    let evidence = directory.join("evidence");
+    fs::create_dir_all(&logs).expect("retained failed-exec verification logs");
+    fs::create_dir(&evidence).expect("fresh failed-exec evidence directory");
+    let marker = evidence.join("after-failed-exec");
+    assert!(
+        !marker.exists(),
+        "failed-exec marker must not predate this run"
+    );
+    let report_path = directory.join("verification.json");
+    let mount = format!(
+        "--mount=type=bind,source={},target=/tmp/exec-timer-control",
+        evidence.display()
+    );
+    let args = [
+        "--log=info",
+        "run",
+        "--base-env=minimal",
+        "--backend",
+        backend,
+        "--strict",
+        "--verify-strict",
+        "--verify",
+        "--verify-json",
+        report_path.to_str().unwrap(),
+        "--keep-logs",
+        "--verify-log-dir",
+        logs.to_str().unwrap(),
+        "--mount=type=tmpfs,target=/test",
+        &mount,
+        "--workdir=/test",
+        "--env=LC_ALL=C",
+        "--env=TZ=UTC",
+        "--",
+        guest.to_str().unwrap(),
+        "failed-exec-expiry",
+        "/tmp/exec-timer-control/after-failed-exec",
+    ];
+    let mut command = super::hermit_command(&args);
+    command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+    assert_eq!(status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+    assert_eq!(bounded_read(&marker, 1024), FAILED_EXEC_MARKER);
+    assert!(bounded_read(&directory.join("stdout"), 64 * MIB).is_empty());
+    let report = VerificationReport::from_json_slice(&bounded_read(&report_path, 16 * MIB))
+        .expect("typed failed-exec timer disposition");
+    assert_eq!(report.verdict, Verdict::NoResult);
+    assert!(!report.verified);
+    assert!(!report.bitwise_parity);
+    assert!(report.comparison.is_none());
+    assert!(report.compared_log_messages.is_none());
+    assert!(report.compared_outputs.is_none());
+    assert!(report.infrastructure_error.is_none());
+    assert!(report.guest_exit_code.is_none());
+    let expected_reason = match backend {
+        "ptrace" => {
+            assert_eq!(report.guest_signal, Some(libc::SIGUSR2));
+            NoResultReason::FirstRunRejected {
+                exit_code: None,
+                signal: Some(libc::SIGUSR2),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            }
+        }
+        "kvm" => {
+            // POSIX timer expiry currently kills the KVM host container. This
+            // proves the deadline survived, not caught/blocked guest delivery.
+            assert!(report.guest_signal.is_none());
+            NoResultReason::ContainerFailed(ContainerFailure {
+                run: VerificationRun::Run1,
+                disposition: ContainerDisposition::Signaled {
+                    signal: libc::SIGUSR2,
+                    core_dumped: false,
+                },
+            })
+        }
+        _ => panic!("unsupported exec timer test backend: {backend}"),
+    };
+    assert_eq!(report.no_result_reason, Some(expected_reason));
 }

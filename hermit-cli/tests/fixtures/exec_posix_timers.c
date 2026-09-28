@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -83,7 +84,46 @@ static void after_exec(char **argv) {
   puts("PASS exec deleted POSIX timers; failed exec retained timers; ITIMER_REAL survived; clock advanced");
 }
 
+static void failed_exec_expiry(char **argv) {
+  struct sigaction action = {.sa_handler = SIG_DFL};
+  sigemptyset(&action.sa_mask);
+  require(sigaction(SIGUSR2, &action, NULL) == 0, "use fatal POSIX timer signal");
+  sigset_t empty;
+  sigemptyset(&empty);
+  require(sigprocmask(SIG_SETMASK, &empty, NULL) == 0, "unblock POSIX timer signal");
+  int timer;
+  struct sigevent event = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR2};
+  require(syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &timer) == 0,
+          "create failed-exec expiry timer");
+  const struct itimerspec value = {.it_value = {.tv_sec = 1}};
+  require(syscall(SYS_timer_settime, timer, 0, &value, NULL) == 0,
+          "arm failed-exec expiry timer");
+  errno = 0;
+  execve("/__hermit_exec_posix_timer_missing__", argv, environ);
+  require(errno == ENOENT, "failed exec must return ENOENT before timer expiry");
+
+  /* The host checks this fresh artifact before accepting SIGUSR2. It proves
+   * that exec returned, even when the fatal signal prevents output capture. */
+  const char marker[] = "failed exec returned ENOENT\n";
+  int fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+  require(fd >= 0, "create failed-exec completion marker");
+  require(write(fd, marker, sizeof(marker) - 1) == (ssize_t)(sizeof(marker) - 1),
+          "write failed-exec completion marker");
+  require(fsync(fd) == 0, "flush failed-exec completion marker");
+  require(close(fd) == 0, "close failed-exec completion marker");
+
+  struct timespec remaining = {.tv_sec = 2};
+  while (nanosleep(&remaining, &remaining) != 0) {
+    require(errno == EINTR, "wait for retained POSIX timer expiry");
+  }
+  require(0, "failed exec cancelled the POSIX timer deadline");
+}
+
 int main(int argc, char **argv) {
+  if (argc == 3 && strcmp(argv[1], "failed-exec-expiry") == 0) {
+    failed_exec_expiry(argv);
+    return 1;
+  }
   if (argc == 5 && strcmp(argv[1], "after") == 0) {
     after_exec(argv);
     return 0;
