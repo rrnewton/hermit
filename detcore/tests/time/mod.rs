@@ -24,7 +24,6 @@ use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;
-use reverie_ptrace::testing::test_fn_with_config;
 
 // Keep this synchronized with the clock-query category in `syscall_time`.
 const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
@@ -552,57 +551,155 @@ fn tod_gettimeofday_faulting_tz_crossing_word_needs_both_pages_writable() {
 }
 
 /// Four bytes before the boundary, `tv_sec` starts on a write-only page and
-/// ends on an inaccessible or unmapped one, so neither of its parts can be read
-/// back, and Linux stores nothing. No user-access copy shows whether a page is
-/// writable without writing it, so the repair writes the word, whose four bytes
-/// on the write-only page are stored before the fault. The run must then fail
-/// with that Tool error rather than continue with them stored.
-fn unreadable_crossing_tv_sec_fails_the_run(unmap_second_page: bool) {
+/// ends on an inaccessible or unmapped one. Linux's eight-byte `put_user`
+/// stores nothing. Hermit's kernel probe must discover that exact stopping
+/// point without modifying either page, and the guest must keep running.
+fn unreadable_crossing_tv_sec_stays_unchanged(unmap_second_page: bool) {
     let config = detcore::Config {
         virtualize_time: true,
         ..Default::default()
     };
-    let result = test_fn_with_config::<Detcore, _>(
+    let epoch_micros = config.epoch.timestamp_micros();
+    check_fn_with_config::<Detcore, _>(
         move || {
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let (pages, page_size) = map_pages(2);
             let boundary = unsafe { pages.add(page_size) };
+            fill_boundary(boundary);
             protect(pages, page_size, libc::PROT_WRITE);
             if unmap_second_page {
                 assert_eq!(unsafe { libc::munmap(boundary.cast(), page_size) }, 0);
             } else {
                 protect(boundary, page_size, libc::PROT_NONE);
             }
-            // Reached only if the repair lets the run continue.
+
             assert_eq!(
                 raw_gettimeofday(unsafe { boundary.sub(4) }.cast(), unmapped),
                 (-1, libc::EFAULT)
             );
+            let after = successful_gettimeofday();
+            let offset = timeval_micros(&after) - epoch_micros;
+            assert!(
+                (0..MAX_VIRTUAL_OFFSET_MICROS).contains(&offset),
+                "the guest did not continue with virtual time: {offset} microseconds past epoch"
+            );
+
+            protect(pages, page_size, libc::PROT_READ | libc::PROT_WRITE);
+            let mapped_after = if unmap_second_page {
+                0
+            } else {
+                protect(boundary, page_size, libc::PROT_READ);
+                BOUNDARY_WINDOW
+            };
+            assert_eq!(
+                boundary_window(boundary, mapped_after),
+                vec![BOUNDARY_FILL; BOUNDARY_WINDOW + mapped_after],
+                "the failed crossing tv_sec must remain byte-for-byte unchanged"
+            );
+            let mapped_len = if unmap_second_page {
+                page_size
+            } else {
+                2 * page_size
+            };
+            assert_eq!(unsafe { libc::munmap(pages.cast(), mapped_len) }, 0);
         },
         config,
         true,
     );
-    match result {
-        Err(reverie::Error::Tool(error)) => assert_eq!(
-            error.to_string(),
-            "replacing host time in the tv_sec of a failed gettimeofday: stored 4 of its 8 bytes \
-             before a fault, leaving it partly stored"
-        ),
-        other => panic!(
-            "expected the repair's Tool error, got {:?}",
-            other.map(|(output, _)| output.status)
-        ),
-    }
 }
 
 #[test]
-fn tod_gettimeofday_faulting_tz_tv_sec_into_inaccessible_page_fails_the_run() {
-    unreadable_crossing_tv_sec_fails_the_run(false);
+fn tod_gettimeofday_faulting_tz_crossing_into_inaccessible_page_leaves_tv_unchanged() {
+    unreadable_crossing_tv_sec_stays_unchanged(false);
 }
 
 #[test]
-fn tod_gettimeofday_faulting_tz_tv_sec_into_unmapped_page_fails_the_run() {
-    unreadable_crossing_tv_sec_fails_the_run(true);
+fn tod_gettimeofday_faulting_tz_crossing_into_unmapped_page_leaves_tv_unchanged() {
+    unreadable_crossing_tv_sec_stays_unchanged(true);
+}
+
+#[test]
+/// A protection key disables writes without changing the VMA's ordinary
+/// read/write permissions. The kernel probe must honor that thread-local PKRU
+/// state and therefore leave `tv` untouched when `tz` also faults.
+fn tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged() {
+    const PKEY_DISABLE_WRITE: libc::c_ulong = 0x2;
+
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch_micros = config.epoch.timestamp_micros();
+    check_fn_with_config::<Detcore, _>(
+        move || {
+            let (page, page_size) = map_pages(1);
+            let tv = page.cast::<libc::timeval>();
+            unsafe { tv.write(SENTINEL_TV) };
+
+            let pkey = unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, PKEY_DISABLE_WRITE) };
+            assert_ne!(
+                pkey,
+                -1,
+                "host lacks the pkey_alloc/PKEY_DISABLE_WRITE capability: {}",
+                std::io::Error::last_os_error()
+            );
+            let assigned = unsafe {
+                libc::syscall(
+                    libc::SYS_pkey_mprotect,
+                    page,
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    pkey,
+                )
+            };
+            assert_eq!(
+                assigned,
+                0,
+                "pkey_mprotect could not assign key {pkey}: {}",
+                std::io::Error::last_os_error()
+            );
+
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            assert_eq!(raw_gettimeofday(tv, unmapped), (-1, libc::EFAULT));
+            let after = successful_gettimeofday();
+            let offset = timeval_micros(&after) - epoch_micros;
+            assert!(
+                (0..MAX_VIRTUAL_OFFSET_MICROS).contains(&offset),
+                "the guest did not continue with virtual time: {offset} microseconds past epoch"
+            );
+
+            let restored = unsafe {
+                libc::syscall(
+                    libc::SYS_pkey_mprotect,
+                    page,
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    0,
+                )
+            };
+            assert_eq!(
+                restored,
+                0,
+                "pkey_mprotect could not restore key 0: {}",
+                std::io::Error::last_os_error()
+            );
+            let observed = unsafe { tv.read() };
+            assert_eq!(
+                (observed.tv_sec, observed.tv_usec),
+                (SENTINEL_TV.tv_sec, SENTINEL_TV.tv_usec),
+                "the PKEY_DISABLE_WRITE timeval must remain byte-for-byte unchanged"
+            );
+            assert_eq!(
+                unsafe { libc::syscall(libc::SYS_pkey_free, pkey) },
+                0,
+                "pkey_free({pkey}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(unsafe { libc::munmap(page.cast(), page_size) }, 0);
+        },
+        config,
+        true,
+    );
 }
 
 #[test]
