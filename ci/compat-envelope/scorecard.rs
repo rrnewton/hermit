@@ -4460,7 +4460,7 @@ This is measured ptrace-reference parity, not CI plan membership and not same-ba
 A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. The CLI can explicitly \
 select eligible not-applicable candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
-At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes perform ptrace-reference parity comparisons for eligible selected verify cells. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
+At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification: since https://github.com/rrnewton/hermit/issues/3301 no committed selector runs a ptrace reference, and parity no longer decides a validation outcome. The counts below come from recorded strict ptrace-vs-candidate reports; eligibility does not mean every cell was selected or measured.\n\n\
 | Candidate backend | Ptrace cells selected by full | Not-applicable probe candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
@@ -15194,16 +15194,16 @@ fn self_test() -> Result<(), String> {
     {
         return Err("scorecard selector description differs from the two actual commands".into());
     }
-    let active = selectors
+    if selectors
         .iter()
-        .filter(|step| step.cmd.contains("--parity-reference ptrace"))
-        .count();
-    let expected = match active {
-        0 => "currently perform ordinary same-backend verification",
-        2 => "perform ptrace-reference parity comparisons",
-        _ => return Err("scorecard description requires both existing selectors to agree".into()),
-    };
-    if !matching_markdown.contains(expected) {
+        .any(|step| step.cmd.contains("--parity-reference"))
+    {
+        return Err(
+            "a constructed backend-parity-c selector passes --parity-reference, which https://github.com/rrnewton/hermit/issues/3301 removed"
+                .into(),
+        );
+    }
+    if !matching_markdown.contains("currently perform ordinary same-backend verification") {
         return Err(
             "scorecard execution description is stale against the constructed selectors".into(),
         );
