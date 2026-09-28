@@ -568,6 +568,10 @@ fn lint_checks_recipe(makefile: &str) -> String {
 }
 
 fn self_test() {
+    assert!(
+        !is_invoked("python3 -c ./scripts/check-z.py", "scripts/check-z.py"),
+        "python -c receives source text even when that text looks like a dotted path"
+    );
     // Comment stripping is what separates a real invocation from a mention.
     let sh = "# ./scripts/check-a.sh mentioned in a comment\n./scripts/check-b.sh\n";
     let stripped = strip_comments(sh, "x.sh");
