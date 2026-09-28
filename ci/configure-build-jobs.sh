@@ -548,8 +548,18 @@ fi
 # CMAKE_GENERATOR, MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds.
 # This carries source identity and the existing budget, not a new timing sample,
 # total Rust compilation budget or runtime evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 895d214e495af3e4bb5cff0b69d2603a01cea40d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 895d214e495af3e4bb5cff0b69d2603a01cea40d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 547278b9b5e9a205c92e40c9e6f189beb8a3ddd7: from
+# 895d214e495af3e4bb5cff0b69d2603a01cea40d, all 99 committed resource inputs
+# and all 934 reverie-dbt/third-party entries retain identical modes and blobs.
+# The complete DBT tree remains a62d15302ee5e907667d1c02f6e629177ad87f61;
+# build.rs remains 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO
+# remains 117d54d744df23921c531d0fe08537249f5a510a. The imported KVM,
+# ptrace/safeptrace, seccomp and LiteInst changes do not alter this recipe.
+# Preserve default CMAKE, unset CMAKE_GENERATOR, native options,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds. This is conditional
+# source-identity carry, not a new timing sample or consumer qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 547278b9b5e9a205c92e40c9e6f189beb8a3ddd7 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 547278b9b5e9a205c92e40c9e6f189beb8a3ddd7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

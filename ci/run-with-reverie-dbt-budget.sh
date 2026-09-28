@@ -457,7 +457,7 @@ fi
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged.
 # This is source-identity carry, not a new timing sample or runtime qualification.
 # Source-identical DBT recipe carry is documented in ci/configure-build-jobs.sh.
-expected_pin=895d214e495af3e4bb5cff0b69d2603a01cea40d
+expected_pin=547278b9b5e9a205c92e40c9e6f189beb8a3ddd7
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
