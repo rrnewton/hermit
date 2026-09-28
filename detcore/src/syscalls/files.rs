@@ -4702,9 +4702,44 @@ mod procfs_wiring_guard {
     /// What `maps_identities_are_minted_through_the_tested_loop` requires of
     /// the `initialize_procfs_snapshot` body; an empty result means it passes.
     fn maps_minting_wiring_violations(body: &str) -> Vec<&'static str> {
+        const CALL: &str = "crate::procfs::mint_mapping_identities(";
         let mut violations = Vec::new();
-        if !body.contains("crate::procfs::mint_mapping_identities(") {
-            violations.push("does not call `crate::procfs::mint_mapping_identities`");
+        match body.find(CALL) {
+            None => violations.push("does not call `crate::procfs::mint_mapping_identities`"),
+            Some(start) => {
+                // The call's argument list, up to its balancing `)`. The
+                // snapshot bytes must be the ones passed, unmodified: a
+                // re-sorted copy would feed the tested loop host-ordered input.
+                // And the stdio map built above must be the one passed: an
+                // empty map here would drop the fdinfo-consistent stdio inode
+                // override and no unit test of the loop itself could notice.
+                let args = &body[start + CALL.len()..];
+                let mut depth = 0usize;
+                let end = args
+                    .char_indices()
+                    .find_map(|(i, c)| match c {
+                        '(' | '[' | '{' => {
+                            depth += 1;
+                            None
+                        }
+                        ')' | ']' | '}' if depth == 0 => Some(i),
+                        ')' | ']' | '}' => {
+                            depth -= 1;
+                            None
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(args.len());
+                if args[..end].split(',').next().map(str::trim) != Some("&contents") {
+                    violations.push("does not pass `&contents` as the snapshot to mint from");
+                }
+                if !args[..end]
+                    .split(',')
+                    .any(|arg| arg.trim() == "&stdio_by_raw_inode")
+                {
+                    violations.push("does not pass `&stdio_by_raw_inode` to the minting loop");
+                }
+            }
         }
         // Parsing mapping identities here would mean the order in which this
         // body mints is no longer the order the unit tests drive.
@@ -4726,8 +4761,9 @@ mod procfs_wiring_guard {
         // itself, by `tool_global::tests::maps_*_are_minted_in_text_order_not_raw_order`,
         // which drive `crate::procfs::mint_mapping_identities`. What those tests
         // cannot see is whether the snapshot initialiser still calls that loop.
-        // This checks only that: the body calls it and does not parse mapping
-        // identities on its own. It does not check the order.
+        // This checks only that: the body calls it with `&contents` and
+        // `&stdio_by_raw_inode`, and does not parse mapping identities on its
+        // own. It does not check the order.
         let body = handler_body("initialize_procfs_snapshot");
         assert!(
             body.len() > 200 && body.contains("needs_mapping_identities"),
@@ -4748,16 +4784,44 @@ mod procfs_wiring_guard {
     #[test]
     fn maps_minting_wiring_check_rejects_a_local_loop() {
         // Positive controls: bodies that bypass the tested loop must be rejected,
-        // otherwise the guard above would pass vacuously.
+        // otherwise the guard above would pass vacuously. Each control asserts
+        // the EXACT violation list, and all but `local_loop` violate one rule
+        // only, so disabling any single check makes its own control fail.
+        const NO_CALL: &str = "does not call `crate::procfs::mint_mapping_identities`";
+        const NOT_CONTENTS: &str = "does not pass `&contents` as the snapshot to mint from";
+        const NO_STDIO: &str = "does not pass `&stdio_by_raw_inode` to the minting loop";
+        const LOCAL_PARSE: &str = "parses mapping identities itself instead of delegating";
+
+        let no_call = "let mapping_identities = BTreeMap::new();";
+        assert_eq!(maps_minting_wiring_violations(no_call), [NO_CALL]);
         let local_loop = "let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)\n\
                           .lines().filter_map(crate::procfs::mapping_header_identity).collect();";
-        assert!(!maps_minting_wiring_violations(local_loop).is_empty());
+        assert_eq!(
+            maps_minting_wiring_violations(local_loop),
+            [NO_CALL, LOCAL_PARSE]
+        );
         let local_order = "let raw_pairs = crate::procfs::mapping_identities_in_text_order(&text);\n\
-                           crate::procfs::mint_mapping_identities(&contents, &stdio, &mut minter)";
-        assert!(!maps_minting_wiring_violations(local_order).is_empty());
+                           crate::procfs::mint_mapping_identities(&contents, &stdio_by_raw_inode, &mut minter)";
+        assert_eq!(maps_minting_wiring_violations(local_order), [LOCAL_PARSE]);
+        let other_buffer = "crate::procfs::mint_mapping_identities(\n\
+                            &resorted,\n\
+                            &stdio_by_raw_inode,\n\
+                            &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                            )";
+        assert_eq!(maps_minting_wiring_violations(other_buffer), [NOT_CONTENTS]);
+        let no_stdio = "crate::procfs::mint_mapping_identities(\n\
+                        &contents,\n\
+                        &BTreeMap::new(),\n\
+                        &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                        )";
+        assert_eq!(maps_minting_wiring_violations(no_stdio), [NO_STDIO]);
         assert!(
             maps_minting_wiring_violations(
-                "crate::procfs::mint_mapping_identities(&contents, &stdio, &mut minter)"
+                "crate::procfs::mint_mapping_identities(\n\
+                 &contents,\n\
+                 &stdio_by_raw_inode,\n\
+                 &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                 )"
             )
             .is_empty()
         );
