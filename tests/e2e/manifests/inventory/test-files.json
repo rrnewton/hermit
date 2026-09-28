@@ -319,6 +319,12 @@
       "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/external_signal_interrupt.c",
+      "runner": "hermit-cli/tests/external_signal_interrupt.rs",
+      "why": "tests/c/external_signal_interrupt.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The dedicated integration suite compiles this guest and signals it from outside Hermit, from a live sibling process or thread, and from ITIMER_REAL while it blocks in FUTEX_WAIT, select, wait4 or waitid, asserting the one RESULT line under both futex modes and both the ptrace and LiteInst backends (https://github.com/rrnewton/hermit/issues/3146). External delivery needs a host-side sender that finds the guest by argv[0], which a manifest cannot express."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/faccessat2_flags.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
