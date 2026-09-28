@@ -57,6 +57,19 @@ static unsigned char byte_read(int fd) {
   return value;
 }
 
+#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
+/* PAUSE is a nonblocking spin hint: the thread stays runnable while retiring
+ * branches less densely than a bare LOOP. Keep the same finite branch count
+ * and expose the consumed loop counter to C. This also slows worker samples. */
+static uint64_t runnable_work(uint64_t iterations) {
+  CHECK(iterations != 0);
+  uint64_t remaining = iterations;
+  __asm__ volatile("1: pause\n loop 1b" : "+c"(remaining));
+  CHECK(remaining == 0);
+  return 1 + 3 * (iterations - remaining);
+}
+#endif
+
 /* Real branches between raw syscalls exercise the surviving PMU clock. Every
  * nanosecond sample and work result is printed and compared without rounding. */
 static uint64_t samples(const char *phase, int round, uint64_t previous) {
@@ -68,12 +81,16 @@ static uint64_t samples(const char *phase, int round, uint64_t previous) {
     /* A branch costs 10ns: 120k actual branches exceed the 100k-RCB timer at
      * 1ms. Compact work bounds precise-timer single-step TRACE output. */
     uint64_t iterations = index == 0 ? 120000 : 2000 + index * 200;
+#ifdef NONLEADER_EXEC_RUNNABLE_LEADER
+    work = runnable_work(iterations);
+#else
     uint64_t remaining = iterations;
     /* LOOP decrements RCX and conditionally branches in one instruction. The
      * read/write RCX constraint makes the finite counter visible to C. */
     __asm__ volatile("1: loop 1b" : "+c"(remaining));
     CHECK(remaining == 0);
     work += 3 * (iterations - remaining);
+#endif
 #else
     for (unsigned i = 0; i < 10000 + index * 1000; ++i) {
       if (i & 1)
@@ -112,7 +129,7 @@ static void *exec_worker(void *unused) {
     CHECK(pthread_cond_wait(&ready, &mutex) == 0);
   CHECK(leader_waiting);
 #ifdef NONLEADER_EXEC_RUNNABLE_LEADER
-  /* The leader first executes a branch-heavy spin, then releases this worker.
+  /* The leader first executes a preemptible spin, then releases this worker.
    * After that release it remains runnable until the kernel destroys it. */
   while (!leader_spinning)
     CHECK(pthread_cond_wait(&ready, &mutex) == 0);
@@ -155,11 +172,9 @@ static void start_round(void) {
   int announced = 0;
   CHECK(syscall(SYS_getppid) > 0);
   for (;;) {
-    /* Compact actual branches keep precise-timer single-step TRACE output
-     * bounded. After the one release this leader executes no blocking calls. */
-    uint64_t iterations = 120000;
-    __asm__ volatile("1: loop 1b" : "+c"(iterations));
-    CHECK(iterations == 0);
+    /* After the one release this leader executes no blocking calls. The
+     * initial 120k branches force a timer before it releases the worker. */
+    (void)runnable_work(120000);
     if (!announced) {
       CHECK(pthread_mutex_lock(&mutex) == 0);
       leader_spinning = 1;

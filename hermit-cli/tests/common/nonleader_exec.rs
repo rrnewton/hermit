@@ -284,11 +284,15 @@ fn run_fixture(scenario: Scenario) {
             "--",
             guest.to_str().unwrap(),
         ];
-        if preempted {
-            // The default 1k margin saw 1,440 branches of total skid here;
-            // 10k exceeded the TRACE cap, and 4k left no log headroom. Notify
-            // 3,072 branches early (>2.1x that observation). This changes
-            // neither the exact target nor refusal of any future overshoot.
+        if scenario == Scenario::RunnableLeader {
+            // PAUSE slows branch retirement in both hot loops. Use a 2,048-RCB
+            // early notification (still above the 1,440-RCB total skid seen
+            // here). This budgets the two-instruction correction tail within
+            // the existing CPU and TRACE caps. It changes neither the precise
+            // target nor refusal of any future overshoot.
+            args.insert(8, "--skid-margin=2048");
+        } else if preempted {
+            // Keep the blocked-leader cell's existing early notification.
             args.insert(8, "--skid-margin=3072");
         }
         let mut command = super::hermit_command(&args);
