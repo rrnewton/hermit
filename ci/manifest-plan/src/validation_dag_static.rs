@@ -236,7 +236,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
-    // controls retain all 783 prior identities.
+    // controls retain all 789 prior identities.
     // The fractional-boot /proc/uptime and round-up sysinfo(2) uptime
     // regressions retain all 797 prior identities.
     // The fixed-boot-instant /proc/stat btime regression retains all 799 prior
