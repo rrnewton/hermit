@@ -445,6 +445,13 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_random_uuid)
     }
 
+    pub(crate) fn procfs_needs_boot_time(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_boot_time)
+    }
+
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
