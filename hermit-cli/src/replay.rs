@@ -147,7 +147,7 @@ impl Replay {
         // select Hermit itself. The target is pre-created to avoid allocation
         // in reverie-process's small pre-exec clone stack.
         let proc_target = chroot.path().join("proc");
-        command.mount(Mount::proc().target(&proc_target));
+        command.mount(Mount::proc().allow_readonly_fallback().target(&proc_target));
 
         command.chroot(chroot.path());
 

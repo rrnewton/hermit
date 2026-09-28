@@ -27,6 +27,9 @@ mod kvm_synchronous_fault;
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
+#[path = "common/readonly_proc.rs"]
+mod readonly_proc;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -1181,6 +1184,69 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
             Ok(())
         });
     }
+}
+
+fn readonly_proc_command(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    // The inherited validation workdir is sufficient for these read-only guests.
+    // A fresh /test tmpfs mount would also be denied by the flags-zero filter.
+    append_hermit_args_using_outer_mount(&mut command, args);
+    // SAFETY: The helper installs the filter using only async-signal-safe
+    // syscalls, in the child before exec, without affecting the test process.
+    unsafe {
+        command.pre_exec(readonly_proc::deny_writable_mounts);
+    }
+    command
+}
+
+fn assert_readonly_proc_run(namespace_only: bool) {
+    let _guard = hermit_run_guard();
+    let mut args = vec![
+        "run",
+        // Local networking would require another flags-zero mount for sysfs.
+        "--network=host",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    if namespace_only {
+        args.push("--namespace-only");
+    } else {
+        args.push("--backend=ptrace");
+    }
+    args.extend_from_slice(&["--", "/bin/cat", "/proc/mounts", "/proc/self/status"]);
+    let output = readonly_proc_command(&args)
+        .output()
+        .expect("start Hermit with writable mounts denied");
+    assert_success(&output, &args);
+    let stdout = stdout(&output);
+    let (mounts, status) = stdout
+        .split_once("\nName:")
+        .expect("cat must return both proc mounts and process status");
+    readonly_proc::assert_readonly_proc(mounts, status, if namespace_only { 1 } else { 3 });
+}
+
+#[test]
+fn namespace_only_uses_readonly_proc_after_permission_denial() {
+    assert_readonly_proc_run(true);
+}
+
+#[test]
+fn run_uses_readonly_proc_after_permission_denial() {
+    assert_readonly_proc_run(false);
+}
+
+#[test]
+fn record_replay_uses_readonly_proc_after_permission_denial() {
+    let _guard = hermit_run_guard();
+    let args = ["record", "--verify", "--", "/bin/true"];
+    let output = readonly_proc_command(&args)
+        .output()
+        .expect("start record/replay with writable mounts denied");
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).contains("Success: replay matched recording."),
+        "record must complete replay verification under the mount restriction: {output:?}"
+    );
 }
 
 #[test]
