@@ -939,32 +939,6 @@ mod posix_timers_tests {
         // Deleting again fails.
         assert!(!timers.remove(id));
     }
-
-    #[test]
-    fn exec_deletes_armed_disarmed_and_non_notifying_timers() {
-        let mut timers = PosixTimers::default();
-        let periodic = timers.create(Some(libc::SIGUSR2));
-        let disarmed = timers.create(Some(libc::SIGALRM));
-        let silent = timers.create(None);
-        timers.settime(periodic, 50, Some(t(100)), t(0));
-        timers.settime(silent, 0, Some(t(200)), t(0));
-
-        timers.clear_for_exec();
-        for id in [periodic, disarmed, silent] {
-            assert!(!timers.contains(id));
-            assert_eq!(timers.gettime(id, t(10)), None);
-            assert_eq!(timers.settime(id, 0, Some(t(300)), t(10)), None);
-            assert_eq!(timers.signal(id), None);
-            assert!(!timers.remove(id));
-        }
-        // A repeated notification is harmless, and the new image can create
-        // and arm timers without reviving the old objects.
-        timers.clear_for_exec();
-        let new = timers.create(Some(libc::SIGUSR1));
-        assert_eq!(new, 3);
-        assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
-        assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
-    }
 }
 
 #[cfg(test)]

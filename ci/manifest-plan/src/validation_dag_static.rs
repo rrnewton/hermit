@@ -244,7 +244,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The every-representable-offset btime regression and the btime-only-for-
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
-    // Five exec POSIX timer lifecycle controls retain all 802 prior identities.
+    // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     ("test.detcore_unit", 807),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
