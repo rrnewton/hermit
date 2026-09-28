@@ -14134,7 +14134,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "34");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "35");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -14160,7 +14160,7 @@ mod nextest_timeout_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            33,
+            34,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -14168,6 +14168,7 @@ mod nextest_timeout_tests {
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
             "run_kvm_synchronous_orphan_segv_preserves_root_success",
             "run_kvm_root_exit_reparents_live_child_and_grandchild",
+            "run_kvm_exec_deletes_posix_timers_and_preserves_itimer",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -15125,11 +15126,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 33 run_kvm_ declarations and
+        // The shipped KVM selection contains 34 run_kvm_ declarations and
         // the unchanged initialized-VM setup control. The eight-mode timer,
         // two-role retirement and six-mode reparenting tests each count as
         // one selected test.
-        ("privileged-only-test.cli_kvm", 34usize),
+        ("privileged-only-test.cli_kvm", 35usize),
     ] {
         let step = privileged
             .steps
