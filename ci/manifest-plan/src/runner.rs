@@ -455,6 +455,14 @@ pub struct Selection {
     pub test: Option<String>,
     pub mode: Option<String>,
     pub backend: Option<String>,
+    /// Hermit backends whose cells this selection omits.
+    ///
+    /// The only committed caller is the GitHub-hosted portable profile, whose
+    /// runners expose `/dev/kvm` without the PMU counter the KVM guest clock
+    /// needs. Those cells stay in the local `full` and `portable` profiles; the
+    /// hosted profile's expected population omits them by the same list, so an
+    /// omitted cell is never counted as a pass.
+    pub exclude_backends: Vec<String>,
     pub include_occasional: bool,
     pub include_manual: bool,
 }
@@ -692,6 +700,7 @@ impl ManifestSet {
                         .backend
                         .as_deref()
                         .is_some_and(|value| value != backend)
+                        || selection.exclude_backends.contains(&backend)
                     {
                         continue;
                     }

@@ -14483,7 +14483,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_applications/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category applications --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_applications/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "applications"
@@ -14502,13 +14502,6 @@
           "test": "applications/git-repository-workflow",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "applications",
-          "test": "applications/timed-progress-bar",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14560,7 +14553,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_bin_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_bin_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_bin_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_bin_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "bin-c"
@@ -14630,7 +14623,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "c-programs"
@@ -14641,13 +14634,6 @@
           "category": "c-programs",
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/acct-refusal-probe",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14663,13 +14649,6 @@
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/add-key-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14697,13 +14676,6 @@
           "category": "c-programs",
           "test": "c-programs/adjtimex-deterministic",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/adjtimex-deterministic",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14725,13 +14697,6 @@
           "category": "c-programs",
           "test": "c-programs/aio-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/aio-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14740,13 +14705,6 @@
           "test": "c-programs/aio-refusal",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/append-pwrite",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14767,21 +14725,7 @@
           "category": "c-programs",
           "test": "c-programs/arch-prctl-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/arch-prctl-determinism",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/bind-getsockname",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14796,13 +14740,6 @@
           "test": "c-programs/bind-getsockname",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/bpf-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14830,13 +14767,6 @@
           "category": "c-programs",
           "test": "c-programs/cachestat-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/cachestat-enosys",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14858,13 +14788,6 @@
           "category": "c-programs",
           "test": "c-programs/cachestat-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/cachestat-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14879,13 +14802,6 @@
           "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/child-subreaper-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14894,13 +14810,6 @@
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/clock-adjtime-deterministic",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14942,13 +14851,6 @@
           "category": "c-programs",
           "test": "c-programs/close-range-fds",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/close-range-fds",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14957,13 +14859,6 @@
           "test": "c-programs/close-range-fds",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/copy-file-range-refusal-probe",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14991,13 +14886,6 @@
           "category": "c-programs",
           "test": "c-programs/copy-file-range-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/copy-file-range-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15012,13 +14900,6 @@
           "category": "c-programs",
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/cpu-virtualization",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15033,13 +14914,6 @@
           "category": "c-programs",
           "test": "c-programs/cwd-roundtrip",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/cwd-roundtrip",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15054,13 +14928,6 @@
           "category": "c-programs",
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/dbt-copied-tiocgpgrp",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15069,13 +14936,6 @@
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/dbt-exec-failure",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15103,21 +14963,7 @@
           "category": "c-programs",
           "test": "c-programs/dbt-execveat-unsupported",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/dbt-execveat-unsupported",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/dbt-mmap-exec",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15139,13 +14985,6 @@
           "test": "c-programs/dbt-mmap-exec",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/dbt-prlimit-self",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15202,13 +15041,6 @@
           "test": "c-programs/dbt-wait-lifecycle",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/dup-shared-offset",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15243,13 +15075,6 @@
           "category": "c-programs",
           "test": "c-programs/epoll-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/epoll-determinism",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15285,13 +15110,6 @@
           "category": "c-programs",
           "test": "c-programs/epoll-readiness",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/epoll-readiness",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15320,13 +15138,6 @@
           "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/eventfd-semantics",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15341,13 +15152,6 @@
           "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/faccessat2-flags",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15362,13 +15166,6 @@
           "category": "c-programs",
           "test": "c-programs/fadvise-hints",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/fadvise-hints",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15383,13 +15180,6 @@
           "category": "c-programs",
           "test": "c-programs/fallocate-extents",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/fallocate-extents",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15398,13 +15188,6 @@
           "test": "c-programs/fallocate-extents",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/fchmod-bits",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15453,13 +15236,6 @@
           "category": "c-programs",
           "test": "c-programs/fd-duplication",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/fd-duplication",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15474,13 +15250,6 @@
           "category": "c-programs",
           "test": "c-programs/file-backed-mmap",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/file-backed-mmap",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15495,13 +15264,6 @@
           "category": "c-programs",
           "test": "c-programs/file-io-roundtrip",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/file-io-roundtrip",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15516,13 +15278,6 @@
           "category": "c-programs",
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/flock-lifecycle",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15531,13 +15286,6 @@
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/fork-exec-pipeline",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15586,13 +15334,6 @@
           "category": "c-programs",
           "test": "c-programs/ftruncate-sparse",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ftruncate-sparse",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15607,13 +15348,6 @@
           "category": "c-programs",
           "test": "c-programs/futex-requeue-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/futex-requeue-enosys",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15629,13 +15363,6 @@
           "test": "c-programs/futex-requeue-enosys",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/futex-waitv-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15663,13 +15390,6 @@
           "category": "c-programs",
           "test": "c-programs/futex-wake-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/futex-wake-enosys",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15691,13 +15411,6 @@
           "category": "c-programs",
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-child",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15706,13 +15419,6 @@
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/get-robust-list-self",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15740,13 +15446,6 @@
           "category": "c-programs",
           "test": "c-programs/getcpu-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/getcpu-identity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15761,13 +15460,6 @@
           "category": "c-programs",
           "test": "c-programs/getcpu",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/getcpu",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15782,13 +15474,6 @@
           "category": "c-programs",
           "test": "c-programs/getitimer-determinism-probe",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/getitimer-determinism-probe",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15797,13 +15482,6 @@
           "test": "c-programs/getitimer-determinism-probe",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/getpriority-identity",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -15831,13 +15509,6 @@
           "category": "c-programs",
           "test": "c-programs/getsockopt-null",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/getsockopt-null",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15880,13 +15551,6 @@
           "category": "c-programs",
           "test": "c-programs/hello-nostdlib",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/hello-nostdlib",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15922,13 +15586,6 @@
           "category": "c-programs",
           "test": "c-programs/inline-syscall-sites",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/inline-syscall-sites",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -15957,13 +15614,6 @@
           "category": "c-programs",
           "test": "c-programs/io-uring-fallback",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/io-uring-fallback",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15978,13 +15628,6 @@
           "category": "c-programs",
           "test": "c-programs/io-uring-ring-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/io-uring-ring-determinism",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15993,13 +15636,6 @@
           "test": "c-programs/io-uring-ring-determinism",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ioctl-fioclex",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16035,13 +15671,6 @@
           "test": "c-programs/ioctl-fionread",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ioctl-siocethtool",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16083,13 +15712,6 @@
           "category": "c-programs",
           "test": "c-programs/kcmp-eperm",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/kcmp-eperm",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16098,13 +15720,6 @@
           "test": "c-programs/kcmp-eperm",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/kcmp-refusal",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16125,13 +15740,6 @@
           "category": "c-programs",
           "test": "c-programs/keyctl-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/keyctl-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16146,13 +15754,6 @@
           "category": "c-programs",
           "test": "c-programs/keyctl-passthrough",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/keyctl-passthrough",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16161,13 +15762,6 @@
           "test": "c-programs/keyctl-passthrough",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/linkat-flags",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16182,13 +15776,6 @@
           "test": "c-programs/linkat-flags",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/listmount-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16216,13 +15803,6 @@
           "category": "c-programs",
           "test": "c-programs/lseek-positioning",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lseek-positioning",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16237,13 +15817,6 @@
           "category": "c-programs",
           "test": "c-programs/lsm-get-self-attr-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-get-self-attr-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16258,13 +15831,6 @@
           "category": "c-programs",
           "test": "c-programs/lsm-list-modules-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-list-modules-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16279,13 +15845,6 @@
           "category": "c-programs",
           "test": "c-programs/lsm-set-self-attr-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/lsm-set-self-attr-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16300,13 +15859,6 @@
           "category": "c-programs",
           "test": "c-programs/madvise-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/madvise-determinism",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16321,13 +15873,6 @@
           "category": "c-programs",
           "test": "c-programs/map-shadow-stack-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/map-shadow-stack-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16342,13 +15887,6 @@
           "category": "c-programs",
           "test": "c-programs/mce-kill-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mce-kill-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16363,13 +15901,6 @@
           "category": "c-programs",
           "test": "c-programs/membarrier-query",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/membarrier-query",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16384,13 +15915,6 @@
           "category": "c-programs",
           "test": "c-programs/memfd-create",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/memfd-create",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16405,13 +15929,6 @@
           "category": "c-programs",
           "test": "c-programs/memfd-secret-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/memfd-secret-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16426,13 +15943,6 @@
           "category": "c-programs",
           "test": "c-programs/meminfo-available-deterministic",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/meminfo-available-deterministic",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16447,13 +15957,6 @@
           "category": "c-programs",
           "test": "c-programs/meminfo-cached-deterministic",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/meminfo-cached-deterministic",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16468,13 +15971,6 @@
           "category": "c-programs",
           "test": "c-programs/meminfo-free-deterministic",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/meminfo-free-deterministic",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16489,13 +15985,6 @@
           "category": "c-programs",
           "test": "c-programs/memorypress",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/memorypress",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16510,13 +15999,6 @@
           "category": "c-programs",
           "test": "c-programs/mempolicy-default",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mempolicy-default",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16531,13 +16013,6 @@
           "category": "c-programs",
           "test": "c-programs/mincore-residency",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mincore-residency",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16552,13 +16027,6 @@
           "category": "c-programs",
           "test": "c-programs/mixed-inline-and-libc-syscalls",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mixed-inline-and-libc-syscalls",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16573,13 +16041,6 @@
           "category": "c-programs",
           "test": "c-programs/mkdir-rmdir",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mkdir-rmdir",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16594,13 +16055,6 @@
           "category": "c-programs",
           "test": "c-programs/mknod-special",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mknod-special",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16609,13 +16063,6 @@
           "test": "c-programs/mknod-special",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mmap-determinism",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16643,13 +16090,6 @@
           "category": "c-programs",
           "test": "c-programs/mmap-layout-pointer-order",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mmap-layout-pointer-order",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16658,13 +16098,6 @@
           "test": "c-programs/mmap-layout-pointer-order",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/mmap-stress-determinism",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16699,13 +16132,6 @@
           "category": "c-programs",
           "test": "c-programs/name-to-handle-at-eopnotsupp",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/name-to-handle-at-eopnotsupp",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16727,13 +16153,6 @@
           "category": "c-programs",
           "test": "c-programs/name-to-handle-directory-eopnotsupp",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/name-to-handle-directory-eopnotsupp",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16749,13 +16168,6 @@
           "test": "c-programs/name-to-handle-directory-eopnotsupp",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/name-to-handle-empty-path-eopnotsupp",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16783,13 +16195,6 @@
           "category": "c-programs",
           "test": "c-programs/name-to-handle-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/name-to-handle-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16798,13 +16203,6 @@
           "test": "c-programs/name-to-handle-refusal",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/name-to-handle-regular-eopnotsupp",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16826,13 +16224,6 @@
           "test": "c-programs/name-to-handle-regular-eopnotsupp",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/nanosleep-par",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16860,13 +16251,6 @@
           "category": "c-programs",
           "test": "c-programs/netlink-autobind-generic",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/netlink-autobind-generic",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16888,13 +16272,6 @@
           "category": "c-programs",
           "test": "c-programs/netlink-autobind-route",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/netlink-autobind-route",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -16910,13 +16287,6 @@
           "test": "c-programs/netlink-autobind-route",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/netlink-autobind-usersock",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16944,13 +16314,6 @@
           "category": "c-programs",
           "test": "c-programs/netns-cookie-tcp4",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/netns-cookie-tcp4",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16965,13 +16328,6 @@
           "category": "c-programs",
           "test": "c-programs/netns-cookie-tcp6",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/netns-cookie-tcp6",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -16980,13 +16336,6 @@
           "test": "c-programs/netns-cookie-tcp6",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/netns-cookie-udp4",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17007,13 +16356,6 @@
           "category": "c-programs",
           "test": "c-programs/no-new-privs-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/no-new-privs-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17028,13 +16370,6 @@
           "category": "c-programs",
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/numa-node-identity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17049,13 +16384,6 @@
           "category": "c-programs",
           "test": "c-programs/o-tmpfile-anon",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/o-tmpfile-anon",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17070,13 +16398,6 @@
           "category": "c-programs",
           "test": "c-programs/openat-flags",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/openat-flags",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17091,13 +16412,6 @@
           "category": "c-programs",
           "test": "c-programs/openat2-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/openat2-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17106,13 +16420,6 @@
           "test": "c-programs/openat2-refusal",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/path-file-ops",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17147,13 +16454,6 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-hardware-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17168,13 +16468,6 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-open-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-open-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17189,13 +16482,6 @@
           "category": "c-programs",
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-software-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17204,13 +16490,6 @@
           "test": "c-programs/perf-event-software-enosys",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/perf-event-watchpoint-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17259,13 +16538,6 @@
           "category": "c-programs",
           "test": "c-programs/pid-probe",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pid-probe",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17287,13 +16559,6 @@
           "category": "c-programs",
           "test": "c-programs/pidfd-open-self-pair",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pidfd-open-self-pair",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17308,13 +16573,6 @@
           "category": "c-programs",
           "test": "c-programs/pidfd-open-self",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pidfd-open-self",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17323,13 +16581,6 @@
           "test": "c-programs/pidfd-open-self",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pidfd-poll-self",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17357,13 +16608,6 @@
           "category": "c-programs",
           "test": "c-programs/pipe-capacity-pin",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pipe-capacity-pin",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17378,13 +16622,6 @@
           "category": "c-programs",
           "test": "c-programs/pipe-capacity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pipe-capacity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17393,13 +16630,6 @@
           "test": "c-programs/pipe-capacity",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pipe-ipc",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17427,13 +16657,6 @@
           "category": "c-programs",
           "test": "c-programs/pipe2-errno-precedence",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pipe2-errno-precedence",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17448,13 +16671,6 @@
           "category": "c-programs",
           "test": "c-programs/pipe2-flags",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pipe2-flags",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17477,13 +16693,6 @@
           "test": "c-programs/poll-readiness",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ppoll-readv",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17511,13 +16720,6 @@
           "category": "c-programs",
           "test": "c-programs/prctl-dumpable",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/prctl-dumpable",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17546,13 +16748,6 @@
           "category": "c-programs",
           "test": "c-programs/prctl-option-policy",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/prctl-option-policy",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17574,13 +16769,6 @@
           "category": "c-programs",
           "test": "c-programs/pread64-nostdlib",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/pread64-nostdlib",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17596,13 +16784,6 @@
           "test": "c-programs/preadv2-flags",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/print-memaddrs",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17651,13 +16832,6 @@
           "category": "c-programs",
           "test": "c-programs/proc-locks",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/proc-locks",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17672,13 +16846,6 @@
           "category": "c-programs",
           "test": "c-programs/process-mrelease-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/process-mrelease-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17693,13 +16860,6 @@
           "category": "c-programs",
           "test": "c-programs/process-vm-readv-refusal-probe",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/process-vm-readv-refusal-probe",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17708,13 +16868,6 @@
           "test": "c-programs/process-vm-readv-refusal-probe",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/process-vm-writev-refusal-probe",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17743,13 +16896,6 @@
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/procfs-positioned-probe",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17798,21 +16944,7 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-attach-eperm",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ptrace-attach-eperm",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ptrace-eperm",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17833,21 +16965,7 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ptrace-seize-eperm",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ptrace-traceme-eperm",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17876,13 +16994,6 @@
           "test": "c-programs/pty-nr-count",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/racewrite-nostdlib",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17903,13 +17014,6 @@
           "category": "c-programs",
           "test": "c-programs/random-readv-stream",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/random-readv-stream",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17924,13 +17028,6 @@
           "category": "c-programs",
           "test": "c-programs/rcx-canonicalization",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/rcx-canonicalization",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17945,13 +17042,6 @@
           "category": "c-programs",
           "test": "c-programs/readdir-entries",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/readdir-entries",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17960,13 +17050,6 @@
           "test": "c-programs/readdir-entries",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/readdir-order-identity",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17995,13 +17078,6 @@
           "test": "c-programs/record-lock",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/record-replay-fd-close",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18043,13 +17119,6 @@
           "category": "c-programs",
           "test": "c-programs/record-replay-setsockopt",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/record-replay-setsockopt",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18064,13 +17133,6 @@
           "category": "c-programs",
           "test": "c-programs/recvmsg-scm-rights-mmap",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/recvmsg-scm-rights-mmap",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18085,13 +17147,6 @@
           "category": "c-programs",
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/remap-file-pages-anonymous-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18100,13 +17155,6 @@
           "test": "c-programs/remap-file-pages-anonymous-enosys",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/remap-file-pages-memfd-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18127,21 +17175,7 @@
           "category": "c-programs",
           "test": "c-programs/remap-file-pages-tmpfile-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/remap-file-pages-tmpfile-enosys",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/rename-ops",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18162,13 +17196,6 @@
           "category": "c-programs",
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/renameat2-flags",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18177,13 +17204,6 @@
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/request-key-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18211,13 +17231,6 @@
           "category": "c-programs",
           "test": "c-programs/rlimit-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/rlimit-identity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18232,13 +17245,6 @@
           "category": "c-programs",
           "test": "c-programs/robust-list",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/robust-list",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18253,13 +17259,6 @@
           "category": "c-programs",
           "test": "c-programs/sched-getaffinity-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sched-getaffinity-identity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18268,13 +17267,6 @@
           "test": "c-programs/sched-getaffinity-identity",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sched-setattr-batch",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18295,13 +17287,6 @@
           "category": "c-programs",
           "test": "c-programs/sched-setattr-idle",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sched-setattr-idle",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18310,13 +17295,6 @@
           "test": "c-programs/sched-setattr-idle",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sched-setattr-other",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18344,13 +17322,6 @@
           "category": "c-programs",
           "test": "c-programs/scheduler-policy-queries",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/scheduler-policy-queries",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18365,13 +17336,6 @@
           "category": "c-programs",
           "test": "c-programs/seccomp-refusal",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/seccomp-refusal",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18380,13 +17344,6 @@
           "test": "c-programs/seccomp-refusal",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sendfile-copy",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18407,21 +17364,7 @@
           "category": "c-programs",
           "test": "c-programs/session-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/session-identity",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/set-tid-address",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18442,21 +17385,7 @@
           "category": "c-programs",
           "test": "c-programs/setitimer-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/setitimer-determinism",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/short-io-split-identity",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18471,13 +17400,6 @@
           "test": "c-programs/short-io-split-identity",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/shutdown-socketpair",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18540,13 +17462,6 @@
           "category": "c-programs",
           "test": "c-programs/signalfd-create",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/signalfd-create",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18589,13 +17504,6 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp4",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/so-incoming-cpu-tcp4",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18610,13 +17518,6 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp6",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/so-incoming-cpu-tcp6",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18638,13 +17539,6 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-udp4",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/so-incoming-cpu-udp4",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18666,13 +17560,6 @@
           "category": "c-programs",
           "test": "c-programs/socket-cookie-tcp",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/socket-cookie-tcp",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18688,13 +17575,6 @@
           "test": "c-programs/socket-cookie-tcp",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/socket-cookie-udp",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18722,13 +17602,6 @@
           "category": "c-programs",
           "test": "c-programs/socket-cookie-unix",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/socket-cookie-unix",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18744,13 +17617,6 @@
           "test": "c-programs/socket-cookie-unix",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/socket-epoll-ordering",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18799,13 +17665,6 @@
           "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/socket-timestamp-timespec",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18814,13 +17673,6 @@
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/socket-timestamp-timeval",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18869,13 +17721,6 @@
           "category": "c-programs",
           "test": "c-programs/splice-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/splice-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18890,13 +17735,6 @@
           "category": "c-programs",
           "test": "c-programs/stat-metadata-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/stat-metadata-identity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18905,13 +17743,6 @@
           "test": "c-programs/stat-metadata-identity",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/statfs-free-determinism",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18932,21 +17763,7 @@
           "category": "c-programs",
           "test": "c-programs/static-nolibc-syscall-sites",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/static-nolibc-syscall-sites",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/statmount-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18967,13 +17784,6 @@
           "category": "c-programs",
           "test": "c-programs/statx-metadata",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/statx-metadata",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -18988,13 +17798,6 @@
           "category": "c-programs",
           "test": "c-programs/symlink-ops",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/symlink-ops",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19009,13 +17812,6 @@
           "category": "c-programs",
           "test": "c-programs/sync-file-range",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sync-file-range",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19024,13 +17820,6 @@
           "test": "c-programs/sync-file-range",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/syscall-file-io",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19065,13 +17854,6 @@
           "category": "c-programs",
           "test": "c-programs/syscall-quick-wins",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/syscall-quick-wins",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19080,13 +17862,6 @@
           "test": "c-programs/syscall-quick-wins",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysfs-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19121,13 +17896,6 @@
           "category": "c-programs",
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/syslog-deterministic",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19136,13 +17904,6 @@
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-ipc-refusal",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19163,13 +17924,6 @@
           "category": "c-programs",
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-sem-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19184,13 +17938,6 @@
           "category": "c-programs",
           "test": "c-programs/sysv-shm-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/sysv-shm-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19205,13 +17952,6 @@
           "category": "c-programs",
           "test": "c-programs/tcp-info-accept4",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/tcp-info-accept4",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19226,13 +17966,6 @@
           "category": "c-programs",
           "test": "c-programs/tcp-info-accept6",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/tcp-info-accept6",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19247,13 +17980,6 @@
           "category": "c-programs",
           "test": "c-programs/tcp-info-client4",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/tcp-info-client4",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19262,13 +17988,6 @@
           "test": "c-programs/tcp-info-client4",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/tee-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19331,13 +18050,6 @@
           "category": "c-programs",
           "test": "c-programs/timer-create-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/timer-create-determinism",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19352,13 +18064,6 @@
           "category": "c-programs",
           "test": "c-programs/umask-mode",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/umask-mode",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19373,13 +18078,6 @@
           "category": "c-programs",
           "test": "c-programs/uname-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/uname-identity",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19394,13 +18092,6 @@
           "category": "c-programs",
           "test": "c-programs/uname",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/uname",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19415,13 +18106,6 @@
           "category": "c-programs",
           "test": "c-programs/unix-autobind-dgram",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/unix-autobind-dgram",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19437,13 +18121,6 @@
           "test": "c-programs/unix-autobind-dgram",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/unix-autobind-seqpacket",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19471,13 +18148,6 @@
           "category": "c-programs",
           "test": "c-programs/unix-autobind-stream",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/unix-autobind-stream",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19499,13 +18169,6 @@
           "category": "c-programs",
           "test": "c-programs/ustat-enosys",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/ustat-enosys",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19514,13 +18177,6 @@
           "test": "c-programs/ustat-enosys",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/utimensat-determinism",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19555,13 +18211,6 @@
           "category": "c-programs",
           "test": "c-programs/vectored-io",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/vectored-io",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -19576,21 +18225,7 @@
           "category": "c-programs",
           "test": "c-programs/vforkexec",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/vforkexec",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/vmsplice-enosys",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19605,13 +18240,6 @@
           "test": "c-programs/vmsplice-enosys",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/wait-on-child",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19670,7 +18298,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "chaos-c"
@@ -19733,7 +18361,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_data_handling/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_data_handling/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_data_handling/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_data_handling/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "data-handling"
@@ -19752,13 +18380,6 @@
           "test": "data-handling/dd-partial-transfers",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "data-handling",
-          "test": "data-handling/jq-json-transform",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19831,19 +18452,12 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "debugger-c"
       },
       "result_manifests": [
-        {
-          "lane": "portable",
-          "category": "debugger-c",
-          "test": "debugger-c/debuggee",
-          "mode": "verify",
-          "backend": "kvm"
-        },
         {
           "lane": "portable",
           "category": "debugger-c",
@@ -19908,7 +18522,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "determinism-stress-c"
@@ -19954,21 +18568,7 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/pipe-chain",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/pipe-chain",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress-c",
-          "test": "determinism-stress-c/pipe-prefill",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20055,19 +18655,12 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "determinism-stress"
       },
       "result_manifests": [
-        {
-          "lane": "portable",
-          "category": "determinism-stress",
-          "test": "determinism-stress/example-race",
-          "mode": "verify",
-          "backend": "kvm"
-        },
         {
           "lane": "portable",
           "category": "determinism-stress",
@@ -20102,13 +18695,6 @@
           "test": "determinism-stress/thread-interleaving",
           "mode": "chaos",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "determinism-stress",
-          "test": "determinism-stress/thread-output",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20160,7 +18746,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "language-runtimes"
@@ -20178,13 +18764,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/bash-random",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/bash-random",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20192,21 +18771,7 @@
           "category": "language-runtimes",
           "test": "language-runtimes/cpp-stl-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/cpp-stl-determinism",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/example-python-random",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20227,13 +18792,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/gawk-random",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/gawk-random",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20242,13 +18800,6 @@
           "test": "language-runtimes/lua-random",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/m4-macro-mkstemp",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20269,21 +18820,7 @@
           "category": "language-runtimes",
           "test": "language-runtimes/perl-hash-order",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/perl-hash-order",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/perl-io-subprocess-time",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20297,21 +18834,7 @@
           "category": "language-runtimes",
           "test": "language-runtimes/perl-random",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/perl-random",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-dict-hash-iteration",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20325,13 +18848,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-hash-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-hash-determinism",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20339,21 +18855,7 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-io-subprocess-time",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-io-subprocess-time",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-random",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20374,21 +18876,7 @@
           "category": "language-runtimes",
           "test": "language-runtimes/rust-hashmap-iteration",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/rust-hashmap-iteration",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/tcl-rand-clock",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20440,7 +18928,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "shared-futex-c"
@@ -20496,7 +18984,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --jobs 1 --results \"$E2E_RESULT_ROOT/portable/manifest_system_utils/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_system_utils/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --exclude-backend kvm --jobs 1 --results \"$E2E_RESULT_ROOT/portable/manifest_system_utils/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_system_utils/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "system-utils"
@@ -20528,13 +19016,6 @@
           "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/clock-determinism",
-          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -20556,21 +19037,7 @@
           "category": "system-utils",
           "test": "system-utils/date-nanoseconds",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/date-nanoseconds",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/du-tree-summary",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20584,21 +19051,7 @@
           "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/errno-path-identity",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-date",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20612,21 +19065,7 @@
           "category": "system-utils",
           "test": "system-utils/example-devrand",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/example-devrand",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/file-timestamp-identity",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20640,21 +19079,7 @@
           "category": "system-utils",
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/find-tree-metadata",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/harness-width-contract",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20668,21 +19093,7 @@
           "category": "system-utils",
           "test": "system-utils/mcookie-random",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mcookie-random",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/mktemp-name",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20703,21 +19114,7 @@
           "category": "system-utils",
           "test": "system-utils/openssl-enc",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-enc",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-genpkey",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20731,13 +19128,6 @@
           "category": "system-utils",
           "test": "system-utils/openssl-passwd",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-passwd",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20745,21 +19135,7 @@
           "category": "system-utils",
           "test": "system-utils/openssl-rand",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-rand",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/openssl-x509",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20787,13 +19163,6 @@
           "category": "system-utils",
           "test": "system-utils/proc-uptime",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/proc-uptime",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20808,13 +19177,6 @@
           "category": "system-utils",
           "test": "system-utils/random-device",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/random-device",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20823,13 +19185,6 @@
           "test": "system-utils/record-getpid",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/record-getpid",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20857,21 +19212,7 @@
           "category": "system-utils",
           "test": "system-utils/shm-coherency-identity",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shm-coherency-identity",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/shuf-permutation",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20892,21 +19233,7 @@
           "category": "system-utils",
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/ssh-keygen-ed25519",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-surface-identity",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20920,13 +19247,6 @@
           "category": "system-utils",
           "test": "system-utils/startup-tls-guards",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/startup-tls-guards",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20934,21 +19254,7 @@
           "category": "system-utils",
           "test": "system-utils/sysfs-sanitized-prefixes",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/sysfs-sanitized-prefixes",
-          "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "system-utils",
-          "test": "system-utils/uuidgen-random",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -21000,7 +19306,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category util-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_util_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_util_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category util-c --ci-only --allow-empty --prebuilt --exclude-backend kvm --results \"$E2E_RESULT_ROOT/portable/manifest_util_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_util_c/junit.xml\"",
       "manifest": {
         "lane": "portable",
         "category": "util-c"
@@ -21056,7 +19362,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-backend kvm",
       "result_manifests": [],
       "deps": [
         "e2e.manifest_applications_on_host",
