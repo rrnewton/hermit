@@ -13764,6 +13764,374 @@ mod tests {
         guest.thread.descriptor_binding(7).unwrap()
     }
 
+    fn legacy_replay_alarm_fixture(
+        input: Option<(u64, NetworkInputKindV2)>,
+    ) -> (
+        Config,
+        GlobalState,
+        Detcore,
+        crate::ThreadState<()>,
+        NetworkChannelId,
+    ) {
+        use detcore_model::network_trace::NetworkChannelV2;
+        use detcore_model::network_trace::NetworkEndpointRoleV2;
+        use detcore_model::network_trace::NetworkInputEventV2;
+        use detcore_model::network_trace::NetworkReleaseV2;
+        use detcore_model::network_trace::NetworkTraceV2;
+        use detcore_model::network_trace::NetworkTransportV2;
+        use reverie::Tool;
+
+        let mut config = Config {
+            sequentialize_threads: true,
+            epoch_explicit: true,
+            ..Config::default()
+        };
+        config.network_trace.policy = NetworkPolicy::Replay;
+        let channel = NetworkChannelId(1);
+        let epoch = LogicalTime::from_nanos(
+            config
+                .epoch
+                .timestamp_nanos_opt()
+                .expect("fixture epoch must fit") as u64,
+        );
+        let inputs = input
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (after_epoch_ns, event))| NetworkInputEventV2 {
+                ordinal: ordinal as u64,
+                channel,
+                release: NetworkReleaseV2 {
+                    not_before_global_time: epoch + LogicalTime::from_nanos(after_epoch_ns),
+                    after_transmitted_offset: 0,
+                },
+                event,
+            })
+            .collect();
+        let trace = NetworkTraceV2 {
+            epoch: config.epoch,
+            channels: vec![NetworkChannelV2 {
+                id: channel,
+                transport: NetworkTransportV2::Tcp,
+                role: NetworkEndpointRoleV2::OutboundClient,
+                local_address: None,
+                peer_address: Some(NetworkAddressV2::Inet4 {
+                    address: [192, 0, 2, 1],
+                    port: 443,
+                }),
+                accepted_from: None,
+            }],
+            inputs,
+            outputs: Vec::new(),
+        };
+        let mut trace_bytes = Vec::new();
+        trace.write_framed(&mut trace_bytes).unwrap();
+        config.network_trace_input = Some(trace_bytes);
+        let state = GlobalState::initialize(&config, false);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .enable_controlled_signal_delivery();
+        let tid = Tid::from_raw(181);
+        let tool: Detcore = Detcore::new(tid, &config);
+        let mut thread = tool.init_thread_state(tid, None);
+        thread.stats.syscall_count = 17;
+        *thread.file_metadata.lock().unwrap() =
+            crate::tool_local::FileMetadata::empty_network_fixture(thread.dettid);
+        let owner = NetworkStreamOwner {
+            thread: thread.dettid,
+            mm: thread.mm_id,
+        };
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(owner.thread, owner.thread, true);
+        install_test_registration(&state, owner.thread, Ivar::new());
+        thread.detpid = state.sched.lock().unwrap().registered_process(owner.thread);
+        assert_eq!(thread.detpid, Some(owner.thread));
+        {
+            let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
+            engine.fd_table_fixture_enable();
+            engine.fd_publication_fixture_register(owner, None);
+        }
+        state.global_time.lock().unwrap().update_global_time(
+            owner.thread,
+            thread.thread_logical_time.as_nanos(),
+            thread.thread_logical_time.inherited_nanos(),
+        );
+        tool.on_thread_state_ready(tid, &state, &thread).unwrap();
+        (config, state, tool, thread, channel)
+    }
+
+    async fn legacy_replay_bind_socket(
+        state: &GlobalState,
+        tool: &Detcore,
+        guest: &mut OwnedReadGuest<'_>,
+        channel: NetworkChannelId,
+    ) -> OpenFileId {
+        let binding = publish_owned_read_fd(tool, guest, crate::fd::FdType::Socket).await;
+        state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .bind(binding.open_file, channel)
+            .unwrap();
+        binding.open_file
+    }
+
+    async fn drive_legacy_wait_callback(state: &GlobalState) -> Resources {
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "the network wait must park before its alarm"
+        );
+        let mut prior = first;
+        let mut resumed = None;
+        for _ in 0..3 {
+            prior = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &prior,
+            )
+            .await;
+            if let Ok(turn) = &prior {
+                resumed = Some(turn.clone());
+                break;
+            }
+        }
+        resumed.expect("the scheduler must resume the waiting syscall")
+    }
+
+    async fn drive_legacy_alarm_callback(state: &GlobalState, owner: NetworkStreamOwner) {
+        let resumed = drive_legacy_wait_callback(state).await;
+        assert_eq!(resumed.tid, owner.thread);
+        assert!(
+            resumed
+                .resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper::from(
+                    reverie::Signal::SIGALRM
+                )))
+        );
+    }
+
+    fn arm_legacy_alarm(state: &GlobalState, owner: NetworkStreamOwner, after: LogicalTime) {
+        let now = state.global_time.lock().unwrap().as_nanos();
+        state.sched.lock().unwrap().register_alarm(
+            owner.thread,
+            owner.thread,
+            now,
+            after,
+            LogicalTime::ZERO,
+            reverie::Signal::SIGALRM,
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_replay_poll_caught_alarm_completes_the_waiting_syscall() {
+        let (config, state, tool, thread, channel) = legacy_replay_alarm_fixture(None);
+        let mut guest = owned_read_guest(&config, &state, thread);
+        legacy_replay_bind_socket(&state, &tool, &mut guest, channel).await;
+        let owner = NetworkStreamOwner {
+            thread: guest.thread.dettid,
+            mm: guest.thread.mm_id,
+        };
+        arm_legacy_alarm(&state, owner, LogicalTime::from_nanos(10));
+        let mut pollfd = libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let call = reverie::syscalls::Poll::new()
+            .with_fds(reverie::syscalls::AddrMut::from_ptr(
+                (&mut pollfd as *mut libc::pollfd).cast(),
+            ))
+            .with_nfds(1)
+            .with_timeout(-1);
+        let mut pending = std::pin::pin!(tool.handle_network_io(&mut guest, call.into()));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drive_legacy_alarm_callback(&state, owner).await;
+        let completed = tokio::time::timeout(std::time::Duration::from_millis(100), pending)
+            .await
+            .expect("caught alarm must complete legacy poll");
+        assert!(matches!(
+            completed,
+            Err(reverie::Error::Errno(errno)) if errno == reverie::syscalls::Errno::EINTR
+        ));
+        assert_eq!(pollfd.revents, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_replay_select_caught_alarm_completes_the_waiting_syscall() {
+        let (config, state, tool, thread, channel) = legacy_replay_alarm_fixture(None);
+        let mut guest = owned_read_guest(&config, &state, thread);
+        legacy_replay_bind_socket(&state, &tool, &mut guest, channel).await;
+        let owner = NetworkStreamOwner {
+            thread: guest.thread.dettid,
+            mm: guest.thread.mm_id,
+        };
+        arm_legacy_alarm(&state, owner, LogicalTime::from_nanos(10));
+        let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe { libc::FD_SET(7, &mut readfds) };
+        let call = reverie::syscalls::Select::new()
+            .with_nfds(8)
+            .with_readfds(reverie::syscalls::AddrMut::from_ptr(&mut readfds))
+            .with_writefds(None)
+            .with_exceptfds(None)
+            .with_timeout(None);
+        let mut pending = std::pin::pin!(tool.handle_network_io(&mut guest, call.into()));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drive_legacy_alarm_callback(&state, owner).await;
+        let completed = tokio::time::timeout(std::time::Duration::from_millis(100), pending)
+            .await
+            .expect("caught alarm must complete legacy select");
+        assert!(matches!(
+            completed,
+            Err(reverie::Error::Errno(errno)) if errno == reverie::syscalls::Errno::EINTR
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_replay_recv_caught_alarm_preserves_restart_errno() {
+        let (config, state, tool, thread, channel) = legacy_replay_alarm_fixture(None);
+        let mut guest = owned_read_guest(&config, &state, thread);
+        legacy_replay_bind_socket(&state, &tool, &mut guest, channel).await;
+        let owner = NetworkStreamOwner {
+            thread: guest.thread.dettid,
+            mm: guest.thread.mm_id,
+        };
+        arm_legacy_alarm(&state, owner, LogicalTime::from_nanos(10));
+        let mut byte = 0u8;
+        let call = reverie::syscalls::Recvfrom::new()
+            .with_fd(7)
+            .with_buf(reverie::syscalls::AddrMut::from_ptr(&mut byte))
+            .with_len(1)
+            .with_flags(0);
+        let mut pending = std::pin::pin!(tool.handle_network_io(&mut guest, call.into()));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drive_legacy_alarm_callback(&state, owner).await;
+        let completed = tokio::time::timeout(std::time::Duration::from_millis(100), pending)
+            .await
+            .expect("caught alarm must complete legacy recv");
+        assert!(matches!(
+            completed,
+            Err(reverie::Error::Errno(errno)) if errno == reverie::syscalls::Errno::ERESTARTSYS
+        ));
+        assert_eq!(byte, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_replay_readiness_and_partial_bytes_precede_later_alarm() {
+        for (event, expected) in [
+            (
+                NetworkInputKindV2::Readiness(detcore_model::network_trace::NetworkReadinessV2 {
+                    readable: true,
+                    ..Default::default()
+                }),
+                None,
+            ),
+            (
+                NetworkInputKindV2::StreamBytes {
+                    stream_offset: 0,
+                    bytes: b"x".to_vec(),
+                },
+                Some(b'x'),
+            ),
+        ] {
+            let (config, state, tool, thread, channel) =
+                legacy_replay_alarm_fixture(Some((0, event)));
+            let mut guest = owned_read_guest(&config, &state, thread);
+            legacy_replay_bind_socket(&state, &tool, &mut guest, channel).await;
+            let owner = NetworkStreamOwner {
+                thread: guest.thread.dettid,
+                mm: guest.thread.mm_id,
+            };
+            arm_legacy_alarm(&state, owner, LogicalTime::from_nanos(1_000));
+            if let Some(expected) = expected {
+                let mut bytes = [0u8; 2];
+                let call = reverie::syscalls::Recvfrom::new()
+                    .with_fd(7)
+                    .with_buf(reverie::syscalls::AddrMut::from_ptr(bytes.as_mut_ptr()))
+                    .with_len(bytes.len())
+                    .with_flags(0);
+                assert_eq!(
+                    tool.handle_network_io(&mut guest, call.into())
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(bytes, [expected, 0]);
+            } else {
+                let mut pollfd = libc::pollfd {
+                    fd: 7,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let call = reverie::syscalls::Poll::new()
+                    .with_fds(reverie::syscalls::AddrMut::from_ptr(
+                        (&mut pollfd as *mut libc::pollfd).cast(),
+                    ))
+                    .with_nfds(1)
+                    .with_timeout(-1);
+                assert_eq!(
+                    tool.handle_network_io(&mut guest, call.into())
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(pollfd.revents, libc::POLLIN);
+            }
+            assert_eq!(state.sched.lock().unwrap().turn, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_replay_finite_poll_timeout_precedes_later_alarm() {
+        let (config, state, tool, thread, channel) = legacy_replay_alarm_fixture(None);
+        let mut guest = owned_read_guest(&config, &state, thread);
+        legacy_replay_bind_socket(&state, &tool, &mut guest, channel).await;
+        let owner = NetworkStreamOwner {
+            thread: guest.thread.dettid,
+            mm: guest.thread.mm_id,
+        };
+        arm_legacy_alarm(&state, owner, LogicalTime::from_nanos(2_000_000));
+        let mut pollfd = libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let call = reverie::syscalls::Poll::new()
+            .with_fds(reverie::syscalls::AddrMut::from_ptr(
+                (&mut pollfd as *mut libc::pollfd).cast(),
+            ))
+            .with_nfds(1)
+            .with_timeout(1);
+        let mut pending = std::pin::pin!(tool.handle_network_io(&mut guest, call.into()));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        let resumed = drive_legacy_wait_callback(&state).await;
+        assert_eq!(resumed.tid, owner.thread);
+        assert!(!resumed.resources.keys().any(|resource| matches!(
+            resource,
+            ResourceID::InboundSignal(_) | ResourceID::WaitidSignals(_)
+        )));
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), pending)
+                .await
+                .expect("finite timeout must complete legacy poll")
+                .unwrap(),
+            0
+        );
+        assert_eq!(pollfd.revents, 0);
+    }
+
     async fn grant_owned_read_foreground(state: &GlobalState, guest: &mut OwnedReadGuest<'_>) {
         let owner = NetworkStreamOwner {
             thread: guest.thread.dettid,

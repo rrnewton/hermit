@@ -703,6 +703,10 @@ pub struct Scheduler {
     backend_is_kvm: bool,
     #[cfg(test)]
     host_signal_attempts: u64,
+    /// Unit controls supply physical signal delivery as an explicit premise;
+    /// alarm selection, wake publication and syscall continuation stay real.
+    #[cfg(test)]
+    controlled_signal_delivery: bool,
     kvm_shared_dequeue_timers: bool,
     pub(crate) real_timers: real_timer::RealTimers,
     parked: parked::ParkedRequests,
@@ -3190,6 +3194,8 @@ impl Scheduler {
             backend_is_kvm: cfg.backend_is_kvm,
             #[cfg(test)]
             host_signal_attempts: 0,
+            #[cfg(test)]
+            controlled_signal_delivery: false,
             kvm_shared_dequeue_timers: cfg.kvm_shared_dequeue_timers,
             real_timers: Default::default(),
             parked: Default::default(),
@@ -4684,6 +4690,12 @@ impl Scheduler {
         self.signal_guest(target, sig);
     }
 
+    #[cfg(test)]
+    pub(crate) fn enable_controlled_signal_delivery(&mut self) {
+        assert!(!self.controlled_signal_delivery);
+        self.controlled_signal_delivery = true;
+    }
+
     // Follow Linux semantics for delivering a signal to a thread within a process group.
     // Optionally take a hint on which tid detcore would *like* to deliver to, if it is available.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4955,8 +4967,13 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
-        let result = if let Some((_, _, _, pidfd, true)) = self.physical_thread_pidfds.get(&dettid)
-        {
+        #[cfg(test)]
+        let controlled = self.controlled_signal_delivery;
+        #[cfg(not(test))]
+        let controlled = false;
+        let result = if controlled {
+            Ok(())
+        } else if let Some((_, _, _, pidfd, true)) = self.physical_thread_pidfds.get(&dettid) {
             let rc = unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
