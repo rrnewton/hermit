@@ -51,6 +51,11 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 // joins the native/recorded allocator protocol and requires the
                 // exact published descriptor binding before it can return.
                 | Sysno::access | Sysno::newfstatat | Sysno::openat
+                // Clone-family calls use the retained native-birth owner: the
+                // provider observes the exact kernel child/table inheritance,
+                // and the scheduler consumes that held-generation projection
+                // before either parent or child can publish descriptor state.
+                | Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork
                 // Neither touches the descriptor table: strict rseq returns
                 // ENOSYS without entering Linux, and readlink reads a path.
                 | Sysno::rseq | Sysno::readlink
@@ -94,10 +99,6 @@ mod tests {
             Sysno::pidfd_open,
             Sysno::pidfd_getfd,
             Sysno::close_range,
-            Sysno::clone,
-            Sysno::clone3,
-            Sysno::fork,
-            Sysno::vfork,
             Sysno::execve,
             Sysno::execveat,
             Sysno::unshare,
@@ -132,6 +133,17 @@ mod tests {
             assert!(initial_record_call_supported(raw(number)), "{number:?}");
         }
         for number in [Sysno::pipe, Sysno::pipe2, Sysno::socketpair] {
+            assert!(!initial_record_call_supported(raw(number)), "{number:?}");
+        }
+    }
+    #[test]
+    fn initial_record_admits_exactly_joined_clone_family() {
+        for number in [Sysno::clone, Sysno::clone3, Sysno::fork, Sysno::vfork] {
+            assert!(initial_record_call_supported(raw(number)), "{number:?}");
+        }
+
+        // These neighboring task/table mutations have no native-effect join.
+        for number in [Sysno::execve, Sysno::execveat, Sysno::unshare, Sysno::setns] {
             assert!(!initial_record_call_supported(raw(number)), "{number:?}");
         }
     }
