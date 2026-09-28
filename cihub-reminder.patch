@@ -1,0 +1,176 @@
+diff --git a/ci-hub/health/integration_tip_validate.py b/ci-hub/health/integration_tip_validate.py
+--- a/ci-hub/health/integration_tip_validate.py
++++ b/ci-hub/health/integration_tip_validate.py
+@@ -74,7 +74,6 @@ Runner = Callable[[Sequence[str], Path, float], subprocess.CompletedProcess[str]]
+ Fetcher = Callable[[Settings, float], str]
+ Spawner = Callable[[Settings, str, str, str, Path, Path, float], Mapping[str, object]]
+-LauncherActive = Callable[[Settings, Mapping[str, object], float, Runner], bool]
+@@ -185,6 +184,7 @@ def exact_record_count(
+             "--repo",
+             REPO,
++            "--log-paths",
+             "--json",
+         ],
+@@ -244,6 +244,50 @@ def exact_record_count(
+     return count, in_progress_count, report
+ 
+ 
++def in_flight_run_handles(report: Mapping[str, object]) -> list[Mapping[str, object]]:
++    """Return ci-hub run records that say their validation is launching or running."""
++
++    selected: list[Mapping[str, object]] = []
++    for handle in report["run_handles"]:
++        if not isinstance(handle, dict):
++            raise ObservationUnavailable("exact validate-status returned a malformed run handle")
++        if handle.get("state") not in {"launching", "running"}:
++            continue
++        if handle.get("admission") == "refused":
++            continue
++        required = ("unit", "sha", "started_at", "slot", "log_file")
++        if any(not isinstance(handle.get(field), str) or not handle[field] for field in required):
++            raise ObservationUnavailable(
++                "an in-flight run handle omitted its unit, SHA, start time, slot, or log path"
++            )
++        if not isinstance(handle.get("process_verified"), bool):
++            raise ObservationUnavailable(
++                "an in-flight run handle omitted whether its process identity was verified"
++            )
++        selected.append(handle)
++    return selected
++
++
++def in_flight_run_text(handles: Sequence[Mapping[str, object]]) -> str:
++    return "; ".join(
++        "unit={unit} state={state} head={sha} slot={slot} log={log_file} "
++        "started={started_at} process_verified={process_verified}".format(**handle)
++        for handle in handles
++    )
++
++
++def exact_status_twice(
++    settings: Settings, target: str, deadline: float, run: Runner
++) -> tuple[int, int, dict[str, object], list[Mapping[str, object]]]:
++    first = exact_record_count(settings, target, remaining(deadline, 25.0), run)
++    if first[0] or first[1]:
++        return (*first, in_flight_run_handles(first[2]))
++    second = exact_record_count(settings, target, remaining(deadline, 25.0), run)
++    handles = in_flight_run_handles(second[2])
++    return second[0], max(second[1], len(handles)), second[2], handles
++
++
+ def admission_status(
+@@ -358,53 +402,6 @@ def read_json(path: Path) -> dict[str, object] | None:
+     return value
+ 
+ 
+-def launcher_unit_is_active(
+-    settings: Settings,
+-    attempt: Mapping[str, object],
+-    timeout: float,
+-    run: Runner,
+-) -> bool:
+-    unit = attempt.get("launcher_unit")
+-    if not isinstance(unit, str) or not unit.endswith(".service"):
+-        return False
+-    completed = run(
+-        [
+-            "systemctl",
+-            "--user",
+-            "show",
+-            unit,
+-            "--property=LoadState",
+-            "--property=ActiveState",
+-            "--property=SubState",
+-            "--property=InvocationID",
+-            "--no-pager",
+-        ],
+-        settings.state_root,
+-        timeout,
+-    )
+-    if completed.returncode != 0:
+-        detail = completed.stderr.strip() or f"exit {completed.returncode}"
+-        raise ObservationUnavailable(
+-            f"cannot query periodic validate launcher unit {unit}: {one_line(detail)}"
+-        )
+-    fields = dict(
+-        line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
+-    )
+-    if fields.get("LoadState") == "not-found":
+-        return False
+-    if fields.get("LoadState") != "loaded" or not fields.get("InvocationID"):
+-        raise ObservationUnavailable(
+-            f"periodic validate launcher unit {unit} returned incomplete systemd identity"
+-        )
+-    return fields.get("ActiveState") in {
+-        "activating",
+-        "active",
+-        "reloading",
+-        "deactivating",
+-    }
+-
+-
+-def tick_attempt_is_active(
+-    settings: Settings,
+-    attempt: Mapping[str, object] | None,
+-    timeout: float,
+-    run: Runner,
+-    active: LauncherActive,
+-) -> bool:
+-    return attempt is not None and active(settings, attempt, timeout, run)
+-
+-
+ def latest_prior_attempt(
+@@ -551,15 +548,13 @@ def run_tick(
+     fetch: Fetcher = fetch_tip,
+     run: Runner = run_bounded,
+     spawn: Spawner = spawn_validate,
+-    launcher_active: LauncherActive = launcher_unit_is_active,
+     dry_run: bool = False,
+ ) -> int:
+     deadline = time.monotonic() + settings.total_timeout_seconds
+     target = fetch(settings, remaining(deadline, 25.0))
+-    count, in_progress, status = exact_record_count(
+-        settings, target, remaining(deadline, 35.0), run
+-    )
++    count, in_progress, status, in_flight = exact_status_twice(
++        settings, target, deadline, run
++    )
+@@ -591,24 +586,16 @@ def run_tick(
+             record_count=0,
+             in_progress_count=in_progress,
++            runs=in_flight_run_text(in_flight),
+             launched=0,
+             summary=(
+                 f"exact Hermit main tip {target} already has {in_progress} "
+-                "validate run(s) in progress; no validate started"
++                f"validate run(s) in progress; {in_flight_run_text(in_flight)}; "
++                "no validate started"
+             ),
+         )
+         return 0
+ 
+     tick_attempt = read_json(settings.state_dir / "latest.json")
+     if tick_attempt is not None and tick_attempt.get("target") != target:
+         tick_attempt = None
+-    if tick_attempt_is_active(
+-        settings,
+-        tick_attempt,
+-        remaining(deadline, 5.0),
+-        run,
+-        launcher_active,
+-    ):
+-        assert tick_attempt is not None
+-        emit(
+-            state="in-progress",
+-            target=target,
+-            record_count=0,
+-            in_progress_count=1,
+-            launched=0,
+-            summary=(
+-                f"launch attempt {tick_attempt.get('attempt_id', '?')} for exact Hermit main "
+-                "tip is still running; no second validate started"
+-            ),
+-        )
+-        return 0
+ 
+     prior = latest_prior_attempt(tick_attempt, status["run_handles"])

@@ -1,0 +1,26 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -8971,6 +8971,8 @@ fn print_recent_validate_history(
+                     serde_json::Value::Null
+                 },
++                "launch_decision_authority": current_main_answer_known
++                    && count > 0,
++                "observation": "fresh main plus two reads of ci-hub run records",
+             });
+@@ -8998,8 +9000,15 @@ fn print_recent_validate_history(
+         if current_main_answer_known {
+-            println!(
+-                "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS={} COUNT={count}",
+-                if count > 0 { "yes" } else { "no" }
+-            );
++            if count > 0 {
++                println!(
++                    "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS=yes COUNT={count}"
++                );
++            } else {
++                println!(
++                    "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS=no COUNT=0 -- run records were read twice; before launching, also run `ci-hub validate-lock admission-status --agent AGENT --kind validate --target {main_sha} --target-was-fetched-main --json`"
++                );
++            }
+         } else {

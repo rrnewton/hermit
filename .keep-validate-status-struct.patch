@@ -1,0 +1,27 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -7132,7 +7132,8 @@ struct ValidateRunAttempt {
+     unit: String,
+     state: String,
+     sha: String,
++    #[serde(skip_serializing)]
+     agent: Option<String>,
+     started_at: String,
+     slot: Option<String>,
+@@ -13055,7 +13056,8 @@ mod tests {
+             unit: "validate-main.service".into(),
+             state: "launching".into(),
+             sha: sha.clone(),
++            agent: None,
+             started_at: "2026-09-11T17:00:00Z".into(),
+             slot: Some("validate-main".into()),
+             log_file: Some("/state/ignored/validate/main.log".into()),
+@@ -13088,6 +13090,7 @@ mod tests {
+         assert_eq!(unknown["launch_decision_authority"], false);
+         assert_eq!(unknown["run_handles"][0]["state"], "launching");
+         assert_eq!(unknown["run_handles"][0]["process_verified"], false);
++        assert!(unknown["run_handles"][0].get("agent").is_none());
+         assert!(unknown["next_action"]
+             .as_str()
+             .unwrap()

@@ -1,0 +1,10 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -8883,3 +8883,3 @@
+-    let current_main_in_progress_count = current_main_sha.as_deref().map(|main_sha| {
+-        current.iter().filter(|entry| entry.in_progress && entry.sha.as_deref() == Some(main_sha)).count()
+-    });
++    let current_main_in_progress_count = current_main_sha
++        .as_deref()
++        .map(|main_sha| exact_in_progress_count(&current, main_sha));

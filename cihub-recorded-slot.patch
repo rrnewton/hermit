@@ -1,0 +1,50 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -6885,6 +6885,8 @@ struct ValidateRunRecord {
+     source_checkout: Option<String>,
+     #[serde(default)]
+     branch: Option<String>,
++    #[serde(default)]
++    wrkslots_slot: Option<String>,
+     #[serde(default)]
+     log: Option<String>,
+@@ -7280,10 +7282,17 @@ fn live_validate_runs_from(
+                 continue;
+             };
+             let (slot, log_file) = if include_log_paths {
+-                let source_checkout = current_validate_run_text(&value, "source_checkout", &path)?;
++                let slot = match value
++                    .get("wrkslots_slot")
++                    .and_then(serde_json::Value::as_str)
++                    .filter(|slot| !slot.is_empty())
++                {
++                    Some(slot) => Some(slot.to_string()),
++                    None => {
++                        let source_checkout = current_validate_run_text(&value, "source_checkout", &path)?;
++                        slot_from_validate_checkout(state_root, &source_checkout)
++                    }
++                };
+                 let log_file = current_validate_run_text(&value, "log", &path)?;
+-                (
+-                    slot_from_validate_checkout(state_root, &source_checkout),
+-                    Some(log_file),
+-                )
++                (slot, Some(log_file))
+             } else {
+@@ -7508,11 +7517,13 @@ fn live_validate_runs_from(
+             started_at: record.started_at.clone(),
+             slot: if include_log_paths {
+-                record
+-                    .source_checkout
+-                    .as_deref()
+-                    .or(record.checkout.as_deref())
+-                    .and_then(|checkout| slot_from_validate_checkout(state_root, checkout))
++                record.wrkslots_slot.clone().or_else(|| {
++                    record
++                        .source_checkout
++                        .as_deref()
++                        .or(record.checkout.as_deref())
++                        .and_then(|checkout| slot_from_validate_checkout(state_root, checkout))
++                })
+             } else {

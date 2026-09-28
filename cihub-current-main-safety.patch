@@ -1,0 +1,87 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -8832,6 +8832,12 @@ fn print_recent_validate_history(
+             "--limit must be greater than zero".into(),
+         ));
+     }
++    let current_main_sha = if args.current_main {
++        Some(fetch_current_validation_main(tool_root, state_root, repo)?)
++    } else {
++        None
++    };
+     let columns = selected_validate_status_columns(&args.columns)?;
+     let main_history_requested = columns.contains(&ValidateStatusColumn::Main);
+@@ -8845,11 +8851,6 @@ fn print_recent_validate_history(
+         None
+     };
+     let now = chrono::Utc::now();
+-    let current_main_sha = if args.current_main {
+-        Some(fetch_current_validation_main(tool_root, state_root, repo)?)
+-    } else {
+-        None
+-    };
+     let include_log_paths = args.log_paths || args.current_main;
+@@ -8870,6 +8871,10 @@ fn print_recent_validate_history(
+     });
+     let live_total = current.iter().filter(|entry| entry.in_progress).count();
++    let current_main_answer_known = current_main_sha.is_none()
++        || current_main_in_progress_count.is_some_and(|count| count > 0)
++        || scan.unreadable_handles.is_empty();
+     if args.exclude_in_progress {
+@@ -8958,9 +8963,16 @@ fn print_recent_validate_history(
+             );
+         if let Some(main_sha) = current_main_sha.as_deref() {
++            let count = current_main_in_progress_count.unwrap_or(0);
+             report["current_main"] = serde_json::json!({
+                 "sha": main_sha,
+-                "in_progress": current_main_in_progress_count != Some(0),
+-                "in_progress_count": current_main_in_progress_count,
++                "in_progress": if current_main_answer_known {
++                    serde_json::Value::Bool(count > 0)
++                } else {
++                    serde_json::Value::Null
++                },
++                "in_progress_count": if current_main_answer_known {
++                    serde_json::json!(count)
++                } else {
++                    serde_json::Value::Null
++                },
+             });
+         }
+@@ -8968,6 +8980,8 @@ fn print_recent_validate_history(
+             "{}",
+             serde_json::to_string_pretty(&report).expect("serialize recent validation history")
+         );
++        if args.current_main && !current_main_answer_known {
++            return Ok(2);
++        }
+         return Ok(if args.run_no.is_some() && entries.is_empty() {
+@@ -8980,10 +8994,17 @@ fn print_recent_validate_history(
+ 
+     if let Some(main_sha) = current_main_sha.as_deref() {
+         let count = current_main_in_progress_count.expect("current-main count is present");
+-        println!(
+-            "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS={} COUNT={count}",
+-            if count > 0 { "yes" } else { "no" }
+-        );
++        if current_main_answer_known {
++            println!(
++                "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS={} COUNT={count}",
++                if count > 0 { "yes" } else { "no" }
++            );
++        } else {
++            println!(
++                "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS=unknown -- unreadable run records may describe this exact commit; repair the records named below, then retry"
++            );
++        }
+     }
+@@ -9028,5 +9049,8 @@ fn print_recent_validate_history(
+     if let Some(footer) = recent_counts.and_then(recent_validate_status_footer) {
+         println!("{footer}");
+     }
++    if args.current_main && !current_main_answer_known {
++        return Ok(2);
++    }
+     Ok(0)
+ }

@@ -1,0 +1,24 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -12919,3 +12919,20 @@
+     }
+ 
++    #[test]
++    fn current_main_in_progress_requires_the_exact_tip_sha() {
++        let mut older = finished_validate_status_entry(
++            CANONICAL_VALIDATE_REPO,
++            &history_row(schema4_receipt_value()),
++            true,
++        );
++        older.in_progress = true;
++        older.sha = Some("a".repeat(40));
++        let mut tip = older.clone();
++        tip.sha = Some("b".repeat(40));
++
++        assert_eq!(exact_in_progress_count(std::slice::from_ref(&older), &"b".repeat(40)), 0);
++        assert_eq!(exact_in_progress_count(&[older, tip], &"b".repeat(40)), 1);
++    }
++
+     #[test]
+     fn python_allocator_warning_filter_removes_only_the_exact_line() {

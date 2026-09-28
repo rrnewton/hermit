@@ -1,0 +1,6 @@
+diff --git a/ci-hub/health/tests/test_integration_tip_validate.py b/ci-hub/health/tests/test_integration_tip_validate.py
+--- a/ci-hub/health/tests/test_integration_tip_validate.py
++++ b/ci-hub/health/tests/test_integration_tip_validate.py
+@@ -261 +261 @@
+-    assert output.count("no second validate started") == 1
++    assert output.count("no validate started") == 1

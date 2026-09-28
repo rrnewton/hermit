@@ -1,0 +1,88 @@
+diff --git a/ci-hub/health/integration_tip_validate.py b/ci-hub/health/integration_tip_validate.py
+--- a/ci-hub/health/integration_tip_validate.py
++++ b/ci-hub/health/integration_tip_validate.py
+@@ -309,18 +309,6 @@ def in_flight_run_text(handles: Sequence[Mapping[str, object]]) -> str:
+     )
+ 
+ 
+-def exact_status_twice(
+-    settings: Settings, target: str, deadline: float, run: Runner
+-) -> tuple[int, int, dict[str, object], list[Mapping[str, object]]]:
+-    """Read twice before claiming no exact-target validation is in flight."""
+-
+-    first = exact_record_count(settings, target, remaining(deadline, 25.0), run)
+-    if first[0] or first[1]:
+-        return (*first, in_flight_run_handles(first[2]))
+-    second = exact_record_count(settings, target, remaining(deadline, 25.0), run)
+-    handles = in_flight_run_handles(second[2])
+-    return second[0], max(second[1], len(handles)), second[2], handles
+-
+-
+ def admission_status(
+@@ -342,6 +330,13 @@ def admission_status(
+     return report
+ 
+ 
++def admission_reports_exact_target(report: Mapping[str, object]) -> bool:
++    return report.get("reason_code") in {
++        "exact-target-already-queued",
++        "exact-target-already-running",
++    }
++
++
+ def atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
+@@ -620,9 +615,27 @@ def run_tick(
+     deadline = time.monotonic() + settings.total_timeout_seconds
+     target = fetch(settings, remaining(deadline, 25.0))
+-    count, in_progress, status, in_flight = exact_status_twice(
+-        settings, target, deadline, run
++    count, in_progress, status = exact_record_count(
++        settings, target, remaining(deadline, 25.0), run
+     )
++    in_flight = in_flight_run_handles(status)
++    admission: dict[str, object] | None = None
++    lock_reports_exact_target = False
++    if not count and not in_progress:
++        # A run record is written before validate-lock publishes its process
++        # identity.  Read the lock between two snapshots so an empty first
++        # snapshot cannot authorize a duplicate launch during that window.
++        admission = admission_status(settings, target, remaining(deadline, 10.0), run)
++        lock_reports_exact_target = admission_reports_exact_target(admission)
++        count, in_progress, status = exact_record_count(
++            settings, target, remaining(deadline, 25.0), run
++        )
++        in_flight = in_flight_run_handles(status)
++        in_progress = max(in_progress, len(in_flight))
++        if lock_reports_exact_target:
++            in_progress = max(in_progress, 1)
+     if count:
+@@ -659,10 +672,17 @@ def run_tick(
+             record_count=0,
+             in_progress_count=in_progress,
+-            runs=in_flight_run_text(in_flight),
++            runs=(
++                in_flight_run_text(in_flight)
++                if in_flight
++                else one_line(admission.get("detail", "validate-lock reports this exact target"))
++            ),
+             launched=0,
+             summary=(
+                 f"exact Hermit main tip {target} already has {in_progress} "
+-                f"validate run(s) in progress; {in_flight_run_text(in_flight)}; "
++                "validate run(s) in progress; "
++                + (
++                    in_flight_run_text(in_flight)
++                    if in_flight
++                    else one_line(admission.get("detail", "validate-lock reports this exact target"))
++                )
++                + "; "
+                 "no validate started"
+             ),
+@@ -675,7 +695,8 @@ def run_tick(
+         tick_attempt = None
+ 
+     prior = latest_prior_attempt(tick_attempt, status["run_handles"])
+-    admission = admission_status(settings, target, remaining(deadline, 10.0), run)
++    if admission is None:
++        admission = admission_status(settings, target, remaining(deadline, 10.0), run)
+     if admission["admissible"] is not True:

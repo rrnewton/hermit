@@ -1,0 +1,19 @@
+Keep current-main validation status concise
+
+[hermit2, scorecard-web, unresolved, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Operators can now read the current-main validation answer immediately even when hundreds of legacy run records are unreadable. The default output keeps its fail-closed unknown verdict while replacing per-record noise with one count, and a documented flag exposes every path and parse error when diagnosis is needed. Unknown results now provide a complete read-only command instead of a literal agent placeholder.
+
+Task: keep_validate_status_current
+Task: make_the_validate_status
+
+Validation:
+- rust-script --test ci-hub/ci-hub.rs current_main_ -- --nocapture (7 passed)
+- rust-script --test ci-hub/ci-hub.rs -- --quiet (457 passed)
+- python3 -m pytest ci-hub/health/tests/test_integration_tip_validate.py ci-hub/health/tests/test_integration_tip_validate_reporting.py ci-hub/health/tests/test_integration_tip_validate_fetch.py -q (43 passed)
+- cargo fmt --all -- --check
+- ./ci-hub/ci-hub validate-status -h and --help (both exit 0)
+- live validate-status --current-main retained rc 2 and reduced output from 493 lines/104232 bytes to 18 lines/5659 bytes
+- live --show-unreadable-handles retained rc 2 and exposed all 477 unreadable records

@@ -1,0 +1,18 @@
+diff --git a/ci-hub/README.md b/ci-hub/README.md
+--- a/ci-hub/README.md
++++ b/ci-hub/README.md
+@@ -153,6 +153,14 @@ Rust driver records an operator stop that reaches its own handler as
+ `no_result`, never as a product failure.
+ 
++To see current and recent validation runs together, including the exact head,
++slot, log path, and start time, run:
++
++```bash
++./ci-hub/ci-hub validate-status --current-main
++```
++
++This fetches main before comparing exact SHAs. An older commit on main does not
++count as a validation of the current main tip. The report reads ci-hub's durable
++run records twice before it says no current-main validation is in progress.
++
+ ## Standing receipt reconciliation
