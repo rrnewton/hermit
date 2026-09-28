@@ -287,6 +287,10 @@ pub(crate) mod tests {
                 },
                 follow_stopped_because: None,
                 first_divergent_record: (verdict == BackendParityVerdict::Diverged).then_some(2),
+                matched_prefix_records: Some(match verdict {
+                    BackendParityVerdict::Matched => 2,
+                    BackendParityVerdict::Diverged => 1,
+                }),
                 first_divergent_syscall: None,
                 first_divergent_scheduler_turn: None,
                 first_divergent_virtual_nanoseconds: None,

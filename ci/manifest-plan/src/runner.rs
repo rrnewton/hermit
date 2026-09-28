@@ -10185,6 +10185,7 @@ backends_disabled:
             },
             follow_stopped_because: None,
             first_divergent_record: divergent.then_some(2),
+            matched_prefix_records: Some(if divergent { 1 } else { 2 }),
             first_divergent_syscall: divergent.then_some(1),
             first_divergent_scheduler_turn: divergent.then_some(7),
             first_divergent_virtual_nanoseconds: divergent.then_some(18),
