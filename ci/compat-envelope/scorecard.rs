@@ -25450,7 +25450,7 @@ mod post_verdict_transaction_tests {
                 CELLS,
             ],
         );
-        commit(&fixture.root, "retire fixture catalogue cell");
+        let retired_commit = commit(&fixture.root, "retire fixture catalogue cell");
 
         // Even with bindings, retirement must refuse to overwrite uncommitted
         // history and leave both output files byte-identical on refusal.
@@ -25597,6 +25597,43 @@ mod post_verdict_transaction_tests {
         let active_once = read_history_files(&fixture.root).unwrap();
         fixture.publish().unwrap();
         assert!(read_history_files(&fixture.root).unwrap() == active_once);
+
+        // REVIEW PROBE: retire the reactivated identity a second time. The
+        // archive must be reused exactly (no duplicate, no loss) and confer no
+        // active attempt mapping; a dirty ledger must still refuse.
+        git(&fixture.ledger, &["add", "scorecard"]);
+        commit(&fixture.ledger, "reactivated history");
+        let committed_reactivated = read_history_files(&fixture.root).unwrap();
+        git(
+            &fixture.root,
+            &[
+                "checkout",
+                &retired_commit,
+                "--",
+                "tests/e2e/manifests/system-utils.yaml",
+                "ci/ci-reason-baseline.json",
+                EXPECTED_PLAN,
+                SCORECARD,
+                CELLS,
+            ],
+        );
+        commit(&fixture.root, "retire catalogue identity again");
+        let mut dirty = committed_reactivated.cells.clone();
+        dirty.push(b'\n');
+        fs::write(fixture.ledger.join(LEDGER_CELLS), &dirty).unwrap();
+        let error = project_observations(&fixture.root, &series, "retirement-2").unwrap_err();
+        assert!(error.contains("uncommitted history"), "{error}");
+        assert_eq!(fs::read(fixture.ledger.join(LEDGER_CELLS)).unwrap(), dirty);
+        fs::write(fixture.ledger.join(LEDGER_CELLS), &committed_reactivated.cells).unwrap();
+        project_observations(&fixture.root, &series, "retirement-2").unwrap();
+        let again = fixture.cells();
+        assert!(!again.cells.iter().any(|cell| cell.id == fixture.id));
+        assert_eq!(comparison_attempt_bindings(&again), Some(envelope));
+        assert!(validate_attempt_bindings(&again, Some(&[])).unwrap().is_empty());
+        let twice = read_history_files(&fixture.root).unwrap();
+        project_observations(&fixture.root, &series, "retirement-2").unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == twice);
+        eprintln!("REVIEW-PROBE second retirement passed include_parity={include_parity}");
     }
 
     #[test]
