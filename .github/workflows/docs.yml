@@ -157,7 +157,25 @@ jobs:
           echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
         } >> "$GITHUB_STEP_SUMMARY"
     - name: Build documentation
+      id: rustdoc
+      # A documentation lint must not throw away a finished website rebuild.
+      # Run https://github.com/rrnewton/hermit/actions/runs/36461693420
+      # rebuilt the compatibility site in 61.7 minutes and then failed here on
+      # one bare URL in a doc comment, so nothing was deployed. The strict
+      # build still runs, and a lint still fails this job, but only after the
+      # site is deployed (see the last step). The validation DAG's
+      # Documentation node remains the gate for documentation lints.
+      continue-on-error: true
       run: cargo doc --workspace --no-deps
+    - name: Build documentation without the lint gate
+      if: steps.rustdoc.outcome == 'failure'
+      env:
+        RUSTFLAGS: -C link-arg=-llzma
+        RUSTDOCFLAGS: ""
+      run: |
+        set -euo pipefail
+        echo '::warning::cargo doc failed under -D warnings. Rebuilding the documentation without -D warnings so the website still deploys; the job fails after deployment.'
+        cargo doc --workspace --no-deps
     - name: Add Hermetic Infra landing page
       run: |
         install -m 0644 docs/site/index.html target/doc/index.html
@@ -302,3 +320,14 @@ jobs:
           ${{ runner.temp }}/compatibility-rebuild.resources.json
         if-no-files-found: ignore
         retention-days: 30
+    - name: Fail on the documentation lint after deployment
+      # Keeps a documentation lint visible as a red run (tick-hub's website
+      # rebuild check reports it) without discarding the deployed website.
+      if: steps.rustdoc.outcome == 'failure'
+      run: |
+        echo '::error::cargo doc --workspace --no-deps failed under RUSTDOCFLAGS=-D warnings; see the "Build documentation" step. The website was deployed from the lint-free rebuild of the same documentation.'
+        {
+          echo '### Documentation lint'
+          echo 'cargo doc failed under -D warnings. The website was still deployed; fix the lint named in the "Build documentation" step.'
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit 1
