@@ -1412,6 +1412,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/network_default_unix.c",
+      "runner": "hermit-cli/tests/record_replay.rs network_only::unix module",
+      "why": "tests/c/network_default_unix.c is owned by the network_only::unix driver: it creates the bounded Unix-socket server/client fixture used to prove internal communication remains available while external network access is denied, then checks the record/replay outcome. It requires driver-supplied paths and roles and is not a standalone no-argument guest."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/network_poll_lowat.c",
       "runner": "hermit-cli/tests/record_replay.rs network_only::lowat module",
       "why": "tests/c/network_poll_lowat.c is owned by the network_only::lowat driver: it supplies controller/client mode and a port, proves the native blocked syscall, and records then strictly replays LOWAT changes across the fixed schedule population; it is not a standalone no-argument guest."

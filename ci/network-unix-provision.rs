@@ -1221,8 +1221,7 @@ mod tests {
     }
     #[test]
     fn collision_or_failed_submission_never_authorizes_a_stop() {
-        let root = PathBuf::from(std::env::var_os("PROVISION_TEST_ROOT").unwrap());
-        let test = tempfile::tempdir_in(root).unwrap();
+        let test = tempfile::tempdir().unwrap();
         let mut owner = Owner::new(&test.path().join("terminal")).unwrap();
         assert!(
             owner
@@ -1313,8 +1312,7 @@ mod tests {
         }
     }
     fn held_test_identity() -> (tempfile::TempDir, UnitIdentity, String) {
-        let root = PathBuf::from(std::env::var_os("PROVISION_TEST_ROOT").unwrap());
-        let path = tempfile::tempdir_in(root).unwrap();
+        let path = tempfile::tempdir().unwrap();
         let directory = File::open(path.path()).unwrap();
         let meta = directory.metadata().unwrap();
         let identity = UnitIdentity {
@@ -1502,10 +1500,7 @@ mod tests {
     }
     #[test]
     fn failed_prepare_and_undrained_test_keep_primary_evidence() {
-        let root = PathBuf::from(
-            std::env::var_os("PROVISION_TEST_ROOT").expect("bounded test output root"),
-        );
-        let test = tempfile::tempdir_in(root).unwrap();
+        let test = tempfile::tempdir().unwrap();
         let mut owner = Owner::new(&test.path().join("terminal")).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(1);
         assert!(owner.prepare(Path::new("/absent-cli"), deadline).is_err());

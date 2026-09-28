@@ -6,6 +6,7 @@
 
 # DELETED WITHOUT NOTICE - DO NOT DEPEND ON IT.
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
+load("@fbsource//tools/build_defs:fb_native_wrapper.bzl", "fb_native")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
@@ -17,6 +18,27 @@ hermit_build_env = {
     "HERMIT_BUILD_GIT_SHA": "unknown",
     "HERMIT_REVERIE_PIN": "835eda06b501a66c47fd90d596b23cc1ea4ebade",
 }
+
+fb_native.cxx_library(
+    name = "unix-guard-client",
+    srcs = [
+        "network-provider/unix/keeper-channel.c",
+        "network-provider/unix/keeper-monitor.c",
+    ],
+    headers = {
+        "keeper-channel.h": "network-provider/unix/keeper-channel.h",
+        "keeper-monitor.h": "network-provider/unix/keeper-monitor.h",
+        "keeper-readback.h": "network-provider/unix/keeper-readback.h",
+        "keeper-session.h": "network-provider/unix/keeper-session.h",
+        "unix-guard.h": "network-provider/unix/unix-guard.h",
+    },
+    compiler_flags = [
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+)
 
 rust_library(
     name = "libhermit",
@@ -67,6 +89,7 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
+        ":unix-guard-client",
     ],
 )
 
