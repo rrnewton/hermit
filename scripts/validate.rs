@@ -24603,7 +24603,7 @@ mod committed_selection_preservation_tests {
             } else {
                 assert!(
                     stdout.contains(
-                        "252 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "253 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
