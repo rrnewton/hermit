@@ -349,7 +349,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // descriptor_is_closed_when_no_scratch_can_be_found) retain all 845 prior
     // identities (`cargo nextest list --profile ci` measured 848;
     // https://github.com/rrnewton/hermit/issues/3328).
-    ("test.detcore_unit", 848),
+    // Six /proc/*/maps identity-minting tests (four in tool_global::tests,
+    // two wiring guards in syscalls::files::procfs_wiring_guard) retain all
+    // 848 prior identities (`cargo nextest list --profile ci` measured 854;
+    // https://github.com/rrnewton/hermit/pull/3255).
+    ("test.detcore_unit", 854),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -402,7 +406,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 848),
+    ("test.detcore_unit_on_host", 854),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),
