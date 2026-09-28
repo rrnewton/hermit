@@ -385,12 +385,8 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     /// invocation.
     const SH_VALUE_FLAGS: [&str; 1] = ["-o"];
 
-    fn value_flags_for(runner: &str) -> &'static [&'static str] {
-        match runner {
-            "rustc" => &RUSTC_VALUE_FLAGS,
-            "python" | "python3" => &PY_VALUE_FLAGS,
-            _ => &SH_VALUE_FLAGS,
-        }
+    fn value_flags_for(_runner: &str) -> &'static [&'static str] {
+        &RUSTC_VALUE_FLAGS
     }
 
     let dotted = format!("./{path}");
