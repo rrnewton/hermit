@@ -4289,8 +4289,8 @@ impl RunOpts {
         // program, and hermit changing its signal dispositions would alter the
         // behaviour being observed.
         //
-        // SAFETY: the closure calls prctl, statfs, and write without allocation
-        // or stdio locks between fork and exec.
+        // SAFETY: prctl and the proc diagnostic use only Linux syscall wrappers
+        // and signal-set operations, without allocation or stdio locks.
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {

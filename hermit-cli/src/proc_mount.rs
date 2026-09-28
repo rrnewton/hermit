@@ -119,3 +119,83 @@ pub(crate) fn report_proc_mode(recorded: Option<bool>, actual: Option<bool>) {
         write_warning(READONLY_WARNING);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+
+    use reverie::process::Container;
+
+    #[test]
+    fn readonly_proc_warning_survives_closed_stderr() {
+        let mut descriptors = [-1; 2];
+        // SAFETY: pipe2 initializes two distinct owned descriptors on success.
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "create stderr pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: ownership of each fresh descriptor is transferred once.
+        let (reader, writer) = unsafe {
+            (
+                OwnedFd::from_raw_fd(descriptors[0]),
+                OwnedFd::from_raw_fd(descriptors[1]),
+            )
+        };
+        drop(reader);
+
+        // Do not create a PID namespace: its init process is protected from an
+        // unhandled SIGPIPE and would let an unsafe warning writer pass.
+        let observation = Container::new()
+            .run(|| {
+                // SAFETY: all descriptor and signal changes affect only this
+                // child. The signal sets are initialized before use.
+                unsafe {
+                    let mut action = std::mem::zeroed::<libc::sigaction>();
+                    action.sa_sigaction = libc::SIG_DFL;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    let mut signals = std::mem::zeroed::<libc::sigset_t>();
+                    libc::sigemptyset(&mut signals);
+                    libc::sigaddset(&mut signals, libc::SIGPIPE);
+                    if libc::dup2(writer.as_raw_fd(), libc::STDERR_FILENO) == -1
+                        || libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut()) == -1
+                        || libc::sigprocmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut())
+                            == -1
+                    {
+                        return Err(*libc::__errno_location());
+                    }
+
+                    super::report_proc_mode(None, Some(true));
+
+                    let mut mask = std::mem::zeroed::<libc::sigset_t>();
+                    let mut pending = std::mem::zeroed::<libc::sigset_t>();
+                    if libc::sigprocmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) == -1
+                        || libc::sigpending(&mut pending) == -1
+                        || libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut action) == -1
+                    {
+                        return Err(*libc::__errno_location());
+                    }
+                    Ok((
+                        libc::getpid(),
+                        action.sa_sigaction == libc::SIG_DFL,
+                        libc::sigismember(&mask, libc::SIGPIPE) == 0,
+                        libc::sigismember(&pending, libc::SIGPIPE) == 0,
+                    ))
+                }
+            })
+            .expect("the warning must not terminate the child with SIGPIPE")
+            .expect("configure and inspect child stderr and signal state");
+        assert!(
+            observation.0 > 1,
+            "the child must not be PID namespace init"
+        );
+        assert_eq!(
+            (observation.1, observation.2, observation.3),
+            (true, true, true),
+            "the warning must preserve default/unblocked SIGPIPE and consume its own pending signal"
+        );
+    }
+}
