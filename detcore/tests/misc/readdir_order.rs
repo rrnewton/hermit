@@ -59,7 +59,8 @@ fn run_five_times_on<S: Sync>(
 }
 
 /// Like [`run_five_times`], also hashing the bytes each syscall returns into
-/// the log, as `hermit run` does by default.
+/// the log, as `hermit run` does whenever its log is read: under `--verify`,
+/// or at log level info or above.
 fn run_five_times_hashing_buffers(guest: fn()) {
     let config = Config {
         sequentialize_threads: true,
@@ -674,8 +675,8 @@ fn rewind_after_host_order_guest() {
     assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
     assert_eq!(drain_names(fd), expected, "after seeking a host position");
 
-    // A buffer too small for a later entry is also read in host order; a
-    // rewind and a larger buffer bring the sorted stream back.
+    // A buffer with room for only the first entry gets it from the sorted
+    // stream, and a rewind starts the stream over.
     let dir = File::open(root.path()).unwrap();
     let fd = dir.as_raw_fd();
     let mut small = [0u8; 24];
@@ -868,7 +869,7 @@ fn seek_during_first_read_guest() {
     expected.extend(sorted_names());
 
     // One thread makes the first getdents64 call on a fresh descriptor, which
-    // reads the whole host directory 512 bytes at a time, while another
+    // reads the whole host directory before it returns, while another
     // rewinds the same open file up to 100 times, stopping early when that
     // call returns. A rewind before the call has no effect and a rewind after
     // it restarts the stream; neither may land in the middle of reading the
@@ -1146,6 +1147,11 @@ fn first_record_short_of_writable_end_guest() {
             assert_eq!(first, expected[..first.len()], "{context}");
             assert_eq!(&bytes[21..], &[0xaa; 24][21..], "{context}");
             if result.is_err() {
+                // `.`'s `d_ino`, as a descriptor of its own reads it.
+                let mut dot = [0u8; 4096];
+                let own = File::open(root.path()).unwrap();
+                getdents64(own.as_raw_fd(), &mut dot).unwrap();
+                assert_eq!(bytes[..8], dot[..8], "{context}");
                 assert_eq!(&bytes[8..16], &0i64.to_ne_bytes(), "{context}");
                 assert_eq!(&bytes[16..18], &24u16.to_ne_bytes(), "{context}");
                 assert_eq!(bytes[18], libc::DT_DIR, "{context}");
@@ -1560,9 +1566,9 @@ fn write_only_prefix_guest() {
 
 /// Detcore cannot read back a buffer the guest can write but not read, so
 /// with the bytes each syscall returns hashed into the log, as `hermit run`
-/// does by default, it cannot log what the call returned; it fails the call
-/// instead (see `write_only_buffer_is_refused_while_hashing_buffers`). So
-/// the write-only tests run without that hashing.
+/// does under `--verify`, it cannot log what the call returned; it fails the
+/// call instead (see `write_only_buffer_is_refused_while_hashing_buffers`).
+/// So the write-only tests run without that hashing.
 #[test]
 fn write_only_prefix_matches_linux() {
     run_five_times_without_hashing_buffers(write_only_prefix_guest);
@@ -1895,6 +1901,10 @@ fn write_only_buffer_refused_guest() {
     let errno = std::io::Error::last_os_error().raw_os_error();
     assert_eq!((result, errno), (-1, Some(libc::EFAULT)));
     unsafe { libc::munmap(map.cast(), 4096) };
+    // The refused call still moves past the eight entries (240 bytes) that
+    // fit its 256-byte buffer; the rest come once each, in sorted order.
+    let rest = drain_names(dir.as_raw_fd());
+    assert_eq!(rest, listing_of(20)[8..]);
 
     println!("write-only buffer refused ok");
 }
@@ -1902,6 +1912,183 @@ fn write_only_buffer_refused_guest() {
 #[test]
 fn write_only_buffer_is_refused_while_hashing_buffers() {
     run_five_times_hashing_buffers(write_only_buffer_refused_guest);
+}
+
+/// `pages` pages, each mapping one of `views` (protection, offset into a
+/// fresh `memfd` of two pages), and any page after them inaccessible. Views
+/// of the same offset are the same memory.
+fn aliased_pages(pages: usize, views: &[(i32, usize)]) -> *mut u8 {
+    let page = 4096;
+    let backing = unsafe { libc::memfd_create(c"readdir-order".as_ptr(), 0) };
+    assert!(backing >= 0);
+    assert_eq!(
+        unsafe { libc::ftruncate(backing, 2 * page as libc::off_t) },
+        0
+    );
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            pages * page,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(map, libc::MAP_FAILED);
+    let map = map.cast::<u8>();
+    for (index, &(protection, offset)) in views.iter().enumerate() {
+        let at = unsafe { map.add(index * page) };
+        let view = unsafe {
+            libc::mmap(
+                at.cast(),
+                page,
+                protection,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                backing,
+                offset as libc::off_t,
+            )
+        };
+        assert_eq!(view, at.cast());
+    }
+    unsafe { libc::close(backing) };
+    map
+}
+
+fn aliased_padding(hashing: bool) {
+    let page = 4096;
+
+    // After `.` and `..`, `a` takes the first 24 bytes of the buffer and
+    // each nine-byte name `bNNNXuvYZ` a 32-byte record, so the record of
+    // `b127` starts 4088 bytes in, and the sixth and seventh bytes of its
+    // name 4112 bytes in. The buffer's first page can be read; its second
+    // is a write-only view of the same memory, so those two bytes land on
+    // `a`'s `d_reclen`. In `b127`'s name they are the length of the whole
+    // call, 0x1738 or 0x2538 bytes, so `a`'s record claims every byte after
+    // it: in the second layout, too, whose third page is write-only other
+    // memory. (Both lengths leave the names valid UTF-8.) Linux does
+    // not look at what it wrote, and returns every record. Hashing the
+    // returned bytes can read only the first page, and must not take the
+    // rest for padding after `a`'s name: a record Linux writes for a
+    // one-byte name is 24 bytes long. So the call fails rather than log
+    // bytes other than those it returned, as with any buffer it cannot read
+    // back (see `write_only_buffer_is_refused_while_hashing_buffers`).
+    for (pages, names, second_view) in [(2, 185, None), (3, 297, Some(page))] {
+        let count = 24 + names * 32;
+        let context = format!("{pages} pages, hashing {hashing}");
+        let root = tempfile::tempdir().unwrap();
+        File::create(root.path().join("a")).unwrap();
+        for index in 0..names {
+            let mut name = format!("b{index:03}XuvYZ").into_bytes();
+            if index == 127 {
+                name[5..7].copy_from_slice(&(count as u16).to_ne_bytes());
+            }
+            File::create(root.path().join(std::ffi::OsStr::from_bytes(&name))).unwrap();
+        }
+        let mut views = vec![
+            (libc::PROT_READ | libc::PROT_WRITE, 0),
+            (libc::PROT_WRITE, 0),
+        ];
+        views.extend(second_view.map(|offset| (libc::PROT_WRITE, offset)));
+        let map = aliased_pages(pages, &views);
+        unsafe { std::ptr::write_bytes(map, 0xaa, page) };
+        let dir = File::open(root.path()).unwrap();
+        let fd = dir.as_raw_fd();
+        let mut warm = [0u8; 48];
+        assert_eq!(getdents64(fd, &mut warm), Ok(48), "{context}");
+        let result = raw_getdents64(fd, map, count as libc::c_uint);
+        if hashing {
+            assert_eq!(result, Err(libc::EFAULT), "{context}");
+        } else {
+            assert_eq!(result, Ok(count), "{context}");
+            let bytes = unsafe { std::slice::from_raw_parts(map, page) };
+            assert_eq!(
+                bytes[16..18],
+                (count as u16).to_ne_bytes(),
+                "{context}: `a`'s record length"
+            );
+            // The last byte of `b127`'s name and the NUL after it.
+            assert_eq!(bytes[19..21], [b'Z', 0], "{context}");
+            assert_eq!(drain_names(fd), Vec::<String>::new(), "{context}");
+        }
+        unsafe { libc::munmap(map.cast(), pages * page) };
+    }
+
+    println!("aliased padding ok");
+}
+
+fn aliased_padding_refused_guest() {
+    aliased_padding(true)
+}
+
+fn aliased_padding_returned_guest() {
+    aliased_padding(false)
+}
+
+#[test]
+fn aliased_padding_is_refused_while_hashing_buffers() {
+    run_five_times_hashing_buffers(aliased_padding_refused_guest);
+}
+
+#[test]
+fn aliased_padding_is_returned_without_hashing_buffers() {
+    run_five_times_without_hashing_buffers(aliased_padding_returned_guest);
+}
+
+fn aliased_record_not_copied_guest() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..300 {
+        File::create(root.path().join(format!("c{index:03}xyz"))).unwrap();
+    }
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend((0..300).map(|index| format!("c{index:03}xyz")));
+    let page = 4096;
+
+    // Two readable views of the same memory, then an inaccessible page, and
+    // a buffer 28 bytes in. After `.` and `..`, each seven-byte name takes a
+    // 32-byte record, so 255 records fill 8160 bytes. A count of 8192 has
+    // room for a 256th, whose `d_ino` Linux stores at once, starting 8188
+    // bytes in: four bytes before the inaccessible page, and in the same
+    // memory as the first half of the 128th record's `d_ino`. That store
+    // faults, so the call returns the same 255 records as with a count of
+    // 8160, and leaves every byte the same, the 128th record's `d_ino`
+    // included, although writing the other records has since changed the
+    // bytes of that memory.
+    for call in [libc::SYS_getdents64, libc::SYS_getdents] {
+        let mut left = Vec::new();
+        for count in [8160, 8192] {
+            let context = format!("syscall {call}, count {count}");
+            let rw = libc::PROT_READ | libc::PROT_WRITE;
+            let map = aliased_pages(3, &[(rw, 0), (rw, 0)]);
+            unsafe { map.add(page + 17).write_volatile(0x5a) };
+            assert_eq!(
+                unsafe { map.add(17).read_volatile() },
+                0x5a,
+                "{context}: the views are not the same memory"
+            );
+            unsafe { std::ptr::write_bytes(map, 0xaa, page) };
+            let dir = File::open(root.path()).unwrap();
+            let fd = dir.as_raw_fd();
+            let mut warm = [0u8; 48];
+            assert_eq!(getdents64(fd, &mut warm), Ok(48), "{context}");
+            let result = unsafe { libc::syscall(call, fd, map.add(28), count) };
+            assert_eq!(result, 8160, "{context}");
+            left.push(unsafe { std::slice::from_raw_parts(map, 2 * page) }.to_vec());
+            assert_eq!(drain_names(fd), expected[2 + 255..], "{context}");
+            unsafe { libc::munmap(map.cast(), 3 * page) };
+        }
+        assert!(
+            left[0] == left[1],
+            "syscall {call}: a store that faulted changed the bytes Linux left"
+        );
+    }
+
+    println!("aliased record not copied ok");
+}
+
+#[test]
+fn aliased_record_not_copied_is_left_as_linux_leaves_it() {
+    run_five_times_hashing_buffers(aliased_record_not_copied_guest);
 }
 
 /// Map every free range of the address space, largest first, so that Detcore
