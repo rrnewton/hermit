@@ -6822,21 +6822,33 @@ mod tests {
         assert_eq!(a, a_again, "mapping must be stable per host inode");
     }
 
+    /// One request a [`PoolMinter`] received. In production each one is a
+    /// `determinize_inode` or `determinize_device` RPC to the global tool.
+    #[derive(Debug, PartialEq, Eq)]
+    enum MintCall {
+        Inode(crate::types::RawInode),
+        Device(u64),
+    }
+
     /// Fresh run-global identity pools, driven directly rather than over the
-    /// guest RPC that production's minter uses.
+    /// guest RPC that production's minter uses. Every request is recorded in
+    /// `calls`, in the order it was made.
     struct PoolMinter {
         inodes: super::InodePool,
         devices: super::DevicePool,
+        calls: Vec<MintCall>,
     }
 
     impl crate::procfs::MappingIdentityMinter for PoolMinter {
         async fn inode(&mut self, raw_inode: crate::types::RawInode) -> crate::types::DetInode {
+            self.calls.push(MintCall::Inode(raw_inode));
             self.inodes
                 .add_inode(raw_inode, LogicalTime::from_nanos(0))
                 .0
         }
 
         async fn device(&mut self, raw_device: u64) -> u64 {
+            self.calls.push(MintCall::Device(raw_device));
             self.devices.determinize(raw_device)
         }
     }
@@ -6852,16 +6864,31 @@ mod tests {
             crate::types::DetInode,
         >,
     ) -> String {
+        render_maps_with_fresh_pools_and_calls(raw, stdio_by_raw_inode).0
+    }
+
+    /// [`render_maps_with_fresh_pools`], also returning the minter, whose
+    /// `calls` list every mint request in order.
+    fn render_maps_with_fresh_pools_and_calls(
+        raw: &str,
+        stdio_by_raw_inode: &std::collections::BTreeMap<
+            crate::types::RawInode,
+            crate::types::DetInode,
+        >,
+    ) -> (String, PoolMinter) {
         let mut minter = PoolMinter {
             inodes: super::InodePool::new(),
             devices: super::DevicePool::new(),
+            calls: Vec::new(),
         };
         let table = futures::executor::block_on(crate::procfs::mint_mapping_identities(
             raw.as_bytes(),
             stdio_by_raw_inode,
             &mut minter,
         ));
-        String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap()
+        let rendered =
+            String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap();
+        (rendered, minter)
     }
 
     /// Whitespace-separated column `n` of every rendered maps line.
@@ -6890,7 +6917,8 @@ mod tests {
         let low = 131_975;
         let high = 2_196_480;
         let no_stdio = std::collections::BTreeMap::new();
-        let run_a = render_maps_with_fresh_pools(&snapshot(low, high), &no_stdio);
+        let (run_a, minter_a) =
+            render_maps_with_fresh_pools_and_calls(&snapshot(low, high), &no_stdio);
         let run_b = render_maps_with_fresh_pools(&snapshot(high, low), &no_stdio);
         assert_eq!(
             run_a, run_b,
@@ -6900,6 +6928,25 @@ mod tests {
         // The first file in address order gets the first minted inode, and the
         // repeated mapping of it reuses that identity rather than minting again.
         assert_eq!(maps_column(&run_a, 4), ["1", "2", "1", "0"], "{run_a}");
+
+        // The exact request sequence. Each newly seen pair asks for its inode
+        // and then its device, as the inline loop this replaced did, and the
+        // repeated `/memfd:first` line is deduplicated BEFORE minting, so it
+        // issues no second inode or device request. The rendered bytes show
+        // neither property: both pools return the same value for a key they
+        // have already seen, and they are independent of each other. In
+        // production each request is one RPC to the global tool.
+        let memfd_dev = libc::makedev(0, 1);
+        assert_eq!(
+            minter_a.calls,
+            [
+                MintCall::Inode(low),
+                MintCall::Device(memfd_dev),
+                MintCall::Inode(high),
+                MintCall::Device(memfd_dev),
+            ],
+            "{run_a}"
+        );
     }
 
     /// The device pool is minted by the same loop, so it must follow text
@@ -6907,6 +6954,11 @@ mod tests {
     /// with the HIGHER number; sorted raw order would give the other device
     /// `00:01`. Swapping which raw device backs which line must not change a
     /// single rendered byte.
+    ///
+    /// The fourth line adds a third raw device, `00:07`, numerically the
+    /// lowest and last in the text. Text order, sorted raw order and REVERSE
+    /// text order then give three different device columns, so a mint pass that
+    /// visits the pairs backwards is caught as well as one that sorts them.
     #[test]
     fn maps_devices_are_minted_in_text_order_not_raw_order() {
         let snapshot = |first_dev: &str, second_dev: &str| {
@@ -6914,6 +6966,7 @@ mod tests {
                 "10000000-10001000 r-xp 00000000 {first_dev} 5000                       /first/lib.so\n\
                  20000000-20001000 r-xp 00000000 {second_dev} 6000                       /second/lib.so\n\
                  30000000-30001000 r--p 00000000 {first_dev} 7000                       /first/other.so\n\
+                 40000000-40001000 r--p 00000000 00:07 8000                       /third/lib.so\n\
                  7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n"
             )
         };
@@ -6925,23 +6978,31 @@ mod tests {
             run_a, run_b,
             "host device numbering order leaked into guest-visible maps"
         );
+        // Text order: 00:2a -> 00:01, 00:15 -> 00:02, 00:07 -> 00:03. Sorted raw
+        // order would render 00:03, 00:02, 00:03, 00:01; reverse text order
+        // would render 00:02, 00:03, 00:02, 00:01.
         assert_eq!(
             maps_column(&run_a, 3),
-            ["00:01", "00:02", "00:01", "00:00"],
+            ["00:01", "00:02", "00:01", "00:03", "00:00"],
             "{run_a}"
         );
-        assert_eq!(maps_column(&run_a, 4), ["1", "2", "3", "0"], "{run_a}");
+        assert_eq!(maps_column(&run_a, 4), ["1", "2", "3", "4", "0"], "{run_a}");
     }
 
     /// A mapping of a file that is also inherited stdio reports the fixed stdio
     /// identity, and that line does not consume a pooled inode: the next newly
     /// seen file still gets the next pooled number.
+    ///
+    /// The override replaces only the INODE. The stdio line sits on raw device
+    /// `00:2a`, the second raw device in text order, so its minted device is
+    /// `00:02`; a stdio line that skipped device determinization would show
+    /// the raw `00:2a` instead.
     #[test]
     fn maps_stdio_override_does_not_consume_a_pooled_inode() {
         let stdio_det = crate::types::DetInode::mint(1_000_001);
         let stdio_by_raw_inode = std::collections::BTreeMap::from([(4242, stdio_det)]);
         let raw = "10000000-10001000 r-xp 00000000 00:01 900                        /memfd:a (deleted)\n\
-                   20000000-20001000 rw-p 00000000 00:01 4242                       /dev/pts/0\n\
+                   20000000-20001000 rw-p 00000000 00:2a 4242                       /dev/pts/0\n\
                    30000000-30001000 r-xp 00000000 00:01 901                        /memfd:b (deleted)\n";
         let rendered = render_maps_with_fresh_pools(raw, &stdio_by_raw_inode);
         assert_eq!(
@@ -6949,6 +7010,40 @@ mod tests {
             ["1", "1000001", "2"],
             "{rendered}"
         );
+        assert_eq!(
+            maps_column(&rendered, 3),
+            ["00:01", "00:02", "00:01"],
+            "{rendered}"
+        );
+    }
+
+    /// Two mappings with the SAME raw inode on DIFFERENT raw devices are two
+    /// distinct files and two distinct table keys. Both lines must be
+    /// rewritten: a pair missing from the table is left alone by
+    /// `sanitize_maps`, which would publish the host device and inode.
+    /// `InodePool` keys on the raw inode alone, so both lines show the same
+    /// pooled inode; the device pool tells them apart.
+    ///
+    /// The inode assertion `["1", "1"]` records CURRENT behaviour of that
+    /// known keying (TaskGraph task `detcore_inode_pool_keyed_by_raw_inode`),
+    /// not required behaviour: whether two different files share a pooled
+    /// inode depends on whether the host happened to give them the same raw
+    /// inode number. A change that keys the pool on `(device, inode)` should
+    /// update this assertion on purpose; it is not a regression.
+    #[test]
+    fn maps_same_raw_inode_on_two_raw_devices_rewrites_both_lines() {
+        let raw = "10000000-10001000 r-xp 00000000 00:2a 5000                       /first/lib.so\n\
+                   20000000-20001000 r-xp 00000000 00:15 5000                       /second/lib.so\n";
+        let no_stdio = std::collections::BTreeMap::new();
+        let rendered = render_maps_with_fresh_pools(raw, &no_stdio);
+        for host_value in ["00:2a", "00:15", "5000"] {
+            assert!(
+                !rendered.contains(host_value),
+                "host identity {host_value} leaked into guest-visible maps:\n{rendered}"
+            );
+        }
+        assert_eq!(maps_column(&rendered, 3), ["00:01", "00:02"], "{rendered}");
+        assert_eq!(maps_column(&rendered, 4), ["1", "1"], "{rendered}");
     }
 }
 
