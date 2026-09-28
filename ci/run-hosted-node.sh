@@ -27,6 +27,11 @@ if [[ ! -f $HERMIT_RUST_SCRIPT_ARTIFACT_ROOT/manifest.tsv ]]; then
     exit 2
 fi
 
+# Budgeted Nextest attempts create per-attempt cgroups below this process's
+# cgroup. Delegate that subtree before entering the user namespace: sudo does
+# not work inside it, and the namespace inherits the delegated cgroup.
+"$ROOT_DIR/ci/delegate-hosted-cgroup.sh" "$$"
+
 echo "HOSTED-ISOLATION: entering a per-job user/mount/network namespace; local validate still uses its pinned-root and cgroup policy" >&2
 exec unshare --user --map-root-user --uts --net --mount \
     bash -c '

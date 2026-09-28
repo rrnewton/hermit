@@ -432,7 +432,15 @@ jobs:
           # configured or requested here.
           GH_TOKEN: ${{ github.token }}
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '.check_nodes|join(",")' ci/portable-shards.json)"
+        # The real Nextest fixture runs its test through nextest-cpu-wrapper,
+        # which creates a per-attempt cgroup below its current one. The hosted
+        # job's cgroup is root-owned; run 36485831200 failed the fixture with
+        # "cannot create fresh attempt cgroup ...: Permission denied". Move this
+        # step's shell into a runner-owned child first, so the node inherits it.
+        # ci/run-hosted-node.sh does the same for the namespaced test jobs.
+        run: |
+          ./ci/delegate-hosted-cgroup.sh "$$"
+          ./ci/run-node.sh portable "$(jq -r '.check_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload preflight check performance report
         if: always()
         uses: actions/upload-artifact@v4
