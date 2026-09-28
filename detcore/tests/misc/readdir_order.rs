@@ -12,7 +12,7 @@
 //! per-filesystem-seeded name hash on ext4 -- and glibc reads them 32KiB at a
 //! time. Sorting each of those buffers separately still left a directory
 //! larger than one buffer as sorted runs whose boundaries depend on the host.
-//! These guests create directories far larger than one buffer, in different
+//! These tests create directories far larger than one buffer, in different
 //! creation orders, and require one global order, stable offsets, and the
 //! POSIX `seekdir`/`rewinddir` behaviour built on them.
 
@@ -39,6 +39,16 @@ fn run_five_times(guest: fn()) {
 }
 
 fn run_five_times_with(guest: fn(), sequentialize_threads: bool) {
+    run_five_times_on(|| (), |()| guest(), sequentialize_threads)
+}
+
+/// Runs `guest` five times, each on a new value from `setup`. The value is made
+/// outside the guest and dropped after its run.
+fn run_five_times_on<S: Sync>(
+    setup: impl Fn() -> S,
+    guest: impl Fn(&S) + Sync,
+    sequentialize_threads: bool,
+) {
     let config = Config {
         sequentialize_threads,
         max_timeslice: None,
@@ -48,9 +58,13 @@ fn run_five_times_with(guest: fn(), sequentialize_threads: bool) {
     let mut expected = None;
 
     for run in 1..=RUNS {
-        let (output, _state) =
-            detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config.clone(), true)
-                .unwrap_or_else(|error| panic!("readdir guest run {run} failed: {error:#}"));
+        let value = setup();
+        let (output, _state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
+            || guest(&value),
+            config.clone(),
+            true,
+        )
+        .unwrap_or_else(|error| panic!("readdir guest run {run} failed: {error:#}"));
         assert_eq!(
             output.status,
             ExitStatus::Exited(0),
@@ -155,7 +169,8 @@ fn assert_whole_directory_sorted(listing: &Listing, expected: &[String]) {
     assert_eq!(listing.offsets, offsets);
 }
 
-fn creation_order_does_not_change_enumeration_guest() {
+/// Two directories holding the same names, created in different orders.
+fn creation_order_directories() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let forward = root.path().join("forward");
     let shuffled = root.path().join("shuffled");
@@ -163,6 +178,12 @@ fn creation_order_does_not_change_enumeration_guest() {
     std::fs::create_dir(&shuffled).unwrap();
     populate(&forward, 0..ENTRIES);
     populate(&shuffled, scrambled());
+    root
+}
+
+fn creation_order_does_not_change_enumeration_guest(root: &tempfile::TempDir) {
+    let forward = root.path().join("forward");
+    let shuffled = root.path().join("shuffled");
     let expected = sorted_names();
 
     let dir = open_dir(&forward);
@@ -190,7 +211,16 @@ fn creation_order_does_not_change_enumeration_guest() {
 
 #[test]
 fn creation_order_does_not_change_enumeration() {
-    run_five_times(creation_order_does_not_change_enumeration_guest);
+    // The host's order depends on the order the files were created in, not
+    // on which process created them. Creating 6000 files inside each traced
+    // run cost most of the test's CPU limit, so they are created outside it,
+    // in new directories for each run, so that the host's inode numbers still
+    // differ between the runs being compared.
+    run_five_times_on(
+        creation_order_directories,
+        creation_order_does_not_change_enumeration_guest,
+        true,
+    );
 }
 
 fn seekdir_and_rewinddir_guest() {
@@ -586,4 +616,277 @@ fn seek_before_first_read_guest() {
 #[test]
 fn seek_before_first_read_is_kept() {
     run_five_times(seek_before_first_read_guest);
+}
+
+fn rewind_after_host_order_guest() {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend(sorted_names());
+
+    // A descriptor seeked before its first read is read in host order (see
+    // `seek_before_first_read_is_kept`). Seeking it back to 0 starts the
+    // directory over, and the sorted stream with it.
+    let probe = File::open(root.path()).unwrap();
+    let received = receive_descriptor(probe.as_raw_fd());
+    drop(probe);
+    let mut buf = [0u8; 4096];
+    let n = getdents64(received, &mut buf).unwrap();
+    unsafe { libc::close(received) };
+    let cookie = records(&buf[..n])
+        .into_iter()
+        .find_map(|(name, off)| (name == ".").then_some(off))
+        .expect("no `.` entry");
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    assert_eq!(unsafe { libc::lseek(fd, cookie, libc::SEEK_SET) }, cookie);
+    assert!(getdents64(fd, &mut buf).unwrap() > 0);
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+    assert_eq!(drain_names(fd), expected, "after seeking a host position");
+
+    // A buffer too small for a later entry is also read in host order; a
+    // rewind and a larger buffer bring the sorted stream back.
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let mut small = [0u8; 24];
+    let n = getdents64(fd, &mut small).unwrap();
+    assert_eq!(record_names(&small[..n], 19), ["."]);
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+    assert_eq!(drain_names(fd), expected, "after a small buffer");
+
+    println!("rewind after host order ok");
+}
+
+#[test]
+fn rewind_after_host_order_sorts_again() {
+    run_five_times(rewind_after_host_order_guest);
+}
+
+fn passed_on_descriptor_guest() {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend(sorted_names());
+
+    // Read part of the directory, then hand the open file to a descriptor
+    // Detcore does not track. On Linux it reads the entries not yet returned;
+    // it may also repeat some here, because the host order differs, but it
+    // must not miss any.
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let mut buf = [0u8; 512];
+    let n = getdents64(fd, &mut buf).unwrap();
+    let first = record_names(&buf[..n], 19);
+    assert!(
+        first.len() < expected.len(),
+        "the first read was not partial"
+    );
+    let received = receive_descriptor(fd);
+    let passed_on: BTreeSet<String> = drain_names(received).into_iter().collect();
+    let missing: Vec<&String> = expected[first.len()..]
+        .iter()
+        .filter(|name| !passed_on.contains(*name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the passed-on descriptor missed {} entries not yet returned, first {:?}",
+        missing.len(),
+        missing.first()
+    );
+
+    // The stream itself continues where it stopped.
+    let mut names = first;
+    names.extend(drain_names(fd));
+    assert_eq!(names, expected);
+
+    // At the end of the stream, the passed-on descriptor is at the end too.
+    let mut buf = [0u8; 4096];
+    assert_eq!(getdents64(received, &mut buf), Ok(0));
+
+    // A rewind restarts both.
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+    assert_eq!(drain_names(received).len(), expected.len());
+    unsafe { libc::close(received) };
+
+    println!("passed-on descriptor ok");
+}
+
+#[test]
+fn passed_on_descriptor_misses_no_entry() {
+    run_five_times(passed_on_descriptor_guest);
+}
+
+fn partly_mapped_buffer_guest() {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend(sorted_names());
+
+    // A buffer whose first page is mapped and whose next two are not. Linux
+    // returns the records that fit in the mapped page.
+    let page = 4096;
+    let buf = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            3 * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(buf, libc::MAP_FAILED);
+    assert_eq!(
+        unsafe { libc::munmap(buf.cast::<u8>().add(page).cast(), 2 * page) },
+        0
+    );
+
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf, 3 * page as libc::c_uint) };
+    assert!(
+        n > 0,
+        "getdents64 into a partly mapped buffer failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let n = n as usize;
+    assert!(n <= page, "{n} bytes returned from a {page}-byte mapping");
+    let first = record_names(
+        unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), n) },
+        19,
+    );
+    unsafe { libc::munmap(buf, page) };
+
+    let mut names = first;
+    names.extend(drain_names(fd));
+    assert_eq!(names, expected);
+
+    println!("partly mapped buffer ok");
+}
+
+#[test]
+fn partly_mapped_buffer_returns_entries_that_fit() {
+    run_five_times(partly_mapped_buffer_guest);
+}
+
+fn long_name_past_writable_end_guest() {
+    let root = tempfile::tempdir().unwrap();
+    // A 200-byte name takes a 224-byte record.
+    let long = "y".repeat(200);
+    File::create(root.path().join(&long)).unwrap();
+
+    // A 256-byte buffer of which only the first 64 bytes are mapped: `.` and
+    // `..` fit, the long name does not. Linux returns the two that fit, and
+    // then fails the call that reaches the long name.
+    let page = 4096;
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            2 * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(map, libc::MAP_FAILED);
+    assert_eq!(
+        unsafe { libc::munmap(map.cast::<u8>().add(page).cast(), page) },
+        0
+    );
+    let buf = unsafe { std::slice::from_raw_parts_mut(map.cast::<u8>().add(page - 64), 64) };
+    buf.fill(0xaa);
+
+    let dir = File::open(root.path()).unwrap();
+    let fd = dir.as_raw_fd();
+    let getdents = || unsafe {
+        libc::syscall(
+            libc::SYS_getdents64,
+            fd,
+            map.cast::<u8>().add(page - 64),
+            256,
+        )
+    };
+    let n = getdents();
+    assert_eq!(n, 48, "{}", std::io::Error::last_os_error());
+    assert_eq!(record_names(&buf[..48], 19), [".", ".."]);
+    assert!(
+        buf[48..].iter().all(|&byte| byte == 0xaa),
+        "bytes after the returned records changed: {:02x?}",
+        &buf[48..]
+    );
+    assert_eq!(getdents(), -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EFAULT)
+    );
+    unsafe { libc::munmap(map, page) };
+    assert_eq!(drain_names(fd), [long]);
+
+    println!("long name past writable end ok");
+}
+
+#[test]
+fn long_name_past_writable_end_returns_entries_before_it() {
+    run_five_times(long_name_past_writable_end_guest);
+}
+
+fn seek_during_first_read_guest() {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    let mut expected = vec![".".to_owned(), "..".to_owned()];
+    expected.extend(sorted_names());
+
+    // One thread makes the first getdents64 call on a fresh descriptor, which
+    // reads the whole host directory 512 bytes at a time, while another
+    // rewinds the same open file up to 100 times, stopping early when that
+    // call returns. A rewind before the call has no effect and a rewind after
+    // it restarts the stream; neither may land in the middle of reading the
+    // host directory. (Unbounded rewinds landing there would keep the read
+    // from ever reaching the end, so a broken lock would hang, not fail.)
+    for trial in 0..20 {
+        let dir = File::open(root.path()).unwrap();
+        let fd = dir.as_raw_fd();
+        let start = std::sync::Barrier::new(2);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let first = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                start.wait();
+                let mut buf = [0u8; 512];
+                let n = getdents64(fd, &mut buf).unwrap();
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                record_names(&buf[..n], 19)
+            });
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..100 {
+                    if done.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
+                }
+            });
+            reader.join().unwrap()
+        });
+        assert!(
+            first == expected[..first.len()],
+            "trial {trial}: the first call returned {first:?}, not the start of the sorted directory"
+        );
+        let rest = drain_names(fd);
+        let mut continued = first;
+        continued.extend(rest.iter().cloned());
+        assert!(
+            rest == expected || continued == expected,
+            "trial {trial}: {} entries after the first {} did not continue or restart the directory",
+            rest.len(),
+            continued.len() - rest.len()
+        );
+    }
+
+    println!("seek during first read ok");
+}
+
+#[test]
+fn seek_during_first_read_leaves_stream_whole() {
+    run_five_times_with(seek_during_first_read_guest, false);
 }
