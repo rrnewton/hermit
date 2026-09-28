@@ -248,9 +248,18 @@ impl NativeBirthOwner {
         {
             return Err(io::Error::other("native creator changed logical lifetime"));
         }
-        let parent = find(raw.parent_task, raw.parent_start).ok_or_else(|| {
-            io::Error::other("native chosen parent remains unprojected; not Outside")
-        })?;
+        // Linux threads inherit the process's real_parent rather than naming
+        // the thread that called clone. That external wait-parent is not a
+        // Detcore task projection and does not own the thread's scheduler
+        // lineage. The authenticated creator does. Process births still need
+        // the exact chosen real_parent projection (including CLONE_PARENT).
+        let parent = if raw.same_thread_group == 1 {
+            creator.clone()
+        } else {
+            find(raw.parent_task, raw.parent_start).ok_or_else(|| {
+                io::Error::other("native chosen parent remains unprojected; not Outside")
+            })?
+        };
         let process = if raw.same_thread_group == 1 {
             creator.process.clone()
         } else {
@@ -401,6 +410,20 @@ mod tests {
                 .consume(NativeBirthDisposition::ExitedBeforeStart)
                 .is_err()
         );
+    }
+    #[test]
+    fn thread_birth_uses_creator_not_external_real_parent_projection() {
+        let flags = CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM | CloneFlags::CLONE_FILES;
+        let admission = proof(flags, flags, 0, -1, false);
+        assert_ne!(
+            admission.raw().parent_task,
+            admission.raw().creator_task,
+            "fixture must model Linux thread real_parent"
+        );
+        let owner = owner(&admission);
+        let outcome = owner.attach(admission).unwrap();
+        assert_eq!(outcome.parent().thread(), owner.request().owner.thread);
+        assert_eq!(outcome.process(), owner.request().process);
     }
     #[test]
     fn exact_failure_cannot_be_relabelled_as_child_or_change_original_request() {

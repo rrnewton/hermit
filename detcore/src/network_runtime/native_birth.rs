@@ -944,8 +944,14 @@ pub(crate) fn synthetic_admission_for_common_consumer(
             | 5002,
         child_start: 31,
         child_table: if shared_files == 1 { 47 } else { 53 },
-        parent_task: (5001u64 << 32) | 5001,
-        parent_start: 29,
+        // A CLONE_THREAD child keeps the process's real_parent, which is not
+        // the creator thread and need not be a Detcore-projected guest task.
+        parent_task: if same_thread_group == 1 {
+            (4001u64 << 32) | 4001
+        } else {
+            (5001u64 << 32) | 5001
+        },
+        parent_start: if same_thread_group == 1 { 23 } else { 29 },
         copy_begin: if shared_files == 1 { 0 } else { 59 },
         copy_end: if shared_files == 1 { 0 } else { 61 },
         kernel_flags: actual.bits(),
