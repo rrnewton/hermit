@@ -55,3 +55,14 @@ repository = "https://github.com/facebookexperimental/hermit"
 # detcore/src/digest.rs.
 [profile.dev.package.sha2]
 opt-level = 3
+
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie" }
+reverie-dbt = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-dbt" }
+reverie-syscalls = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-syscalls" }
+reverie-memory = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-memory" }
+reverie-rpc-transport = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-rpc-transport" }
+reverie-sabre = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/experimental/reverie-sabre" }
+reverie-ptrace = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-ptrace" }
+reverie-kvm = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/scratch-mainred/rev16-rev-e2e/reverie-liteinst" }
