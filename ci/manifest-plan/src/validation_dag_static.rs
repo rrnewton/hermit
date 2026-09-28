@@ -227,7 +227,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
-    // controls retain all 783 prior identities.
+    // controls retain all 789 prior identities.
     ("test.detcore_unit", 797),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
