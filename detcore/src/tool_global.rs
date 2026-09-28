@@ -7271,22 +7271,58 @@ mod tests {
         assert_eq!(mtime, LogicalTime::from_secs(1));
     }
 
-    /// Mint maps identities the way `initialize_procfs_snapshot` does: walk the
-    /// pairs in the order `mapping_identities_in_text_order` yields and push
-    /// each through the run-global pools, then render the snapshot.
-    fn render_maps_with_fresh_pools(raw: &str) -> String {
-        let mut inodes = super::InodePool::new();
-        let mut devices = super::DevicePool::new();
-        let t = LogicalTime::from_nanos(0);
-        let mut table = std::collections::BTreeMap::new();
-        for (raw_dev, raw_inode) in crate::procfs::mapping_identities_in_text_order(raw) {
-            let det_inode = inodes
-                .add_inode(raw_inode, super::ObservedMtime::Unobserved, t)
-                .0;
-            let det_dev = devices.determinize(raw_dev);
-            table.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
+    /// Fresh run-global identity pools, driven directly rather than over the
+    /// guest RPC that production's minter uses.
+    struct PoolMinter {
+        inodes: super::InodePool,
+        devices: super::DevicePool,
+    }
+
+    impl crate::procfs::MappingIdentityMinter for PoolMinter {
+        async fn inode(&mut self, raw_inode: crate::types::RawInode) -> crate::types::DetInode {
+            self.inodes
+                .add_inode(
+                    raw_inode,
+                    super::ObservedMtime::Unobserved,
+                    LogicalTime::from_nanos(0),
+                )
+                .0
         }
+
+        async fn device(&mut self, raw_device: u64) -> u64 {
+            self.devices.determinize(raw_device)
+        }
+    }
+
+    /// Render one maps snapshot as a fresh run would, through the PRODUCTION
+    /// minting loop: `crate::procfs::mint_mapping_identities` is the function
+    /// `initialize_procfs_snapshot` calls (with an RPC-backed minter), so a
+    /// change to its mint ORDER changes what these tests render.
+    fn render_maps_with_fresh_pools(
+        raw: &str,
+        stdio_by_raw_inode: &std::collections::BTreeMap<
+            crate::types::RawInode,
+            crate::types::DetInode,
+        >,
+    ) -> String {
+        let mut minter = PoolMinter {
+            inodes: super::InodePool::new(),
+            devices: super::DevicePool::new(),
+        };
+        let table = futures::executor::block_on(crate::procfs::mint_mapping_identities(
+            raw.as_bytes(),
+            stdio_by_raw_inode,
+            &mut minter,
+        ));
         String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap()
+    }
+
+    /// Whitespace-separated column `n` of every rendered maps line.
+    fn maps_column(rendered: &str, n: usize) -> Vec<&str> {
+        rendered
+            .lines()
+            .map(|line| line.split_whitespace().nth(n).unwrap())
+            .collect()
     }
 
     /// Two runs with the same guest-visible maps, where the host numbered the
@@ -7306,8 +7342,9 @@ mod tests {
         };
         let low = 131_975;
         let high = 2_196_480;
-        let run_a = render_maps_with_fresh_pools(&snapshot(low, high));
-        let run_b = render_maps_with_fresh_pools(&snapshot(high, low));
+        let no_stdio = std::collections::BTreeMap::new();
+        let run_a = render_maps_with_fresh_pools(&snapshot(low, high), &no_stdio);
+        let run_b = render_maps_with_fresh_pools(&snapshot(high, low), &no_stdio);
         assert_eq!(
             run_a, run_b,
             "host inode numbering order leaked into guest-visible maps"
@@ -7315,11 +7352,56 @@ mod tests {
 
         // The first file in address order gets the first minted inode, and the
         // repeated mapping of it reuses that identity rather than minting again.
-        let inode_column: Vec<&str> = run_a
-            .lines()
-            .map(|line| line.split_whitespace().nth(4).unwrap())
-            .collect();
-        assert_eq!(inode_column, ["1", "2", "1", "0"], "{run_a}");
+        assert_eq!(maps_column(&run_a, 4), ["1", "2", "1", "0"], "{run_a}");
+    }
+
+    /// The device pool is minted by the same loop, so it must follow text
+    /// order too. Here the first file in address order sits on the raw device
+    /// with the HIGHER number; sorted raw order would give the other device
+    /// `00:01`. Swapping which raw device backs which line must not change a
+    /// single rendered byte.
+    #[test]
+    fn maps_devices_are_minted_in_text_order_not_raw_order() {
+        let snapshot = |first_dev: &str, second_dev: &str| {
+            format!(
+                "10000000-10001000 r-xp 00000000 {first_dev} 5000                       /first/lib.so\n\
+                 20000000-20001000 r-xp 00000000 {second_dev} 6000                       /second/lib.so\n\
+                 30000000-30001000 r--p 00000000 {first_dev} 7000                       /first/other.so\n\
+                 7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n"
+            )
+        };
+        let no_stdio = std::collections::BTreeMap::new();
+        // 00:2a (42) is numerically above 00:15 (21); run_a puts it first.
+        let run_a = render_maps_with_fresh_pools(&snapshot("00:2a", "00:15"), &no_stdio);
+        let run_b = render_maps_with_fresh_pools(&snapshot("00:15", "00:2a"), &no_stdio);
+        assert_eq!(
+            run_a, run_b,
+            "host device numbering order leaked into guest-visible maps"
+        );
+        assert_eq!(
+            maps_column(&run_a, 3),
+            ["00:01", "00:02", "00:01", "00:00"],
+            "{run_a}"
+        );
+        assert_eq!(maps_column(&run_a, 4), ["1", "2", "3", "0"], "{run_a}");
+    }
+
+    /// A mapping of a file that is also inherited stdio reports the fixed stdio
+    /// identity, and that line does not consume a pooled inode: the next newly
+    /// seen file still gets the next pooled number.
+    #[test]
+    fn maps_stdio_override_does_not_consume_a_pooled_inode() {
+        let stdio_det = crate::types::DetInode::mint(1_000_001);
+        let stdio_by_raw_inode = std::collections::BTreeMap::from([(4242, stdio_det)]);
+        let raw = "10000000-10001000 r-xp 00000000 00:01 900                        /memfd:a (deleted)\n\
+                   20000000-20001000 rw-p 00000000 00:01 4242                       /dev/pts/0\n\
+                   30000000-30001000 r-xp 00000000 00:01 901                        /memfd:b (deleted)\n";
+        let rendered = render_maps_with_fresh_pools(raw, &stdio_by_raw_inode);
+        assert_eq!(
+            maps_column(&rendered, 4),
+            ["1", "1000001", "2"],
+            "{rendered}"
+        );
     }
 }
 

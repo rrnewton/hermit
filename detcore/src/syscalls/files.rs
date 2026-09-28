@@ -482,6 +482,37 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
     path || times
 }
 
+/// The run-global identity pools, reached through this guest's RPCs to the
+/// global tool: the same `InodePool`/`DevicePool` that `stat` determinizes
+/// through, so a mapping line and a `stat` of the same file agree.
+struct GuestMappingMinter<'a, G, T> {
+    guest: &'a mut G,
+    tool: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<'a, G, T> GuestMappingMinter<'a, G, T> {
+    fn new(guest: &'a mut G) -> Self {
+        Self {
+            guest,
+            tool: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<G, T> crate::procfs::MappingIdentityMinter for GuestMappingMinter<'_, G, T>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    async fn inode(&mut self, raw_inode: RawInode) -> DetInode {
+        determinize_inode(self.guest, raw_inode).await.0
+    }
+
+    async fn device(&mut self, raw_device: u64) -> u64 {
+        determinize_device(self.guest, raw_device).await
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
@@ -1651,8 +1682,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let needs_mapping_identities = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
-        let mut mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
-        if needs_mapping_identities {
+        let mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
             // reports for that fd, which is the fixed `deterministic_stdio_inode`
             // value rather than a pooled one. Matching is by raw inode, read
@@ -1673,21 +1703,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     stdio_by_raw_inode.insert(raw, det);
                 }
             }
-            // Mint in maps-TEXT order (guest address order), not sorted raw
-            // order: a file first seen here gets the next deterministic inode,
-            // so the order must not depend on host inode numbering.
-            let raw_pairs = crate::procfs::mapping_identities_in_text_order(
-                &String::from_utf8_lossy(&contents),
-            );
-            for (raw_dev, raw_inode) in raw_pairs {
-                let det_inode = match stdio_by_raw_inode.get(&raw_inode) {
-                    Some(inode) => *inode,
-                    None => determinize_inode(guest, raw_inode).await.0,
-                };
-                let det_dev = determinize_device(guest, raw_dev).await;
-                mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
-            }
-        }
+            // The minting loop lives in `crate::procfs::mint_mapping_identities`
+            // so the unit tests drive the same code: it mints in maps-TEXT
+            // order, never in host raw-number order, because a file first
+            // seen here gets the next deterministic inode.
+            crate::procfs::mint_mapping_identities(
+                &contents,
+                &stdio_by_raw_inode,
+                &mut GuestMappingMinter::<G, T>::new(guest),
+            )
+            .await
+        } else {
+            BTreeMap::new()
+        };
         let mountinfo = if guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
@@ -5004,26 +5032,67 @@ mod procfs_wiring_guard {
         }
     }
 
+    /// What `maps_identities_are_minted_through_the_tested_loop` requires of
+    /// the `initialize_procfs_snapshot` body; an empty result means it passes.
+    fn maps_minting_wiring_violations(body: &str) -> Vec<&'static str> {
+        let mut violations = Vec::new();
+        if !body.contains("crate::procfs::mint_mapping_identities(") {
+            violations.push("does not call `crate::procfs::mint_mapping_identities`");
+        }
+        // Parsing mapping identities here would mean the order in which this
+        // body mints is no longer the order the unit tests drive.
+        if [
+            "mapping_header_identity",
+            "mapping_identities_in_text_order",
+        ]
+        .iter()
+        .any(|local_parse| body.contains(local_parse))
+        {
+            violations.push("parses mapping identities itself instead of delegating");
+        }
+        violations
+    }
+
     #[test]
-    fn maps_identities_are_minted_in_text_order() {
-        // `tool_global::tests::maps_identities_are_minted_in_text_order_not_raw_order`
-        // proves the helper's order is host-independent. This binds the
-        // snapshot initialiser to that helper, so reintroducing a local
-        // sorted-raw collection here cannot pass silently.
+    fn maps_identities_are_minted_through_the_tested_loop() {
+        // The mint ORDER is tested behaviourally, against the production loop
+        // itself, by `tool_global::tests::maps_*_are_minted_in_text_order_not_raw_order`,
+        // which drive `crate::procfs::mint_mapping_identities`. What those tests
+        // cannot see is whether the snapshot initialiser still calls that loop.
+        // This checks only that: the body calls it and does not parse mapping
+        // identities on its own. It does not check the order.
         let body = handler_body("initialize_procfs_snapshot");
         assert!(
             body.len() > 200 && body.contains("needs_mapping_identities"),
             "guard extractor did not find a real body for `initialize_procfs_snapshot` \
-             (len {}), so the order assertion would be vacuous",
+             (len {}), so the wiring assertion would be vacuous",
             body.len()
         );
+        let violations = maps_minting_wiring_violations(body);
         assert!(
-            body.contains("crate::procfs::mapping_identities_in_text_order("),
-            "MISSING MECHANISM: `initialize_procfs_snapshot` no longer mints /proc/*/maps \
-             identities through `mapping_identities_in_text_order`. Minting in any \
-             host-derived order (for example a sorted set of raw (dev, inode) pairs) lets \
-             host inode numbering decide which newly seen file gets the lower \
-             deterministic inode."
+            violations.is_empty(),
+            "MISSING MECHANISM: `initialize_procfs_snapshot` {violations:?}. /proc/*/maps \
+             identities must be minted by `crate::procfs::mint_mapping_identities`, whose \
+             text-order minting is what the tool_global unit tests exercise; a local loop \
+             could mint in host raw-number order without any test noticing."
+        );
+    }
+
+    #[test]
+    fn maps_minting_wiring_check_rejects_a_local_loop() {
+        // Positive controls: bodies that bypass the tested loop must be rejected,
+        // otherwise the guard above would pass vacuously.
+        let local_loop = "let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)\n\
+                          .lines().filter_map(crate::procfs::mapping_header_identity).collect();";
+        assert!(!maps_minting_wiring_violations(local_loop).is_empty());
+        let local_order = "let raw_pairs = crate::procfs::mapping_identities_in_text_order(&text);\n\
+                           crate::procfs::mint_mapping_identities(&contents, &stdio, &mut minter)";
+        assert!(!maps_minting_wiring_violations(local_order).is_empty());
+        assert!(
+            maps_minting_wiring_violations(
+                "crate::procfs::mint_mapping_identities(&contents, &stdio, &mut minter)"
+            )
+            .is_empty()
         );
     }
 
