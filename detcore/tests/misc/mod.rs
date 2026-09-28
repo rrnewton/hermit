@@ -1209,6 +1209,120 @@ fn waitid_polls_until_child_exit_and_supports_wnohang() {
 }
 
 #[test]
+fn wait4_argument_errors_match_linux_and_preserve_children() {
+    det_test_fn_sequential_without_pmu(|| {
+        fn wait4_error(pid: libc::pid_t, options: libc::c_int, expected: libc::c_int) {
+            let mut status = 0;
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_wait4,
+                    pid,
+                    &mut status,
+                    options,
+                    std::ptr::null_mut::<libc::rusage>(),
+                )
+            };
+            assert_eq!(
+                result, -1,
+                "wait4({pid}, {options:#x}) unexpectedly succeeded"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(expected),
+                "wait4({pid}, {options:#x}) returned the wrong errno"
+            );
+        }
+
+        fn spawn_exiting_child(exit_status: libc::c_int) -> libc::pid_t {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0, "fork should succeed");
+            if child == 0 {
+                unsafe { libc::_exit(exit_status) };
+            }
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                },
+                0
+            );
+            assert_eq!(unsafe { info.si_pid() }, child);
+            assert_eq!(info.si_code, libc::CLD_EXITED);
+            assert_eq!(unsafe { info.si_status() }, exit_status);
+            child
+        }
+
+        fn reap_child(child: libc::pid_t, exit_status: libc::c_int) {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), exit_status);
+        }
+
+        wait4_error(libc::pid_t::MIN, 0, libc::ESRCH);
+        wait4_error(libc::pid_t::MIN, libc::WNOHANG, libc::ESRCH);
+
+        let mut release_pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
+        let running_child = unsafe { libc::fork() };
+        assert!(running_child >= 0, "fork should succeed");
+        if running_child == 0 {
+            unsafe {
+                libc::close(release_pipe[1]);
+                let mut byte = 0_u8;
+                let result = libc::read(release_pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(if result == 1 { 31 } else { 126 });
+            }
+        }
+        unsafe { libc::close(release_pipe[0]) };
+        wait4_error(libc::pid_t::MIN, libc::WNOHANG, libc::ESRCH);
+        let byte = 1_u8;
+        assert_eq!(
+            unsafe { libc::write(release_pipe[1], (&byte as *const u8).cast(), 1) },
+            1
+        );
+        unsafe { libc::close(release_pipe[1]) };
+        reap_child(running_child, 31);
+
+        let zombie_wnohang = spawn_exiting_child(41);
+        wait4_error(libc::pid_t::MIN, libc::WNOHANG, libc::ESRCH);
+        reap_child(zombie_wnohang, 41);
+
+        let zombie_blocking = spawn_exiting_child(42);
+        wait4_error(libc::pid_t::MIN, 0, libc::ESRCH);
+        reap_child(zombie_blocking, 42);
+
+        let zombie_untraced = spawn_exiting_child(51);
+        wait4_error(
+            libc::pid_t::MIN,
+            libc::WUNTRACED | libc::WNOHANG,
+            libc::ESRCH,
+        );
+        reap_child(zombie_untraced, 51);
+
+        let invalid_options_child = spawn_exiting_child(61);
+        wait4_error(libc::pid_t::MIN, 0x10, libc::EINVAL);
+        wait4_error(-1, 0x10, libc::EINVAL);
+        reap_child(invalid_options_child, 61);
+
+        for bit in 0..u32::BITS {
+            let option = (1_u32 << bit) as libc::c_int;
+            let expected = if matches!(bit, 0 | 1 | 3 | 29 | 30 | 31) {
+                libc::ECHILD
+            } else {
+                libc::EINVAL
+            };
+            wait4_error(-1, option, expected);
+        }
+    });
+}
+
+#[test]
 fn ordinary_clone_child_starts_before_parent_resumes() {
     det_test_fn_sequential_without_pmu(|| {
         use std::sync::Arc;
