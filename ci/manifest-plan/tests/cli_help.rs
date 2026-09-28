@@ -303,6 +303,54 @@ fn help_does_not_turn_missing_or_unknown_arguments_into_success() {
     }
 }
 
+/// `run --parity-reference ptrace` used to add a ptrace reference run whose
+/// log comparison could overwrite a candidate's outcome. The flag was removed
+/// in https://github.com/rrnewton/hermit/issues/3301. It is refused by name,
+/// before any selection, execution or output, and the refusal says what
+/// replaced it.
+#[test]
+fn test_harness_refuses_the_removed_parity_reference_flag() {
+    const REFUSAL: &str = "test-harness: --parity-reference was removed: a ptrace reference \
+         run no longer decides a cell's outcome \
+         (https://github.com/rrnewton/hermit/issues/3301). Drop the flag; each selected \
+         verify cell runs its own backend's strict verification.\n";
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let directory = non_repository_dir("removed-parity-reference");
+    let results = directory.join("results.jsonl");
+    let results_arg = results.to_string_lossy().into_owned();
+    for arguments in [
+        vec!["run", "--parity-reference", "ptrace"],
+        vec!["run", "--parity-reference"],
+        vec![
+            "run",
+            "--results",
+            results_arg.as_str(),
+            "--category",
+            "backend-parity-c",
+            "--parity-reference",
+            "ptrace",
+        ],
+        vec!["plan", "--parity-reference", "ptrace"],
+    ] {
+        let output = run_from(harness, &arguments, Some(&directory));
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            REFUSAL,
+            "{arguments:?}"
+        );
+        assert!(!results.exists(), "{arguments:?} created {results:?}");
+    }
+    for help in [vec!["--help"], vec!["run", "--help"]] {
+        let output = run_from(harness, &help, Some(&directory));
+        assert!(output.status.success(), "{help:?}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("parity-reference"), "{help:?}: {stdout}");
+    }
+    std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
+}
+
 #[test]
 fn manifest_plan_no_arguments_remains_the_default_text_plan() {
     let output = run(env!("CARGO_BIN_EXE_hermit-manifest-plan"), &[]);
