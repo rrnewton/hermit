@@ -98,7 +98,14 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                     assert!(!before.is_empty() && before.len() <= 4 * 65536);
                     assert_eq!(before.len(), after.len());
                     assert_eq!(before.len() % 2, 0);
-                    assert!(before.as_bytes().chunks_exact(2).all(|pair| pair == b"a5"));
+                    assert!(
+                        before
+                            .as_bytes()
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .all(|pair| pair == b"a5")
+                    );
                     assert!(after.bytes().all(|byte| byte.is_ascii_hexdigit()));
                 }
                 assert!(row["rc"].is_i64());
@@ -506,7 +513,14 @@ fn assert_sibling_observations(stdout: &[u8], direction: &str, selector: &str, c
         let before = usage["before"].as_str().unwrap();
         assert!((8192..=131072).contains(&before.len()));
         assert_eq!(before.len() % 2, 0);
-        assert!(before.as_bytes().chunks_exact(2).all(|pair| pair == b"a5"));
+        assert!(
+            before
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| pair == b"a5")
+        );
         assert_eq!(usage["after"], before);
         assert!(
             rows[..5]
