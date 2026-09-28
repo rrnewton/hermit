@@ -1719,6 +1719,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         guest.thread_state_mut().past_global_first_execve = true;
+        // Only a successful exec reaches this callback. Delete the old image's
+        // POSIX timer IDs while exec still owns its scheduler turn; the global
+        // notification below cancels their deadlines before the pre-handler
+        // can yield. alarm()/ITIMER_REAL and the continuous clock survive exec.
+        guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .clear_for_exec();
         // A successful exec clears the kernel's clear_child_tid registration.
         // Mirror that reset before any replacement-image syscall can run.
         if guest.config().sequentialize_threads {

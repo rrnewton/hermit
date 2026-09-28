@@ -271,6 +271,21 @@ impl TimedEvents {
         self.remove_signal_timer(SignalTimerId::Posix(dp, timer_id));
     }
 
+    /// Successful exec deletes POSIX timers, but preserves alarm()/ITIMER_REAL.
+    /// Cancel both the deadline and periodic rearming state, including timers
+    /// armed by a sibling. Other processes and non-timer events are untouched.
+    pub fn remove_posix_timers(&mut self, dp: DetPid) {
+        let ids: Vec<_> = self
+            .signal_timers
+            .keys()
+            .copied()
+            .filter(|id| matches!(id, SignalTimerId::Posix(pid, _) if *pid == dp))
+            .collect();
+        for id in ids {
+            self.remove_signal_timer(id);
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     fn remove_signal_timer(&mut self, id: SignalTimerId) -> Option<SignalTimerState> {
@@ -686,6 +701,81 @@ mod test {
             ))
         );
         assert_eq!(ev.remove_alarm(p), Some((at(1000), LogicalTime::ZERO)));
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn exec_deletes_only_its_process_posix_timers() {
+        for kvm in [false, true] {
+            let mut ev = TimedEvents::default();
+            let p = pid(100);
+            let deadline = at(1000);
+            if kvm {
+                ev.insert_kvm_real_deadline(deadline, p);
+            } else {
+                ev.insert_alarm(deadline, p, tid(100), Signal::SIGALRM, at(250));
+            }
+            ev.insert(deadline, tid(101));
+            ev.insert_child_exit(deadline, pid(200), p, tid(100));
+            ev.insert_posix_timer(
+                deadline,
+                pid(200),
+                tid(200),
+                7,
+                Signal::SIGUSR2,
+                LogicalTime::ZERO,
+            );
+            let preserved: Vec<_> = ev.iter().collect();
+            let alarm = ev.alarm_state(p);
+            let kvm_deadlines = ev.kvm_real_deadlines.clone();
+
+            // Two same-deadline timers, one armed by a sibling, and a timer
+            // with its own bucket exercise both map cleanup paths.
+            ev.insert_posix_timer(deadline, p, tid(100), 7, Signal::SIGUSR2, at(50));
+            ev.insert_posix_timer(deadline, p, tid(101), 8, Signal::SIGUSR1, at(70));
+            ev.insert_posix_timer(at(900), p, tid(100), 9, Signal::SIGUSR2, LogicalTime::ZERO);
+            ev.remove_posix_timers(p);
+            ev.remove_posix_timers(p); // Empty/repeated exec is harmless.
+
+            assert_eq!(ev.iter().collect::<Vec<_>>(), preserved);
+            assert_eq!(ev.next_deadline(), Some(deadline));
+            assert_eq!(ev.alarm_state(p), alarm);
+            assert_eq!(ev.kvm_real_deadlines, kvm_deadlines);
+            assert!(
+                !ev.signal_timers
+                    .keys()
+                    .any(|id| matches!(id, SignalTimerId::Posix(owner, _) if *owner == p))
+            );
+        }
+    }
+
+    #[test]
+    fn exec_cancels_periodic_rearm_after_an_expiration() {
+        let mut ev = TimedEvents::default();
+        let p = pid(100);
+        ev.insert_posix_timer(at(100), p, tid(101), 7, Signal::SIGUSR2, at(50));
+        assert_eq!(
+            ev.pop_if_before(at(100)),
+            Some((
+                at(100),
+                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 7), tid(101), Signal::SIGUSR2),
+            ))
+        );
+        assert_eq!(ev.next_deadline(), Some(at(150)));
+        ev.remove_posix_timers(p);
+        assert!(ev.is_empty());
+        assert!(ev.signal_timers.is_empty());
+        assert_eq!(ev.pop(), None);
+
+        ev.insert_posix_timer(at(300), p, tid(100), 8, Signal::SIGUSR1, LogicalTime::ZERO);
+        assert_eq!(ev.pop_if_before(at(299)), None);
+        assert_eq!(
+            ev.pop_if_before(at(300)),
+            Some((
+                at(300),
+                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 8), tid(100), Signal::SIGUSR1),
+            ))
+        );
         assert!(ev.is_empty());
     }
 }
