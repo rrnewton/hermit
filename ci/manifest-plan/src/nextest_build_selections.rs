@@ -37,6 +37,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.network_syscall_determinism_diagnostic" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_misc"])
         }
+        "test.detcore_time" => Some(&["-p", "hermit-detcore", "--test", "tests_time"]),
         "test.detcore_parallel"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
