@@ -109,6 +109,7 @@ fn every_test_harness_subcommand_has_conventional_help() {
         "build",
         "audit-compile",
         "run",
+        "parity",
     ];
 
     let non_repo = non_repository_dir("subcommand-help");
@@ -155,6 +156,7 @@ fn test_harness_help_names_every_public_environment_control() {
         "HERMIT_BIN",
         "HERMIT_E2E_EMPTY_WORKDIR",
         "E2E_KEEP_VERIFY_LOGS",
+        "E2E_PARITY_SELECT",
         "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER",
         "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER",
     ] {
@@ -201,6 +203,11 @@ fn execution_subcommand_help_names_every_environment_read() {
             stdout.contains("DAGRUN_TEST_COUNTS_PATH"),
             command == "run",
             "DAGRUN_TEST_COUNTS_PATH belongs only to the run protocol"
+        );
+        assert_eq!(
+            stdout.contains("  E2E_PARITY_SELECT="),
+            command == "run",
+            "only run reads E2E_PARITY_SELECT, for its parity post-pass"
         );
     }
 

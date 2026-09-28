@@ -231,7 +231,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // parity-rerun tests: 625 + 24 - 9 = 640 in `cargo nextest list`.
     // The parity review follow-ups add 5 tests (2 parity, 1 runner, 2 cli_help)
     // and retain all 640 prior identities (`cargo nextest list` measured 645).
-    ("test.regular_crates", 645),
+    // Seven parity post-pass tests and the test-harness post-pass test retain
+    // all 645 prior identities (`cargo nextest list` measured 653).
+    // The post-pass review fixes add 10 tests (7 parity, 3 test-harness) and
+    // retain all 653 prior identities (`cargo nextest list` measured 663).
+    ("test.regular_crates", 663),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -296,7 +300,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 645),
+    ("test.regular_crates_on_host", 663),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
