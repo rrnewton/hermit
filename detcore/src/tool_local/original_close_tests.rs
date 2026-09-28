@@ -10,13 +10,14 @@ use crate::network_replay::original_connect::Local;
 use crate::network_replay::*;
 use crate::network_runtime::OriginalSelection;
 
-fn install(
+fn install_at(
     engine: &mut NetworkReplayEngine,
     metadata: &mut FileMetadata,
     owner: NetworkStreamOwner,
+    fd: i32,
 ) -> FdSlotBinding {
     metadata
-        .add_fd(owner.thread, 7, OFlag::empty(), FdType::Socket, None)
+        .add_fd(owner.thread, fd, OFlag::empty(), FdType::Socket, None)
         .unwrap();
     let replacement = *metadata.pending_network_installations.last().unwrap();
     let effect = engine.fd_publication_fixture_effect(owner, replacement);
@@ -40,7 +41,24 @@ fn install(
     );
     metadata.publication_server_acknowledge(&batch).unwrap();
     assert!(metadata.network_publication.awaiting_global_ack.is_none());
-    metadata.descriptor_binding(7).unwrap()
+    metadata.descriptor_binding(fd).unwrap()
+}
+
+fn install(
+    engine: &mut NetworkReplayEngine,
+    metadata: &mut FileMetadata,
+    owner: NetworkStreamOwner,
+) -> FdSlotBinding {
+    install_at(engine, metadata, owner, 7)
+}
+
+pub(crate) fn dispatcher_install(
+    engine: &mut NetworkReplayEngine,
+    metadata: &mut FileMetadata,
+    owner: NetworkStreamOwner,
+    fd: i32,
+) -> FdSlotBinding {
+    install_at(engine, metadata, owner, fd)
 }
 
 // This is the existing modeled Alias transaction, with an explicit successful
@@ -150,6 +168,24 @@ pub(crate) fn fixture(
     fixture_with_alias(occupied, false)
 }
 
+pub(crate) fn dispatcher_fixture(
+    fd: i32,
+) -> (NetworkReplayEngine, FileMetadata, NetworkStreamOwner) {
+    let first = DetTid::from_raw(61);
+    let owner = NetworkStreamOwner {
+        thread: first,
+        mm: MmId::initial(first),
+    };
+    let mut engine = NetworkReplayEngine::record_native_receive(
+        chrono::Utc.timestamp_opt(1_790_000_000, 0).unwrap(),
+    );
+    engine.fd_table_fixture_enable();
+    engine.fd_publication_fixture_register(owner, None);
+    let mut metadata = FileMetadata::empty_network_fixture(first);
+    dispatcher_install(&mut engine, &mut metadata, owner, fd);
+    (engine, metadata, owner)
+}
+
 fn fixture_with_alias(
     occupied: bool,
     retain_alias: bool,
@@ -222,11 +258,11 @@ fn selection(admission: &Admission) -> OriginalSelection {
         task_start: 99,
         table: 5,
         file: if admission.arguments.binding.is_some() {
-            7
+            admission.arguments.fd as u64
         } else {
             0
         },
-        requested_fd: 7,
+        requested_fd: admission.arguments.fd,
         ready: 1,
         user_address: 0,
         fdput_flags: 0,
@@ -235,7 +271,7 @@ fn selection(admission: &Admission) -> OriginalSelection {
     }
 }
 
-fn selected(owner: NetworkStreamOwner, admission: &Admission) -> OriginalSelection {
+pub(crate) fn selected(owner: NetworkStreamOwner, admission: &Admission) -> OriginalSelection {
     let mut value = selection(admission);
     value.owner_mm = owner.mm.generation();
     value

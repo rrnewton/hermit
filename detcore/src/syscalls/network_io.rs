@@ -8481,6 +8481,379 @@ mod original_file_delegate_error_tests {
         }
     }
 
+    struct CloseDispatchBoundary {
+        admission: Option<crate::network_replay::original_connect::Admission>,
+        outcome: Option<crate::network_runtime::original_connect::Outcome>,
+        events: Vec<&'static str>,
+    }
+
+    struct CloseDispatchGuest<'a> {
+        config: &'a Config,
+        global: crate::tool_global::GlobalState,
+        thread: crate::ThreadState<usize>,
+        engine: Mutex<crate::network_replay::NetworkReplayEngine>,
+        owner: crate::network_replay::NetworkStreamOwner,
+        boundary: Mutex<CloseDispatchBoundary>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for CloseDispatchGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let mut engine = self.engine.lock().unwrap();
+            let mut boundary = self.boundary.lock().unwrap();
+            let reply = match request.2 {
+                GlobalRequest::Network(NetworkRequest::FdPublication(request)) => {
+                    use crate::network_replay::NetworkFdPublicationReply as P;
+                    use crate::network_replay::NetworkFdPublicationRequest as Q;
+                    let reply = match request {
+                        Q::Acquire { files } => {
+                            P::Admitted(engine.acquire_fd_publication(self.owner, files).unwrap())
+                        }
+                        Q::Publish { permit, batch } => P::Published(
+                            engine
+                                .publish_fd_publication(self.owner, permit, &batch)
+                                .unwrap(),
+                        ),
+                        Q::Acknowledge { permit, batch } => {
+                            engine
+                                .acknowledge_fd_publication(self.owner, permit, &batch)
+                                .unwrap();
+                            P::Released
+                        }
+                        Q::ReleaseEmpty { permit } => {
+                            engine
+                                .release_empty_fd_publication(self.owner, permit)
+                                .unwrap();
+                            P::Released
+                        }
+                    };
+                    NetworkReply::FdPublication(reply)
+                }
+                GlobalRequest::Network(NetworkRequest::BeginFdRead { files, fd })
+                | GlobalRequest::Network(NetworkRequest::BeginOrdinaryFdRead { files, fd }) => {
+                    NetworkReply::FdRead(engine.begin_fd_read(self.owner, files, fd).unwrap())
+                }
+                GlobalRequest::Network(NetworkRequest::FinishFdRead { admission }) => {
+                    engine.finish_fd_read(self.owner, admission).unwrap();
+                    boundary.events.push("read-ebadf-release");
+                    NetworkReply::Unit
+                }
+                GlobalRequest::Network(NetworkRequest::NativeBeginOriginalExternalFromRead {
+                    arguments,
+                    read,
+                }) => {
+                    assert!(boundary.events.is_empty());
+                    assert_eq!(arguments.kind, Kind::Close);
+                    let admission = engine
+                        .begin_original_external_from_read(self.owner, arguments, read)
+                        .unwrap();
+                    engine
+                        .original_connect_provider_submitted(self.owner, &admission)
+                        .unwrap();
+                    engine
+                        .original_call_prepared(self.owner, &admission, None, 17)
+                        .unwrap();
+                    boundary.admission = Some(admission.clone());
+                    boundary.events.push("admitted-prepared");
+                    NetworkReply::OriginalConnectAdmission(admission)
+                }
+                GlobalRequest::Network(NetworkRequest::NativeSubmitOriginalConnect {
+                    admission,
+                }) => {
+                    assert_eq!(boundary.admission.as_ref(), Some(&admission));
+                    assert_eq!(boundary.events, ["admitted-prepared"]);
+                    engine
+                        .original_connect_invoked(self.owner, &admission)
+                        .unwrap();
+                    boundary.events.push("submitted");
+                    NetworkReply::Unit
+                }
+                GlobalRequest::Network(NetworkRequest::NativeOriginalConnectOutcome {
+                    admission,
+                }) => {
+                    assert_eq!(boundary.admission.as_ref(), Some(&admission));
+                    assert_eq!(
+                        boundary.events,
+                        ["admitted-prepared", "submitted", "closed"]
+                    );
+                    boundary.events.push("outcome");
+                    NetworkReply::OriginalConnectOutcome(
+                        boundary
+                            .outcome
+                            .clone()
+                            .expect("physical close outcome missing"),
+                    )
+                }
+                GlobalRequest::Network(NetworkRequest::NativeRetireOriginalConnect {
+                    admission,
+                }) => {
+                    assert_eq!(boundary.admission.as_ref(), Some(&admission));
+                    assert_eq!(
+                        boundary.events,
+                        ["admitted-prepared", "submitted", "closed", "outcome"]
+                    );
+                    engine
+                        .finish_original_connect(self.owner, &admission)
+                        .unwrap();
+                    boundary.events.push("retired");
+                    NetworkReply::Unit
+                }
+                other => panic!("unexpected close-dispatch request: {other:?}"),
+            };
+            (None, GlobalResponse::Network(Ok(reply)))
+        }
+
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore<FailingDelegate>> for CloseDispatchGuest<'_> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Tid {
+            Tid::from_raw(self.owner.thread.as_raw())
+        }
+
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+
+        fn local_global_state(&self) -> Option<&GlobalState> {
+            Some(&self.global)
+        }
+
+        fn memory(&self) -> LocalMemory {
+            LocalMemory::new()
+        }
+
+        fn thread_state(&self) -> &crate::ThreadState<usize> {
+            &self.thread
+        }
+
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<usize> {
+            &mut self.thread
+        }
+
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            unsafe { std::mem::zeroed() }
+        }
+
+        async fn stack(&mut self) -> NoStack {
+            panic!("close dispatcher must not use a guest stack")
+        }
+
+        async fn daemonize(&mut self) {
+            panic!("close dispatcher must not daemonize")
+        }
+
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, arguments) = syscall.into_parts();
+            let Syscall::Close(call) = Syscall::from_raw(number, arguments) else {
+                panic!("close dispatcher changed physical syscall shape")
+            };
+            let admission = self
+                .thread
+                .original_connect
+                .as_ref()
+                .and_then(|local| local.admission.clone())
+                .expect("close injection lost admission");
+            assert!(self.thread.original_connect.as_ref().unwrap().invoked);
+            let selected =
+                crate::tool_local::original_close_tests::selected(self.owner, &admission);
+            {
+                let mut engine = self.engine.lock().unwrap();
+                let mut metadata = self.thread.file_metadata.lock().unwrap();
+                engine
+                    .publish_original_close_selection(
+                        self.owner,
+                        &admission,
+                        &selected,
+                        &mut metadata,
+                    )
+                    .unwrap();
+            }
+            let result = unsafe { libc::close(call.fd()) };
+            let returned = if result == 0 {
+                0
+            } else {
+                -i64::from(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .expect("close errno missing"),
+                )
+            };
+            {
+                let mut engine = self.engine.lock().unwrap();
+                engine
+                    .original_connect_returned(self.owner, &admission, returned)
+                    .unwrap();
+                engine
+                    .original_connect_provider_retired(self.owner, &admission, returned)
+                    .unwrap();
+                engine
+                    .original_connect_pin_released(self.owner, &admission)
+                    .unwrap();
+            }
+            self.thread.original_connect.as_mut().unwrap().returned = Some(returned);
+            let mut boundary = self.boundary.lock().unwrap();
+            assert_eq!(boundary.events, ["admitted-prepared", "submitted"]);
+            boundary.outcome = Some(crate::network_runtime::original_connect::Outcome {
+                admission,
+                returned,
+                pin: None,
+                address: None,
+                socket: None,
+                read_copy: None,
+            });
+            boundary.events.push("closed");
+            if returned == 0 {
+                Ok(0)
+            } else {
+                Err(Errno::new((-returned) as i32))
+            }
+        }
+
+        async fn inject_original_read(&mut self, _: syscalls::Read) -> reverie::InjectedReadResult {
+            panic!("retired close generation must refuse Read before physical injection")
+        }
+
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+            panic!("unexpected tail injection")
+        }
+
+        fn set_timer(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+
+        fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn v4_close_dispatch_joins_physical_effect_lifetime_and_fd_generation() {
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::IntoRawFd;
+        use std::os::fd::OwnedFd;
+
+        fn pipe() -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+
+        let (read_end, _write_end) = pipe();
+        let fd = read_end.into_raw_fd();
+        let (engine, metadata, owner) =
+            crate::tool_local::original_close_tests::dispatcher_fixture(fd);
+        let old = metadata.descriptor_binding(fd).unwrap();
+        let mut config = Config {
+            sequentialize_threads: false,
+            max_timeslice: None,
+            epoch_explicit: true,
+            epoch: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            ..Config::default()
+        };
+        config.network_trace.policy = NetworkPolicy::Record;
+        let tool: Detcore<FailingDelegate> =
+            Detcore::new(Tid::from_raw(owner.thread.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(owner.thread.as_raw()), None);
+        thread.dettid = owner.thread;
+        thread.mm_id = owner.mm;
+        thread.stats.syscall_count = 10;
+        thread.end_of_timeslice = Some(LogicalTime::MAX);
+        thread.file_metadata = std::sync::Arc::new(Mutex::new(metadata));
+        let mut guest = CloseDispatchGuest {
+            config: &config,
+            global: GlobalState::native_record_view_fixture(&config),
+            thread,
+            engine: Mutex::new(engine),
+            owner,
+            boundary: Mutex::new(CloseDispatchBoundary {
+                admission: None,
+                outcome: None,
+                events: Vec::new(),
+            }),
+        };
+
+        assert_eq!(
+            tool.handle_syscall_event(&mut guest, syscalls::Close::new().with_fd(fd).into(),)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(guest.thread.original_connect.is_none());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        let mut byte = 0u8;
+        let read = syscalls::Read::new()
+            .with_fd(fd)
+            .with_buf(AddrMut::from_ptr(&mut byte))
+            .with_len(1);
+        assert!(matches!(
+            tool.handle_syscall_event(&mut guest, read.into()).await,
+            Err(Error::Errno(errno)) if errno == Errno::EBADF
+        ));
+        assert_eq!(guest.thread.descriptor_binding(fd), Err(Errno::EBADF));
+
+        let (replacement_source, replacement_peer) = pipe();
+        let source = replacement_source.into_raw_fd();
+        if source != fd {
+            assert_eq!(unsafe { libc::dup3(source, fd, libc::O_CLOEXEC) }, fd);
+            assert_eq!(unsafe { libc::close(source) }, 0);
+        }
+        let replacement_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(replacement_fd.as_raw_fd(), fd);
+        let replacement = {
+            let mut engine = guest.engine.lock().unwrap();
+            let mut metadata = guest.thread.file_metadata.lock().unwrap();
+            crate::tool_local::original_close_tests::dispatcher_install(
+                &mut engine,
+                &mut metadata,
+                owner,
+                fd,
+            )
+        };
+        assert_eq!(replacement.slot, old.slot);
+        assert_ne!(replacement.generation, old.generation);
+        assert_eq!(guest.thread.descriptor_binding(fd).unwrap(), replacement);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC
+        );
+        assert_eq!(
+            guest.boundary.lock().unwrap().events,
+            [
+                "admitted-prepared",
+                "submitted",
+                "closed",
+                "outcome",
+                "retired",
+                "read-ebadf-release"
+            ]
+        );
+        drop(replacement_peer);
+        drop(replacement_fd);
+    }
+
     struct LegacyFlagsGuest<'a> {
         config: &'a Config,
         thread: crate::ThreadState<usize>,
