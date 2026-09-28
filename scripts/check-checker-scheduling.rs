@@ -339,28 +339,60 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     const RUNNERS: [&str; 5] = ["python3", "python", "bash", "sh", "rustc"];
     /// Flags whose VALUE is the next token, so that token is never the script.
     ///
-    /// ⚠️ THE ORIGINAL NOTE HERE HAD THE RISK BACKWARDS, and that is why this list
-    /// exists rather than being avoided. It said naming these "is a guess -- and a
-    /// wrong guess here fails in the silent direction". Both ways of being wrong
-    /// were checked, and neither does:
+    /// ⚠️ THIS IS PER-RUNNER, AND A FLAT LIST WAS WRONG. `-c` is the case that
+    /// forced the split, and it is wrong in OPPOSITE DIRECTIONS for the two
+    /// families. Measured 2026-08-26 by executing them:
     ///
+    ///     sh -c /tmp/probe.sh        -> the script RUNS
+    ///     bash -c /tmp/probe.sh      -> the script RUNS
+    ///     python3 -c /tmp/probe.sh   -> SyntaxError; the path is SOURCE TEXT
+    ///
+    /// So for the shells the token after `-c` may BE the invocation, and
+    /// skipping it hides a real one. For python it is code, and a bare path
+    /// there executes nothing. A flat list has to choose, and either choice is
+    /// wrong for one family.
+    ///
+    /// ⚠️ AN EARLIER REVISION OF THIS FILE PUT `-c` IN THE FLAT LIST, WHICH MADE
+    /// `sh -c scripts/check-x.rs` READ AS UNSCHEDULED. That is a false ORPHAN --
+    /// the loud direction, per the note below, but still wrong, and it would have
+    /// hidden any checker actually scheduled through a shell.
+    ///
+    /// The two ways of being wrong are still asymmetric:
     ///   * OVER-marking (listing a flag that takes no value): the scan skips one
     ///     token too many, lands past the script, and reports a FALSE ORPHAN --
     ///     loud, and one line to fix.
-    ///   * UNDER-marking (the state before this list): the scan stops ON the
-    ///     value, so `rustc -o <checker> in.rs` reads an OUTPUT as an invocation
-    ///     and reports a FALSE "SCHEDULED" -- silent, and it defeats the guard.
-    ///
-    /// So omitting the list is the silent failure and having it is the loud one.
-    /// Both directions are pinned in `self_test`.
-    const VALUE_FLAGS: [&str; 18] = [
-        // rustc
+    ///   * UNDER-marking: the scan stops ON the value, so `rustc -o <checker>
+    ///     in.rs` reads an OUTPUT as an invocation and reports a FALSE
+    ///     "SCHEDULED" -- silent, and it defeats the guard.
+    /// Both directions are pinned in `self_test`, per runner.
+    const RUSTC_VALUE_FLAGS: [&str; 17] = [
         "-o", "--out-dir", "--emit", "--extern", "--target", "--edition",
         "--crate-name", "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C",
         "-Z", "-W", "-A", "-D",
-        // python / shell: the token after these is code or a module name
-        "-m",
     ];
+    /// python: the token after these is a module name or SOURCE TEXT, never a
+    /// script path the interpreter executes as a file.
+    ///
+    /// ⚠️ `-W` AND `-X` ARE DELIBERATELY ABSENT although they also take values.
+    /// Adding them closes the gap that `python3 -X faulthandler <script>` reads
+    /// as an ORPHAN -- a real improvement, and NOT this change's business. The
+    /// pin at the `-X` case fires when that gap closes and says so, which makes
+    /// it a deliberate decision for whoever takes it rather than a side effect
+    /// of a `-c` fix.
+    const PY_VALUE_FLAGS: [&str; 2] = ["-m", "-c"];
+    /// sh/bash: `-o` names a shell option (`-o pipefail`). `-c` is DELIBERATELY
+    /// ABSENT -- its argument is a command, and a script path there is an
+    /// invocation.
+    const SH_VALUE_FLAGS: [&str; 1] = ["-o"];
+
+    fn value_flags_for(runner: &str) -> &'static [&'static str] {
+        match runner {
+            "rustc" => &RUSTC_VALUE_FLAGS,
+            "python" | "python3" => &PY_VALUE_FLAGS,
+            _ => &SH_VALUE_FLAGS,
+        }
+    }
+
     let dotted = format!("./{path}");
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -373,7 +405,7 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
                 // A flag that takes a separate value consumes the token after it,
                 // so skip both. An attached form (`--edition=2021`, `-Dwarnings`)
                 // is a single token and is handled by the plain skip.
-                if VALUE_FLAGS.contains(&tokens[next]) {
+                if value_flags_for(token).contains(&tokens[next]) {
                     next += 1;
                 }
                 next += 1;
@@ -604,6 +636,56 @@ target/ci/check-exit-status-class --gate";
         !is_invoked("rustc -o scripts/check-z.rs other.rs", "scripts/check-z.rs"),
         "an output path directly after -o read as an invocation -- a false SCHEDULED, \
          which is the silent direction this guard must never fail in"
+    );
+    // ⚠️ `-c` IS OPPOSITE FOR THE SHELLS AND FOR PYTHON, WHICH IS WHY THE TABLE
+    // IS PER-RUNNER. An earlier revision of this file put `-c` in one flat list
+    // and asserted the shell case the WRONG WAY ROUND. Measured by execution:
+    // `sh -c <script>` and `bash -c <script>` RUN the script; `python3 -c <path>`
+    // raises SyntaxError because the path is source text.
+    assert!(
+        is_invoked("sh -c scripts/check-z.rs other.rs", "scripts/check-z.rs"),
+        "sh -c <script> EXECUTES that script, so skipping the token after -c \
+         hides a real invocation and reports a false ORPHAN"
+    );
+    assert!(
+        is_invoked("bash -c scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -c behaves as sh -c here; the argument is a command, not a value"
+    );
+    assert!(
+        !is_invoked("python3 -c scripts/check-z.py other.py", "scripts/check-z.py"),
+        "python -c takes SOURCE TEXT; a bare path there executes nothing, so \
+         reading it as an invocation is a false SCHEDULED -- the silent direction"
+    );
+    // ⚠️ THE MAIN-SIDE BUG THE SPLIT ACTUALLY FIXES, AND IT PREDATES `-c`.
+    // The flat list applied rustc's flags to every runner, and FOUR OF THEM ARE
+    // VALUELESS OPTIONS IN BASH -- verified by running them: `bash -m`, `bash -l`,
+    // `bash -C`, `bash -D` are all accepted with no argument. Treating them as
+    // value-taking makes the scan skip the SCRIPT as though it were the flag's
+    // value, so a checker genuinely scheduled as `bash -m scripts/check-x.sh`
+    // reads as an ORPHAN. Note `-m` is correctly value-taking for PYTHON
+    // (`python -m module`), which is precisely why one list could not serve both.
+    assert!(
+        is_invoked("bash -m scripts/check-x.sh", "scripts/check-x.sh"),
+        "-m is monitor mode in bash and takes no value; skipping the token after \
+         it hides the script and reports a false ORPHAN"
+    );
+    assert!(
+        is_invoked("bash -l scripts/check-x.sh", "scripts/check-x.sh"),
+        "-l is login shell in bash and takes no value"
+    );
+    assert!(
+        is_invoked("sh -C scripts/check-x.sh", "scripts/check-x.sh"),
+        "-C is noclobber in sh and takes no value; -C is rustc codegen, which is \
+         the collision that made a single table unserviceable"
+    );
+    assert!(
+        is_invoked("python3 -m scripts.check_x scripts/check-x.py", "scripts/check-x.py"),
+        "-m IS value-taking for python, so the module name must not hide the path"
+    );
+    // A shell option name is a value and must still be skipped.
+    assert!(
+        is_invoked("bash -o pipefail scripts/check-x.sh", "scripts/check-x.sh"),
+        "-o names a shell option; its value must not hide the script after it"
     );
     // A value-taking flag must not hide the script that follows its value. Without
     // the table this stops on `2021` and reports a false ORPHAN.
