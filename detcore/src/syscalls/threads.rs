@@ -41,6 +41,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::SchedValue;
+use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
@@ -1354,7 +1355,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                         bitset,
                     )
                     .await;
-                    let res = if ans != Some(SchedValue::TimeOut) {
+                    let res = if ans == Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)) {
+                        // The scheduler ended the wait for a signal, so the wait was
+                        // interrupted, not woken. Report it with the futex's restart
+                        // errno and let the kernel apply the guest's disposition on
+                        // resume, exactly as the polling mode does
+                        // (https://github.com/rrnewton/hermit/issues/3146).
+                        let errno = call.signal_interrupt_errno();
+                        trace!(
+                            "[detcore, dtid {}] futex wait interrupted by a signal: {:?}",
+                            &dettid, errno
+                        );
+                        Err(Error::Errno(errno))
+                    } else if ans != Some(SchedValue::TimeOut) {
                         let expected = call.val();
                         // AUTONOMOUS-BOT-IMPLEMENTED
                         // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
