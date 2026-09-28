@@ -1,0 +1,47 @@
+{
+  "expected_cell_count": 27,
+  "expected_cells_match": true,
+  "observed_cell_count": 27,
+  "result_row_count": 27,
+  "retry_row_count": 0,
+  "attempt_one_only": true,
+  "outcome_counts": {
+    "ERROR": 5,
+    "FAIL": 10,
+    "PASS": 12
+  },
+  "invocation_count": 27,
+  "expected_invocation_count": 27,
+  "cells_passing_first_attempt_without_retry": 12,
+  "passing_cell_ids": [
+    "backend-parity-c/pthread-lifecycle",
+    "c-programs/just-spin",
+    "c-programs/printf-with-threads",
+    "c-programs/prodcons-determinism",
+    "c-programs/random-sources",
+    "c-programs/sigmask-preemption",
+    "c-programs/threadexhaustion",
+    "determinism-stress-c/lock-free",
+    "determinism-stress-c/pid-tid",
+    "determinism-stress-c/producer-consumer",
+    "determinism-stress/order-violation",
+    "language-runtimes/ruby-random"
+  ],
+  "nonpassing_cell_ids": [
+    "c-programs/get-robust-list-thread",
+    "c-programs/nanosleep-threads-nocrash",
+    "c-programs/sched-yield-progress",
+    "c-programs/sigtimedwait-no-timeout",
+    "c-programs/sigtimedwait-timeout-0s",
+    "c-programs/sigtimedwait-timeout-1s",
+    "c-programs/sysinfo-uptime",
+    "c-programs/thread-sync-determinism",
+    "c-programs/writev-determinism",
+    "chaos-c/lock-granularity",
+    "data-handling/zstd-multithread",
+    "determinism-stress-c/pid-tid-identity",
+    "determinism-stress-c/signal-order",
+    "determinism-stress/thread-contention",
+    "language-runtimes/node-v8-jit"
+  ]
+}

@@ -1,0 +1,14 @@
+[
+  "backend-parity-c/pthread-lifecycle",
+  "c-programs/just-spin",
+  "c-programs/printf-with-threads",
+  "c-programs/prodcons-determinism",
+  "c-programs/random-sources",
+  "c-programs/sigmask-preemption",
+  "c-programs/threadexhaustion",
+  "determinism-stress-c/lock-free",
+  "determinism-stress-c/pid-tid",
+  "determinism-stress-c/producer-consumer",
+  "determinism-stress/order-violation",
+  "language-runtimes/ruby-random"
+]

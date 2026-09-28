@@ -1,0 +1,19 @@
+[patch."https://github.com/rrnewton/reverie.git"]
+nostd-print = { path = "pr529-only/reverie-source/experimental/nostd-print" }
+reverie-core = { path = "pr529-only/reverie-source/reverie" }
+reverie-dbt = { path = "pr529-only/reverie-source/reverie-dbt" }
+reverie-kvm = { path = "pr529-only/reverie-source/reverie-kvm" }
+reverie-liteinst = { path = "pr529-only/reverie-source/reverie-liteinst" }
+reverie-memory = { path = "pr529-only/reverie-source/reverie-memory" }
+reverie-preload = { path = "pr529-only/reverie-source/reverie-preload" }
+reverie-process = { path = "pr529-only/reverie-source/reverie-process" }
+reverie-ptrace = { path = "pr529-only/reverie-source/reverie-ptrace" }
+reverie-rpc = { path = "pr529-only/reverie-source/experimental/reverie-rpc" }
+reverie-rpc-macros = { path = "pr529-only/reverie-source/experimental/reverie-rpc-macros" }
+reverie-rpc-transport = { path = "pr529-only/reverie-source/reverie-rpc-transport" }
+reverie-sabre = { path = "pr529-only/reverie-source/experimental/reverie-sabre" }
+reverie-sabre-macros = { path = "pr529-only/reverie-source/experimental/reverie-sabre-macros" }
+reverie-sabre-stats = { path = "pr529-only/reverie-source/experimental/reverie-sabre-stats" }
+reverie-syscalls = { path = "pr529-only/reverie-source/reverie-syscalls" }
+reverie-util = { path = "pr529-only/reverie-source/reverie-util" }
+safeptrace = { path = "pr529-only/reverie-source/safeptrace" }

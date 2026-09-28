@@ -1,0 +1,19 @@
+[patch."https://github.com/rrnewton/reverie.git"]
+nostd-print = { path = "vectored-only/reverie-source/experimental/nostd-print" }
+reverie-core = { path = "vectored-only/reverie-source/reverie" }
+reverie-dbt = { path = "vectored-only/reverie-source/reverie-dbt" }
+reverie-kvm = { path = "vectored-only/reverie-source/reverie-kvm" }
+reverie-liteinst = { path = "vectored-only/reverie-source/reverie-liteinst" }
+reverie-memory = { path = "vectored-only/reverie-source/reverie-memory" }
+reverie-preload = { path = "vectored-only/reverie-source/reverie-preload" }
+reverie-process = { path = "vectored-only/reverie-source/reverie-process" }
+reverie-ptrace = { path = "vectored-only/reverie-source/reverie-ptrace" }
+reverie-rpc = { path = "vectored-only/reverie-source/experimental/reverie-rpc" }
+reverie-rpc-macros = { path = "vectored-only/reverie-source/experimental/reverie-rpc-macros" }
+reverie-rpc-transport = { path = "vectored-only/reverie-source/reverie-rpc-transport" }
+reverie-sabre = { path = "vectored-only/reverie-source/experimental/reverie-sabre" }
+reverie-sabre-macros = { path = "vectored-only/reverie-source/experimental/reverie-sabre-macros" }
+reverie-sabre-stats = { path = "vectored-only/reverie-source/experimental/reverie-sabre-stats" }
+reverie-syscalls = { path = "vectored-only/reverie-source/reverie-syscalls" }
+reverie-util = { path = "vectored-only/reverie-source/reverie-util" }
+safeptrace = { path = "vectored-only/reverie-source/safeptrace" }

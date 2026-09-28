@@ -1,0 +1,19 @@
+[patch."https://github.com/rrnewton/reverie.git"]
+nostd-print = { path = "integration-evidence/reverie-source/experimental/nostd-print" }
+reverie-core = { path = "integration-evidence/reverie-source/reverie" }
+reverie-dbt = { path = "integration-evidence/reverie-source/reverie-dbt" }
+reverie-kvm = { path = "integration-evidence/reverie-source/reverie-kvm" }
+reverie-liteinst = { path = "integration-evidence/reverie-source/reverie-liteinst" }
+reverie-memory = { path = "integration-evidence/reverie-source/reverie-memory" }
+reverie-preload = { path = "integration-evidence/reverie-source/reverie-preload" }
+reverie-process = { path = "integration-evidence/reverie-source/reverie-process" }
+reverie-ptrace = { path = "integration-evidence/reverie-source/reverie-ptrace" }
+reverie-rpc = { path = "integration-evidence/reverie-source/experimental/reverie-rpc" }
+reverie-rpc-macros = { path = "integration-evidence/reverie-source/experimental/reverie-rpc-macros" }
+reverie-rpc-transport = { path = "integration-evidence/reverie-source/reverie-rpc-transport" }
+reverie-sabre = { path = "integration-evidence/reverie-source/experimental/reverie-sabre" }
+reverie-sabre-macros = { path = "integration-evidence/reverie-source/experimental/reverie-sabre-macros" }
+reverie-sabre-stats = { path = "integration-evidence/reverie-source/experimental/reverie-sabre-stats" }
+reverie-syscalls = { path = "integration-evidence/reverie-source/reverie-syscalls" }
+reverie-util = { path = "integration-evidence/reverie-source/reverie-util" }
+safeptrace = { path = "integration-evidence/reverie-source/safeptrace" }

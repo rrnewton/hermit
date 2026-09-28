@@ -1,0 +1,11 @@
+c-programs/just-spin	--include-manual
+c-programs/printf-with-threads	--probe-disabled
+c-programs/prodcons-determinism	--include-manual
+c-programs/random-sources	--probe-disabled
+c-programs/sigmask-preemption	--probe-disabled
+c-programs/sysinfo-uptime	--probe-disabled
+determinism-stress-c/lock-free	--probe-disabled
+determinism-stress-c/pid-tid	--probe-disabled
+determinism-stress-c/producer-consumer	--probe-disabled
+determinism-stress/order-violation	--probe-disabled
+language-runtimes/ruby-random	--include-manual

@@ -1,0 +1,17 @@
+hermit_measurement_commit=5c0bae832d515ce2b8b9cfcf2d7b97f010d641c6
+hermit_base_commit=9d4bb692ddfe02241e6341a2faeb83782215e1a5
+reverie_arm_commit=c632c111619cb47922a72235b3e1130b91355603
+reverie_arm_tree=93961fe62f708118e3a8b1d40a207c93c055bfa9
+reverie_arm_parent=cf60111cb2c3781d98c7af1c85c6f7f395db8d4b
+pinned_image=localhost/hermit-hermetic-validate@sha256:e38c3b2d5cd8a17ed2f99b4a24dd76c9ee63329cdc8c9723e4650ab085fae985
+machine=devbig014
+kernel=7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf
+cell_count=27
+baseline_rows=54
+baseline_attempts=1,2
+execution_policy=one invocation per cell; attempt 1 only; harness retry cap compiled to 1
+scheduled_jobs=1
+qgroup_limit_bytes=12884901888
+required_free_reserve_bytes=68719476736
+comparison=Hermit measurement source held at 5c0bae83 over base 9d4bb692; the exact PR529-only Reverie source is measured as one causal comparison arm
+status=diagnostic-only; PR529 is not merged or selected by this diagnostic

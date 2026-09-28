@@ -1,0 +1,11 @@
+bitwise-pass	rejected-as-measurement-infrastructure
+zero-info-count	rejected-as-measurement-infrastructure
+noncanonical-pass	rejected-as-measurement-infrastructure
+infrastructure-error	rejected-as-measurement-infrastructure
+prerequisite-error	rejected-as-measurement-infrastructure
+incomplete-verification	rejected-as-measurement-infrastructure
+untyped-error	rejected-as-measurement-infrastructure
+1 pass 1	rejected
+0 measured-nonpass 1	rejected
+0 pass 2	rejected
+2 measured-nonpass 1	rejected

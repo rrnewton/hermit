@@ -1,0 +1,2 @@
+53b4a31aabc6e3270637a8e4551cbb8fb455537c0f8c90360582bc8ae8d060c6  /home/newton/work/dev-hermit/worktrees/slots/integration-pr529-pr538-diagnostic/integration-evidence/brs-vectored-only-90ad-3372702-1789015450305808498/runner.rs.original
+b86624d21f577ce4d01f8aa6bd2770f805bd76ac68cb27e9fb4fbc583de947da  /home/newton/work/dev-hermit/worktrees/slots/integration-pr529-pr538-diagnostic/integration-evidence/brs-vectored-only-90ad-3372702-1789015450305808498/runner.rs.one-attempt

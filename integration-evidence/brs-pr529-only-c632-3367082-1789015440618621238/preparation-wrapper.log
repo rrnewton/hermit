@@ -1,0 +1,10 @@
+dns github.com: refused (gaierror)
+dns crates.io: refused (gaierror)
+dns static.crates.io: refused (gaierror)
+assert-no-network: route-table: no route (0 non-loopback routes, 0 non-loopback interfaces)
+assert-no-network: dns github.com: refused
+assert-no-network: dns crates.io: refused
+assert-no-network: dns static.crates.io: refused
+assert-no-network: tcp 1.1.1.1:443: refused
+assert-no-network: tcp 8.8.8.8:53: refused
+assert-no-network: OK -- no route, no DNS, no raw TCP. This environment is isolated.

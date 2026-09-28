@@ -1,0 +1,17 @@
+hermit_measurement_commit=5c0bae832d515ce2b8b9cfcf2d7b97f010d641c6
+hermit_base_commit=9d4bb692ddfe02241e6341a2faeb83782215e1a5
+reverie_arm_commit=90ad5b98fa897f03e817d74b1fa66e68f1b758fb
+reverie_arm_tree=962f40b6e487e82feb56b0da113f772376cba389
+reverie_arm_parent=3646ba2c662f65b97e94d39f60852b62610ca5a0
+pinned_image=localhost/hermit-hermetic-validate@sha256:e38c3b2d5cd8a17ed2f99b4a24dd76c9ee63329cdc8c9723e4650ab085fae985
+machine=devbig014
+kernel=7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf
+cell_count=27
+baseline_rows=54
+baseline_attempts=1,2
+execution_policy=one invocation per cell; attempt 1 only; harness retry cap compiled to 1
+scheduled_jobs=1
+qgroup_limit_bytes=12884901888
+required_free_reserve_bytes=68719476736
+comparison=Hermit measurement source held at 5c0bae83 over base 9d4bb692; the exact approved PR538 repair is measured without PR529 as the other causal comparison arm
+status=diagnostic-only; PR538 is not merged or selected by this diagnostic

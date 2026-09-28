@@ -1,0 +1,37 @@
+dns github.com: refused (gaierror)
+dns crates.io: refused (gaierror)
+dns static.crates.io: refused (gaierror)
+assert-no-network: route-table: no route (0 non-loopback routes, 0 non-loopback interfaces)
+assert-no-network: dns github.com: refused
+assert-no-network: dns crates.io: refused
+assert-no-network: dns static.crates.io: refused
+assert-no-network: tcp 1.1.1.1:443: refused
+assert-no-network: tcp 8.8.8.8:53: refused
+assert-no-network: OK -- no route, no DNS, no raw TCP. This environment is isolated.
+ld.so (GNU libc) stable release version 2.42.
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+assert-build-dependencies: OK -- 18/18 executable build dependencies are present.
+assert-build-dependencies: OK -- 4/4 native libraries and development headers are present.
+warning: patch `reverie-util v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-util)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+   Compiling reverie-memory v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-memory)
+   Compiling reverie-process v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-process)
+   Compiling reverie-syscalls v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-syscalls)
+   Compiling reverie-core v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie)
+   Compiling safeptrace v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/safeptrace)
+   Compiling detcore-model v0.2.0 (/src/detcore-model)
+   Compiling reverie-ptrace v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-ptrace)
+   Compiling reverie-preload v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-preload)
+   Compiling reverie-rpc-transport v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-rpc-transport)
+   Compiling hermit v0.2.0 (/src/hermit-cli)
+   Compiling hermit-detcore v0.2.0 (/src/detcore)
+   Compiling reverie-liteinst v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-liteinst)
+   Compiling reverie-kvm v0.2.0 (/src/integration-evidence/comparison-arms/vectored-only/reverie-source/reverie-kvm)
+   Compiling hermit-resources v0.2.0 (/src/hermit-resources)
+    Finished `release` profile [optimized] target(s) in 4m 13s
