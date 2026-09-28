@@ -18,6 +18,41 @@ pub type RawFd = std::os::unix::io::RawFd;
 /// Nondeterministic "physical" inode
 pub type RawInode = u64;
 
+/// Nondeterministic "physical" device number (`st_dev`, Linux `dev_t` encoding).
+pub type RawDevice = u64;
+
+/// Host identity of a file: the `(st_dev, st_ino)` pair.
+///
+/// An inode number is unique only within one filesystem, so a bare
+/// [`RawInode`] does not name a file: `/dev/null` and the third file created on
+/// a fresh tmpfs are both inode 3, and every btrfs subvolume root is inode 256.
+/// The determinization boundary keys on this pair instead.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+pub struct RawFileId {
+    /// Host device number of the filesystem holding the inode.
+    pub dev: RawDevice,
+    /// Host inode number, meaningful only together with `dev`.
+    pub ino: RawInode,
+}
+
+impl RawFileId {
+    /// Pair a host device number with a host inode number from that device.
+    pub const fn new(dev: RawDevice, ino: RawInode) -> Self {
+        Self { dev, ino }
+    }
+}
+
 /// Deterministic "virtual" inode.
 ///
 /// Deliberately a newtype rather than an alias for [`RawInode`]. As an alias
@@ -28,9 +63,10 @@ pub type RawInode = u64;
 /// There is intentionally no `From<RawInode>` impl. The only supported way to
 /// turn a host inode into a `DetInode` is the determinization boundary in
 /// `tool_global` (`determinize_inode` -> `add_inode`), which mints values from
-/// a monotonic counter. [`DetInode::mint`] exists for that boundary and for the
-/// handful of compile-time constants; every call site is a deliberate,
-/// auditable assertion that the value is already deterministic.
+/// a monotonic counter kept separately for each host device.
+/// [`DetInode::mint`] exists for that boundary and for the handful of
+/// compile-time constants; every call site is a deliberate, auditable
+/// assertion that the value is already deterministic.
 #[derive(
     Debug,
     Clone,

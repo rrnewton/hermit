@@ -264,14 +264,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
-    ("test.detcore_unit", 810),
+    // Six per-device inode pool tests (https://github.com/rrnewton/hermit/issues/2897)
+    // retain all 810 prior identities (`cargo nextest list` measured 816).
+    ("test.detcore_unit", 816),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
     // The read-only proc chroot identity test retains all 170 prior identities.
-    ("test.hermit_integration", 171),
+    // The two inode_device_identity_determinism tests
+    // (https://github.com/rrnewton/hermit/issues/2897) retain all 171 prior
+    // identities (`cargo nextest list` measured 173).
+    ("test.hermit_integration", 173),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -298,9 +303,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 810),
+    // The host node carries the identical selection: 816 (see test.detcore_unit).
+    ("test.detcore_unit_on_host", 816),
     // Host variants select the same proc regressions and retain prior identities.
-    ("test.hermit_integration_on_host", 171),
+    // The two inode_device_identity_determinism tests retain all 171 prior identities.
+    ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 757),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
@@ -2373,7 +2380,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_device_identity_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -2394,6 +2401,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"fp_reduction_determinism"########,
             r########"futex2_refusal"########,
             r########"hashseed_determinism"########,
+            r########"inode_device_identity_determinism"########,
             r########"inode_nr_determinism"########,
             r########"kernel_keyring"########,
             r########"key_users_determinism"########,

@@ -80,6 +80,14 @@ pub struct DetStat {
     pub mtime: Timespec,
 }
 
+impl DetStat {
+    /// The host `(st_dev, st_ino)` identity of a stat taken from the kernel
+    /// and not yet determinized, as the `InodePool` keys it.
+    pub fn host_file_id(&self) -> detcore_model::fd::RawFileId {
+        detcore_model::fd::RawFileId::new(self.dev, self.inode)
+    }
+}
+
 impl Default for DetStat {
     fn default() -> Self {
         let statx: libc::statx = unsafe { std::mem::zeroed() };

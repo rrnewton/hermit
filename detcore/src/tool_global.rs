@@ -111,21 +111,84 @@ pub(crate) async fn yield_once() {
     .await;
 }
 
+/// The run-global map from host file identities to deterministic inodes.
+///
+/// Keyed by the host `(st_dev, st_ino)` pair and numbered SEPARATELY FOR EACH
+/// HOST DEVICE (see https://github.com/rrnewton/hermit/issues/2897). Each
+/// device gets a slot in first-observation order and its own counter from 1,
+/// and a minted value is `(slot << DEVICE_SLOT_SHIFT) | counter`. Values on
+/// every device after the first are therefore at least `2^32`; a guest that
+/// truncates `st_ino` to 32 bits (for example the `cpio` newc format) sees
+/// only the counter.
+///
+/// One counter shared by every filesystem coupled their numbering: an extra
+/// mint anywhere shifted every later mint everywhere. A host file replaced
+/// while the guest runs is exactly such an extra mint. `chef` replaces
+/// `/etc/ld.so.cache` by rename at irregular times (eight renames were seen in
+/// 28 minutes on 2026-09-28), every dynamically linked guest process `fstat`s
+/// it, and a process that started after the rename saw a new host inode. One
+/// `--verify` run minted one more inode than the other, so hermit's own
+/// per-run tmpfs work directory was inode 22 in one run and 21 in the other,
+/// and `getdents64` of that empty directory diverged. The per-device counter
+/// confines such a shift to the device on which the host file changed.
+///
+/// Keying on the bare inode number also merged unrelated files: `/dev/null`
+/// and the third inode of a fresh tmpfs are both host inode 3, and every
+/// btrfs subvolume root is inode 256.
+///
+/// `/proc/<pid>/maps` identities are kept apart from `stat` identities
+/// because the maps device column is not always the file's `st_dev`; see
+/// [`InodePool::resolve_mapping`] and [`InodePool::add_inode`] for how the two
+/// are paired in either order.
 #[derive(Debug)]
 struct InodePool {
-    // TODO(T87258449): merge these two maps:
-    inodes: HashMap<RawInode, DetInode>,
+    /// `stat`-side identities: `(st_dev, st_ino)` as `stat`, `fstat`,
+    /// `getdents` and fd links report them.
+    inodes: HashMap<RawFileId, DetInode>,
+    /// `/proc/<pid>/maps` identities: the `(device column, inode column)` pair
+    /// of a maps header, which can name the same file under another device.
+    mapping_inodes: HashMap<RawFileId, DetInode>,
     detinodes_info: HashMap<DetInode, DetInodeInfo>,
-    /// Counter backing the minted [`DetInode`]s. Deliberately a plain integer:
-    /// it is the *source* of deterministic inodes, not one itself, and typing
-    /// it `RawInode` previously blurred that distinction.
-    next_inode: u64,
+    /// Live inodes with a `stat`-side identity, by host inode number on any
+    /// device. Read only to pair a maps identity with its `stat` identity.
+    stat_by_raw_inode: HashMap<RawInode, BTreeSet<DetInode>>,
+    /// Live inodes minted from a maps identity and not yet paired with a
+    /// `stat` identity, by host inode number.
+    provisional_by_raw_inode: HashMap<RawInode, BTreeSet<DetInode>>,
+    /// `(maps device, stat device)` pairs seen to name the same file. A pair
+    /// found here is preferred over any other device when pairing.
+    paired_devices: HashSet<(RawDevice, RawDevice)>,
+    /// Per host device: its slot and the next counter value on that device.
+    /// Deliberately plain integers: they are the *source* of deterministic
+    /// inodes, not deterministic inodes themselves.
+    devices: HashMap<RawDevice, DeviceInodeCounter>,
+    next_device_slot: u64,
+    /// Run-global mint order, so that "the earliest-minted candidate" means
+    /// that and not the numerically smallest [`DetInode`] (which is the
+    /// earliest-seen DEVICE).
+    next_mint_sequence: u64,
 }
+
+#[derive(Debug)]
+struct DeviceInodeCounter {
+    slot: u64,
+    next: u64,
+}
+
+/// Bits of a minted [`DetInode`] holding the per-device counter; the device's
+/// slot sits above them.
+const DEVICE_SLOT_SHIFT: u32 = 32;
 
 /// Everything we know (globally) about a DetInode.
 #[derive(Debug)]
 struct DetInodeInfo {
-    raw: RawInode,
+    /// The `stat`-side identity; `None` while the inode is known only from a
+    /// maps header.
+    stat: Option<RawFileId>,
+    /// Every maps identity resolved to this inode.
+    mappings: Vec<RawFileId>,
+    /// Position in the run-global mint order.
+    sequence: u64,
     mtime: LogicalTime,
 }
 
@@ -177,49 +240,221 @@ impl InodePool {
     fn new() -> Self {
         InodePool {
             inodes: HashMap::new(),
+            mapping_inodes: HashMap::new(),
             detinodes_info: HashMap::new(),
-            next_inode: 1,
+            stat_by_raw_inode: HashMap::new(),
+            provisional_by_raw_inode: HashMap::new(),
+            paired_devices: HashSet::new(),
+            devices: HashMap::new(),
+            next_device_slot: 0,
+            next_mint_sequence: 0,
         }
     }
 
-    // Allocate the next deterministic inode.  This takes the raw-inode and
-    // can return an existing mapping or extend the mapping by creating a
-    // new deterministic inode. The returned inode is strictly increasing
-    // to avoid inode re-use issue in some filesystem like ext4.
-    fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
-        match self.inodes.get(&raw_inode) {
-            None => {
-                // THE determinization boundary: the single place a host inode
-                // is deliberately mapped to a deterministic one. The value is
-                // minted from a monotonic counter, never derived from the host
-                // inode's bits.
-                let new = DetInode::mint(self.next_inode);
-                self.next_inode += 1;
-                assert!(self.inodes.insert(raw_inode, new).is_none());
-                let prev = self.detinodes_info.insert(
-                    new,
-                    DetInodeInfo {
-                        raw: raw_inode,
-                        mtime,
-                    },
-                );
-                assert!(prev.is_none()); // Should not have been previously used.
-                (new, mtime)
-            }
-            Some(dino) => {
-                let info = self
-                    .detinodes_info
-                    .get(dino)
-                    .expect("Internal invariant broken, det_ino missing entry");
-                (*dino, info.mtime)
-            }
+    fn info(&self, dino: DetInode) -> &DetInodeInfo {
+        self.detinodes_info
+            .get(&dino)
+            .expect("Internal invariant broken, det_ino missing entry")
+    }
+
+    // Allocate the next deterministic inode.  This takes the host file
+    // identity and can return an existing mapping or extend the mapping by
+    // creating a new deterministic inode. The returned inode is strictly
+    // increasing within its device to avoid inode re-use issue in some
+    // filesystem like ext4.
+    //
+    // An inode first seen through a `/proc/<pid>/maps` header (the kernel maps
+    // an executable and its ELF interpreter at execve without anyone calling
+    // `stat`) is ADOPTED here instead of minting a second inode for the same
+    // file, so maps and `stat` agree whichever the guest reads first.
+    fn add_inode(&mut self, raw: RawFileId, mtime: LogicalTime) -> (DetInode, LogicalTime) {
+        if let Some(dino) = self.inodes.get(&raw) {
+            return (*dino, self.info(*dino).mtime);
         }
+        if let Some(dino) = self.provisional_candidate(raw) {
+            self.adopt(dino, raw);
+            return (dino, self.info(dino).mtime);
+        }
+        let dino = self.mint(raw.dev, mtime);
+        self.detinodes_info.get_mut(&dino).unwrap().stat = Some(raw);
+        assert!(self.inodes.insert(raw, dino).is_none());
+        self.stat_by_raw_inode
+            .entry(raw.ino)
+            .or_default()
+            .insert(dino);
+        (dino, mtime)
+    }
+
+    /// THE determinization boundary: the single place a host inode is
+    /// deliberately mapped to a deterministic one. The value is minted from
+    /// the device's monotonic counter, never derived from the host inode's
+    /// bits. The caller records the identity it was minted for.
+    fn mint(&mut self, dev: RawDevice, mtime: LogicalTime) -> DetInode {
+        let next_device_slot = &mut self.next_device_slot;
+        let device = self.devices.entry(dev).or_insert_with(|| {
+            let slot = *next_device_slot;
+            *next_device_slot += 1;
+            DeviceInodeCounter { slot, next: 1 }
+        });
+        assert!(
+            device.next < (1 << DEVICE_SLOT_SHIFT),
+            "more than 2^{DEVICE_SLOT_SHIFT} inodes determinized on one device"
+        );
+        assert!(
+            device.slot < (1 << (u64::BITS - DEVICE_SLOT_SHIFT)),
+            "more than 2^{} devices determinized",
+            u64::BITS - DEVICE_SLOT_SHIFT
+        );
+        let new = DetInode::mint((device.slot << DEVICE_SLOT_SHIFT) | device.next);
+        device.next += 1;
+        let sequence = self.next_mint_sequence;
+        self.next_mint_sequence += 1;
+        let prev = self.detinodes_info.insert(
+            new,
+            DetInodeInfo {
+                stat: None,
+                mappings: Vec::new(),
+                sequence,
+                mtime,
+            },
+        );
+        assert!(prev.is_none()); // Should not have been previously used.
+        new
+    }
+
+    /// Choose among `candidates` (inodes with the host inode number in
+    /// question) the one whose device pairs with `device`: first a candidate
+    /// on a device already seen paired with it, then the earliest-minted.
+    fn pick_candidate(
+        &self,
+        candidates: Option<&BTreeSet<DetInode>>,
+        candidate_device: impl Fn(&DetInodeInfo) -> RawDevice,
+        is_paired: impl Fn(RawDevice) -> bool,
+    ) -> Option<DetInode> {
+        candidates?
+            .iter()
+            .map(|dino| (*dino, self.info(*dino)))
+            .min_by_key(|(_, info)| (!is_paired(candidate_device(info)), info.sequence))
+            .map(|(dino, _)| dino)
+    }
+
+    /// A provisional (maps-only) inode that `stat` identity `raw` may name.
+    fn provisional_candidate(&self, raw: RawFileId) -> Option<DetInode> {
+        self.pick_candidate(
+            self.provisional_by_raw_inode.get(&raw.ino),
+            |info| info.mappings[0].dev,
+            |maps_dev| maps_dev == raw.dev || self.paired_devices.contains(&(maps_dev, raw.dev)),
+        )
+    }
+
+    /// Give provisional inode `dino` its `stat` identity `raw`.
+    fn adopt(&mut self, dino: DetInode, raw: RawFileId) {
+        let info = self.detinodes_info.get_mut(&dino).unwrap();
+        assert!(info.stat.is_none(), "only a provisional inode is adopted");
+        info.stat = Some(raw);
+        let maps_dev = info.mappings[0].dev;
+        self.paired_devices.insert((maps_dev, raw.dev));
+        remove_from_index(&mut self.provisional_by_raw_inode, raw.ino, dino);
+        assert!(self.inodes.insert(raw, dino).is_none());
+        self.stat_by_raw_inode
+            .entry(raw.ino)
+            .or_default()
+            .insert(dino);
+    }
+
+    /// Resolve the identity a `/proc/<pid>/maps` header names.
+    ///
+    /// The maps device column is not always the device `stat` reports for the
+    /// same file: on btrfs it is not the subvolume's `st_dev` (on the
+    /// development host `/usr/bin/cat` is `00:20` in maps and device `0x21`
+    /// from `stat`), and on overlayfs it is the device of the real layer file.
+    /// The inode number agrees in those cases. So, in order:
+    ///
+    /// 1. a maps identity resolved before resolves the same way;
+    /// 2. an exact `stat`-side match on `(dev, ino)`;
+    /// 3. a `stat`-side inode with the same host inode number, preferring one
+    ///    on a device already seen paired with this maps device, then the
+    ///    earliest-minted; the device pair is remembered;
+    /// 4. otherwise a PROVISIONAL inode is minted under the maps device, and
+    ///    [`InodePool::add_inode`] adopts it when `stat` later names a file
+    ///    with that inode number, so maps and `stat` agree in either order.
+    ///
+    /// Residual: steps 3 and 4 match across devices by inode number alone, so
+    /// an unrelated file on another device with the same host inode number
+    /// can be taken for the mapped file when no paired-device candidate
+    /// exists. Files on pipefs, sockfs, procfs and the internal shmem mount
+    /// draw inode numbers from a host-global counter that differs between
+    /// runs, so such a collision can differ between runs. On the development
+    /// host those numbers are near 3.9e9 while root-filesystem inode numbers
+    /// are 1e5 to 5e7. The pool keyed every lookup by the bare inode number
+    /// before https://github.com/rrnewton/hermit/issues/2897, which had this
+    /// exposure everywhere.
+    fn resolve_mapping(&mut self, raw: RawFileId, mtime: LogicalTime) -> (DetInode, LogicalTime) {
+        if let Some(dino) = self.mapping_inodes.get(&raw) {
+            return (*dino, self.info(*dino).mtime);
+        }
+        let paired_stat_inode = self.inodes.get(&raw).copied().or_else(|| {
+            self.pick_candidate(
+                self.stat_by_raw_inode.get(&raw.ino),
+                |info| info.stat.expect("indexed as stat-side").dev,
+                |stat_dev| self.paired_devices.contains(&(raw.dev, stat_dev)),
+            )
+        });
+        let dino = match paired_stat_inode {
+            Some(dino) => {
+                let info = self.detinodes_info.get_mut(&dino).unwrap();
+                let stat_dev = info.stat.expect("indexed as stat-side").dev;
+                info.mappings.push(raw);
+                self.paired_devices.insert((raw.dev, stat_dev));
+                dino
+            }
+            None => {
+                let dino = self.mint(raw.dev, mtime);
+                self.detinodes_info
+                    .get_mut(&dino)
+                    .unwrap()
+                    .mappings
+                    .push(raw);
+                self.provisional_by_raw_inode
+                    .entry(raw.ino)
+                    .or_default()
+                    .insert(dino);
+                dino
+            }
+        };
+        assert!(self.mapping_inodes.insert(raw, dino).is_none());
+        (dino, self.info(dino).mtime)
     }
 
     // remove a det inode
     fn remove_inode(&mut self, det_inode: DetInode) {
         if let Some(info) = self.detinodes_info.remove(&det_inode) {
-            self.inodes.remove(&info.raw);
+            for mapping in &info.mappings {
+                self.mapping_inodes.remove(mapping);
+            }
+            match info.stat {
+                Some(raw) => {
+                    self.inodes.remove(&raw);
+                    remove_from_index(&mut self.stat_by_raw_inode, raw.ino, det_inode);
+                }
+                None => {
+                    let ino = info.mappings[0].ino;
+                    remove_from_index(&mut self.provisional_by_raw_inode, ino, det_inode);
+                }
+            }
+        }
+    }
+}
+
+fn remove_from_index(
+    index: &mut HashMap<RawInode, BTreeSet<DetInode>>,
+    ino: RawInode,
+    dino: DetInode,
+) {
+    if let std::collections::hash_map::Entry::Occupied(mut minted) = index.entry(ino) {
+        minted.get_mut().remove(&dino);
+        if minted.get().is_empty() {
+            minted.remove();
         }
     }
 }
@@ -1418,7 +1653,10 @@ impl GlobalTool for GlobalState {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
             GlobalRequest::DeterminizeInode(ino) => {
-                R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
+                R::DeterminizeInode(self.recv_determinize_inode(from, ino, false).await)
+            }
+            GlobalRequest::DeterminizeMappingInode(ino) => {
+                R::DeterminizeMappingInode(self.recv_determinize_inode(from, ino, true).await)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -2336,7 +2574,12 @@ impl GlobalState {
         sched.wake_futex_waiters_after_exit(&wakes)
     }
 
-    async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
+    async fn recv_determinize_inode(
+        &self,
+        from: Tid,
+        ino: RawFileId,
+        from_mapping: bool,
+    ) -> (DetInode, LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
         // Here we establish a policy that when we first see a file its mtime is epoch.
         let nanos = self
@@ -2345,11 +2588,13 @@ impl GlobalState {
             .timestamp_nanos_opt()
             .expect("epoch cannot be represented in a timestamp with nanosecond precision")
             as u64;
-        let (dino, ns) = self
-            .inodes
-            .lock()
-            .unwrap()
-            .add_inode(ino, LogicalTime::from_nanos(nanos));
+        let mut pool = self.inodes.lock().unwrap();
+        let (dino, ns) = if from_mapping {
+            pool.resolve_mapping(ino, LogicalTime::from_nanos(nanos))
+        } else {
+            pool.add_inode(ino, LogicalTime::from_nanos(nanos))
+        };
+        drop(pool);
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
             from, ino, dino, ns
@@ -2408,7 +2653,7 @@ impl GlobalState {
         self.inodes.lock().unwrap().remove_inode(d_ino);
     }
 
-    async fn recv_touch_file(&self, from: Tid, ino: RawInode) {
+    async fn recv_touch_file(&self, from: Tid, ino: RawFileId) {
         let _sched = self.lock_rpc_scheduler(false).await;
         let mtime = if self.cfg.virtualize_time {
             self.global_time.lock().unwrap().as_nanos()
@@ -2426,19 +2671,15 @@ impl GlobalState {
             from, ino, mtime,
         );
         let mut mg = self.inodes.lock().unwrap();
-        let dino =
-            if let Some(d) = mg.inodes.get(&ino) {
-                *d
-            } else {
-                // Otherwise we haven't seen this inode yet (e.g. because there hasnt been a
-                // stat on it), so we just-in-time add it.
-                let nanos =
-                    self.cfg.epoch.timestamp_nanos_opt().expect(
-                        "epoch cannot be represented in a timestamp with nanosecond precision",
-                    ) as u64;
-                let (d, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
-                d
-            };
+        // If we haven't seen this inode yet (e.g. because there hasnt been a
+        // stat on it), add_inode adds it just in time.
+        let nanos = self
+            .cfg
+            .epoch
+            .timestamp_nanos_opt()
+            .expect("epoch cannot be represented in a timestamp with nanosecond precision")
+            as u64;
+        let (dino, _) = mg.add_inode(ino, LogicalTime::from_nanos(nanos));
         let info = mg
             .detinodes_info
             .get_mut(&dino)
@@ -2783,8 +3024,13 @@ pub enum GlobalRequest {
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
-    /// Translate nondeterministic to deterministic inode.
-    DeterminizeInode(RawInode),
+    /// Translate a host file identity to a deterministic inode.
+    DeterminizeInode(RawFileId),
+
+    /// Translate the identity a `/proc/<pid>/maps` header names, whose device
+    /// column may differ from the file's `st_dev` (see
+    /// `InodePool::resolve_mapping`).
+    DeterminizeMappingInode(RawFileId),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -2804,7 +3050,7 @@ pub enum GlobalRequest {
     UnlinkInode(DetInode),
 
     /// Bump mtime
-    TouchFile(RawInode),
+    TouchFile(RawFileId),
 
     /// Retrieve global time.
     GlobalTimeLowerBound,
@@ -2904,6 +3150,7 @@ pub enum GlobalResponse {
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
+    DeterminizeMappingInode((DetInode, LogicalTime)),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     DeterminizeDevice(u64),
@@ -3468,7 +3715,7 @@ where
 /// track a (possibly new) inode, by returning a deterministic inode.
 /// Also return the logical mtime for the inode, though this is only
 /// used if `virtualize_metadata` is set.
-pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawInode) -> (DetInode, LogicalTime)
+pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawFileId) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3476,6 +3723,22 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::DeterminizeInode(inode)).await;
     match resp.1 {
         GlobalResponse::DeterminizeInode(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Like [`determinize_inode`], for the `(device, inode)` pair a
+/// `/proc/<pid>/maps` header names. The maps device column is not always the
+/// file's `st_dev` (btrfs reports the superblock device there), so a pair not
+/// seen exactly resolves to an existing inode with the same host inode number.
+pub async fn determinize_mapping_inode<G, T>(guest: &mut G, inode: RawFileId) -> DetInode
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeMappingInode(inode)).await;
+    match resp.1 {
+        GlobalResponse::DeterminizeMappingInode(x) => x.0,
         _ => unreachable!(),
     }
 }
@@ -3549,7 +3812,7 @@ where
 
 /// Update the modification time for a file, using its inode.
 /// This will set the mtime to a coherent global-time value.
-pub async fn touch_file<G, T>(guest: &mut G, inode: RawInode)
+pub async fn touch_file<G, T>(guest: &mut G, inode: RawFileId)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -4266,6 +4529,7 @@ mod tests {
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
     use crate::tool_local::ExecFdBlockingOverrides;
+    use crate::types::DetInode;
     use crate::types::DetPid;
     use crate::types::DetTid;
     use crate::types::DetTime;
@@ -4273,6 +4537,8 @@ mod tests {
     use crate::types::LogicalTime;
     use crate::types::MmId;
     use crate::types::Op;
+    use crate::types::RawDevice;
+    use crate::types::RawFileId;
     use crate::types::SchedEvent;
 
     #[test]
@@ -6798,8 +7064,11 @@ mod tests {
     /// A deterministic inode must be minted from the monotonic counter, never
     /// derived from the host inode's bits. This is the behavioural half of the
     /// guarantee whose static half is `DetInode` being a newtype: even for a
-    /// large, realistic host inode the det value stays small and dense, so a
-    /// leaked host inode is distinguishable from a genuine det one.
+    /// large, realistic host inode the det value is the device's counter, so on
+    /// the first device seen it stays small and dense and a leaked host inode
+    /// is distinguishable from a genuine det one. Devices after the first put
+    /// their slot in the high bits (`(slot << 32) | counter`, for example
+    /// 4294967297), so there the low 32 bits carry that property.
     #[test]
     fn det_inodes_are_minted_not_passed_through() {
         use crate::types::DetInode;
@@ -6807,19 +7076,220 @@ mod tests {
         let mut pool = super::InodePool::new();
         let t = LogicalTime::from_nanos(0);
 
-        let host_a = 221_742_951; // the value observed leaking into FileContents
-        let host_b = 998_877_665;
+        let dev = 0x21;
+        let host_a = RawFileId::new(dev, 221_742_951); // the value observed leaking into FileContents
+        let host_b = RawFileId::new(dev, 998_877_665);
         let (a, _) = pool.add_inode(host_a, t);
         let (b, _) = pool.add_inode(host_b, t);
 
-        assert_ne!(a.as_raw(), host_a, "det inode must not be the host inode");
-        assert_ne!(b.as_raw(), host_b, "det inode must not be the host inode");
+        assert_ne!(
+            a.as_raw(),
+            host_a.ino,
+            "det inode must not be the host inode"
+        );
+        assert_ne!(
+            b.as_raw(),
+            host_b.ino,
+            "det inode must not be the host inode"
+        );
         assert_eq!(a, DetInode::mint(1), "minting starts at 1");
         assert_eq!(b, DetInode::mint(2), "minting is monotonic");
 
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/2897: the pool once had one
+    /// counter for every filesystem, so a host file replaced mid-run (chef
+    /// renaming a fresh `/etc/ld.so.cache` into place) cost one extra mint in
+    /// one `--verify` run and shifted every later inode, including hermit's
+    /// own per-run tmpfs work directory (21 in one run, 22 in the other). The
+    /// replay below is that trace in miniature: the same guest, run twice,
+    /// where the second run's host replaced one root-filesystem file.
+    #[test]
+    fn a_host_file_replaced_mid_run_does_not_shift_other_devices() {
+        const ROOT: RawDevice = 0x21;
+        let t = LogicalTime::from_nanos(0);
+        let ld_so_cache = RawFileId::new(ROOT, 50_379_720);
+        let replaced_ld_so_cache = RawFileId::new(ROOT, 50_395_848);
+        let libc = RawFileId::new(ROOT, 43_905_055);
+
+        // The work directory's tmpfs is mounted afresh by each run, so its
+        // host device differs between runs while its inode numbers do not.
+        let run = |tmpfs: RawDevice, host_replaced_the_cache: bool| {
+            let mut pool = super::InodePool::new();
+            pool.add_inode(ld_so_cache, t);
+            pool.add_inode(libc, t);
+            let tmpfs_root = pool.add_inode(RawFileId::new(tmpfs, 1), t).0;
+            // A later process maps the cache again.
+            let cache = if host_replaced_the_cache {
+                replaced_ld_so_cache
+            } else {
+                ld_so_cache
+            };
+            pool.add_inode(cache, t);
+            let work_dir = pool.add_inode(RawFileId::new(tmpfs, 2), t).0;
+            let dot_dot = pool.add_inode(RawFileId::new(tmpfs, 1), t).0;
+            (tmpfs_root, work_dir, dot_dot)
+        };
+
+        let first = run(0x9e, false);
+        let second = run(0x9c, true);
+        assert_eq!(
+            first, second,
+            "the tmpfs inodes a getdents64 of the work directory reports must not \
+             depend on a replaced file on another device"
+        );
+        assert_eq!(
+            first.0, first.2,
+            "`..` of the work directory is the tmpfs root"
+        );
+    }
+
+    /// An inode number names a file only together with its device.
+    #[test]
+    fn the_same_inode_number_on_two_devices_names_two_files() {
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        let dev_null = RawFileId::new(0x5, 3);
+        let tmpfs_third = RawFileId::new(0x9e, 3);
+
+        let (null, _) = pool.add_inode(dev_null, t);
+        let (tmp, _) = pool.add_inode(tmpfs_third, t);
+        assert_ne!(null, tmp);
+        assert_eq!(pool.add_inode(dev_null, t).0, null);
+        assert_eq!(pool.add_inode(tmpfs_third, t).0, tmp);
+
+        // Devices are numbered in first-observation order, each from 1.
+        assert_eq!(null, DetInode::mint(1));
+        assert_eq!(tmp, DetInode::mint((1 << super::DEVICE_SLOT_SHIFT) | 1));
+        assert_eq!(
+            pool.add_inode(RawFileId::new(0x5, 99), t).0,
+            DetInode::mint(2)
+        );
+    }
+
+    /// A maps header's device column can differ from `st_dev` for the same
+    /// file (btrfs: `00:20` in maps, `0x21` from `stat`), so a maps identity
+    /// with no exact match resolves to the inode `stat` already minted for
+    /// that host inode number, and maps keeps agreeing with `stat`.
+    #[test]
+    fn maps_identities_resolve_to_the_stat_identity_of_the_same_inode() {
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        let stat_libc = RawFileId::new(0x21, 43_905_055);
+        let maps_libc = RawFileId::new(0x20, 43_905_055);
+
+        let (from_stat, _) = pool.add_inode(stat_libc, t);
+        assert_eq!(pool.resolve_mapping(maps_libc, t).0, from_stat);
+        assert!(
+            !pool.inodes.contains_key(&maps_libc),
+            "a maps identity must not become a stat identity"
+        );
+
+        // An exact match wins over the inode-number fallback.
+        let (other_file_same_ino, _) = pool.add_inode(RawFileId::new(0x9e, 43_905_055), t);
+        assert_eq!(
+            pool.resolve_mapping(RawFileId::new(0x9e, 43_905_055), t).0,
+            other_file_same_ino
+        );
+        assert_eq!(pool.resolve_mapping(maps_libc, t).0, from_stat);
+
+        // A number never seen on any device is minted under the maps device.
+        let fresh = RawFileId::new(0x20, 7);
+        let (minted, _) = pool.resolve_mapping(fresh, t);
+        assert_eq!(pool.add_inode(fresh, t).0, minted);
+    }
+
+    /// The kernel maps an executable and its ELF interpreter at execve, and
+    /// nothing `stat`s them, so a guest that reads its own maps before it
+    /// `stat`s `/proc/self/exe` resolves the maps identity first. The later
+    /// `stat` identity (another device on btrfs) must adopt that inode rather
+    /// than mint a second one for the same file.
+    #[test]
+    fn a_maps_identity_resolved_before_stat_is_adopted_by_stat() {
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        let maps_cat = RawFileId::new(0x20, 100_490);
+        let stat_cat = RawFileId::new(0x21, 100_490);
+
+        let (from_maps, _) = pool.resolve_mapping(maps_cat, t);
+        let (from_stat, _) = pool.add_inode(stat_cat, t);
+        assert_eq!(from_maps, from_stat, "maps first, then stat");
+        assert_eq!(pool.resolve_mapping(maps_cat, t).0, from_stat);
+        assert_eq!(pool.add_inode(stat_cat, t).0, from_stat);
+        assert!(pool.provisional_by_raw_inode.is_empty());
+
+        // Once adopted, the inode is no longer provisional: a second file with
+        // the same inode number on yet another device is a different file.
+        let (tmpfs_file, _) = pool.add_inode(RawFileId::new(0x9e, 100_490), t);
+        assert_ne!(tmpfs_file, from_stat);
+
+        // A second maps-first file on the same btrfs adopts the same way, and
+        // the pairing agrees with the stat-first order.
+        let maps_ld = RawFileId::new(0x20, 100_500);
+        let (ld_from_maps, _) = pool.resolve_mapping(maps_ld, t);
+        assert_eq!(
+            pool.add_inode(RawFileId::new(0x21, 100_500), t).0,
+            ld_from_maps
+        );
+    }
+
+    /// Once a maps device has been seen paired with a stat device, a candidate
+    /// on that stat device is preferred over an earlier-minted file with the
+    /// same inode number on an unrelated device, and "earliest" is mint order,
+    /// not the numerically smallest inode.
+    #[test]
+    fn a_paired_device_is_preferred_over_an_unrelated_same_numbered_file() {
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        // Pair maps device 0x20 with stat device 0x21.
+        let (libc, _) = pool.add_inode(RawFileId::new(0x21, 1_000), t);
+        assert_eq!(pool.resolve_mapping(RawFileId::new(0x20, 1_000), t).0, libc);
+
+        // An unrelated file on a pipe-like device takes inode number 2_000
+        // first; the real file on the paired device is minted after it.
+        // Without the pairing, the earliest-minted candidate (`unrelated`)
+        // would be chosen.
+        let (unrelated, _) = pool.add_inode(RawFileId::new(0x0d, 2_000), t);
+        let (real, _) = pool.add_inode(RawFileId::new(0x21, 2_000), t);
+        assert_ne!(unrelated, real);
+        assert_eq!(pool.resolve_mapping(RawFileId::new(0x20, 2_000), t).0, real);
+
+        // With no paired candidate, the earliest-MINTED candidate is chosen,
+        // even when a later mint on an earlier-seen device is numerically
+        // smaller.
+        let mut pool = super::InodePool::new();
+        pool.add_inode(RawFileId::new(0x21, 1), t); // device 0x21 gets slot 0
+        let (first_minted, _) = pool.add_inode(RawFileId::new(0x9e, 5_000), t);
+        let (smaller_later, _) = pool.add_inode(RawFileId::new(0x21, 5_000), t);
+        assert!(smaller_later < first_minted);
+        assert_eq!(
+            pool.resolve_mapping(RawFileId::new(0x30, 5_000), t).0,
+            first_minted
+        );
+    }
+
+    #[test]
+    fn removing_an_inode_forgets_its_host_identity() {
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        let file = RawFileId::new(0x21, 10);
+        let (first, _) = pool.add_inode(file, t);
+        assert_eq!(pool.resolve_mapping(RawFileId::new(0x20, 10), t).0, first);
+        pool.remove_inode(first);
+        assert!(pool.stat_by_raw_inode.is_empty());
+        assert!(pool.mapping_inodes.is_empty());
+        let (second, _) = pool.add_inode(file, t);
+        assert_ne!(first, second, "inodes are never reused on a device");
+        assert_eq!(pool.resolve_mapping(RawFileId::new(0x20, 10), t).0, second);
+
+        // A provisional (maps-only) inode is forgotten the same way.
+        let (provisional, _) = pool.resolve_mapping(RawFileId::new(0x20, 11), t);
+        pool.remove_inode(provisional);
+        assert!(pool.provisional_by_raw_inode.is_empty());
+        assert_ne!(pool.add_inode(RawFileId::new(0x21, 11), t).0, provisional);
     }
 }
 

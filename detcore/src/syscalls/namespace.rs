@@ -31,6 +31,8 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
 use crate::types::DetInode;
+use crate::types::RawDevice;
+use crate::types::RawFileId;
 use crate::types::RawInode;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -202,6 +204,39 @@ fn deterministic_stdio_inode_for_raw(
     matched
 }
 
+/// Host device of every pipe (`kind == "pipe"`) or every socket.
+///
+/// A `pipe:[N]`/`socket:[N]` link names only an inode number, and the inode
+/// pool keys on `(st_dev, st_ino)`
+/// (https://github.com/rrnewton/hermit/issues/2897). Every pipe lives on the
+/// kernel's single internal pipefs mount and every socket on its single sockfs
+/// mount, whatever the namespace, so one `fstat` of a pipe and of a socket
+/// made here names the same device the guest's own `fstat` reports. The value
+/// is only a pool key and never reaches the guest. If the probe fails, a
+/// sentinel keeps anonymous objects apart from real filesystems.
+fn anonymous_object_device(kind: &str) -> RawDevice {
+    static DEVICES: std::sync::OnceLock<(RawDevice, RawDevice)> = std::sync::OnceLock::new();
+    const UNKNOWN_PIPE_DEVICE: RawDevice = u64::MAX;
+    const UNKNOWN_SOCKET_DEVICE: RawDevice = u64::MAX - 1;
+    let (pipe, socket) = *DEVICES.get_or_init(|| {
+        let pipe = nix::unistd::pipe()
+            .ok()
+            .and_then(|(read, _write)| nix::sys::stat::fstat(&read).ok())
+            .map_or(UNKNOWN_PIPE_DEVICE, |stat| stat.st_dev);
+        let socket = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .ok()
+        .and_then(|socket| nix::sys::stat::fstat(&socket).ok())
+        .map_or(UNKNOWN_SOCKET_DEVICE, |stat| stat.st_dev);
+        (pipe, socket)
+    });
+    if kind == "pipe" { pipe } else { socket }
+}
+
 fn canonical_anonymous_proc_fd_target(
     identity: &AnonymousProcFdIdentity,
     inode: DetInode,
@@ -239,7 +274,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
             Some(inode) => inode,
-            None => determinize_inode(guest, identity.raw_inode).await.0,
+            None => {
+                let raw =
+                    RawFileId::new(anonymous_object_device(identity.kind), identity.raw_inode);
+                determinize_inode(guest, raw).await.0
+            }
         };
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
@@ -314,7 +353,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .flatten();
             let inode = match inode_override {
                 Some(inode) => inode,
-                None => determinize_inode(guest, stat.st_ino).await.0,
+                None => {
+                    determinize_inode(guest, RawFileId::new(stat.st_dev, stat.st_ino))
+                        .await
+                        .0
+                }
             };
             format!("{kind}:[{inode}]").into_bytes()
         } else {
