@@ -3074,6 +3074,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             "test.detcore_unit",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.regular_crates",
             "test.hermit_integration",
             "test.arbitrary_binaries",
