@@ -3230,8 +3230,7 @@ impl RunOpts {
                      executable path.",
                     requested
                 )
-            })
-            .map_err(|error| error.context(GuestProgramFault::NotFound))?;
+            })?;
         validate_executable(&resolved, requested, None)
     }
 
