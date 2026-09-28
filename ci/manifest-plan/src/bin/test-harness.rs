@@ -289,7 +289,7 @@ fn set_once(slot: &mut Option<String>, values: &mut impl Iterator<Item = String>
 }
 
 /// `--parity-reference` was removed rather than left unknown, so a caller from
-/// before https://github.com/rrnewton/hermit/issues/3301 learns what replaced it.
+/// before <https://github.com/rrnewton/hermit/issues/3301> learns what replaced it.
 const REMOVED_PARITY_REFERENCE: &str = "--parity-reference was removed: a ptrace \
      reference run no longer decides a cell's outcome \
      (https://github.com/rrnewton/hermit/issues/3301). Drop the flag; each selected \
@@ -2440,7 +2440,7 @@ mod tests {
     use super::validate_args;
     use super::validation_audit_worker_capacity;
 
-    /// Before https://github.com/rrnewton/hermit/issues/3301, `run
+    /// Before <https://github.com/rrnewton/hermit/issues/3301>, `run
     /// --parity-reference ptrace` sent every non-ptrace verify cell through a
     /// second ptrace run and a `hermit log-diff` comparison that could turn the
     /// candidate's PASS into a FAIL. The same mixed selection now runs each
