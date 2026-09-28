@@ -3080,12 +3080,24 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
 /// of bytes the guest already observes. The text qualifies: `sanitize_maps`
 /// renders every raw line -- addresses, permissions, offsets and pathnames
 /// included -- in its original order and rewrites only the device and inode
-/// columns, so the line order is already guest-visible output. It is
-/// reproducible because the addresses are. On the ptrace and LiteInst
-/// backends, `init_tracee` in `reverie/reverie-ptrace/src/tracer.rs` calls
-/// `personality(PER_LINUX | ADDR_NO_RANDOMIZE)` in the child's `pre_exec`
-/// closure installed by `TracerBuilder::spawn`, and LiteInst launches through
-/// that same `TracerBuilder` (`reverie-liteinst/src/backend.rs`).
+/// columns, so the line order is already guest-visible output. The addresses
+/// are reproducible because every Linux-process backend Hermit launches sets
+/// `ADDR_NO_RANDOMIZE` before the guest execs:
+///
+/// - ptrace: `init_tracee` in `reverie/reverie-ptrace/src/tracer.rs` calls
+///   `personality(PER_LINUX | ADDR_NO_RANDOMIZE)` in the child's `pre_exec`
+///   closure installed by `TracerBuilder::spawn`;
+/// - LiteInst launches through that same `TracerBuilder`
+///   (`reverie-liteinst/src/backend.rs`);
+/// - DBT ORs `ADDR_NO_RANDOMIZE` into the current personality in its own
+///   `pre_exec` (`reverie/reverie-dbt/src/launcher.rs`, the
+///   `libc::personality` calls in the launch command);
+/// - SaBRe does the same in `spawn_tracee` (`hermit-cli/src/sabre_ptrace.rs`).
+///
+/// `personality(2)` is classified `PassThrough`
+/// (`crate::syscall_classification`), so a guest can turn ASLR back on and
+/// re-exec. The address columns are then already nondeterministic guest
+/// output, and the mint order still follows the bytes the guest sees.
 ///
 /// The raw numbers are not guest-controlled: Linux hands out shmem and memfd
 /// inodes from per-CPU batches, so two memfds created in the same guest order

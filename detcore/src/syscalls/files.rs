@@ -4581,9 +4581,39 @@ mod procfs_wiring_guard {
     /// What `maps_identities_are_minted_through_the_tested_loop` requires of
     /// the `initialize_procfs_snapshot` body; an empty result means it passes.
     fn maps_minting_wiring_violations(body: &str) -> Vec<&'static str> {
+        const CALL: &str = "crate::procfs::mint_mapping_identities(";
         let mut violations = Vec::new();
-        if !body.contains("crate::procfs::mint_mapping_identities(") {
-            violations.push("does not call `crate::procfs::mint_mapping_identities`");
+        match body.find(CALL) {
+            None => violations.push("does not call `crate::procfs::mint_mapping_identities`"),
+            Some(start) => {
+                // The call's argument list, up to its balancing `)`. The stdio
+                // map built above must be the one passed: an empty map here
+                // would drop the fdinfo-consistent stdio inode override and no
+                // unit test of the loop itself could notice.
+                let args = &body[start + CALL.len()..];
+                let mut depth = 0usize;
+                let end = args
+                    .char_indices()
+                    .find_map(|(i, c)| match c {
+                        '(' | '[' | '{' => {
+                            depth += 1;
+                            None
+                        }
+                        ')' | ']' | '}' if depth == 0 => Some(i),
+                        ')' | ']' | '}' => {
+                            depth -= 1;
+                            None
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(args.len());
+                if !args[..end]
+                    .split(',')
+                    .any(|arg| arg.trim() == "&stdio_by_raw_inode")
+                {
+                    violations.push("does not pass `&stdio_by_raw_inode` to the minting loop");
+                }
+            }
         }
         // Parsing mapping identities here would mean the order in which this
         // body mints is no longer the order the unit tests drive.
@@ -4634,9 +4664,19 @@ mod procfs_wiring_guard {
         let local_order = "let raw_pairs = crate::procfs::mapping_identities_in_text_order(&text);\n\
                            crate::procfs::mint_mapping_identities(&contents, &stdio, &mut minter)";
         assert!(!maps_minting_wiring_violations(local_order).is_empty());
+        let no_stdio = "crate::procfs::mint_mapping_identities(\n\
+                        &contents,\n\
+                        &BTreeMap::new(),\n\
+                        &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                        )";
+        assert!(!maps_minting_wiring_violations(no_stdio).is_empty());
         assert!(
             maps_minting_wiring_violations(
-                "crate::procfs::mint_mapping_identities(&contents, &stdio, &mut minter)"
+                "crate::procfs::mint_mapping_identities(\n\
+                 &contents,\n\
+                 &stdio_by_raw_inode,\n\
+                 &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                 )"
             )
             .is_empty()
         );
