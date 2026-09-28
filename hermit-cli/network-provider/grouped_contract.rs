@@ -403,10 +403,10 @@ mod tests {
         let classic:Value=serde_json::from_slice(include_bytes!("accepted-classic-v40-contract.json")).unwrap();
         let classic_sources = classic["source_files"].as_array().unwrap();
         let selected_sources = selected["source_files"].as_array().unwrap();
-        assert_eq!(classic_sources.len(), 22);
-        assert_eq!(selected_sources.len(), 38);
-        assert_eq!(&selected_sources[..22], classic_sources);
-        assert_eq!(&selected_sources[22..], &[
+        assert_eq!(classic_sources.len(), 23);
+        assert_eq!(selected_sources.len(), 39);
+        assert_eq!(&selected_sources[..23], classic_sources);
+        assert_eq!(&selected_sources[23..], &[
             json!("ftrace-coverage.h"),json!("driver-grouped.c"),json!("grouped-driver.h"),
             json!("grouped-io.h"),json!("grouped-owner.h"),json!("grouped-probes.bpf.h"),
             json!("grouped-probes.h"),json!("grouped-target.h"),json!("provider-grouped.bpf.c"),
@@ -414,7 +414,7 @@ mod tests {
             json!("accepted-classic-v40-contract.json"),json!("accepted-grouped-v4-contract.json"),
             json!("fd-call-shared.bpf.h"),json!("fd-journal.bpf.h"),json!("stream-frontier.h"),
         ]);
-        assert_eq!(parsed.source_files.len(), 38);
+        assert_eq!(parsed.source_files.len(), 39);
     }
 
     #[test]
@@ -437,7 +437,7 @@ mod tests {
             refuses(&changed);
         }
         let count=selected["source_files"].as_array().unwrap().len();
-        assert_eq!(count,38);
+        assert_eq!(count,39);
         for index in 0..count {
             let mut changed = selected.clone();
             changed["source_files"].as_array_mut().unwrap().remove(index);

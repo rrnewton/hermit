@@ -238,7 +238,8 @@ impl Contract {
                     && matches!(result.hooks.get("__skb_datagram_iter"),Some((widths,7,4)) if widths.as_slice()==[8,4,8,4,1,8,8])
                     && matches!(result.hooks.get("skb_copy_datagram_iter"),Some((widths,4,4)) if widths.as_slice()==[8,4,8,4])
                     && [
-                        "stream-copy.h", "stream-copy.bpf.h", "stream-copy-driver.h",
+                        "stream-copy.h", "stream-copy.bpf.h", "stream-copy-grouped-source.inc",
+                        "stream-copy-driver.h",
                         "provider.bpf.c",
                         "driver.c",
                         "fd-effects.bpf.h",
@@ -1149,7 +1150,8 @@ mod tests {
         value["programs"] = json!(45);
         value["links"] = json!(50);
         value["shared_links"] = Value::Array(value["shared_links"].as_array().unwrap()[3..8].to_vec());
-        for name in ["stream-copy.h", "stream-copy.bpf.h", "stream-copy-driver.h"] {
+        for name in ["stream-copy.h", "stream-copy.bpf.h", "stream-copy-grouped-source.inc",
+            "stream-copy-driver.h"] {
             let sources = value["source_files"].as_array_mut().unwrap();
             let index = sources.iter().position(|source| source.as_str() == Some(name)).unwrap();
             sources.remove(index);

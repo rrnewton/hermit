@@ -101,6 +101,7 @@
     "epoll-ctl-copy-driver.h",
     "stream-copy.h",
     "stream-copy.bpf.h",
+    "stream-copy-grouped-source.inc",
     "stream-copy-driver.h"
   ],
   "hooks": {

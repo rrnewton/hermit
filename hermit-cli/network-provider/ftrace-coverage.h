@@ -9,12 +9,29 @@
 #endif
 _Static_assert(AP_FTRACE_MUTATE_ROLE<=17U,"ftrace role mutant");
 #define AP_FTRACE_ALL_ROLES ((1U<<17)-1U)
+#if defined(__BPF__) && defined(AP_FTRACE_RUNTIME_MUTANT)
+#error "runtime role mutation is host-control-only"
+#endif
+#ifdef AP_FTRACE_RUNTIME_MUTANT
+#include <stdlib.h>
+static inline unsigned ap_ftrace_selected_mutant(void) {
+    const char *text=getenv("AP_FTRACE_MUTATE_ROLE");
+    if(!text || !*text)return 0;
+    char *end=0;const unsigned long role=strtoul(text,&end,10);
+    return end && !*end && role<=17U?(unsigned)role:0;
+}
+#else
+static __attribute__((always_inline)) inline unsigned ap_ftrace_selected_mutant(void) {
+    return AP_FTRACE_MUTATE_ROLE;
+}
+#endif
 static __attribute__((always_inline)) inline int ap_ftrace_role_enabled(unsigned role) {
-    return role>=1 && role<=17 && role!=AP_FTRACE_MUTATE_ROLE;
+    return role>=1 && role<=17 && role!=ap_ftrace_selected_mutant();
 }
 static __attribute__((always_inline)) inline unsigned ap_ftrace_coverage_mask(void) {
+    const unsigned mutant=ap_ftrace_selected_mutant();
     return AP_FTRACE_ALL_ROLES &
-        (AP_FTRACE_MUTATE_ROLE ? ~(1U<<((AP_FTRACE_MUTATE_ROLE+16U)%17U)) : ~0U);
+        (mutant ? ~(1U<<((mutant+16U)%17U)) : ~0U);
 }
 #ifndef __BPF__
 #include <stddef.h>

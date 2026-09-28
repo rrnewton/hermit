@@ -338,6 +338,9 @@ fn run() -> Result<()> {
                 manifest["schema"] == 1
                     && manifest["kind"] == kind
                     && manifest["abi_version"] == contract.abi_version
+                    && manifest["object"] == object_name
+                    && manifest["library"] == library_name
+                    && manifest["compile_only"] == true
                     && (!accepted || match manifest.get("copy_version") {
                         None if contract.abi_version == "4150525553540007" => contract.accepted_copy_version()? == 4,
                         Some(value) => value.as_u64() == Some(contract.accepted_copy_version()?),
@@ -407,6 +410,10 @@ fn run() -> Result<()> {
         args.clang.as_os_str().to_owned(),
         os("-O2"),
         os("-g"),
+        OsString::from(format!(
+            "-ffile-prefix-map={}=.",
+            args.source.display()
+        )),
         os("-Wall"),
         os("-Wextra"),
         os("-Werror"),

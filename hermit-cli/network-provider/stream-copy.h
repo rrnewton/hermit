@@ -37,13 +37,23 @@
 /* Keep the compatibility roles on the production source-selection branch.
  * A role mutant therefore removes a real linear or fragment observation,
  * rather than changing only a test-side coverage bitmap. */
-static inline int ap_stream_copy_source_roles(u32 nonlinear) {
+static inline int ap_stream_copy_source_enter(u32 nonlinear) {
 #ifdef AP_FTRACE_PROVIDER
-    return nonlinear?(ap_ftrace_role_enabled(14) && ap_ftrace_role_enabled(15)):
-        (ap_ftrace_role_enabled(12) && ap_ftrace_role_enabled(13));
+    return ap_ftrace_role_enabled(nonlinear?14:12);
 #else
     (void)nonlinear;return 1;
 #endif
+}
+static inline int ap_stream_copy_source_exit(u32 nonlinear) {
+#ifdef AP_FTRACE_PROVIDER
+    return ap_ftrace_role_enabled(nonlinear?15:13);
+#else
+    (void)nonlinear;return 1;
+#endif
+}
+static inline int ap_stream_copy_source_roles(u32 nonlinear) {
+    return ap_stream_copy_source_enter(nonlinear) &&
+        ap_stream_copy_source_exit(nonlinear);
 }
 /* A nonlinear skb can still satisfy some or all of one copy from its linear
  * head. Return only that first bounded segment; the caller continues from the
@@ -52,6 +62,22 @@ static inline u64 ap_stream_copy_linear_take(u64 source,u64 requested,u64 linear
     if(!requested || source>=linear)return 0;
     const u64 available=linear-source;
     return requested<available?requested:available;
+}
+/* Resolve one authenticated skb fragment against the absolute skb cursor.
+ * Return -1 when the requested range is beyond this fragment, 0 on an
+ * impossible overlap, and 1 with a range bounded by BOTH frag->len and the
+ * remaining request.  The BPF producer and host controls share this exact
+ * arithmetic so a request can never extend into adjacent page-backed data. */
+static inline int ap_stream_copy_fragment_window(u64 start,u64 remaining,
+        u64 cursor,u64 fragment_length,u64 *within,u64 *take) {
+    if(!remaining || !fragment_length || cursor>~0ULL-fragment_length)return 0;
+    const u64 end=cursor+fragment_length;
+    if(start>=end)return -1;
+    if(start<cursor)return 0;
+    *within=start-cursor;
+    const u64 available=fragment_length-*within;
+    *take=remaining<available?remaining:available;
+    return *take?1:0;
 }
 /* A mixed skb's linear head is stable only with one full head/data owner.
  * Payload-only references do not qualify, and a page-backed head needs a

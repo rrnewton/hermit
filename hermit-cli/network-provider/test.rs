@@ -114,10 +114,28 @@ const ACCEPTED_CONTROLS: &[&str] = &[
     "grouped-adoption-test.c",
     "grouped-wire-test.c",
 ];
+const UNIX_CONTROLS: &[(&str, &[&str])] = &[
+    (
+        "keeper-terminal-tests.c",
+        &["syscall", "poll", "write", "fdatasync", "close", "unlinkat", "fstat", "fstatat"],
+    ),
+    (
+        "keeper-phase-tests.c",
+        &[
+            "syscall", "poll", "write", "fdatasync", "close", "unlinkat", "fstat", "fstatat",
+            "fcntl", "clock_gettime",
+        ],
+    ),
+    (
+        "keeper-readback-tests.c",
+        &["fcntl", "fstat", "pread", "clock_gettime", "nanosleep", "syscall", "close"],
+    ),
+];
 
 // Test-only channel implementation inputs are not part of the production
 // DSO contract. Hash every separately compiled module/header independently.
 const CHANNEL_CONTROL_INPUTS: &[&str] = &[
+    "grouped-owner.c", "grouped-io.c",
     "grouped-keeper-wire.c", "grouped-keeper-wire.h",
     "grouped-keeper-dual.c", "grouped-keeper-dual.h",
     "grouped-guardian-bootstrap.c", "grouped-guardian-bootstrap.h",
@@ -132,7 +150,14 @@ fn channel_control_inputs(source: &Path, accepted: bool) -> Result<BTreeMap<Stri
 
 fn control_sources(source: &Path, accepted: bool) -> Result<BTreeMap<String, String>> {
     if !accepted {
-        return Ok(BTreeMap::new());
+        return [
+            "unix/keeper-terminal-tests.c",
+            "unix/keeper-phase-tests.c",
+            "unix/keeper-readback-tests.c",
+        ]
+        .into_iter()
+        .map(|name| Ok((name.to_owned(), digest(&read(&source.join(name), MIB)?))))
+        .collect();
     }
     ACCEPTED_CONTROLS
         .iter()
@@ -332,6 +357,48 @@ fn run() -> Result<()> {
             }
         }
     }
+    if receipt["passed"] == true && !accepted {
+        for (name, wraps) in UNIX_CONTROLS {
+            let executable = output.join(name.strip_suffix(".c").unwrap());
+            let mut compile = Command::new("clang");
+            compile.args([
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-UNDEBUG",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-Wl,--gc-sections",
+            ]);
+            for wrapped in *wraps {
+                compile.arg(format!("-Wl,--wrap={wrapped}"));
+            }
+            compile
+                .arg("-I")
+                .arg(source.join("unix"))
+                .arg(source.join("unix").join(name))
+                .arg("-o")
+                .arg(&executable);
+            let compiled = execute_stage(&mut compile, started, &stdout_path, &stderr_path);
+            stages.push(json!({"name":format!("compile:{name}"),"receipt":compiled}));
+            if compiled["passed"] != true {
+                receipt = compiled;
+                break;
+            }
+            let tested = execute_stage(
+                &mut Command::new(&executable),
+                started,
+                &stdout_path,
+                &stderr_path,
+            );
+            stages.push(json!({"name":format!("test:{name}"),"receipt":tested}));
+            if tested["passed"] != true {
+                receipt = tested;
+                break;
+            }
+        }
+    }
     if receipt["passed"] == true && accepted {
         for (label, name) in [
             ("fd", "fd-effects-test.c"),
@@ -377,29 +444,15 @@ fn run() -> Result<()> {
         } else {receipt=compiled;}
     }
     if receipt["passed"] == true && accepted {
-        for role in 1..=17 {
-            let source_name=match role {
-                1..=11 => "fd-effects-test.c",
-                12..=15 => "stream-copy-v5-driver-test.c",
-                16..=17 => "stream-membership-v5-test.c",
-                _ => unreachable!(),
-            };
-            let executable=output.join(format!("ftrace-coverage-mutant-{role}"));
-            let mut compile=Command::new("clang");
-            // Each mutant executes the same production helper/header path as
-            // its O2 positive control above. Avoid spending the fixed suite
-            // wall budget re-optimizing the large host fixture 17 times.
-            compile.args(["-O0","-Wall","-Wextra","-Werror","-UNDEBUG",
-                    "-DAP_FTRACE_PROVIDER=1"])
-                .arg(format!("-DAP_FTRACE_MUTATE_ROLE={role}"));
-            if source_name=="fd-effects-test.c" {compile.arg("-DAP_NATIVE_COPY_VERSION=5ULL");}
-            if source_name=="fd-effects-test.c" {compile.arg("-DAP_FTRACE_MUTANT_ONLY=1");}
-            compile
-                .arg("-I").arg(&source)
-                .arg(source.join(source_name)).arg("-o").arg(&executable);
-            let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
-            stages.push(json!({"name":format!("compile:ftrace-mutant-{role}"),"receipt":compiled}));
-            if compiled["passed"]!=true {receipt=compiled;break;}
+        let executable=output.join("grouped-source-fragment-overread-mutant");
+        let mut compile=Command::new("clang");
+        compile.args(["-O0","-Wall","-Wextra","-Werror","-UNDEBUG",
+            "-DAP_FTRACE_PROVIDER=1","-DAP_STREAM_COPY_MUTATE_FRAGMENT_LENGTH=1"])
+            .arg("-I").arg(&source)
+            .arg(source.join("stream-copy-v5-driver-test.c")).arg("-o").arg(&executable);
+        let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
+        stages.push(json!({"name":"compile:grouped-source-fragment-overread-mutant","receipt":compiled}));
+        if compiled["passed"]==true {
             let tested=execute_stage(&mut Command::new(&executable),started,&stdout_path,&stderr_path);
             let refused=tested["passed"]==false &&
                 tested["signal"].as_i64()==Some(libc::SIGABRT as i64) && tested["timed_out"]==false &&
@@ -408,14 +461,53 @@ fn run() -> Result<()> {
                 tested["natural_terminal_group"]==true && tested["cleanup_complete"]==true &&
                 tested["cleanup_errors"].as_array().is_some_and(|errors| errors.is_empty());
             let accepted=json!({"passed":refused,"expected_refusal":true,"raw":tested});
-            stages.push(json!({"name":format!("test:ftrace-mutant-{role}"),"receipt":accepted}));
-            if !refused {receipt=accepted;break;}
+            stages.push(json!({"name":"test:grouped-source-fragment-overread-mutant","receipt":accepted}));
+            if !refused {receipt=accepted;}
+        } else {receipt=compiled;}
+    }
+    if receipt["passed"] == true && accepted {
+        for (label, source_name, roles) in [
+            ("fd", "fd-effects-test.c", 1..=11),
+            ("stream-copy", "stream-copy-v5-driver-test.c", 12..=15),
+            ("stream-membership", "stream-membership-v5-test.c", 16..=17),
+        ] {
+            let executable=output.join(format!("ftrace-coverage-mutants-{label}"));
+            let mut compile=Command::new("clang");
+            // Compile each unchanged production helper/header path once, then
+            // select one host-only role gate per execution. This preserves 17
+            // independent aborting controls without charging 17 compiler
+            // startups to the unchanged aggregate 60-second action.
+            compile.args(["-O0","-Wall","-Wextra","-Werror","-UNDEBUG",
+                    "-DAP_FTRACE_PROVIDER=1","-DAP_FTRACE_RUNTIME_MUTANT=1"]);
+            if source_name=="fd-effects-test.c" {compile.arg("-DAP_NATIVE_COPY_VERSION=5ULL");}
+            if source_name=="fd-effects-test.c" {compile.arg("-DAP_FTRACE_MUTANT_ONLY=1");}
+            compile
+                .arg("-I").arg(&source)
+                .arg(source.join(source_name)).arg("-o").arg(&executable);
+            let compiled=execute_stage(&mut compile,started,&stdout_path,&stderr_path);
+            stages.push(json!({"name":format!("compile:ftrace-mutants-{label}"),"receipt":compiled}));
+            if compiled["passed"]!=true {receipt=compiled;break;}
+            for role in roles {
+                let mut command=Command::new(&executable);
+                command.env("AP_FTRACE_MUTATE_ROLE",role.to_string());
+                let tested=execute_stage(&mut command,started,&stdout_path,&stderr_path);
+                let refused=tested["passed"]==false &&
+                    tested["signal"].as_i64()==Some(libc::SIGABRT as i64) && tested["timed_out"]==false &&
+                    tested["log_overflow"]==false && tested["primary_error"].is_null() &&
+                    tested["terminal_bounds_error"].is_null() &&
+                    tested["natural_terminal_group"]==true && tested["cleanup_complete"]==true &&
+                    tested["cleanup_errors"].as_array().is_some_and(|errors| errors.is_empty());
+                let accepted=json!({"passed":refused,"expected_refusal":true,"raw":tested});
+                stages.push(json!({"name":format!("test:ftrace-mutant-{role}"),"receipt":accepted}));
+                if !refused {receipt=accepted;break;}
+            }
+            if receipt["passed"]!=true {break;}
         }
     }
     let expected_stages = 1 + if accepted {
-        2 * ACCEPTED_CONTROLS.len()+42
+        2 * ACCEPTED_CONTROLS.len()+30
     } else {
-        0
+        2 * UNIX_CONTROLS.len()
     };
     let complete =
         stages.len() == expected_stages && stages.iter().all(|s| s["receipt"]["passed"] == true);

@@ -37,8 +37,12 @@ int main(void) {
     (void)ap_require_retirement_target;
     assert(ap_shared_fdget_role(AP_ORIGINAL_CONNECT,0x1000,0x101c)==1);
     assert(ap_shared_fdget_role(AP_ACCEPT_EFFECT,0x1000,0x1021)==4);
+    assert(!ap_shared_fdget_role(AP_ACCEPT_EFFECT,0x1000,0x1020));
+    assert(!ap_shared_fdget_role(AP_ACCEPT_EFFECT,0x1000,0x1022));
     assert(ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1023)==10);
     assert(ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1037)==11);
+    assert(!ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1036));
+    assert(!ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1038));
     struct ap_task_command connect=mutant_connect_owner();
     struct ap_fd_call call=mutant_connect_call();
     assert(ap_original_copy_infer_success(
@@ -151,8 +155,12 @@ static void original_copy_controls(void) {
         &c,&o,19,23,~0ULL-7,0,0x8001,24,0x4000));COPY_CHECK(!memcmp(&c,&pending,sizeof(c)));
     COPY_CHECK(ap_shared_fdget_role(AP_ORIGINAL_CONNECT,0x1000,0x101c)==AP_SHARED_FDGET_CONNECT_ROLE);
     COPY_CHECK(ap_shared_fdget_role(AP_ACCEPT_EFFECT,0x1000,0x1021)==AP_SHARED_FDGET_ACCEPT_ROLE);
+    COPY_CHECK(!ap_shared_fdget_role(AP_ACCEPT_EFFECT,0x1000,0x1020));
+    COPY_CHECK(!ap_shared_fdget_role(AP_ACCEPT_EFFECT,0x1000,0x1022));
     COPY_CHECK(ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1023)==AP_SHARED_FDGET_EPOLL_PRIMARY_ROLE);
     COPY_CHECK(ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1037)==AP_SHARED_FDGET_EPOLL_TARGET_ROLE);
+    COPY_CHECK(!ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1036));
+    COPY_CHECK(!ap_shared_fdget_role(AP_ORIGINAL_EPOLL_CTL,0x1000,0x1038));
     COPY_CHECK(!ap_shared_fdget_role(AP_ORIGINAL_CONNECT,0x1000,0x1021));
     COPY_CHECK(ap_file_fdget_caller_site(0xffffffff81faaca0ULL,0xffffffff81facb54ULL));
     COPY_CHECK(!ap_file_fdget_caller_site(0xffffffff81faaca0ULL,0xffffffff81facb55ULL));
@@ -214,7 +222,7 @@ static void original_copy_controls(void) {
     p.recursion_misses=1;COPY_CHECK(!ap_copy_link_matches(1,&p,sizeof(p),&l,sizeof(l),"__sys_connect"));
     p.recursion_misses=0;p.id=0;COPY_CHECK(!ap_copy_link_matches(1,&p,sizeof(p),&l,sizeof(l),"__sys_connect"));
     p.id=37;p.type=BPF_PROG_TYPE_TRACING;COPY_CHECK(!ap_copy_link_matches(1,&p,sizeof(p),&l,sizeof(l),"__sys_connect"));
-    assert(copy_checks==110);
+    assert(copy_checks==114);
     printf("original copy boundary production controls=%u\n",copy_checks);
 }
 #undef COPY_CHECK

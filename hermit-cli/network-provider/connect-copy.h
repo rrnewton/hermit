@@ -411,12 +411,13 @@ static __attribute__((always_inline)) inline int ap_original_copy_end(
 static __attribute__((always_inline)) inline int ap_original_copy_infer_success(
     struct ap_fd_call *call,const struct ap_task_command *owner,u64 task,u64 start,
     u64 callee_stack,u64 destination,u64 file_word,u64 length,u64 address) {
-    if(!ap_ftrace_role_enabled(2) || !ap_ftrace_role_enabled(3) ||
+    if(!ap_ftrace_role_enabled(2) ||
        !callee_stack || callee_stack>~0ULL-8 || destination!=callee_stack+8 ||
        !ap_original_copy_frame(call,owner,task,start,destination,file_word,length,address) ||
        call->copied_address || call->original.copy_entered || call->original.copy_returned ||
        call->original.copy_remaining)return 0;
     call->copied_address=destination;call->original.copy_entered=1;
+    if(!ap_ftrace_role_enabled(3))return 0;
     call->original.copy_returned=1;call->original.copy_remaining=0;return 1;
 }
 #ifndef __BPF__

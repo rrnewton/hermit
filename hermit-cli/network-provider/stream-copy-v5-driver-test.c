@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #define AP_NATIVE_COPY_VERSION 5
+#define AP_GROUPED_PROVIDER 1
 /* Additive V5 controls of the SAME retained-copy callback. The original
  * stream-copy-driver-test.c runs separately under exact default ABI7/copy4.
  * These test stubs are unchanged boundary scaffolding, not native evidence. */
@@ -10,6 +11,72 @@
 #include <stdlib.h>
 #include <string.h>
 #include "fd-effects.h"
+
+/* Exact host execution of stream_copy_emit_grouped_source.  Kernel pointer
+ * reads are translated onto three retained page images, while the included
+ * producer body, its fragment bounds and its role gates are production code. */
+#define AP_STREAM_COPY_TRANSPORT_SHIFT 8
+#define TEST_FRAGMENTS 4
+#define TEST_VMEMMAP 0xffd4000000000000ULL
+#define TEST_DIRECT 0xff11000000000000ULL
+struct stream_copy_skb_view {
+    u64 head,data;
+    u32 tail,end,size,nonlinear;
+    s32 users;
+};
+struct stream_copy_shared_view { u64 frag_list; s32 dataref; u8 count,flags; };
+struct test_frag { u64 netmem; u32 len,offset; };
+struct skb_shared_info {
+    struct test_frag frags[TEST_FRAGMENTS];
+    u64 frag_list;
+    s32 dataref;
+    u8 nr_frags,flags;
+};
+struct sk_buff {
+    struct stream_copy_skb_view view;
+    struct skb_shared_info shared;
+};
+static struct ap_config source_config={
+    .anchor_phase=AP_GROUPED_ANCHOR_ACTIVE,
+    .vmemmap_base=TEST_VMEMMAP,
+    .page_offset_base=TEST_DIRECT,
+};
+static int ap_config_map;
+static unsigned char direct_pages[3][AP_STREAM_COPY_PAGE_BYTES];
+static unsigned char emitted_bytes[64];
+struct emitted_segment { u64 source,count,offset; };
+static struct emitted_segment emitted_segments[8];
+static u32 emitted_segment_count;
+static void *lookup(void *map,const u32 *key) {
+    assert(map==&ap_config_map && key && *key==0);return &source_config;
+}
+static int fd_read_kernel(void *out,u32 count,const void *source) {
+    const u64 address=(u64)source;
+    if(address>=TEST_DIRECT && address<TEST_DIRECT+sizeof(direct_pages)) {
+        const u64 offset=address-TEST_DIRECT;
+        if(count>sizeof(direct_pages)-offset)return -1;
+        memcpy(out,(const unsigned char *)direct_pages+offset,count);return 0;
+    }
+    memcpy(out,source,count);return 0;
+}
+#define CORE(address) (address)
+static int stream_copy_read_skb(struct sk_buff *skb,struct stream_copy_skb_view *out) {
+    if(!skb)return 0;*out=skb->view;return 1;
+}
+static int stream_copy_read_shared(struct skb_shared_info *shared,
+        struct stream_copy_shared_view *out) {
+    if(!shared)return 0;
+    *out=(struct stream_copy_shared_view){.frag_list=shared->frag_list,
+        .dataref=shared->dataref,.count=shared->nr_frags,.flags=shared->flags};
+    return 1;
+}
+static int stream_copy_emit_range(struct ap_fd_call *call,u64 source,u64 count,u64 offset) {
+    assert(call && count && emitted_segment_count<8 && offset+count<=sizeof(emitted_bytes));
+    emitted_segments[emitted_segment_count++]=(struct emitted_segment){source,count,offset};
+    return !fd_read_kernel(emitted_bytes+offset,count,(const void *)source);
+}
+#include "stream-copy-grouped-source.inc"
+#undef CORE
 enum ap_slot_state { AP_SLOT_FREE, AP_SLOT_RESERVED, AP_SLOT_ACTIVE, AP_SLOT_DISARMING, AP_SLOT_COLLECTED, AP_SLOT_QUARANTINED };
 struct ap_pending_command {
     enum ap_slot_state state;
@@ -219,8 +286,71 @@ static void exact_image_fragment_address(void) {
     assert(!ap_stream_fragment_source(five_level_vmemmap,0,1,
         five_level_vmemmap,0xfefffffffffff000ULL));
 }
+static void reset_emission(void) {
+    memset(emitted_bytes,0,sizeof(emitted_bytes));
+    memset(emitted_segments,0,sizeof(emitted_segments));
+    emitted_segment_count=0;
+}
+static void grouped_source_producer_bytes(void) {
+    struct ap_fd_call call={0};
+    struct sk_buff skb={0};
+    const unsigned char linear[]="ABCDEFGHIJ";
+    call.original.stream_copy.summary.initial_count=16;
+    call.original.stream_copy.before_count=16;
+    call.original.stream_copy.source=2;
+    call.original.stream_copy.requested=5;
+    skb.view=(struct stream_copy_skb_view){.data=(u64)linear,.size=10};
+    reset_emission();
+    assert(stream_copy_emit_grouped_source(&call,&skb));
+    assert(emitted_segment_count==1);
+    assert(emitted_segments[0].source==(u64)linear+2);
+    assert(emitted_segments[0].count==5 && emitted_segments[0].offset==0);
+    assert(!memcmp(emitted_bytes,"CDEFG",5));
+
+    memcpy(direct_pages[0]+100,"ijk",3);
+    memcpy(direct_pages[1]+4094,"lmno",4);
+    memset(&call,0,sizeof(call));memset(&skb,0,sizeof(skb));
+    call.original.stream_copy.summary.initial_count=32;
+    call.original.stream_copy.before_count=32;
+    call.original.stream_copy.source=6;
+    call.original.stream_copy.requested=9;
+    call.original.stream_copy.copy_active=AP_STREAM_COPY_TCP<<AP_STREAM_COPY_TRANSPORT_SHIFT;
+    skb.shared.dataref=1;skb.shared.nr_frags=2;
+    skb.shared.frags[0]=(struct test_frag){.netmem=TEST_VMEMMAP,.len=3,.offset=100};
+    skb.shared.frags[1]=(struct test_frag){.netmem=TEST_VMEMMAP+64,.len=4,.offset=4094};
+    skb.view=(struct stream_copy_skb_view){.head=(u64)&skb.shared,.data=(u64)linear,
+        .end=0,.size=15,.nonlinear=7};
+    reset_emission();
+    assert(stream_copy_emit_grouped_source(&call,&skb));
+    assert(emitted_segment_count==3);
+    assert(emitted_segments[0].count==2 && emitted_segments[0].offset==0);
+    assert(emitted_segments[1].count==3 && emitted_segments[1].offset==2);
+    assert(emitted_segments[2].count==4 && emitted_segments[2].offset==5);
+    assert(!memcmp(emitted_bytes,"GHijklmno",9));
+
+    /* Fragment-only start inside the first fragment catches the historical
+     * W3c overread: the first emission is the two-byte suffix, not frag len. */
+    call.original.stream_copy.source=9;
+    call.original.stream_copy.requested=6;
+    reset_emission();
+    assert(stream_copy_emit_grouped_source(&call,&skb));
+    assert(emitted_segment_count==2);
+    assert(emitted_segments[0].count==2 && emitted_segments[0].offset==0);
+    assert(emitted_segments[1].count==4 && emitted_segments[1].offset==2);
+    assert(!memcmp(emitted_bytes,"jklmno",6));
+
+    call.original.stream_copy.source=14;
+    call.original.stream_copy.requested=2;
+    reset_emission();
+    assert(!stream_copy_emit_grouped_source(&call,&skb));
+    assert(!emitted_segment_count);
+}
 int main(void) {
-    recv_exit_copy_version();exact_image_fragment_address();
+    recv_exit_copy_version();exact_image_fragment_address();grouped_source_producer_bytes();
+    assert(ap_stream_copy_source_enter(0));
+    assert(ap_stream_copy_source_exit(0));
+    assert(ap_stream_copy_source_enter(1));
+    assert(ap_stream_copy_source_exit(1));
     assert(ap_stream_copy_source_roles(0));
     assert(ap_stream_copy_source_roles(1));
     assert(ap_stream_copy_linear_take(2,3,10)==3);
@@ -228,6 +358,23 @@ int main(void) {
     assert(ap_stream_copy_linear_take(10,5,10)==0);
     assert(ap_stream_copy_linear_take(12,5,10)==0);
     assert(ap_stream_copy_linear_take(2,0,10)==0);
+    u64 within=99,take=99;
+    assert(ap_stream_copy_fragment_window(12,20,10,5,&within,&take)==1);
+    assert(within==2 && take==3); /* never read 20 bytes from a 3-byte suffix */
+    assert(ap_stream_copy_fragment_window(15,4,10,5,&within,&take)==-1);
+    assert(ap_stream_copy_fragment_window(9,4,10,5,&within,&take)==0);
+    assert(ap_stream_copy_fragment_window(10,0,10,5,&within,&take)==0);
+    assert(ap_stream_copy_fragment_window(10,1,~0ULL-2,5,&within,&take)==0);
+    /* Mixed/multi-fragment plan: two linear bytes, then exact 3+4 fragment
+     * suffixes. The second request is deliberately larger than each fragment. */
+    u64 start=8,remaining=9,linear=10,cursor=linear,total=0;
+    u64 linear_take=ap_stream_copy_linear_take(start,remaining,linear);
+    assert(linear_take==2);start+=linear_take;remaining-=linear_take;total+=linear_take;
+    assert(ap_stream_copy_fragment_window(start,remaining,cursor,3,&within,&take)==1);
+    assert(within==0 && take==3);start+=take;remaining-=take;cursor+=3;total+=take;
+    assert(ap_stream_copy_fragment_window(start,remaining,cursor,4,&within,&take)==1);
+    assert(within==0 && take==4);remaining-=take;total+=take;
+    assert(total==9 && remaining==0);
     assert(ap_stream_copy_mixed_head_owned(2,3,15,5,1,0));
     assert(ap_stream_copy_mixed_head_owned(8,5,15,5,1,0));
     assert(!ap_stream_copy_mixed_head_owned(10,3,15,5,1,0));
@@ -239,6 +386,6 @@ int main(void) {
     struct ap_session *s=calloc(1,sizeof(*s));assert(s);struct ring_buffer ring={0};
     active_prefix_and_interleave(s,&ring);peek_and_fault(s,&ring);strict_shapes_and_retained_partial(s,&ring);
     reset(s,&ring);free(s);
-    puts("copy5 actual C collector: Begin/DATA/End, interleave, Peek, fault, 25 malformed pairs, terminal partial custody, recv exit accepts copy5 and refuses copy4, exact-image page-layout/address refusals; no native proof");
+    puts("copy5 actual C collector: Begin/DATA/End, interleave, Peek, fault, 25 malformed pairs, terminal partial custody, recv exit accepts copy5 and refuses copy4, exact grouped linear/mixed/multifrag byte producer, page-layout/address refusals; no native proof");
     return 0;
 }
