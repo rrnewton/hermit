@@ -1645,7 +1645,7 @@ fn comparator_choice_does_not_depend_on_the_backend() {
 }
 
 #[test]
-fn contained_network_refusal_shutdown_requires_the_actual_ptrace_controller() {
+fn contained_network_refusal_keeps_the_ordinary_ptrace_completion_owner() {
     for backend in ["ptrace", "e9patch", "liteinst", "sabre", "kvm", "dbt"] {
         for strict in [false, true] {
             for no_namespace in [false, true] {
@@ -1662,10 +1662,10 @@ fn contained_network_refusal_shutdown_requires_the_actual_ptrace_controller() {
                     !run.effective_det_config()
                         .controller_can_exit_on_network_refusal
                 );
-                assert_eq!(
-                    run.contained_det_config()
+                assert!(
+                    !run.contained_det_config()
                         .controller_can_exit_on_network_refusal,
-                    !no_namespace && matches!(backend, "ptrace" | "e9patch")
+                    "{backend}, strict={strict}, no_namespace={no_namespace}: preserve the typed refusal; do not exit inside the Tool RPC"
                 );
             }
         }
@@ -5598,12 +5598,16 @@ impl RunOpts {
         Ok(())
     }
 
-    /// Used only inside run/verify's completed container body. A plain child
-    /// from --no-namespace lacks the PID-namespace teardown guarantee.
+    /// Used only inside run/verify's completed container body. Ordinary ptrace
+    /// returns a typed refusal through its retained completion owner, including
+    /// physical task cleanup and failed GlobalState cleanup. Exiting inside a
+    /// Tool RPC would skip that owner and the encoded result; the outer network
+    /// finalizer correctly cannot infer a replay refusal from status 122 alone.
+    /// E9 instrumentation also dispatches onto this ordinary ptrace runtime.
+    /// No-namespace and plugin configurations never acquire exit authority.
     fn contained_det_config(&self) -> DetConfig {
         let mut config = self.effective_det_config();
-        config.controller_can_exit_on_network_refusal = !self.no_namespace
-            && matches!(self.runtime_backend(), Backend::Ptrace | Backend::E9patch);
+        config.controller_can_exit_on_network_refusal = false;
         config
     }
 

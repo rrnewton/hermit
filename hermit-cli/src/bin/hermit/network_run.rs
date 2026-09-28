@@ -1604,6 +1604,67 @@ mod tests {
             .unwrap_err();
         assert!(error.downcast_ref::<PolicyRefusal>().is_some());
     }
+
+    #[test]
+    fn actual_owned_child_preserves_typed_replay_refusal_without_a_guard_denial() {
+        use detcore::network_failure::NetworkFailurePhase;
+        use detcore::network_failure::NetworkRpcError;
+        use detcore::network_replay::NetworkReplayError;
+        use detcore_model::network_trace::NetworkChannelId;
+        use detcore_model::network_trace::NetworkPolicy;
+
+        // The child and parent use the real owned container/result boundary.
+        // Only the engine's refusal is a fixture input; no guard/provider
+        // cleanup certificate is constructed by this unit test.
+        for typed in [true, false] {
+            let started = Container::new().run_with_startup_owned(
+                Duration::from_secs(2),
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+                &mut |_| -> (Wire, ()) {
+                    let refusal = NetworkRpcError::from_engine(
+                        NetworkPolicy::Replay,
+                        NetworkFailurePhase::Transmit,
+                        NetworkReplayError::OutboundMismatch {
+                            channel: NetworkChannelId(1),
+                            offset: 0,
+                        },
+                    )
+                    .into_error();
+                    let error = if typed {
+                        Error::new(reverie::Error::Tool(refusal))
+                    } else {
+                        // Identical words cannot mint the failure class.
+                        Error::msg(refusal.to_string())
+                    };
+                    (Err(SerializableError::from(error)), ())
+                },
+            );
+            let error = finalize_owned(Some(started), None, None, None, None).unwrap_err();
+            assert_eq!(error.downcast_ref::<PolicyRefusal>().is_some(), typed);
+            assert_eq!(
+                super::super::failure_exit_code(&error),
+                if typed { 122 } else { 125 },
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains("MissingResult"), "{error:#}");
+        }
+
+        let started = Container::new().run_with_startup_owned(
+            Duration::from_secs(2),
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+            &mut |_| -> (Wire, ()) { (Ok(RunValue::Run(ExitStatus::Exited(122), None)), ()) },
+        );
+        assert_eq!(
+            finalize_owned(Some(started), None, None, None, None)
+                .unwrap()
+                .into_status()
+                .unwrap(),
+            ExitStatus::Exited(122),
+            "an ordinary encoded guest exit is not a controller policy refusal"
+        );
+    }
     #[test]
     fn actual_missing_125_zero_crash_and_prior_failure_cannot_claim_policy() {
         for (code, prior) in [
