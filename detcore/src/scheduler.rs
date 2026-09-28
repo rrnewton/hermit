@@ -2184,6 +2184,9 @@ impl Scheduler {
         assert!(group.contains(&caller));
         assert!(group.contains(&new_leader));
         self.exec_incarnations.insert(new_leader, post_exec_mm);
+        // Reloading backends enter thread-start before handle_post_exec. Cancel
+        // old POSIX deadlines before admitting the replacement's first turn.
+        self.blocked.timed_waiters.remove_posix_timers(detpid);
 
         if caller == new_leader {
             self.next_turns
@@ -5747,6 +5750,59 @@ mod test {
             0,
             "successful exec must clear the scheduler's prior CHILD_CLEARTID address"
         );
+    }
+
+    #[test]
+    fn exec_reconnect_deletes_posix_deadlines_before_new_image_admission() {
+        for nonleader in [false, true] {
+            let mut sched = Scheduler::new(&Config::default());
+            let leader = DetTid::from_raw(17);
+            let sibling = DetTid::from_raw(18);
+            let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, sibling);
+            let deadline = LogicalTime::from_nanos(1_000_000);
+            sched.register_alarm(
+                detpid,
+                leader,
+                LogicalTime::ZERO,
+                deadline,
+                LogicalTime::ZERO,
+                Signal::SIGALRM,
+            );
+            sched.register_posix_timer(
+                detpid,
+                sibling,
+                0,
+                Some(deadline),
+                deadline,
+                Signal::SIGUSR2,
+            );
+            sched.reconnect_after_exec(ExecReconnect {
+                caller: if nonleader { sibling } else { leader },
+                new_leader: leader,
+                detpid,
+                pre_exec_mm,
+                post_exec_mm: pre_exec_mm.for_exec(detpid),
+                child_tid_addr: 0,
+                reconnect_priority: Some(DEFAULT_PRIORITY),
+            });
+            // No replacement-image request has been published yet. Timer
+            // cancellation must already be complete at this boundary.
+            assert_eq!(
+                sched.blocked.timed_waiters.alarm_state(detpid),
+                Some((deadline, LogicalTime::ZERO))
+            );
+            assert_eq!(
+                sched.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                vec![(
+                    deadline,
+                    TimedEvent::SignalEvt(
+                        timed_waiters::SignalTimerId::Alarm(detpid),
+                        leader,
+                        Signal::SIGALRM
+                    )
+                ),]
+            );
+        }
     }
 
     /// F1/F2: an admission deferred while a tentative_pop window is live must

@@ -178,7 +178,7 @@ struct PosixTimer {
 /// Timers are shared among all threads of a process and, per POSIX, are **not**
 /// inherited across `fork(2)`. Detcore therefore shares this table on
 /// `CLONE_THREAD` and starts a fresh, empty table for every new process (see
-/// `init_thread_state`).
+/// `init_thread_state`). Successful exec deletes the timers as well.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PosixTimers {
     /// Deterministic id allocator. Kernel `timer_t`s are opaque, so we hand out
@@ -251,6 +251,12 @@ impl PosixTimers {
     /// Remove a timer; returns whether it existed.
     pub(crate) fn remove(&mut self, id: i32) -> bool {
         self.timers.remove(&id).is_some()
+    }
+
+    /// Linux deletes all POSIX timers on successful exec. Keep the process's
+    /// ID allocator, but invalidate armed, disarmed and non-notifying timers.
+    pub(crate) fn clear_for_exec(&mut self) {
+        self.timers.clear();
     }
 }
 
@@ -932,6 +938,32 @@ mod posix_timers_tests {
         assert!(!timers.contains(id));
         // Deleting again fails.
         assert!(!timers.remove(id));
+    }
+
+    #[test]
+    fn exec_deletes_armed_disarmed_and_non_notifying_timers() {
+        let mut timers = PosixTimers::default();
+        let periodic = timers.create(Some(libc::SIGUSR2));
+        let disarmed = timers.create(Some(libc::SIGALRM));
+        let silent = timers.create(None);
+        timers.settime(periodic, 50, Some(t(100)), t(0));
+        timers.settime(silent, 0, Some(t(200)), t(0));
+
+        timers.clear_for_exec();
+        for id in [periodic, disarmed, silent] {
+            assert!(!timers.contains(id));
+            assert_eq!(timers.gettime(id, t(10)), None);
+            assert_eq!(timers.settime(id, 0, Some(t(300)), t(10)), None);
+            assert_eq!(timers.signal(id), None);
+            assert!(!timers.remove(id));
+        }
+        // A repeated notification is harmless, and the new image can create
+        // and arm timers without reviving the old objects.
+        timers.clear_for_exec();
+        let new = timers.create(Some(libc::SIGUSR1));
+        assert_eq!(new, 3);
+        assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
+        assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
     }
 }
 
