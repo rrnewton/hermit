@@ -110,6 +110,54 @@ fn tod_gettimeofday() {
     );
 }
 
+#[test]
+/// Linux copies `tv` to user memory before `tz` and reports EFAULT if the `tz`
+/// copy faults, so the host has already stored its wall clock in `tv` when the
+/// call fails. The guest must still observe virtual time there, and a faulting
+/// `tv` must keep reporting the kernel's EFAULT.
+fn tod_gettimeofday_faulting_tz_writes_virtual_tv() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    let epoch = config.epoch;
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let errno = || unsafe { *libc::__errno_location() };
+            // Address 1 is below mmap_min_addr, so it can never be mapped.
+            let faulting = 1usize as *mut libc::c_void;
+
+            let mut tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            // Issue the raw syscall so no vDSO path can bypass the tracer.
+            let ret = unsafe { libc::syscall(libc::SYS_gettimeofday, &mut tv, faulting) };
+            assert_eq!(ret, -1);
+            assert_eq!(errno(), libc::EFAULT);
+            let dt = DateTime::from_timestamp(tv.tv_sec, 1000 * tv.tv_usec as u32).unwrap();
+            // Same bound as `tod_gettimeofday`: host wall-clock time is years
+            // away from the virtual epoch.
+            let delta = diff_millis(epoch, dt);
+            assert!(
+                (0..100).contains(&delta),
+                "tv {}.{:06} is {} ms from the virtual epoch {}",
+                tv.tv_sec,
+                tv.tv_usec,
+                delta,
+                epoch,
+            );
+
+            let ret =
+                unsafe { libc::syscall(libc::SYS_gettimeofday, faulting, ptr::null_mut::<u8>()) };
+            assert_eq!(ret, -1);
+            assert_eq!(errno(), libc::EFAULT);
+        },
+        config,
+        true,
+    );
+}
+
 fn raw_getimeofday_delta() {
     let dt1 = {
         let mut tp: MaybeUninit<libc::timeval> = MaybeUninit::uninit();

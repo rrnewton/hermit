@@ -171,17 +171,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let time_ns = guest_clock_time(guest).await;
 
-        let ret = self.record_or_replay(guest, call).await?;
+        let result = self.record_or_replay(guest, call).await;
 
         let mut memory = guest.memory();
 
         let tv: Timeval = time_ns.into();
 
+        // Linux stores `tv` before copying `tz`, so a faulting `tz` fails with
+        // EFAULT only after host wall-clock time has reached `tv`. Overwrite
+        // `tv` with virtual time on failure as well. If `tv` is itself the
+        // faulting pointer this write fails too; the syscall's own error is
+        // what the guest must see, so it takes precedence.
         if let Some(tp) = call.tv() {
-            memory.write_value(tp, &tv)?;
+            let written = memory.write_value(tp, &tv);
+            if result.is_ok() {
+                written?;
+            }
         }
 
-        Ok(ret)
+        Ok(result?)
     }
 
     /// time
