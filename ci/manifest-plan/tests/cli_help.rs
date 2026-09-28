@@ -82,6 +82,10 @@ fn every_manifest_cli_has_conventional_help() {
             env!("CARGO_BIN_EXE_generate-test-footprints"),
         ),
         ("manifest-metadata", env!("CARGO_BIN_EXE_manifest-metadata")),
+        (
+            "generate-parity-cells",
+            env!("CARGO_BIN_EXE_generate-parity-cells"),
+        ),
     ] {
         assert_help(binary, name, &non_repo);
     }
