@@ -154,6 +154,29 @@ where
     result.map_err(Error::from)
 }
 
+async fn complete_proven_child<G, T>(
+    guest: &mut G,
+    call: syscalls::Waitid,
+    child: DetPid,
+) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // KVM publishes backend waitability before the owner's exit hook inserts
+    // final CPU. Wait only for our registered birth-owned publication; the
+    // hook's synchronous prefix does not need another guest scheduler turn.
+    if call.options() & libc::WNOWAIT == 0
+        && !guest
+            .thread_state()
+            .wait_for_child_cpu_publication(child)
+            .await
+    {
+        return Err(failure("proven child has no owned final CPU publication"));
+    }
+    complete_child(guest, call, child).await
+}
+
 async fn wait_terminal<G, T>(
     guest: &mut G,
     call: syscalls::Waitid,
@@ -234,7 +257,7 @@ where
                         "private proof did not report the selected terminal child",
                     ));
                 }
-                return complete_child(guest, call, child).await;
+                return complete_proven_child(guest, call, child).await;
             }
             // Even ECHILD is impossible after logical revalidation under the
             // retained grant. It does not prove that a legacy physical reap
@@ -614,6 +637,161 @@ mod tests {
                 consumed: Mutex::new(Vec::new()),
                 expect_rollup: !nowait,
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct CpuPublicationWake(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for CpuPublicationWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Use the actual child-state initializer, including its KVM/serial gate,
+    // rather than manufacturing a ready notification in the component.
+    fn unpublished_child(guest: &mut CompletionGuest) -> crate::ThreadState<()> {
+        guest.config.backend_is_kvm = true;
+        guest.config.sequentialize_threads = true;
+        guest.thread.clone_flags = Some(syscalls::CloneFlags::empty());
+        let tool = <Detcore as reverie::Tool>::new(Pid::from_raw(3), &guest.config);
+        let mut child = <Detcore as reverie::Tool>::init_thread_state(
+            &tool,
+            Pid::from_raw(7),
+            Some((Pid::from_raw(3), &guest.thread)),
+        );
+        child.thread_logical_time = crate::types::DetTime::zero();
+        child.thread_logical_time.add_syscall_with_cost(123_000);
+        child
+    }
+
+    #[tokio::test]
+    async fn cpu_publication_waits_before_exact_consumption_without_a_new_turn() {
+        use std::future::Future;
+        use std::task::Context;
+
+        let child = DetPid::from_raw(7);
+        let call = syscalls::Waitid::new().with_options(libc::WEXITED);
+        for result in [Ok(0), Err(Errno::EFAULT)] {
+            for prepublished in [false, true] {
+                let mut guest = CompletionGuest::new(result, false);
+                let mut exited = unpublished_child(&mut guest);
+                // External registration repeats legacy preparation before the
+                // child's start hook. It must retain the birth token.
+                guest.thread.prepare_child_process_cpu_time(child);
+                if prepublished {
+                    assert!(exited.record_exited_child_process_cpu_time(child));
+                }
+                let mut future = Box::pin(complete_proven_child(&mut guest, call, child));
+                if !prepublished {
+                    let wakes = Arc::new(CpuPublicationWake::default());
+                    let waker = std::task::Waker::from(Arc::clone(&wakes));
+                    let mut cx = Context::from_waker(&waker);
+                    assert!(future.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    assert!(exited.record_exited_child_process_cpu_time(child));
+                    assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+                }
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                let std::task::Poll::Ready(actual) = future.as_mut().poll(&mut cx) else {
+                    panic!("published CPU must complete without another scheduling turn");
+                };
+                drop(future);
+                assert_eq!(actual.map_err(|e| e.into_errno().unwrap()), result);
+                assert_eq!(guest.injected.len(), 1);
+                assert_eq!(*guest.consumed.lock().unwrap(), [child]);
+                let cpu = guest.thread.process_cpu_time().children_system;
+                assert_eq!(cpu, LogicalTime::from_nanos(123_000));
+                assert!(!guest.thread.has_exited_child_process_cpu_time(child));
+                assert!(matches!(
+                    complete_proven_child(&mut guest, call, child).await,
+                    Err(Error::Tool(_))
+                ));
+                assert_eq!(guest.injected.len(), 1);
+                assert_eq!(guest.thread.process_cpu_time().children_system, cpu);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_publication_cancellation_and_unknown_owner_cannot_consume() {
+        use std::future::Future;
+        use std::task::Context;
+
+        let parent = DetPid::from_raw(3);
+        let child = DetPid::from_raw(7);
+        let spec = terminal_child_wait_spec(ChildWaitSelector::Exact(child), parent, libc::WEXITED);
+        let call = syscalls::Waitid::new().with_options(libc::WEXITED);
+        let mut guest = CompletionGuest::new(Ok(0), false);
+        // A snapshot by itself is not a birth-owned publication proof.
+        assert!(guest.thread.has_exited_child_process_cpu_time(child));
+        assert!(matches!(
+            complete_proven_child(&mut guest, call, child).await,
+            Err(Error::Tool(_))
+        ));
+        assert!(guest.injected.is_empty());
+        let mut exited = unpublished_child(&mut guest);
+        let mut future = Box::pin(complete_proven_child(&mut guest, call, child));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        // This models callback cancellation, not a guest syscall return. No
+        // backend effect or accounting/selection mutation may precede readiness.
+        drop(future);
+        assert!(guest.injected.is_empty());
+        assert!(guest.consumed.lock().unwrap().is_empty());
+        assert_eq!(
+            guest.thread.process_cpu_time().children_system,
+            LogicalTime::ZERO
+        );
+        assert_eq!(
+            guest
+                .scheduler
+                .lock()
+                .unwrap()
+                .ready_child_wait(parent, spec),
+            Some(child)
+        );
+        assert!(exited.record_exited_child_process_cpu_time(child));
+        assert_eq!(
+            complete_proven_child(&mut guest, call, child)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(guest.injected.len(), 1);
+        assert_eq!(*guest.consumed.lock().unwrap(), [child]);
+    }
+
+    #[tokio::test]
+    async fn nowait_does_not_wait_for_pending_cpu_publication() {
+        let parent = DetPid::from_raw(3);
+        let child = DetPid::from_raw(7);
+        let spec = terminal_child_wait_spec(ChildWaitSelector::Exact(child), parent, libc::WEXITED);
+        for result in [Ok(0), Err(Errno::EFAULT)] {
+            let mut guest = CompletionGuest::new(result, true);
+            let _exited = unpublished_child(&mut guest);
+            let call = syscalls::Waitid::new().with_options(libc::WEXITED | libc::WNOWAIT);
+            assert_eq!(
+                complete_proven_child(&mut guest, call, child)
+                    .await
+                    .map_err(|e| e.into_errno().unwrap()),
+                result
+            );
+            assert_eq!(guest.injected.len(), 1);
+            assert!(guest.consumed.lock().unwrap().is_empty());
+            assert!(!guest.thread.has_exited_child_process_cpu_time(child));
+            assert_eq!(
+                guest.thread.process_cpu_time().children_system,
+                LogicalTime::ZERO
+            );
+            assert_eq!(
+                guest
+                    .scheduler
+                    .lock()
+                    .unwrap()
+                    .ready_child_wait(parent, spec),
+                Some(child)
+            );
         }
     }
 
