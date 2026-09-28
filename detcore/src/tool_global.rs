@@ -1201,7 +1201,7 @@ impl GlobalTool for GlobalState {
                 }
                 R::CancelExec(())
             }
-            GlobalRequest::MarkPastFirstExecve(signal_identity) => {
+            GlobalRequest::MarkPastFirstExecve(detpid, signal_identity) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 if self.cfg.kvm_shared_dequeue_timers {
                     let result = (|| {
@@ -1237,6 +1237,10 @@ impl GlobalTool for GlobalState {
                         return (None, R::ThreadExited);
                     }
                 }
+                // The exec caller still owns its turn: delete process-owned
+                // POSIX deadlines before the replacement image can yield or run.
+                // Failed exec takes CancelExec and never reaches this point.
+                sched.blocked.timed_waiters.remove_posix_timers(detpid);
                 self.past_first_execve.store(true, SeqCst);
                 let overrides = self
                     .post_exec_fd_blocking
@@ -2724,8 +2728,9 @@ pub enum GlobalRequest {
     /// Clear the saved transition after an exec attempt returns with an error.
     CancelExec(DetPid),
 
-    /// Mark the initial image transition complete for backends that begin post-exec.
-    MarkPastFirstExecve(Option<reverie::SignalTaskIdentity>),
+    /// Complete a successful image transition, including the initial image, and
+    /// delete the process's POSIX timer deadlines before the new image runs.
+    MarkPastFirstExecve(DetPid, Option<reverie::SignalTaskIdentity>),
 
     /// The parent is adding a child-thread to the round-robin pool.  Contains the dettid
     /// of the new child and it's starting scheduler priority IF it is available to the caller.
@@ -2991,8 +2996,12 @@ where
         .kvm_shared_dequeue_timers
         .then(|| guest.signal_task_identity())
         .flatten();
-    let (_, response) =
-        send_and_update_time(guest, GlobalRequest::MarkPastFirstExecve(signal_identity)).await;
+    let detpid = guest.thread_state().detpid.expect("detpid unset");
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::MarkPastFirstExecve(detpid, signal_identity),
+    )
+    .await;
     let overrides = match response {
         GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
         _ => unreachable!(),
@@ -5760,7 +5769,7 @@ mod tests {
                 (
                     worker_clock,
                     old_mm.for_exec(detpid),
-                    GlobalRequest::MarkPastFirstExecve(None),
+                    GlobalRequest::MarkPastFirstExecve(detpid, None),
                 ),
             )
             .await;
@@ -5769,6 +5778,86 @@ mod tests {
             GlobalResponse::MarkPastFirstExecve(fd_blocking)
         );
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_successful_exec_cancels_posix_deadlines() {
+        let (config, state, leader, detpid) = cancellation_test_state();
+        install_test_registration(&state, leader, Ivar::new());
+        let clock = DetTime::new(&config);
+        let mm = MmId::initial(detpid);
+        let deadline = LogicalTime::from_nanos(1_000_000);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.register_alarm(
+                detpid,
+                leader,
+                LogicalTime::ZERO,
+                deadline,
+                LogicalTime::ZERO,
+                Signal::SIGALRM,
+            );
+            sched.register_posix_timer(
+                detpid,
+                leader,
+                0,
+                Some(deadline),
+                deadline,
+                Signal::SIGUSR2,
+            );
+        }
+        let before: Vec<_> = state
+            .sched
+            .lock()
+            .unwrap()
+            .blocked
+            .timed_waiters
+            .iter()
+            .collect();
+        for request in [
+            GlobalRequest::PrepareExec(detpid, mm, Default::default()),
+            GlobalRequest::CancelExec(detpid),
+            GlobalRequest::PrepareExec(detpid, mm, Default::default()),
+        ] {
+            state
+                .receive_rpc(
+                    reverie::Tid::from_raw(leader.as_raw()),
+                    (clock.clone(), mm, request),
+                )
+                .await;
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .blocked
+                    .timed_waiters
+                    .iter()
+                    .collect::<Vec<_>>(),
+                before
+            );
+        }
+
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(leader.as_raw()),
+                (
+                    clock,
+                    mm.for_exec(detpid),
+                    GlobalRequest::MarkPastFirstExecve(detpid, None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            response.1,
+            GlobalResponse::MarkPastFirstExecve(Default::default())
+        );
+        let sched = state.sched.lock().unwrap();
+        assert_eq!(
+            sched.blocked.timed_waiters.alarm_state(detpid),
+            Some((deadline, LogicalTime::ZERO))
+        );
+        assert_eq!(sched.blocked.timed_waiters.iter().count(), 1);
     }
 
     #[tokio::test]
