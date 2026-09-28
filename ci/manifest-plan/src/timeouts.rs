@@ -93,11 +93,15 @@ pub const LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT: usize =
 /// independently audited. The author base's one-commit sysinfo uptime change is
 /// disclosed in the dated qualification report with its current-source screen.
 /// The calibration was measured at 19553a64 and committed on the author base
-/// b63af4583a. The branch is now based on main e63236584625, which differs
-/// from the author base by the KVM process-retirement fence (detcore scheduler
-/// and tool_global) and the Reverie pin moves b0ede531 -> a1d07619 -> 6297f715
-/// (reverie-kvm and one default no-op GlobalTool callback); that delta is
-/// disclosed in the report and was not measured with LiteInst.
+/// b63af4583a. The branch is now based on main b280bc4807, 91 commits later.
+/// That delta includes a rewritten, multi-threaded
+/// tests/c/clock_exec_continuity.c guest for the selected
+/// system-utils/clock-exec-continuity cell, and Detcore sysinfo, /proc/stat
+/// btime, virtual-time, POSIX-timer-on-exec and read-only /proc changes. The
+/// report lists the delta and the LiteInst screen run at b280bc4807 (every
+/// selected cell once, six of them ten more times, all clean). These
+/// calibration rows were not re-derived from that screen; the
+/// clock-exec-continuity row describes the old single-threaded program.
 pub const LITEINST_2026_09_27_EVIDENCE_SHA: &str = "19553a64308ca123bbde7cc3d7720e0aa72e795a";
 pub const LITEINST_2026_09_27_EVIDENCE_DETCORE_TREE: &str =
     "5577d908861170c5b5e89a47ce4460a80008afef";
