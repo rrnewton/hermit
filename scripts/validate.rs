@@ -13759,7 +13759,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "34");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "36");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -13785,7 +13785,7 @@ mod nextest_timeout_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            33,
+            35,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -14752,11 +14752,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 33 run_kvm_ declarations and
+        // The shipped KVM selection contains 35 run_kvm_ declarations and
         // the unchanged initialized-VM setup control. The eight-mode timer,
         // two-role retirement and six-mode reparenting tests each count as
         // one selected test.
-        ("privileged-only-test.cli_kvm", 34usize),
+        ("privileged-only-test.cli_kvm", 36usize),
     ] {
         let step = privileged
             .steps
