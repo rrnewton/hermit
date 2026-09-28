@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/exec_posix_timers.rs"]
+mod exec_posix_timers;
+
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
@@ -7581,6 +7584,16 @@ fn run_kvm_exit_group_cancels_rdtsc_posthook_wait() {
 #[test]
 fn run_kvm_itimer_real_interrupts_sleep_in_all_eight_modes() {
     kvm_itimer::run();
+}
+
+#[test]
+fn run_ptrace_exec_deletes_posix_timers_and_preserves_itimer() {
+    exec_posix_timers::run("ptrace");
+}
+
+#[test]
+fn run_kvm_exec_deletes_posix_timers_and_preserves_itimer() {
+    exec_posix_timers::run("kvm");
 }
 
 #[test]
