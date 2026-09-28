@@ -13522,3 +13522,43 @@ fn run_kvm_waitid_terminal_copyout_preserves_arenas_and_child_lifecycle() {
 fn run_kvm_waitid_error_copyout_preserves_arenas_and_interrupt_precedence() {
     kvm_waitid_copyout::run("errors");
 }
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_pid_success() {
+    kvm_waitid_copyout::run_sibling("leader-child", "pid", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_pid_efault() {
+    kvm_waitid_copyout::run_sibling("leader-child", "pid", "efault");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_all_success() {
+    kvm_waitid_copyout::run_sibling("leader-child", "all", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_all_efault() {
+    kvm_waitid_copyout::run_sibling("leader-child", "all", "efault");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_pid_success() {
+    kvm_waitid_copyout::run_sibling("worker-child", "pid", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_pid_efault() {
+    kvm_waitid_copyout::run_sibling("worker-child", "pid", "efault");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_all_success() {
+    kvm_waitid_copyout::run_sibling("worker-child", "all", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_all_efault() {
+    kvm_waitid_copyout::run_sibling("worker-child", "all", "efault");
+}
