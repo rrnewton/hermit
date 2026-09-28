@@ -500,6 +500,7 @@ mod tests {
         scheduler: Mutex<Scheduler>,
         result: Result<i64, Errno>,
         injected: Vec<syscalls::Waitid>,
+        injected_wait4: Vec<syscalls::Wait4>,
         consumed: Mutex<Vec<DetPid>>,
         expect_rollup: bool,
     }
@@ -590,10 +591,11 @@ mod tests {
         }
         async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
             let (number, args) = call.into_parts();
-            let Syscall::Waitid(call) = Syscall::from_raw(number, args) else {
-                panic!("expected final waitid only");
-            };
-            self.injected.push(call);
+            match Syscall::from_raw(number, args) {
+                Syscall::Waitid(call) => self.injected.push(call),
+                Syscall::Wait4(call) => self.injected_wait4.push(call),
+                _ => panic!("expected final child wait only"),
+            }
             self.result
         }
         async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
@@ -634,6 +636,7 @@ mod tests {
                 scheduler: Mutex::new(scheduler),
                 result,
                 injected: Vec::new(),
+                injected_wait4: Vec::new(),
                 consumed: Mutex::new(Vec::new()),
                 expect_rollup: !nowait,
             }
@@ -663,6 +666,190 @@ mod tests {
         child.thread_logical_time = crate::types::DetTime::zero();
         child.thread_logical_time.add_syscall_with_cost(123_000);
         child
+    }
+
+    #[tokio::test]
+    async fn wait4_completion_publishes_then_consumes_exact_child_once() {
+        use std::future::Future;
+        use std::task::Context;
+
+        use super::super::complete_selected_kvm_wait4;
+
+        let child = DetPid::from_raw(7);
+        for options in [
+            0,
+            libc::WNOHANG,
+            libc::WUNTRACED,
+            libc::WNOHANG | libc::WUNTRACED,
+        ] {
+            for result in [Ok(7), Err(Errno::EFAULT)] {
+                for prepublished in [false, true] {
+                    let mut guest = CompletionGuest::new(result, false);
+                    let mut exited = unpublished_child(&mut guest);
+                    let call = syscalls::Wait4::new()
+                        .with_pid(-1)
+                        .with_options(syscalls::WaitPidFlag::from_bits_retain(options));
+                    if prepublished {
+                        assert!(exited.record_exited_child_process_cpu_time(child));
+                    }
+                    let mut future = Box::pin(complete_selected_kvm_wait4(&mut guest, call, child));
+                    if !prepublished {
+                        let wakes = Arc::new(CpuPublicationWake::default());
+                        let waker = std::task::Waker::from(Arc::clone(&wakes));
+                        let mut cx = Context::from_waker(&waker);
+                        assert!(future.as_mut().poll(&mut cx).is_pending());
+                        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+                        assert!(exited.record_exited_child_process_cpu_time(child));
+                        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    }
+                    let actual = future.await;
+                    assert_eq!(actual.map_err(|e| e.into_errno().unwrap()), result);
+                    assert!(guest.injected.is_empty());
+                    assert_eq!(guest.injected_wait4.len(), 1);
+                    assert_eq!(guest.injected_wait4[0].pid(), 7);
+                    assert_eq!(guest.injected_wait4[0].options().bits(), options);
+                    assert_eq!(*guest.consumed.lock().unwrap(), [child]);
+                    assert_eq!(
+                        guest.thread.process_cpu_time().children_system,
+                        LogicalTime::from_nanos(123_000)
+                    );
+                    assert!(!guest.thread.has_exited_child_process_cpu_time(child));
+                    assert!(matches!(
+                        complete_selected_kvm_wait4(&mut guest, call, child).await,
+                        Err(Error::Tool(_))
+                    ));
+                    assert_eq!(guest.injected_wait4.len(), 1);
+                    assert_eq!(
+                        guest.thread.process_cpu_time().children_system,
+                        LogicalTime::from_nanos(123_000)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wait4_completion_refuses_impossible_selected_results_without_consumption() {
+        use super::super::complete_selected_kvm_wait4;
+        let parent = DetPid::from_raw(3);
+        let child = DetPid::from_raw(7);
+        let spec = terminal_child_wait_spec(ChildWaitSelector::Exact(child), parent, libc::WEXITED);
+        let call = syscalls::Wait4::new().with_pid(-1);
+        for result in [Ok(0), Err(Errno::EINVAL), Err(Errno::ECHILD), Ok(9)] {
+            let mut guest = CompletionGuest::new(result, false);
+            let mut exited = unpublished_child(&mut guest);
+            assert!(exited.record_exited_child_process_cpu_time(child));
+            let actual = complete_selected_kvm_wait4(&mut guest, call, child).await;
+            assert!(matches!(actual, Err(Error::Tool(_))));
+            assert_eq!(guest.injected_wait4.len(), 1);
+            assert_eq!(guest.injected_wait4[0].pid(), 7);
+            assert!(guest.consumed.lock().unwrap().is_empty());
+            assert!(guest.thread.has_exited_child_process_cpu_time(child));
+            assert_eq!(
+                guest.thread.process_cpu_time().children_system,
+                LogicalTime::ZERO
+            );
+            assert_eq!(
+                guest
+                    .scheduler
+                    .lock()
+                    .unwrap()
+                    .ready_child_wait(parent, spec),
+                Some(child)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wait4_completion_unknown_publication_and_cancellation_cannot_inject() {
+        use std::future::Future;
+        use std::task::Context;
+
+        use super::super::complete_selected_kvm_wait4;
+        let parent = DetPid::from_raw(3);
+        let child = DetPid::from_raw(7);
+        let spec = terminal_child_wait_spec(ChildWaitSelector::Exact(child), parent, libc::WEXITED);
+        let call = syscalls::Wait4::new().with_pid(7);
+        let mut guest = CompletionGuest::new(Ok(7), false);
+        assert!(matches!(
+            complete_selected_kvm_wait4(&mut guest, call, child).await,
+            Err(Error::Tool(_))
+        ));
+        assert!(guest.injected_wait4.is_empty());
+        let mut exited = unpublished_child(&mut guest);
+        let mut future = Box::pin(complete_selected_kvm_wait4(&mut guest, call, child));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        drop(future);
+        assert!(guest.injected_wait4.is_empty());
+        assert!(guest.consumed.lock().unwrap().is_empty());
+        assert_eq!(
+            guest.thread.process_cpu_time().children_system,
+            LogicalTime::ZERO
+        );
+        assert_eq!(
+            guest
+                .scheduler
+                .lock()
+                .unwrap()
+                .ready_child_wait(parent, spec),
+            Some(child)
+        );
+        assert!(exited.record_exited_child_process_cpu_time(child));
+        assert_eq!(
+            complete_selected_kvm_wait4(&mut guest, call, child)
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(guest.injected_wait4.len(), 1);
+    }
+
+    #[test]
+    fn wait4_terminal_selection_retains_raw_option_validation() {
+        use syscalls::WaitPidFlag;
+
+        use super::super::wait4_uses_terminal_selector;
+        for bits in [
+            0,
+            libc::WNOHANG,
+            libc::WUNTRACED,
+            libc::WNOHANG | libc::WUNTRACED,
+        ] {
+            assert!(wait4_uses_terminal_selector(
+                WaitPidFlag::from_bits_retain(bits),
+                true
+            ));
+        }
+        for bits in [
+            libc::WCONTINUED,
+            libc::__WCLONE,
+            libc::__WALL,
+            libc::__WNOTHREAD,
+            0x100,
+            -1,
+        ] {
+            let options = WaitPidFlag::from_bits_retain(bits);
+            assert_eq!(options.bits(), bits);
+            assert!(!wait4_uses_terminal_selector(options, true));
+        }
+        for bits in [0, libc::WNOHANG, libc::__WNOTHREAD, 0x100] {
+            assert!(wait4_uses_terminal_selector(
+                WaitPidFlag::from_bits_retain(bits),
+                false
+            ));
+        }
+        for bits in [
+            libc::WUNTRACED,
+            libc::WCONTINUED,
+            libc::__WCLONE,
+            libc::__WALL,
+        ] {
+            assert!(!wait4_uses_terminal_selector(
+                WaitPidFlag::from_bits_retain(bits),
+                false
+            ));
+        }
     }
 
     #[tokio::test]

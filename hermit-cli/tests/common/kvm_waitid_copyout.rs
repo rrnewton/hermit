@@ -728,3 +728,273 @@ fn run_fixture(
         "complete test stays inside its shared bound"
     );
 }
+
+// Keep the mixed wait4/waitid contract under the same complete INFO and I/O
+// verification as the waitid fixtures above. Raw wait4 rusage is not compared
+// with native CPU time: children accounting is observed through getrusage.
+pub(super) fn run_wait4_fault() {
+    run_fixture(
+        "wait4-consuming-fault",
+        "kvm_wait4_fault.c",
+        &[],
+        assert_wait4_fault_observations,
+        |_, _| {},
+    );
+}
+
+fn assert_wait4_fault_observations(stdout: &[u8]) {
+    let rows: Vec<serde_json::Value> = std::str::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("complete mixed-wait observation"))
+        .collect();
+    assert_eq!(rows.len(), 8 * 19 + 1);
+    let names = [
+        "target-peek",
+        "before-fault",
+        "consuming-fault",
+        "after-fault",
+        "target-ECHILD",
+        "target-wait4-ECHILD",
+        "live-sibling-P_ALL",
+        "live-sibling-wait4-P_ALL",
+        "after-empty-waits",
+        "sibling-peek",
+        "sibling-peek-again",
+        "after-sibling-peeks",
+        "sibling-consume",
+        "after-sibling-consume",
+        "sibling-ECHILD",
+        "all-ECHILD",
+        "all-wait4-ECHILD",
+        "after-final-ECHILD",
+    ];
+    let encode = |bytes: &[u8]| {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        bytes
+            .iter()
+            .flat_map(|byte| {
+                [
+                    DIGITS[(byte >> 4) as usize] as char,
+                    DIGITS[(byte & 15) as usize] as char,
+                ]
+            })
+            .collect::<String>()
+    };
+    let mut children = BTreeSet::new();
+    for case in 0..8 {
+        let observations = &rows[case * 19..(case + 1) * 19];
+        let summary = &observations[18];
+        let fault = case / 4 + 1;
+        let nonblock = (case / 2) % 2;
+        let untraced = case % 2;
+        assert_eq!(summary["type"], "case");
+        assert_eq!(summary["case"], case);
+        assert_eq!(summary["fault"], fault);
+        assert_eq!(summary["nonblock"], nonblock);
+        assert_eq!(summary["untraced"], untraced);
+        assert_eq!(summary["passed"], true);
+        let child = summary["child"].as_i64().unwrap();
+        let sibling = summary["sibling"].as_i64().unwrap();
+        assert!(child > 0 && sibling > 0 && child != sibling);
+        assert!(children.insert(child) && children.insert(sibling));
+        let mut cpus = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let row = &observations[index];
+            assert_eq!(row["case"], case);
+            assert_eq!(row["name"], *name);
+            match index {
+                1 | 3 | 8 | 11 | 13 | 17 => {
+                    assert_eq!(row["type"], "cpu");
+                    let cpu = (
+                        row["user_us"].as_i64().unwrap(),
+                        row["system_us"].as_i64().unwrap(),
+                    );
+                    assert!(cpu.0 >= 0 && cpu.1 >= 0);
+                    cpus.push(cpu);
+                }
+                2 | 5 | 7 | 16 => {
+                    assert_eq!(row["type"], "wait4");
+                    let consumes = index == 2;
+                    let selector = if index == 5 || (consumes && untraced == 0) {
+                        child
+                    } else {
+                        -1
+                    };
+                    assert_eq!(row["selector"], selector);
+                    assert_eq!(
+                        row["options"],
+                        if consumes {
+                            nonblock | (untraced << 1)
+                        } else {
+                            1
+                        }
+                    );
+                    assert_eq!(row["fault"], if consumes { fault } else { 0 });
+                    assert_eq!(row["status"], if consumes { 31 + case } else { 0 });
+                    assert_eq!(row["rc"], if index == 7 { 0 } else { -1 });
+                    assert_eq!(
+                        row["errno"],
+                        if consumes {
+                            libc::EFAULT
+                        } else if index == 7 {
+                            0
+                        } else {
+                            libc::ECHILD
+                        }
+                    );
+                    let mut status = [0xa5; 4096];
+                    if consumes && fault == 2 {
+                        status[64..68].copy_from_slice(&(((31 + case) as i32) << 8).to_le_bytes());
+                    }
+                    assert_eq!(row["status_arena"], encode(&status));
+                    assert_eq!(row["usage_arena"], "a5".repeat(4096));
+                }
+                _ => {
+                    assert_eq!(row["type"], "waitid");
+                    let event = matches!(index, 0 | 9 | 10 | 12);
+                    let all = matches!(index, 6 | 15);
+                    let id = if index == 15 {
+                        0
+                    } else if matches!(index, 0 | 4) {
+                        child
+                    } else {
+                        sibling
+                    };
+                    let status = if !event {
+                        0
+                    } else if index == 0 {
+                        31 + case
+                    } else {
+                        73 + case
+                    };
+                    let options = if matches!(index, 0 | 9 | 10) {
+                        libc::WEXITED | libc::WNOWAIT
+                    } else if index == 12 {
+                        libc::WEXITED
+                    } else {
+                        libc::WEXITED | libc::WNOHANG
+                    };
+                    let error = if matches!(index, 4 | 14 | 15) {
+                        libc::ECHILD
+                    } else {
+                        0
+                    };
+                    assert_eq!(row["child"], id);
+                    assert_eq!(row["which"], if all { libc::P_ALL } else { libc::P_PID });
+                    assert_eq!(row["options"], options);
+                    assert_eq!(row["status"], status);
+                    assert_eq!(row["event"], i32::from(event));
+                    assert_eq!(row["rc"], if error == 0 { 0 } else { -1 });
+                    assert_eq!(row["errno"], error);
+                    let uid = u32::try_from(row["uid"].as_u64().unwrap()).unwrap();
+                    let values = if event {
+                        [
+                            libc::SIGCHLD as u32,
+                            0,
+                            libc::CLD_EXITED as u32,
+                            id as u32,
+                            uid,
+                            status as u32,
+                        ]
+                    } else {
+                        [0; 6]
+                    };
+                    let mut info = [0xa5; 160];
+                    for (offset, value) in [0, 4, 8, 16, 20, 24].into_iter().zip(values) {
+                        info[16 + offset..20 + offset].copy_from_slice(&value.to_le_bytes());
+                    }
+                    assert_eq!(row["arena"], encode(&info));
+                }
+            }
+        }
+        assert_eq!(cpus.len(), 6);
+        let adds = |before: (i64, i64), after: (i64, i64)| {
+            assert!(after.0 >= before.0 && after.1 >= before.1 && after != before);
+        };
+        adds(cpus[0], cpus[1]);
+        assert_eq!(cpus[1], cpus[2]);
+        assert_eq!(cpus[1], cpus[3]);
+        adds(cpus[3], cpus[4]);
+        assert_eq!(cpus[4], cpus[5]);
+    }
+    assert_eq!(children.len(), 16);
+    let summary = rows.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["cases"], 8);
+    assert_eq!(summary["children"], 16);
+    assert_eq!(summary["calls"], 96);
+    assert_eq!(summary["passed"], true);
+    assert!(summary["assertions"].as_u64().unwrap() > 400);
+}
+
+// INT_MIN is a raw pid_t argument error, after supported-option validation.
+// Keep this separate from the eight consuming-fault/CPU lifecycle cases.
+pub(super) fn run_wait4_int_min() {
+    run_fixture(
+        "wait4-int-min",
+        "kvm_wait4_int_min.c",
+        &[],
+        assert_wait4_int_min_observations,
+        |_, _| {},
+    );
+}
+
+fn assert_wait4_int_min_observations(stdout: &[u8]) {
+    let text = std::str::from_utf8(stdout).unwrap();
+    assert!(text.ends_with('\n'));
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("complete raw wait4 observation"))
+        .collect();
+    let pids = [
+        0x0000_0000_8000_0000_u64,
+        0xffff_ffff_8000_0000,
+        0x1234_5678_8000_0000,
+        0x1234_5678_8000_0001,
+    ];
+    let options = [
+        libc::WUNTRACED as u64,
+        (libc::WNOHANG | libc::WUNTRACED) as u64,
+        0_u64,
+        libc::WNOHANG as u64,
+        0x1234_5678_0000_0002,
+        0xffff_ffff_0000_0003,
+        0x100,
+        0xfedc_ba98_0000_0102,
+    ];
+    assert_eq!(rows.len(), 65);
+    let expected_arena = "a5".repeat(4096);
+    let mut index = 0;
+    for pid in pids {
+        for option in options {
+            for protected in 0..2_u64 {
+                let row = &rows[index];
+                assert_eq!(row["type"], "min-pid");
+                assert_eq!(row["case"].as_u64(), Some(index as u64));
+                assert_eq!(row["raw_pid"].as_u64(), Some(pid));
+                assert_eq!(row["raw_options"].as_u64(), Some(option));
+                assert_eq!(row["protected"].as_u64(), Some(protected));
+                let expected = if option as u32 & !3 != 0 {
+                    libc::EINVAL
+                } else if pid as u32 == 0x8000_0000 {
+                    libc::ESRCH
+                } else {
+                    libc::ECHILD
+                };
+                assert_eq!(row["rc"].as_i64(), Some(-1));
+                assert_eq!(row["errno"].as_i64(), Some(i64::from(expected)));
+                assert_eq!(row["status_arena"].as_str(), Some(expected_arena.as_str()));
+                assert_eq!(row["usage_arena"].as_str(), Some(expected_arena.as_str()));
+                index += 1;
+            }
+        }
+    }
+    assert_eq!(index, 64);
+    assert_eq!(
+        rows[64],
+        serde_json::json!({
+            "type": "summary", "cases": 64, "calls": 64, "children": 0, "passed": true
+        })
+    );
+}
