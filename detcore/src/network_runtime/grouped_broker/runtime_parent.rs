@@ -324,7 +324,7 @@ impl GroupedParentOwner {
         .map(Into::into)
         .collect();
         let spec = CapabilityUnitLaunch {
-            kind: CapabilityServiceKind::Accepted,
+            kind: CapabilityServiceKind::AcceptedKeeper,
             unit: self.keeper_unit.as_ref().unwrap(),
             executable: &self.helper,
             arguments: &args,

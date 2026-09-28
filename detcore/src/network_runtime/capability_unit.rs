@@ -46,6 +46,10 @@ pub const OTHER_CAPABILITY_UNIT_MEMORY_MAX: u64 = 256 * 1024 * 1024;
 pub enum CapabilityServiceKind {
     /// Readonly accepted TCP observer, started after clone before guest start.
     Accepted,
+    /// Metadata/custody keeper for the retained GroupedV1 compatibility route.
+    /// Unlike the BPF-loading Accepted creator, this process is admitted by the
+    /// original 256-MiB keeper policy and never receives verifier headroom.
+    AcceptedKeeper,
     /// Unix policy keeper, started and armed before the container clone.
     UnixGuard,
     /// Short-lived metadata-only executable querying original BPF object IDs.
@@ -91,7 +95,9 @@ impl CapabilityUnitLaunch<'_> {
     /// the same policy used by `command`; it does not launch or transfer owners.
     pub fn arguments(&self) -> io::Result<Vec<OsString>> {
         let prefix = match self.kind {
-            CapabilityServiceKind::Accepted => "hermit-accepted-",
+            CapabilityServiceKind::Accepted | CapabilityServiceKind::AcceptedKeeper => {
+                "hermit-accepted-"
+            }
             CapabilityServiceKind::UnixGuard => "hermit-unix-",
             CapabilityServiceKind::UnixReadback => "hermit-unix-readback-",
             CapabilityServiceKind::AcceptedReadback => "hermit-accepted-readback-",
@@ -115,6 +121,7 @@ impl CapabilityUnitLaunch<'_> {
         }
         match self.kind {
             CapabilityServiceKind::Accepted
+            | CapabilityServiceKind::AcceptedKeeper
             | CapabilityServiceKind::UnixReadback
             | CapabilityServiceKind::AcceptedReadback
                 if !self.writable_directories.is_empty() =>
@@ -161,7 +168,9 @@ impl CapabilityUnitLaunch<'_> {
             _ => OTHER_CAPABILITY_UNIT_MEMORY_MAX,
         };
         let remain_after_exit = match self.kind {
-            CapabilityServiceKind::Accepted | CapabilityServiceKind::AcceptedReadback => "no",
+            CapabilityServiceKind::Accepted
+            | CapabilityServiceKind::AcceptedKeeper
+            | CapabilityServiceKind::AcceptedReadback => "no",
             CapabilityServiceKind::UnixGuard | CapabilityServiceKind::UnixReadback => "yes",
         };
         for property in [
@@ -181,7 +190,9 @@ impl CapabilityUnitLaunch<'_> {
             CapabilityServiceKind::UnixReadback | CapabilityServiceKind::AcceptedReadback => {
                 "CAP_SYS_ADMIN"
             }
-            CapabilityServiceKind::Accepted | CapabilityServiceKind::UnixGuard => {
+            CapabilityServiceKind::Accepted
+            | CapabilityServiceKind::AcceptedKeeper
+            | CapabilityServiceKind::UnixGuard => {
                 "CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_RESOURCE CAP_SYS_PTRACE"
             }
         };
@@ -331,6 +342,25 @@ mod tests {
                 args[0].clone()
             ]
         );
+    }
+    #[test]
+    fn grouped_keeper_uses_the_admitted_256_mib_policy_not_loader_headroom() {
+        let spec = CapabilityUnitLaunch {
+            kind: CapabilityServiceKind::AcceptedKeeper,
+            unit: "hermit-accepted-01000000000000000000000000000000.service",
+            executable: Path::new("/product/hermit"),
+            arguments: &[OsString::from("--grouped-runtime-keeper-private-stdin-v1")],
+            lifetime: CapabilityServiceLifetime::ControllerOwned,
+            writable_directories: &[],
+        };
+        let argv = spec.arguments().unwrap();
+        assert!(argv.contains(&OsString::from("--property=MemoryMax=268435456")));
+        assert!(!argv.contains(&OsString::from("--property=MemoryMax=536870912")));
+        assert!(!argv.iter().any(|argument| {
+            argument
+                .to_string_lossy()
+                .starts_with("--property=RuntimeMaxSec=")
+        }));
     }
     #[test]
     fn accepted_readback_exits_with_its_helper_but_unix_lifetimes_stay_retained() {
