@@ -1603,10 +1603,83 @@ pub(crate) struct ProcessCpuSnapshot {
     pub children_system: LogicalTime,
 }
 
+/// Runtime-only readiness for one child birth. A retired or replaced token can
+/// never be made ready again; cancelled waiters leave only weak references.
+#[derive(Debug)]
+pub(crate) struct ChildCpuPublication(Mutex<ChildCpuPublicationState>);
+
+#[derive(Debug)]
+enum ChildCpuPublicationState {
+    Pending(Vec<std::sync::Weak<futures::task::AtomicWaker>>),
+    Published,
+    Invalidated,
+}
+
+impl ChildCpuPublication {
+    fn pending() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(ChildCpuPublicationState::Pending(
+            Vec::new(),
+        ))))
+    }
+
+    fn finish(&self, published: bool) {
+        let waiters = {
+            let mut state = self.0.lock().expect("child CPU publication mutex poisoned");
+            if matches!(*state, ChildCpuPublicationState::Invalidated)
+                || published && matches!(*state, ChildCpuPublicationState::Published)
+            {
+                return;
+            }
+            let next = if published {
+                ChildCpuPublicationState::Published
+            } else {
+                ChildCpuPublicationState::Invalidated
+            };
+            match std::mem::replace(&mut *state, next) {
+                ChildCpuPublicationState::Pending(waiters) => waiters,
+                _ => Vec::new(),
+            }
+        };
+        // Do not call an arbitrary task waker under either accounting lock.
+        for waiter in waiters.into_iter().filter_map(|waiter| waiter.upgrade()) {
+            waiter.wake();
+        }
+    }
+
+    async fn wait(&self) -> bool {
+        let waiter = Arc::new(futures::task::AtomicWaker::new());
+        {
+            let mut state = self.0.lock().expect("child CPU publication mutex poisoned");
+            match &mut *state {
+                ChildCpuPublicationState::Pending(waiters) => {
+                    waiters.retain(|waiter| waiter.strong_count() != 0);
+                    waiters.push(Arc::downgrade(&waiter));
+                }
+                ChildCpuPublicationState::Published => return true,
+                ChildCpuPublicationState::Invalidated => return false,
+            }
+        }
+        futures::future::poll_fn(|cx| {
+            waiter.register(cx.waker());
+            let state = self.0.lock().expect("child CPU publication mutex poisoned");
+            match *state {
+                ChildCpuPublicationState::Pending(_) => std::task::Poll::Pending,
+                ChildCpuPublicationState::Published => std::task::Poll::Ready(true),
+                ChildCpuPublicationState::Invalidated => std::task::Poll::Ready(false),
+            }
+        })
+        .await
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct ProcessCpuTime {
     snapshot: ProcessCpuSnapshot,
     exited_children: BTreeMap<DetPid, ProcessCpuSnapshot>,
+    // Runtime ownership, not record-format state. ThreadState clones retain the
+    // same parent accounting Arc; notification tokens also retain their identity.
+    #[serde(skip)]
+    child_cpu_publications: BTreeMap<DetPid, Arc<ChildCpuPublication>>,
 }
 
 impl ProcessCpuTime {
@@ -1814,6 +1887,10 @@ pub struct ThreadState<T> {
 
     /// Parent process accounting notified when this process leader exits.
     pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
+
+    /// Actual sequential KVM child's birth-owned publication capability.
+    #[serde(skip)]
+    pub(crate) parent_cpu_publication: Option<Arc<ChildCpuPublication>>,
 
     /// Per-thread checkpoints used to add only new work to the process totals.
     pub(crate) last_accounted_user_time: LogicalTime,
@@ -2178,20 +2255,82 @@ impl<T> ThreadState<T> {
         )
     }
 
-    pub(crate) fn record_exited_child_process_cpu_time(&mut self, pid: DetPid) {
+    pub(crate) fn record_exited_child_process_cpu_time(&mut self, pid: DetPid) -> bool {
         self.account_process_cpu_time();
         let Some(parent) = &self.parent_process_cpu_time else {
-            return;
+            return true;
         };
         let child = self
             .process_cpu_time
             .lock()
             .expect("process CPU time mutex poisoned")
             .snapshot;
-        parent
+        {
+            let mut parent = parent
+                .lock()
+                .expect("parent process CPU time mutex poisoned");
+            if let Some(publication) = &self.parent_cpu_publication
+                && !parent
+                    .child_cpu_publications
+                    .get(&pid)
+                    .is_some_and(|current| Arc::ptr_eq(current, publication))
+            {
+                return false;
+            }
+            parent.record_exited_child(pid, child);
+        }
+        if let Some(publication) = &self.parent_cpu_publication {
+            publication.finish(true);
+        }
+        true
+    }
+
+    /// Called once at the process child's ThreadState birth. The later external
+    /// registration's legacy prepare_child call must not replace this token.
+    pub(crate) fn prepare_child_cpu_publication(&self, pid: DetPid) -> Arc<ChildCpuPublication> {
+        let publication = ChildCpuPublication::pending();
+        let previous = {
+            let mut parent = self
+                .process_cpu_time
+                .lock()
+                .expect("process CPU time mutex poisoned");
+            parent.prepare_child(pid);
+            parent
+                .child_cpu_publications
+                .insert(pid, Arc::clone(&publication))
+        };
+        if let Some(previous) = previous {
+            previous.finish(false);
+        }
+        publication
+    }
+
+    pub(crate) async fn wait_for_child_cpu_publication(&self, pid: DetPid) -> bool {
+        let publication = {
+            let parent = self
+                .process_cpu_time
+                .lock()
+                .expect("process CPU time mutex poisoned");
+            let Some(publication) = parent.child_cpu_publications.get(&pid) else {
+                return false;
+            };
+            Arc::clone(publication)
+        };
+        // Subscription and publication share the token mutex. Registration
+        // followed by a state recheck cannot lose a publication wake. Neither
+        // this mutex nor the accounting mutex survives a Pending return.
+        if !publication.wait().await {
+            return false;
+        }
+        let parent = self
+            .process_cpu_time
             .lock()
-            .expect("parent process CPU time mutex poisoned")
-            .record_exited_child(pid, child);
+            .expect("process CPU time mutex poisoned");
+        parent
+            .child_cpu_publications
+            .get(&pid)
+            .is_some_and(|current| Arc::ptr_eq(current, &publication))
+            && parent.exited_children.contains_key(&pid)
     }
 
     pub(crate) fn has_exited_child_process_cpu_time(&self, pid: DetPid) -> bool {
@@ -2204,17 +2343,37 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn reap_child_process_cpu_time(&mut self, pid: DetPid) {
         self.account_process_cpu_time();
-        self.process_cpu_time
-            .lock()
-            .expect("process CPU time mutex poisoned")
-            .reap_child(pid);
+        let publication = {
+            let mut parent = self
+                .process_cpu_time
+                .lock()
+                .expect("process CPU time mutex poisoned");
+            // Preserve legacy missing-snapshot behavior. The KVM waitid path
+            // requires the snapshot before its irreversible completion.
+            let had_snapshot = parent.exited_children.contains_key(&pid);
+            parent.reap_child(pid);
+            if had_snapshot {
+                parent.child_cpu_publications.remove(&pid)
+            } else {
+                None
+            }
+        };
+        if let Some(publication) = publication {
+            publication.finish(false);
+        }
     }
 
     pub(crate) fn prepare_child_process_cpu_time(&self, pid: DetPid) {
-        self.process_cpu_time
+        let mut parent = self
+            .process_cpu_time
             .lock()
-            .expect("process CPU time mutex poisoned")
-            .prepare_child(pid);
+            .expect("process CPU time mutex poisoned");
+        // External registration may repeat preparation after ThreadState birth.
+        // Only that birth replaces a KVM token; registration must preserve both
+        // a pending token and any already-published snapshot for this birth.
+        if !parent.child_cpu_publications.contains_key(&pid) {
+            parent.prepare_child(pid);
+        }
     }
 
     /// Create a fresh new thread state from nothing.  In practice this is only used for the thread
@@ -2262,6 +2421,7 @@ impl<T> ThreadState<T> {
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
             parent_process_cpu_time: None,
+            parent_cpu_publication: None,
             last_accounted_user_time,
             last_accounted_system_time,
             thread_cpu_start_user_time: last_accounted_user_time,
@@ -3503,6 +3663,63 @@ mod timeslice_tests {
         parent.reap_child(pid);
         assert_eq!(parent.snapshot.children_user, LogicalTime::from_nanos(16));
         assert_eq!(parent.snapshot.children_system, LogicalTime::from_nanos(30));
+    }
+
+    #[tokio::test]
+    async fn child_cpu_publication_replacement_rejects_stale_owner_and_snapshot() {
+        use std::future::Future;
+        use std::task::Context;
+
+        let cfg = Config::default();
+        let child = DetPid::from_raw(7);
+        let mut parent = ThreadState::new(DetPid::from_raw(3), &cfg, ());
+        assert!(!parent.wait_for_child_cpu_publication(child).await);
+        let before = serde_json::to_value(&*parent.process_cpu_time.lock().unwrap()).unwrap();
+        let first = parent.prepare_child_cpu_publication(child);
+        let mut old_child = ThreadState::new(child, &cfg, ());
+        old_child.parent_process_cpu_time = Some(Arc::clone(&parent.process_cpu_time));
+        old_child.parent_cpu_publication = Some(Arc::clone(&first));
+        let mut old_wait = Box::pin(parent.wait_for_child_cpu_publication(child));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(old_wait.as_mut().poll(&mut cx).is_pending());
+        let second = parent.prepare_child_cpu_publication(child);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!old_wait.await);
+        assert!(!old_child.record_exited_child_process_cpu_time(child));
+        assert!(!parent.has_exited_child_process_cpu_time(child));
+        // Neither runtime notification state nor host wakers enter recordings.
+        {
+            let cpu = parent.process_cpu_time.lock().unwrap();
+            assert_eq!(serde_json::to_value(&*cpu).unwrap(), before);
+            let clone = cpu.clone();
+            assert!(Arc::ptr_eq(
+                clone.child_cpu_publications.get(&child).unwrap(),
+                &second
+            ));
+            let restored: ProcessCpuTime = serde_json::from_value(before).unwrap();
+            assert!(restored.child_cpu_publications.is_empty());
+        }
+
+        let mut current_child = ThreadState::new(child, &cfg, ());
+        current_child.parent_process_cpu_time = Some(Arc::clone(&parent.process_cpu_time));
+        current_child.parent_cpu_publication = Some(Arc::clone(&second));
+        assert!(current_child.record_exited_child_process_cpu_time(child));
+        parent.prepare_child_process_cpu_time(child);
+        assert!(parent.has_exited_child_process_cpu_time(child));
+        assert!(parent.wait_for_child_cpu_publication(child).await);
+        // ThreadState clones retain the same process identity.
+        assert!(Arc::ptr_eq(
+            current_child
+                .clone()
+                .parent_cpu_publication
+                .as_ref()
+                .unwrap(),
+            &second
+        ));
+        parent.reap_child_process_cpu_time(child);
+        assert!(!parent.wait_for_child_cpu_publication(child).await);
+        assert!(!current_child.record_exited_child_process_cpu_time(child));
+        assert!(!parent.has_exited_child_process_cpu_time(child));
     }
 
     fn nz(value: u64) -> Option<NonZeroU64> {

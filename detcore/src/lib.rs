@@ -1676,6 +1676,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         Some(Arc::clone(&pts.1.process_cpu_time))
                     },
+                    parent_cpu_publication: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        pts.1.parent_cpu_publication.clone()
+                    } else if self.cfg.backend_is_kvm && self.cfg.sequentialize_threads {
+                        Some(pts.1.prepare_child_cpu_publication(dettid))
+                    } else {
+                        None
+                    },
                     last_accounted_user_time,
                     last_accounted_system_time,
                     thread_cpu_start_user_time: last_accounted_user_time,
@@ -3068,10 +3075,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // full slice.
         let now = thread_state.thread_logical_time.as_nanos();
         thread_state.stats.close_final_timeslice(now);
-        // Reverie invokes this callback while the backend still owns the exit
-        // event, before the guest parent can consume it with wait. Ptrace also
-        // guarantees that the process leader exits after the other threads, so
-        // the final published aggregate is complete when wait returns.
+        // Ptrace keeps its exit event stopped while this hook runs. KVM runs
+        // this owner hook after worker joins and child waitability publication.
+        // Publish final CPU in this synchronous prefix: serial KVM waitid waits
+        // for that owned notification before consuming, not for the hook tail.
         // DETERMINISTIC RECOVERY (TODO-HUMAN-REVIEW(PR-1147)). `ThreadState::detpid`
         // is `Option` and starts as `None` ("Initialized later" at the clone site),
         // so a thread that reaches the exit hook before its per-thread identity is
@@ -3107,7 +3114,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // precedes local rebinding. Its snapshot includes the worker's tail;
         // the earlier displaced-leader snapshot is only a prefix.
         if current == detpid {
-            thread_state.record_exited_child_process_cpu_time(detpid);
+            if !thread_state.record_exited_child_process_cpu_time(detpid) {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "child CPU publication ownership changed before final exit"
+                )));
+            }
         } else {
             thread_state.account_process_cpu_time();
         }
