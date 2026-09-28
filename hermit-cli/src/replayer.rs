@@ -334,15 +334,23 @@ impl Default for Replayer {
 
 impl detcore::RecordOrReplay for Replayer {
     async fn invoke_original_read<G: Guest<Self>>(
-        &self, guest: &mut G, call: reverie::syscalls::Read,
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Read,
     ) -> Result<reverie::InjectedReadResult, Error> {
         self.expect_syscall(guest, call.into());
-        let event = guest.thread_state_mut().next_event()
-            .expect("recorded original Read event").event;
+        let event = guest
+            .thread_state_mut()
+            .next_event()
+            .expect("recorded original Read event")
+            .event;
         let result = match event {
             Ok(SyscallEvent::ReadInterrupted { signal }) => {
-                let signal = reverie::Signal::try_from(signal).map_err(|_| Error::Tool(
-                    anyhow::anyhow!("recorded Read interruption has invalid signal number {signal}")))?;
+                let signal = reverie::Signal::try_from(signal).map_err(|_| {
+                    Error::Tool(anyhow::anyhow!(
+                        "recorded Read interruption has invalid signal number {signal}"
+                    ))
+                })?;
                 // Retain the original attempt's scheduling ownership while the
                 // backend awaits the actual stop. The stream cannot create a
                 // signal, siginfo, native result, or a completed Read.
@@ -364,19 +372,25 @@ impl detcore::RecordOrReplay for Replayer {
         // allocator. Native FD-table capture must refuse it before enrollment;
         // ordinary full-trace Replay keeps its existing dispatcher below.
         if matches!(call, Syscall::Read(_) | Syscall::Openat(_))
-            || matches!(call, Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETFL)) {
+            || matches!(call, Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETFL))
+        {
             detcore::OriginalFileExecution::Recorded
         } else {
             detcore::OriginalFileExecution::Native
         }
     }
     fn consume_recorded_original_file<G: Guest<Self>>(
-        &self, guest: &mut G, call: Syscall,
-    ) -> impl std::future::Future<Output=Result<i64, Error>> + Send {
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> impl std::future::Future<Output = Result<i64, Error>> + Send {
         async move {
             if !matches!(call, Syscall::Read(_))
-                && !matches!(call, Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETFL)) {
-                return Err(Error::Tool(anyhow::anyhow!("recorded original-file command changed")));
+                && !matches!(call, Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETFL))
+            {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "recorded original-file command changed"
+                )));
             }
             // Use the ordinary dispatcher: ReadV2 supplies its existing bytes-
             // derived result or serialized errno; F_GETFL consumes Return.
@@ -2196,24 +2210,35 @@ mod exec_snapshot_tests {
 
 #[cfg(test)]
 mod original_openat_delegate_tests {
+    use detcore::OriginalFileExecution;
+    use detcore::RecordOrReplay;
+
     use super::*;
-    use detcore::{OriginalFileExecution, RecordOrReplay};
 
     #[test]
     fn openat_native_record_and_network_only_replay_use_actual_allocator() {
         let call = Syscall::Openat(Openat::new());
-        assert_eq!(crate::recorder::Recorder::default().original_file_execution(call),
-            OriginalFileExecution::Native);
-        assert_eq!(Replayer::default().original_file_execution(call),
-            OriginalFileExecution::Recorded);
+        assert_eq!(
+            crate::recorder::Recorder::default().original_file_execution(call),
+            OriginalFileExecution::Native
+        );
+        assert_eq!(
+            Replayer::default().original_file_execution(call),
+            OriginalFileExecution::Recorded
+        );
         // `run` uses the default Detcore delegate for both network policies;
         // full-trace replay instead explicitly constructs Detcore<Replayer>.
-        for policy in [detcore_model::network_trace::NetworkPolicy::Record,
-            detcore_model::network_trace::NetworkPolicy::Replay] {
+        for policy in [
+            detcore_model::network_trace::NetworkPolicy::Record,
+            detcore_model::network_trace::NetworkPolicy::Replay,
+        ] {
             let mut config = detcore::Config::default();
             config.network_trace.policy = policy;
             let tool = <detcore::Detcore as Tool>::new(Tid::from_raw(73), &config);
-            assert_eq!(tool.as_ref().original_file_execution(call), OriginalFileExecution::Native);
+            assert_eq!(
+                tool.as_ref().original_file_execution(call),
+                OriginalFileExecution::Native
+            );
         }
     }
 }

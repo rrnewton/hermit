@@ -606,7 +606,10 @@ pub(crate) fn validate_network_trace_replay(
     ) {
         return Err(Error::msg(format!(
             "unsupported network trace codec version {}, expected {}, {} or {}",
-            artifact.codec_version, NETWORK_TRACE_VERSION_V2, NETWORK_TRACE_VERSION_V3, NETWORK_TRACE_VERSION_V4
+            artifact.codec_version,
+            NETWORK_TRACE_VERSION_V2,
+            NETWORK_TRACE_VERSION_V3,
+            NETWORK_TRACE_VERSION_V4
         )));
     }
     let bytes = detcore::network_replay::read_bounded_network_trace(file)

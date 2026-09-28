@@ -359,7 +359,9 @@ impl Default for Recorder {
 
 impl detcore::RecordOrReplay for Recorder {
     async fn invoke_original_read<G: Guest<Self>>(
-        &self, guest: &mut G, call: reverie::syscalls::Read,
+        &self,
+        guest: &mut G,
+        call: reverie::syscalls::Read,
     ) -> Result<reverie::InjectedReadResult, Error> {
         let debug = DebugEvent::new(call.into(), &guest.memory());
         let outcome = guest.inject_original_read(call).await;
@@ -369,15 +371,26 @@ impl detcore::RecordOrReplay for Recorder {
                 self.record_read_result(guest, call, *result);
             }
             reverie::InjectedReadResult::Interrupted(ticket) => {
-                let signal = ticket.signal().ok_or_else(|| Error::Tool(
-                    anyhow::anyhow!("interrupted Read ticket has no actual signal cause")))?;
+                let signal = ticket.signal().ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "interrupted Read ticket has no actual signal cause"
+                    ))
+                })?;
                 // Keep the attempted Read before subsequent handler events.
                 // No ReadV2 bytes or native errno exist for this attempt.
                 guest.thread_state_mut().push_debug_event(debug).unwrap();
-                self.record_event(guest, Ok(SyscallEvent::ReadInterrupted { signal: signal as i32 }));
+                self.record_event(
+                    guest,
+                    Ok(SyscallEvent::ReadInterrupted {
+                        signal: signal as i32,
+                    }),
+                );
             }
-            reverie::InjectedReadResult::RecordedInterruption(_) =>
-                return Err(Error::Tool(anyhow::anyhow!("native recorder received a replay control"))),
+            reverie::InjectedReadResult::RecordedInterruption(_) => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "native recorder received a replay control"
+                )));
+            }
         }
         Ok(outcome)
     }
@@ -1468,13 +1481,21 @@ mod mkdir_probe_tests {
 }
 #[cfg(test)]
 mod original_file_delegate_tests {
-    use super::*;
-    use detcore::{OriginalFileExecution, RecordOrReplay};
-    use reverie::syscalls::{Addr, AddrMut, LocalMemory, SyscallInfo};
-    use reverie::{GlobalRPC, Never, Stack, TimerSchedule};
     use std::os::fd::AsRawFd;
 
+    use detcore::OriginalFileExecution;
+    use detcore::RecordOrReplay;
+    use reverie::GlobalRPC;
+    use reverie::Never;
+    use reverie::Stack;
+    use reverie::TimerSchedule;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::LocalMemory;
     use reverie::syscalls::Read as SysRead;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
 
     // This Guest executes real test-owned F_GETFL and armed Read syscalls. It does not
     // synthesize Prepared/Returned or provider selection. These are delegate
@@ -1588,15 +1609,24 @@ mod original_file_delegate_tests {
                 Ok(i64::from(result))
             }
         }
-        async fn inject_original_read(&mut self, call: reverie::syscalls::Read) -> reverie::InjectedReadResult {
+        async fn inject_original_read(
+            &mut self,
+            call: reverie::syscalls::Read,
+        ) -> reverie::InjectedReadResult {
             if std::mem::take(&mut self.interrupt_next_read) {
                 // Explicit delegate input only. This fixture has no native
                 // observation, Task or provider cancellation authority.
-                reverie::InjectedReadResult::Interrupted(reverie::InterruptedSyscall::with_signal(reverie::Signal::SIGUSR1))
-            } else { reverie::InjectedReadResult::Complete(self.inject(call).await) }
+                reverie::InjectedReadResult::Interrupted(reverie::InterruptedSyscall::with_signal(
+                    reverie::Signal::SIGUSR1,
+                ))
+            } else {
+                reverie::InjectedReadResult::Complete(self.inject(call).await)
+            }
         }
         async fn await_recorded_read_interruption(
-            &mut self, _: reverie::syscalls::Read, signal: reverie::Signal,
+            &mut self,
+            _: reverie::syscalls::Read,
+            signal: reverie::Signal,
         ) -> Result<reverie::InterruptedSyscall, Error> {
             // Delegate-only control. Real stopped-task custody is exercised
             // separately by interrupted_read_tests through actual ptrace.
@@ -1792,7 +1822,10 @@ mod original_file_delegate_tests {
     impl Drop for ReadBuffer {
         fn drop(&mut self) {
             // SAFETY: this is the exact still-owned mapping and original length.
-            assert_eq!(unsafe { libc::munmap(self.0 as *mut libc::c_void, 4096) }, 0);
+            assert_eq!(
+                unsafe { libc::munmap(self.0 as *mut libc::c_void, 4096) },
+                0
+            );
         }
     }
 
@@ -1806,7 +1839,8 @@ mod original_file_delegate_tests {
     }
 
     async fn recorded_read_fixture() -> RecordedReadFixture {
-        use std::io::{Seek, SeekFrom};
+        use std::io::Seek;
+        use std::io::SeekFrom;
         use std::os::unix::net::UnixStream;
 
         let data = tempfile::tempdir().unwrap();
@@ -1878,9 +1912,7 @@ mod original_file_delegate_tests {
         // SAFETY: both descriptors are owned. Atomically close the original
         // socket mapping and replace it without an unowned numeric-FD gap.
         assert_eq!(
-            unsafe {
-                libc::dup3(replacement.as_raw_fd(), slot.as_raw_fd(), libc::O_CLOEXEC)
-            },
+            unsafe { libc::dup3(replacement.as_raw_fd(), slot.as_raw_fd(), libc::O_CLOEXEC) },
             slot.as_raw_fd()
         );
         assert_eq!(
@@ -2035,37 +2067,69 @@ mod original_file_delegate_tests {
         use std::os::fd::FromRawFd;
         for invalid in [0, i32::MIN, i32::MAX] {
             let data = tempfile::tempdir().unwrap();
-            let config = detcore::Config { replay_data: Some(data.path().to_path_buf()), ..Default::default() };
+            let config = detcore::Config {
+                replay_data: Some(data.path().to_path_buf()),
+                ..Default::default()
+            };
             let recorder = Recorder::new(Pid::from_raw(std::process::id() as i32), &config);
             let mut recording = guest(&recorder, &config, true);
-            let raw = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC) };
+            let raw = unsafe {
+                libc::timerfd_create(
+                    libc::CLOCK_MONOTONIC,
+                    libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+                )
+            };
             assert!(raw >= 0, "timerfd fixture: {}", io::Error::last_os_error());
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             let mut byte = [0x5a];
-            let read = reverie::syscalls::Read::new().with_fd(fd.as_raw_fd())
-                .with_buf(AddrMut::from_raw(byte.as_mut_ptr() as usize)).with_len(1);
+            let read = reverie::syscalls::Read::new()
+                .with_fd(fd.as_raw_fd())
+                .with_buf(AddrMut::from_raw(byte.as_mut_ptr() as usize))
+                .with_len(1);
             // Explicit malformed trace input, followed by an actual Linux
             // timerfd Read whose one-byte count produces the genuine EINVAL.
             let debug = DebugEvent::new(read.into(), &recording.memory());
             recording.thread.push_debug_event(debug).unwrap();
-            recorder.record_event(&mut recording, Ok(SyscallEvent::ReadInterrupted { signal: invalid }));
+            recorder.record_event(
+                &mut recording,
+                Ok(SyscallEvent::ReadInterrupted { signal: invalid }),
+            );
             recording.read_operands = Some((read.fd(), read.buf().unwrap().as_raw(), read.len()));
-            assert!(matches!(recorder.invoke_original_read(&mut recording, read).await.unwrap(),
-                reverie::InjectedReadResult::Complete(Err(Errno::EINVAL))));
+            assert!(matches!(
+                recorder
+                    .invoke_original_read(&mut recording, read)
+                    .await
+                    .unwrap(),
+                reverie::InjectedReadResult::Complete(Err(Errno::EINVAL))
+            ));
             assert_eq!(recording.injections, 1);
             assert_eq!(byte, [0x5a]);
             drop(recording);
-            let replayer = crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+            let replayer =
+                crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
             let mut replay = guest(&replayer, &config, false);
-            let error = replayer.invoke_original_read(&mut replay, read).await.unwrap_err();
-            let Error::Tool(error) = error else { panic!("malformed control became a guest errno") };
-            assert_eq!(error.to_string(), format!("recorded Read interruption has invalid signal number {invalid}"));
+            let error = replayer
+                .invoke_original_read(&mut replay, read)
+                .await
+                .unwrap_err();
+            let Error::Tool(error) = error else {
+                panic!("malformed control became a guest errno")
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("recorded Read interruption has invalid signal number {invalid}")
+            );
             assert_eq!(replay.thread.count, 1);
             assert_eq!(replay.recorded_interruption_waits, 0);
             assert_eq!(replay.injections, 0);
             assert_eq!(byte, [0x5a]);
-            assert!(matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
-                reverie::InjectedReadResult::Complete(Err(Errno::EINVAL))));
+            assert!(matches!(
+                replayer
+                    .invoke_original_read(&mut replay, read)
+                    .await
+                    .unwrap(),
+                reverie::InjectedReadResult::Complete(Err(Errno::EINVAL))
+            ));
             assert_eq!(replay.thread.count, 2);
             assert_eq!(replay.recorded_interruption_waits, 0);
             assert_eq!(replay.injections, 0);
@@ -2080,45 +2144,84 @@ mod original_file_delegate_tests {
     #[tokio::test]
     async fn original_read_interruption_preserves_control_handler_and_retry_order() {
         let data = tempfile::tempdir().unwrap();
-        let config = detcore::Config { replay_data: Some(data.path().to_path_buf()), ..Default::default() };
+        let config = detcore::Config {
+            replay_data: Some(data.path().to_path_buf()),
+            ..Default::default()
+        };
         let recorder = Recorder::new(Pid::from_raw(std::process::id() as i32), &config);
         let mut recording = guest(&recorder, &config, true);
         let file = std::fs::File::open("/dev/null").unwrap();
         let mut bytes = [0x5a; 4];
-        let read = reverie::syscalls::Read::new().with_fd(file.as_raw_fd())
-            .with_buf(AddrMut::from_raw(bytes.as_mut_ptr() as usize)).with_len(bytes.len());
+        let read = reverie::syscalls::Read::new()
+            .with_fd(file.as_raw_fd())
+            .with_buf(AddrMut::from_raw(bytes.as_mut_ptr() as usize))
+            .with_len(bytes.len());
         recording.interrupt_next_read = true;
-        let result = recorder.invoke_original_read(&mut recording, read).await.unwrap();
-        assert!(matches!(result, reverie::InjectedReadResult::Interrupted(_)));
+        let result = recorder
+            .invoke_original_read(&mut recording, read)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            reverie::InjectedReadResult::Interrupted(_)
+        ));
         assert_eq!(bytes, [0x5a; 4]);
         assert_eq!(recording.injections, 0);
-        let sentinel = Fcntl::new().with_fd(file.as_raw_fd()).with_cmd(FcntlCmd::F_GETFL);
-        let flags = recorder.handle_syscall_event(&mut recording, sentinel.into()).await.unwrap();
+        let sentinel = Fcntl::new()
+            .with_fd(file.as_raw_fd())
+            .with_cmd(FcntlCmd::F_GETFL);
+        let flags = recorder
+            .handle_syscall_event(&mut recording, sentinel.into())
+            .await
+            .unwrap();
         assert_eq!(recording.injections, 1);
         recording.read_operands = Some((read.fd(), read.buf().unwrap().as_raw(), read.len()));
-        assert!(matches!(recorder.invoke_original_read(&mut recording, read).await.unwrap(),
-            reverie::InjectedReadResult::Complete(Ok(0))));
+        assert!(matches!(
+            recorder
+                .invoke_original_read(&mut recording, read)
+                .await
+                .unwrap(),
+            reverie::InjectedReadResult::Complete(Ok(0))
+        ));
         assert_eq!(recording.injections, 2);
         assert_eq!(bytes, [0x5a; 4]);
         drop(recording);
-        let replayer = crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
+        let replayer =
+            crate::replayer::Replayer::new(Pid::from_raw(std::process::id() as i32), &config);
         // The canceled attempt has an explicit control, never ReadV2 or errno.
         // The old test incorrectly omitted the original replay Read entirely.
         let mut inspect = guest(&replayer, &config, false);
-        assert!(matches!(inspect.thread.next_event().unwrap().event,
-            Ok(SyscallEvent::ReadInterrupted { signal: libc::SIGUSR1 })));
+        assert!(matches!(
+            inspect.thread.next_event().unwrap().event,
+            Ok(SyscallEvent::ReadInterrupted {
+                signal: libc::SIGUSR1
+            })
+        ));
         drop(inspect);
         let mut replay = guest(&replayer, &config, false);
-        assert!(matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
+        assert!(
+            matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
             reverie::InjectedReadResult::RecordedInterruption(ticket)
-                if ticket.signal() == Some(reverie::Signal::SIGUSR1)));
+                if ticket.signal() == Some(reverie::Signal::SIGUSR1))
+        );
         assert_eq!(replay.thread.count, 1);
         assert_eq!(bytes, [0x5a; 4]);
         assert_eq!(replay.injections, 0);
-        assert_eq!(replayer.consume_recorded_original_file(&mut replay, sentinel.into()).await.unwrap(), flags);
+        assert_eq!(
+            replayer
+                .consume_recorded_original_file(&mut replay, sentinel.into())
+                .await
+                .unwrap(),
+            flags
+        );
         assert_eq!(replay.thread.count, 2);
-        assert!(matches!(replayer.invoke_original_read(&mut replay, read).await.unwrap(),
-            reverie::InjectedReadResult::Complete(Ok(0))));
+        assert!(matches!(
+            replayer
+                .invoke_original_read(&mut replay, read)
+                .await
+                .unwrap(),
+            reverie::InjectedReadResult::Complete(Ok(0))
+        ));
         assert_eq!(replay.thread.count, 3);
         assert_eq!(replay.injections, 0);
         assert_eq!(bytes, [0x5a; 4]);
@@ -2127,7 +2230,6 @@ mod original_file_delegate_tests {
         assert!(matches!(replay.thread.next_debug_event(),
             Err(bincode::error::DecodeError::Io { inner, .. }) if inner.kind() == io::ErrorKind::UnexpectedEof));
     }
-
 }
 
 #[cfg(test)]

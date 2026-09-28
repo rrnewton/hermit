@@ -2677,9 +2677,7 @@ async fn finish_native_controller_result<T>(
     match (result, finish_native_controller_runtime(owner).await) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) => {
-            Err(Error::new(cleanup).context("native controller cleanup"))
-        }
+        (Ok(_), Err(cleanup)) => Err(Error::new(cleanup).context("native controller cleanup")),
         (Err(primary), Err(cleanup)) => {
             Err(primary.context(format!("native controller cleanup: {cleanup}")))
         }

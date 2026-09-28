@@ -767,7 +767,10 @@ impl Replayer {
     }
 
     pub(super) async fn apply_read_event<G: Guest<Self>>(
-        &self, guest: &mut G, syscall: Read, event: crate::event::ReadEvent,
+        &self,
+        guest: &mut G,
+        syscall: Read,
+        event: crate::event::ReadEvent,
     ) -> Result<i64, Error> {
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {

@@ -126,8 +126,12 @@ where
 {
     unsafe {
         run_with_network_startup_observed(
-            container, startup_timeout, accepted_launch, prepared_guard,
-            &mut |_, _| Ok(()), run,
+            container,
+            startup_timeout,
+            accepted_launch,
+            prepared_guard,
+            &mut |_, _| Ok(()),
+            run,
         )
     }
 }
@@ -158,15 +162,24 @@ where
     O: FnMut(&NetworkParentOwnership, Instant) -> Result<(), StartupError>,
 {
     unsafe {
-        run_with_network_startup_hooked(container, startup_timeout, accepted_launch,
-            prepared_guard, &mut NoGroupedHook, observe_parent, run)
+        run_with_network_startup_hooked(
+            container,
+            startup_timeout,
+            accepted_launch,
+            prepared_guard,
+            &mut NoGroupedHook,
+            observe_parent,
+            run,
+        )
     }
 }
 
 struct NoGroupedHook;
 impl detcore::network_runtime::AcceptedPostSpawn for NoGroupedHook {
-    fn after_spawn(&mut self, _: detcore::network_runtime::AcceptedSpawned<'_>)
-        -> io::Result<Option<detcore::network_runtime::GroupedBootstrapTransport>> {
+    fn after_spawn(
+        &mut self,
+        _: detcore::network_runtime::AcceptedSpawned<'_>,
+    ) -> io::Result<Option<detcore::network_runtime::GroupedBootstrapTransport>> {
         Ok(None)
     }
 }
@@ -204,7 +217,9 @@ where
     }
     // This transport is allocated before ARM/clone, outside the protected guest
     // namespace. Guard-only mode creates no accepted transport or service.
-    let wire_format = accepted_launch.as_ref().map(|launch| launch.expected.wire_format);
+    let wire_format = accepted_launch
+        .as_ref()
+        .map(|launch| launch.expected.wire_format);
     let mut incarnation = None;
     let mut endpoints = None;
     if accepted_launch.is_some() {
@@ -305,7 +320,10 @@ where
                     Err(StartupError::Protocol)
                 }
             };
-            let observed = observe_parent(parent.as_ref().expect("service owner retained"), context.deadline());
+            let observed = observe_parent(
+                parent.as_ref().expect("service owner retained"),
+                context.deadline(),
+            );
             // Preserve the original service failure, with both owners retained.
             started.and(observed)
         },
@@ -321,7 +339,11 @@ where
             let (owner, resource) = match (controller, incarnation, wire_format) {
                 (Some(controller), Some(incarnation), Some(wire_format)) => {
                     let (owner, resource) = unsafe {
-                        NetworkRuntimeResources::from_authenticated_startup(controller, incarnation, wire_format)
+                        NetworkRuntimeResources::from_authenticated_startup(
+                            controller,
+                            incarnation,
+                            wire_format,
+                        )
                     };
                     (Some(owner), Some(resource))
                 }
