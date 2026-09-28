@@ -280,8 +280,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
     // Thirty-three exec transfer, teardown and refusal controls retain all 810 IDs.
-    ("test.detcore_unit", 843),
-    ("test.detcore_misc", 27),
+    // The wait4 argument-validation precedence test
+    // (wait4_argument_validation_follows_linux_precedence) retains all 843
+    // prior identities.
+    ("test.detcore_unit", 844),
+    // The wait4 argument-error regression
+    // (wait4_argument_errors_match_linux_and_preserve_children) retains all 27
+    // prior identities selected after the node's five named skips.
+    ("test.detcore_misc", 28),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -328,9 +334,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 27),
+    // The host node carries the identical 28-test tests_misc selection.
+    ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 843),
+    // The host node carries the identical library/binary selection.
+    ("test.detcore_unit_on_host", 844),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),
