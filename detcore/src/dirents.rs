@@ -273,6 +273,31 @@ impl DirentFormat {
         Ok(entries)
     }
 
+    /// Decode records as [`parse`](Self::parse) does when only the first
+    /// `readable` bytes of them could be read; the rest are zeroed. Linux does
+    /// not write the padding after the last record's name, which can lie in a
+    /// page the guest cannot read, so only that padding may be missing.
+    pub(crate) fn parse_written(
+        self,
+        bytes: &mut [u8],
+        readable: usize,
+    ) -> Result<Vec<DirEntry>, Errno> {
+        let len = bytes.len();
+        bytes[readable.min(len)..].fill(0);
+        let entries = self.parse(bytes)?;
+        if readable >= len {
+            return Ok(entries);
+        }
+        let mut last = 0;
+        for _ in 1..entries.len() {
+            last += usize::from(u16::from_ne_bytes([bytes[last + 16], bytes[last + 17]]));
+        }
+        match entries.last() {
+            Some(entry) if last + self.written_len(entry.name.len()) <= readable => Ok(entries),
+            _ => Err(Errno::EFAULT),
+        }
+    }
+
     /// Append one record to `out`, zero-filling the padding.
     pub(crate) fn encode(self, entry: &DirEntry, ino: u64, off: i64, out: &mut Vec<u8>) {
         let reclen = self.record_len(entry.name.len());
@@ -1033,6 +1058,37 @@ mod test {
         let mut unterminated = good.clone();
         unterminated[19..24].fill(b'x');
         assert_eq!(DirentFormat::Dirent64.parse(&unterminated), Err(Errno::EIO));
+    }
+
+    #[test]
+    fn only_the_last_records_padding_may_be_unread() {
+        let mut bytes = Vec::new();
+        for (format, names) in [
+            (DirentFormat::Dirent64, ["00", "01"]),
+            (DirentFormat::Legacy, ["00", "01"]),
+        ] {
+            bytes.clear();
+            for name in names {
+                format.encode(&entry(name), 5, 1, &mut bytes);
+            }
+            let whole = format.parse(&bytes).unwrap();
+            // The second record starts at 24; Linux writes 22 bytes of it in
+            // the dirent64 layout, and all 24 in the legacy one.
+            let written = 24 + format.written_len(2);
+            for readable in 0..=bytes.len() {
+                let mut read = bytes.clone();
+                read[readable..].fill(0xaa);
+                let parsed = format.parse_written(&mut read, readable);
+                if readable >= written {
+                    assert_eq!(parsed, Ok(whole.clone()), "{format:?}, {readable} readable");
+                } else {
+                    assert!(
+                        parsed.is_err(),
+                        "{format:?}, {readable} readable: {parsed:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn entry(name: &str) -> DirEntry {

@@ -245,10 +245,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
-    // Nine directory-stream controls retain all 807 prior identities.
-    ("test.detcore_unit", 816),
-    // Eighteen whole-stream readdir_order tests retain all 27 prior identities.
-    ("test.detcore_misc", 45),
+    // Ten directory-stream controls retain all 807 prior identities.
+    ("test.detcore_unit", 817),
+    // Twenty-one whole-stream readdir_order tests retain all 27 prior identities.
+    ("test.detcore_misc", 48),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -279,9 +279,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 45),
+    ("test.detcore_misc_on_host", 48),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 816),
+    ("test.detcore_unit_on_host", 817),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 753),
