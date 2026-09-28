@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
 
@@ -261,6 +262,10 @@ pub(super) struct Controller {
     // This readiness-only alias and the session's endpoint refer to the same
     // private socket. No task future can own either descriptor's last reference.
     ready: OwnedFd,
+    // Requests are submitted by scheduler futures while the run-owned driver
+    // can be blocked waiting for provider input. This eventfd makes submission
+    // an edge for that native poll rather than a 50 ms sampling delay.
+    driver_wake: OwnedFd,
     run: [u8; 16],
     wire_format: Option<super::ProviderWireFormat>,
     copy_authority_owner: std::sync::Arc<()>,
@@ -282,12 +287,19 @@ impl Controller {
             }
             !state.pending_send.is_empty()
         };
-        let mut descriptor = libc::pollfd {
-            fd: self.ready.as_raw_fd(),
-            events: libc::POLLIN | if writable { libc::POLLOUT } else { 0 },
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.ready.as_raw_fd(),
+                events: libc::POLLIN | if writable { libc::POLLOUT } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.driver_wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 50) };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -295,7 +307,59 @@ impl Controller {
                 return Err(error);
             }
         }
+        if descriptors[1].revents & libc::POLLIN != 0 {
+            self.drain_driver_wake()?;
+        }
         Ok(())
+    }
+
+    fn wake_driver(&self) -> io::Result<()> {
+        let value = 1_u64;
+        loop {
+            let written = unsafe {
+                libc::write(
+                    self.driver_wake.as_raw_fd(),
+                    (&value as *const u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if written == std::mem::size_of::<u64>() as isize {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // A saturated eventfd is already a retained wake request.
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+
+    fn drain_driver_wake(&self) -> io::Result<()> {
+        let mut value = 0_u64;
+        loop {
+            let read = unsafe {
+                libc::read(
+                    self.driver_wake.as_raw_fd(),
+                    (&mut value as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if read == std::mem::size_of::<u64>() as isize {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
+        }
     }
 
     pub(super) fn retained_response(&self, sequence: u64) -> io::Result<Option<Reply>> {
@@ -416,6 +480,11 @@ impl Controller {
             wire_format.unwrap_or(super::ProviderWireFormat::Abi7Copy4),
         )
         .map_err(|(error, _)| error)?;
+        let raw_driver_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw_driver_wake < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let driver_wake = unsafe { OwnedFd::from_raw_fd(raw_driver_wake) };
         Ok(Self {
             state: Mutex::new(State {
                 session,
@@ -425,6 +494,7 @@ impl Controller {
                 failure: None,
             }),
             ready,
+            driver_wake,
             run,
             wire_format,
             copy_authority_owner: std::sync::Arc::new(()),
@@ -511,7 +581,8 @@ impl Controller {
             rejected_rights,
             ..
         } = &mut *state;
-        requests.prepare(key, owner, operation, &body, || {
+        let pending_before = pending_send.len();
+        let result = requests.prepare(key, owner, operation, &body, || {
             let rights = duplicate_rights()?;
             let envelope = Envelope {
                 run: self.run,
@@ -530,7 +601,13 @@ impl Controller {
             };
             pending_send.push_back(sequence);
             Ok(sequence)
-        })
+        });
+        let queued = pending_send.len() != pending_before;
+        drop(state);
+        if queued {
+            self.wake_driver()?;
+        }
+        result
     }
 
     pub(super) fn retain_native_birth_cleanup(
@@ -1413,6 +1490,58 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newly_queued_request_wakes_the_native_driver_once() {
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let endpoint = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+        let _peer = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+        let controller = Controller::new(endpoint, [6; 16]).unwrap();
+        let mut wake = libc::pollfd {
+            fd: controller.driver_wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut wake, 1, 0) }, 0);
+
+        let sequence = controller
+            .prepare(
+                Effect::Observation(1),
+                owner(),
+                &Request::ReadStatus,
+                || Ok(vec![]),
+            )
+            .unwrap();
+        assert_eq!(unsafe { libc::poll(&mut wake, 1, 0) }, 1);
+        controller.drive_once().unwrap();
+        wake.revents = 0;
+        assert_eq!(unsafe { libc::poll(&mut wake, 1, 0) }, 0);
+
+        assert_eq!(
+            controller
+                .prepare(
+                    Effect::Observation(1),
+                    owner(),
+                    &Request::ReadStatus,
+                    || panic!("duplicate request transferred rights"),
+                )
+                .unwrap(),
+            sequence
+        );
+        assert_eq!(unsafe { libc::poll(&mut wake, 1, 0) }, 0);
+    }
+
     #[test]
     fn native_birth_finish_keeps_one_physical_owner_after_known_or_unknown_submission() {
         let owner = owner();
