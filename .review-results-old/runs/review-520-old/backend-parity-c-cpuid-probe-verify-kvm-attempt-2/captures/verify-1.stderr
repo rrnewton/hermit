@@ -1,0 +1,5 @@
+:: Run1...
+:: Verification logs retained:
+::   run 1: /results/runs/review-520-old/backend-parity-c-cpuid-probe-verify-kvm-attempt-2/verify-logs/verify-1/run1_log_XQa4o
+HERMIT_INTERNAL_FAILURE class=cli-error
+Error: KVM guest execution failed: guest exception vector 13 at 0x1014dac (CR2=0x0)
