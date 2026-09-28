@@ -28363,7 +28363,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "67 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "68 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -28491,6 +28491,7 @@ mod committed_selection_preservation_tests {
             "test.command_strict_verify",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.detcore_unit",
             "test.envelope_levels",
             "test.hermit_integration",
@@ -28516,8 +28517,9 @@ mod committed_selection_preservation_tests {
         // the one bucket e2e.manifest_compat_on_host (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448); 206 until
         // test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(expected.len(), 16);
+        // https://github.com/rrnewton/hermit/issues/3301). 17 since
+        // test.detcore_time_on_host was enrolled.
+        assert_eq!(expected.len(), 17);
         let requested = [public.join(","), "e2e.manifest_compat".into()].join(",");
         for only in [false, true] {
             let mut argv = if only {

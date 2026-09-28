@@ -278,6 +278,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.detcore_unit",
     "test.detcore_misc",
     "test.detcore_parallel",
+    "test.detcore_time",
     "test.hermit_integration",
     "test.arbitrary_binaries",
     "test.cli",
@@ -386,13 +387,13 @@ struct Profile {
 const PROFILES: [Profile; 11] = [
     Profile {
         label: "full",
-        direct_steps: 86,
-        selected_steps: 87,
+        direct_steps: 87,
+        selected_steps: 88,
     },
     Profile {
         label: "portable",
-        direct_steps: 73,
-        selected_steps: 74,
+        direct_steps: 74,
+        selected_steps: 75,
     },
     Profile {
         label: "quick",
@@ -413,8 +414,8 @@ const PROFILES: [Profile; 11] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 67,
-        selected_steps: 67,
+        direct_steps: 68,
+        selected_steps: 68,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1129,10 +1130,10 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // check.backend_parity_suites, lint.clippy, doc.doctests and doc.rustdoc,
     // which were already in this split's dependency closure and became its
     // roots; 20 until check.backend_parity_suites was retired with
-    // tests/backend-parity (also slice S13).
-    if split.len() != 19 {
+    // tests/backend-parity (also slice S13). 20 since test.detcore_time and its hosted twin were enrolled.
+    if split.len() != 20 {
         return Err(format!(
-            "hosted test split has {} roots, expected 19",
+            "hosted test split has {} roots, expected 20",
             split.len()
         ));
     }
@@ -1171,10 +1172,10 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // compat.<program> nodes that depended on compatprep.fixtures became the
     // e2e.manifest_compat bucket (2026-10-01), whose hosted twin is authored.
     // 23 until check.backend_parity_suites was retired with
-    // tests/backend-parity (also slice S13).
-    if split.len() != 22 {
+    // tests/backend-parity (also slice S13). 23 since test.detcore_time and its hosted twin were enrolled.
+    if split.len() != 23 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 22",
+            "hosted test dependency closure has {} nodes, expected 23",
             split.len()
         ));
     }
@@ -1798,10 +1799,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // them; 111 since sabrecompat.manifest_compat, the SaBRe lane's bucket, joined
     // them; 110 since portablecompat.manifest_compat, the focused lane's corpus
     // bucket, joined them; 109 since e2e.manifest_compat and its hosted twin
-    // joined the test-harness producers (2026-10-01).
-    if expected.len() != 118 {
+    // joined the test-harness producers (2026-10-01); 120 since
+    // test.detcore_time and its hosted twin were enrolled.
+    if expected.len() != 120 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 118",
+            "structured result producer registry has {} entries, expected 120",
             expected.len()
         ));
     }
@@ -1810,9 +1812,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 40 {
+    if expected_counts.len() != 42 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 40",
+            "Nextest expected-count registry has {} entries, expected 42",
             expected_counts.len()
         ));
     }
@@ -1941,8 +1943,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // the SaBRe lane's sabrecompat.manifest_compat, and 39 with the strict
     // lane's strictcompat.manifest_compat, and 40 with the rr lane's
     // rrcompat.manifest_compat. Envelope 2 -> 7 with the five super stress
-    // probe nodes.
-    if actual_group_counts != [69, 40, 7, 2] {
+    // probe nodes. Nextest 69 -> 71 when test.detcore_time and its hosted twin
+    // were enrolled.
+    if actual_group_counts != [71, 40, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2473,9 +2476,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // rrcompat.manifest_compat (648 - 139 + 1).
     // 415 since the 100 superstress repetition nodes became one node per
     // probe (510 - 100 + 5).
-    if cfg.steps.len() != 415 {
+    // 417 when test.detcore_time and its hosted twin were enrolled (415 + 2).
+    if cfg.steps.len() != 417 {
         return Err(format!(
-            "superset has {} steps, expected 415",
+            "superset has {} steps, expected 417",
             cfg.steps.len()
         ));
     }
@@ -4138,6 +4142,7 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 68 since test.detcore_time_on_host was enrolled;
         // 67 since check.backend_parity_suites_on_host was retired with
         // tests/backend-parity (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 68 since
@@ -4154,7 +4159,7 @@ sys.exit(37)
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13); 251 before.
-        assert_eq!(selected.steps.len(), 67);
+        assert_eq!(selected.steps.len(), 68);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -4180,6 +4185,7 @@ sys.exit(37)
             "command_strict_verify",
             "detcore_misc",
             "detcore_parallel",
+            "detcore_time",
             "detcore_unit",
             "envelope_levels",
             "hermit_integration",
@@ -4210,6 +4216,7 @@ sys.exit(37)
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
+        // 23 since test.detcore_time_on_host was enrolled;
         // 22 since check.backend_parity_suites_on_host was retired with
         // tests/backend-parity (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301);
@@ -4222,7 +4229,7 @@ sys.exit(37)
         // change of 2026-09-30 retired build.liteinst_runtime_release_on_host
         // and moved check.dbt_runtime_abi into the pinned root, which gave it
         // the hosted twin check.dbt_runtime_abi_on_host.
-        assert_eq!(new_variants.len(), 22);
+        assert_eq!(new_variants.len(), 23);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -4355,6 +4362,8 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
+            // 67 = the 68 hosted-portable direct steps since
+            // test.detcore_time_on_host was enrolled, minus the one planted loss;
             // 66 = the 67 hosted-portable direct steps since
             // check.backend_parity_suites_on_host was retired with
             // tests/backend-parity in slice S13 of
@@ -4372,7 +4381,7 @@ sys.exit(37)
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 66 direct steps"),
+            error.contains("hosted-portable label has 67 direct steps"),
             "{error}"
         );
     }
@@ -4457,6 +4466,7 @@ sys.exit(37)
                     "test.command_strict_verify",
                     "test.detcore_misc",
                     "test.detcore_parallel",
+                    "test.detcore_time",
                     "test.detcore_unit",
                     "test.hermit_integration",
                     "test.hermit_modes",

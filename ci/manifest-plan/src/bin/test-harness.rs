@@ -6244,6 +6244,7 @@ sys.exit(1 if failed else 0)
             "test.detcore_unit",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.regular_crates",
             "test.hermit_integration",
             "test.arbitrary_binaries",
@@ -6295,9 +6296,10 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/hermit/issues/3301, test.dbt_parity left
         // the dbt-parity shard (23 to 22; the shard is now dbt-runtime-abi) and
         // check.backend_parity_suites left the integration shard when
-        // tests/backend-parity was retired (22 to 21).
-        assert_eq!(physical_rows, 21);
-        assert_eq!(resolved.len(), 21);
+        // tests/backend-parity was retired (22 to 21). test.detcore_time joined
+        // the unit shard when it was enrolled (21 to 22).
+        assert_eq!(physical_rows, 22);
+        assert_eq!(resolved.len(), 22);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.

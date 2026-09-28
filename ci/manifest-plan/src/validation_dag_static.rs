@@ -141,6 +141,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.command_strict_verify",
     "test.detcore_misc",
     "test.detcore_parallel",
+    "test.detcore_time",
     "test.detcore_unit",
     "test.hermit_integration",
     "test.hermit_modes",
@@ -156,6 +157,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.command_strict_verify_on_host",
     "test.detcore_misc_on_host",
     "test.detcore_parallel_on_host",
+    "test.detcore_time_on_host",
     "test.detcore_unit_on_host",
     "test.hermit_integration_on_host",
     "test.hermit_unit_on_host",
@@ -671,6 +673,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities selected after the node's five named skips.
     ("test.detcore_misc", 29),
     ("test.detcore_parallel", 5),
+    // The previously unenrolled tests_time target contributes all 28 measured IDs.
+    ("test.detcore_time", 28),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
@@ -843,6 +847,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 850 prior
     // identities.
     // The host node carries the identical library/binary selection.
+    ("test.detcore_time_on_host", 28),
     ("test.detcore_unit_on_host", 868),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
@@ -3310,6 +3315,42 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             est_duration_s: 120.0,
             rss_baseline_bytes: Some(2147483648),
             hard_mem_max_bytes: Some(4294967296),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 720,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"detcore_time"########,
+        desc: r########"Detcore time integration cases (tests_time, serial execution)"########,
+        description: r########"MEASURED 2026-09-28 (task detcore_tests_time_unenrolled_and_inverted): five successful exact-command cgroup samples peaked at 80302080, 76382208, 75063296, 76529664, and 76382208 bytes. The 128-MiB scheduling baseline rounds above the 80302080-byte maximum plus 20%, and the 1-GiB hard cap supplies conservative headroom. Exact -j1 wall times were 3.95, 3.71, 4.08, 3.90, and 3.82 seconds, so est_duration_s rounds the maximum upward to 5 seconds. Sixteen selected cases use a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer; target_timeslice_yields_at_syscall_boundaries_without_pmu explicitly disables max_timeslice. The PMU-dependent cases remain together so validation covers the shipped tests_time binary without silent skips."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_time -j 1"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 5.0,
+            rss_baseline_bytes: Some(134217728),
+            hard_mem_max_bytes: Some(1073741824),
             classification: StepClass::CpuBound,
             preferred_inner_jobs: None,
             measured_effective_cores: None,
