@@ -239,10 +239,14 @@ impl Controller {
         let mut state = self.state.lock().unwrap();
         let (envelope, rights, response) = outgoing(&state, self.run, owner, prepared)?;
         let kind = preparation(envelope, response, owner, call, command)?;
-        let [task] = rights else {
-            return Err(invalid(
-                "copy preparation lacks its one retained task description",
-            ));
+        let task = match (kind, rights) {
+            (CopyKind::Read, [task]) => task,
+            (CopyKind::Helper(_), [_, task]) => task,
+            _ => {
+                return Err(invalid(
+                    "copy preparation changed its typed owner/worker descriptions",
+                ));
+            }
         };
         let task_identity = PidfdIdentity::read(task)?;
         let task = task.as_fd().try_clone_to_owned()?;
@@ -457,8 +461,14 @@ impl Controller {
                 prepared.call,
                 prepared.command,
             )? != prepared.kind
-            || rights.len() != 1
-            || PidfdIdentity::read(&rights[0])? != prepared.task_identity
+            || rights.len()
+                != if matches!(prepared.kind, CopyKind::Helper(_)) {
+                    2
+                } else {
+                    1
+                }
+            || PidfdIdentity::read(rights.last().expect("validated preparation rights"))?
+                != prepared.task_identity
             || !state
                 .requests
                 .0
@@ -711,6 +721,7 @@ pub(crate) fn controlled_empty_copy_terminal_authority(
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
 
     use super::*;
@@ -726,11 +737,54 @@ mod tests {
         pub(super) controller: Controller,
         peer: AcceptedSession,
         task: OwnedFd,
+        owner_task: OwnedFd,
+        _owner_thread: HeldThread,
         pub(super) owner: NetworkStreamOwner,
         pub(super) call: NetworkStreamCallId,
         kind: CopyKind,
         pub(super) selection: OriginalSelection,
         prepared: Option<u64>,
+    }
+    struct HeldThread {
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for HeldThread {
+        fn drop(&mut self) {
+            self.stop.take();
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+    fn held_owner() -> io::Result<(OwnedFd, HeldThread)> {
+        let (ready, task) = std::sync::mpsc::sync_channel(1);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let raw = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_open,
+                    libc::syscall(libc::SYS_gettid),
+                    libc::O_EXCL,
+                )
+            };
+            let pin = if raw < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+            };
+            if ready.send(pin).is_ok() {
+                let _ = stopped.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        });
+        let held = HeldThread {
+            stop: Some(stop),
+            join: Some(join),
+        };
+        let pin = task
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(io::Error::other)??;
+        Ok((pin, held))
     }
     fn ok(name: &str) -> CallStatus {
         CallStatus {
@@ -799,6 +853,11 @@ mod tests {
                 return Err(io::Error::last_os_error());
             }
             let task = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+            let (owner_task, owner_thread) = held_owner()?;
+            assert_ne!(
+                PidfdIdentity::read(&owner_task)?,
+                PidfdIdentity::read(&task)?
+            );
             let kind = match operation {
                 11 => CopyKind::Read,
                 21 | 22 => CopyKind::Helper(AuxiliaryRole::Receive {
@@ -822,6 +881,8 @@ mod tests {
                 controller: Controller::with_wire(left, run, wire)?,
                 peer: AcceptedSession::new(right, run).map_err(|(error, _)| error)?,
                 task,
+                owner_task,
+                _owner_thread: owner_thread,
                 owner,
                 call: serde_json::from_value(serde_json::json!(selection.call))?,
                 kind,
@@ -854,6 +915,18 @@ mod tests {
             acknowledge: bool,
             changed_status: Option<CallStatus>,
         ) -> io::Result<u64> {
+            let rights = match self.kind {
+                CopyKind::Read => vec![self.task.try_clone()?],
+                CopyKind::Helper(_) => vec![self.owner_task.try_clone()?, self.task.try_clone()?],
+            };
+            self.prepare_with_rights(acknowledge, changed_status, rights)
+        }
+        fn prepare_with_rights(
+            &mut self,
+            acknowledge: bool,
+            changed_status: Option<CallStatus>,
+            rights: Vec<OwnedFd>,
+        ) -> io::Result<u64> {
             let request = match self.kind {
                 CopyKind::Read => Request::PrepareOriginalConnect {
                     kind: Kind::Read,
@@ -874,10 +947,12 @@ mod tests {
             let sequence =
                 self.controller
                     .prepare(self.kind.key(self.call), self.owner, &request, || {
-                        Ok(vec![self.task.as_fd().try_clone_to_owned()?])
+                        Ok(rights)
                     })?;
             self.prepared = Some(sequence);
             if acknowledge {
+                // Explicit simulated service reply: a fixture premise, not a
+                // native provider success receipt.
                 let name = match self.kind {
                     CopyKind::Read => "ap_prepare_original_read",
                     CopyKind::Helper(role) => role.prepare_name(),
@@ -1255,12 +1330,116 @@ mod tests {
                 if operation == 21 {
                     selected.original_count = 512;
                 }
-                let bound =
-                    controlled_copy_authority(wire, owner(), operation, selected.clone()).unwrap();
+                let mut fixture =
+                    Fixture::new(Some(wire), owner(), operation, selected.clone()).unwrap();
+                let sequence = fixture.prepare(true, None).unwrap();
+                let token = fixture
+                    .controller
+                    .prepared_copy_authority(owner(), fixture.call, sequence, selected.command)
+                    .unwrap();
+                let worker = PidfdIdentity::read(&fixture.task).unwrap();
+                assert_ne!(worker, PidfdIdentity::read(&fixture.owner_task).unwrap());
+                assert_eq!(token.task_identity, worker);
+                assert_eq!(PidfdIdentity::read(&token.task).unwrap(), worker);
+                let selection = fixture.select(None).unwrap();
+                let bound = fixture
+                    .controller
+                    .bind_copy_authority(token, selection)
+                    .unwrap();
                 assert_eq!(bound.version(), wire.copy_version());
                 assert_eq!(bound.operation(), operation);
                 assert_eq!(bound.flags(), selected.address_length);
                 bound.validate_selection(&selected).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn helper_copy_authority_requires_pair_and_rejects_worker_role_or_selection_changes() {
+        for wire in [ProviderWireFormat::Abi7Copy4, ProviderWireFormat::Abi8Copy5] {
+            for operation in [21, 22] {
+                let mut selected = selection();
+                selected.original_count = if operation == 21 { 512 } else { 2048 };
+                selected.address_length =
+                    libc::MSG_DONTWAIT | if operation == 22 { libc::MSG_PEEK } else { 0 };
+                for count in [0, 1, 3] {
+                    let mut fixture =
+                        Fixture::new(Some(wire), owner(), operation, selected.clone()).unwrap();
+                    let rights = (0..count)
+                        .map(|_| fixture.task.try_clone().unwrap())
+                        .collect();
+                    let error = fixture.prepare_with_rights(true, None, rights).unwrap_err();
+                    assert!(
+                        error.to_string().contains("rights shape mismatch"),
+                        "{error}"
+                    );
+                    assert!(fixture.prepared.is_none());
+                }
+                // Each corruption begins with a usable pair and an issued
+                // authority. No arity error can stand in for these guards.
+                for case in 0..7 {
+                    let mut fixture =
+                        Fixture::new(Some(wire), owner(), operation, selected.clone()).unwrap();
+                    let sequence = fixture.prepare(true, None).unwrap();
+                    let token = fixture
+                        .controller
+                        .prepared_copy_authority(owner(), fixture.call, sequence, selected.command)
+                        .unwrap();
+                    assert_eq!(
+                        token.task_identity,
+                        PidfdIdentity::read(&fixture.task).unwrap()
+                    );
+                    let mut changed = selected.clone();
+                    match case {
+                        0 => {
+                            // Deliberately corrupt only the retained worker FD,
+                            // leaving the issued duplicate and pair arity intact.
+                            let state = fixture.controller.state.lock().unwrap();
+                            let (_, rights, _) = state
+                                .session
+                                .acknowledged_outgoing_request(sequence)
+                                .unwrap();
+                            assert_eq!(rights.len(), 2);
+                            assert_eq!(
+                                unsafe {
+                                    libc::dup3(
+                                        fixture.owner_task.as_raw_fd(),
+                                        rights[1].as_raw_fd(),
+                                        libc::O_CLOEXEC,
+                                    )
+                                },
+                                rights[1].as_raw_fd()
+                            );
+                        }
+                        1 => {
+                            fixture.kind = CopyKind::Helper(AuxiliaryRole::Receive {
+                                kind: if operation == 21 {
+                                    ReceiveKind::Peek
+                                } else {
+                                    ReceiveKind::Drain
+                                },
+                                address: selected.user_address,
+                                count: if operation == 21 { 1024 } else { 512 },
+                                provider: selected.provider,
+                                file: selected.file,
+                            });
+                        }
+                        2 => changed.file += 1,
+                        3 => changed.provider += 1,
+                        4 => changed.original_count += 1,
+                        5 => changed.address_length ^= libc::MSG_PEEK,
+                        6 => changed.user_address += 1,
+                        _ => unreachable!(),
+                    }
+                    let selection = fixture.select(Some(changed)).unwrap();
+                    assert!(
+                        fixture
+                            .controller
+                            .bind_copy_authority(token, selection)
+                            .is_err(),
+                        "case {case}"
+                    );
+                }
             }
         }
     }
@@ -1280,6 +1459,24 @@ mod tests {
             selected.original_count = if operation == 21 { 512 } else { 2048 };
             selected.address_length =
                 libc::MSG_DONTWAIT | if operation == 22 { libc::MSG_PEEK } else { 0 };
+            let fixture = Fixture::new(
+                Some(ProviderWireFormat::Abi8Copy5),
+                owner(),
+                operation,
+                selected.clone(),
+            )
+            .unwrap();
+            let CopyKind::Helper(role) = fixture.kind else {
+                unreachable!()
+            };
+            assert!(
+                !role.valid(),
+                "zero held file must invalidate the receive role"
+            );
+            assert_ne!(
+                PidfdIdentity::read(&fixture.owner_task).unwrap(),
+                PidfdIdentity::read(&fixture.task).unwrap()
+            );
             assert!(
                 controlled_copy_authority(
                     ProviderWireFormat::Abi8Copy5,

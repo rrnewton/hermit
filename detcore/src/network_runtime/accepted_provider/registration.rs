@@ -609,14 +609,15 @@ impl Registrations {
             (
                 Operation::PrepareOriginalFileObservation,
                 Request::PrepareOriginalFileObservation { call, mm, fd, role },
-            ) if rights.len() == 1
+            ) if rights.len() == if role == AuxiliaryRole::File { 1 } else { 2 }
                 && envelope.accept.is_none()
                 && call != 0
                 && fd >= 0
                 && mm == owner.mm.generation()
                 && role.valid() =>
             {
-                let observed = backend.identity(&rights[0])?;
+                let helper = rights.last().expect("validated auxiliary rights");
+                let observed = backend.identity(helper)?;
                 // The worker is an auxiliary actor, not a substituted guest.
                 if self.0.values().any(|r| {
                     r.identity == observed
@@ -625,6 +626,45 @@ impl Registrations {
                     return Err(io::Error::other(
                         "auxiliary worker aliases an existing task owner",
                     ));
+                }
+                if role != AuxiliaryRole::File {
+                    let owner_pin = &rights[0];
+                    let owner_identity = backend.identity(owner_pin)?;
+                    if self.0.values().any(|registration| {
+                        registration.identity == owner_identity && registration.owner != owner
+                    }) {
+                        return Err(io::Error::other(
+                            "helper owner PIDFD aliases another registered task",
+                        ));
+                    }
+                    if let Some(registration) = self.0.get(&owner.thread) {
+                        if registration.owner != owner || registration.identity != owner_identity {
+                            return Err(io::Error::other(
+                                "helper owner changed its authenticated task registration",
+                            ));
+                        }
+                    } else {
+                        self.0.insert(
+                            owner.thread,
+                            Registration {
+                                owner,
+                                identity: owner_identity,
+                                outcome: None,
+                                failure: None,
+                                active: None,
+                                last_allocator: None,
+                                auxiliary: None,
+                            },
+                        );
+                        let receipt = self.0.get_mut(&owner.thread).unwrap();
+                        match backend.register(owner_pin) {
+                            Ok(status) => receipt.outcome = Some(status),
+                            Err(error) => {
+                                receipt.failure = Some(error.to_string());
+                                return Err(error);
+                            }
+                        }
+                    }
                 }
                 let receipt = self
                     .0
@@ -682,7 +722,7 @@ impl Registrations {
                     completion_known: false,
                     retirement_submitted: false,
                 });
-                let registration = backend.register(&rights[0])?;
+                let registration = backend.register(helper)?;
                 receipt.auxiliary.as_mut().unwrap().registration = Some(registration.clone());
                 if registration.returned != 0 || registration.errno.is_some() {
                     Reply::Prepared(Observation {
@@ -693,7 +733,12 @@ impl Registrations {
                     let prepared = if role == AuxiliaryRole::File {
                         backend.prepare_auxiliary_file(&rights[0], call, mm, fd)?
                     } else {
-                        backend.prepare_helper_receive(&rights[0], call, mm, fd, role)?
+                        // The first right authenticates the guest owner whose
+                        // stream Call is being satisfied.  The second right is
+                        // the service worker that performs the actual native
+                        // receive, so the BPF command must be installed on that
+                        // worker rather than on the blocked guest thread.
+                        backend.prepare_helper_receive(helper, call, mm, fd, role)?
                     };
                     if prepared.status.returned == 0
                         && prepared.status.errno.is_none()
@@ -713,10 +758,13 @@ impl Registrations {
                     role,
                 },
             ) if rights.is_empty() && envelope.accept.is_none() => {
-                let pins = prepared_rights.filter(|p| p.len() == 1).ok_or_else(|| {
-                    io::Error::other("auxiliary collection lost original worker PIDFD")
-                })?;
-                let identity = backend.identity(&pins[0])?;
+                let pins = prepared_rights
+                    .filter(|p| p.len() == if role == AuxiliaryRole::File { 1 } else { 2 })
+                    .ok_or_else(|| {
+                        io::Error::other("auxiliary collection lost original worker PIDFD")
+                    })?;
+                let worker = pins.last().expect("validated auxiliary worker");
+                let identity = backend.identity(worker)?;
                 let auxiliary = self
                     .0
                     .get_mut(&owner.thread)
@@ -735,7 +783,7 @@ impl Registrations {
                         io::Error::other("auxiliary collection changed its retained worker/command")
                     })?;
                 auxiliary.completion = Some(envelope.sequence);
-                let selection = backend.read_original(&pins[0], command)?;
+                let selection = backend.read_original(worker, command)?;
                 let effect = if selection.status.returned == 0 && selection.status.errno.is_none() {
                     role.check_selection(
                         &selection.raw,
@@ -744,7 +792,7 @@ impl Registrations {
                         auxiliary.fd,
                         command,
                     )?;
-                    let observed = backend.collect_original(&pins[0], command)?;
+                    let observed = backend.collect_original(worker, command)?;
                     if observed.status.returned == 0
                         && observed.status.errno.is_none()
                         && (observed.raw.command.operation != role.operation()
@@ -773,9 +821,10 @@ impl Registrations {
                 },
             ) if rights.is_empty() && envelope.accept.is_none() => {
                 let pins = prepared_rights
-                    .filter(|p| p.len() == 1)
+                    .filter(|p| matches!(p.len(), 1 | 2))
                     .ok_or_else(|| io::Error::other("auxiliary retirement lost original PIDFD"))?;
-                let identity = backend.identity(&pins[0])?;
+                let worker = pins.last().expect("validated auxiliary worker");
+                let identity = backend.identity(worker)?;
                 let receipt = self
                     .0
                     .get_mut(&owner.thread)
@@ -798,7 +847,7 @@ impl Registrations {
                 // The service's incoming-group check requires the actual
                 // original command ACK before this idle task-storage removal.
                 auxiliary.retirement_submitted = true;
-                let status = backend.retire_auxiliary(&pins[0])?;
+                let status = backend.retire_auxiliary(worker)?;
                 if status.returned == 0 && status.errno.is_none() {
                     receipt.auxiliary = None;
                 }
@@ -3112,6 +3161,7 @@ mod openat_auxiliary_tests {
     #[derive(Default)]
     struct Probe {
         calls: Vec<&'static str>,
+        owner_registration: Option<Result<CallStatus, &'static str>>,
         unknown_register: bool,
         failed_retire: bool,
         wrong_operation: bool,
@@ -3148,6 +3198,14 @@ mod openat_auxiliary_tests {
             Ok(*pin)
         }
         fn register(&mut self, actual: &Self::Pin) -> io::Result<CallStatus> {
+            if *actual == pin(11) {
+                self.calls.push("register owner");
+                return self
+                    .owner_registration
+                    .take()
+                    .expect("owner registration must be an explicit fixture premise")
+                    .map_err(io::Error::other);
+            }
             assert_eq!(*actual, pin(22));
             self.calls.push("register");
             if self.unknown_register {
@@ -3293,30 +3351,58 @@ mod openat_auxiliary_tests {
             let mut backend = Probe::default();
             // Stream Call ownership does not require an unrelated Openat command.
             registry.0.get_mut(&owner().thread).unwrap().last_allocator = None;
-            let worker = [pin(22)];
-            assert!(
-                registry
-                    .dispatch(&mut backend, &receive_prepare(role), &[pin(11)], None)
-                    .is_err()
-            );
-            assert!(backend.calls.is_empty());
+            let pins = [pin(11), pin(22)];
+            for invalid in [
+                vec![pin(22)],          // missing owner: schema control
+                vec![pin(11), pin(11)], // valid arity, guest substituted for worker
+                vec![pin(33), pin(22)], // changed authenticated owner
+                vec![pin(22), pin(11)], // reversed pair aliases the guest
+            ] {
+                assert!(
+                    registry
+                        .dispatch(&mut backend, &receive_prepare(role), &invalid, None)
+                        .is_err()
+                );
+                assert!(backend.calls.is_empty());
+                assert!(registry.0[&owner().thread].auxiliary.is_none());
+            }
             registry
-                .dispatch(&mut backend, &receive_prepare(role), &worker, None)
+                .dispatch(&mut backend, &receive_prepare(role), &pins, None)
                 .unwrap();
             assert!(
                 registry
-                    .dispatch(&mut backend, &collect(), &[], Some(&worker))
+                    .dispatch(&mut backend, &collect(), &[], Some(&pins))
                     .is_err()
             );
+            assert_eq!(backend.calls, ["register", "prepare receive"]);
+            // Unlike File above, the other valid Receive role has the same
+            // arity and must reach retained role equality.
+            let other_role = self::role(if kind == ReceiveKind::Drain {
+                ReceiveKind::Peek
+            } else {
+                ReceiveKind::Drain
+            });
+            assert!(other_role.valid());
             assert!(
                 registry
-                    .dispatch(&mut backend, &receive_collect(role), &[], Some(&[pin(33)]))
+                    .dispatch(&mut backend, &receive_collect(other_role), &[], Some(&pins))
+                    .is_err()
+            );
+            assert_eq!(backend.calls, ["register", "prepare receive"]);
+            assert!(
+                registry
+                    .dispatch(
+                        &mut backend,
+                        &receive_collect(role),
+                        &[],
+                        Some(&[pin(11), pin(33)])
+                    )
                     .is_err()
             );
             assert_eq!(backend.calls, ["register", "prepare receive"]);
             let reply: Reply = serde_json::from_slice(
                 &registry
-                    .dispatch(&mut backend, &receive_collect(role), &[], Some(&worker))
+                    .dispatch(&mut backend, &receive_collect(role), &[], Some(&pins))
                     .unwrap(),
             )
             .unwrap();
@@ -3329,7 +3415,7 @@ mod openat_auxiliary_tests {
             };
             assert_eq!(effect.raw.command.operation, role.operation());
             registry
-                .dispatch(&mut backend, &retire(), &[], Some(&worker))
+                .dispatch(&mut backend, &retire(), &[], Some(&pins))
                 .unwrap();
             assert_eq!(registry.active_count(), 0);
             assert_eq!(registry.0[&owner().thread].identity, pin(11));
@@ -3339,6 +3425,157 @@ mod openat_auxiliary_tests {
             );
         }
     }
+    #[test]
+    fn helper_receive_registers_owner_before_worker_and_preserves_owner_failure() {
+        for kind in [ReceiveKind::Drain, ReceiveKind::Peek] {
+            for outcome in [
+                Ok(ok("register owner")),
+                Ok(CallStatus {
+                    operation: "register owner".into(),
+                    returned: -1,
+                    errno: Some(libc::EIO),
+                }),
+                Ok(CallStatus {
+                    operation: "register owner".into(),
+                    returned: -1,
+                    errno: Some(libc::EEXIST),
+                }),
+                Err("owner registered then lost reply"),
+            ] {
+                let mut registry = Registrations::default();
+                let mut backend = Probe {
+                    owner_registration: Some(outcome.clone()),
+                    ..Default::default()
+                };
+                let role = role(kind);
+                let pins = [pin(11), pin(22)];
+                let result = registry.dispatch(&mut backend, &receive_prepare(role), &pins, None);
+                let succeeded = outcome
+                    .as_ref()
+                    .is_ok_and(|s| s.returned == 0 && s.errno.is_none());
+                assert_eq!(result.is_ok(), succeeded);
+                let receipt = &registry.0[&owner().thread];
+                assert_eq!(receipt.owner, owner());
+                assert_eq!(receipt.identity, pin(11));
+                assert!(receipt.last_allocator.is_none());
+                match &outcome {
+                    Ok(status) => {
+                        assert_eq!(receipt.outcome.as_ref(), Some(status));
+                        assert!(receipt.failure.is_none());
+                    }
+                    Err(error) => {
+                        assert!(receipt.outcome.is_none());
+                        assert_eq!(receipt.failure.as_deref(), Some(*error));
+                        assert_eq!(result.unwrap_err().to_string(), *error);
+                    }
+                }
+                if succeeded {
+                    let auxiliary = receipt.auxiliary.as_ref().unwrap();
+                    assert_eq!((auxiliary.identity, auxiliary.command), (pin(22), Some(91)));
+                    assert_eq!(
+                        backend.calls,
+                        ["register owner", "register", "prepare receive"]
+                    );
+                } else {
+                    assert!(receipt.auxiliary.is_none());
+                    assert_eq!(backend.calls, ["register owner"]);
+                }
+                let stored = (receipt.outcome.clone(), receipt.failure.clone());
+                let calls = backend.calls.clone();
+                assert!(
+                    registry
+                        .dispatch(&mut backend, &receive_prepare(role), &pins, None)
+                        .is_err()
+                );
+                assert_eq!(backend.calls, calls);
+                let receipt = &registry.0[&owner().thread];
+                assert_eq!((receipt.outcome.clone(), receipt.failure.clone()), stored);
+                assert_eq!(registry.active_count(), usize::from(succeeded));
+            }
+        }
+    }
+
+    #[test]
+    fn helper_receive_refuses_changed_owner_mm_and_other_owner_aliases_before_registration() {
+        for kind in [ReceiveKind::Drain, ReceiveKind::Peek] {
+            for case in 0..4 {
+                let mut registry = registry();
+                let mut backend = Probe::default();
+                let role = role(kind);
+                let mut request = receive_prepare(role);
+                let mut pins = [pin(11), pin(22)];
+                match case {
+                    0 => {
+                        // Valid request MM, but a different incarnation of the
+                        // already registered owner.
+                        let mut changed = owner();
+                        changed.mm = changed.mm.for_exec(changed.thread);
+                        request.owner = Some(changed);
+                        request.body =
+                            serde_json::to_vec(&Request::PrepareOriginalFileObservation {
+                                call: 17,
+                                mm: changed.mm.generation(),
+                                fd: 88,
+                                role,
+                            })
+                            .unwrap();
+                    }
+                    1 => {
+                        // A body MM that disagrees with its envelope owner.
+                        request.body =
+                            serde_json::to_vec(&Request::PrepareOriginalFileObservation {
+                                call: 17,
+                                mm: owner().mm.generation() + 1,
+                                fd: 88,
+                                role,
+                            })
+                            .unwrap();
+                    }
+                    2 | 3 => {
+                        let thread = DetTid::from_raw(32);
+                        let other = NetworkStreamOwner {
+                            thread,
+                            mm: crate::types::MmId::initial(thread),
+                        };
+                        registry.0.insert(
+                            thread,
+                            Registration {
+                                owner: other,
+                                identity: pin(33),
+                                outcome: Some(ok("other owner")),
+                                failure: None,
+                                active: None,
+                                last_allocator: None,
+                                auxiliary: None,
+                            },
+                        );
+                        pins[if case == 2 { 0 } else { 1 }] = pin(33);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    registry
+                        .dispatch(&mut backend, &request, &pins, None)
+                        .is_err(),
+                    "case {case}"
+                );
+                assert!(backend.calls.is_empty());
+                assert!(registry.0[&owner().thread].auxiliary.is_none());
+                assert_eq!(registry.0[&owner().thread].identity, pin(11));
+                // The rejection leaves the original usable custody intact.
+                registry
+                    .dispatch(
+                        &mut backend,
+                        &receive_prepare(role),
+                        &[pin(11), pin(22)],
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(backend.calls, ["register", "prepare receive"]);
+            }
+        }
+    }
+
     #[test]
     fn helper_receive_unknown_native_outcomes_latch_without_rearming_or_recollecting() {
         for kind in [ReceiveKind::Drain, ReceiveKind::Peek] {
@@ -3352,22 +3589,21 @@ mod openat_auxiliary_tests {
                     failed_retire: stage == 3,
                     ..Default::default()
                 };
-                let worker = [pin(22)];
-                let prepare =
-                    registry.dispatch(&mut backend, &receive_prepare(role), &worker, None);
+                let pins = [pin(11), pin(22)];
+                let prepare = registry.dispatch(&mut backend, &receive_prepare(role), &pins, None);
                 if stage <= 1 {
                     assert!(prepare.is_err());
                 } else {
                     prepare.unwrap();
                     let collect =
-                        registry.dispatch(&mut backend, &receive_collect(role), &[], Some(&worker));
+                        registry.dispatch(&mut backend, &receive_collect(role), &[], Some(&pins));
                     if stage == 2 {
                         assert!(collect.is_err());
                     } else {
                         collect.unwrap();
                         let result: Reply = serde_json::from_slice(
                             &registry
-                                .dispatch(&mut backend, &retire(), &[], Some(&worker))
+                                .dispatch(&mut backend, &retire(), &[], Some(&pins))
                                 .unwrap(),
                         )
                         .unwrap();
@@ -3377,7 +3613,23 @@ mod openat_auxiliary_tests {
                         ));
                     }
                 }
+                let expected: &[&str] = match stage {
+                    0 => &["register"],
+                    1 => &["register", "prepare receive"],
+                    2 => &["register", "prepare receive", "select", "collect"],
+                    3 => &["register", "prepare receive", "select", "collect", "retire"],
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    backend.calls, expected,
+                    "native stage {stage} was not reached"
+                );
                 let held = registry.0[&owner().thread].auxiliary.as_ref().unwrap();
+                assert_eq!(held.registration.is_some(), stage != 0);
+                assert_eq!(held.command, if stage <= 1 { None } else { Some(91) });
+                assert_eq!(held.completion, if stage <= 1 { None } else { Some(42) });
+                assert_eq!(held.completion_known, stage == 3);
+                assert_eq!(held.retirement_submitted, stage == 3);
                 assert_eq!(
                     (held.role, held.identity, held.call, held.request),
                     (role, pin(22), 17, 41)
@@ -3386,17 +3638,17 @@ mod openat_auxiliary_tests {
                 let calls = backend.calls.clone();
                 assert!(
                     registry
-                        .dispatch(&mut backend, &receive_prepare(role), &worker, None)
+                        .dispatch(&mut backend, &receive_prepare(role), &pins, None)
                         .is_err()
                 );
                 assert!(
                     registry
-                        .dispatch(&mut backend, &receive_collect(role), &[], Some(&worker))
+                        .dispatch(&mut backend, &receive_collect(role), &[], Some(&pins))
                         .is_err()
                 );
                 assert!(
                     registry
-                        .dispatch(&mut backend, &retire(), &[], Some(&worker))
+                        .dispatch(&mut backend, &retire(), &[], Some(&pins))
                         .is_err()
                 );
                 assert_eq!(backend.calls, calls);
@@ -3405,28 +3657,31 @@ mod openat_auxiliary_tests {
     }
     #[test]
     fn helper_receive_wrong_held_file_refuses_before_native_collection_and_keeps_owner() {
-        let mut registry = registry();
-        let mut backend = Probe {
-            wrong_file: true,
-            ..Default::default()
-        };
-        let role = role(ReceiveKind::Drain);
-        let worker = [pin(22)];
-        registry
-            .dispatch(&mut backend, &receive_prepare(role), &worker, None)
-            .unwrap();
-        assert!(
+        for kind in [ReceiveKind::Drain, ReceiveKind::Peek] {
+            let role = role(kind);
+            let mut registry = registry();
+            let mut backend = Probe {
+                wrong_file: true,
+                ..Default::default()
+            };
+            let pins = [pin(11), pin(22)];
             registry
-                .dispatch(&mut backend, &receive_collect(role), &[], Some(&worker))
-                .is_err()
-        );
-        assert!(
-            registry
-                .dispatch(&mut backend, &receive_collect(role), &[], Some(&worker))
-                .is_err()
-        );
-        assert_eq!(backend.calls, ["register", "prepare receive", "select"]);
-        assert_eq!(registry.active_count(), 1);
+                .dispatch(&mut backend, &receive_prepare(role), &pins, None)
+                .unwrap();
+            assert!(
+                registry
+                    .dispatch(&mut backend, &receive_collect(role), &[], Some(&pins))
+                    .is_err()
+            );
+            assert!(
+                registry
+                    .dispatch(&mut backend, &receive_collect(role), &[], Some(&pins))
+                    .is_err()
+            );
+            assert_eq!(backend.calls, ["register", "prepare receive", "select"]);
+            assert_eq!(registry.active_count(), 1);
+            assert_eq!(registry.0[&owner().thread].identity, pin(11));
+        }
     }
     #[test]
     fn original_openat_auxiliary_refuses_guest_role_completion_without_retrying() {

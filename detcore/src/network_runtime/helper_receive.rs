@@ -599,6 +599,7 @@ fn observe(
     work: &Execution,
     held: &Held,
     quarantine: &NativeQuarantine,
+    owner_task: &OwnedFd,
 ) -> io::Result<NativeObservation> {
     let initial = held.receipt();
     let scratch = Scratch::new(&initial.effect)?;
@@ -642,7 +643,12 @@ fn observe(
             fd: work.original.as_raw_fd(),
             role,
         },
-        || Ok(vec![task.as_fd().try_clone_to_owned()?]),
+        || {
+            Ok(vec![
+                owner_task.as_fd().try_clone_to_owned()?,
+                task.as_fd().try_clone_to_owned()?,
+            ])
+        },
     )?;
     held.state.lock().unwrap().receipt.prepare_request = Some(prepared);
     let Reply::Prepared(observed) = executor.block_on(controller.response(prepared))? else {
@@ -864,6 +870,7 @@ impl RuntimeShared {
         let quarantine = Arc::new(NativeQuarantine::default());
         let worker_quarantine = quarantine.clone();
         let worker_effect = effect.clone();
+        let owner_task = self.physical.lock().unwrap().get(owner)?.try_clone()?;
         let (worker, receive) = self.start_native_worker_with_quarantine(
             executor,
             None,
@@ -905,6 +912,7 @@ impl RuntimeShared {
                         &work,
                         &held,
                         &worker_quarantine,
+                        &owner_task,
                     )
                 })();
                 match &result {

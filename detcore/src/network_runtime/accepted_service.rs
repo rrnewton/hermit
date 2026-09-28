@@ -48,50 +48,50 @@ fn command_preparation(
         ));
     }
     let (prior, pins, outcome) = session.retained_request(prepared)?;
-    if prior.operation != operation
-        || prior.owner != envelope.owner
-        || prior.accept.is_some()
-        || pins.len() != 1
-    {
+    if prior.operation != operation || prior.owner != envelope.owner || prior.accept.is_some() {
         return Err(io::Error::other("original command changed retained target"));
     }
-    let expected = match (operation, serde_json::from_slice::<Request>(&prior.body)?) {
-        (Operation::PrepareOriginalConnect, Request::PrepareOriginalConnect { call, kind, .. }) => {
-            if let Request::CollectOriginalConnect {
-                kind: submitted, ..
-            } = serde_json::from_slice(&envelope.body)?
-            {
-                if submitted != kind {
-                    return Err(io::Error::other(
-                        "original completion changed prepared syscall kind",
-                    ));
+    let (expected, expected_pins) =
+        match (operation, serde_json::from_slice::<Request>(&prior.body)?) {
+            (
+                Operation::PrepareOriginalConnect,
+                Request::PrepareOriginalConnect { call, kind, .. },
+            ) => {
+                if let Request::CollectOriginalConnect {
+                    kind: submitted, ..
+                } = serde_json::from_slice(&envelope.body)?
+                {
+                    if submitted != kind {
+                        return Err(io::Error::other(
+                            "original completion changed prepared syscall kind",
+                        ));
+                    }
                 }
+                (call, 1)
             }
-            call
-        }
-        (
-            Operation::PrepareOriginalFileObservation,
-            Request::PrepareOriginalFileObservation { call, role, .. },
-        ) if role.valid() => {
-            if let Request::CollectOriginalFileObservation {
-                role: submitted, ..
-            } = serde_json::from_slice(&envelope.body)?
-            {
-                if submitted != role {
-                    return Err(io::Error::other(
-                        "auxiliary collection changed prepared role",
-                    ));
+            (
+                Operation::PrepareOriginalFileObservation,
+                Request::PrepareOriginalFileObservation { call, role, .. },
+            ) if role.valid() => {
+                if let Request::CollectOriginalFileObservation {
+                    role: submitted, ..
+                } = serde_json::from_slice(&envelope.body)?
+                {
+                    if submitted != role {
+                        return Err(io::Error::other(
+                            "auxiliary collection changed prepared role",
+                        ));
+                    }
                 }
+                (call, if role.is_receive() { 2 } else { 1 })
             }
-            call
-        }
-        (Operation::PrepareNativeBirth, Request::PrepareNativeBirth { call, .. }) => call,
-        _ => {
-            return Err(io::Error::other(
-                "original command names another preparation",
-            ));
-        }
-    };
+            (Operation::PrepareNativeBirth, Request::PrepareNativeBirth { call, .. }) => (call, 1),
+            _ => {
+                return Err(io::Error::other(
+                    "original command names another preparation",
+                ));
+            }
+        };
     let Reply::Prepared(observed) = serde_json::from_slice(
         outcome.ok_or_else(|| io::Error::other("original preparation remains unknown"))?,
     )?
@@ -100,7 +100,8 @@ fn command_preparation(
             "original command lacks preparation response",
         ));
     };
-    if expected != call
+    if pins.len() != expected_pins
+        || expected != call
         || observed.status.returned != 0
         || observed.status.errno.is_some()
         || observed.raw != command
@@ -157,7 +158,12 @@ fn copy_preparation(
             ));
         }
     };
-    command_preparation(session, envelope, call, command, prepared, operation)
+    let mut pins = command_preparation(session, envelope, call, command, prepared, operation)?;
+    // Read has one task; helper receive retains [owner, worker]. Project only
+    // the command target after validating that role's exact arity. These are
+    // duplicates: both original rights stay in transport custody, in order.
+    let command_pin = pins.pop().expect("validated copy preparation rights");
+    Ok(vec![command_pin])
 }
 
 // Read's copy/terminal ring join delays only submission of the existing
@@ -780,7 +786,7 @@ impl AcceptedProviderService {
             if prior.operation != Operation::PrepareOriginalFileObservation
                 || prior.owner != envelope.owner
                 || prior.accept.is_some()
-                || pins.len() != 1
+                || pins.len() != if role.is_receive() { 2 } else { 1 }
                 || !matches!(serde_json::from_slice::<Request>(&prior.body),
                     Ok(Request::PrepareOriginalFileObservation { call: c, role: r, .. }) if c == *call && r == *role && r.valid())
                 || !matches!(serde_json::from_slice::<Reply>(body.ok_or_else(|| io::Error::other("auxiliary preparation unresolved"))?),
@@ -1339,6 +1345,423 @@ impl AcceptedProviderService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network_replay::NetworkStreamOwner;
+    use crate::network_replay::original_connect::Kind;
+    use crate::network_runtime::PidfdIdentity;
+    use crate::network_runtime::ProviderWireFormat;
+    use crate::network_runtime::accepted_provider::AuxiliaryRole;
+    use crate::network_runtime::accepted_provider::CallStatus;
+    use crate::network_runtime::accepted_provider::Observation;
+    use crate::network_runtime::accepted_provider::ReceiveKind;
+
+    struct CopyTask {
+        pin: OwnedFd,
+        stop: Option<std::sync::mpsc::Sender<()>>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl CopyTask {
+        fn new() -> Self {
+            let (ready, task) = std::sync::mpsc::sync_channel(1);
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let join = std::thread::spawn(move || {
+                let raw = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_open,
+                        libc::syscall(libc::SYS_gettid),
+                        libc::O_EXCL,
+                    )
+                };
+                assert!(raw >= 0, "{}", io::Error::last_os_error());
+                ready
+                    .send(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+                    .unwrap();
+                let _ = stopped.recv_timeout(Duration::from_secs(30));
+            });
+            let pin = task.recv_timeout(Duration::from_secs(30)).unwrap();
+            Self {
+                pin,
+                stop: Some(stop),
+                join: Some(join),
+            }
+        }
+        fn exit(&mut self) {
+            self.stop.take();
+            if let Some(join) = self.join.take() {
+                join.join().unwrap();
+                // pthread_join observes the clear-tid wake before the kernel
+                // necessarily publishes PIDFD exit readiness. Establish the
+                // actual death premise independently of controller_exited;
+                // the test below must still check that production predicate.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut descriptor = libc::pollfd {
+                    fd: self.pin.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "test task PIDFD exit remains unknown");
+                    let result = unsafe {
+                        libc::poll(&mut descriptor, 1, remaining.as_millis().max(1) as i32)
+                    };
+                    if result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    assert_eq!(result, 1, "test task PIDFD exit remains unknown");
+                    assert_eq!(descriptor.revents & libc::POLLNVAL, 0);
+                    assert_ne!(descriptor.revents & libc::POLLIN, 0);
+                    break;
+                }
+            }
+        }
+    }
+    impl Drop for CopyTask {
+        fn drop(&mut self) {
+            self.exit();
+        }
+    }
+    struct CopyFixture {
+        controller: AcceptedSession,
+        service: AcceptedSession,
+        owner: CopyTask,
+        worker: CopyTask,
+        copy: Envelope,
+    }
+    fn copy_status() -> CallStatus {
+        CallStatus {
+            operation: "simulated preparation".into(),
+            returned: 0,
+            errno: None,
+        }
+    }
+    impl CopyFixture {
+        fn new(wire: ProviderWireFormat, operation: u64) -> Self {
+            let owner = CopyTask::new();
+            let worker = CopyTask::new();
+            assert_ne!(
+                PidfdIdentity::read(&owner.pin).unwrap(),
+                PidfdIdentity::read(&worker.pin).unwrap()
+            );
+            let mut pair = [-1; 2];
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(
+                        libc::AF_UNIX,
+                        libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                        0,
+                        pair.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            let mut controller =
+                AcceptedSession::from_wire(unsafe { OwnedFd::from_raw_fd(pair[0]) }, [7; 16], wire)
+                    .unwrap();
+            let mut service =
+                AcceptedSession::from_wire(unsafe { OwnedFd::from_raw_fd(pair[1]) }, [7; 16], wire)
+                    .unwrap();
+            let thread = crate::types::DetTid::from_raw(31);
+            let target = NetworkStreamOwner {
+                thread,
+                mm: crate::types::MmId::initial(thread),
+            };
+            let request = if operation == 11 {
+                Request::PrepareOriginalConnect {
+                    kind: Kind::Read,
+                    call: 17,
+                    mm: target.mm.generation(),
+                    fd: 88,
+                    address: 0x8000,
+                    length: 0,
+                    original_count: 1024,
+                }
+            } else {
+                assert!(matches!(operation, 21 | 22));
+                Request::PrepareOriginalFileObservation {
+                    call: 17,
+                    mm: target.mm.generation(),
+                    fd: 88,
+                    role: AuxiliaryRole::Receive {
+                        kind: if operation == 21 {
+                            ReceiveKind::Drain
+                        } else {
+                            ReceiveKind::Peek
+                        },
+                        address: 0x8000,
+                        count: if operation == 21 { 1 } else { 1024 },
+                        provider: 7,
+                        file: 19,
+                    },
+                }
+            };
+            let prepare = Envelope {
+                run: [7; 16],
+                sequence: 1,
+                owner: Some(target),
+                accept: None,
+                operation: if operation == 11 {
+                    Operation::PrepareOriginalConnect
+                } else {
+                    Operation::PrepareOriginalFileObservation
+                },
+                body: serde_json::to_vec(&request).unwrap(),
+            };
+            let pins = if operation == 11 {
+                vec![worker.pin.try_clone().unwrap()]
+            } else {
+                vec![
+                    owner.pin.try_clone().unwrap(),
+                    worker.pin.try_clone().unwrap(),
+                ]
+            };
+            assert_eq!(controller.prepare(prepare.clone(), pins).unwrap(), 1);
+            assert!(controller.try_send(1).unwrap());
+            assert!(matches!(
+                service.try_receive().unwrap(),
+                Some(Received::Request(1))
+            ));
+            let copy = Envelope {
+                sequence: 2,
+                operation: Operation::ReadOriginalCopy,
+                body: serde_json::to_vec(&Request::ReadOriginalCopy {
+                    call: 17,
+                    command: 91,
+                    prepared: 1,
+                    first: 0,
+                })
+                .unwrap(),
+                ..prepare
+            };
+            Self {
+                controller,
+                service,
+                owner,
+                worker,
+                copy,
+            }
+        }
+        fn reply(&mut self, response: Reply) {
+            // Simulate only the wire preparation premise. No physical provider,
+            // completion, copy manifest, or native success receipt is produced.
+            self.service
+                .dispatch(1, |_, _| {
+                    serde_json::to_vec(&response).map_err(io::Error::other)
+                })
+                .unwrap();
+            assert!(self.service.try_reply(1).unwrap());
+            assert!(matches!(
+                self.controller.try_receive().unwrap(),
+                Some(Received::Acknowledged(1))
+            ));
+        }
+        fn acknowledge(&mut self) {
+            self.reply(Reply::Prepared(Observation {
+                status: copy_status(),
+                raw: 91,
+            }));
+        }
+        fn custody(&self) -> Vec<(i32, PidfdIdentity)> {
+            self.service
+                .retained_request(1)
+                .unwrap()
+                .1
+                .iter()
+                .map(|pin| {
+                    assert!(unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFD) } >= 0);
+                    (pin.as_raw_fd(), PidfdIdentity::read(pin).unwrap())
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn copy_preparation_selects_command_worker_and_preserves_ordered_custody() {
+        for wire in [ProviderWireFormat::Abi7Copy4, ProviderWireFormat::Abi8Copy5] {
+            for operation in [11, 21, 22] {
+                let mut fixture = CopyFixture::new(wire, operation);
+                fixture.acknowledge();
+                let worker = PidfdIdentity::read(&fixture.worker.pin).unwrap();
+                let owner = PidfdIdentity::read(&fixture.owner.pin).unwrap();
+                assert_ne!(owner, worker);
+                let custody = fixture.custody();
+                let identities: Vec<_> = custody.iter().map(|(_, identity)| *identity).collect();
+                assert_eq!(
+                    identities,
+                    if operation == 11 {
+                        vec![worker]
+                    } else {
+                        vec![owner, worker]
+                    }
+                );
+                let selected =
+                    copy_preparation(&fixture.service, &fixture.copy, 17, 91, 1).unwrap();
+                assert_eq!(PidfdIdentity::read(&selected[0]).unwrap(), worker);
+                assert_eq!(selected.len(), 1);
+                assert!(!custody.iter().any(|(fd, _)| *fd == selected[0].as_raw_fd()));
+                assert_eq!(fixture.custody(), custody);
+                drop(selected);
+                assert_eq!(fixture.custody(), custody);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_preparation_liveness_follows_worker_for_both_owner_death_orders() {
+        for wire in [ProviderWireFormat::Abi7Copy4, ProviderWireFormat::Abi8Copy5] {
+            for operation in [21, 22] {
+                for worker_dead in [false, true] {
+                    let mut fixture = CopyFixture::new(wire, operation);
+                    fixture.acknowledge();
+                    let custody = fixture.custody();
+                    if worker_dead {
+                        fixture.worker.exit();
+                    } else {
+                        fixture.owner.exit();
+                    }
+                    assert_eq!(
+                        controller_exited(fixture.owner.pin.as_fd()).unwrap(),
+                        !worker_dead
+                    );
+                    assert_eq!(
+                        controller_exited(fixture.worker.pin.as_fd()).unwrap(),
+                        worker_dead
+                    );
+                    let worker = PidfdIdentity::read(&fixture.worker.pin).unwrap();
+                    // A native-operation double at the production selection
+                    // seam observes actual PIDFD liveness, not a canned result.
+                    let mut probed = None;
+                    let mut terminal_probe = |pin: &OwnedFd| {
+                        probed = Some(PidfdIdentity::read(pin).unwrap());
+                        controller_exited(pin.as_fd()).unwrap()
+                    };
+                    let selected =
+                        copy_preparation(&fixture.service, &fixture.copy, 17, 91, 1).unwrap();
+                    assert_eq!(terminal_probe(&selected[0]), worker_dead);
+                    assert_eq!(probed, Some(worker));
+                    drop(selected);
+                    assert_eq!(fixture.custody(), custody);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_preparation_rejects_changed_identity_role_arity_and_unresolved_preparation() {
+        for wire in [ProviderWireFormat::Abi7Copy4, ProviderWireFormat::Abi8Copy5] {
+            for operation in [11, 21, 22] {
+                for case in 0..17 {
+                    let mut fixture = CopyFixture::new(wire, operation);
+                    match case {
+                        6 => {} // admitted but not dispatched/acknowledged
+                        7 => {
+                            assert!(
+                                fixture
+                                    .service
+                                    .dispatch(1, |_, _| Err(io::Error::other(
+                                        "unknown preparation"
+                                    )))
+                                    .is_err()
+                            );
+                        }
+                        8 | 9 => fixture.reply(Reply::Prepared(Observation {
+                            status: CallStatus {
+                                returned: if case == 8 { -1 } else { 0 },
+                                errno: Some(libc::EIO),
+                                ..copy_status()
+                            },
+                            raw: 91,
+                        })),
+                        10 => fixture.reply(Reply::Retired),
+                        16 => fixture.reply(Reply::Prepared(Observation {
+                            status: copy_status(),
+                            raw: 92,
+                        })),
+                        _ => fixture.acknowledge(),
+                    }
+                    let mut call = 17;
+                    let mut command = 91;
+                    let mut prepared = 1;
+                    match case {
+                        0 => {
+                            let owner = fixture.copy.owner.as_mut().unwrap();
+                            owner.mm = owner.mm.for_exec(owner.thread);
+                        }
+                        1 => fixture.copy.owner = None,
+                        2 => {
+                            fixture.copy.accept =
+                                Some(crate::network_replay::NetworkAcceptLeaseId(1))
+                        }
+                        3 => call += 1,
+                        4 => command += 1,
+                        5 => prepared += 10,
+                        11 => fixture
+                            .service
+                            .mutate_retained_request_for_test(1, |prior, pins| {
+                                if operation == 11 {
+                                    let mut request: Request =
+                                        serde_json::from_slice(&prior.body).unwrap();
+                                    let Request::PrepareOriginalConnect { kind, .. } = &mut request
+                                    else {
+                                        unreachable!()
+                                    };
+                                    *kind = Kind::Connect;
+                                    prior.body = serde_json::to_vec(&request).unwrap();
+                                } else {
+                                    let mut request: Request =
+                                        serde_json::from_slice(&prior.body).unwrap();
+                                    let Request::PrepareOriginalFileObservation { role, .. } =
+                                        &mut request
+                                    else {
+                                        unreachable!()
+                                    };
+                                    *role = AuxiliaryRole::File;
+                                    prior.body = serde_json::to_vec(&request).unwrap();
+                                    pins.remove(0); // valid File arity, still no receive authority
+                                }
+                            }),
+                        12 => fixture
+                            .service
+                            .mutate_retained_request_for_test(1, |_, pins| {
+                                pins.pop();
+                            }),
+                        13 => fixture
+                            .service
+                            .mutate_retained_request_for_test(1, |_, pins| {
+                                pins.push(pins.last().unwrap().try_clone().unwrap());
+                            }),
+                        14 => fixture
+                            .service
+                            .mutate_retained_request_for_test(1, |prior, _| {
+                                let mut request: Request =
+                                    serde_json::from_slice(&prior.body).unwrap();
+                                match &mut request {
+                                    Request::PrepareOriginalConnect { call, .. }
+                                    | Request::PrepareOriginalFileObservation { call, .. } => {
+                                        *call += 1
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                prior.body = serde_json::to_vec(&request).unwrap();
+                            }),
+                        15 => fixture
+                            .service
+                            .mutate_retained_request_for_test(1, |prior, _| {
+                                prior.operation = Operation::PrepareNativeBirth
+                            }),
+                        _ => {}
+                    }
+                    let custody = fixture.custody();
+                    assert!(
+                        copy_preparation(&fixture.service, &fixture.copy, call, command, prepared)
+                            .is_err(),
+                        "case {case}, operation {operation}"
+                    );
+                    assert_eq!(fixture.custody(), custody);
+                }
+            }
+        }
+    }
 
     #[test]
     fn provider_maintenance_is_fast_only_for_active_transactions() {

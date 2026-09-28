@@ -105,6 +105,20 @@ pub(super) struct Envelope {
     /// correlation and rights check. This is not portable network trace data.
     pub body: Vec<u8>,
 }
+impl Envelope {
+    fn expected_rights(&self) -> Option<usize> {
+        if self.operation == Operation::PrepareOriginalFileObservation {
+            return match serde_json::from_slice::<super::accepted_provider::Request>(&self.body) {
+                Ok(super::accepted_provider::Request::PrepareOriginalFileObservation {
+                    role,
+                    ..
+                }) if role.valid() => Some(if role.is_receive() { 2 } else { 1 }),
+                _ => None,
+            };
+        }
+        Some(self.operation.rights())
+    }
+}
 
 /// Exact consumed read-only reply. It contains no nested request body and no
 /// descriptor capability, so one retained receipt has bounded size.
@@ -215,7 +229,9 @@ impl<T> Outbox<T> {
         rights: Vec<T>,
     ) -> Result<u64, (io::Error, Vec<T>)> {
         // Failure returns ownership rather than letting temporary arguments drop.
-        if envelope.operation == Operation::Reply || rights.len() != envelope.operation.rights() {
+        if envelope.operation == Operation::Reply
+            || envelope.expected_rights() != Some(rights.len())
+        {
             return Err((protocol("accepted request rights shape mismatch"), rights));
         }
         let Some(next) = self.next.checked_add(1) else {
@@ -489,7 +505,6 @@ fn validate_file_observation_group_for_version(
     };
     if p.sequence != prepared
         || c.sequence != completed
-        || *pr != 1
         || *cr != 0
         || p.owner != Some(owner)
         || c.owner != Some(owner)
@@ -514,7 +529,13 @@ fn validate_file_observation_group_for_version(
     let Reply::Prepared(armed) = serde_json::from_slice(pb)? else {
         return Err(protocol("auxiliary preparation changed result"));
     };
-    if pc != call
+    if *pr
+        != if role == super::accepted_provider::AuxiliaryRole::File {
+            1
+        } else {
+            2
+        }
+        || pc != call
         || mm != owner.mm.generation()
         || fd < 0
         || armed.raw == 0
@@ -2169,6 +2190,18 @@ impl AcceptedSession {
         };
         Ok((&entry.envelope, &entry.rights, outcome))
     }
+
+    /// Corrupt already admitted custody to exercise service guards which the
+    /// real receive boundary normally protects. Never admits production input.
+    #[cfg(test)]
+    pub(super) fn mutate_retained_request_for_test(
+        &mut self,
+        sequence: u64,
+        change: impl FnOnce(&mut Envelope, &mut Vec<OwnedFd>),
+    ) {
+        let entry = self.incoming.entries.get_mut(&sequence).unwrap();
+        change(&mut entry.envelope, &mut entry.rights);
+    }
     pub(super) fn retain_read_copy(
         &mut self,
         completed: u64,
@@ -2366,7 +2399,7 @@ impl AcceptedSession {
         );
         let valid = parsed
             .as_ref()
-            .is_ok_and(|e| e.run == self.run && e.operation.rights() == raw.rights.len())
+            .is_ok_and(|e| e.run == self.run && e.expected_rights() == Some(raw.rights.len()))
             && raw.control_valid
             && raw.flags == libc::MSG_CMSG_CLOEXEC;
         if !valid {
@@ -2927,6 +2960,151 @@ mod tests {
         assert_eq!(session.quarantine[0].flags, libc::MSG_CMSG_CLOEXEC);
         assert!(session.incoming.entries.is_empty());
     }
+    #[test]
+    fn accepted_native_receive_role_arity_preserves_rejected_rights_and_sequence() {
+        use crate::network_replay::original_connect::Kind;
+        use crate::network_runtime::ProviderWireFormat;
+        use crate::network_runtime::accepted_provider::AuxiliaryRole;
+        use crate::network_runtime::accepted_provider::ReceiveKind;
+        use crate::network_runtime::accepted_provider::Request;
+
+        for wire in [ProviderWireFormat::Abi7Copy4, ProviderWireFormat::Abi8Copy5] {
+            for role in [
+                None,
+                Some(AuxiliaryRole::File),
+                Some(AuxiliaryRole::Receive {
+                    kind: ReceiveKind::Drain,
+                    address: 0x8000,
+                    count: 1,
+                    provider: 7,
+                    file: 19,
+                }),
+                Some(AuxiliaryRole::Receive {
+                    kind: ReceiveKind::Peek,
+                    address: 0x8000,
+                    count: 1024,
+                    provider: 7,
+                    file: 19,
+                }),
+            ] {
+                let mut request = envelope();
+                let thread = crate::types::DetTid::from_raw(31);
+                request.owner = Some(NetworkStreamOwner {
+                    thread,
+                    mm: crate::types::MmId::initial(thread),
+                });
+                let mm = request.owner.unwrap().mm.generation();
+                request.operation = if role.is_some() {
+                    Operation::PrepareOriginalFileObservation
+                } else {
+                    Operation::PrepareOriginalConnect
+                };
+                request.body = serde_json::to_vec(&match role {
+                    Some(role) => Request::PrepareOriginalFileObservation {
+                        call: 17,
+                        mm,
+                        fd: 88,
+                        role,
+                    },
+                    None => Request::PrepareOriginalConnect {
+                        kind: Kind::Read,
+                        call: 17,
+                        mm,
+                        fd: 88,
+                        address: 0x8000,
+                        length: 0,
+                        original_count: 1024,
+                    },
+                })
+                .unwrap();
+                let expected = if role.is_some_and(AuxiliaryRole::is_receive) {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(request.expected_rights(), Some(expected));
+                for count in 0..=3 {
+                    let mut outbox = Outbox {
+                        wire_format: wire,
+                        ..Outbox::default()
+                    };
+                    let rights: Vec<_> = (0..count).map(|_| native_memfd(c"arity-owner")).collect();
+                    let identities = rights.iter().map(native_identity).collect::<Vec<_>>();
+                    let raw_fds = rights.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+                    if count == expected {
+                        assert_eq!(outbox.prepare(request.clone(), rights).unwrap(), 1);
+                        assert_eq!(outbox.next, 2);
+                        assert_eq!(
+                            outbox.entries[&1]
+                                .rights
+                                .iter()
+                                .map(native_identity)
+                                .collect::<Vec<_>>(),
+                            identities
+                        );
+                        continue;
+                    }
+                    let (_, returned) = outbox.prepare(request.clone(), rights).unwrap_err();
+                    assert!(outbox.entries.is_empty());
+                    assert_eq!(outbox.next, 1);
+                    assert_eq!(
+                        returned.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+                        raw_fds
+                    );
+                    assert_eq!(
+                        returned.iter().map(native_identity).collect::<Vec<_>>(),
+                        identities
+                    );
+
+                    // Send the malformed arity through the real SCM receive
+                    // boundary, bypassing only the sender's rejecting Outbox.
+                    let (sender, receiver) = native_pair();
+                    let mut session =
+                        AcceptedSession::from_wire(receiver, request.run, wire).unwrap();
+                    let bytes = encode(&request).unwrap();
+                    if returned.is_empty() {
+                        assert_eq!(
+                            unsafe {
+                                libc::send(
+                                    sender.as_raw_fd(),
+                                    bytes.as_ptr().cast(),
+                                    bytes.len(),
+                                    libc::MSG_NOSIGNAL,
+                                )
+                            },
+                            bytes.len() as isize
+                        );
+                    } else {
+                        native_send(&sender, &bytes, &returned);
+                    }
+                    drop(returned);
+                    assert!(session.try_receive().is_err());
+                    assert!(session.incoming.entries.is_empty());
+                    assert!(
+                        session
+                            .dispatch(request.sequence, |_, _| panic!(
+                                "malformed arity dispatched"
+                            ))
+                            .is_err()
+                    );
+                    assert_eq!(session.quarantine.len(), 1);
+                    assert_eq!(
+                        session.quarantine[0]
+                            .rights
+                            .iter()
+                            .map(native_identity)
+                            .collect::<Vec<_>>(),
+                        identities
+                    );
+                    let valid = (0..expected)
+                        .map(|_| native_memfd(c"valid-arity-owner"))
+                        .collect();
+                    assert_eq!(outbox.prepare(request.clone(), valid).unwrap(), 1);
+                }
+            }
+        }
+    }
+
     #[test]
     fn accepted_native_wrong_arity_and_truncated_payload_keep_every_delivered_right() {
         let (sender, receiver) = native_pair();
@@ -6069,7 +6247,7 @@ mod helper_receive_transport_tests {
                     raw: 91,
                 }))
                 .unwrap(),
-                1,
+                2,
             ),
             (
                 collect,
@@ -6132,11 +6310,9 @@ mod helper_receive_transport_tests {
         rights: usize,
     ) {
         let sequence = envelope.sequence;
-        let pins: Vec<OwnedFd> = if rights == 1 {
-            vec![std::fs::File::open("/dev/null").unwrap().into()]
-        } else {
-            vec![]
-        };
+        let pins: Vec<OwnedFd> = (0..rights)
+            .map(|_| std::fs::File::open("/dev/null").unwrap().into())
+            .collect();
         let sent = pins.iter().map(|fd| fd.try_clone().unwrap()).collect();
         assert_eq!(outbox.prepare(envelope.clone(), sent).unwrap(), sequence);
         outbox.entries.get_mut(&sequence).unwrap().state = SendState::Submitted;
@@ -6182,8 +6358,10 @@ mod helper_receive_transport_tests {
                 let result = session.retain_read_copy(2, records);
                 assert_eq!(result.is_ok(), wire == ProviderWireFormat::Abi7Copy4);
                 if wire == ProviderWireFormat::Abi8Copy5 {
-                    let pin = session.incoming.entries[&1].rights[0].as_raw_fd();
-                    assert!(unsafe { libc::fcntl(pin, libc::F_GETFD) } >= 0);
+                    assert_eq!(session.incoming.entries[&1].rights.len(), 2);
+                    for pin in &session.incoming.entries[&1].rights {
+                        assert!(unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFD) } >= 0);
+                    }
                     assert!(!session.incoming.entries[&2].read_copy_finalized);
                     assert!(session.incoming.entries[&1].read_copy.is_none());
                     assert!(
@@ -6248,9 +6426,16 @@ mod helper_receive_transport_tests {
                     ))
                     .is_err()
             );
-            assert_eq!(session.incoming.entries[&1].rights.len(), 1);
-            let retained_pin = session.incoming.entries[&1].rights[0].as_raw_fd();
-            assert!(unsafe { libc::fcntl(retained_pin, libc::F_GETFD) } >= 0);
+            assert_eq!(session.incoming.entries[&1].rights.len(), 2);
+            let retained_pins: Vec<_> = session.incoming.entries[&1]
+                .rights
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect();
+            assert_ne!(retained_pins[0], retained_pins[1]);
+            for pin in &retained_pins {
+                assert!(unsafe { libc::fcntl(*pin, libc::F_GETFD) } >= 0);
+            }
             assert!(matches!(
                 session.incoming.entries[&2].command_ack,
                 CommandAckState::Unsubmitted
@@ -6350,8 +6535,10 @@ mod helper_receive_transport_tests {
             session.incoming.retire_sent_original_ack(5).unwrap();
             assert!(session.incoming.entries.is_empty());
             assert!(session.outgoing.entries.is_empty());
-            assert_eq!(unsafe { libc::fcntl(retained_pin, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            for pin in retained_pins {
+                assert_eq!(unsafe { libc::fcntl(pin, libc::F_GETFD) }, -1);
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            }
         }
     }
     #[test]
