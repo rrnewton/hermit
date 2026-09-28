@@ -228,8 +228,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
     // controls retain all 783 prior identities.
-    ("test.detcore_unit", 797),
-    ("test.detcore_misc", 27),
+    // Exact `-p hermit-detcore --lib --bins` listing: 798 identities, including
+    // wait4_argument_validation_follows_linux_precedence.
+    ("test.detcore_unit", 798),
+    // Exact tests_misc listing with the node's five skips: 28 matching
+    // identities, including wait4_argument_errors_match_linux_and_preserve_children.
+    ("test.detcore_misc", 28),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
@@ -255,9 +259,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 27),
+    // The host node carries the identical 28-test tests_misc selection.
+    ("test.detcore_misc_on_host", 28),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 797),
+    // The host node carries the identical 798-test library/binary selection.
+    ("test.detcore_unit_on_host", 798),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 750),
