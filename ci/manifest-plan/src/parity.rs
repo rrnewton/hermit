@@ -1735,7 +1735,7 @@ pub struct ParityGoldenSidecar {
     pub binary_sha256: Option<String>,
     pub outcome: String,
     pub artifact_dir: String,
-    /// The retained log the golden was taken from.
+    /// The retained log the golden was taken from, as an absolute path.
     pub source_log: String,
     pub log_sha256: String,
     pub log_bytes: u64,
@@ -1771,6 +1771,10 @@ fn plain_relative(test_id: &str, suffix: &str) -> Result<PathBuf, String> {
 /// One side of a comparison, hashed when it was chosen.
 #[derive(Clone, Debug)]
 struct Operand {
+    /// Absolute: resolved against this process's working directory when the
+    /// operand was chosen ([`hashed`]), so it names the same file for a
+    /// log-diff child running in the artifacts directory and for a later
+    /// reader of `parity.jsonl`, which records no working directory.
     log: PathBuf,
     sha256: String,
     bytes: u64,
@@ -2115,16 +2119,17 @@ fn independent_of_cwd(path: &Path) -> Result<PathBuf, String> {
     })
 }
 
-/// A program path as [`independent_of_cwd`] resolves it, except that a bare
-/// name stays bare so `PATH` still finds it.
+/// A program path as [`independent_of_cwd`] resolves it, except that a name
+/// with no `/` byte stays as spelled so `PATH` still finds it. That is the
+/// exec rule (`execvp`, and `std::process::Command`'s own classification):
+/// any name containing a `/`, such as `hermit/` or `./hermit`, is used as a
+/// path and never searched for.
 fn program_independent_of_cwd(program: &Path) -> Result<PathBuf, String> {
-    if program
-        .parent()
-        .is_some_and(|parent| parent.as_os_str().is_empty())
-    {
-        Ok(program.to_path_buf())
-    } else {
+    use std::os::unix::ffi::OsStrExt;
+    if program.as_os_str().as_bytes().contains(&b'/') {
         independent_of_cwd(program)
+    } else {
+        Ok(program.to_path_buf())
     }
 }
 
@@ -2333,7 +2338,7 @@ fn reference_golden(
             binary_sha256: row.binary_sha256.clone(),
             outcome: row.outcome.clone(),
             artifact_dir: row.artifact_dir.clone(),
-            source_log: path_text(&source),
+            source_log: path_text(&independent_of_cwd(&source)?),
             log_sha256: operand.sha256.clone(),
             log_bytes: operand.bytes,
             guest_inputs,
@@ -2406,18 +2411,17 @@ fn compare(
     let _ = fs::remove_file(&json);
     // The child runs in the artifacts directory, so each path it is handed
     // must not depend on this process's working directory: a relative
-    // `--results`, `E2E_RESULT_ROOT`, `--artifacts` or `HERMIT_BIN` would
-    // otherwise resolve a second time below the artifacts directory.
+    // `--results`, `--artifacts`, `E2E_RESULT_ROOT` or `HERMIT_BIN` would
+    // otherwise resolve a second time below the artifacts directory. The two
+    // logs are operands, which are absolute already.
     let spawn_paths = (|| {
         Ok::<_, String>((
             program_independent_of_cwd(&config.hermit_bin)?,
-            independent_of_cwd(&comparison.reference.log)?,
-            independent_of_cwd(&comparison.candidate.log)?,
             independent_of_cwd(&json)?,
             independent_of_cwd(&config.artifacts)?,
         ))
     })();
-    let (program, reference, candidate, report_path, child_dir) = match spawn_paths {
+    let (program, report_path, child_dir) = match spawn_paths {
         Ok(paths) => paths,
         Err(error) => return unavailable(error),
     };
@@ -2426,8 +2430,8 @@ fn compare(
     let (status, stderr) = match run_bounded(
         Command::new(&program)
             .arg("log-diff")
-            .arg(&reference)
-            .arg(&candidate)
+            .arg(&comparison.reference.log)
+            .arg(&comparison.candidate.log)
             .arg("--json")
             .arg(&report_path)
             .args(["--record-envelope", PARITY_RECORD_ENVELOPE])
@@ -2551,6 +2555,7 @@ fn run_bounded(
 }
 
 fn hashed(path: &Path, epoch: Option<String>) -> Result<Operand, String> {
+    let path = &independent_of_cwd(path)?;
     let mut file =
         fs::File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut digest = Sha256::new();
@@ -4562,10 +4567,14 @@ mod tests {
         relative.join(path.strip_prefix("/").unwrap())
     }
 
-    /// A relative artifacts directory and a relative hermit, as a relative
-    /// `--results`, `E2E_RESULT_ROOT` or `HERMIT_BIN` gives, are measured
-    /// exactly as their absolute spellings are: the comparison runs in the
-    /// artifacts directory and must not resolve them a second time below it.
+    /// Relative spellings of every path the post-pass is handed are measured
+    /// exactly as their absolute spellings are: a relative artifacts
+    /// directory (a relative `--results` or `--artifacts`), relative retained
+    /// log directories in the rows' `--verify-log-dir` (a relative
+    /// `E2E_RESULT_ROOT`) and a relative hermit (`HERMIT_BIN`). The comparison
+    /// runs in the artifacts directory and must not resolve any of them a
+    /// second time below it, and the records name both logs by absolute
+    /// paths, because `parity.jsonl` records no working directory.
     #[test]
     fn relative_artifacts_and_hermit_paths_are_still_measured() {
         // Deeper than the working directory, so that resolving the relative
@@ -4578,11 +4587,21 @@ mod tests {
             std::process::id()
         ));
         let fixture = Fixture::new(&label);
-        let rows = vec![
+        let mut rows = vec![
             fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/one", "kvm", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/one", "liteinst", 1, "PASS", Some(DIVERGENT)),
         ];
+        for row in &mut rows {
+            let flag = row
+                .argv
+                .iter()
+                .position(|arg| arg == VERIFY_LOG_DIR_FLAG)
+                .unwrap();
+            let logs = relative_to_cwd(Path::new(&row.argv[flag + 1]));
+            assert!(logs.is_relative() && logs.is_dir(), "{}", logs.display());
+            row.argv[flag + 1] = path_text(&logs);
+        }
         let scope = BTreeSet::from([
             parity_cell("fx/one", ParityBackend::Kvm),
             parity_cell("fx/one", ParityBackend::Liteinst),
@@ -4590,6 +4609,13 @@ mod tests {
         let artifacts = relative_to_cwd(&fixture.artifacts());
         let relative_hermit = relative_to_cwd(&fixture.hermit);
         assert!(artifacts.is_relative() && relative_hermit.is_relative());
+        // Each recorded path is absolute and names the file it was measured
+        // from.
+        let absolute_file = |path: Option<&str>| {
+            let path = Path::new(path.expect("a measured record names both logs"));
+            assert!(path.is_absolute() && path.is_file(), "{}", path.display());
+            fs::read(path).unwrap()
+        };
         // The absolute hermit isolates the logs and the report path; the
         // relative one adds the program path.
         for (pass, hermit) in [fixture.hermit.clone(), relative_hermit].iter().enumerate() {
@@ -4611,9 +4637,54 @@ mod tests {
             );
             assert_eq!(fixture.log_diff_calls(), 2 * (pass + 1));
             assert_eq!(read_records(&config.output), report.records);
+            for (record, candidate) in report.records.iter().zip([REFERENCE, DIVERGENT]) {
+                assert_eq!(
+                    absolute_file(record.reference_log.as_deref()),
+                    REFERENCE.as_bytes()
+                );
+                assert_eq!(
+                    absolute_file(record.candidate_log.as_deref()),
+                    candidate.as_bytes()
+                );
+            }
+            let (_, sidecar) = golden_paths(&config.output_dir, "fx/one").unwrap();
+            let sidecar: ParityGoldenSidecar =
+                serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
+            assert_eq!(
+                absolute_file(Some(&sidecar.source_log)),
+                REFERENCE.as_bytes()
+            );
         }
         drop(fixture);
         let _ = fs::remove_dir_all(&top);
+    }
+
+    /// A program name with no `/` stays as spelled, so `PATH` still finds
+    /// it; any name containing a `/` is a path, as exec treats it, and is
+    /// resolved against this process's working directory.
+    #[test]
+    fn only_a_program_name_without_a_slash_is_left_for_path() {
+        let cwd = std::env::current_dir().unwrap();
+        for bare in ["hermit", "hermit-2.0"] {
+            assert_eq!(
+                program_independent_of_cwd(Path::new(bare)).unwrap(),
+                Path::new(bare)
+            );
+        }
+        for (spelled, resolved) in [
+            ("./hermit", cwd.join("hermit")),
+            ("bin/hermit", cwd.join("bin/hermit")),
+            ("hermit/", cwd.join("hermit/")),
+            ("/opt/hermit", PathBuf::from("/opt/hermit")),
+        ] {
+            let program = program_independent_of_cwd(Path::new(spelled)).unwrap();
+            assert!(program.is_absolute(), "{spelled}: {}", program.display());
+            assert_eq!(
+                path_text(&program),
+                path_text(&resolved),
+                "{spelled} keeps its meaning"
+            );
+        }
     }
 
     fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
