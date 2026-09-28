@@ -13678,6 +13678,22 @@ fn recorded_shell_quote(value: &str) -> String {
 #[cfg(test)]
 static HISTORY_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serialize tests that share process-wide fixture state.
+///
+/// The lock guards no data: it only orders tests that change the environment
+/// (HistoryFixtureEnvironment) or the working directory (RestoreCwd), and both
+/// guards restore that state in `Drop`, including while a panic unwinds. A
+/// poisoned lock therefore means only that an earlier test failed, and that
+/// test already reports its own failure. Recovering the guard lets every later
+/// test report its own verdict instead of a PoisonError; run 36485831200 turned
+/// one missing-corpus failure into 15 failures this way.
+#[cfg(test)]
+fn history_fixture_lock() -> std::sync::MutexGuard<'static, ()> {
+    HISTORY_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct HistoryFixtureEnvironment {
     previous: [Option<std::ffi::OsString>; 2],
 }
@@ -24992,7 +25008,7 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn self_test_corpus_retains_the_complete_archived_input() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -25024,7 +25040,7 @@ mod catalogue_ledger_tests {
     fn self_test_corpus_requires_exact_committed_objects_and_identity() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -25357,7 +25373,7 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn exact_archive_and_parent_lock_are_required_before_history_changes() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -26059,7 +26075,7 @@ mod post_verdict_transaction_tests {
     }
 
     fn catalogue_retirement_fixture(include_parity: bool) {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         if include_parity {
             let measured = fixture.options.results_head.as_deref().unwrap();
@@ -26291,7 +26307,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn import_retires_bound_ordinary_comparison_without_losing_provenance() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let row = result_row(&fixture.options.expected_head);
         fs::write(
@@ -26450,7 +26466,7 @@ mod post_verdict_transaction_tests {
             );
             return;
         }
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let mut tracked = fixture.cells();
         let heads = [
@@ -26589,7 +26605,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn identical_current_rows_retain_one_binding_and_one_comparison() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let row = result_row(&fixture.options.expected_head);
         let raw = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
@@ -26641,7 +26657,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn retained_bindings_and_current_retry_events_reconcile_together() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let retained = fixture.cells();
@@ -26744,7 +26760,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn attempt_bindings_survive_normal_projection_and_current_ingestion() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let first = comparison_attempt_bindings(&fixture.cells())
@@ -26812,7 +26828,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn selected_custom_attempts_publish_without_becoming_comparable_cells() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let comparable = serde_json::to_value(fixture.cells().cells).unwrap();
@@ -27146,7 +27162,7 @@ mod post_verdict_transaction_tests {
     /// only the audit projected from the raw row publishes.
     #[test]
     fn declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let reason = DECLARED_EXIT_REASON;
@@ -27388,7 +27404,7 @@ mod post_verdict_transaction_tests {
     /// event projected from that row is accepted.
     #[test]
     fn observe_results_reconciles_declared_guest_exits_with_committed_series() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let head = fixture.options.expected_head.clone();
         let (id, row) = declared_exit_row(&head);
@@ -27479,7 +27495,7 @@ mod post_verdict_transaction_tests {
     /// contradiction and aborts the fold rather than being kept as red.
     #[test]
     fn a_retained_failed_match_refuses_what_the_runner_cannot_write() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -27605,7 +27621,7 @@ mod post_verdict_transaction_tests {
     /// admits the sibling.
     #[test]
     fn a_matched_attempt_the_runner_failed_is_retained_red_beside_a_valid_sibling() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -27728,7 +27744,7 @@ mod post_verdict_transaction_tests {
     /// readers refuse it rather than retaining it.
     #[test]
     fn a_matched_attempt_counts_only_if_the_runner_passed_it() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, mut declared) = declared_exit_row(&measured);
@@ -28123,7 +28139,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn invalid_snapshot_refuses_before_history_work_but_after_publication_authority() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let ledger = directory.path().join("ledger");
@@ -28188,7 +28204,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn two_head_writeback_preserves_attribution_and_refuses_unbound_or_moving_inputs() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let invoker = fixture.options.expected_head.clone();
