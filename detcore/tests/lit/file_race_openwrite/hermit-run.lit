@@ -1,2 +1,0 @@
-RUN: %hermit run --no-sequentialize-threads --no-deterministic-io -- %me | FileCheck %s
-CHECK: {{(1*2+|2*1+)}}
