@@ -225,12 +225,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The release-profile GlobalTime behind-baseline refusal test retains all
     // 623 prior identities.
     // The failed_match series-evidence test retains all 624 prior identities.
-    ("test.regular_crates", 625),
+    // Three log-diff matched-prefix tests from d550979ad (hermit-cli's
+    // logdiff_report.rs is compiled into manifest-plan through a #[path]
+    // include) and fifteen parity-cell derivation tests from 71b5bca69 join
+    // the 625 prior identities (643). The ptrace-parity removal in b9ec113b5
+    // and b280bc480 then deletes five parity-reference tests and adds two.
+    ("test.regular_crates", 640),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
     // retain all 750 prior identities in the prepared Nextest inventory.
+    // Four log-diff matched-prefix tests from d550979ad retain all 753 prior
+    // identities.
     ("test.hermit_unit", 757),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -245,6 +252,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
+    // The log-diff matched-prefix count test from d550979ad retains all 807
+    // prior identities.
     ("test.detcore_unit", 808),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
@@ -286,7 +295,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 625),
+    ("test.regular_crates_on_host", 640),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
