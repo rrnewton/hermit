@@ -482,6 +482,7 @@ impl StartOpts {
                 self.network_deployment.roots()?,
                 self.network_deployment.accepted_root(),
                 site,
+                record_timeout,
                 move |(_, identity, prepared, _), resource| {
                     let _guard = record_global.init_tracing();
                     let command = options.guest_command()?;
@@ -567,6 +568,7 @@ impl StartOpts {
                 self.network_deployment.roots()?,
                 self.network_deployment.accepted_root(),
                 "record_verify.record",
+                record_timeout,
                 move |(_, identity, _, _, prepared), resource| {
                     let _guard = record_global.init_tracing();
 
@@ -622,6 +624,7 @@ impl StartOpts {
                 self.network_deployment.accepted_root(),
                 "record_verify.replay",
                 None,
+                record_timeout,
                 move |(_, _, _, _, prepared), resource, listener| {
                     if listener.is_some() {
                         return Err(Error::msg("autopilot received a debugger listener"));
@@ -710,6 +713,7 @@ impl StartOpts {
             self.network_deployment.roots()?,
             self.network_deployment.accepted_root(),
             "record_verify_debug.record",
+            record_timeout,
             move |(_, identity, prepared), resource| {
                 let _guard = record_global.init_tracing();
 
@@ -793,6 +797,7 @@ impl StartOpts {
                 self.network_deployment.accepted_root(),
                 "record_verify_debug.replay",
                 Some(gdb_listener),
+                record_timeout,
                 move |(_, _, _, prepared), resource, listener| {
                     let _guard = replay_global.init_tracing();
                     let prepared_replay = prepared

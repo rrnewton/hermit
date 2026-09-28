@@ -88,6 +88,7 @@ impl ReplayOpts {
                 self.network_deployment.accepted_root(),
                 "with_container",
                 gdb_listener,
+                None,
                 move |(_, _, prepared), resource, listener| {
                     let prepared_replay = prepared
                         .take()
@@ -156,6 +157,7 @@ impl ReplayOpts {
                     self.network_deployment.accepted_root(),
                     "with_container",
                     gdb_listener,
+                    None,
                     move |(_, _, _, prepared), resource, listener| {
                         let prepared_replay = prepared.take().ok_or_else(|| {
                             Error::msg("replay trace reservation was consumed twice")

@@ -510,6 +510,7 @@ pub(super) fn run(
         "with_container",
         None,
         None,
+        None,
         |resource, _| execute(resource),
     )
 }
@@ -527,6 +528,7 @@ pub(super) fn run_record(
         false,
         true,
         "with_container",
+        None,
         None,
         None,
         |resource, _| execute(resource),
@@ -549,6 +551,7 @@ pub(super) fn run_replay(
         "with_container",
         None,
         None,
+        None,
         |resource, _| execute(resource),
     )
 }
@@ -566,6 +569,7 @@ pub(super) fn run_record_at(
         false,
         true,
         site,
+        None,
         None,
         None,
         |resource, _| execute(resource),
@@ -591,6 +595,7 @@ pub(super) fn run_replay_at(
         site,
         listener,
         None,
+        None,
         execute,
     )
 }
@@ -604,6 +609,7 @@ fn run_owned_with_guards<G, F>(
     use_accepted: bool,
     site: &'static str,
     listener: Option<std::net::TcpListener>,
+    timeout: Option<Duration>,
     work: F,
 ) -> Result<(RunValue, G), Error>
 where
@@ -626,6 +632,7 @@ where
         use_accepted,
         site,
         listener,
+        timeout,
         backing,
         move |resource, listener| {
             let mut state = child_state.borrow_mut();
@@ -645,6 +652,7 @@ pub(super) fn run_record_at_owned<G, F>(
     roots: Option<(&Path, &Path)>,
     accepted_root: Option<&Path>,
     site: &'static str,
+    timeout: Option<Duration>,
     mut work: F,
 ) -> Result<(RunValue, G), Error>
 where
@@ -660,6 +668,7 @@ where
         true,
         site,
         None,
+        timeout,
         move |guards, resource, _| work(guards, resource),
     )
 }
@@ -671,6 +680,7 @@ pub(super) fn run_replay_at_owned<G, F>(
     accepted_root: Option<&Path>,
     site: &'static str,
     listener: Option<std::net::TcpListener>,
+    timeout: Option<Duration>,
     work: F,
 ) -> Result<(RunValue, G), Error>
 where
@@ -691,6 +701,7 @@ where
         true,
         site,
         listener,
+        timeout,
         work,
     )
 }
@@ -701,6 +712,7 @@ pub(super) fn run_at_owned<G, F>(
     roots: Option<(&Path, &Path)>,
     accepted_root: Option<&Path>,
     site: &'static str,
+    timeout: Option<Duration>,
     mut work: F,
 ) -> Result<(RunValue, G), Error>
 where
@@ -716,6 +728,7 @@ where
         false,
         site,
         None,
+        timeout,
         move |guards, resource, _| work(guards, resource),
     )
 }
@@ -859,6 +872,7 @@ fn run_owned(
     use_accepted: bool,
     site: &'static str,
     listener: Option<std::net::TcpListener>,
+    timeout: Option<Duration>,
     mut failed_backing: Option<Box<dyn Any>>,
     mut execute: impl FnMut(
         Option<NetworkRuntimeResources>,
@@ -904,6 +918,7 @@ fn run_owned(
     let guard_preparation = (|| -> Result<_, Error> {
         let mut guard_context = None;
         let prepared = if let Some(roots) = guard_roots {
+            roots.admit_launch().map_err(refusal)?;
             let package =
                 PackagedUnixGuard::discover(&std::env::current_exe()?).map_err(refusal)?;
             let identity = uuid::Uuid::new_v4().simple().to_string();
@@ -1015,7 +1030,17 @@ fn run_owned(
             },
             &mut |mut resource, control, mut guard_owner| {
                 let mut runtime_owner = None;
-                let result: Wire = arm_container_init_guards()
+                let mut alarm = None;
+                let result = arm_container_init_guards()
+                    .and_then(|()| {
+                        if let Some(limit) = timeout {
+                            let after = limit
+                                .checked_add(super::run_timeout::RUN_TIMEOUT_UNWIND_GRACE)
+                                .ok_or_else(|| anyhow::anyhow!("--timeout grace overflow"))?;
+                            alarm = Some(super::run_timeout::RunTimeoutFallback::arm(after)?);
+                        }
+                        Ok(())
+                    })
                     .and_then(|()| {
                         catch_child_panic_at(site, &mut || {
                             if use_accepted && resource.is_none() {
@@ -1085,9 +1110,21 @@ fn run_owned(
                             stopped?;
                             result
                         })
-                    })
-                    .map_err(SerializableError::from);
-                (result, runtime_owner)
+                    });
+                let unresolved = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.cleanup_stage().is_some());
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.kind() == hermit::FailureKind::RunTimeout)
+                {
+                    super::run_timeout::stall_the_unwind_if_asked();
+                }
+                let exit = super::owned_container::PublishedFailureExit::new(unresolved, alarm);
+                let result: Wire = result.map_err(SerializableError::from);
+                (result, (runtime_owner, exit))
             },
         )
     };

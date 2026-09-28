@@ -684,9 +684,9 @@ impl AcceptedParentFinalizer {
                 (query.0.as_str(), self.query_task.as_ref(), Some(query.1.child.id()))
             }
         };
-        if unit != identity.unit || !pidfd_terminal(task
-            .ok_or_else(|| io::Error::other("failed accepted unit lacks original helper PIDFD"))?.as_fd())? {
-            return Err(io::Error::other("failed accepted unit lacks original helper terminal proof"));
+        if unit != identity.unit { return Err(io::Error::other("failed accepted unit identity changed")); }
+        if let Some(task) = task {
+            if !pidfd_terminal(task.as_fd())? { return Err(io::Error::other("failed accepted helper remains live")); }
         }
         if !group_absent(group.ok_or_else(|| io::Error::other("accepted wrapper group missing"))?, deadline)? {
             return Err(io::Error::other("failed accepted unit wrapper group remains live"));
@@ -741,6 +741,7 @@ impl AcceptedParentFinalizer {
             "manager_readback":shown, "result":result, "exec_main_code":code,
             "first_failed_manager_readback":self.first_failed_manager_readbacks.get(&identity.unit),
             "exec_main_status":exit, "wrapper_wait":status.into_raw(),
+            "helper_pidfd_captured":task.is_some(),
             "held_nlink_before":held.nlink(), "held_nlink_after":after.nlink(),
             "observed_ns":now_ns()?, "prior_command_count":self.commands.len()
         }));
@@ -798,13 +799,14 @@ impl AcceptedParentFinalizer {
     fn drain_once(&mut self, deadline: Instant) -> io::Result<Value> {
         within(deadline)?;
         if !self.service()?.controller_has_exited()? { return Err(io::Error::other("actual accepted controller remains live")); }
-        loop {
-            // The service's close protocol waits for the CLI's original Child
-            // joins. Drive that same retained owner before waiting for service exit.
-            self.progress_grouped(deadline)?;
-            if pidfd_terminal(self.loader_task.as_ref()
-                .ok_or_else(|| io::Error::other("accepted loader PIDFD was not captured"))?.as_fd())? { break; }
-            pause(deadline)?;
+        if self.loader_task.is_some() {
+            loop {
+                // The service's close protocol waits for the CLI's original Child
+                // joins. Drive that same retained owner before waiting for service exit.
+                self.progress_grouped(deadline)?;
+                if pidfd_terminal(self.loader_task.as_ref().unwrap().as_fd())? { break; }
+                pause(deadline)?;
+            }
         }
         // Preserve all raw partial-load/failure records even if READY was never
         // delivered. They cannot become successful empty-inventory evidence.
@@ -880,6 +882,10 @@ pub struct AcceptedRecovery {
     failed: bool,
     finished: bool,
 }
+/// A failed launch can retain one accepted provider, one readback unit and a
+/// grouped sibling. Bound those unresolved populations across fresh CLI
+/// processes; completed receipts do not consume this budget.
+const MAX_UNRESOLVED_ACCEPTED_LAUNCHES: usize = 8;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptFileIdentity {
@@ -1284,6 +1290,7 @@ impl AcceptedRecovery {
     fn initialize_once(&mut self, artifact: ProviderArtifact) -> io::Result<()> {
         receipt_label(&self.label)?;
         self.root.identity()?;
+        admit_accepted_launch(&self.root)?;
         self.artifact = Some(artifact);
         for (i, name) in receipt_names(&self.label).iter().enumerate() {
             // Retain each actual description before validating metadata or
@@ -1907,6 +1914,51 @@ fn accepted_directory_names(root: &crate::unix_guard_package::RecoveryDeployment
     }
     Ok(names)
 }
+fn accepted_labels(names: &BTreeSet<String>) -> io::Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut labels = BTreeMap::<String, BTreeSet<String>>::new();
+    for name in names {
+        let suffix = name.strip_prefix("accepted-").ok_or_else(|| io::Error::other("unexpected file in accepted recovery root"))?;
+        let (label, extension) = suffix.split_once('.').ok_or_else(|| io::Error::other("accepted recovery filename lacks role"))?;
+        receipt_label(label)?;
+        if !matches!(extension, "terminal.jsonl" | "stdout.log" | "stderr.log") {
+            return Err(io::Error::other("unexpected accepted recovery file role"));
+        }
+        if !labels.entry(label.to_owned()).or_default().insert(extension.to_owned()) {
+            return Err(io::Error::other("accepted recovery repeated file role"));
+        }
+    }
+    Ok(labels)
+}
+/// Refuse a new load once eight prior launches lack a complete, internally
+/// authenticated terminal receipt. This admission check never deletes evidence.
+fn admit_accepted_launch(root: &crate::unix_guard_package::RecoveryDeploymentRoot) -> io::Result<()> {
+    let identity = root.identity()?;
+    let names = accepted_directory_names(root)?;
+    if names.len().checked_add(3).is_none_or(|count| count > 384) {
+        return Err(io::Error::other("accepted recovery lacks bounded receipt capacity"));
+    }
+    let complete_roles = BTreeSet::from(["terminal.jsonl".to_owned(), "stdout.log".to_owned(), "stderr.log".to_owned()]);
+    let mut unresolved = 0usize;
+    for (label, roles) in accepted_labels(&names)? {
+        let completed = if roles == complete_roles {
+            let terminal = receipt_open(root.directory.as_fd(), &receipt_names(&label)[0], false)?;
+            let bytes = receipt_read(&terminal)?;
+            let first = std::str::from_utf8(&bytes).ok().and_then(|text| text.lines().next())
+                .and_then(|row| serde_json::from_str::<BeforeReceipt>(row).ok());
+            first.is_some_and(|before| validate_accepted_receipt(root, &label, &before.artifact).is_ok())
+        } else { false };
+        if !completed {
+            unresolved = unresolved.checked_add(1).ok_or_else(|| io::Error::other("accepted unresolved population overflow"))?;
+        }
+    }
+    if unresolved >= MAX_UNRESOLVED_ACCEPTED_LAUNCHES {
+        return Err(io::Error::other("accepted unresolved launch admission bound reached"));
+    }
+    if root.identity()? != identity || accepted_directory_names(root)? != names {
+        return Err(io::Error::other("accepted recovery changed during admission census"));
+    }
+    Ok(())
+}
 /// Read every entry in an owner's bounded accepted root. Exactly three files
 /// per launch and distinct actual run identities are required; guard files or
 /// unrelated leftovers are refused, never filtered or exempted.
@@ -1916,16 +1968,7 @@ pub fn validate_accepted_recovery_directory(
 ) -> io::Result<Vec<AcceptedReceiptReadback>> {
     let identity = root.identity()?;
     let names = accepted_directory_names(root)?;
-    let mut labels = BTreeSet::new();
-    for name in &names {
-        let suffix = name.strip_prefix("accepted-").ok_or_else(|| io::Error::other("unexpected file in accepted recovery root"))?;
-        let (label, extension) = suffix.split_once('.').ok_or_else(|| io::Error::other("accepted recovery filename lacks role"))?;
-        receipt_label(label)?;
-        if !matches!(extension, "terminal.jsonl" | "stdout.log" | "stderr.log") {
-            return Err(io::Error::other("unexpected accepted recovery file role"));
-        }
-        labels.insert(label.to_owned());
-    }
+    let labels = accepted_labels(&names)?.into_keys().collect::<BTreeSet<_>>();
     if labels.is_empty() { return Err(io::Error::other("accepted recovery census has no completed launch")); }
     let declared = labels.iter().flat_map(|label| receipt_names(label)).collect::<BTreeSet<_>>();
     if names != declared { return Err(io::Error::other("accepted recovery three-file population differs")); }
@@ -2073,6 +2116,22 @@ mod recovery_receipt_tests {
         r.failure("preserved partial initialization").unwrap();
         assert!(String::from_utf8(receipt_read(r.files[0].as_ref().unwrap()).unwrap()).unwrap().contains("accepted_failed"));
         assert!(validate_accepted_recovery_directory(&r.root, &artifact()).is_err());
+    }
+    #[test]
+    fn accepted_admission_bounds_unresolved_launches_without_deleting_evidence() {
+        let temp=tempfile::tempdir().unwrap();std::fs::set_permissions(temp.path(),std::fs::Permissions::from_mode(0o700)).unwrap();
+        for ordinal in 1..=MAX_UNRESOLVED_ACCEPTED_LAUNCHES {
+            let label=format!("{ordinal:032x}");std::fs::write(temp.path().join(receipt_names(&label)[0].clone()),b"retained failure\n").unwrap();
+        }
+        let before=std::fs::read_dir(temp.path()).unwrap().map(|entry|entry.unwrap().file_name()).collect::<BTreeSet<_>>();
+        let root=crate::unix_guard_package::RecoveryDeploymentRoot::open_at(temp.path()).unwrap();
+        let mut refused=AcceptedRecovery::retain(root,"f1".repeat(16));
+        assert_eq!(refused.initialize(artifact()).unwrap_err().to_string(),"accepted unresolved launch admission bound reached");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().map(|entry|entry.unwrap().file_name()).collect::<BTreeSet<_>>(),before);
+        std::fs::remove_file(temp.path().join(receipt_names(&format!("{:032x}",MAX_UNRESOLVED_ACCEPTED_LAUNCHES))[0].clone())).unwrap();
+        let root=crate::unix_guard_package::RecoveryDeploymentRoot::open_at(temp.path()).unwrap();
+        let mut admitted=AcceptedRecovery::retain(root,"f2".repeat(16));admitted.initialize(artifact()).unwrap();
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(),MAX_UNRESOLVED_ACCEPTED_LAUNCHES-1+3);
     }
     #[test]
     fn accepted_file_readback_refuses_fifo_mode_hardlink_missing_and_replaced_inode() {

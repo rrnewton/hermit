@@ -5728,6 +5728,7 @@ impl RunOpts {
                 roots,
                 self.network_accepted_recovery.as_deref(),
                 "with_container",
+                timeout,
                 execute,
             );
         }
@@ -5767,6 +5768,7 @@ impl RunOpts {
                 self.network_accepted_recovery.as_deref(),
                 "with_container",
                 None,
+                timeout,
                 move |guards, resource, _| execute(guards, resource),
             )
         } else {
@@ -5776,6 +5778,7 @@ impl RunOpts {
                 roots,
                 self.network_accepted_recovery.as_deref(),
                 "with_container",
+                timeout,
                 execute,
             )
         }

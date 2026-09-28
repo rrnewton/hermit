@@ -84,9 +84,20 @@ impl std::error::Error for ParentCleanupUnconfirmed {}
 /// Only the CLI init owns this fallback. Reverie drops it after flushing and
 /// closing the serialized error. _exit is a process/group exit; a raw clone
 /// callback's ordinary return would exit only its current thread.
-struct PublishedFailureExit {
+pub(super) struct PublishedFailureExit {
     unresolved: bool,
     _alarm: Option<super::run_timeout::RunTimeoutFallback>,
+}
+impl PublishedFailureExit {
+    pub(super) fn new(
+        unresolved: bool,
+        alarm: Option<super::run_timeout::RunTimeoutFallback>,
+    ) -> Self {
+        Self {
+            unresolved,
+            _alarm: alarm,
+        }
+    }
 }
 impl Drop for PublishedFailureExit {
     fn drop(&mut self) {
@@ -208,13 +219,7 @@ where
             {
                 super::run_timeout::stall_the_unwind_if_asked();
             }
-            (
-                result,
-                PublishedFailureExit {
-                    unresolved,
-                    _alarm: alarm,
-                },
-            )
+            (result, PublishedFailureExit::new(unresolved, alarm))
         }
     };
     let (first, child_pid) = match container.run_with_deferred_drop_owned(&mut factory) {
