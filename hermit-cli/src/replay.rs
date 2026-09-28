@@ -161,6 +161,8 @@ impl Replay {
             builder = builder.sequentialized_guest();
         }
         let tracer = builder.spawn().await?;
+        let proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
+        crate::proc_mount::report_proc_mode(metadata.proc_readonly, proc_readonly);
 
         Ok(Self {
             tracer,
