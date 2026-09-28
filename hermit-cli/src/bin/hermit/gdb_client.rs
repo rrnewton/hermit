@@ -414,7 +414,13 @@ mod tests {
             (metadata.dev(), metadata.ino())
         });
         for entry in std::fs::read_dir(format!("/proc/{client_pid}/fd")).unwrap() {
-            let metadata = std::fs::metadata(entry.unwrap().path()).unwrap();
+            // The stand-in's loader still opens and closes descriptors after
+            // READY. A descriptor closed after the listing was not inherited.
+            let metadata = match std::fs::metadata(entry.unwrap().path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("stat GDB child descriptor: {error}"),
+            };
             assert!(
                 !private.contains(&(metadata.dev(), metadata.ino())),
                 "the GDB child inherited a private watcher descriptor"
