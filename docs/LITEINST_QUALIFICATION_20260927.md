@@ -15,10 +15,11 @@ selected:
   screen at the author base. The failure is quoted in the screen section.
 - `backend-parity-c/environment-and-workdir` and
   `backend-parity-c/pipe-multiwriter-ordering` would run in the
-  `backend-parity-c` node, which compares every LiteInst cell against a
-  ptrace reference run. All 97 LiteInst cells already selected in that node
-  fail that comparison in recent full validates, and these two were never
-  measured under it.
+  `backend-parity-c` node. When this change was written, that node compared
+  every LiteInst cell against a ptrace reference run, and these two were never
+  measured under that comparison. Hermit `main` has since removed it
+  (`b9ec113b5f`, `b280bc4807`). The two cells stay disabled because enabling
+  them under same-backend verification is a separate decision.
 - `language-runtimes/perl-io-subprocess-time` passed 10/10 in the census
   (`qual10-batch1`), but the exact-head full validation of this change failed
   it on both attempts with a guest-visible `ERESTARTSYS` (-512) leak on
@@ -67,13 +68,18 @@ from the base.
   below reruns all 166 cells at the author base, and reruns these four ten
   times each.
 - **Base of this change.** The branch is based on Hermit `main`
-  `e63236584625`, three commits after the author base. It was first rebased
-  onto `55214f50e4dd`, which is `bffdf33788ca` plus one unrelated commit that
-  is not on `main` and only touches the GDB helper test
-  (`hermit-cli/src/bin/hermit/gdb_client.rs`); then onto `bffdf33788ca`,
-  dropping that commit; then onto `e63236584625`, one commit after
-  `bffdf33788ca`. None of the rebases had conflicts. The delta from the author
-  base was not screened with LiteInst. It contains:
+  `b280bc4807bf1a4baff74a09e45aaf6778c09fe7` ("Remove the ptrace parity rerun
+  from test-harness"), 91 commits after the author base. It was first based on
+  `55214f50e4dd`, which is `bffdf33788ca` plus one unrelated commit that is not
+  on `main` and only touches the GDB helper test
+  (`hermit-cli/src/bin/hermit/gdb_client.rs`). It was then rebased onto
+  `bffdf33788ca`, dropping that commit, then onto `e63236584625`, and then
+  onto `b280bc4807`. The last rebase's only textual conflict was in the
+  generated `ci/compat-envelope/cells.json`, which was regenerated with the
+  new parity snapshot and pinned parity counts. The Reverie pin (`6297f715`) and agent-utils
+  pin (`26dd3eaa34`) are the same at `e63236584625` and `b280bc4807`.
+
+  The delta from the author base to `e63236584625` is three commits:
   - the KVM process-retirement fence in `detcore/src/scheduler/` and
     `detcore/src/tool_global.rs`, with its tests and DAG test counts;
   - a Reverie pin move from `b0ede531` to `a1d07619`. Its changes are in
@@ -97,10 +103,58 @@ from the base.
   backend, and the LiteInst runtime crates (`reverie-liteinst`,
   `reverie-preload`, `reverie-syscalls`, `reverie-process`, `reverie-memory`)
   are byte-identical from the measured pin `b0ede531` to `6297f715`
-  (`git diff --quiet` exits 0). That the delta is inert for LiteInst is a
-  reading of the source, not a measurement. `git diff --quiet b63af4583a
-  e63236584625 -- tests/e2e/manifests ci/manifest-plan/src/timeouts.rs`
-  exits 0.
+  (`git diff --quiet` exits 0).
+
+  The delta from `e63236584625` to `b280bc4807` is 88 commits. None of them is
+  an ancestor of `19553a64`, `b63af4583a` or `e63236584625`. Thirty touch
+  `detcore/`, `detcore-model/`, `hermit-cli/`, `tests/c/` or
+  `tests/e2e/manifests/`. The ones that can change what a selected cell's
+  guest sees or how it runs are:
+  - **A rewritten guest for a selected cell.** "Require exact fixed-epoch
+    clock parity between Cargo and Buck" (`b9ecf41ad2`) and "Anchor the Buck
+    clock-parity epoch on CLOCK_REALTIME only" (`465056029c`) change 182
+    lines (173 added, 9 removed) in `tests/c/clock_exec_continuity.c`, the
+    guest of the selected cell
+    `system-utils/clock-exec-continuity`. Each of its three exec generations
+    now runs four bracketed work segments (0, 100,000, 100,000 and 200,000
+    Collatz iterations) and two serialized pthreads that each read the clock
+    four times, and it reads `CLOCK_REALTIME`. The manifest adds `-pthread`
+    to its `cflags`. The census and the author-base screen measured the old
+    single-threaded program.
+  - **sysinfo, uptime and `btime`.** "Fix runtime semantics exposed by
+    portable validation" (`72c333f0a0`), "Round sysinfo uptime up as Linux
+    does" (`6b7d0d0b5a`), "Fix btime, Ubuntu unwind closure, and runtime-only
+    admission" (`f41ed8e34b`) and "Compute btime exactly and only for
+    /proc/stat" (`0c5ce50f11`) change `detcore/src/syscalls/sysinfo.rs`,
+    `detcore/src/procfs.rs`, `detcore/src/syscalls/files.rs`,
+    `detcore/src/fd.rs`, `detcore-model/src/config.rs` and
+    `detcore-model/src/time.rs`. "Advance the record version for the procfs
+    uptime projection" (`9b1ad63d79`) changes only the record format version.
+  - **Virtual time.** "Refuse final virtual time behind its baseline in
+    release builds too" (`42aca806f9`) and "Complete Buck release runtime
+    artifact" (`9450988081`) change `detcore-model/src/time.rs` and
+    `detcore/src/tool_global.rs`.
+  - **POSIX timers across exec.** "Delete process POSIX timers on successful
+    exec" (`6ffdf53c01`) changes `detcore/src/scheduler.rs`,
+    `detcore/src/scheduler/timed_waiters.rs`, `detcore/src/tool_global.rs`,
+    `detcore/src/tool_local.rs` and `detcore/src/lib.rs`.
+  - **`/proc` mounting.** "Allow read-only proc fallback in Hermit
+    containers" (`e46e369da8`) and "Report read-only proc mounts and
+    recording mode mismatches" (`0520fe4408`) change
+    `hermit-cli/src/bin/hermit/container.rs`, the new
+    `hermit-cli/src/proc_mount.rs`, and `run.rs`, `record.rs`, `replay.rs`
+    and `metadata.rs`.
+  - **Backend execution.** "Heap-pin backend execution before deadline
+    handling" (`822ff607eb`) changes `hermit-cli/src/lib.rs`.
+
+  The rest are the log-diff report schema (`d550979ad0`), the Buck release
+  build (`ea7a341ffe`, `932ca9ee26` and the `BUCK` part of `9450988081`), the
+  GDB helper (`e4c9786ce1`, `d90336ee6f`), the parity overhaul (`71b5bca69b`,
+  `b9ec113b5f`, `b280bc4807`), tests, and CI. `git diff --quiet e63236584625
+  b280bc4807 -- ci/manifest-plan/src/timeouts.rs` exits 0, and in
+  `tests/e2e/manifests/` the only change to a selected recipe is the
+  `-pthread` flag above. The LiteInst screen of this delta is in "Current-source
+  screen at `b280bc4807`" below.
 
 ## What was measured and how
 
@@ -169,7 +223,7 @@ and `ci/compat-envelope/cells.json` come from `scorecard.rs update`,
 `ci/expected-e2e-plan.json` from `test-harness expected-plan`, and
 `ci/dag/validate.json` from `generate-validation-dag --write`.
 
-| Quantity | Before (e63236584625) | After |
+| Quantity | Before (b280bc4807) | After |
 | --- | ---: | ---: |
 | LiteInst `verify`: selected / enabled but unselected / disabled (of 361) | 146 / 3 / 212 | 308 / 3 / 50 |
 | LiteInst, all modes: selected / not selected / not applicable (of 1,083) | 146 / 3 / 934 | 308 / 3 / 772 |
@@ -178,7 +232,7 @@ and `ci/compat-envelope/cells.json` come from `scorecard.rs update`,
 | Not-applicable comparable cells | 4,770 | 4,608 |
 | Required full-plan cells (including 3 custom commands) | 859 | 1,021 |
 | Hosted-portable plan cells | 855 | 1,017 |
-| Portable backend-parity-c relations (all / LiteInst) | 173 / 97 | 173 / 97 |
+| Portable `backend-parity-c` non-ptrace `verify` cells (all / LiteInst) | 173 / 97 | 173 / 97 |
 | DAG `result_manifests` entries over all steps (LiteInst `verify` among them) | 2,173 (293) | 2,497 (617) |
 
 These are selection counts, not a backend determinism percentage. The
@@ -562,27 +616,110 @@ checked content identity.
 The screen results are in the parent workspace's
 `ignored/liteinst-lane-claude/promote-groupc/impl/screen/`.
 
-## Deselected for the ptrace parity reference: two `backend-parity-c` cells
+## Current-source screen at `b280bc4807`
+
+The census and the author-base screen predate the 88 commits from
+`e63236584625` to `b280bc4807` listed under "Base of this change", including
+the rewritten `clock_exec_continuity.c` guest. The same official pressure
+runner therefore re-ran the selected cells at `b280bc4807`, with the same
+command as above, from a clean clone at
+`b280bc4807bf1a4baff74a09e45aaf6778c09fe7`, where these cells are still
+disabled. Against `b280bc4807`, this change's manifest diff touches only
+selection fields (`backends_disabled` entries and `ci` membership), so the
+screened guest, recipe and runtime are the ones this change selects. The two
+screens ran at the same time on the same host, each with `--jobs 8`, so their
+wall times include the other's load.
+
+| Screen | Cells file (SHA256) | Repetitions | Exit | Wall | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| `screen162-r1` | `cells-162.jsonl` (`2e44af02e1ee3b63505b70ded2ad17d56470a2567338aedf53e6c783b39525a8`) | 1 | 0 | 1,770.6 s | 162 / 162 first-attempt PASS, 0 retried |
+| `r10-6` | `cells-r10-6.jsonl` (`c6f89a9828aba0b10746145dcbe9ac0378d21e1accd8d2bef208992c6e0a2cc3`) | 10 | 0 | 1,815.6 s | 60 / 60 first-attempt PASS, 0 retried |
+
+`cells-162.jsonl` is exactly the 162 cells this change adds to the expected
+plan. `r10-6` repeats the six selected cells most exposed to the delta:
+
+- `system-utils/clock-exec-continuity`, whose guest was rewritten;
+- `c-programs/sysinfo`, `c-programs/sysinfo-uptime` and
+  `system-utils/auxv-loader-dump`, the selected cells that call `sysinfo`;
+- `c-programs/timer-create-determinism`, for the POSIX-timer change;
+- `system-utils/proc-uptime`, for the uptime and `/proc` changes.
+
+Both runs report `hermit_sha=b280bc4807bf1a4baff74a09e45aaf6778c09fe7`,
+Detcore tree `27894a0abce8441bf62c7c17873df06fc323b5a4` (the same tree as
+this change's head) and `source_tree_dirty=false`. The same checker (SHA256
+`ff47013e1ae19e2575e4bd5a3a74e022b7dbb466b02aa38cb7e9d72d70c0b401`) reported
+zero problems for all 162 rows of `screen162-r1` and all 60 rows of `r10-6`.
+As negative controls, asking it for two repetitions per cell of
+`screen162-r1` reported all 162 cells short, and asking for eleven per cell
+of `r10-6` reported all six short. Summary SHA256s:
+`screen162-r1/summary.json`
+`66bd3df82024a5f65a6395e398059264453e8d5f059bfbf519d8e25c070cabd9`,
+`r10-6/summary.json`
+`9be503737c361ef75bc77f50959d61ca474f6061b27486532f974dbf9ecf4f70`.
+
+In `screen162-r1` the largest per-cell cost was
+`system-utils/auxv-loader-dump` at 8.60 CPU s and 11.50 wall s. Two cells
+exceeded a third of the 22 s CPU bound: `system-utils/auxv-loader-dump` and
+`data-handling/archive-roundtrip` (7.52 CPU s). Every wall time was under a
+third of the 57 s wall bound. In `r10-6` the largest costs over ten
+repetitions were:
+
+| Cell | Max CPU (s) | Max wall (s) |
+| --- | ---: | ---: |
+| `c-programs/sysinfo` | 1.03 | 2.57 |
+| `c-programs/sysinfo-uptime` | 4.02 | 6.13 |
+| `c-programs/timer-create-determinism` | 1.59 | 3.03 |
+| `system-utils/auxv-loader-dump` | 9.22 | 12.28 |
+| `system-utils/clock-exec-continuity` | 2.25 | 4.43 |
+| `system-utils/proc-uptime` | 2.26 | 3.87 |
+
+All are inside the unchanged 22 / 57.
+
+The calibration rows were not re-derived from this screen. They remain the
+`19553a64` measurements that `LITEINST_2026_09_27_EVIDENCE_SHA` names. For
+`system-utils/clock-exec-continuity` that row measured the old
+single-threaded program: p90 2,155,460 CPU µs and 3,736 wall ms, giving 4 /
+15 s. The rewritten program's ten `r10-6` samples give p90 2,234,738 CPU µs
+and 4,362 wall ms, which the same formula turns into 4 / 18 s (4 / 18 s from
+the maximum samples as well). The wall figure is higher than the recorded row
+but well inside the configured 57 s. For `system-utils/auxv-loader-dump`,
+the `r10-6` p90 (8,568,652 CPU µs, 11,527 wall ms) gives 13 / 47 s, inside
+its recorded 14 / 51 s.
+
+## Not selected: two `backend-parity-c` cells
 
 `backend-parity-c/environment-and-workdir` and
-`backend-parity-c/pipe-multiwriter-ordering` passed every raw check, both
-screens and the bounds. They are still not selected. The `backend-parity-c`
-node passes `--parity-reference ptrace`, so after a LiteInst candidate passes,
-the runner executes a ptrace reference cell and fails the candidate when the
-two backends diverge. The evidence above is LiteInst-against-LiteInst only
-and never measured that comparison for these two cells.
+`backend-parity-c/pipe-multiwriter-ordering` passed every raw check, the
+one-repetition author-base screen and the bounds. They are still not selected.
 
-The comparison fails for every LiteInst cell the node already runs. The four
-most recent full-validate `results.jsonl` files for
-`manifest_backend_parity_c` (heads `4ad1c594b825`, `694e9392a8ec` and
-`9c5820a6fdc3`, the last twice) each contain the same 97 LiteInst cells with
-two attempts each. All 194 rows are FAIL: 192 with "liteinst diverged from
-ptrace: shared Detcore INFO records" and 2 that also differ in guest stdout.
-Selecting these two cells would add two more reds of that known kind.
+When this change was written, both `backend-parity-c` nodes passed
+`--parity-reference ptrace`. After a LiteInst candidate passed, the runner
+executed a ptrace reference cell and failed the candidate when the two
+backends diverged. The evidence above is LiteInst-against-LiteInst only, and
+it never measured that comparison for these two cells. The comparison failed
+for every LiteInst cell the node ran. The four most recent full-validate
+`results.jsonl` files for `manifest_backend_parity_c` at that time (heads
+`4ad1c594b825`, `694e9392a8ec` and `9c5820a6fdc3`, the last twice) each
+contain the same 97 LiteInst cells with two attempts each. All 194 rows are
+FAIL: 192 with "liteinst diverged from ptrace: shared Detcore INFO records"
+and 2 that also differ in guest stdout.
 
-Both keep their LiteInst disabled entries, restored byte-for-byte from the
-base, and their calibration rows are removed. All counts and generated files
-were regenerated for the final 162 cells.
+That mechanism no longer exists at the base of this change. Hermit `main`
+commit `b9ec113b5f` ("Stop requesting ptrace parity reference runs from
+validation") removed the flag from both generated nodes, and
+`validation_dag::assert_invariants` now refuses any step that carries it.
+Commit `b280bc4807` ("Remove the ptrace parity rerun from test-harness")
+deleted the rerun from the runner. Both nodes now run ordinary same-backend
+verification, and a cross-backend difference is a scored parity result, not
+a validation outcome (https://github.com/rrnewton/hermit/issues/3301).
+
+The two cells stay disabled for a different reason. Enabling them would be a
+new selection in `backend-parity-c.yaml` under same-backend verification.
+That is a separate decision this change does not make, and neither cell was
+screened at the current base. Both keep their LiteInst disabled entries,
+restored byte-for-byte from the base, and their calibration rows are
+removed. All counts and generated files were regenerated for the final 162
+cells.
 
 ## Deselected after exact-head full validation: `language-runtimes/perl-io-subprocess-time`
 
@@ -831,12 +968,13 @@ not establish"). The other cell carrying that reason,
 - **Same-backend repeats only.** These are LiteInst-against-LiteInst strict
   repeat comparisons. They are not comparisons against a ptrace golden run,
   and they are not cross-backend parity. No selected cell runs in the
-  `backend-parity-c` node or under `--parity-reference ptrace`. Bounds stay
-  unchanged.
+  `backend-parity-c` node, and validation at this base no longer runs a
+  ptrace parity reference for any node. Bounds stay unchanged.
 - **Ten repetitions do not bound rare divergence.** `system-utils/sort-random`
   passed ten of ten at `19553a64` and then diverged once in ten at the author
-  base. The other 159 selected cells were screened once each at the author
-  base, which cannot exclude a divergence of similar frequency. Full
+  base. At `b280bc4807`, 156 of the 162 selected cells were screened once
+  each and six were screened eleven times (once plus ten), which cannot
+  exclude a divergence of similar frequency. Full
   validation runs each selected cell once per run, so such a cell would
   appear as an intermittent red rather than be hidden.
 - **Every selected cell opens the file on which `sort-random` diverged.**
@@ -849,9 +987,12 @@ not establish"). The other cell carrying that reason,
   only a rare subset. It is tracked as TaskGraph task `liteinst_maps_read_divergence`.
 - **Historical measurement.** The ten-repetition evidence is at `19553a64`.
   The author-base screen is one repetition per cell, plus ten for the four
-  sysinfo cells. That screen bounds only a gross regression from the one-commit
-  delta. It does not re-derive the calibration, and it does not cover the
-  three commits between the author base and `e63236584625`.
+  sysinfo cells. The `b280bc4807` screen is one repetition for each of the
+  162 selected cells, plus ten for the six cells most exposed to the 91-commit
+  delta from the author base, including the rewritten
+  `system-utils/clock-exec-continuity` guest. These screens bound only a gross
+  regression from that delta. They do not re-derive the calibration, whose
+  `system-utils/clock-exec-continuity` row still describes the old program.
 - **Out of scope.** Nothing here covers replay, chaos, memory determinism,
   arbitrary-program determinism, Linux semantic equivalence on unsupported
   paths, or readiness to replace ptrace.
