@@ -97,3 +97,5 @@ printf '%s\n' "$digest" > image.digest
 echo ":: image.digest = $digest"
 echo
 echo "Commit flake.nix, flake.lock and image.digest together."
+
+# inert tamper opponent
