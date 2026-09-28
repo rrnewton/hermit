@@ -729,8 +729,8 @@ static __attribute__((noinline)) int fd_file_fdget_session(struct pt_regs *ctx) 
             fd_problem(AP_FD_MISSING);return 1;
         }
         if(!ap_file_fdget_caller_site(function_ip,return_ip))return 1;
-        if(CORE(ctx->bp)!=(u64)(u32)c->expected_level ||
-           CORE(ctx->r12)!=(u64)(u32)c->expected_option) {fd_problem(AP_FD_IDENTITY);return 1;}
+        if(!ap_file_fdget_entry_registers(CORE(ctx->bp),CORE(ctx->r12),
+              c->expected_level,c->expected_option)) {fd_problem(AP_FD_IDENTITY);return 1;}
         struct pt_regs *regs=fd_task_regs(current_task());struct ap_file_entry_snapshot operands={0};
         if(!regs || !ap_file_read_entry(c,CORE(ctx->di),CORE(&regs->orig_ax),
               CORE(&regs->di),CORE(&regs->si),fd_read_kernel,&operands)) {

@@ -25,7 +25,8 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
         ),
         _ => matches!(
             call.number(),
-            Sysno::read | Sysno::write | Sysno::close
+            Sysno::read | Sysno::pread64 | Sysno::write | Sysno::close
+                | Sysno::dup | Sysno::dup2 | Sysno::dup3
                 | Sysno::connect | Sysno::bind | Sysno::listen
                 | Sysno::accept | Sysno::accept4 | Sysno::shutdown
                 | Sysno::getsockname | Sysno::getpeername
@@ -39,6 +40,15 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 | Sysno::getuid | Sysno::geteuid | Sysno::getgid | Sysno::getegid
                 | Sysno::getrandom | Sysno::clock_gettime | Sysno::gettimeofday
                 | Sysno::uname | Sysno::sched_getaffinity | Sysno::prlimit64
+                // Alarm is virtualized by the deterministic scheduler and has
+                // no native descriptor or network-provider side effect.
+                | Sysno::alarm
+                // Access and pread64 have no descriptor-table effect and are
+                // carried by the recorder/replayer's ordinary effect stream.
+                // Openat is the one admitted filesystem allocator: its handler
+                // joins the native/recorded allocator protocol and requires the
+                // exact published descriptor binding before it can return.
+                | Sysno::access | Sysno::openat
                 // Neither touches the descriptor table: strict rseq returns
                 // ENOSYS without entering Linux, and readlink reads a path.
                 | Sysno::rseq | Sysno::readlink
@@ -60,15 +70,11 @@ mod tests {
     fn initial_record_refuses_all_unjoined_descriptor_creators_and_table_changes() {
         for number in [
             Sysno::open,
-            Sysno::openat,
             Sysno::openat2,
             Sysno::creat,
             Sysno::pipe,
             Sysno::pipe2,
             Sysno::socketpair,
-            Sysno::dup,
-            Sysno::dup2,
-            Sysno::dup3,
             Sysno::recvmsg,
             Sysno::recvmmsg,
             Sysno::sendmsg,
@@ -102,6 +108,27 @@ mod tests {
         }
     }
     #[test]
+    fn initial_record_admits_recorded_loader_reads_and_exactly_joined_openat() {
+        for number in [Sysno::access, Sysno::pread64, Sysno::openat] {
+            assert!(initial_record_call_supported(raw(number)), "{number:?}");
+        }
+
+        // Negative controls: admitting the joined openat operation must not
+        // admit sibling descriptor creators that lack its publication join.
+        for number in [Sysno::open, Sysno::openat2, Sysno::creat] {
+            assert!(!initial_record_call_supported(raw(number)), "{number:?}");
+        }
+    }
+    #[test]
+    fn initial_record_admits_exactly_joined_descriptor_aliases() {
+        for number in [Sysno::dup, Sysno::dup2, Sysno::dup3] {
+            assert!(initial_record_call_supported(raw(number)), "{number:?}");
+        }
+        for number in [Sysno::pipe, Sysno::pipe2, Sysno::socketpair] {
+            assert!(!initial_record_call_supported(raw(number)), "{number:?}");
+        }
+    }
+    #[test]
     fn initial_record_keeps_scalar_tcp_and_original_descriptor_operations() {
         for number in [
             Sysno::read,
@@ -117,6 +144,7 @@ mod tests {
             Sysno::getsockname,
             Sysno::getpeername,
             Sysno::shutdown,
+            Sysno::alarm,
             Sysno::rseq,
             Sysno::readlink,
             Sysno::exit,

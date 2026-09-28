@@ -114,6 +114,22 @@ static __attribute__((always_inline)) inline int ap_file_fdget_caller_site(
         function_ip<=~0ULL-AP_FILE_CALLER_RETURN_DELTA &&
         return_ip==function_ip+AP_FILE_CALLER_RETURN_DELTA;
 }
+/* KPROBE_MULTI session ftrace regs preserve the caller's exact RBP/FD but do
+ * not retain its callee-saved R12 command on this admitted kernel (it is zero
+ * at fdget_raw). The next check copies syscall pt_regs::si and requires the
+ * exact F_GETFL command, so accepting the unavailable R12 adds no substitute
+ * evidence. Classic mid-function contexts must still carry both registers. */
+static __attribute__((always_inline)) inline int ap_file_fdget_entry_registers(
+        unsigned long long fd,unsigned long long option,
+        unsigned long long expected_fd,unsigned long long expected_option) {
+    if(fd!=(unsigned int)expected_fd)return 0;
+#ifdef AP_FTRACE_PROVIDER
+    (void)option;(void)expected_option;
+    return 1;
+#else
+    return option==(unsigned int)expected_option;
+#endif
+}
 /* A classic fdget_raw entry stores its observed mid-function PC. The session
  * replacement stores the actual function start. Relate that retained start
  * to the authenticated classic entry image before treating either old site

@@ -156,6 +156,15 @@ static void original_copy_controls(void) {
     COPY_CHECK(!ap_shared_fdget_role(AP_ORIGINAL_CONNECT,0x1000,0x1021));
     COPY_CHECK(ap_file_fdget_caller_site(0xffffffff81faaca0ULL,0xffffffff81facb54ULL));
     COPY_CHECK(!ap_file_fdget_caller_site(0xffffffff81faaca0ULL,0xffffffff81facb55ULL));
+#ifdef AP_FTRACE_PROVIDER
+    /* The live session exposes zero R12; exact F_GETFL is independently read
+     * from the original syscall pt_regs by ap_file_read_entry. */
+    COPY_CHECK(ap_file_fdget_entry_registers(4,0,4,3));
+    COPY_CHECK(!ap_file_fdget_entry_registers(5,0,4,3));
+#else
+    COPY_CHECK(ap_file_fdget_entry_registers(4,3,4,3));
+    COPY_CHECK(!ap_file_fdget_entry_registers(4,0,4,3));
+#endif
     COPY_CHECK(ap_file_fdget_session_marker(
         0xffffffff81faaca0ULL,0xffffffff81faaca6ULL));
     COPY_CHECK(!ap_file_fdget_session_marker(
@@ -205,7 +214,7 @@ static void original_copy_controls(void) {
     p.recursion_misses=1;COPY_CHECK(!ap_copy_link_matches(1,&p,sizeof(p),&l,sizeof(l),"__sys_connect"));
     p.recursion_misses=0;p.id=0;COPY_CHECK(!ap_copy_link_matches(1,&p,sizeof(p),&l,sizeof(l),"__sys_connect"));
     p.id=37;p.type=BPF_PROG_TYPE_TRACING;COPY_CHECK(!ap_copy_link_matches(1,&p,sizeof(p),&l,sizeof(l),"__sys_connect"));
-    assert(copy_checks==108);
+    assert(copy_checks==110);
     printf("original copy boundary production controls=%u\n",copy_checks);
 }
 #undef COPY_CHECK

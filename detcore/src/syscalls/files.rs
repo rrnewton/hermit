@@ -1151,12 +1151,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Close,
     ) -> Result<i64, Error> {
-        if guest.config().network_trace.policy
-            == detcore_model::network_trace::NetworkPolicy::Record
-            && self.accepted_model_mode(guest).await?
-        {
-            // Actual shared engine admission still requires the private complete
-            // capability. Configuration and this dispatch are not its issuer.
+        if self.original_connect_record_route(guest).await? {
+            // Close must use the same V3/V4 capability route as Connect. In
+            // particular, V4 descriptor tracking can be active without the
+            // legacy accepted-mode bit; bypassing its native removal join
+            // leaves an authenticated Openat slot live across FD reuse.
             return self.network_original_close(guest, call).await;
         }
         let fd = call.fd();
