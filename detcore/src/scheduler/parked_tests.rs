@@ -2795,6 +2795,29 @@ fn child_wait_ready_and_no_child_precede_alarm_selection() {
                 }
                 _ => unreachable!(),
             }
+            // Consumption wakes a blocked waiter through a deferred admission.
+            // Run the same prefix as the daemon before alarm selection.
+            let pending_wake = blocked && change == 1;
+            assert_eq!(
+                s.pending_run_queue_admissions.get(&tid).copied(),
+                pending_wake.then_some(AdmitIntent::Fixed(AdmitSide::Back))
+            );
+            assert_eq!(s.run_queue.contains_tid(tid), !blocked);
+            assert_eq!(
+                s.blocked.child_waiters.contains_key(&tid),
+                blocked && !pending_wake
+            );
+            let before_turn = s.turn;
+            let before_time = s.committed_time;
+            s.step2_drain_prefix().unwrap();
+            assert!(s.pending_run_queue_admissions.is_empty());
+            assert_eq!(s.run_queue.contains_tid(tid), !blocked || pending_wake);
+            assert_eq!(
+                s.blocked.child_waiters.contains_key(&tid),
+                blocked && !pending_wake
+            );
+            assert_eq!(s.turn, before_turn);
+            assert_eq!(s.committed_time, before_time);
             b.recipients.lock().unwrap().push(SignalRecipient {
                 task: task(100, 100),
             });
@@ -3100,6 +3123,24 @@ fn child_wait_cancellation_and_terminal_receipt_cannot_restore_membership() {
                 Some(SchedResponse::Signaled(None))
             ));
         }
+        assert!(!s.next_turns.contains_key(&tid));
+        assert!(!s.blocked.child_waiters.contains_key(&tid));
+        // Logical retirement is immediate; physical queue removal is deferred.
+        assert_eq!(
+            s.pending_run_queue_removals.get(&tid),
+            Some(&RemovalDisposition::Retire)
+        );
+        assert_eq!(s.run_queue.contains_tid(tid), observed);
+        assert!(!s.parked.permits.contains_key(&tid));
+        assert!(s.parked.requests.keys().all(|wait| wait.dettid != tid));
+        assert!(s.thread_is_logically_killed(tid));
+        let before_turn = s.turn;
+        let before_time = s.committed_time;
+        s.step2_drain_prefix().unwrap();
+        assert!(s.pending_run_queue_removals.is_empty());
+        assert!(s.pending_run_queue_admissions.is_empty());
+        assert_eq!(s.turn, before_turn);
+        assert_eq!(s.committed_time, before_time);
         assert!(!s.next_turns.contains_key(&tid));
         assert!(!s.blocked.child_waiters.contains_key(&tid));
         assert!(!s.run_queue.contains_tid(tid));
