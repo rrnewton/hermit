@@ -402,6 +402,18 @@ mod tests {
             }
         }
         let rescue = EndClient(client_pid);
+        // Pin the stand-in before checking its parent, so this pidfd names the
+        // helper's only child even if the PID is reused later.
+        // SAFETY: pidfd_open has no pointer arguments.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, client_pid as libc::pid_t, 0) };
+        assert!(
+            raw >= 0,
+            "pin the GDB stand-in: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: pidfd_open returned a new owned descriptor.
+        let client = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let exited = || helper::parent_exited(client.as_raw_fd()).expect("poll the stand-in pidfd");
         let status = std::fs::read_to_string(format!("/proc/{client_pid}/status")).unwrap();
         let parent = status
             .lines()
@@ -414,8 +426,9 @@ mod tests {
             (metadata.dev(), metadata.ino())
         });
         for entry in std::fs::read_dir(format!("/proc/{client_pid}/fd")).unwrap() {
-            // The stand-in's loader still opens and closes descriptors after
-            // READY. A descriptor closed after the listing was not inherited.
+            // The stand-in's loader still opens and closes its own descriptors
+            // after READY, so an entry may vanish before its stat. That alone
+            // does not show it was never inherited; see the check below.
             let metadata = match std::fs::metadata(entry.unwrap().path()) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -426,8 +439,22 @@ mod tests {
                 "the GDB child inherited a private watcher descriptor"
             );
         }
+        // While it runs, the stand-in closes only descriptors it opened itself.
+        // Its exit closes the rest: GNU sleep's atexit handler closes 1 and 2,
+        // exit_files() then drops the whole table, and only after that does
+        // the pidfd report the exit. So the skip is sound only if the same
+        // stand-in still has descriptors 0 to 2 and has not exited.
+        let stdio =
+            (0..3).all(|fd| std::fs::metadata(format!("/proc/{client_pid}/fd/{fd}")).is_ok());
+        assert!(
+            stdio && !exited(),
+            "the GDB stand-in exited during the descriptor scan, so a vanished entry may have been inherited"
+        );
         drop(rescue);
         watch.finish().expect("GDB helper finish failed");
+        // Control: finish() returns only after the helper reaps the stand-in,
+        // so the same pidfd must now report the exit the check above rejects.
+        assert!(exited(), "the stand-in pidfd did not report its exit");
     }
 
     #[test]
