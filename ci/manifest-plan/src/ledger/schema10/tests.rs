@@ -943,22 +943,33 @@ fn generated_plan_populations_preserve_command_policy() {
                     "{label}/{active}/{mutation}"
                 );
             }
-            // Plans retained before the release-build names were forwarded
-            // must keep reading with the same cells and parity relations.
-            for (spelling, literal_jobs) in
-                [("pre-release-env", false), ("pre-release-env-jobs", true)]
-            {
+            // Plans retained before the parity post-pass names or the
+            // release-build names were forwarded must keep reading with the
+            // same cells and parity relations.
+            for (spelling, literal_jobs) in [
+                ("pre-epoch-env", false),
+                ("pre-release-env", false),
+                ("pre-release-env-jobs", true),
+            ] {
                 if label != "full" {
                     continue;
                 }
                 let mut previous = cfg.clone();
                 let step = &mut previous.steps[index];
-                assert_ne!(step.cmd, PRE_RELEASE_ENV_PARITY_COMMAND);
-                step.cmd = if active {
-                    PRE_RELEASE_ENV_PARITY_COMMAND.to_owned()
+                if spelling == "pre-epoch-env" {
+                    for name in crate::backend_parity_policy::PARITY_POST_PASS_ENV {
+                        let word = format!(" --env {name} ");
+                        assert_eq!(step.cmd.matches(&word).count(), 1, "{name}");
+                        step.cmd = step.cmd.replacen(&word, " ", 1);
+                    }
                 } else {
-                    PRE_RELEASE_ENV_PARITY_COMMAND.replacen("--parity-reference ptrace ", "", 1)
-                };
+                    assert_ne!(step.cmd, PRE_RELEASE_ENV_PARITY_COMMAND);
+                    step.cmd = if active {
+                        PRE_RELEASE_ENV_PARITY_COMMAND.to_owned()
+                    } else {
+                        PRE_RELEASE_ENV_PARITY_COMMAND.replacen("--parity-reference ptrace ", "", 1)
+                    };
+                }
                 if literal_jobs {
                     assert_eq!(step.cmd.matches(" --results ").count(), 1);
                     step.cmd = step.cmd.replace(" --results ", " --jobs 8 --results ");

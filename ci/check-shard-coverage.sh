@@ -42,6 +42,7 @@ for required in \
     'export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"' \
     'export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1' \
     'mkdir -p "$ROOT_DIR/target/tmp"' \
+    '"$ROOT_DIR/ci/delegate-hosted-cgroup.sh" "$$"' \
     'exec unshare --user --map-root-user --uts --net --mount' \
     'ip link set lo up' \
     'mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp' \

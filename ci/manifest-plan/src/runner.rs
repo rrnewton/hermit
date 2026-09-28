@@ -1131,6 +1131,12 @@ pub struct CellRunSpec {
     attempt: String,
     #[serde(skip)]
     fixed_workdir_source: PathBuf,
+    /// Normalize the retained ptrace log into `normalized-ptrace-golden.log`.
+    /// Only `E2E_KEEP_VERIFY_LOGS=1` asks for this; logs retained for the
+    /// parity post-pass alone are never normalized, so parity retention adds
+    /// no process to the cell and cannot change its outcome.
+    #[serde(skip)]
+    normalize_ptrace_golden: bool,
 }
 
 /// The existing pressure-test result vocabulary for one executed cell.
@@ -1705,7 +1711,14 @@ pub struct RunContext {
     /// See [`CellResult::binary_build_sha`].
     pub binary_build_sha: Option<String>,
     pub prebuilt: bool,
+    /// `E2E_KEEP_VERIFY_LOGS=1`: retain every verify cell's logs and normalize
+    /// each ptrace golden, as before.
     pub keep_logs: bool,
+    /// `(test, backend)` verify cells whose logs are retained for the parity
+    /// post-pass even without `keep_logs`. This is the selection closure of
+    /// [`crate::parity::retention_closure`]: retention only, so it neither
+    /// normalizes a ptrace golden nor adds any other process to the cell.
+    pub parity_retained: BTreeSet<(String, String)>,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
     /// Per-machine scaling for individual test CPU and wall bounds. This is execution policy,
@@ -1727,6 +1740,14 @@ fn resolve_run_epoch(
             .map_err(|_| "HERMIT_EPOCH must be valid Unicode".to_owned()),
         None => Ok(detcore_model::config::epoch_from_host_time(capture_now()).to_rfc3339()),
     }
+}
+
+/// The `HERMIT_EPOCH` a harness process started now would give every guest:
+/// the environment's value verbatim, or one sampled from host time. A caller
+/// that launches several harness processes whose logs are compared (the
+/// pressure test's parity post-pass) samples this once and passes it to each.
+pub fn run_epoch_from_env() -> Result<String, String> {
+    resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)
 }
 
 impl RunContext {
@@ -1837,12 +1858,28 @@ impl RunContext {
             binary_build_sha,
             prebuilt,
             keep_logs: std::env::var("E2E_KEEP_VERIFY_LOGS").as_deref() == Ok("1"),
+            parity_retained: BTreeSet::new(),
             run_verify_strict,
             record_verify_strict,
             timeout_multipliers: timeout_multipliers_from_env()?,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
         })
+    }
+
+    /// Retain the verify logs of these `(test, backend)` cells for the parity
+    /// post-pass. See [`RunContext::parity_retained`].
+    pub fn with_parity_retained(mut self, cells: BTreeSet<(String, String)>) -> Self {
+        self.parity_retained = cells;
+        self
+    }
+
+    /// Whether this verify cell's logs are kept after the run.
+    pub fn retains_verify_logs(&self, test: &str, backend: &str) -> bool {
+        self.keep_logs
+            || self
+                .parity_retained
+                .contains(&(test.to_string(), backend.to_string()))
     }
 
     pub fn with_scheduled_worker_capacity(
@@ -2371,7 +2408,7 @@ pub fn build_spec(
                 "--verify-json".into(),
                 verdict.to_string_lossy().into_owned(),
             ]);
-            if context.keep_logs {
+            if context.retains_verify_logs(&cell.id.test, backend) {
                 let logs = dir.join(format!("verify-logs/verify-{attempt}"));
                 fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
                 argv.extend([
@@ -2512,6 +2549,7 @@ pub fn build_spec(
         expected_guest_exit: cell_expected_guest_exit(cell),
         attempt: attempt.into(),
         fixed_workdir_source,
+        normalize_ptrace_golden: context.keep_logs,
     })
 }
 
@@ -2617,6 +2655,7 @@ fn execute_spec_until(
     let mut accounted_cpu_usage_usec = Some(output.cpu_usage_usec);
     let mut normalization_error = None;
     if output.timeout.is_none()
+        && spec.normalize_ptrace_golden
         && spec.id.mode == "verify"
         && spec.id.backend.as_deref() == Some("ptrace")
     {
@@ -5530,6 +5569,7 @@ mod tests {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -5725,6 +5765,7 @@ mod tests {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -6125,6 +6166,7 @@ mod tests {
             expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
+            normalize_ptrace_golden: false,
         };
 
         // This is the exact boundary reached when the aggregate execution
@@ -6837,6 +6879,7 @@ mod tests {
             expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
+            normalize_ptrace_golden: false,
         }
     }
 
@@ -7519,6 +7562,7 @@ int main(int argc, char **argv) {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -7593,6 +7637,7 @@ int main(int argc, char **argv) {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -7717,6 +7762,7 @@ int main(int argc, char **argv) {
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -7987,6 +8033,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -8044,6 +8091,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -8342,6 +8390,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -8479,6 +8528,7 @@ backends_disabled:
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: true,
             record_verify_strict: true,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -9757,6 +9807,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -9802,6 +9853,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -10215,6 +10267,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: Some(expected),
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -10680,6 +10733,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -10836,6 +10890,7 @@ cp "{}" "$verdict"
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -10894,6 +10949,7 @@ cp "{}" "$verdict"
             source_dirty: false,
             prebuilt: false,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
@@ -11062,6 +11118,7 @@ cp "{}" "$verdict"
             source_dirty: false,
             prebuilt: true,
             keep_logs: false,
+            parity_retained: BTreeSet::new(),
             run_verify_strict: false,
             record_verify_strict: false,
             timeout_multipliers: TimeoutMultipliers::default(),
