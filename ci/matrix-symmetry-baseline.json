@@ -6,6 +6,7 @@
   ],
   "backend_private_guest_files": [
     "tests/c/kvm_exact_child_waits.c",
+    "tests/c/kvm_gettimeofday_efault.c",
     "tests/c/liteinst_host_activation.c",
     "tests/c/liteinst_inert_runtime.c",
     "tests/c/mountinfo_device_identity.c",
