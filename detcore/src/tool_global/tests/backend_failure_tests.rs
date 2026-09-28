@@ -369,6 +369,7 @@ async fn cancelled_constructed_child(register: bool, terminal: bool) {
         config: &config,
         thread: parent_thread,
         requests: Mutex::new(Vec::new()),
+        post_exec: false,
     };
     if register {
         let mut registration = std::pin::pin!(tool.register_external_child(
@@ -720,6 +721,7 @@ async fn thread_start_marker_is_set_before_the_first_registration_wait() {
         config: &config,
         thread,
         requests: Mutex::new(Vec::new()),
+        post_exec: false,
     };
     // This test Guest's pid accessor expects the normal process identity.
     guest.thread.detpid = Some(DetPid::from_raw(17));
