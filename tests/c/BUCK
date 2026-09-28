@@ -83,7 +83,7 @@ cpp_unittest(
 
 cpp_unittest(
     name = "dbi_mmap_exec",
-    srcs = ["dbi_mmap_exec.c"],
+    srcs = ["dbt_mmap_exec.c"],
     labels = ["autodeps2_generated"],
 )
 
