@@ -298,11 +298,11 @@ fn run_fixture(scenario: Scenario) {
             guest.to_str().unwrap(),
         ];
         if scenario == Scenario::RunnableLeader {
-            // PAUSE slows branch retirement in both hot loops. A 768-RCB early
+            // PAUSE slows branch retirement in both hot loops. A 512-RCB early
             // notification shortens each single-step correction tail while
             // retaining the same workload and repeated leader preemptions.
             // The precise target and refusal of every overshoot are unchanged.
-            args.insert(8, "--skid-margin=768");
+            args.insert(8, "--skid-margin=512");
         } else if preempted {
             // Keep the blocked-leader cell's existing early notification.
             args.insert(8, "--skid-margin=3072");
