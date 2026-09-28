@@ -598,6 +598,9 @@ impl ConstructedValidationPlanV10 {
                 let required = expected
                     .iter()
                     .filter(|cell| selector_matches(selector, cell))
+                    .filter(|cell| {
+                        !crate::validation_dag::hosted_step_omits_backend(step, &cell.backend)
+                    })
                     .cloned()
                     .collect::<BTreeSet<_>>();
                 if owned != required {

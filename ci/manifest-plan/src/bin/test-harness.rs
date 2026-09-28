@@ -76,6 +76,8 @@ Selection options:
   --test <ID>
   --mode <verify|chaos|replay|naked|custom>
   --backend <ptrace|dbt|kvm|sabre|liteinst>
+  --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
+                                   Omit that backend's cells; may repeat
   --ci-only                        Select required CI cells
   --include-occasional             Include occasional cells
   --include-manual                 Include manual cells; requires exact test and mode
@@ -138,7 +140,9 @@ const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
   --category <CATEGORY>
   --test <ID>
   --mode <verify|chaos|replay|naked|custom>
-  --backend <ptrace|dbt|kvm|sabre|liteinst>";
+  --backend <ptrace|dbt|kvm|sabre|liteinst>
+  --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
+                                   Omit that backend's cells; may repeat";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -349,6 +353,13 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             "--test" => set_once(&mut args.selection.test, &mut values, "--test"),
             "--mode" => set_once(&mut args.selection.mode, &mut values, "--mode"),
             "--backend" => set_once(&mut args.selection.backend, &mut values, "--backend"),
+            "--exclude-backend" => {
+                let backend = required_value(&mut values, "--exclude-backend");
+                if args.selection.exclude_backends.contains(&backend) {
+                    fail(format!("--exclude-backend {backend} was given twice"));
+                }
+                args.selection.exclude_backends.push(backend);
+            }
             "--ci-only" => {
                 args.ci_only = true;
                 args.selection.population = Some(Population::Required);
@@ -546,6 +557,26 @@ fn validate_args(command: &str, args: &Args) {
     {
         fail("--backend must name a Hermit backend");
     }
+    if args
+        .selection
+        .exclude_backends
+        .iter()
+        .any(|backend| !matches!(backend.as_str(), "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"))
+    {
+        fail("--exclude-backend must name a Hermit backend");
+    }
+    if let Some(backend) = args.selection.backend.as_deref() {
+        if args
+            .selection
+            .exclude_backends
+            .iter()
+            .any(|excluded| excluded == backend)
+        {
+            fail(format!(
+                "--backend {backend} and --exclude-backend {backend} select nothing; name one"
+            ));
+        }
+    }
     if command == "build" && args.prebuilt {
         fail("build does not accept --prebuilt");
     }
@@ -569,6 +600,9 @@ fn validate_args(command: &str, args: &Args) {
         }
         if args.selection.include_manual || args.ci_only {
             fail("--probe-disabled is mutually exclusive with --include-manual and --ci-only");
+        }
+        if !args.selection.exclude_backends.is_empty() {
+            fail("--probe-disabled names one exact backend; --exclude-backend has no meaning there");
         }
     }
     if args.allow_empty {
@@ -715,6 +749,7 @@ fn audit_cli_brackets(root: &Path) {
         "--test",
         "--mode",
         "--backend",
+        "--exclude-backend",
         "--results",
         "--junit",
         "--format",
@@ -2192,9 +2227,9 @@ fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) 
     }
 }
 
-/// The cells `run` executes for `args`: its filters, over the required
+/// The selection `run` applies for `args`: its filters, over the required
 /// population unless manual cells are included.
-fn run_cells(manifests: &ManifestSet, args: &Args) -> Result<Vec<SelectedCell>, String> {
+fn run_selection(args: &Args) -> Selection {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
         selection.population = Some(if selection.include_manual {
@@ -2203,11 +2238,31 @@ fn run_cells(manifests: &ManifestSet, args: &Args) -> Result<Vec<SelectedCell>, 
             Population::Required
         });
     }
-    manifests.select(&selection)
+    selection
+}
+
+/// The cells `run` executes for `args`: its filters, over the required
+/// population unless manual cells are included.
+fn run_cells(manifests: &ManifestSet, args: &Args) -> Result<Vec<SelectedCell>, String> {
+    manifests.select(&run_selection(args))
 }
 
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let cells = run_cells(manifests, args).unwrap_or_else(|e| fail(e));
+    if !args.selection.exclude_backends.is_empty() {
+        let unfiltered = manifests
+            .select(&Selection {
+                exclude_backends: Vec::new(),
+                ..run_selection(args)
+            })
+            .unwrap_or_else(|e| fail(e))
+            .len();
+        eprintln!(
+            "Omitted by --exclude-backend {}: {} of {unfiltered} selected cells (not run, no result row)",
+            args.selection.exclude_backends.join(","),
+            unfiltered - cells.len()
+        );
+    }
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
@@ -3919,6 +3974,57 @@ sys.exit(1 if failed else 0)
             }
         }
         Some(args)
+    }
+
+    /// Every committed hosted-portable `test-harness run` command parses and
+    /// validates as the harness itself reads it, and names each
+    /// hosted-portable excluded backend exactly once; the local steps name
+    /// none. `parse` exits the process on a repeated `--exclude-backend`, so
+    /// the flag is counted before parsing to name the offending step.
+    #[test]
+    fn committed_hosted_portable_harness_commands_exclude_each_backend_once() {
+        use hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS;
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("actual committed graph");
+        let mut hosted = 0;
+        let mut local = 0;
+        for step in &committed.steps {
+            let Some(values) = harness_run_args(&step.cmd) else {
+                continue;
+            };
+            assert!(
+                values
+                    .iter()
+                    .filter(|value| *value == "--exclude-backend")
+                    .count()
+                    <= HOSTED_PORTABLE_EXCLUDED_BACKENDS.len(),
+                "{}: {values:?}",
+                step.tag()
+            );
+            let args = parse(values.clone().into_iter());
+            validate_args("run", &args);
+            if step.labels == ["hosted-portable"] {
+                hosted += 1;
+                assert_eq!(
+                    args.selection.exclude_backends,
+                    HOSTED_PORTABLE_EXCLUDED_BACKENDS,
+                    "{}: {values:?}",
+                    step.tag()
+                );
+            } else {
+                local += 1;
+                assert!(
+                    args.selection.exclude_backends.is_empty(),
+                    "{}: {values:?}",
+                    step.tag()
+                );
+            }
+        }
+        // Twelve hosted-portable manifest buckets, one step each, after
+        // backend-parity-c was folded into c-programs
+        // (https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(hosted, 12, "hosted-portable harness steps");
+        assert!(local > hosted, "local harness steps: {local}");
     }
 
     /// The parity post-pass must finish inside the dagrun step that runs the

@@ -6225,7 +6225,33 @@ fn check_raw_census(
 
 fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> {
     let tag = step.tag();
-    manifest_step_policy(step)?;
+    let (selection, _) = manifest_step_policy(step)?;
+    // The only admitted backend omission is the hosted-portable one: exactly
+    // HOSTED_PORTABLE_EXCLUDED_BACKENDS, carried by a step labelled only
+    // hosted-portable. Any other exclusion shape is not a normal publisher,
+    // so an omission cannot leak into a local profile's raw census.
+    let exclusions = if selection.exclude_backends.is_empty() {
+        String::new()
+    } else if step.labels.iter().map(String::as_str).eq(["hosted-portable"])
+        && selection
+            .exclude_backends
+            .iter()
+            .map(String::as_str)
+            .eq(hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
+                .iter()
+                .copied())
+    {
+        selection
+            .exclude_backends
+            .iter()
+            .map(|backend| format!(" --exclude-backend {backend}"))
+            .collect()
+    } else {
+        return Err(format!(
+            "{tag} omits backend(s) {:?} outside the hosted-portable exclusion contract",
+            selection.exclude_backends
+        ));
+    };
     // These are the source-defined width contracts of the admitted payload:
     // the scheduler appends only its decimal width, or suppresses injection for
     // the system-utils payload that already fixes --jobs 1. This does not
@@ -6365,7 +6391,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         (
             format!(
                 "./ci/run-with-hermit-e2e-artifact.sh {install}target/debug/test-harness run \
-            --lane {} --category {} {selector}{jobs} \
+            --lane {} --category {} {selector}{exclusions}{jobs} \
             --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
             --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
                 manifest.lane, manifest.category
@@ -14082,8 +14108,8 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             "--ci-only" => selection.population = Some(Population::Required),
             "--prebuilt" => prebuilt = true,
             "--allow-empty" => {}
-            "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--results"
-            | "--junit" | "--jobs" => {
+            "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--exclude-backend"
+            | "--results" | "--junit" | "--jobs" => {
                 index += 1;
                 let value = argv
                     .get(index)
@@ -14094,6 +14120,11 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     "--test" => selection.test = Some(value.clone()),
                     "--mode" => selection.mode = Some(value.clone()),
                     "--backend" => selection.backend = Some(value.clone()),
+                    // The hosted-portable nodes omit the KVM backend. Modeling
+                    // the omission keeps the retry bound computed over the
+                    // cells the node actually runs; the repeated-option guard
+                    // above still refuses a second exclusion.
+                    "--exclude-backend" => selection.exclude_backends.push(value.clone()),
                     _ => {}
                 }
             }
@@ -15328,6 +15359,14 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             " --lane privileged",
             "retry bounds: parity-control supplies --lane more than once",
         ),
+        (
+            " --exclude-backend",
+            "retry bounds: parity-control lacks a value for --exclude-backend",
+        ),
+        (
+            " --exclude-backend kvm --exclude-backend kvm",
+            "retry bounds: parity-control supplies --exclude-backend more than once",
+        ),
     ] {
         match manifest_command_policy("parity-control", &format!("{parity_command}{suffix}")) {
             Err(refusal) if refusal == expected => {}
@@ -15343,6 +15382,43 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
         }
     }
+    // The hosted-portable publisher carries exactly the KVM omission and the
+    // local one carries none, so the two retry bounds are computed over
+    // different, correctly sized cell sets.
+    for (tag, expected) in [
+        ("e2e.manifest_c_programs", &[][..]),
+        ("e2e.manifest_c_programs_on_host", &["kvm"][..]),
+    ] {
+        let publisher = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: committed DAG lost {tag}"))?;
+        let (selection, _) = manifest_step_policy(publisher)?;
+        if selection.exclude_backends != expected {
+            return Err(format!(
+                "retry bounds: {tag} excludes {:?}, expected {expected:?}",
+                selection.exclude_backends
+            ));
+        }
+        let backends = manifests
+            .select(&selection)?
+            .iter()
+            .map(|cell| cell.id.backend.clone().unwrap_or_else(|| "native".into()))
+            .collect::<BTreeSet<_>>();
+        if backends.iter().any(|backend| expected.contains(&backend.as_str())) {
+            return Err(format!(
+                "retry bounds: {tag} still selects a cell of an excluded backend"
+            ));
+        }
+        // Without this the exclusion check above is vacuous: the local node
+        // must still select the KVM cells that the hosted node omits.
+        if expected.is_empty() && !backends.contains("kvm") {
+            return Err(format!(
+                "retry bounds: {tag} selects no kvm cell, so the hosted omission is untested"
+            ));
+        }
+    }
     for tag in ["e2e.manifest_c_programs", "e2e.manifest_c_programs_on_host"] {
         let publisher = committed
             .steps
@@ -15351,14 +15427,14 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .ok_or_else(|| format!("retry bounds: committed DAG lost {tag}"))?;
         normal_raw_result_path(publisher, "parity-control")?;
         let mut planted = publisher.clone();
-        if planted.cmd.matches("--prebuilt --results").count() != 1 {
+        if planted.cmd.matches(" --results ").count() != 1 {
             return Err(format!(
-                "retry bounds: {tag} no longer has one --prebuilt --results boundary to plant into"
+                "retry bounds: {tag} no longer has one --results boundary to plant into"
             ));
         }
         planted.cmd = planted.cmd.replace(
-            "--prebuilt --results",
-            "--prebuilt --parity-reference ptrace --results",
+            " --results ",
+            " --parity-reference ptrace --results ",
         );
         match normal_raw_result_path(&planted, "parity-control") {
             Err(refusal) if refusal == unmodeled(tag) => {}
@@ -15370,6 +15446,42 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             Ok(_) => {
                 return Err(format!(
                     "retry bounds: planted parity on {tag} was accepted as a normal publisher"
+                ))
+            }
+        }
+    }
+    // The hosted exclusion must not be admitted on a local publisher: planting
+    // it into the local node must be refused by the exclusion contract, not
+    // accepted as a normal (smaller) raw census.
+    {
+        let tag = "e2e.manifest_c_programs";
+        let mut planted = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: committed DAG lost {tag}"))?
+            .clone();
+        if planted.cmd.matches("--prebuilt --results").count() != 1 {
+            return Err(format!(
+                "retry bounds: {tag} no longer has one --prebuilt --results boundary to plant into"
+            ));
+        }
+        planted.cmd = planted
+            .cmd
+            .replace("--prebuilt --results", "--prebuilt --exclude-backend kvm --results");
+        let expected = format!(
+            "{tag} omits backend(s) [\"kvm\"] outside the hosted-portable exclusion contract"
+        );
+        match normal_raw_result_path(&planted, "parity-control") {
+            Err(refusal) if refusal == expected => {}
+            Err(refusal) => {
+                return Err(format!(
+                    "retry bounds: planted local exclusion on {tag} was refused for the wrong reason: {refusal}"
+                ))
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "retry bounds: planted local exclusion on {tag} was accepted as a normal publisher"
                 ))
             }
         }
