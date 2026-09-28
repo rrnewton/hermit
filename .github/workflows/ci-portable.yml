@@ -315,23 +315,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          corpus_root="$(mktemp -d "$RUNNER_TEMP/scorecard-self-test-corpus.XXXXXX")"
-          timeout --foreground --kill-after=10s 120s bash -euo pipefail -s -- "$corpus_root" <<'CORPUS'
-          corpus_root=$1
-          corpus_commit=352c54f800e62426fe54bd58c9110e8d93d8daaf
-          archive_blob=c55b6e644a6f32aadfdea8fbbf76dfaddb20de3e
-          identity_blob=cc25483da6bf92e361a0a7596ba87ea33872eb15
-          git init --quiet "$corpus_root"
-          git -C "$corpus_root" remote add origin https://github.com/rrnewton/hermit_test_ledger.git
-          git -C "$corpus_root" config remote.origin.promisor true
-          git -C "$corpus_root" config remote.origin.partialclonefilter blob:none
-          git -C "$corpus_root" -c protocol.version=2 fetch --quiet --no-tags --depth=1 --filter=blob:none origin "$corpus_commit"
-          # Fetch only the two pinned fixture blobs before the no-fetch test begins.
-          for object in "$archive_blob" "$identity_blob"; do
-            git -C "$corpus_root" cat-file -e "$object^{blob}"
-            GIT_NO_LAZY_FETCH=1 git -C "$corpus_root" cat-file -e "$object^{blob}"
-          done
-          CORPUS
+          corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
           printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
       - name: Run preflight nodes
         env:
@@ -424,6 +408,19 @@ jobs:
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           ./ci/prepare-rust-scripts.sh --check
+      # check.lint_checks runs every rust-script test suite, including the
+      # scorecard self-test that gate.manifest already ran in preflight. That
+      # test reads the pinned ledger corpus and never fetches, and GITHUB_ENV
+      # does not cross jobs, so this job prepares its own copy. Run 36485831200
+      # omitted it here: the corpus test failed and 14 unrelated scorecard
+      # tests failed behind it on the poisoned fixture lock.
+      - name: Prepare pinned scorecard self-test corpus
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
+          printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
       - name: Run preflight check nodes
         env:
           # Let gh authenticate with this repository's read-only token. The two
@@ -547,21 +544,6 @@ jobs:
           nextest=$(command -v cargo-nextest)
           install -Dm755 "$nextest" target/ci/bin/cargo-nextest
           target/ci/bin/cargo-nextest --version
-      - name: Stage debug DBT runtime
-        run: |
-          set -euo pipefail
-          runtime=$(
-            cargo build -p detcore-dbt --message-format=json-render-diagnostics |
-              jq -r '
-                select(.reason == "compiler-artifact" and .target.name == "detcore_dbt")
-                | .filenames[]
-                | select(endswith(".so"))
-              ' |
-              tail -n 1
-          )
-          test -n "$runtime"
-          test -f "$runtime"
-          install -Dm755 "$runtime" target/debug/deps/libdetcore_dbt.so
       - name: Enumerate constructed portable E2E steps
         id: cells
         run: |
@@ -575,6 +557,29 @@ jobs:
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
+      # build.workspace_on_host already builds detcore-dbt (its first command is
+      # `cargo build --locked -p detcore-dbt`, followed by the feature-unified
+      # workspace build) and then hashes target/debug/deps/libdetcore_dbt.{so,rlib}
+      # into the prepared-Nextest record as runtime files of every -p hermit and
+      # --workspace selection. A step here used to re-run
+      # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
+      # resolves different dependency features from the workspace build (for
+      # example parking_lot, bytes, syn and tracing-core), so Cargo recompiled
+      # reverie-dbt and detcore-dbt and overwrote both unhashed cdylib/rlib
+      # files after they were recorded. Every consumer then refused its inventory:
+      # run 36485831200 lost 12 nodes in 7 test-debug jobs to "prepared
+      # executable, package identity, or runtime file changed", about 5 s after
+      # start and before any test ran. The pack step below ships the recorded
+      # runtime unchanged. Re-verify the whole prepared record here, after the
+      # last step that may touch target/debug and before anything is packed, so
+      # a later mutation fails in this producer instead of in every consumer.
+      - name: Verify prepared Nextest inputs are unchanged
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/ci/rust-script-bin:$PATH"
+          export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"
+          export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
+          ./ci/nextest-binaries.rs assert hosted-portable
       - name: Pack debug prebuilt tree
         run: |
           set -euo pipefail
