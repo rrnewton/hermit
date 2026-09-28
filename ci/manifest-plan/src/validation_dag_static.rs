@@ -246,7 +246,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
     // Twenty-one directory-stream controls retain all 807 prior identities.
-    ("test.detcore_unit", 828),
+    // logdiff::tests::matched_prefix_counts_leading_equal_compared_messages,
+    // added by d550979ad0, was never counted: main b280bc4807 recorded 807
+    // while `cargo nextest list` measured 808. Counting it retains all 828
+    // prior identities.
+    ("test.detcore_unit", 829),
     // Thirty-one whole-stream readdir_order tests retain all 27 prior identities.
     ("test.detcore_misc", 58),
     ("test.detcore_parallel", 5),
@@ -281,7 +285,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 58),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 828),
+    ("test.detcore_unit_on_host", 829),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
     ("test.hermit_unit_on_host", 753),
