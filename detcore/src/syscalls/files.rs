@@ -283,6 +283,19 @@ fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, 
     }
 }
 
+fn require_random_device_read_access(status_flags: i32) -> Result<(), Errno> {
+    if status_flags & libc::O_PATH != 0
+        || !matches!(
+            status_flags & libc::O_ACCMODE,
+            libc::O_RDONLY | libc::O_RDWR
+        )
+    {
+        Err(Errno::EBADF)
+    } else {
+        Ok(())
+    }
+}
+
 /// Inherited container output is a stream even when an outer runner stores it
 /// in a seekable file.  The backing file also carries Hermit's own diagnostics,
 /// so exposing its live offset makes tool logging guest-visible.  Preserve real
@@ -1508,6 +1521,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if call.len() == 0 {
+            if let Ok(Some(status_flags)) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (detfd.ty() == FdType::Rng).then(|| detfd.status_flags())
+            }) {
+                // Replay reserves random-device fd slots with eventfds. A
+                // physical zero-length read of that placeholder returns EINVAL
+                // even though the logical random-device read must return zero.
+                require_random_device_read_access(status_flags)?;
+                let policy = if guest.config().backend_is_kvm {
+                    crate::iovecs::UserAddressPolicy::Kvm
+                } else {
+                    crate::iovecs::UserAddressPolicy::Native
+                };
+                // vfs_read still checks access_ok for a zero-length buffer:
+                // NULL is valid, but an address beyond TASK_SIZE is EFAULT.
+                policy.validate(&[crate::iovecs::ImportedIovec {
+                    base: call.buf().map_or(0, |address| address.as_raw()),
+                    len: 0,
+                }])?;
+                return Ok(0);
+            }
             // Zero-count reads only serve to detect errors.
             let res = guest.inject(Syscall::from(call)).await?;
             return Ok(res);
@@ -1529,21 +1562,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(bytes.len() as i64);
         }
 
-        let (
-            fd_type,
-            physically_nonblocking,
-            logically_nonblocking,
-            resource,
-            random_device_offset,
-        ) = guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.ty(),
-                detfd.physically_nonblocking(),
-                detfd.is_nonblocking(),
-                detfd.resource(),
-                detfd.random_device_offset(),
-            )
-        })?;
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, random_device) =
+            guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.resource(),
+                    detfd.clone(),
+                )
+            })?;
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::R);
@@ -1561,17 +1589,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = match fd_type {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
-                let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n = self.fill_random_device_bytes(
-                    guest,
-                    remote_buf,
-                    call.len(),
-                    random_device_offset,
-                )?;
-                guest.thread_state().with_detfd(call.fd(), |detfd| {
-                    detfd.advance_random_device_offset(n);
-                })?;
-                return Ok(n as i64);
+                let status_flags = random_device.status_flags();
+                random_device
+                    .with_random_device_stream(|offset| {
+                        require_random_device_read_access(status_flags)?;
+                        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+                        self.fill_random_device_bytes(guest, remote_buf, call.len(), offset)
+                    })
+                    .map(|n| n as i64)
             }
             FdType::Regular => {
                 if guest.config().deterministic_io {
@@ -2241,12 +2266,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Mirrors [`Self::handle_writev`] for the read direction. Detcore adds
     /// open-file resource ordering and, for physically nonblocking pipe/socket
-    /// fds, the nonblocking scheduler integration; otherwise the vectored read is
-    /// recorded/replayed as one kernel operation so its iovec order is preserved.
+    /// fds, the nonblocking scheduler integration. Random devices use the shared
+    /// canonical cursor; other descriptors retain their recorded kernel operation.
     pub async fn handle_readv<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        self.handle_readv_with_output(guest, call, &mut None).await
+    }
+
+    pub(crate) async fn handle_readv_with_output<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+        rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
     ) -> Result<i64, Error> {
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             self.require_timer_slack_access(guest, call.fd(), false)?;
@@ -2263,13 +2297,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, detfd) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
                     detfd.is_nonblocking(),
                     detfd.resource(),
+                    detfd.clone(),
                 )
             })?;
 
@@ -2286,12 +2321,37 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let res = if physically_nonblocking
+        let res = if fd_type == FdType::Rng {
+            // This import and cursor transaction are synchronous. In particular,
+            // evidence belongs to these descriptors, not a pre-await snapshot.
+            (|| {
+                require_random_device_read_access(detfd.status_flags())?;
+                let policy = if guest.config().backend_is_kvm {
+                    crate::iovecs::UserAddressPolicy::Kvm
+                } else {
+                    crate::iovecs::UserAddressPolicy::Native
+                };
+                let iovecs = crate::iovecs::import_read_iovecs(
+                    &guest.memory(),
+                    call.iov().map_or(0, |addr| addr.as_raw()),
+                    call.len(),
+                    policy,
+                )?;
+                let written = detfd.with_random_device_stream(|offset| {
+                    self.fill_random_device_iovecs(guest, &iovecs, offset)
+                })?;
+                if written > 0 && self.cfg.detlog_io_buffers && crate::detlog_observed!() {
+                    *rng_output = Some(crate::io_buffers::rng_readv_extents(&iovecs, written)?);
+                }
+                Ok(written as i64)
+            })()
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
         } else {
-            Ok(self.record_or_replay(guest, call).await?)
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
         };
 
         resource_release_all(guest).await;

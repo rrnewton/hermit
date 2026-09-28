@@ -238,7 +238,8 @@ pub(crate) fn write_random_chunk(
     };
     match memory.write(second_buf, &local_buf[PTRACE_WORD_SPLIT..]) {
         Ok(second) => Ok(first + second),
-        Err(_) => Ok(first),
+        Err(Errno::EFAULT) => Ok(first),
+        Err(error) => Err(error),
     }
 }
 
@@ -393,6 +394,70 @@ mod tests {
             } else {
                 Ok(n as usize)
             }
+        }
+    }
+
+    struct SecondHalfFailure {
+        error: Errno,
+        bytes: [u8; 8],
+        writes: Vec<(usize, Vec<u8>)>,
+    }
+
+    impl MemoryAccess for SecondHalfFailure {
+        fn read_vectored(
+            &self,
+            _remote: &[IoSlice],
+            _local: &mut [IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("random copying must not read guest memory")
+        }
+
+        fn write_vectored(
+            &mut self,
+            _local: &[IoSlice],
+            _remote: &mut [IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("the fake memory's scalar write must be used")
+        }
+
+        fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+            self.writes.push((addr.as_raw(), buf.to_vec()));
+            match self.writes.len() {
+                1 => {
+                    assert_eq!(addr.as_raw(), 0x1000);
+                    assert_eq!(buf.len(), 4);
+                    self.bytes[..4].copy_from_slice(buf);
+                    Ok(4)
+                }
+                2 => {
+                    assert_eq!(addr.as_raw(), 0x1004);
+                    assert_eq!(buf.len(), 4);
+                    Err(self.error)
+                }
+                _ => panic!("random copying retried a failed write"),
+            }
+        }
+    }
+
+    #[test]
+    fn eight_byte_random_copy_distinguishes_faults_from_backend_errors() {
+        for (error, expected) in [(Errno::EFAULT, Ok(4)), (Errno::EIO, Err(Errno::EIO))] {
+            let mut memory = SecondHalfFailure {
+                error,
+                bytes: [0xa5; 8],
+                writes: Vec::new(),
+            };
+            let address = AddrMut::from_raw(0x1000).unwrap();
+
+            assert_eq!(
+                write_random_chunk(&mut memory, address, &[1, 2, 3, 4, 5, 6, 7, 8]),
+                expected
+            );
+            assert_eq!(memory.bytes, [1, 2, 3, 4, 0xa5, 0xa5, 0xa5, 0xa5]);
+            assert_eq!(
+                memory.writes,
+                [(0x1000, vec![1, 2, 3, 4]), (0x1004, vec![5, 6, 7, 8])]
+            );
         }
     }
 
