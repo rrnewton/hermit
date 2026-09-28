@@ -94,6 +94,7 @@ use std::process::ExitCode;
 use safe_ci_dag_runner::cgroup::is_in_scope;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::RunResult;
+use safe_ci_dag_runner::model::Step;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
@@ -115,6 +116,51 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
+const MANIFEST_COMPILE_TAG: &str = "pre.manifest_compile";
+
+fn expected_manifest_compile_command(root: &Path) -> String {
+    let root = validate_plan::shell_quote(&root.to_string_lossy());
+    format!(
+        "cargo build --quiet -p hermit-manifest-plan \
+             --bin hermit-manifest-plan --bin generate-test-footprints && \
+         rust-script --force --wrapper true {root}/tests/manifest-cli.rs && \
+         rust-script --force --wrapper true {root}/ci/compat-envelope/scorecard.rs && \
+         rust-script --force --wrapper true {root}/ci/compat-envelope/pressure-test.rs"
+    )
+}
+
+fn manifest_compile_binding(
+    root: &Path,
+    compile: &Step,
+    manifest: &Step,
+) -> Result<(), String> {
+    if !root.is_absolute() {
+        return Err(format!("repository root is not absolute: {}", root.display()));
+    }
+    if compile.tag() != MANIFEST_COMPILE_TAG
+        || compile.deps != vec![PIN_GATE_TAG]
+        || compile.cmd != expected_manifest_compile_command(root)
+        || !compile.env.is_empty()
+        || compile.skip_reason.is_some()
+    {
+        return Err(format!(
+            "manifest compile node does not use the pinned checkout/cache contract: tag={} deps={:?} env={:?} skip={:?} cmd={}",
+            compile.tag(), compile.deps, compile.env, compile.skip_reason, compile.cmd
+        ));
+    }
+    if manifest.tag() != "gate.manifest"
+        || manifest.cmd != "./ci/test_harness.sh validate"
+        || manifest.deps != vec![MANIFEST_COMPILE_TAG]
+        || !manifest.env.is_empty()
+        || manifest.skip_reason.is_some()
+    {
+        return Err(format!(
+            "gate.manifest does not consume the pinned compile predecessor: deps={:?} env={:?} skip={:?} cmd={}",
+            manifest.deps, manifest.env, manifest.skip_reason, manifest.cmd
+        ));
+    }
+    Ok(())
+}
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
@@ -1187,6 +1233,48 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: pin authority was not deduped to the observed preflight: {pin_nodes:?}"
             ));
         }
+        let compile = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == MANIFEST_COMPILE_TAG)
+            .ok_or("full-plan bracket: missing manifest compile preflight")?;
+        let manifest = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "gate.manifest")
+            .ok_or("full-plan bracket: missing gate.manifest")?;
+        manifest_compile_binding(&root, compile, manifest)
+            .map_err(|e| format!("full-plan bracket: {e}"))?;
+
+        let mut changed = compile.clone();
+        let checkout = validate_plan::shell_quote(&root.to_string_lossy());
+        let wrong_checkout = "/another/hermit";
+        let command_mutations = [
+            format!("CARGO_HOME=/tmp/different {}", compile.cmd),
+            compile.cmd.replace(&checkout, wrong_checkout),
+            format!("{} || true", compile.cmd),
+            format!("echo {}", validate_plan::shell_quote(&compile.cmd)),
+        ];
+        for command in command_mutations {
+            changed.cmd = command;
+            if manifest_compile_binding(&root, &changed, manifest).is_ok() {
+                return Err(
+                    "full-plan bracket: altered checkout/cache or inert compile command was accepted"
+                        .into(),
+                );
+            }
+        }
+        changed = compile.clone();
+        changed
+            .env
+            .insert("XDG_CACHE_HOME".into(), "/tmp/different-cache".into());
+        if manifest_compile_binding(&root, &changed, manifest).is_ok() {
+            return Err(
+                "full-plan bracket: per-node rust-script cache override was accepted".into(),
+            );
+        }
         for required in ["test.strict_compat", "privileged-cpuid.faulting"] {
             if !full.cfg.steps.iter().any(|s| s.tag() == required) {
                 return Err(format!("full-plan bracket: fused plan lost {required}"));
@@ -1319,10 +1407,15 @@ cleared-caps refusal names {} starved step(s)",
         .map_err(|rc| format!("full-plan bracket: nested positive form refused rc={rc}"))?;
         let nested = build_plan(&root, &nested_args, &tmp)?;
         if nested.cfg.steps.iter().any(|s| s.tag() == "gate.manifest")
+            || nested
+                .cfg
+                .steps
+                .iter()
+                .any(|s| s.tag() == MANIFEST_COMPILE_TAG)
             || !nested.cfg.steps.iter().any(|s| s.tag() == PIN_GATE_TAG)
         {
             return Err(
-                "full-plan bracket: nested reuse did not remove only manifest while retaining the pin gate"
+                "full-plan bracket: nested reuse did not remove manifest and its compile predecessor while retaining the pin gate"
                     .into(),
             );
         }
@@ -1335,7 +1428,7 @@ cleared-caps refusal names {} starved step(s)",
             return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
         }
         println!(
-            "  full plan: {} fused node(s), 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
+            "  full plan: {} fused node(s), 1 manifest compile + 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
             full.cfg.steps.len()
         );
     }
@@ -2409,10 +2502,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let mut steps = pre;
         let compat_gate = if args.reuse_parent_manifest_gate {
             // The outer node is reachable only after its real gate.manifest
-            // passed. Avoid rerunning that ~75 s exact-tree audit inside the
-            // nested payload, but retain the cheap, independently observed
-            // submodule and pin gates.
-            steps.retain(|s| s.tag() != gate);
+            // passed. Avoid rerunning its compile predecessor and exact-tree
+            // audit inside the nested payload, but retain the independently
+            // observed submodule and pin gates.
+            steps.retain(|s| {
+                let tag = s.tag();
+                tag != gate && tag != MANIFEST_COMPILE_TAG
+            });
             PIN_GATE_TAG
         } else {
             gate

@@ -9,11 +9,12 @@
 //! # The single rule this module exists to enforce
 //!
 //! **Nothing validate runs may execute outside `safe-ci-dag-runner`.** Every gate
-//! — preflight submodule init, the Reverie pin check, the manifest gate, each CI
+//! — preflight submodule init, the Reverie pin check, the manifest-script compile,
+//! the manifest gate, each CI
 //! lane node, and each compatibility probe — is a DAG *node*. The driver makes
 //! exactly one kind of call (`run_dag_boxed_ordered`) and never spawns work
 //! itself. The previous Phase-1 wrapper had a `run_subprocess_gate` helper that
-//! shelled out for the three preflight gates; that was a second execution path
+//! shelled out for the preflight gates; that was a second execution path
 //! inside the driver, so those gates were unboxed, untimed by the runner, and
 //! invisible to its typed accounting. It is gone.
 //!
@@ -57,8 +58,10 @@ use crate::validate_corpus::CorpusPaths;
 /// through `with-proxy`, so it needs more than a trivial ceiling but must not
 /// inherit a lane-sized one.
 const PREFLIGHT_TIMEOUT_S: i64 = 900;
-/// CPU budget for preflight. These gates are I/O-bound (clone, fetch, a small
-/// rustc); a tight CPU ceiling catches a spin without flaking under host load.
+/// CPU budget for preflight. Submodule and pin work is mostly I/O, while the
+/// manifest-script compile intentionally moves reusable Cargo/rustc work out of
+/// gate.manifest. The finite existing ceiling applies independently to each
+/// node; this prototype does not raise any bound.
 const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
 /// Memory ceiling for a preflight gate. `git submodule update --recursive` on
 /// this tree peaks well under a GiB; 2 GiB leaves headroom without being a
@@ -234,12 +237,11 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
         .join(" ")
 }
 
-/// The three always-on preflight gates, as DAG nodes.
+/// The four always-on preflight gates, as DAG nodes.
 ///
-/// `validate.sh` runs these before every profile and fails fast if either of the
-/// first two fails (validate.sh:4745-4752); the dependency edges below reproduce
-/// that fail-fast structurally — a failed dependency SKIPS its dependents, which
-/// the runner reports as `skipped` rather than as passes.
+/// The dependency edges make every profile fail fast structurally: a failed
+/// dependency SKIPS its dependents, which the runner reports as `skipped`
+/// rather than as passes.
 pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     let proxy = if with_proxy { "with-proxy " } else { "" };
     // The Reverie-pin launcher is bound to THIS repository explicitly, never left
@@ -277,11 +279,42 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_MEM_BYTES,
         ),
         node(
+            "pre",
+            "manifest_compile",
+            "Compile reusable test manifest and inventory checks",
+            // These are the exact rust-script entrypoints that gate.manifest
+            // executes below. The DAG runner gives this node and its dependent
+            // the same working directory and inherited CARGO_HOME,
+            // CARGO_TARGET_DIR, HOME, and XDG_CACHE_HOME. The shebang therefore
+            // selects the same rust-script target directory too. rust-script's
+            // wrapper compiles each exact entrypoint, then `true` prevents its
+            // body from running. The later --force invocations therefore ask
+            // Cargo to freshness-check reusable artifacts. Temporary mutation
+            // probes intentionally keep their fresh compiles inside
+            // gate.manifest; no test, population, assertion, or comparator
+            // moves out of that gate.
+            format!(
+                "cargo build --quiet -p hermit-manifest-plan \
+                     --bin hermit-manifest-plan --bin generate-test-footprints && \
+                 rust-script --force --wrapper true {root}/tests/manifest-cli.rs && \
+                 rust-script --force --wrapper true {root}/ci/compat-envelope/scorecard.rs && \
+                 rust-script --force --wrapper true {root}/ci/compat-envelope/pressure-test.rs"
+            ),
+            vec!["pre.reverie_pin".to_string()],
+            PREFLIGHT_TIMEOUT_S,
+            PREFLIGHT_CPU_TIMEOUT_S,
+            PREFLIGHT_MEM_BYTES,
+        ),
+        node(
             "gate",
             "manifest",
             "Centralized test manifest and inventory",
             "./ci/test_harness.sh validate".to_string(),
-            vec!["pre.reverie_pin".to_string()],
+            // A compile failure is its own failed preflight node. This edge
+            // keeps gate.manifest from starting, so the scheduler records the
+            // gate as dependency-skipped rather than manufacturing a manifest
+            // verdict from an infrastructure failure.
+            vec!["pre.manifest_compile".to_string()],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,

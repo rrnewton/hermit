@@ -1432,7 +1432,9 @@ EOF
     [[ $(grep -Fc '"Reverie pin consistency",' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
         die "the validate driver must plan the Reverie-pin ancestor-and-monotonic gate exactly once"
     [[ $(grep -Fc 'vec!["pre.reverie_pin".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate manifest gate must depend on the Reverie-pin ancestor-and-monotonic gate"
+        die "the validate manifest compile node must depend on the Reverie-pin ancestor-and-monotonic gate"
+    [[ $(grep -Fc 'vec!["pre.manifest_compile".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
+        die "the validate manifest gate must depend on the exact-entrypoint compile node"
     [[ $(grep -Fc 'reverie_pin_current: pin_gate_passed' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
         die "the Rust validate receipt must derive pin ancestry and monotonicity from the observed gate"
     [[ $(grep -Fc '"reverie_pin_current": ctx.reverie_pin_current' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
