@@ -161,6 +161,21 @@ static void check_raw_signal_abi_boundaries(void) {
                        sizeof(uint64_t)),
                EFAULT);
 
+  unsigned char *partial_mask = mapping + page_size - sizeof(uint32_t);
+  memset(partial_mask, 0, sizeof(uint32_t));
+  errno = 0;
+  expect_errno("rt_sigprocmask signal mask crosses inaccessible page",
+               syscall(SYS_rt_sigprocmask, SIG_BLOCK, partial_mask, NULL,
+                       sizeof(uint64_t)),
+               EFAULT);
+
+  void *wrapping_mask = (void *)(UINTPTR_MAX - sizeof(uint32_t) + 1);
+  errno = 0;
+  expect_errno("rt_sigprocmask signal mask wraps address space",
+               syscall(SYS_rt_sigprocmask, SIG_BLOCK, wrapping_mask, NULL,
+                       sizeof(uint64_t)),
+               EFAULT);
+
   errno = 0;
   expect_errno("rt_sigsuspend inaccessible valid-size pointer",
                syscall(SYS_rt_sigsuspend, inaccessible, sizeof(uint64_t)),

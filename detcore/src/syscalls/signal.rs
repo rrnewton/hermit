@@ -128,38 +128,28 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
     mask & !(1_u64 << bit)
 }
 
-/// Read one raw kernel signal mask while preserving the kernel's user-access check.
+fn rt_sigsuspend_with_snapshot(
+    call: syscalls::RtSigsuspend,
+    snapshot: Addr<'_, KernelSigset>,
+) -> syscalls::RtSigsuspend {
+    call.with_mask(Some(snapshot.cast()))
+}
+
+/// Read one raw kernel signal mask with Linux user-access checks.
 ///
-/// `safeptrace::Stopped::read` deliberately uses `PTRACE_PEEKDATA` for reads of
-/// eight bytes or less. That operation can read a `PROT_NONE` page, unlike the
-/// kernel's `copy_from_user`, so using `MemoryAccess::read_value` alone would
-/// turn an `EFAULT` from a raw signal syscall into success. An invalid `how`
-/// value makes `rt_sigprocmask` copy exactly the kernel-sized input and then
-/// return `EINVAL` without changing the mask. Use that as a permission probe,
-/// then read the already-validated word while the guest is stopped.
-pub(super) async fn read_kernel_sigset<G, T>(
-    guest: &mut G,
+/// This must not use the ptrace backend's small-read optimization, because
+/// `PTRACE_PEEKDATA` can read a `PROT_NONE` page that Linux `copy_from_user`
+/// rejects. It must not inject a syscall either: an internal injection creates
+/// a signal/restart point that the guest did not execute. Reverie's explicit
+/// user-access read preserves the backend's copy-from-user behavior without
+/// changing guest state.
+pub(super) fn read_kernel_sigset<M: MemoryAccess>(
+    memory: &M,
     address: Addr<'_, libc::sigset_t>,
-) -> Result<KernelSigset, Error>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let validation = syscalls::RtSigprocmask::new()
-        .with_how(-1)
-        .with_set(Some(address))
-        .with_oldset(None)
-        .with_sigsetsize(KERNEL_SIGSET_SIZE);
-    match guest.inject(validation).await {
-        Err(Errno::EINVAL) => {}
-        Err(errno) => return Err(errno.into()),
-        Ok(_) => {
-            // Both Linux and the KVM syscall implementation reject an unknown
-            // operation. Success means the backend did not validate the probe.
-            return Err(Errno::EIO.into());
-        }
-    }
-    Ok(guest.memory().read_value(address.cast())?)
+) -> Result<KernelSigset, Error> {
+    let mut bytes = [0_u8; KERNEL_SIGSET_SIZE];
+    memory.read_exact_with_user_access(address.cast(), &mut bytes)?;
+    Ok(KernelSigset::from_ne_bytes(bytes))
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -352,10 +342,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
-        let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
+        // Keep one entry snapshot alive through the physical syscall. The guest
+        // pointer may be shared with another thread, but Linux copies the mask
+        // once on syscall entry; Detcore's pending-signal classification and
+        // the injected rt_sigsuspend must therefore consume the same value.
+        let temporary_mask = read_kernel_sigset(&guest.memory(), mask_addr)?;
         let mut stack = guest.stack().await;
+        let temporary_mask_addr = stack.push(temporary_mask);
         let pending_addr = stack.push(0_u64);
-        let pending_guard = stack.commit()?;
+        let scratch_guard = stack.commit()?;
         let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
             .expect("stack address must be non-null");
         let pending_call = syscalls::RtSigpending::new()
@@ -363,17 +358,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(pending_call).await?;
         let pending: u64 = guest.memory().read_value(pending_addr)?;
-        drop(pending_guard);
+        let snapshotted_call = rt_sigsuspend_with_snapshot(call, temporary_mask_addr);
 
-        if pending & !temporary_mask != 0 {
+        let result = if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
             // performs delivery and restores the old mask.
-            self.record_or_replay_blocking(guest, call.into()).await
+            self.record_or_replay_blocking(guest, snapshotted_call.into())
+                .await
         } else {
-            self.record_or_replay_rt_sigsuspend(guest, call).await
-        }
+            self.record_or_replay_rt_sigsuspend(guest, snapshotted_call)
+                .await
+        };
+        drop(scratch_guard);
+        result
     }
 
     /// rt_sigaction
@@ -451,7 +450,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
             Ok(guest.inject_with_retry(call).await?)
         } else if let Some(set) = call.set() {
-            let set_mask = read_kernel_sigset(guest, set).await?;
+            let set_mask = read_kernel_sigset(&guest.memory(), set)?;
             let mut stack = guest.stack().await;
             let new_set = stack.push(without_perf_event_signal(set_mask));
             let _stack_guard = stack.commit()?;
@@ -738,6 +737,21 @@ mod tests {
         let usr1 = 1_u64 << (libc::SIGUSR1 as u32 - 1);
         assert_eq!(without_perf_event_signal(reserved | usr1), usr1);
         assert_eq!(without_perf_event_signal(usr1), usr1);
+    }
+
+    #[test]
+    fn rt_sigsuspend_uses_the_entry_mask_snapshot() {
+        let original = Addr::<libc::sigset_t>::from_raw(0x1000).unwrap();
+        let snapshot = Addr::<KernelSigset>::from_raw(0x2000).unwrap();
+        let call = syscalls::RtSigsuspend::new()
+            .with_mask(Some(original))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+
+        let snapshotted = rt_sigsuspend_with_snapshot(call, snapshot);
+
+        assert_eq!(snapshotted.mask().unwrap().as_raw(), snapshot.as_raw());
+        assert_ne!(snapshotted.mask().unwrap().as_raw(), original.as_raw());
+        assert_eq!(snapshotted.sigsetsize(), KERNEL_SIGSET_SIZE);
     }
 
     #[test]
