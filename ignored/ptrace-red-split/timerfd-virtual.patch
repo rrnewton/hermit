@@ -1,0 +1,984 @@
+diff --git a/ai_docs/timerfd-virtual-scheduling-review-2026-09-24.md b/ai_docs/timerfd-virtual-scheduling-review-2026-09-24.md
+new file mode 100644
+index 0000000000..bb721754cd
+--- /dev/null
++++ b/ai_docs/timerfd-virtual-scheduling-review-2026-09-24.md
+@@ -0,0 +1,102 @@
++# Deterministic-scheduling review: virtual timerfd (separate from the socket fix)
++
++Change class (skill §0): this adds a **virtual-time timer strategy for an
++existing ready/wait strategy** — timerfd expiry, readiness, blocking, wake
++ordering, relative/absolute deadlines, ties, timed waits, and fd lifecycle.
++It changes no `scheduler.rs` code; it reuses the existing `SleepUntil` timed
++waiter and timed-event machinery. Freeze: publication is this record plus the
++timer-only diff (socket io-buffer and manifest changes are a separate change).
++
++## Authority (§1)
++
++- Capability source: `docs/DETERMINISM_ARGUMENT.md` rubric (scope claim,
++  entropy inventory, mitigation) and the Hermit v2 roadmap timer/RCB notes.
++- Standard scheduler: `detcore/src/scheduler.rs` (+ `timed_waiters.rs`,
++  `real_timer.rs` read directly) — committed turns advance `committed_time`;
++  timed events pop in `(deadline, tie-order)` sequence; when no thread is
++  runnable the scheduler fast-forwards to the earliest timed event, which is
++  the legacy order this change plugs into.
++- Paper citation in the skill (Kaiser et al.) is an external link unreachable
++  from this host (proxy 403); no claim here depends on it — the implemented
++  scheduler code above is the normative reference used.
++- Refusal boundary: under strict mode a blocking wait with no deterministic
++  wake source must fail closed, never silently consume host timing. The
++  disarmed-blocking-read path parks on `InternalIOPolling` (checked every
++  scheduler visit) instead of inventing `EAGAIN`.
++- Linux reference: `timerfd_create/settime/gettime` ABI (one-shot/interval,
++  `TFD_TIMER_ABSTIME`, `TFD_TIMER_CANCEL_ON_SET` n/a on a never-jumping
++  virtual clock, read returns `u64` expirations, wrong-type fd => `EINVAL`,
++  small read buffer => `EINVAL`, level/edge semantics via epoll flags).
++  Every behaviour below was first recorded natively on this host.
++
++## Event path (§2)
++
++`timerfd_create` (host fd created, state in open-file description) ->
++`timerfd_settime` (validate, compute virtual deadline from
++`thread_observe_time`; host fd never armed) -> producer wake sources are
++virtual deadlines only -> waiter representation: `TimerfdVirtual{clockid,
++deadline, interval, pending}` on the shared open-file description + epoll
++interest recorded at `epoll_ctl` -> consumer checks: `read`, `poll`, `ppoll`,
++`epoll_wait`, `epoll_pwait` each `collect(now)` (folds expirations at or
++before virtual now; interval deadlines advance with `u128` math) and park via
++`SleepUntil(min(deadline, timeout))`, a deterministic timed event in the same
++queue as futex/sleep waiters. Host state cannot change the result: the only
++host probe retained is for *non-timerfd* targets merged alongside.
++
++Ties: two timerfds at one deadline both collect ready in fd order from the
++interest map; a timerfd vs futex waiter at one deadline wakes in timed-event
++queue order (existing scheduler tie rule, unchanged).
++
++## Test trajectories (§3–§7, §9)
++
++Battery `tfd_battery.c` (11 modes), native ground truth recorded first, then
++identical Hermit output for every mode, strict `--verify` matched for
++rel/periodic/tie/et/refuse plus the `timer-family-identity` fixture:
++
++| Mode | Native | Hermit | Covers |
++|---|---|---|---|
++| rel | `poll=1 v=1` | same | relative one-shot |
++| abs | `epoll=1 data=7 v=1` | same | `TFD_TIMER_ABSTIME`, epoll data |
++| disarm | `poll=0 EAGAIN` | same | disarm before expiry |
++| periodic | `total=3 interval=1ms remain>0` | same | interval counts, gettime |
++| tie | `n=2 1 2` | same | two timers, same deadline |
++| dup | `v=1` | same | dup shares description/state |
++| fork | child consumes, parent `EAGAIN` | same | fork shared description |
++| blockread | `v=1` | same | blocking read parked until armed by peer thread |
++| refuse | pipe/nsec/flags/small all `EINVAL`, remain 4ms | same | refusal controls |
++| et | `ET n1=1 n2=0`, `ONESHOT m1=1 m2=0` | same | edge/one-shot |
++| exec | `poll=1 v=1` | same | non-CLOEXEC across exec |
++
++Plus existing `detcore/tests/misc/notification_fds.rs` (timerfd, mixed epoll
++sources — the merge case that found the tuple-write bug fixed in this diff):
++4 passed. Unit: `TimerfdVirtual::collect` (boundary/interval/no-double-count).
++
++Deterministic-review findings while testing: (1) synthesized epoll events
++originally serialized fd+event tuples — guest data corruption, fixed and the
++battery now compares full `data.u64`; (2) wrong-type `timerfd_settime`
++returned `EBADF`, native is `EINVAL`, fixed. Neither involved weakening the
++fixture or its comparator; `timer-family-identity` stays `ci:false`.
++
++## Backends (§8) and evidence (§9)
++
++- ptrace: full battery + fixture + notification tests (above), guests
++  11/11 identical to native, verify matched on the strict runs quoted.
++  Fixture qualification: 20 repetitions, 0 determinism divergences,
++  17 matched + 3 host PMU `skid_overshoot` infrastructure errors — **not**
++  clean 20/20, so the cell is not re-enabled by the socket change either.
++- liteinst: same `DetcoreTool` handlers execute; local attempt is
++  `backend-unavailable` (runtime DSO not built in this checkout), so liteinst
++  is **not measured** here and no liteinst cell is re-enabled.
++- sabre/kvm/dbt: timerfd cells are disabled for those backends in the
++  manifests; this change does not touch their runners. Not claimed.
++
++Residual, disclosed not fixed: `select/pselect6` and raw `epoll_pwait2`
++(no typed Reverie variant) still consult the host for timerfd readiness;
++`--no-sequentialize-threads`, namespace-only, record/replay modes are
++outside this claim (record/replay replays the new syscalls as ordinary calls;
++the host fd is created but never armed there either).
++
++Verdict for the timer diff: correct under the frozen semantics above and
++ready to publish **separately** from the socket fix, with
++`post-facto-human-review` (determinization strategy). It does not land as
++`ci:true` for any timer cell until a skid-free 20/20 exists.
+diff --git a/detcore/src/fd.rs b/detcore/src/fd.rs
+index 89eca566c1..7734ea73b2 100644
+--- a/detcore/src/fd.rs
++++ b/detcore/src/fd.rs
+@@ -166,6 +166,16 @@ struct OpenFileDescription {
+     /// after entering the guest can already carry a lock.
+     #[serde(default)]
+     flock_mode_known: bool,
++    /// Virtual timerfd state, shared by every alias of the timerfd. The host
++    /// descriptor is never armed: expiry is computed from virtual time so
++    /// `read`/`poll`/`epoll` readiness cannot leak host timing.
++    #[serde(default)]
++    timerfd: TimerfdVirtual,
++    /// Epoll interest list (`target fd -> (events, data)`) for an epoll
++    /// instance, recorded at `epoll_ctl` so `epoll_wait` can synthesize
++    /// virtual-timerfd readiness without consulting the host.
++    #[serde(default)]
++    epoll_targets: std::collections::BTreeMap<RawFd, (u32, u64)>,
+     /// Whether Detcore has EVER known this description's lock state.
+     ///
+     /// This separates two different unknowns that `flock_mode_known == false`
+@@ -178,6 +188,63 @@ struct OpenFileDescription {
+     flock_mode_ever_known: bool,
+ }
+ 
++/// Virtual state of one timerfd: an absolute virtual deadline, a repeat
++/// interval (`0` = one-shot), and expirations not yet consumed by `read`.
++#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
++pub(crate) struct TimerfdVirtual {
++    pub clockid: i32,
++    pub deadline: Option<LogicalTime>,
++    pub interval_nanos: u64,
++    pub pending: u64,
++}
++
++impl TimerfdVirtual {
++    /// Fold every expiry at or before `now` into `pending`, advancing an
++    /// interval timer's deadline past `now`. Returns the pending count.
++    pub fn collect(&mut self, now: LogicalTime) -> u64 {
++        self.collect_added(now).0
++    }
++
++    /// Like `collect`, also returning how many expirations this call added
++    /// (edge-triggered readiness fires exactly when that count is nonzero).
++    pub fn collect_added(&mut self, now: LogicalTime) -> (u64, u64) {
++        let before = self.pending;
++        let Some(deadline) = self.deadline else {
++            return (self.pending, 0);
++        };
++        if now < deadline {
++            return (self.pending, 0);
++        }
++        if self.interval_nanos == 0 {
++            self.pending += 1;
++            self.deadline = None;
++            return (self.pending, self.pending - before);
++        }
++        let elapsed = u128::from(now.as_nanos() - deadline.as_nanos());
++        let interval = u128::from(self.interval_nanos);
++        let count = elapsed / interval + 1;
++        self.pending = self.pending.saturating_add(count as u64);
++        let next = u128::from(deadline.as_nanos()) + count * interval;
++        self.deadline = Some(LogicalTime::from_big_nanos(next));
++        (self.pending, self.pending - before)
++    }
++}
++
++/// Render virtual timerfd state as the `itimerspec` Linux reports.
++pub(crate) fn timerfd_itimerspec(state: TimerfdVirtual, now: LogicalTime) -> libc::itimerspec {
++    let remaining = match state.deadline {
++        Some(deadline) if deadline > now => deadline.as_nanos() - now.as_nanos(),
++        // An expired timer reports 0, like Linux; callers collect first, so
++        // an interval timer reaches here with its next deadline in future.
++        Some(_) => 0,
++        None => 0,
++    };
++    libc::itimerspec {
++        it_interval: crate::syscalls::time::ns_to_timespec(state.interval_nanos),
++        it_value: crate::syscalls::time::ns_to_timespec(remaining),
++    }
++}
++
+ impl PartialEq for DetFd {
+     fn eq(&self, other: &Self) -> bool {
+         self.fd == other.fd
+@@ -225,6 +292,8 @@ impl DetFd {
+                 flock_mode: None,
+                 flock_mode_known: true,
+                 flock_mode_ever_known: true,
++                timerfd: TimerfdVirtual::default(),
++                epoll_targets: std::collections::BTreeMap::new(),
+                 // By default, we assume it matches the flags we were given:
+                 physically_nonblocking: oflags_nonblocking(bits),
+             })),
+@@ -553,6 +622,38 @@ impl DetFd {
+         self.description().socket_receive_timestamp
+     }
+ 
++    /// Mutate this timerfd's virtual state under its open-file lock.
++    pub(crate) fn with_timerfd<R>(&self, f: impl FnOnce(&mut TimerfdVirtual) -> R) -> R {
++        f(&mut self.description().timerfd)
++    }
++
++    /// Snapshot this timerfd's virtual state.
++    pub(crate) fn timerfd_state(&self) -> TimerfdVirtual {
++        self.description().timerfd
++    }
++
++    /// Record one epoll interest entry (ADD/MOD) or remove it (DEL).
++    pub(crate) fn epoll_set_target(&self, target: RawFd, entry: Option<(u32, u64)>) {
++        let mut description = self.description();
++        match entry {
++            Some(entry) => {
++                description.epoll_targets.insert(target, entry);
++            }
++            None => {
++                description.epoll_targets.remove(&target);
++            }
++        }
++    }
++
++    /// Snapshot this epoll instance's interest list.
++    pub(crate) fn epoll_targets(&self) -> Vec<(RawFd, (u32, u64))> {
++        self.description()
++            .epoll_targets
++            .iter()
++            .map(|(fd, entry)| (*fd, *entry))
++            .collect()
++    }
++
+     // AUTONOMOUS-BOT-IMPLEMENTED
+     // TODO-HUMAN-REVIEW(PR-1064)
+     /// Mark this open file as a `NETLINK_SOCK_DIAG` socket. Shared across every
+@@ -653,6 +754,30 @@ impl fmt::Display for DetFd {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn timerfd_virtual_collects_only_at_or_after_the_virtual_deadline() {
++        let at = |ns| LogicalTime::from_nanos(ns);
++        let mut state = TimerfdVirtual {
++            clockid: libc::CLOCK_MONOTONIC,
++            deadline: Some(at(40_000_000)),
++            interval_nanos: 0,
++            pending: 0,
++        };
++        assert_eq!(state.collect(at(39_999_999)), 0, "host-early must not fire");
++        assert_eq!(state.collect(at(40_000_000)), 1);
++        assert_eq!(state.deadline, None, "one-shot disarms after expiry");
++        // Interval timers fold every elapsed period and stay armed.
++        let mut periodic = TimerfdVirtual {
++            clockid: libc::CLOCK_MONOTONIC,
++            deadline: Some(at(10_000_000)),
++            interval_nanos: 10_000_000,
++            pending: 0,
++        };
++        assert_eq!(periodic.collect(at(35_000_000)), 3);
++        assert_eq!(periodic.deadline, Some(at(40_000_000)));
++        assert_eq!(periodic.collect(at(35_000_000)), 3, "no double counting");
++    }
++
+     #[test]
+     fn dup_shares_open_file_state_but_not_slot_flags() {
+         let owner = DetTid::from_raw(10);
+diff --git a/detcore/src/syscalls/files.rs b/detcore/src/syscalls/files.rs
+index 1c18603c7d..d8905d960d 100644
+--- a/detcore/src/syscalls/files.rs
++++ b/detcore/src/syscalls/files.rs
+@@ -1580,7 +1580,8 @@ impl<T: RecordOrReplay> Detcore<T> {
+                     Ok(self.record_or_replay(guest, call).await?)
+                 }
+             }
+-            FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
++            FdType::Timerfd => return self.handle_timerfd_read(guest, call).await,
++            FdType::Signalfd | FdType::Eventfd | FdType::Inotify => {
+                 trace!(
+                     "Possibly blocking read call on notification fd {}, type {:?}",
+                     call.fd(),
+@@ -3872,6 +3873,13 @@ impl<T: RecordOrReplay> Detcore<T> {
+             FdType::Timerfd,
+         )
+         .await?;
++        // All Detcore clocks read one virtual timeline (see
++        // handle_clock_gettime), so the id is recorded for introspection;
++        // deadlines for every clockid are computed on that same timeline.
++        let clockid = reverie::syscalls::FromToRaw::into_raw(call.clockid()) as i32;
++        let _ = guest.thread_state().with_detfd(fd, |detfd| {
++            detfd.with_timerfd(|state| state.clockid = clockid)
++        });
+         Ok(fd as i64)
+     }
+ 
+@@ -3886,22 +3894,154 @@ impl<T: RecordOrReplay> Detcore<T> {
+         Ok(self.record_or_replay(guest, call).await?)
+     }
+ 
+-    /// timerfd_settime system call.
++    /// The detfd must name a timerfd. Linux returns `EINVAL` (not `EBADF`)
++    /// for a descriptor of the wrong type on timerfd calls, verified against
++    /// a pipe descriptor natively.
++    fn require_timerfd<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> Result<(), Error> {
++        let ty = guest
++            .thread_state()
++            .with_detfd(fd, |detfd| detfd.ty())
++            .map_err(Error::Errno)?;
++        if ty != FdType::Timerfd {
++            return Err(Errno::EINVAL.into());
++        }
++        Ok(())
++    }
++
++    /// timerfd_settime: arm/disarm against the virtual clock. The host
++    /// descriptor is deliberately never armed, so host time cannot make the
++    /// timerfd readable early (the `timer-family-identity` divergence).
+     pub async fn handle_timerfd_settime<G: Guest<Self>>(
+         &self,
+         guest: &mut G,
+         call: syscalls::TimerfdSettime,
+     ) -> Result<i64, Error> {
+-        self.notification_fd_control(guest, call.into()).await
++        Self::require_timerfd(guest, call.fd())?;
++        if call.flags() & !libc::TFD_TIMER_ABSTIME != 0 {
++            return Err(Errno::EINVAL.into());
++        }
++        let new_ptr = call.new_value().ok_or(Errno::EFAULT)?;
++        let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
++        for ts in [new.it_value, new.it_interval] {
++            if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
++                return Err(Errno::EINVAL.into());
++            }
++        }
++        let now = thread_observe_time(guest).await;
++        let interval_ns = super::time::timespec_to_ns(new.it_interval);
++        let value_ns = super::time::timespec_to_ns(new.it_value);
++        let deadline = if value_ns == 0 {
++            None
++        } else if call.flags() & libc::TFD_TIMER_ABSTIME != 0 {
++            Some(LogicalTime::from_nanos(value_ns))
++        } else {
++            Some(now + std::time::Duration::from_nanos(value_ns))
++        };
++        let old = guest
++            .thread_state()
++            .with_detfd(call.fd(), |detfd| {
++                detfd.with_timerfd(|state| {
++                    state.collect(now);
++                    let old = *state;
++                    state.deadline = deadline;
++                    state.interval_nanos = interval_ns;
++                    state.pending = 0;
++                    old
++                })
++            })
++            .map_err(Error::Errno)?;
++        if let Some(old_ptr) = call.old_value() {
++            guest
++                .memory()
++                .write_value(old_ptr, &crate::fd::timerfd_itimerspec(old, now))?;
++        }
++        Ok(0)
+     }
+ 
+-    /// timerfd_gettime system call.
++    /// timerfd_gettime: report virtual remaining time and interval.
+     pub async fn handle_timerfd_gettime<G: Guest<Self>>(
+         &self,
+         guest: &mut G,
+         call: syscalls::TimerfdGettime,
+     ) -> Result<i64, Error> {
+-        self.notification_fd_control(guest, call.into()).await
++        Self::require_timerfd(guest, call.fd())?;
++        let curr_ptr = call.value().ok_or(Errno::EFAULT)?;
++        let now = thread_observe_time(guest).await;
++        let state = guest
++            .thread_state()
++            .with_detfd(call.fd(), |detfd| {
++                detfd.with_timerfd(|state| {
++                    state.collect(now);
++                    *state
++                })
++            })
++            .map_err(Error::Errno)?;
++        guest
++            .memory()
++            .write_value(curr_ptr, &crate::fd::timerfd_itimerspec(state, now))?;
++        Ok(0)
++    }
++
++    /// Read a virtual timerfd: return and clear pending expirations, or wait
++    /// (blocking descriptor) / `EAGAIN` (nonblocking) until the virtual
++    /// deadline. Never reads the host descriptor.
++    pub async fn handle_timerfd_read<G: Guest<Self>>(
++        &self,
++        guest: &mut G,
++        call: syscalls::Read,
++    ) -> Result<i64, Error> {
++        let buf = call.buf().ok_or(Errno::EFAULT)?;
++        if call.len() < 8 {
++            return Err(Errno::EINVAL.into());
++        }
++        loop {
++            let now = thread_observe_time(guest).await;
++            let (pending, deadline, nonblocking) = guest
++                .thread_state()
++                .with_detfd(call.fd(), |detfd| {
++                    (
++                        detfd.with_timerfd(|state| state.collect(now)),
++                        detfd.timerfd_state().deadline,
++                        detfd.is_nonblocking(),
++                    )
++                })
++                .map_err(Error::Errno)?;
++            if pending > 0 {
++                guest
++                    .thread_state()
++                    .with_detfd(call.fd(), |detfd| {
++                        detfd.with_timerfd(|state| state.pending = 0)
++                    })
++                    .map_err(Error::Errno)?;
++                guest.memory().write_exact(buf, &pending.to_ne_bytes())?;
++                return Ok(8);
++            }
++            if nonblocking {
++                return Err(Errno::EAGAIN.into());
++            }
++            let Some(deadline) = deadline else {
++                // Disarmed: Linux blocks until another thread arms the
++                // timerfd (or a signal arrives), so poll the virtual state
++                // through the scheduler instead of inventing EAGAIN.
++                let mut rsrc = Resources::new(guest.thread_state().dettid);
++                rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
++                rsrc.fyi("timerfd_read");
++                if matches!(
++                    resource_request(guest, rsrc).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++                continue;
++            };
++            let request = Self::sleep_request_abs(guest, deadline).await;
++            if matches!(
++                resource_request(guest, request).await,
++                ResumeStatus::Signaled(_)
++            ) {
++                return Err(Errno::EINTR.into());
++            }
++        }
+     }
+ 
+     /// inotify_init1 system call.
+diff --git a/detcore/src/syscalls/io.rs b/detcore/src/syscalls/io.rs
+index 21bb65c877..ea5d3d46f3 100644
+--- a/detcore/src/syscalls/io.rs
++++ b/detcore/src/syscalls/io.rs
+@@ -1019,6 +1019,20 @@ impl<T: RecordOrReplay> Detcore<T> {
+             return result;
+         }
+ 
++        let timers = Self::timerfd_libc_pollfds(guest, call.fds(), call.nfds());
++        if !timers.is_empty() {
++            let result = self
++                .handle_ppoll_virtual_timerfd(guest, call, timers, deadline)
++                .await;
++            if let (Some(timeout_address), Some(timeout), Some(started_at)) =
++                (timeout_address, timeout, started_at)
++            {
++                self.write_ppoll_remaining(guest, timeout_address, timeout, started_at)
++                    .await?;
++            }
++            return result;
++        }
++
+         let mut rsrc = Resources::new(guest.thread_state().dettid);
+         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+         rsrc.fyi("ppoll");
+@@ -1052,6 +1066,118 @@ impl<T: RecordOrReplay> Detcore<T> {
+         Ok(())
+     }
+ 
++    /// `ppoll` variant of `timerfd_pollfds_at` over `libc::pollfd` entries.
++    fn timerfd_libc_pollfds<G: Guest<Self>>(
++        guest: &mut G,
++        fds: Option<reverie::syscalls::AddrMut<'_, libc::pollfd>>,
++        nfds: u64,
++    ) -> Vec<(usize, RawFd)> {
++        let Some(fds) = fds else {
++            return Vec::new();
++        };
++        let count = nfds.min(4096) as usize;
++        let mut out = Vec::new();
++        for index in 0..count {
++            let addr = reverie::syscalls::AddrMut::<libc::pollfd>::from_raw(
++                fds.as_raw() + index * std::mem::size_of::<libc::pollfd>(),
++            );
++            let Some(addr) = addr else { continue };
++            let Ok(entry) = guest.memory().read_value(addr) else {
++                continue;
++            };
++            if entry.fd < 0 || entry.events & libc::POLLIN == 0 {
++                continue;
++            }
++            let is_timer = guest
++                .thread_state()
++                .with_detfd(entry.fd, |d| d.ty() == crate::fd::FdType::Timerfd)
++                .unwrap_or(false);
++            if is_timer {
++                out.push((index, entry.fd));
++            }
++        }
++        out
++    }
++
++    /// Virtual-timerfd `ppoll` (unmasked): zero-time probes merged with
++    /// virtual expirations, parked at the earliest virtual deadline.
++    async fn handle_ppoll_virtual_timerfd<G: Guest<Self>>(
++        &self,
++        guest: &mut G,
++        call: syscalls::Ppoll,
++        timers: Vec<(usize, RawFd)>,
++        deadline: Option<LogicalTime>,
++    ) -> Result<i64, Error> {
++        let fds_ptr = call.fds().ok_or(Errno::EFAULT)?;
++        loop {
++            let now = thread_observe_time(guest).await;
++            let mut next_deadline: Option<LogicalTime> = None;
++            let mut expired: Vec<usize> = Vec::new();
++            for (index, fd) in &timers {
++                let collected = guest.thread_state().with_detfd(*fd, |detfd| {
++                    detfd.with_timerfd(|s| (s.collect(now), s.deadline))
++                });
++                if let Ok((pending, dl)) = collected {
++                    if pending > 0 {
++                        expired.push(*index);
++                    } else if let Some(dl) = dl {
++                        next_deadline = Some(next_deadline.map_or(dl, |d| d.min(dl)));
++                    }
++                }
++            }
++            let (probe, _guard) = self.prepare_ppoll_probe(guest, call).await?;
++            let host_result = guest.inject_with_retry(probe).await;
++            if expired.is_empty() {
++                let n = host_result?;
++                if n > 0 {
++                    return Ok(n);
++                }
++            } else {
++                let count = call.nfds().min(4096) as usize;
++                // SAFETY: `pollfd` is a plain C record; zeroed staging is
++                // overwritten by `read_values` before any use.
++                let mut entries: Vec<libc::pollfd> =
++                    (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
++                guest.memory().read_values(fds_ptr.into(), &mut entries)?;
++                for index in &expired {
++                    entries[*index].revents |= libc::POLLIN;
++                }
++                guest.memory().write_values(fds_ptr, &entries)?;
++                return Ok(entries.iter().filter(|e| e.revents != 0).count() as i64);
++            }
++            if let Some(timeout) = deadline
++                && now >= timeout
++            {
++                return Ok(0);
++            }
++            let wake = match (next_deadline, deadline) {
++                (Some(d), Some(t)) => Some(d.min(t)),
++                (Some(d), None) => Some(d),
++                (None, Some(t)) => Some(t),
++                (None, None) => None,
++            };
++            if let Some(wake) = wake {
++                let request = Self::sleep_request_abs(guest, wake).await;
++                if matches!(
++                    resource_request(guest, request).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++            } else {
++                let mut rsrc = Resources::new(guest.thread_state().dettid);
++                rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
++                rsrc.fyi("ppoll");
++                if matches!(
++                    resource_request(guest, rsrc).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++            }
++        }
++    }
++
+     /// Handle a guest-internal poll call that can be fully determinized.
+     // TODO-HUMAN-REVIEW(PR-1052): Review scheduler fairness for zero-timeout poll.
+     pub async fn handle_internal_poll<G: Guest<Self>>(
+@@ -1059,6 +1185,10 @@ impl<T: RecordOrReplay> Detcore<T> {
+         guest: &mut G,
+         call: syscalls::Poll,
+     ) -> Result<i64, Error> {
++        let timers = Self::timerfd_pollfds(guest, &call);
++        if !timers.is_empty() {
++            return self.handle_poll_virtual_timerfd(guest, call, timers).await;
++        }
+         let timeout_millis = call.timeout();
+         if timeout_millis == 0 {
+             // A nonblocking poll can still be the synchronization point in a
+@@ -1081,6 +1211,128 @@ impl<T: RecordOrReplay> Detcore<T> {
+         }
+     }
+ 
++    /// Pollfds (index, fd) naming virtual timerfds with `POLLIN` interest.
++    fn timerfd_pollfds<G: Guest<Self>>(
++        guest: &mut G,
++        call: &syscalls::Poll,
++    ) -> Vec<(usize, RawFd)> {
++        Self::timerfd_pollfds_at(guest, call.fds(), call.nfds())
++    }
++
++    fn timerfd_pollfds_at<G: Guest<Self>>(
++        guest: &mut G,
++        fds: Option<reverie::syscalls::AddrMut<'_, syscalls::PollFd>>,
++        nfds: u64,
++    ) -> Vec<(usize, RawFd)> {
++        let Some(fds) = fds else {
++            return Vec::new();
++        };
++        let count = nfds.min(4096) as usize;
++        let mut out = Vec::new();
++        for index in 0..count {
++            let entry = guest.memory().read_value(
++                reverie::syscalls::AddrMut::from_raw(
++                    fds.as_raw() + index * std::mem::size_of::<syscalls::PollFd>(),
++                )
++                .unwrap(),
++            );
++            let Ok(entry) = entry else { continue };
++            let entry: syscalls::PollFd = entry;
++            if entry.fd < 0 || !entry.events.contains(syscalls::PollFlags::POLLIN) {
++                continue;
++            }
++            let is_timer = guest
++                .thread_state()
++                .with_detfd(entry.fd, |d| d.ty() == crate::fd::FdType::Timerfd)
++                .unwrap_or(false);
++            if is_timer {
++                out.push((index, entry.fd));
++            }
++        }
++        out
++    }
++
++    /// Virtual-timerfd `poll`: host-probe every iteration, synthesize
++    /// `POLLIN` for expired virtual timerfds, and park at the earliest
++    /// virtual deadline (or the poll timeout) like the epoll path.
++    async fn handle_poll_virtual_timerfd<G: Guest<Self>>(
++        &self,
++        guest: &mut G,
++        call: syscalls::Poll,
++        timers: Vec<(usize, RawFd)>,
++    ) -> Result<i64, Error> {
++        let fds_ptr = call.fds().ok_or(Errno::EFAULT)?;
++        let timeout_abs = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
++        loop {
++            let now = thread_observe_time(guest).await;
++            let mut next_deadline: Option<LogicalTime> = None;
++            let mut expired: Vec<usize> = Vec::new();
++            for (index, fd) in &timers {
++                let collected = guest.thread_state().with_detfd(*fd, |detfd| {
++                    detfd.with_timerfd(|s| (s.collect(now), s.deadline))
++                });
++                if let Ok((pending, deadline)) = collected {
++                    if pending > 0 {
++                        expired.push(*index);
++                    } else if let Some(deadline) = deadline {
++                        next_deadline = Some(next_deadline.map_or(deadline, |d| d.min(deadline)));
++                    }
++                }
++            }
++            let probe = syscalls::Poll::new()
++                .with_fds(call.fds())
++                .with_nfds(call.nfds())
++                .with_timeout(0);
++            let host_result = guest.inject(probe).await;
++            if expired.is_empty() {
++                host_result?;
++                if call.timeout() == 0 || host_result.unwrap_or(0) > 0 {
++                    return Ok(host_result.unwrap_or(0));
++                }
++            } else {
++                // Merge: mark expired timerfds POLLIN and recount.
++                let count = call.nfds().min(4096) as usize;
++                let mut entries = vec![syscalls::PollFd::default(); count];
++                guest.memory().read_values(fds_ptr.into(), &mut entries)?;
++                for index in &expired {
++                    entries[*index].revents |= syscalls::PollFlags::POLLIN;
++                }
++                guest.memory().write_values(fds_ptr, &entries)?;
++                return Ok(entries.iter().filter(|e| !e.revents.is_empty()).count() as i64);
++            }
++            if let Some(timeout) = timeout_abs
++                && now >= timeout
++            {
++                return Ok(0);
++            }
++            let wake = match (next_deadline, timeout_abs) {
++                (Some(d), Some(t)) => Some(d.min(t)),
++                (Some(d), None) => Some(d),
++                (None, Some(t)) => Some(t),
++                (None, None) => None,
++            };
++            if let Some(wake) = wake {
++                let request = Self::sleep_request_abs(guest, wake).await;
++                if matches!(
++                    resource_request(guest, request).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++            } else {
++                let mut rsrc = Resources::new(guest.thread_state().dettid);
++                rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
++                rsrc.fyi("poll");
++                if matches!(
++                    resource_request(guest, rsrc).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++            }
++        }
++    }
++
+     /// Handle a poll syscall that deponds on external, nondeterminstic IO.
+     pub async fn handle_external_poll<G: Guest<Self>>(
+         &self,
+@@ -1143,7 +1395,28 @@ impl<T: RecordOrReplay> Detcore<T> {
+     ) -> Result<i64, Error> {
+         let dettid = guest.thread_state().dettid;
+         resource_request(guest, Resources::new(dettid)).await; // empty request
+-        Ok(self.record_or_replay(guest, call).await?)
++        let result = self.record_or_replay(guest, call).await?;
++        // Record the interest list on success so epoll_wait can synthesize
++        // virtual-timerfd readiness deterministically. The host list is kept
++        // in sync for every non-timerfd target.
++        if result >= 0 {
++            let entry = match call.op() {
++                libc::EPOLL_CTL_DEL => None,
++                _ => call.event().and_then(|ptr| {
++                    guest
++                        .memory()
++                        .read_value(ptr)
++                        .ok()
++                        .map(|event: libc::epoll_event| (event.events, event.u64))
++                }),
++            };
++            if call.op() == libc::EPOLL_CTL_DEL || entry.is_some() {
++                let _ = guest.thread_state().with_detfd(call.epfd(), |detfd| {
++                    detfd.epoll_set_target(call.fd(), entry)
++                });
++            }
++        }
++        Ok(result)
+     }
+ 
+     /// epoll_pwait syscall (MAYHANG)
+@@ -1203,6 +1476,19 @@ impl<T: RecordOrReplay> Detcore<T> {
+         guest: &mut G,
+         call: syscalls::EpollPwait,
+     ) -> Result<i64, Error> {
++        // NULL-sigmask epoll_pwait over a virtual timerfd shares the
++        // epoll_wait virtual path (identical wait semantics without a mask).
++        let targets = Self::epoll_targets_with_timerfd(guest, call.epfd());
++        if !targets.is_empty() {
++            let wait = syscalls::EpollWait::new()
++                .with_epfd(call.epfd())
++                .with_events(call.events())
++                .with_maxevents(call.maxevents())
++                .with_timeout(call.timeout());
++            return self
++                .handle_epoll_wait_virtual_timerfd(guest, wait, targets)
++                .await;
++        }
+         let timeout_millis = call.timeout();
+         if timeout_millis == 0 {
+             // Cannot block, but must still yield a scheduler turn: a
+@@ -1280,6 +1566,15 @@ impl<T: RecordOrReplay> Detcore<T> {
+         guest: &mut G,
+         call: syscalls::EpollWait,
+     ) -> Result<i64, Error> {
++        // An interest list containing a timerfd takes the virtual path: the
++        // host timerfd is never armed, so polling it would report host time.
++        let targets = Self::epoll_targets_with_timerfd(guest, call.epfd());
++        let has_timerfd = !targets.is_empty();
++        if has_timerfd {
++            return self
++                .handle_epoll_wait_virtual_timerfd(guest, call, targets)
++                .await;
++        }
+         let timeout_millis = call.timeout();
+         if timeout_millis == 0 {
+             Ok(guest.inject(call).await?) // Already non-blocking.
+@@ -1292,6 +1587,153 @@ impl<T: RecordOrReplay> Detcore<T> {
+         }
+     }
+ 
++    /// The recorded interest list of `epfd` when it contains a timerfd
++    /// target, or an empty list otherwise (the common non-timerfd case).
++    fn epoll_targets_with_timerfd<G: Guest<Self>>(
++        guest: &mut G,
++        epfd: RawFd,
++    ) -> Vec<(RawFd, (u32, u64))> {
++        let targets = guest
++            .thread_state()
++            .with_detfd(epfd, |detfd| detfd.epoll_targets())
++            .unwrap_or_default();
++        let has_timerfd = targets.iter().any(|(fd, _)| {
++            guest
++                .thread_state()
++                .with_detfd(*fd, |detfd| detfd.ty() == crate::fd::FdType::Timerfd)
++                .unwrap_or(false)
++        });
++        if has_timerfd { targets } else { Vec::new() }
++    }
++
++    /// `epoll_wait` over a set containing at least one virtual timerfd.
++    ///
++    /// Timerfd readiness is synthesized from virtual time and the wait parks
++    /// as a `SleepUntil` timed waiter at the earliest of (next timerfd
++    /// deadline, epoll timeout), so virtual-time fast-forward wakes it in
++    /// deterministic deadline order alongside futex/sleep waiters. Other
++    /// targets keep the existing nonblocking host probe per iteration.
++    async fn handle_epoll_wait_virtual_timerfd<G: Guest<Self>>(
++        &self,
++        guest: &mut G,
++        call: syscalls::EpollWait,
++        targets: Vec<(RawFd, (u32, u64))>,
++    ) -> Result<i64, Error> {
++        let events_ptr = call.events().ok_or(Errno::EFAULT)?;
++        let maxevents = call.maxevents();
++        if maxevents <= 0 {
++            return Err(Errno::EINVAL.into());
++        }
++        let timeout_abs = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
++        loop {
++            let now = thread_observe_time(guest).await;
++            // Synthesize readiness for every expired timerfd target.
++            let mut ready: Vec<(RawFd, libc::epoll_event)> = Vec::new();
++            let mut oneshot_spent: Vec<RawFd> = Vec::new();
++            let mut next_deadline: Option<LogicalTime> = None;
++            for (fd, (events, data)) in &targets {
++                let collected = guest.thread_state().with_detfd(*fd, |detfd| {
++                    detfd.with_timerfd(|s| {
++                        let (pending, added) = s.collect_added(now);
++                        (pending, added, s.deadline)
++                    })
++                });
++                let Ok((pending, added, deadline)) = collected else {
++                    continue;
++                };
++                // Edge-triggered targets fire only when this collect added
++                // an expiry; level-triggered targets fire while unread
++                // expirations remain.
++                let edge = events & (libc::EPOLLET as u32) != 0;
++                if pending > 0 && (!edge || added > 0) {
++                    if events & (libc::EPOLLIN as u32) != 0 {
++                        ready.push((
++                            *fd,
++                            libc::epoll_event {
++                                events: libc::EPOLLIN as u32,
++                                u64: *data,
++                            },
++                        ));
++                        if events & (libc::EPOLLONESHOT as u32) != 0 {
++                            oneshot_spent.push(*fd);
++                        }
++                    }
++                } else if let Some(deadline) = deadline {
++                    next_deadline = Some(next_deadline.map_or(deadline, |d| d.min(deadline)));
++                }
++            }
++            // Host probe for non-timerfd targets (existing behaviour),
++            // merged with virtual timerfd readiness in one result like
++            // Linux level-triggered epoll: neither source may mask the other.
++            let probe = syscalls::EpollWait::new()
++                .with_epfd(call.epfd())
++                .with_events(call.events())
++                .with_maxevents(call.maxevents())
++                .with_timeout(0);
++            let host_result = guest.inject(probe).await;
++            if ready.is_empty() {
++                host_result?;
++            }
++            let host_count = host_result.unwrap_or(0).max(0) as usize;
++            let total = (host_count + ready.len()).min(maxevents as usize);
++            if total > 0 {
++                if host_count < total {
++                    let base =
++                        events_ptr.as_raw() + host_count * std::mem::size_of::<libc::epoll_event>();
++                    let dest = reverie::syscalls::AddrMut::from_raw(base).ok_or(Errno::EFAULT)?;
++                    let events_only: Vec<libc::epoll_event> = ready[..total - host_count]
++                        .iter()
++                        .map(|(_, event)| *event)
++                        .collect();
++                    guest.memory().write_values(dest, &events_only)?;
++                }
++                for fd in &oneshot_spent {
++                    let _ = guest
++                        .thread_state()
++                        .with_detfd(call.epfd(), |detfd| detfd.epoll_set_target(*fd, None));
++                }
++                return Ok(total as i64);
++            }
++            if call.timeout() == 0 {
++                return Ok(0);
++            }
++            if let Some(timeout) = timeout_abs
++                && now >= timeout
++            {
++                return Ok(0);
++            }
++            // Park until the earliest deterministic wake point.
++            let wake = match (next_deadline, timeout_abs) {
++                (Some(d), Some(t)) => Some(d.min(t)),
++                (Some(d), None) => Some(d),
++                (None, Some(t)) => Some(t),
++                (None, None) => None,
++            };
++            if let Some(wake) = wake {
++                let request = Self::sleep_request_abs(guest, wake).await;
++                if matches!(
++                    resource_request(guest, request).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++            } else {
++                // No timer armed and no timeout: only a host target can make
++                // progress, so poll it through the scheduler like the
++                // non-timerfd path.
++                let mut rsrc = Resources::new(guest.thread_state().dettid);
++                rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
++                rsrc.fyi("epoll_wait");
++                if matches!(
++                    resource_request(guest, rsrc).await,
++                    ResumeStatus::Signaled(_)
++                ) {
++                    return Err(Errno::EINTR.into());
++                }
++            }
++        }
++    }
++
+     /// Connect system call (MAYHANG)
+     /// Note that connect waits until a TCP handshake but does not wait for accept() on the other end.
+     /// Nevertheless, it can block for a long time while waiting for connection, unless the socket
+diff --git a/detcore/src/syscalls/time.rs b/detcore/src/syscalls/time.rs
+index 1f2ce8e8c5..4867d6e6f3 100644
+--- a/detcore/src/syscalls/time.rs
++++ b/detcore/src/syscalls/time.rs
+@@ -55,14 +55,14 @@ fn time_from_resources(rsrcs: &Resources) -> Option<LogicalTime> {
+ 
+ /// Flatten a `timespec` to nanoseconds. Negative fields are not valid for the
+ /// timer syscalls we handle; treat them as zero rather than panicking.
+-fn timespec_to_ns(ts: libc::timespec) -> u64 {
++pub(crate) fn timespec_to_ns(ts: libc::timespec) -> u64 {
+     let secs = ts.tv_sec.max(0) as u64;
+     let nsec = ts.tv_nsec.max(0) as u64;
+     secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+ }
+ 
+ /// Inverse of [`timespec_to_ns`].
+-fn ns_to_timespec(ns: u64) -> libc::timespec {
++pub(crate) fn ns_to_timespec(ns: u64) -> libc::timespec {
+     libc::timespec {
+         tv_sec: (ns / 1_000_000_000) as libc::time_t,
+         tv_nsec: (ns % 1_000_000_000) as libc::c_long,

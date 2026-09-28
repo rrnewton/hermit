@@ -1,0 +1,40 @@
+Fix aliased-recvmsg io-buffer EFAULT; re-enable socket and procfs ptrace verify
+
+[hermit2, degraded-unresolved, unresolved, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+c-programs/socket-timestamp-edge-cases crashed before comparison (verify
+exit 125, guest exit 9): Detcore's io-buffer hashing re-read the guest
+msghdr after recvmsg, but the guest legally points msg_control at its own
+header, so the receive overwrote msg_iov with control bytes and hashing
+faulted a successful syscall with EFAULT. Message-syscall iovecs are now
+snapshotted before dispatch (recvmsg/sendmsg/recvmmsg/sendmmsg) and extents
+resolve from the snapshot; batch messages whose msg_len was itself
+overwritten contribute no extent instead of hashing unwritten bytes. The
+cell re-qualified 20/20 canonical matched and is re-enabled for ptrace
+(liteinst not re-run, stays ci:false). system-utils/procfs-sanitized-paths
+re-qualified 20/20 under its pre-existing manifest comparison profile
+(compare_io_buffers:false, rcb_time:false; the retained divergence was in
+smaps raw bytes that profile excludes by design) and is re-enabled; plan,
+DAG, and frozen counts are regenerated (+2 cells). The virtual-timerfd
+scheduler change for timer-family-identity is a separate change with its
+own deterministic-scheduling review and is not in this commit; that cell
+stays ci:false.
+
+Determinism
+The snapshot is taken from the same guest state the kernel consumes, so
+extent resolution is a pure function of pre-call headers, delivered byte
+counts, and (batch) post-call msg_len; it cannot depend on control bytes
+written over the header. No comparator or guest assertion changed.
+
+Linux Semantics
+msg_control overlapping msghdr is permitted; native recvmsg succeeds and
+the guest's truncated/aliased/batch expectations all pass. Timestamp
+canonicalization in handle_recvmsg is unchanged.
+
+Validation
+cargo test -p hermit-detcore --lib io_buffers: 14 passed including new
+aliased-header regression. cargo test -p hermit-manifest-plan: all suites
+passed. cargo fmt --check and clippy -p hermit-detcore: clean. Canonical
+ptrace verify: socket guest 20/20 matched, procfs 20/20 matched under its
+manifest profile. Independent adversarial review: no goalpost moving.
