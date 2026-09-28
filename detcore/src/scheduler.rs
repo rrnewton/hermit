@@ -5287,6 +5287,14 @@ impl Scheduler {
         for (dettid, mut signals) in pending {
             match self.waitid_signal_request(dettid) {
                 Some(WaitidSignalRequest::Parked) => {
+                    // This legacy wake completes the child-wait resource and
+                    // replaces it with an ordinary signal grant. Retire its
+                    // parked capability at the same ownership boundary; a
+                    // shared alarm may become due later in this very pass.
+                    if let Err(error) = self.retire_child_wait_signal_request(dettid) {
+                        self.fail_parked(dettid, error);
+                        continue;
+                    }
                     // Decide run-queue residency HERE, by asking the queue, and
                     // never by inferring it from which resource the thread
                     // holds. A thread can hold either park request while already

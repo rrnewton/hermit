@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +26,16 @@ static const size_t field_offsets[] = {0, 4, 8, 16, 20, 24};
 static pid_t children[64];
 static size_t child_count, page_size, cases, assertions;
 static volatile sig_atomic_t alarms;
+
+/* The restarting handler uses only lock-free atomic pointer access,
+ * volatile sig_atomic_t observations and the async-signal-safe write/_exit
+ * operations. It emits nothing until the interrupted wait has returned. */
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "signal-safe arena pointer");
+static _Atomic(unsigned char *) restart_info;
+static volatile sig_atomic_t restart_length, restart_pipe;
+static volatile sig_atomic_t restart_seen, restart_write_result;
+static volatile sig_atomic_t restart_write_errno;
+static volatile sig_atomic_t restart_snapshot[2 * 65536];
 
 static void require(int yes, const char *what) {
   ++assertions;
@@ -321,6 +332,171 @@ static void error_call(const char *name, int which, long id,
   arena_drop(&i); arena_drop(&u); ++cases;
 }
 
+/* This handler must observe interruption copyout before it makes a positive
+ * child event possible. An early timer sees A5 instead of zeros and fails the
+ * later snapshot assertion; no sleep, retry or favorable rerun hides it.
+ * Setup-only signal blocking ends before the timer is armed. */
+static void restart_alarm_handler(int signal) {
+  int saved_errno = errno;
+  if (signal != SIGALRM) _exit(91);
+  ++alarms;
+  unsigned char *info = atomic_load_explicit(&restart_info, memory_order_relaxed);
+  sig_atomic_t length = restart_length;
+  if (info == NULL || length <= 0 || length > 2 * 65536) _exit(92);
+  for (sig_atomic_t n = 0; n < length; ++n)
+    restart_snapshot[n] = ((volatile unsigned char *)info)[n];
+  restart_seen = 1;
+  errno = 0;
+  restart_write_result = (sig_atomic_t)write(restart_pipe, "r", 1);
+  restart_write_errno = errno;
+  if (restart_write_result != 1) _exit(94);
+  errno = saved_errno;
+}
+
+static pid_t interrupt_child(int pipefd[2], int status) {
+  require(pipe(pipefd) == 0, "fresh interrupt-child pipe");
+  pid_t child = fork();
+  if (child == 0) {
+    close(pipefd[1]);
+    char byte;
+    if (read(pipefd[0], &byte, 1) != 1) _exit(93);
+    close(pipefd[0]); _exit(status);
+  }
+  track(child);
+  require(close(pipefd[0]) == 0, "close interrupt-child parent read end");
+  return child;
+}
+
+static void block_alarm_for_setup(sigset_t *previous) {
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGALRM);
+  require(sigprocmask(SIG_BLOCK, &blocked, previous) == 0,
+          "block alarm only while initializing handler state");
+  require(sigismember(previous, SIGALRM) == 0,
+          "the tested wait must restore an unblocked SIGALRM");
+}
+
+static void writable_interrupted_wait(pid_t child) {
+  sigset_t previous_mask;
+  block_alarm_for_setup(&previous_mask);
+  struct arena i = arena_new(), u = arena_new();
+  fields(i.expected + 64, 6, 0, 0);
+  alarms = 0;
+  struct sigaction action = {.sa_handler = alarm_handler}, previous;
+  sigemptyset(&action.sa_mask);
+  require(sigaction(SIGALRM, &action, &previous) == 0,
+          "install fresh non-SA_RESTART handler");
+  require(sigprocmask(SIG_SETMASK, &previous_mask, NULL) == 0,
+          "restore unblocked signal before arming interrupt");
+  struct itimerval timer = {.it_value = {.tv_usec = 50000}};
+  require(setitimer(ITIMER_REAL, &timer, NULL) == 0, "arm writable interrupt timer");
+  struct result r = raw_waitid(P_PID, child, i.memory + 64, WEXITED, u.memory + 64);
+  timer = (struct itimerval){0};
+  require(setitimer(ITIMER_REAL, &timer, NULL) == 0, "disarm writable interrupt timer");
+  require(sigaction(SIGALRM, &previous, NULL) == 0, "restore non-restarting handler");
+  printf("{\"type\":\"case\",\"name\":\"interrupted-writable-info\","
+         "\"which\":%d,\"id\":%d,\"rc\":%ld,\"errno\":%d,"
+         "\"options\":\"%#x\",\"alarms\":%d,\"info_mode\":0,"
+         "\"usage_protection\":%d,\"info_before\":\"",
+         P_PID, child, r.value, r.error, WEXITED, alarms, RW);
+  hex(i.before, i.length);
+  printf("\",\"info_after\":\""); hex(i.memory, i.length);
+  printf("\",\"aux_before\":\""); hex(u.before, u.length);
+  printf("\",\"aux_after\":\""); hex(u.memory, u.length);
+  puts("\"}"); fflush(stdout);
+  require(alarms == 1 && r.value == -1 && r.error == EINTR,
+          "one writable-info interruption returns exact EINTR");
+  require(memcmp(i.memory, i.expected, i.length) == 0,
+          "EINTR writes six zeros and preserves the full A5 arena");
+  require(memcmp(u.memory, u.expected, u.length) == 0,
+          "EINTR leaves every rusage byte and guard untouched");
+  arena_drop(&i); arena_drop(&u); ++cases;
+}
+
+static void restarted_wait(pid_t child, int pipefd, int status) {
+  sigset_t previous_mask;
+  block_alarm_for_setup(&previous_mask);
+  struct arena i = arena_new(), u = arena_new();
+  fields(i.expected + 64, 6, 0, 0);
+  unsigned char *snapshot = malloc(i.length);
+  require(snapshot != NULL, "allocate complete handler snapshot");
+  atomic_store_explicit(&restart_info, i.memory, memory_order_relaxed);
+  restart_length = (sig_atomic_t)i.length;
+  restart_pipe = pipefd;
+  restart_seen = 0;
+  restart_write_result = -2;
+  restart_write_errno = 0;
+  for (size_t n = 0; n < i.length; ++n) restart_snapshot[n] = -1;
+  alarms = 0;
+  struct sigaction action = {.sa_handler = restart_alarm_handler,
+                            .sa_flags = SA_RESTART}, previous;
+  sigemptyset(&action.sa_mask);
+  require(sigaction(SIGALRM, &action, &previous) == 0, "SA_RESTART handler");
+  require(sigprocmask(SIG_SETMASK, &previous_mask, NULL) == 0,
+          "restore unblocked signal before arming restart");
+  struct itimerval timer = {.it_value = {.tv_usec = 50000}};
+  require(setitimer(ITIMER_REAL, &timer, NULL) == 0, "arm restart timer");
+  /* Exactly one application call: only the kernel/backend may restart it.
+   * NULL rusage keeps this errors-mode case valid on native Linux as well. */
+  unsigned wait_calls = 0;
+  ++wait_calls;
+  struct result r = raw_waitid(P_PID, child, i.memory + 64, WEXITED, NULL);
+  timer = (struct itimerval){0};
+  require(setitimer(ITIMER_REAL, &timer, NULL) == 0, "disarm restart timer");
+  require(sigaction(SIGALRM, &previous, NULL) == 0, "restore prior alarm handler");
+  for (size_t n = 0; n < i.length; ++n) {
+    require(restart_snapshot[n] >= 0 && restart_snapshot[n] <= 255,
+            "handler copied every arena byte");
+    snapshot[n] = (unsigned char)restart_snapshot[n];
+  }
+  printf("{\"type\":\"case\",\"name\":\"restarted-writable-info\","
+         "\"which\":%d,\"id\":%d,\"rc\":%ld,\"errno\":%d,"
+         "\"options\":\"%#x\",\"alarms\":%d,\"info_mode\":0,"
+         "\"usage_protection\":%d,\"null_usage\":1,\"info_offset\":64,"
+         "\"sa_restart\":true,\"wait_calls\":%u,\"handler_seen\":%d,"
+         "\"release_rc\":%d,\"release_errno\":%d,\"handler_info\":\"",
+         P_PID, child, r.value, r.error, WEXITED, alarms, RW, wait_calls,
+         restart_seen, restart_write_result, restart_write_errno);
+  hex(snapshot, i.length);
+  printf("\",\"info_before\":\""); hex(i.before, i.length);
+  printf("\",\"info_after\":\""); hex(i.memory, i.length);
+  printf("\",\"aux_before\":\""); hex(u.before, u.length);
+  printf("\",\"aux_after\":\""); hex(u.memory, u.length);
+  puts("\"}"); fflush(stdout);
+  require(alarms == 1 && restart_seen == 1, "one actual restarting interruption");
+  require(wait_calls == 1 && restart_write_result == 1 && restart_write_errno == 0,
+          "one wait and one exact handler release write");
+  require(memcmp(snapshot, i.expected, i.length) == 0,
+          "six zero fields and all A5 guards before handler releases child");
+  require(r.value == 0 && r.error == 0, "SA_RESTART returns the positive event");
+  fields(i.expected + 64, 6, child, status);
+  require(memcmp(i.memory, i.expected, i.length) == 0,
+          "restarted exact-child event preserves all padding and guards");
+  require(memcmp(u.memory, u.expected, u.length) == 0,
+          "NULL restart rusage leaves auxiliary arena untouched");
+  atomic_store_explicit(&restart_info, NULL, memory_order_relaxed);
+  free(snapshot); arena_drop(&i); arena_drop(&u); ++cases;
+}
+
+static void additional_interrupt_cases(void) {
+  int pipefd[2];
+  pid_t child = interrupt_child(pipefd, 73);
+  writable_interrupted_wait(child);
+  info_check("interrupted-child-live", child, WEXITED | WNOHANG, 0, -1);
+  require(write(pipefd[1], "x", 1) == 1, "release interrupted live child");
+  require(close(pipefd[1]) == 0, "close interrupted-child release pipe");
+  info_check("interrupted-child-reap", child, WEXITED, 0, 73);
+  info_check("interrupted-child-ECHILD", child, WEXITED | WNOHANG, ECHILD, -1);
+  forget(child);
+
+  child = interrupt_child(pipefd, 74);
+  restarted_wait(child, pipefd[1], 74);
+  require(close(pipefd[1]) == 0, "close restarted-child release pipe");
+  info_check("restarted-child-ECHILD", child, WEXITED | WNOHANG, ECHILD, -1);
+  forget(child);
+}
+
 static void error_cases(void) {
   pid_t gone = terminal_child(71);
   info_check("setup-reap", gone, WEXITED, 0, 71); forget(gone);
@@ -372,6 +548,7 @@ static void error_cases(void) {
   info_check("live-child-reap", child, WEXITED, 0, 72);
   info_check("live-child-ECHILD", child, WEXITED | WNOHANG, ECHILD, -1);
   forget(child);
+  additional_interrupt_cases();
 }
 
 int main(int argc, char **argv) {

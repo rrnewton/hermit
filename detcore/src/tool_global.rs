@@ -43,6 +43,7 @@ pub(crate) use exec_identity::retire_exec;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+pub(crate) use parked::child_wait_request;
 pub(crate) use parked::parked_wait_request;
 pub(crate) use parked::polled_read_request;
 pub(crate) use parked::signal_dequeued;
