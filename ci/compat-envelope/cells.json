@@ -194676,12 +194676,12 @@
       "enabled": true,
       "status": "green",
       "last_tested": {
-        "hermit_sha": "8f07f6b6d3ab184f0572655b319c5b6dbe434033",
-        "detcore_tree": "e1284bc245e029a07cdc5695a244159567d2a7b1",
+        "hermit_sha": "9628418a6533127b87deb48dcd21b9df3b768b93",
+        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
         "depth": {
           "hermit": {
-            "commits": 2550,
-            "first_parent": 2475
+            "commits": 2562,
+            "first_parent": 2487
           },
           "reverie": {
             "commits": 999,
@@ -194690,6 +194690,156 @@
         }
       },
       "observations": [
+        {
+          "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+          "provenance": "validate",
+          "depth": {
+            "hermit": {
+              "commits": 2562,
+              "first_parent": 2487
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "9628418a6533127b87deb48dcd21b9df3b768b93"
+          ],
+          "results": [
+            "pass"
+          ],
+          "canonical_comparisons": [
+            {
+              "hermit_sha": "9628418a6533127b87deb48dcd21b9df3b768b93",
+              "hermit_commits": 2562,
+              "hermit_first_parent": 2487,
+              "run_id": "validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507",
+              "evidence_sha256": "3adfcf45da88c56e2f99ff05a78d0c694f16b8b316b742d97b7526e0b5f85727",
+              "result": "pass",
+              "left_info_messages": [
+                198061
+              ],
+              "right_info_messages": [
+                198061
+              ]
+            }
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "9628418a6533127b87deb48dcd21b9df3b768b93",
+              "run_id": "validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507",
+              "result": "pass",
+              "argv": [
+                "/repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/verify-1.json",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home",
+                "--env",
+                "XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/repo/tests/e2e/applications/kvm-python-examples.sh",
+                "--run"
+              ],
+              "guest_argv": [
+                "/repo/tests/e2e/applications/kvm-python-examples.sh",
+                "--run"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config /repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home --env XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/tests/e2e/applications/kvm-python-examples.sh --run",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "kvm",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/verify-1.json",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/repo/tests/e2e/applications/kvm-python-examples.sh",
+                    "--run"
+                  ],
+                  "guest_argv": [
+                    "/repo/tests/e2e/applications/kvm-python-examples.sh",
+                    "--run"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config /repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/home --env XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/applications-kvm-python-examples-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/tests/e2e/applications/kvm-python-examples.sh --run"
+                }
+              ]
+            }
+          ]
+        },
         {
           "detcore_tree": "101ff46d9714e436b24daa95886ad9f9a30ae9b1",
           "provenance": "validate",
@@ -195430,12 +195580,12 @@
       "enabled": true,
       "status": "green",
       "last_tested": {
-        "hermit_sha": "8f07f6b6d3ab184f0572655b319c5b6dbe434033",
-        "detcore_tree": "e1284bc245e029a07cdc5695a244159567d2a7b1",
+        "hermit_sha": "9628418a6533127b87deb48dcd21b9df3b768b93",
+        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
         "depth": {
           "hermit": {
-            "commits": 2550,
-            "first_parent": 2475
+            "commits": 2562,
+            "first_parent": 2487
           },
           "reverie": {
             "commits": 999,
@@ -195444,6 +195594,152 @@
         }
       },
       "observations": [
+        {
+          "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+          "provenance": "validate",
+          "depth": {
+            "hermit": {
+              "commits": 2562,
+              "first_parent": 2487
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "9628418a6533127b87deb48dcd21b9df3b768b93"
+          ],
+          "results": [
+            "pass"
+          ],
+          "canonical_comparisons": [
+            {
+              "hermit_sha": "9628418a6533127b87deb48dcd21b9df3b768b93",
+              "hermit_commits": 2562,
+              "hermit_first_parent": 2487,
+              "run_id": "validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507",
+              "evidence_sha256": "855fb28ab8e46698c11bd975ba6f106f192336293d0dc41a4222f27913bd95e8",
+              "result": "pass",
+              "left_info_messages": [
+                99
+              ],
+              "right_info_messages": [
+                99
+              ]
+            }
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "9628418a6533127b87deb48dcd21b9df3b768b93",
+              "run_id": "validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507",
+              "result": "pass",
+              "argv": [
+                "/repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "ptrace",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/verify-1.json",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home",
+                "--env",
+                "XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures/program"
+              ],
+              "guest_argv": [
+                "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures/program"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config /repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home --env XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures/program",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "ptrace",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/verify-1.json",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures/program"
+                  ],
+                  "guest_argv": [
+                    "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures/program"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config /repo/target/ci/hermit-e2e-artifacts/8879cbd6e402cf298456bf9163cb9bc5a49689ba2e8270658f1b6d76934a9d40/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/home --env XDG_CONFIG_HOME=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /results/runs/validate-degraded-lander-2-9628418a6533-1788078922635064033-2806210-4d91e507/backend-parity-c-cpuid-probe-verify-ptrace/fixtures/program"
+                }
+              ]
+            }
+          ]
+        },
         {
           "detcore_tree": "101ff46d9714e436b24daa95886ad9f9a30ae9b1",
           "provenance": "validate",
