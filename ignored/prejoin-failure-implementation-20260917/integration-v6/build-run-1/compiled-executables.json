@@ -1,0 +1,266 @@
+{
+  "detcore": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/detcore-e88446e05572c3ab",
+    "sha256": "10bb0967678e53cd17581b29e1ef6c479d0a04b3cc3b1f55a9473ba54ec8b39f",
+    "bytes": 170047456,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/detcore#hermit-detcore@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/detcore/Cargo.toml",
+      "target": {
+        "kind": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "detcore",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/detcore/src/lib.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": true,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/detcore-e88446e05572c3ab"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/detcore-e88446e05572c3ab",
+      "fresh": false
+    },
+    "selection": "detcore"
+  },
+  "verification-report": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/verification_report-5cbb1dfbbf5ca292",
+    "sha256": "0527ad4f024fcd8dd05ffb2834dccbad4b401e794358e4b7f80caf9cdfdaf722",
+    "bytes": 204831592,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli#hermit@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/Cargo.toml",
+      "target": {
+        "kind": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "verification-report",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/src/bin/verification-report.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": false,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "dbt",
+        "default",
+        "e9patch",
+        "kvm-native-test-support",
+        "sabre",
+        "third-party-backends"
+      ],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/verification_report-5cbb1dfbbf5ca292"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/verification_report-5cbb1dfbbf5ca292",
+      "fresh": false
+    },
+    "selection": null
+  },
+  "hermit-bin": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-05800bdedabbe955",
+    "sha256": "e7c69441a48e054727e9032814bfb4cd756af1ab10a977aa8eb62f06e95add11",
+    "bytes": 424676864,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli#hermit@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/Cargo.toml",
+      "target": {
+        "kind": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "hermit",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/src/bin/hermit/main.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": false,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "dbt",
+        "default",
+        "e9patch",
+        "kvm-native-test-support",
+        "sabre",
+        "third-party-backends"
+      ],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-05800bdedabbe955"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-05800bdedabbe955",
+      "fresh": false
+    },
+    "selection": null
+  },
+  "hermit": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692",
+    "sha256": "651d04e26590ba13db77eaa81311e72baf14cedc460ec2850eebc9a8b934e5cd",
+    "bytes": 373691696,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli#hermit@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/Cargo.toml",
+      "target": {
+        "kind": [
+          "rlib",
+          "cdylib"
+        ],
+        "crate_types": [
+          "rlib",
+          "cdylib"
+        ],
+        "name": "hermit",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/src/lib.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": true,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "dbt",
+        "default",
+        "e9patch",
+        "kvm-native-test-support",
+        "sabre",
+        "third-party-backends"
+      ],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692",
+      "fresh": false
+    },
+    "selection": "hermit"
+  },
+  "syscaller": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/syscaller-1319b64ff4971092",
+    "sha256": "a15c034f3b689191bef3046ceb87860256b0770d93aaffde986593c0ae4e33c5",
+    "bytes": 7207440,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/detcore#hermit-detcore@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/detcore/Cargo.toml",
+      "target": {
+        "kind": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "syscaller",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/detcore/scripts/syscaller.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": false,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/syscaller-1319b64ff4971092"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/syscaller-1319b64ff4971092",
+      "fresh": false
+    },
+    "selection": null
+  },
+  "hermit-dap": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit_dap-215ecb28611ce80d",
+    "sha256": "84ec724a75ecb05a52cd7c1e9642d933ee726ecf6fa2784d81dd016d289a9905",
+    "bytes": 9350688,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli#hermit@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/Cargo.toml",
+      "target": {
+        "kind": [
+          "bin"
+        ],
+        "crate_types": [
+          "bin"
+        ],
+        "name": "hermit-dap",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/src/bin/hermit-dap.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": false,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "dbt",
+        "default",
+        "e9patch",
+        "kvm-native-test-support",
+        "sabre",
+        "third-party-backends"
+      ],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit_dap-215ecb28611ce80d"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit_dap-215ecb28611ce80d",
+      "fresh": false
+    },
+    "selection": null
+  }
+}

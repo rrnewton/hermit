@@ -1,0 +1,33 @@
+{
+  "plan": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v7/build-plan.json",
+    "resolved_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v7/build-plan.json",
+    "bytes": 57706,
+    "mode": 420,
+    "sha256": "4b6b756b6e1845b00d2122d2c2946bfc4e38c56fd37c27c68c3b47ddb8aef237"
+  },
+  "caller": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v7/build.py",
+    "resolved_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v7/build.py",
+    "bytes": 9130,
+    "mode": 420,
+    "sha256": "449573c72c69e5afa8b00d1bff3bc50cf6a374b8649957c0475a9f054d2df43b"
+  },
+  "execution": [
+    "/usr/bin/python3",
+    "-B",
+    "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v7/build.py"
+  ],
+  "outputs": {
+    "compile": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/compile",
+    "list-detcore": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/list-detcore",
+    "list-syscaller": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/list-syscaller",
+    "list-hermit": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/list-hermit",
+    "list-hermit-bin": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/list-hermit-bin",
+    "list-hermit-dap": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/list-hermit-dap",
+    "list-verification-report": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/list-verification-report",
+    "native-detcore": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/native-detcore",
+    "native-hermit": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v7/native-hermit"
+  },
+  "scope": "Preparation only; no execution. Same compile, six actual inventories and 51 + 9 native methods."
+}

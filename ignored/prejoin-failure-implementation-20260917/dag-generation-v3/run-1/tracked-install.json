@@ -1,0 +1,7 @@
+{
+  "path": "ci/dag/validate.json",
+  "previous_sha256": "e4732d7805528e44a3a7b070c83981b819488bbbb089617f089453b5d75e8615",
+  "sha256": "08ddd41443f061ad617ec8ed4ee62b7b01f3781dd2bb13d44880fc59a539edb2",
+  "source": "generated validate.json retained in same directory",
+  "inspection": "Read complete 161-line diff; only reviewed preparation/features/selectors/descriptions and seven measured count entries; no test identity removals, labels or bounds changed."
+}

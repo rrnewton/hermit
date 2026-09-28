@@ -1,0 +1,17 @@
+--- a/ci/manifest-plan/src/nextest_build_selections.rs
++++ b/ci/manifest-plan/src/nextest_build_selections.rs
+@@ -626,11 +626,11 @@
+         let producer = missing_hardware
+             .steps
+             .iter_mut()
+-            .find(|step| step.tag() == "build.workspace")
++            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+             .unwrap();
+         assert!(
+-            producer
+-                .cmd
++            execution_command(producer)
++                .unwrap()
+                 .ends_with("./ci/nextest-binaries.rs prepare full")
+         );
+         producer.cmd = producer.cmd.replace(

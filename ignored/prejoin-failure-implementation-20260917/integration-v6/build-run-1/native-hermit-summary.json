@@ -1,0 +1,21 @@
+{
+  "selected": [
+    "kvm_failure_tests::combined::kvm_normal_detcore_child_registration_preserves_start_and_status_37",
+    "kvm_failure_tests::combined::kvm_worker_failure_consumes_actual_registered_detcore_child_gate_before_join",
+    "kvm_failure_tests::combined::kvm_worker_failure_consumes_actual_unregistered_detcore_child_gate_before_join",
+    "kvm_failure_tests::kvm_failed_completion_cleans_unstarted_scheduler_and_retains_typed_cause",
+    "kvm_failure_tests::kvm_normal_completion_preserves_status_and_output",
+    "tests::kvm_backend_config_marks_concurrent_process_children",
+    "tests::kvm_mountinfo_config_preserves_captured_provenance",
+    "tests::kvm_mountinfo_config_refuses_missing_or_malformed_capture",
+    "tests::kvm_mountinfo_config_refuses_uncaptured_provenance_vectors"
+  ],
+  "counts": [
+    "9",
+    "0",
+    "0",
+    "0",
+    "338"
+  ],
+  "raw_sha256": "a2d84d3a45838470488f5a77ac12c866cbfc456ff849ce8f4391c16e75dae0c1"
+}

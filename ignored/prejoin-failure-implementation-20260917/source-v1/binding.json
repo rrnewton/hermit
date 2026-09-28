@@ -1,0 +1,67 @@
+{
+  "repository": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+  "base": "7f84482cd88a9fd5701220b200b30e734ffb72db",
+  "branch": "codex/kvm-prejoin-hermit-20260917",
+  "files": [
+    {
+      "path": "detcore/src/scheduler.rs",
+      "bytes": 353840,
+      "mode": "644",
+      "sha256": "d9b94c41fb688d46bfae5420bb0319a8ad26249f39691f11d2dec908394da358"
+    },
+    {
+      "path": "detcore/src/tool_global.rs",
+      "bytes": 252090,
+      "mode": "644",
+      "sha256": "eb1b453f204641198438781850e65718262e4a3d1fd0db0d22e28737a60f7f3a"
+    },
+    {
+      "path": "detcore/src/tool_local.rs",
+      "bytes": 147672,
+      "mode": "644",
+      "sha256": "478e5b174251b8857c72d9fa1092901ea2a21d0a6f497793c7c419118db21e48"
+    },
+    {
+      "path": "detcore/src/lib.rs",
+      "bytes": 162299,
+      "mode": "644",
+      "sha256": "cdf9f91911e91f15a76422b85407e19154cd49b3ff404fadc2cd7df59cfd1fdf"
+    },
+    {
+      "path": "detcore/src/tool_global/tests/backend_failure_tests.rs",
+      "bytes": 20899,
+      "mode": "644",
+      "sha256": "9cf91f4bb31f32a6be0d0eff860efb809dd1c97aed004f387d749bc403ac2b5a"
+    },
+    {
+      "path": "hermit-cli/src/lib.rs",
+      "bytes": 202831,
+      "mode": "644",
+      "sha256": "85d05f793a89f384e3622252b928b7dd09f526407c389d85673427b9d70c1ae0"
+    },
+    {
+      "path": "hermit-cli/src/kvm_failure_tests.rs",
+      "bytes": 16054,
+      "mode": "644",
+      "sha256": "40502a0de99cabe71929a2b9d6c1d9db96e5b57d728f9dccd16676f7a4249781"
+    },
+    {
+      "path": "hermit-cli/Cargo.toml",
+      "bytes": 4256,
+      "mode": "644",
+      "sha256": "a162b2488ba30c19f844d1bdd890d8f0fa1e636b2fed51481547a1e9afe2da8a"
+    },
+    {
+      "path": "ci/manifest-plan/src/nextest_build_selections.rs",
+      "bytes": 23885,
+      "mode": "644",
+      "sha256": "dbb90d69df7e5afb5c045db93bf51f91bb86faffc5acd7c7848379dc8fc6cc1b"
+    },
+    {
+      "path": "ci/manifest-plan/src/validation_dag_static.rs",
+      "bytes": 347695,
+      "mode": "644",
+      "sha256": "1cbfcc6eaa3f1baa5754fb1f46dc5a9716cfc3a1b8e19969c1ff47e0492543ea"
+    }
+  ]
+}

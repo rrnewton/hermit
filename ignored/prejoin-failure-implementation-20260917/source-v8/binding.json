@@ -1,0 +1,98 @@
+{
+  "repository": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+  "base": "7f84482cd88a9fd5701220b200b30e734ffb72db",
+  "branch": "codex/kvm-prejoin-hermit-20260917",
+  "files": [
+    {
+      "path": "detcore/src/scheduler.rs",
+      "mode": "644",
+      "bytes": 353840,
+      "sha256": "d9b94c41fb688d46bfae5420bb0319a8ad26249f39691f11d2dec908394da358"
+    },
+    {
+      "path": "detcore/src/tool_global.rs",
+      "mode": "644",
+      "bytes": 252090,
+      "sha256": "eb1b453f204641198438781850e65718262e4a3d1fd0db0d22e28737a60f7f3a"
+    },
+    {
+      "path": "detcore/src/tool_local.rs",
+      "mode": "644",
+      "bytes": 147672,
+      "sha256": "478e5b174251b8857c72d9fa1092901ea2a21d0a6f497793c7c419118db21e48"
+    },
+    {
+      "path": "detcore/src/lib.rs",
+      "mode": "644",
+      "bytes": 162299,
+      "sha256": "cdf9f91911e91f15a76422b85407e19154cd49b3ff404fadc2cd7df59cfd1fdf"
+    },
+    {
+      "path": "detcore/src/tool_global/tests/backend_failure_tests.rs",
+      "mode": "644",
+      "bytes": 20908,
+      "sha256": "5011d86cc92498712dc7563fa107946dd3ab862cb02560c1573b1ae52598c335"
+    },
+    {
+      "path": "hermit-cli/src/lib.rs",
+      "mode": "644",
+      "bytes": 202908,
+      "sha256": "15e897c0e705b9cef214137bec2964f49791fa514c1ea9f3c948751ba9eec246"
+    },
+    {
+      "path": "hermit-cli/src/kvm_failure_tests.rs",
+      "mode": "644",
+      "bytes": 16054,
+      "sha256": "40502a0de99cabe71929a2b9d6c1d9db96e5b57d728f9dccd16676f7a4249781"
+    },
+    {
+      "path": "hermit-cli/Cargo.toml",
+      "mode": "644",
+      "bytes": 4358,
+      "sha256": "675cbd89210c846db960eddfa4da9de8b253e7fea29072d8bf8fe3e197d36391"
+    },
+    {
+      "path": "ci/manifest-plan/src/nextest_build_selections.rs",
+      "mode": "644",
+      "bytes": 26156,
+      "sha256": "9e4d1a9d8544a246be90d828613fc87740131195d4e1913ec00e14bbd219f05c"
+    },
+    {
+      "path": "ci/manifest-plan/src/validation_dag_static.rs",
+      "mode": "644",
+      "bytes": 349470,
+      "sha256": "04ceec6708e90df45dc983aedffa4d2e289f98d453b3cfbbbd3204df72488e4d"
+    },
+    {
+      "path": "detcore/src/scheduler/runqueue.rs",
+      "mode": "644",
+      "bytes": 30121,
+      "sha256": "c3cbe795d768fd0e9b7a51896d012be1804c652077e5e9e2beac673a8de4456d"
+    },
+    {
+      "path": "hermit-cli/src/kvm_execution_tests.rs",
+      "mode": "644",
+      "bytes": 6340,
+      "sha256": "4999738c5e429b8da9fc4dc882ebe1bb88a1c9cb5fbe7f450db9d84af50a4459"
+    },
+    {
+      "path": "ci/dag/validate.json",
+      "mode": "644",
+      "bytes": 2857181,
+      "sha256": "08ddd41443f061ad617ec8ed4ee62b7b01f3781dd2bb13d44880fc59a539edb2"
+    }
+  ],
+  "patch_sha256": "9c42112a9086aaac2ebe3d963cf702e7e62e4976f226a64bc1032e84af096096",
+  "patch_bytes": 141132,
+  "report_sha256": "64f5c25e9120ff0767775300ac8bbb2377ee303889d44f93bbaf72c097fe7755",
+  "source_manifest_sha256": "22b40c21328cecef468695f7bb87dd3cc7f585d281e215eb92adee5c923f0e6b",
+  "selected_tests_sha256": "05cf8321ddc83cf8adfbb881e4a18873a516f669304471122d54e2e408e2dc74",
+  "increment_sha256": "bf396438e53f7218d62217b6c5cf3752b968790db9ba5e9003c26cdc4e3eebe4",
+  "previous_binding_sha256": "a0d794610f92e1cefe8507d4c5c077bf994555d179099e059c66b1ca06d604b0",
+  "reverie_binding_sha256": "e7c6e8e677c2a937ae94f62d4da427a754a5070e148823ca72b3a35083f8d79b",
+  "native_counts": {
+    "detcore": 51,
+    "hermit": 9
+  },
+  "execution": "No execution on source-v8; generated file provenance described separately in REPORT.md."
+}

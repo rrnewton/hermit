@@ -1,0 +1,120 @@
+{
+  "status": "workspace lock refresh completed",
+  "old_lock_sha256": "5da1f034468bdc66c88f80da93779c3bf7025444ac6424d8932251654ea09ddd",
+  "new_lock_sha256": "4a193ac7bcced21dc3b0951fc8131ebc231388ac0e7acaf9af9f15da4388756a",
+  "diff_sha256": "32b909bf806c51e3f8bd9ebfccd274e1de3e0d2418b73603504a5541011f3e16",
+  "changes": [
+    {
+      "name": "nostd-print",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-core",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-dbt",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-kvm",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-liteinst",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-memory",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-preload",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-process",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-ptrace",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-rpc",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-rpc-macros",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-rpc-transport",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-sabre",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-sabre-macros",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-sabre-stats",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "reverie-syscalls",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    },
+    {
+      "name": "safeptrace",
+      "version": "0.2.0",
+      "old_source": "git+https://github.com/rrnewton/reverie.git?rev=114b309413612fafc2657c74e83811c71aac7b19#114b309413612fafc2657c74e83811c71aac7b19",
+      "new_source": "local path from bound nine-package configuration and its path dependencies"
+    }
+  ],
+  "source_and_other_inputs_unchanged": true,
+  "cpu_seconds": 0.300399,
+  "wall_seconds": 0.868262932,
+  "observer_exit": 0,
+  "complete": true,
+  "inactive": "inactive",
+  "empty": true,
+  "observer_error": null,
+  "stop_reason": null,
+  "stderr_truncated": "false"
+}

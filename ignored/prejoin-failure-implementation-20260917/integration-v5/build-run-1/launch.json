@@ -1,0 +1,45 @@
+{
+  "plan_sha256": "89e2e568017eab93859fc826d58284caae42cbfa346542c6907e2dd31c5ca7b3",
+  "caller_sha256": "2244826c172779e9edbbe322c1f92d9a4724227a67acd2fc0899153a14119fcb",
+  "execution": [
+    "/usr/bin/python3",
+    "-B",
+    "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v5/build.py"
+  ],
+  "cwd": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+  "environment": {
+    "HOME": "/home/newton",
+    "USER": "newton",
+    "LOGNAME": "newton",
+    "XDG_RUNTIME_DIR": "/run/user/212630",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/212630/bus",
+    "PATH": "/home/newton/.rustup/toolchains/nightly-2026-07-29-x86_64-unknown-linux-gnu/bin:/usr/local/bin:/usr/bin:/bin",
+    "CARGO_HOME": "/home/newton/.cargo",
+    "RUSTUP_HOME": "/home/newton/.rustup",
+    "RUSTC": "/home/newton/.rustup/toolchains/nightly-2026-07-29-x86_64-unknown-linux-gnu/bin/rustc",
+    "RUSTDOC": "/home/newton/.rustup/toolchains/nightly-2026-07-29-x86_64-unknown-linux-gnu/bin/rustdoc",
+    "CARGO_TARGET_DIR": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_NET_OFFLINE": "true",
+    "RUSTFLAGS": "",
+    "LC_ALL": "C",
+    "LANG": "C",
+    "TZ": "UTC",
+    "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v5/build-run-1/tmp",
+    "CARGO_TERM_COLOR": "never",
+    "THIRD_PARTY_BUILD_JOBS": "2"
+  },
+  "repositories": [
+    {
+      "source_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+      "source_binding": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/source-v2/binding.json",
+      "source_manifest": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/source-v2/tracked-source-manifest.json"
+    },
+    {
+      "source_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917",
+      "source_binding": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/ignored/prejoin-failure-implementation-20260917/source-v9-preparation/binding.json",
+      "source_manifest": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/ignored/prejoin-failure-implementation-20260917/source-v9-preparation/tracked-source-manifest.json"
+    }
+  ],
+  "scope": "Two frozen source candidates, actual affected lib/bin inventory, 60 exact no-VM native controls; no guest or initialized-VM execution."
+}

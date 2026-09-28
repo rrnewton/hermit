@@ -1,0 +1,18 @@
+{
+  "checks": [
+    {
+      "source_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+      "binding_sha256": "ccc309603bf29799c8adbc3c1277f747c8469c442ab008e156e32a1d3b16d0e0",
+      "manifest_sha256": "ca0f1753d314e95dec433fc08098b2d7e5ba3e64efe88d162ba74349dd5e77e6",
+      "checked": true
+    },
+    {
+      "source_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917",
+      "binding_sha256": "80a9dbc832572f35935ccb7ab0d612c756c85374709fc9aab90a343ca5fcb6f8",
+      "manifest_sha256": "90ccb638898bfcd57a1f9ac9db7e9f47780a4a2d181c68b9283766eb57af433f",
+      "checked": true
+    }
+  ],
+  "all_plan_inputs_match": true,
+  "scope": "Post-failure full manifests and current file rows match. Reverie v6 top-level patch/report metadata is known stale and was not used to establish the source rows."
+}

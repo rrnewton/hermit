@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "/home/newton/.rustup/toolchains/nightly-2026-07-29-x86_64-unknown-linux-gnu/bin/rustfmt",
+    "--edition",
+    "2024",
+    "--config",
+    "skip_children=true",
+    "detcore/src/scheduler.rs",
+    "detcore/src/tool_global.rs",
+    "detcore/src/tool_local.rs",
+    "detcore/src/lib.rs",
+    "detcore/src/tool_global/tests/backend_failure_tests.rs",
+    "hermit-cli/src/lib.rs",
+    "hermit-cli/src/kvm_failure_tests.rs"
+  ],
+  "exit_code": 0,
+  "wall_seconds": 0.21415554801933467,
+  "kind": "source formatting only; no build or test"
+}

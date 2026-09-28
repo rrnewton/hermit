@@ -1,0 +1,10 @@
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie" }
+reverie-dbt = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-dbt" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-liteinst" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-memory" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-ptrace" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-rpc-transport" }
+reverie-sabre = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/experimental/reverie-sabre" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-syscalls" }

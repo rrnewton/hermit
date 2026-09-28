@@ -1,0 +1,10 @@
+{
+  "names": [
+    "kvm_matches_ptrace_for_fork_tree",
+    "kvm_matches_ptrace_for_prefilled_pipe_across_fork",
+    "kvm_matches_ptrace_for_pthread_lifecycle",
+    "kvm_mountinfo_uses_its_synthetic_namespace_identity"
+  ],
+  "count": 4,
+  "raw_sha256": "23d1cc3c495e258d18353499e8b17b4fbac62355847ecb83e3567b0e9cd9c905"
+}

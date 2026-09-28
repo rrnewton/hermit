@@ -1,0 +1,47 @@
+{
+  "native_summary": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/integration-v6/build-run-1/summary.json",
+  "native_summary_sha256": "edb69e387ae256b66d570a3a0cb5f3d3b471a222ca0a9dbaf8b30c8858f671d2",
+  "native_inventory_counts": {
+    "detcore": 696,
+    "syscaller": 0,
+    "hermit": 347,
+    "hermit-bin": 295,
+    "hermit-dap": 3,
+    "verification-report": 0
+  },
+  "qualification_summary": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/ignored/prejoin-failure-implementation-20260917/qualification-build-v2/run-1/summary.json",
+  "qualification_summary_sha256": "90dffd20cc3a46fb77b8ecf079bf37bec91c4fd75553599486749d896dc06322",
+  "kvm_original_cli": [
+    "run_kvm_awk_mincore_probe_terminates",
+    "run_kvm_bash_process_substitution_is_deterministic",
+    "run_kvm_counts_standard_input",
+    "run_kvm_cpuid_policy_is_deterministic",
+    "run_kvm_exact_child_waits_have_stable_scheduler_turns",
+    "run_kvm_executes_dynamic_guest",
+    "run_kvm_f_getfl_and_reads_standard_input",
+    "run_kvm_lists_host_directory_metadata",
+    "run_kvm_pipe_pipe2_and_getgroups_round_trip",
+    "run_kvm_preserves_closed_standard_input",
+    "run_kvm_propagates_explicit_environment",
+    "run_kvm_random_device_lseek_matches_linux",
+    "run_kvm_reads_host_file",
+    "run_kvm_reads_standard_input",
+    "run_kvm_reports_fixed_supplementary_groups",
+    "run_kvm_reports_hostname",
+    "run_kvm_resolves_bare_program_from_guest_path",
+    "run_kvm_respects_workdir_for_relative_paths",
+    "run_kvm_setpriv_capability_wrapper_is_deterministic",
+    "run_kvm_verify_does_not_write_to_standard_input",
+    "run_kvm_verify_f_getfl_and_replays_standard_input",
+    "run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags",
+    "run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stdout_flags",
+    "run_kvm_verify_replays_standard_input"
+  ],
+  "setup_test": "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution",
+  "authored_count_updates": {
+    "hermit_unit": 645,
+    "detcore_unit": 696,
+    "cli_kvm": 25
+  },
+  "scope": "Actual inventories only, not all inventoried tests executed."
+}

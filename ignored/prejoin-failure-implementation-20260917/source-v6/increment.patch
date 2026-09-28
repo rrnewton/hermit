@@ -1,0 +1,63 @@
+--- a/ci/manifest-plan/src/nextest_build_selections.rs
++++ b/ci/manifest-plan/src/nextest_build_selections.rs
+@@ -602,6 +602,49 @@
+             .find(|step| step.tag() == "privileged-test.cli_kvm")
+             .unwrap();
+         assert_command_selection(original).unwrap();
++        let portable = crate::nextest_binaries::config_selections(&graph, "portable").unwrap();
++        let full = crate::nextest_binaries::config_selections(&graph, "full").unwrap();
++        let hardware: Vec<String> = serde_json::from_str(&original.env[SELECTION_ENV]).unwrap();
++        let hardware_key = crate::nextest_binaries::selection_key(&hardware);
++        assert_eq!(full.get(&hardware_key), Some(&hardware));
++        assert!(!portable.contains_key(&hardware_key));
++        assert_eq!(full.len(), portable.len() + 1);
++        for (key, selection) in &portable {
++            assert_eq!(full.get(key), Some(selection));
++        }
++        for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
++            let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
++            let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
++            assert!(selection.contains(&"third-party-backends,kvm-native-test-support".into()));
++            assert!(
++                !selection
++                    .iter()
++                    .any(|arg| arg.contains("kvm-execution-tests"))
++            );
++        }
++        let mut missing_hardware = graph.clone();
++        let producer = missing_hardware
++            .steps
++            .iter_mut()
++            .find(|step| step.tag() == "build.workspace")
++            .unwrap();
++        assert!(
++            producer
++                .cmd
++                .ends_with("./ci/nextest-binaries.rs prepare full")
++        );
++        producer.cmd = producer.cmd.replace(
++            "./ci/nextest-binaries.rs prepare full",
++            "./ci/nextest-binaries.rs prepare portable",
++        );
++        missing_hardware
++            .steps
++            .sort_by_key(|step| step.tag() != "privileged-test.cli_kvm");
++        let error = assert_preparation_dependencies(&missing_hardware).unwrap_err();
++        assert!(
++            error.starts_with("privileged-test.cli_kvm") && error.contains("same filesystem root"),
++            "{error}"
++        );
+         let direct = graph
+             .steps
+             .iter()
+--- a/ci/manifest-plan/src/validation_dag_static.rs
++++ b/ci/manifest-plan/src/validation_dag_static.rs
+@@ -1176,7 +1176,7 @@
+             r########"hosted-portable"########,
+             r########"portable"########,
+         ],
+-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare portable"########,
++        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare full"########,
+         cmdtype: CmdType::Unknown,
+         manifest: None,
+         integration_test_binaries: None,

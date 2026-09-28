@@ -1,0 +1,296 @@
+--- a/detcore/src/tool_global/tests/backend_failure_tests.rs
++++ b/detcore/src/tool_global/tests/backend_failure_tests.rs
+@@ -578,7 +578,7 @@
+ fn both_fork_and_thread_construction_reset_the_parent_start_marker() {
+     let config = Config::default();
+     let parent = Tid::from_raw(17);
+-    let tool = Detcore::new(parent, &config);
++    let tool: Detcore = Detcore::new(parent, &config);
+     let mut state = tool.init_thread_state(parent, None);
+     state.thread_start_entered = true;
+     for flags in [
+--- a/hermit-cli/src/lib.rs
++++ b/hermit-cli/src/lib.rs
+@@ -2154,6 +2154,9 @@
+ #[cfg(test)]
+ mod kvm_failure_tests;
+ 
++#[cfg(all(test, feature = "kvm-execution-tests"))]
++mod kvm_execution_tests;
++
+ // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
+ #[cfg(feature = "dbt")]
+ fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
+--- a/hermit-cli/Cargo.toml
++++ b/hermit-cli/Cargo.toml
+@@ -26,6 +26,8 @@
+ sabre = []
+ e9patch = []
+ third-party-backends = ["dbt", "sabre", "e9patch"]
++# Hardware qualification selected only by the existing KVM validation nodes.
++kvm-execution-tests = []
+ 
+ [dependencies]
+ anyhow = "1.0.103"
+--- a/ci/manifest-plan/src/nextest_build_selections.rs
++++ b/ci/manifest-plan/src/nextest_build_selections.rs
+@@ -153,19 +153,27 @@
+         "test.cli"
+         | "test.isolated_dbt_workdir"
+         | "test.cli_on_host"
+-        | "privileged-test.cli_kvm"
+         | "super.liteinst_python3_verify_diagnostics"
+         | "super.dbt_pipe_backpressure_diagnostic"
+         | "super.dbt_failed_exec_recovery_diagnostic"
+         | "super.dbt_unsupported_syscall_aggregation_diagnostic"
+         | "super.dbt_strict_blocked_stdin_teardown_diagnostic"
+-        | "super.dbt_guest_stderr_isolation_diagnostic"
++        | "super.dbt_guest_stderr_isolation_diagnostic" => Some(&[
++            "-p",
++            "hermit",
++            "--features",
++            "third-party-backends",
++            "--test",
++            "cli",
++        ]),
++        "privileged-test.cli_kvm"
+         | "privileged-only-test.cli_kvm"
+         | "privileged-only-test.cli_kvm_on_host" => Some(&[
+             "-p",
+             "hermit",
+             "--features",
+-            "third-party-backends",
++            "third-party-backends,kvm-execution-tests",
++            "--lib",
+             "--test",
+             "cli",
+         ]),
+--- a/ci/manifest-plan/src/validation_dag_static.rs
++++ b/ci/manifest-plan/src/validation_dag_static.rs
+@@ -3040,10 +3040,10 @@
+     StaticStepSpec {
+         group: r########"privileged-test"########,
+         job: r########"cli_kvm"########,
+-        desc: r########"All 24 run_kvm_ CLI tests"########,
+-        description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
++        desc: r########"KVM CLI tests and initialized-VM setup cleanup"########,
++        description: r########"Runs all 24 KVM-specific hermit CLI tests and the initialized-VM setup cleanup control after requiring /dev/kvm. The inventory gate requires all 24 CLI tests and exactly the named setup test. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
+         labels: &[r########"full"########, r########"kvm"########],
+-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
++        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 24) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
+         cmdtype: CmdType::Unknown,
+         manifest: None,
+         integration_test_binaries: Some(&[r########"cli"########]),
+@@ -4488,10 +4488,10 @@
+     StaticStepSpec {
+         group: r########"privileged-only-test"########,
+         job: r########"cli_kvm"########,
+-        desc: r########"All 24 run_kvm_ CLI tests"########,
+-        description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
++        desc: r########"KVM CLI tests and initialized-VM setup cleanup"########,
++        description: r########"Runs all 24 KVM-specific hermit CLI tests and the initialized-VM setup cleanup control after requiring /dev/kvm. The inventory gate requires all 24 CLI tests and exactly the named setup test. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
+         labels: &[r########"privileged"########, r########"kvm"########],
+-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
++        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 24) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
+         cmdtype: CmdType::Unknown,
+         manifest: None,
+         integration_test_binaries: Some(&[r########"cli"########]),
+@@ -6088,10 +6088,10 @@
+     StaticStepSpec {
+         group: r########"privileged-only-test"########,
+         job: r########"cli_kvm_on_host"########,
+-        desc: r########"All 24 run_kvm_ CLI tests"########,
+-        description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
++        desc: r########"KVM CLI tests and initialized-VM setup cleanup"########,
++        description: r########"Runs all 24 KVM-specific hermit CLI tests and the initialized-VM setup cleanup control after requiring /dev/kvm. The inventory gate requires all 24 CLI tests and exactly the named setup test. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
+         labels: &[r########"hosted-privileged"########],
+-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
++        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] as $selected | ([$selected[] | select(.key | startswith("run_kvm_"))] | length == 24) and ([$selected[] | select(.key == "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution")] | length == 1)' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests and the named setup test; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends,kvm-execution-tests --lib --test cli -j 1 -E 'test(/^run_kvm_/) | test(=kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution)'; exit $?"########,
+         cmdtype: CmdType::Unknown,
+         manifest: None,
+         integration_test_binaries: Some(&[r########"cli"########]),
+--- a/hermit-cli/src/kvm_execution_tests.rs
++++ b/hermit-cli/src/kvm_execution_tests.rs
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ * This source code is licensed under the BSD-style license found in the
++ * LICENSE file in the root directory of this source tree.
++ */
++
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
++
++use reverie::BackendStatsRequest;
++use reverie::BackendStatsSource;
++use reverie::GlobalRPC;
++use reverie::Guest;
++use reverie::Pid;
++use reverie::Tool;
++
++use super::*;
++
++static INITIALIZED: AtomicUsize = AtomicUsize::new(0);
++static STARTED: AtomicUsize = AtomicUsize::new(0);
++static THREAD_EXITED: AtomicUsize = AtomicUsize::new(0);
++static PROCESS_EXITED: AtomicUsize = AtomicUsize::new(0);
++
++#[derive(Default)]
++struct SetupFailureTool(Detcore);
++
++#[reverie::tool]
++impl Tool for SetupFailureTool {
++    type GlobalState = detcore::GlobalState;
++    type ThreadState = <Detcore as Tool>::ThreadState;
++
++    fn new(pid: Pid, config: &DetConfig) -> Self {
++        Self(Detcore::new(pid, config))
++    }
++
++    fn init_thread_state(
++        &self,
++        tid: Pid,
++        parent: Option<(Pid, &Self::ThreadState)>,
++    ) -> Self::ThreadState {
++        INITIALIZED.fetch_add(1, Ordering::SeqCst);
++        self.0.init_thread_state(tid, parent)
++    }
++
++    async fn handle_thread_start<G: Guest<Self>>(
++        &self,
++        _guest: &mut G,
++    ) -> Result<(), reverie::Error> {
++        STARTED.fetch_add(1, Ordering::SeqCst);
++        Err(std::io::Error::other("initialized VM setup failure").into())
++    }
++
++    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
++        &self,
++        tid: Pid,
++        global: &G,
++        thread: Self::ThreadState,
++        status: ExitStatus,
++    ) -> Result<(), reverie::Error> {
++        THREAD_EXITED.fetch_add(1, Ordering::SeqCst);
++        self.0.on_exit_thread(tid, global, thread, status).await?;
++        Err(std::io::Error::other("separate initialized VM cleanup failure").into())
++    }
++
++    async fn on_exit_process<G: GlobalRPC<Self::GlobalState>>(
++        self,
++        pid: Pid,
++        global: &G,
++        status: ExitStatus,
++    ) -> Result<(), reverie::Error> {
++        PROCESS_EXITED.fetch_add(1, Ordering::SeqCst);
++        self.0.on_exit_process(pid, global, status).await
++    }
++}
++
++fn setup_failure_elf() -> Vec<u8> {
++    // Existing static_elf_at layout: one RX LOAD at file offset 0x1000,
++    // virtual 0x400000. UD2 must not execute during Tool setup. The untracked
++    // pre-run intentionally reaches the exception HLT before Tool state exists.
++    let mut image = vec![0; 0x1002];
++    image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
++    for (offset, value) in [(16, 2u16), (18, 62), (52, 64), (54, 56), (56, 1)] {
++        image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
++    }
++    for (offset, value) in [(20, 1u32), (64, 1), (68, 5)] {
++        image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
++    }
++    for (offset, value) in [
++        (24, 0x400000u64),
++        (32, 64),
++        (72, 0x1000),
++        (80, 0x400000),
++        (88, 0x400000),
++        (96, 2),
++        (104, 0x2000),
++        (112, 0x1000),
++    ] {
++        image[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
++    }
++    image[0x1000..].copy_from_slice(&[0x0f, 0x0b]);
++    image
++}
++
++async fn check_initialized_vm_setup_failure(preamble: bool) {
++    for count in [&INITIALIZED, &STARTED, &THREAD_EXITED, &PROCESS_EXITED] {
++        count.store(0, Ordering::SeqCst);
++    }
++    let config = prepare_backend_config(
++        DetConfig {
++            sequentialize_threads: true,
++            max_timeslice: None,
++            ..DetConfig::default()
++        },
++        Backend::Kvm,
++    );
++    // KVM/PMU refusal is a failure to measure, never an early success.
++    let mut backend = reverie_kvm::KvmBackend::new(16 * 1024 * 1024).unwrap();
++    backend.set_root_pid(detcore::ROOT_DETPID.as_raw()).unwrap();
++    backend.set_backend_stats_request(BackendStatsRequest::new(true));
++    backend
++        .install_static_elf(&setup_failure_elf(), "/setup-failure")
++        .unwrap();
++    if preamble {
++        // Exercise the existing public API's untracked-to-tracked refusal.
++        // UD2 reaches the exception HLT; no Tool state exists during this run.
++        backend
++            .run(|_, _| panic!("UD2 fixture cannot issue a syscall"))
++            .unwrap();
++        assert_eq!(backend.backend_stats().total_exits(), 1);
++    }
++    let exits_before_setup = backend.backend_stats().total_exits();
++    let completion = backend
++        .run_static_elf_with_tool_completion::<SetupFailureTool>(config, true)
++        .await
++        .expect("constructed GlobalState must be recovered");
++    assert_eq!(backend.backend_stats().total_exits(), exits_before_setup);
++    assert_eq!(STARTED.load(Ordering::SeqCst), usize::from(!preamble));
++    for count in [&INITIALIZED, &THREAD_EXITED, &PROCESS_EXITED] {
++        assert_eq!(count.load(Ordering::SeqCst), 1);
++    }
++    let error = completion.result.as_ref().unwrap_err();
++    assert_setup_primary(error, preamble);
++    let reverie_kvm::Error::WithCleanup { cleanup, .. } = error else {
++        panic!("separate cleanup error was not retained");
++    };
++    assert!(cleanup.iter().any(|error| matches!(error.primary(),
++        reverie_kvm::Error::Reverie(reverie::Error::Io(error))
++        if error.to_string() == "separate initialized VM cleanup failure")));
++    let error = tokio::time::timeout(
++        Duration::from_secs(2),
++        finish_kvm_tool_completion(completion, false, &None),
++    )
++    .await
++    .unwrap()
++    .unwrap_err();
++    assert_setup_primary(
++        error.downcast_ref::<reverie_kvm::Error>().unwrap(),
++        preamble,
++    );
++}
++
++fn assert_setup_primary(error: &reverie_kvm::Error, preamble: bool) {
++    if preamble {
++        assert!(
++            matches!(error.primary(), reverie_kvm::Error::GuestClock(message)
++            if message.contains("cannot start a clock after untracked guest execution"))
++        );
++    } else {
++        assert!(
++            matches!(error.primary(), reverie_kvm::Error::Reverie(reverie::Error::Io(error))
++            if error.to_string() == "initialized VM setup failure")
++        );
++    }
++}
++
++#[tokio::test]
++async fn initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution() {
++    for preamble in [false, true] {
++        check_initialized_vm_setup_failure(preamble).await;
++    }
++}

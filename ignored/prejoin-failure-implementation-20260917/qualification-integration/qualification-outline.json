@@ -1,0 +1,40 @@
+{
+  "source_inputs": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/tests/kvm_harder.rs",
+      "sha256": "f4bf3d08b9ab712ce228dcafed2eb519faaea7c5e775401fd9ac156185d0a65a",
+      "bytes": 6144
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/tests/backend-parity/fixtures/pthread_lifecycle.c",
+      "sha256": "060e698e06919066bc7c2f2e0aab0563696ad762beabfb6c06c7e74c734667cd",
+      "bytes": 869
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/tests/cli.rs",
+      "sha256": "9e4dc5901edaa7ece16d4a5fe14d4182c62a82c7e82c885d2ea4876183a994a0",
+      "bytes": 267845
+    }
+  ],
+  "existing_cli_success_selector": "kvm_matches_ptrace_for_pthread_lifecycle",
+  "existing_target": "kvm_harder",
+  "strict_runs": [
+    "ptrace run",
+    "ptrace verify",
+    "kvm run",
+    "kvm verify"
+  ],
+  "fixture_expected_stdout": "threads=4 total=10\n",
+  "guest_execution": "Not released or performed. Caller and bounds must be bound before execution.",
+  "excluded": "Adjacent fork-tree and prefilled-pipe fork selectors are not selected for this increment.",
+  "production_setup_target": "hermit library; nondefault kvm-execution-tests feature",
+  "production_setup_selector": "kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution",
+  "recurring_nodes": [
+    "privileged-test.cli_kvm",
+    "privileged-only-test.cli_kvm",
+    "privileged-only-test.cli_kvm_on_host"
+  ],
+  "recurring_selection": "Preserve all existing 24 run_kvm_ CLI identities plus one exact new library setup method. Count change awaits actual inventory.",
+  "hardware_requirement": "Require /dev/kvm; KvmBackend construction and PMU refusal fail measurement, never early success.",
+  "portable_selection": "third-party-backends,kvm-native-test-support remains unchanged; no VM setup module compiled."
+}

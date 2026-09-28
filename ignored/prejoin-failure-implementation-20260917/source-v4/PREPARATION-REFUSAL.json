@@ -1,0 +1,5 @@
+{
+  "status": "unexecuted incomplete preparation retained",
+  "error": "Previous frozen source copies are under source/, not files/. Read of files/detcore/src/scheduler.rs refused before binding or measurement plan creation.",
+  "source_mutation": false
+}

@@ -1,0 +1,9 @@
+# Hermit generated validation graph after measured inventories
+
+Only ci/dag/validate.json changed from source-v7. Its bytes equal the successful dag-generation-v3 generated file: SHA 08ddd41443f061ad617ec8ed4ee62b7b01f3781dd2bb13d44880fc59a539edb2, 2,857,181 bytes. The complete generated diff was read before installation; prior tracked bytes and install/readback records are retained under dag-generation-v3/run-1. This source preparation does not claim execution of the DAG, a library test, VM, or guest.
+
+The generator and exact --check both completed with exit 0 and complete, inactive, empty service accounting. Aggregate CPU / wall: generate 102.891690 s / 60.152043 s; check 3.242176 s / 3.602636 s. Independent systemctl readbacks agree. The 16 MiB generated-file bound is a readback limit, not a disk cap over the generated file or Cargo cache.
+
+The generated change contains the reviewed prepare full producer, native-support and separate hardware qualification selections, corresponding descriptions and exact measured count changes: Hermit 645, Detcore 696, three privileged KVM populations 25. It preserves every existing selector identity, label and resource bound. The numbers come from the retained actual inventories, not a generated estimate. The same-root preparation regression was corrected in source-v7 and is not yet executed as a library test.
+
+All other source-v7 bytes, including the real Detcore controls and setup fixture, are unchanged. The local integration Cargo.lock is separately bound and must not be staged or landed. Reverie source-v12 is a new unexecuted correction to the actual Claude review; the prior Hermit/Rv9 native and hardware inventories remain reported under their original source versions. Full follow-up native and real-guest qualification remains required.

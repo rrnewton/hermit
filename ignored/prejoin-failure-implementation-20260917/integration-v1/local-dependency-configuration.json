@@ -1,0 +1,27 @@
+{
+  "packages": {
+    "reverie-sabre": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/experimental/reverie-sabre",
+    "reverie-dbt": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-dbt",
+    "reverie-kvm": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-kvm",
+    "reverie-liteinst": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-liteinst",
+    "reverie-memory": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-memory",
+    "reverie-ptrace": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-ptrace",
+    "reverie-rpc-transport": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-rpc-transport",
+    "reverie-syscalls": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie-syscalls",
+    "reverie-core": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917/reverie"
+  },
+  "unchanged_declared_revisions": {
+    "reverie-core": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-dbt": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-syscalls": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-memory": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-rpc-transport": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-sabre": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-ptrace": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-kvm": "114b309413612fafc2657c74e83811c71aac7b19",
+    "reverie-liteinst": "114b309413612fafc2657c74e83811c71aac7b19"
+  },
+  "old_hermit_lock_sha256": "5da1f034468bdc66c88f80da93779c3bf7025444ac6424d8932251654ea09ddd",
+  "reverie_lock_sha256": "1c09663e46bf21ad7c07eedd7821cccb72ae21f42485192649ff5473962bc856",
+  "scope": "local source integration only; no published revision pin changed"
+}

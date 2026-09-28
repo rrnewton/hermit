@@ -1,0 +1,9 @@
+{
+  "status": "failed",
+  "active_stage": "generate",
+  "error": "generate failed",
+  "retained_stages": [
+    "generate"
+  ],
+  "scope": "Official validation DAG generation to one fresh ignored file, followed by the generator exact freshness check. No tracked source mutation, tests, VM or guests."
+}

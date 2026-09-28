@@ -1,0 +1,8 @@
+{
+  "current_inputs_match": true,
+  "unchanged_stages_after_versioned_path_normalization": true,
+  "unchanged_exact_selection": true,
+  "prior_attempt": "integration-v3 failed at compile; retained",
+  "source_delta": "Two feature import attributes only in Reverie; Hermit source-v2 unchanged",
+  "execution": "Not launched"
+}

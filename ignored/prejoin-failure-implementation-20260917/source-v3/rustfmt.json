@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "/home/newton/.rustup/toolchains/nightly-2026-07-29-x86_64-unknown-linux-gnu/bin/rustfmt",
+    "--edition",
+    "2024",
+    "--config",
+    "skip_children=true",
+    "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/src/kvm_execution_tests.rs"
+  ],
+  "exit": 0,
+  "wall_seconds": 0.01023611007258296
+}

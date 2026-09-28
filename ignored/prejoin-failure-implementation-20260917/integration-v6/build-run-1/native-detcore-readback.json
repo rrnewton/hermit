@@ -1,0 +1,1038 @@
+{
+  "stage": "native-detcore",
+  "observer_exit": 0,
+  "result_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/result.json",
+  "result_sha256": "85cdd52143c40bebf0a8af664367fe52cc5f726152191e1e18f241c89d7fa1f0",
+  "result": {
+    "schema": 1,
+    "scope": "Aggregate CPU observation of the actual safehermit service only",
+    "launch": {
+      "binary": "/usr/bin/python3",
+      "binary_sha256": "9cfdf1a01d07dadb394dd2dc9fd8316254c36764076d23dc2c895c8401735576",
+      "arguments": [
+        "-B",
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/before_exec.py",
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/before-exec.json",
+        "94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d"
+      ],
+      "payload": {
+        "binary": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/detcore-e88446e05572c3ab",
+        "binary_sha256": "10bb0967678e53cd17581b29e1ef6c479d0a04b3cc3b1f55a9473ba54ec8b39f",
+        "arguments": [
+          "--exact",
+          "scheduler::test::a_vanished_thread_aborts_its_turn_and_a_live_one_does_not",
+          "scheduler::test::buffered_admission_cancelled_by_buffered_removal",
+          "scheduler::test::exec_reconnect_only_buffers_while_tentative_selection_is_live",
+          "scheduler::test::physical_exit_barrier_is_disabled_for_other_backends",
+          "scheduler::test::physical_exit_barrier_precedes_empty_queue_timer_fast_forward",
+          "tool_global::robust_exit_clock_tests::backend_failure_preserves_consuming_robust_exit_clock_accounting",
+          "tool_global::robust_exit_clock_tests::robust_exit_acknowledgements_preserve_global_action_order_and_eligibility",
+          "tool_global::robust_exit_clock_tests::robust_exit_callbacks_keep_rejected_or_mismatched_batches_incomplete",
+          "tool_global::robust_exit_clock_tests::robust_exit_callbacks_preserve_owner_clocks_across_arrival_orders",
+          "tool_global::robust_exit_clock_tests::robust_exit_clock_ack_still_refuses_a_backwards_owner_sample",
+          "tool_global::tests::abnormal_cleanup_cancels_a_registered_scheduler",
+          "tool_global::tests::abnormal_cleanup_cancels_an_unstarted_scheduler",
+          "tool_global::tests::backend_failure_tests::backend_failure_blocks_registration_that_passed_earlier_header_admission",
+          "tool_global::tests::backend_failure_tests::backend_failure_blocks_rpc_clock_and_child_registration_at_admission",
+          "tool_global::tests::backend_failure_tests::backend_failure_closes_selection_before_consuming_clear_tid_cleanup",
+          "tool_global::tests::backend_failure_tests::backend_failure_completes_registered_daemon_without_another_request",
+          "tool_global::tests::backend_failure_tests::backend_failure_completes_unstarted_daemon_without_aborting_it",
+          "tool_global::tests::backend_failure_tests::backend_failure_consumes_registered_child_before_thread_start",
+          "tool_global::tests::backend_failure_tests::backend_failure_consumes_unregistered_child_without_admission_or_clock",
+          "tool_global::tests::backend_failure_tests::backend_failure_ends_quiescence_without_another_request",
+          "tool_global::tests::backend_failure_tests::backend_failure_precedes_ready_request_without_grant_or_timer_processing",
+          "tool_global::tests::backend_failure_tests::backend_failure_wakes_each_global_subscriber_and_late_arrivals",
+          "tool_global::tests::backend_failure_tests::both_fork_and_thread_construction_reset_the_parent_start_marker",
+          "tool_global::tests::backend_failure_tests::normal_cancellation_consumes_unstarted_child_without_registration",
+          "tool_global::tests::backend_failure_tests::ordinary_unknown_started_owner_is_not_acknowledged_as_unstarted",
+          "tool_global::tests::backend_failure_tests::thread_start_marker_is_set_before_the_first_registration_wait",
+          "tool_global::tests::backend_failure_tests::unstarted_cleanup_rejects_a_different_payload_mm",
+          "tool_global::tests::backend_failure_tests::unstarted_cleanup_rejects_another_senders_identity",
+          "tool_global::tests::child_registration_fails_closed_for_a_tombstoned_tid",
+          "tool_global::tests::child_start_clock_is_independent_of_first_rpc_arrival",
+          "tool_global::tests::duplicate_deregistration_is_acknowledged_without_clock_or_scheduler_mutation",
+          "tool_global::tests::exec_reconnect_retains_inherited_work_accounting_across_local_reload",
+          "tool_global::tests::exec_reconnect_retires_siblings_and_reuses_live_scheduler_and_clock_state",
+          "tool_global::tests::external_registration_with_child_cleartid_preserves_exact_exit_wake",
+          "tool_global::tests::external_registration_without_child_cleartid_disables_exit_wake",
+          "tool_global::tests::failed_exec_clears_prepared_state_without_retiring_siblings",
+          "tool_global::tests::first_nonstartup_rpc_counts_only_new_child_work",
+          "tool_global::tests::late_child_tid_wait_after_exit_returns_spurious_wake",
+          "tool_global::tests::late_futex_rpc_after_thread_removal_returns_eintr",
+          "tool_global::tests::late_resource_request_after_logical_kill_is_cancelled",
+          "tool_global::tests::live_registration_without_next_turn_is_not_terminal",
+          "tool_global::tests::nonleader_exec_rebinds_caller_to_leader_and_preserves_its_clock",
+          "tool_global::tests::parent_continue_propagates_terminal_scheduler_cancellation",
+          "tool_global::tests::pending_futex_request_woken_by_logical_kill_is_terminal",
+          "tool_global::tests::pending_resource_request_woken_by_logical_kill_is_terminal",
+          "tool_global::tests::pending_start_request_woken_by_logical_kill_is_terminal",
+          "tool_global::tests::required_physical_thread_id_missing_is_terminal",
+          "tool_global::tests::set_child_tid_address_rpc_updates_and_resets_the_registration",
+          "tool_global::tests::tombstoned_timer_registration_cannot_mutate_scheduler_state",
+          "tool_global::tests::trace_replay_yield_propagates_terminal_scheduler_cancellation",
+          "tool_global::tests::vfork_registration_does_not_charge_inherited_work_before_startup",
+          "--test-threads=1",
+          "--nocapture"
+        ]
+      },
+      "before_exec_spec_sha256": "94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d",
+      "cpu_allowance_usec": 30000000,
+      "wall_seconds": 60,
+      "log_bytes": 1048576,
+      "safehermit_log_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/safehermit",
+      "wrapper_sha256": "dae61b1819d424ea9928143d728fba6897f45cb619c8164ad87030922130f760",
+      "observer_sources": {
+        "observer.py": "f10ab861f262dbbd18295d92e59e05174299b72b397f58de844ee1725266eae6",
+        "unit_reference.py": "e00b79d292060b7a467d6a99ed88082719682d205efbdc56ecbe5fb7256fe0d0",
+        "before_exec.py": "184d1b1dcdb8c8a75626d2c0fe403d1527e160f51e0cc98338f405bf8a0319bd",
+        "source-inputs.json": "af15f634235359032b1ea544207713c32318906d51447ff6de171ada09c8b5b7"
+      },
+      "cwd": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+      "epoch": 1789652096.0556097,
+      "monotonic_ns": 1811024813839405,
+      "pid": 1232932,
+      "wrapper_identity": {
+        "pid": 1232932,
+        "start_ticks": 181102481,
+        "parent_pid": 1232712,
+        "state": "R",
+        "cgroup": "/user.slice/user-212630.slice/user@212630.service/3pai_sandbox.slice/run-p1210520-i1360322665.scope"
+      }
+    },
+    "wrapper_argv": [
+      "/home/newton/work/dev-hermit/bin/safehermit",
+      "--sh-deadline",
+      "60",
+      "--sh-max-log-bytes",
+      "1048576",
+      "--sh-report",
+      "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/safehermit.report",
+      "/usr/bin/python3",
+      "-B",
+      "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/before_exec.py",
+      "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/before-exec.json",
+      "94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d"
+    ],
+    "wrapper_exit_code": 0,
+    "stop_reason": null,
+    "observer_error": null,
+    "final_accounting": {
+      "source": "systemd CPUUsageNSec after service exit",
+      "cpu_usage_nsec": 415190000,
+      "cgroup_empty": true,
+      "exec_main_code": 1,
+      "exec_main_status": 0,
+      "properties": {
+        "Id": "safehermit-20260917T133456Z-1232932.service",
+        "LoadState": "loaded",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "ControlGroup": "",
+        "MainPID": 0,
+        "ExecMainPID": 1233339,
+        "ExecMainCode": 1,
+        "ExecMainStatus": 0,
+        "ExecMainStartTimestampMonotonic": 1811025127971,
+        "CPUUsageNSec": 415190000
+      }
+    },
+    "kill_commands": [],
+    "accounting_complete": true,
+    "comparison_eligible": true,
+    "loaded_systemd_library_before": {
+      "path": "/usr/lib64/libsystemd.so.0.43.0",
+      "bytes": 1251104,
+      "sha256": "ce568412d003dd7e271896e57211d464bcb1a74e76fa4dad706ea418a5847d37",
+      "mapped_filename": "/lib64/libsystemd.so.0",
+      "device": 33,
+      "inode": 1693638
+    },
+    "authenticated_service": {
+      "unit": "safehermit-20260917T133456Z-1232932.service",
+      "initial_properties": {
+        "Id": "safehermit-20260917T133456Z-1232932.service",
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "running",
+        "ControlGroup": "/user.slice/user-212630.slice/user@212630.service/app.slice/safehermit-20260917T133456Z-1232932.service",
+        "MainPID": 1233339,
+        "ExecMainPID": 1233339,
+        "ExecMainCode": 0,
+        "ExecMainStatus": 0,
+        "ExecMainStartTimestampMonotonic": 1811025127971,
+        "CPUUsageNSec": 2895000,
+        "RuntimeMaxUSec": 60000000,
+        "MemoryMax": 17179869184,
+        "MemorySwapMax": 0,
+        "IgnoreSIGPIPE": 1,
+        "ExecStart": {
+          "value": {
+            "type": "a(sasbttttuii)",
+            "data": [
+              [
+                "/usr/bin/python3",
+                [
+                  "/usr/bin/python3",
+                  "-B",
+                  "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/before_exec.py",
+                  "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/before-exec.json",
+                  "94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d"
+                ],
+                false,
+                1789652096369742,
+                1811025127971,
+                0,
+                0,
+                1233339,
+                0,
+                0
+              ]
+            ]
+          },
+          "query_argv": [
+            "/usr/bin/busctl",
+            "--user",
+            "--json=short",
+            "get-property",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+            "org.freedesktop.systemd1.Service",
+            "ExecStart"
+          ],
+          "stdout_sha256": "45bb892fee1252be12795fe67b9e93cf289f28f25ace318aea60db18acbc7372",
+          "raw_stdout": "{\"type\":\"a(sasbttttuii)\",\"data\":[[\"/usr/bin/python3\",[\"/usr/bin/python3\",\"-B\",\"/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/before_exec.py\",\"/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/before-exec.json\",\"94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d\"],false,1789652096369742,1811025127971,0,0,1233339,0,0]]}\n",
+          "returncode": 0
+        }
+      },
+      "main_process": {
+        "pid": 1233339,
+        "start_ticks": 181102512,
+        "parent_pid": 32320,
+        "state": "R",
+        "cgroup": "/user.slice/user-212630.slice/user@212630.service/app.slice/safehermit-20260917T133456Z-1232932.service"
+      },
+      "cgroup_inode": 39196817,
+      "cgroup_device": 27
+    },
+    "payload_authorization": {
+      "request": {
+        "payload": {
+          "arguments": [
+            "--exact",
+            "scheduler::test::a_vanished_thread_aborts_its_turn_and_a_live_one_does_not",
+            "scheduler::test::buffered_admission_cancelled_by_buffered_removal",
+            "scheduler::test::exec_reconnect_only_buffers_while_tentative_selection_is_live",
+            "scheduler::test::physical_exit_barrier_is_disabled_for_other_backends",
+            "scheduler::test::physical_exit_barrier_precedes_empty_queue_timer_fast_forward",
+            "tool_global::robust_exit_clock_tests::backend_failure_preserves_consuming_robust_exit_clock_accounting",
+            "tool_global::robust_exit_clock_tests::robust_exit_acknowledgements_preserve_global_action_order_and_eligibility",
+            "tool_global::robust_exit_clock_tests::robust_exit_callbacks_keep_rejected_or_mismatched_batches_incomplete",
+            "tool_global::robust_exit_clock_tests::robust_exit_callbacks_preserve_owner_clocks_across_arrival_orders",
+            "tool_global::robust_exit_clock_tests::robust_exit_clock_ack_still_refuses_a_backwards_owner_sample",
+            "tool_global::tests::abnormal_cleanup_cancels_a_registered_scheduler",
+            "tool_global::tests::abnormal_cleanup_cancels_an_unstarted_scheduler",
+            "tool_global::tests::backend_failure_tests::backend_failure_blocks_registration_that_passed_earlier_header_admission",
+            "tool_global::tests::backend_failure_tests::backend_failure_blocks_rpc_clock_and_child_registration_at_admission",
+            "tool_global::tests::backend_failure_tests::backend_failure_closes_selection_before_consuming_clear_tid_cleanup",
+            "tool_global::tests::backend_failure_tests::backend_failure_completes_registered_daemon_without_another_request",
+            "tool_global::tests::backend_failure_tests::backend_failure_completes_unstarted_daemon_without_aborting_it",
+            "tool_global::tests::backend_failure_tests::backend_failure_consumes_registered_child_before_thread_start",
+            "tool_global::tests::backend_failure_tests::backend_failure_consumes_unregistered_child_without_admission_or_clock",
+            "tool_global::tests::backend_failure_tests::backend_failure_ends_quiescence_without_another_request",
+            "tool_global::tests::backend_failure_tests::backend_failure_precedes_ready_request_without_grant_or_timer_processing",
+            "tool_global::tests::backend_failure_tests::backend_failure_wakes_each_global_subscriber_and_late_arrivals",
+            "tool_global::tests::backend_failure_tests::both_fork_and_thread_construction_reset_the_parent_start_marker",
+            "tool_global::tests::backend_failure_tests::normal_cancellation_consumes_unstarted_child_without_registration",
+            "tool_global::tests::backend_failure_tests::ordinary_unknown_started_owner_is_not_acknowledged_as_unstarted",
+            "tool_global::tests::backend_failure_tests::thread_start_marker_is_set_before_the_first_registration_wait",
+            "tool_global::tests::backend_failure_tests::unstarted_cleanup_rejects_a_different_payload_mm",
+            "tool_global::tests::backend_failure_tests::unstarted_cleanup_rejects_another_senders_identity",
+            "tool_global::tests::child_registration_fails_closed_for_a_tombstoned_tid",
+            "tool_global::tests::child_start_clock_is_independent_of_first_rpc_arrival",
+            "tool_global::tests::duplicate_deregistration_is_acknowledged_without_clock_or_scheduler_mutation",
+            "tool_global::tests::exec_reconnect_retains_inherited_work_accounting_across_local_reload",
+            "tool_global::tests::exec_reconnect_retires_siblings_and_reuses_live_scheduler_and_clock_state",
+            "tool_global::tests::external_registration_with_child_cleartid_preserves_exact_exit_wake",
+            "tool_global::tests::external_registration_without_child_cleartid_disables_exit_wake",
+            "tool_global::tests::failed_exec_clears_prepared_state_without_retiring_siblings",
+            "tool_global::tests::first_nonstartup_rpc_counts_only_new_child_work",
+            "tool_global::tests::late_child_tid_wait_after_exit_returns_spurious_wake",
+            "tool_global::tests::late_futex_rpc_after_thread_removal_returns_eintr",
+            "tool_global::tests::late_resource_request_after_logical_kill_is_cancelled",
+            "tool_global::tests::live_registration_without_next_turn_is_not_terminal",
+            "tool_global::tests::nonleader_exec_rebinds_caller_to_leader_and_preserves_its_clock",
+            "tool_global::tests::parent_continue_propagates_terminal_scheduler_cancellation",
+            "tool_global::tests::pending_futex_request_woken_by_logical_kill_is_terminal",
+            "tool_global::tests::pending_resource_request_woken_by_logical_kill_is_terminal",
+            "tool_global::tests::pending_start_request_woken_by_logical_kill_is_terminal",
+            "tool_global::tests::required_physical_thread_id_missing_is_terminal",
+            "tool_global::tests::set_child_tid_address_rpc_updates_and_resets_the_registration",
+            "tool_global::tests::tombstoned_timer_registration_cannot_mutate_scheduler_state",
+            "tool_global::tests::trace_replay_yield_propagates_terminal_scheduler_cancellation",
+            "tool_global::tests::vfork_registration_does_not_charge_inherited_work_before_startup",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "binary": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/detcore-e88446e05572c3ab",
+          "binary_sha256": "10bb0967678e53cd17581b29e1ef6c479d0a04b3cc3b1f55a9473ba54ec8b39f"
+        },
+        "phase": "ready",
+        "pid": 1233339,
+        "spec_sha256": "94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d",
+        "start_ticks": 181102512,
+        "token": "6f1a89b3e49de7052e85255c141c6bc05c4d3e22d255f40e4a234f33770c8ca6"
+      },
+      "response": {
+        "payload": {
+          "arguments": [
+            "--exact",
+            "scheduler::test::a_vanished_thread_aborts_its_turn_and_a_live_one_does_not",
+            "scheduler::test::buffered_admission_cancelled_by_buffered_removal",
+            "scheduler::test::exec_reconnect_only_buffers_while_tentative_selection_is_live",
+            "scheduler::test::physical_exit_barrier_is_disabled_for_other_backends",
+            "scheduler::test::physical_exit_barrier_precedes_empty_queue_timer_fast_forward",
+            "tool_global::robust_exit_clock_tests::backend_failure_preserves_consuming_robust_exit_clock_accounting",
+            "tool_global::robust_exit_clock_tests::robust_exit_acknowledgements_preserve_global_action_order_and_eligibility",
+            "tool_global::robust_exit_clock_tests::robust_exit_callbacks_keep_rejected_or_mismatched_batches_incomplete",
+            "tool_global::robust_exit_clock_tests::robust_exit_callbacks_preserve_owner_clocks_across_arrival_orders",
+            "tool_global::robust_exit_clock_tests::robust_exit_clock_ack_still_refuses_a_backwards_owner_sample",
+            "tool_global::tests::abnormal_cleanup_cancels_a_registered_scheduler",
+            "tool_global::tests::abnormal_cleanup_cancels_an_unstarted_scheduler",
+            "tool_global::tests::backend_failure_tests::backend_failure_blocks_registration_that_passed_earlier_header_admission",
+            "tool_global::tests::backend_failure_tests::backend_failure_blocks_rpc_clock_and_child_registration_at_admission",
+            "tool_global::tests::backend_failure_tests::backend_failure_closes_selection_before_consuming_clear_tid_cleanup",
+            "tool_global::tests::backend_failure_tests::backend_failure_completes_registered_daemon_without_another_request",
+            "tool_global::tests::backend_failure_tests::backend_failure_completes_unstarted_daemon_without_aborting_it",
+            "tool_global::tests::backend_failure_tests::backend_failure_consumes_registered_child_before_thread_start",
+            "tool_global::tests::backend_failure_tests::backend_failure_consumes_unregistered_child_without_admission_or_clock",
+            "tool_global::tests::backend_failure_tests::backend_failure_ends_quiescence_without_another_request",
+            "tool_global::tests::backend_failure_tests::backend_failure_precedes_ready_request_without_grant_or_timer_processing",
+            "tool_global::tests::backend_failure_tests::backend_failure_wakes_each_global_subscriber_and_late_arrivals",
+            "tool_global::tests::backend_failure_tests::both_fork_and_thread_construction_reset_the_parent_start_marker",
+            "tool_global::tests::backend_failure_tests::normal_cancellation_consumes_unstarted_child_without_registration",
+            "tool_global::tests::backend_failure_tests::ordinary_unknown_started_owner_is_not_acknowledged_as_unstarted",
+            "tool_global::tests::backend_failure_tests::thread_start_marker_is_set_before_the_first_registration_wait",
+            "tool_global::tests::backend_failure_tests::unstarted_cleanup_rejects_a_different_payload_mm",
+            "tool_global::tests::backend_failure_tests::unstarted_cleanup_rejects_another_senders_identity",
+            "tool_global::tests::child_registration_fails_closed_for_a_tombstoned_tid",
+            "tool_global::tests::child_start_clock_is_independent_of_first_rpc_arrival",
+            "tool_global::tests::duplicate_deregistration_is_acknowledged_without_clock_or_scheduler_mutation",
+            "tool_global::tests::exec_reconnect_retains_inherited_work_accounting_across_local_reload",
+            "tool_global::tests::exec_reconnect_retires_siblings_and_reuses_live_scheduler_and_clock_state",
+            "tool_global::tests::external_registration_with_child_cleartid_preserves_exact_exit_wake",
+            "tool_global::tests::external_registration_without_child_cleartid_disables_exit_wake",
+            "tool_global::tests::failed_exec_clears_prepared_state_without_retiring_siblings",
+            "tool_global::tests::first_nonstartup_rpc_counts_only_new_child_work",
+            "tool_global::tests::late_child_tid_wait_after_exit_returns_spurious_wake",
+            "tool_global::tests::late_futex_rpc_after_thread_removal_returns_eintr",
+            "tool_global::tests::late_resource_request_after_logical_kill_is_cancelled",
+            "tool_global::tests::live_registration_without_next_turn_is_not_terminal",
+            "tool_global::tests::nonleader_exec_rebinds_caller_to_leader_and_preserves_its_clock",
+            "tool_global::tests::parent_continue_propagates_terminal_scheduler_cancellation",
+            "tool_global::tests::pending_futex_request_woken_by_logical_kill_is_terminal",
+            "tool_global::tests::pending_resource_request_woken_by_logical_kill_is_terminal",
+            "tool_global::tests::pending_start_request_woken_by_logical_kill_is_terminal",
+            "tool_global::tests::required_physical_thread_id_missing_is_terminal",
+            "tool_global::tests::set_child_tid_address_rpc_updates_and_resets_the_registration",
+            "tool_global::tests::tombstoned_timer_registration_cannot_mutate_scheduler_state",
+            "tool_global::tests::trace_replay_yield_propagates_terminal_scheduler_cancellation",
+            "tool_global::tests::vfork_registration_does_not_charge_inherited_work_before_startup",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "binary": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/detcore-e88446e05572c3ab",
+          "binary_sha256": "10bb0967678e53cd17581b29e1ef6c479d0a04b3cc3b1f55a9473ba54ec8b39f"
+        },
+        "phase": "exec",
+        "pid": 1233339,
+        "spec_sha256": "94ac134d38d9489740be000db9a950fcaabc337bbf2a3d9dbc778d2a3885ea0d",
+        "start_ticks": 181102512,
+        "token": "6f1a89b3e49de7052e85255c141c6bc05c4d3e22d255f40e4a234f33770c8ca6"
+      },
+      "monotonic_ns": 1811025463738712,
+      "first_cpu_sample": {
+        "monotonic_ns": 1811025318106151,
+        "usage_usec": 163135,
+        "members": [
+          {
+            "pid": 1233339,
+            "start_ticks": 181102512,
+            "parent_pid": 32320,
+            "state": "S",
+            "cgroup": "/user.slice/user-212630.slice/user@212630.service/app.slice/safehermit-20260917T133456Z-1232932.service"
+          }
+        ]
+      },
+      "meaning": "Authorization sent; payload start requires actual execution evidence."
+    },
+    "final_report": {
+      "run_id": "20260917T133456Z-1232932",
+      "binary": "/usr/bin/python3",
+      "binary_source": "argv:positional-path",
+      "binary_sha256": "9cfdf1a01d07dadb394dd2dc9fd8316254c36764076d23dc2c895c8401735576",
+      "log_dir": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/safehermit/brs-safehermit-20260917T133456Z-1232932-1232948-1789652096149820623",
+      "log_file": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/safehermit/brs-safehermit-20260917T133456Z-1232932-1232948-1789652096149820623/hermit.log",
+      "unit": "safehermit-20260917T133456Z-1232932",
+      "bound.wall": "APPLIED:60s",
+      "bound.cgroup": "APPLIED:MemoryMax=16G MemorySwapMax=0",
+      "bound.disk": "APPLIED:8G for log_dir only; guest paths and explicit log files elsewhere are outside this bound",
+      "bound.bytes": "APPLIED:1048576 (LETHAL: the run is cgroup-killed at the cap)",
+      "bound.logfilter": "NOT_APPLIED:by owner ruling -- the emitter is left loud so a stuck run stays visible; the low byte cap is the mechanism that fires",
+      "env.forwarded": "APPLIED:24 variables forwarded",
+      "note.run_record": "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/native-detcore/safehermit/registry/20260917T133456Z-1232932.json (best-effort; nothing depends on it)",
+      "elapsed_secs": "1",
+      "bytes_written": "1166",
+      "truncated": "false",
+      "runner_exit_code": "0",
+      "unit_result": "success",
+      "exit_code": "0"
+    },
+    "stderr_receipt_sha256": "b32a7badc85d592667412bab99be5570f0cb60259d0ca5aa774e80574d78670a",
+    "loaded_systemd_library_after": {
+      "path": "/usr/lib64/libsystemd.so.0.43.0",
+      "bytes": 1251104,
+      "sha256": "ce568412d003dd7e271896e57211d464bcb1a74e76fa4dad706ea418a5847d37",
+      "mapped_filename": "/lib64/libsystemd.so.0",
+      "device": 33,
+      "inode": 1693638
+    },
+    "loaded_systemd_library_final_readback": {
+      "path": "/usr/lib64/libsystemd.so.0.43.0",
+      "bytes": 1251104,
+      "sha256": "ce568412d003dd7e271896e57211d464bcb1a74e76fa4dad706ea418a5847d37",
+      "mapped_filename": "/lib64/libsystemd.so.0",
+      "device": 33,
+      "inode": 1693638
+    },
+    "systemd_calls": [
+      {
+        "function": "sd_bus_open_user",
+        "status": 0
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 5000000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": -2,
+        "seconds": 0.0005193399265408516,
+        "error_name": "org.freedesktop.systemd1.NoSuchUnit",
+        "error_message": "Unit safehermit-20260917T133456Z-1232932.service not found."
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": -2,
+        "seconds": 0.000155953923240304,
+        "error_name": "org.freedesktop.systemd1.NoSuchUnit",
+        "error_message": "Unit safehermit-20260917T133456Z-1232932.service not found."
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": -2,
+        "seconds": 9.770691394805908e-05,
+        "error_name": "org.freedesktop.systemd1.NoSuchUnit",
+        "error_message": "Unit safehermit-20260917T133456Z-1232932.service not found."
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": -2,
+        "seconds": 8.12220387160778e-05,
+        "error_name": "org.freedesktop.systemd1.NoSuchUnit",
+        "error_message": "Unit safehermit-20260917T133456Z-1232932.service not found."
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": -2,
+        "seconds": 7.420103065669537e-05,
+        "error_name": "org.freedesktop.systemd1.NoSuchUnit",
+        "error_message": "Unit safehermit-20260917T133456Z-1232932.service not found."
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": -2,
+        "seconds": 0.0001443270593881607,
+        "error_name": "org.freedesktop.systemd1.NoSuchUnit",
+        "error_message": "Unit safehermit-20260917T133456Z-1232932.service not found."
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "RefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": 1,
+        "seconds": 0.0013413941487669945,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "GetUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": 1,
+        "seconds": 0.027069964911788702,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "Id",
+        "status": 0,
+        "seconds": 0.0013233560603111982,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "LoadState",
+        "status": 0,
+        "seconds": 4.8242975026369095e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "ActiveState",
+        "status": 0,
+        "seconds": 3.157695755362511e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "SubState",
+        "status": 0,
+        "seconds": 2.860301174223423e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ControlGroup",
+        "status": 0,
+        "seconds": 2.987496554851532e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "MainPID",
+        "status": 0,
+        "seconds": 2.8591835871338844e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainPID",
+        "status": 0,
+        "seconds": 2.607889473438263e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainCode",
+        "status": 0,
+        "seconds": 0.0012485550250858068,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainStatus",
+        "status": 0,
+        "seconds": 2.863304689526558e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainStartTimestampMonotonic",
+        "status": 0,
+        "seconds": 2.6640016585588455e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "CPUUsageNSec",
+        "status": 0,
+        "seconds": 4.831305705010891e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "RuntimeMaxUSec",
+        "status": 0,
+        "seconds": 2.7602072805166245e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "MemoryMax",
+        "status": 0,
+        "seconds": 2.5407876819372177e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "MemorySwapMax",
+        "status": 0,
+        "seconds": 2.4587148800492287e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "IgnoreSIGPIPE",
+        "status": 0,
+        "seconds": 2.53280159085989e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "GetUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": 1,
+        "seconds": 0.001163447042927146,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "GetUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": 1,
+        "seconds": 0.0002722679637372494,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "Id",
+        "status": 0,
+        "seconds": 9.654508903622627e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "LoadState",
+        "status": 0,
+        "seconds": 4.0550949051976204e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "ActiveState",
+        "status": 0,
+        "seconds": 3.342004492878914e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Unit",
+        "property": "SubState",
+        "status": 0,
+        "seconds": 3.1606992706656456e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ControlGroup",
+        "status": 0,
+        "seconds": 3.247801214456558e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "MainPID",
+        "status": 0,
+        "seconds": 3.185798414051533e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainPID",
+        "status": 0,
+        "seconds": 3.089592792093754e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainCode",
+        "status": 0,
+        "seconds": 2.9684044420719147e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainStatus",
+        "status": 0,
+        "seconds": 2.8042122721672058e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "ExecMainStartTimestampMonotonic",
+        "status": 0,
+        "seconds": 2.7161091566085815e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_get_property",
+        "path": "/org/freedesktop/systemd1/unit/safehermit_2d20260917T133456Z_2d1232932_2eservice",
+        "interface": "org.freedesktop.systemd1.Service",
+        "property": "CPUUsageNSec",
+        "status": 0,
+        "seconds": 2.8042122721672058e-05,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_set_method_call_timeout",
+        "microseconds": 250000,
+        "status": 0
+      },
+      {
+        "function": "sd_bus_call_method",
+        "destination": "org.freedesktop.systemd1",
+        "path": "/org/freedesktop/systemd1",
+        "interface": "org.freedesktop.systemd1.Manager",
+        "member": "UnrefUnit",
+        "signature": "s",
+        "arguments": [
+          "safehermit-20260917T133456Z-1232932.service"
+        ],
+        "status": 1,
+        "seconds": 0.0002484619617462158,
+        "error_name": null,
+        "error_message": null
+      },
+      {
+        "function": "sd_bus_flush_close_unref",
+        "connection_closed": true
+      }
+    ],
+    "sample_count": 25,
+    "maximum_sampled_usage_usec": 411170,
+    "completed_monotonic_ns": 1811026236339471,
+    "elapsed_seconds": 1.422500066,
+    "safehermit_report_sha256": "73f059aa6f58279e465a6306e69ad8d81bbbe864c581a468ea06f74a188d9474"
+  }
+}

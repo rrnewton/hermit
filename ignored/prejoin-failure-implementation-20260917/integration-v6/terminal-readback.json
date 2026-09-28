@@ -1,0 +1,47 @@
+[
+  {
+    "stage": "compile",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "list-detcore",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "list-syscaller",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "list-hermit",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "list-hermit-bin",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "list-hermit-dap",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "list-verification-report",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "native-detcore",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  },
+  {
+    "stage": "native-hermit",
+    "inactive_empty_postread": true,
+    "complete_uncapped_accounting": true
+  }
+]

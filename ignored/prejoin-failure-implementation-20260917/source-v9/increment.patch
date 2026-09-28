@@ -1,0 +1,25 @@
+--- a/hermit-cli/src/kvm_failure_tests.rs
++++ b/hermit-cli/src/kvm_failure_tests.rs
+@@ -24,10 +24,10 @@
+     let completion = reverie_kvm::ToolRunCompletion {
+         global_state,
+         result: Err(reverie_kvm::Error::WithCleanup {
+-            primary: Box::new(reverie_kvm::Error::InvalidGuestPid(-17)),
+-            cleanup: vec![reverie_kvm::Error::HostIo(
++            primary: std::sync::Arc::new(reverie_kvm::Error::InvalidGuestPid(-17)),
++            cleanup: vec![std::sync::Arc::new(reverie_kvm::Error::HostIo(
+                 std::io::Error::from_raw_os_error(libc::EIO),
+-            )],
++            ))],
+         }),
+     };
+     let result = tokio::time::timeout(
+@@ -49,7 +49,7 @@
+     };
+     assert_eq!(cleanup.len(), 1);
+     assert!(
+-        matches!(&cleanup[0], reverie_kvm::Error::HostIo(error) if error.raw_os_error() == Some(libc::EIO))
++        matches!(cleanup[0].as_ref(), reverie_kvm::Error::HostIo(error) if error.raw_os_error() == Some(libc::EIO))
+     );
+ }
+ 

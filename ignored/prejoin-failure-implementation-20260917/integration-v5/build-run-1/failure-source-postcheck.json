@@ -1,0 +1,17 @@
+{
+  "checks": [
+    {
+      "source_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+      "binding_sha256": "ccc309603bf29799c8adbc3c1277f747c8469c442ab008e156e32a1d3b16d0e0",
+      "manifest_sha256": "ca0f1753d314e95dec433fc08098b2d7e5ba3e64efe88d162ba74349dd5e77e6",
+      "checked": true
+    },
+    {
+      "source_root": "/home/newton/work/dev-hermit/worktrees/slots/kvm-proc-fd-identity-20260917",
+      "binding_sha256": "b7bec902c8b54760a122d4aaa8ed325d955eebf2188c0a486cae4d97e4950164",
+      "manifest_sha256": "c5e2cb5adc5f8d924dafd90fe99b5de781e439d6fe83288655faca84149a27f2",
+      "checked": true
+    }
+  ],
+  "all_plan_inputs_match": true
+}

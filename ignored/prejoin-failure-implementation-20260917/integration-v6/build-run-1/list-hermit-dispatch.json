@@ -1,0 +1,69 @@
+{
+  "argv": [
+    "/usr/bin/python3",
+    "-B",
+    "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/observer.py",
+    "--out",
+    "/home/newton/work/dev-hermit/worktrees/slots/kvm-parity-recovery-20260916/ignored/recovery/main-increment-independent-review/closed-standard-input-20260917/measurement-observer/measurement-prejoin-native-20260917/hermit-integration-v6/list-hermit",
+    "--cpu-usec",
+    "5000000",
+    "--wall-seconds",
+    "15",
+    "--log-bytes",
+    "1048576",
+    "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692",
+    "--list",
+    "--format",
+    "terse"
+  ],
+  "cwd": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917",
+  "artifact": {
+    "path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692",
+    "sha256": "651d04e26590ba13db77eaa81311e72baf14cedc460ec2850eebc9a8b934e5cd",
+    "bytes": 373691696,
+    "mode": 493,
+    "cargo_artifact": {
+      "reason": "compiler-artifact",
+      "package_id": "path+file:///home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli#hermit@0.2.0",
+      "manifest_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/Cargo.toml",
+      "target": {
+        "kind": [
+          "rlib",
+          "cdylib"
+        ],
+        "crate_types": [
+          "rlib",
+          "cdylib"
+        ],
+        "name": "hermit",
+        "src_path": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/hermit-cli/src/lib.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": true,
+        "test": true
+      },
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 2,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "features": [
+        "dbt",
+        "default",
+        "e9patch",
+        "kvm-native-test-support",
+        "sabre",
+        "third-party-backends"
+      ],
+      "filenames": [
+        "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692"
+      ],
+      "executable": "/home/newton/work/dev-hermit/worktrees/slots/kvm-prejoin-hermit-20260917/target/prejoin-integration-v5/debug/deps/hermit-e33760590de23692",
+      "fresh": false
+    },
+    "selection": "hermit"
+  },
+  "selected": null
+}

@@ -1,0 +1,10 @@
+{
+  "names": [
+    "tests::data_dir_without_replay_is_rejected",
+    "tests::gdbserver_port_without_replay_is_rejected",
+    "tests::replay_options_use_existing_command_vocabulary"
+  ],
+  "count": 3,
+  "selected": [],
+  "raw_sha256": "cfa625260021c4973c9242987b77c6db7da8306cfa53961810b948b7d70cf91a"
+}

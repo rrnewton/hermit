@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "/usr/bin/systemctl",
+    "--user",
+    "show",
+    "safehermit-20260917T130401Z-3323210.service",
+    "--property=LoadState,ActiveState,SubState,MainPID,ControlGroup"
+  ],
+  "exit": 0,
+  "properties": {
+    "LoadState": "not-found",
+    "ActiveState": "inactive",
+    "SubState": "dead",
+    "MainPID": "0",
+    "ControlGroup": ""
+  },
+  "stderr": ""
+}

@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "/home/newton/.rustup/toolchains/nightly-2026-07-29-x86_64-unknown-linux-gnu/bin/rustfmt",
+    "--edition",
+    "2024",
+    "--config",
+    "skip_children=true",
+    "ci/manifest-plan/src/nextest_build_selections.rs",
+    "ci/manifest-plan/src/validation_dag_static.rs"
+  ],
+  "exit": 0,
+  "before": {
+    "ci/manifest-plan/src/nextest_build_selections.rs": "5fe0ce583f70280cbad8d47df8943228a8d2016cb8f0c97e6417f451d28da58e",
+    "ci/manifest-plan/src/validation_dag_static.rs": "04ceec6708e90df45dc983aedffa4d2e289f98d453b3cfbbbd3204df72488e4d"
+  },
+  "after": {
+    "ci/manifest-plan/src/nextest_build_selections.rs": "7ac2291fa46b2016121506ce759c2d7e36f5f06f8c63d506cd867b77bcc82c45",
+    "ci/manifest-plan/src/validation_dag_static.rs": "04ceec6708e90df45dc983aedffa4d2e289f98d453b3cfbbbd3204df72488e4d"
+  },
+  "scope": "Source formatting only; no build, inventory or runtime validation."
+}
