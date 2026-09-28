@@ -359,6 +359,7 @@ impl DetFd {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review canonical random-device cursor sharing.
     /// Return the cursor shared by aliases of this random-device open file.
+    #[cfg(test)]
     pub(crate) fn random_device_offset(&self) -> u64 {
         self.description().random_device_offset
     }
@@ -366,11 +367,33 @@ impl DetFd {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review canonical random-device cursor sharing.
     /// Advance the cursor shared by aliases of this random-device open file.
+    #[cfg(test)]
     pub(crate) fn advance_random_device_offset(&self, count: usize) {
         let mut description = self.description();
         description.random_device_offset = description
             .random_device_offset
             .saturating_add(count as u64);
+    }
+
+    /// Copy from the shared random-device cursor and commit the returned byte count.
+    ///
+    /// The description stays locked throughout the synchronous copy. The closure
+    /// must not access this description through another `DetFd` method or alias.
+    /// Clone the descriptor and drop its metadata guard before entering this
+    /// transaction; the closure must not acquire Detcore metadata/description
+    /// locks or await. This preserves the metadata-before-description lock order.
+    /// A large copy can block relaxed-mode aliases for its bounded duration.
+    /// An error leaves the cursor unchanged; it does not undo guest memory writes.
+    pub(crate) fn with_random_device_stream<R>(
+        &self,
+        copy: impl FnOnce(u64) -> Result<usize, R>,
+    ) -> Result<usize, R> {
+        let mut description = self.description();
+        let copied = copy(description.random_device_offset)?;
+        description.random_device_offset = description
+            .random_device_offset
+            .saturating_add(copied as u64);
+        Ok(copied)
     }
 
     /// Path used to open this file description, when it was observable.
@@ -538,8 +561,17 @@ impl DetFd {
     /// Update file status flags for every alias of this open file description.
     pub fn set_status_flags(&self, flags: i32) {
         let mut description = self.description();
-        description.status_flags = flags & !OFlag::O_CLOEXEC.bits();
-        description.physically_nonblocking = oflags_nonblocking(flags);
+        // F_SETFL cannot change how this description was opened. Access
+        // checks must retain these bits even when an alias passes only
+        // O_NONBLOCK (whose access-mode bits happen to spell O_RDONLY).
+        let mutable = (OFlag::O_APPEND
+            | OFlag::O_ASYNC
+            | OFlag::O_DIRECT
+            | OFlag::O_NOATIME
+            | OFlag::O_NONBLOCK)
+            .bits();
+        description.status_flags = (description.status_flags & !mutable) | (flags & mutable);
+        description.physically_nonblocking = oflags_nonblocking(description.status_flags);
     }
 
     // TODO-HUMAN-REVIEW(PR-912): Review open-file sharing of socket receive timestamps.
@@ -652,6 +684,65 @@ impl fmt::Display for DetFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_access_modes_survive_status_updates_through_aliases() {
+        for mode in [
+            OFlag::O_RDONLY,
+            OFlag::O_WRONLY,
+            OFlag::O_RDWR,
+            OFlag::O_ACCMODE,
+            OFlag::O_PATH,
+        ] {
+            let original = DetFd::new(
+                3,
+                mode,
+                FdType::Rng,
+                OpenFileId::new(DetTid::from_raw(1), 0),
+            );
+            let alias = original.clone().with_fd(4);
+            for update in [
+                OFlag::O_NONBLOCK,
+                OFlag::O_RDWR,
+                OFlag::O_WRONLY,
+                OFlag::O_PATH | OFlag::O_NONBLOCK,
+            ] {
+                alias.set_status_flags(update.bits());
+                assert_eq!(
+                    original.status_flags() & (OFlag::O_ACCMODE | OFlag::O_PATH).bits(),
+                    mode.bits()
+                );
+                assert_eq!(
+                    original.is_nonblocking(),
+                    update.contains(OFlag::O_NONBLOCK)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_status_updates_preserve_immutable_flags_and_replace_mutable_flags() {
+        let immutable = OFlag::O_RDWR | OFlag::O_SYNC;
+        let original = DetFd::new(
+            3,
+            immutable | OFlag::O_APPEND | OFlag::O_NONBLOCK,
+            FdType::Rng,
+            OpenFileId::new(DetTid::from_raw(1), 0),
+        );
+        let alias = original.clone().with_fd(4);
+        alias.set_status_flags((OFlag::O_WRONLY | OFlag::O_ASYNC | OFlag::O_NOATIME).bits());
+        assert_eq!(
+            original.status_flags(),
+            (immutable | OFlag::O_ASYNC | OFlag::O_NOATIME).bits()
+        );
+        assert!(!original.physically_nonblocking());
+        alias.set_status_flags(OFlag::O_NONBLOCK.bits());
+        assert_eq!(
+            original.status_flags(),
+            (immutable | OFlag::O_NONBLOCK).bits()
+        );
+        assert!(original.physically_nonblocking());
+    }
 
     #[test]
     fn dup_shares_open_file_state_but_not_slot_flags() {
@@ -856,6 +947,122 @@ mod tests {
         assert_eq!(original.random_device_offset(), 0);
         duplicate.advance_random_device_offset(50);
         assert_eq!(original.random_device_offset(), 50);
+    }
+
+    #[test]
+    fn random_device_stream_commits_returned_prefix_for_dup_aliases() {
+        let owner = DetTid::from_raw(10);
+        let id = OpenFileId::new(owner, 0);
+        let original = DetFd::new(3, OFlag::empty(), FdType::Rng, id);
+        let duplicate = original.clone().with_fd(4);
+        original.advance_random_device_offset(7);
+
+        assert_eq!(
+            duplicate.with_random_device_stream(|offset| {
+                assert_eq!(offset, 7);
+                // A copy requesting eight bytes completed only this prefix.
+                Ok::<_, ()>(3)
+            }),
+            Ok(3)
+        );
+        assert_eq!(original.random_device_offset(), 10);
+        assert_eq!(duplicate.random_device_offset(), 10);
+        assert_eq!(
+            original.with_random_device_stream(|offset| {
+                assert_eq!(offset, 10);
+                Ok::<_, ()>(2)
+            }),
+            Ok(2)
+        );
+        assert_eq!(original.random_device_offset(), 12);
+        assert_eq!(duplicate.random_device_offset(), 12);
+        assert_eq!(original.open_file_id(), id);
+        assert_eq!(duplicate.open_file_id(), id);
+        assert!(Arc::ptr_eq(&original.open_file, &duplicate.open_file));
+    }
+
+    #[test]
+    fn random_device_stream_preserves_error_identity_and_cursor() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(3, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 0));
+        let duplicate = original.clone().with_fd(4);
+        original.advance_random_device_offset(11);
+        let failure = Arc::new(String::from("copy failure"));
+
+        let error = duplicate
+            .with_random_device_stream(|offset| {
+                assert_eq!(offset, 11);
+                Err(Arc::clone(&failure))
+            })
+            .unwrap_err();
+        assert!(Arc::ptr_eq(&error, &failure));
+        assert_eq!(original.random_device_offset(), 11);
+        assert_eq!(duplicate.random_device_offset(), 11);
+        assert_eq!(original.open_file_id(), duplicate.open_file_id());
+    }
+
+    #[test]
+    fn random_device_stream_saturates_independently_of_partitioning() {
+        let owner = DetTid::from_raw(10);
+        for initial in [u64::MAX - 2, u64::MAX] {
+            let whole = DetFd::new(3, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 0));
+            let split = DetFd::new(4, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 1));
+            whole.description().random_device_offset = initial;
+            split.description().random_device_offset = initial;
+
+            assert_eq!(
+                whole.with_random_device_stream(|offset| {
+                    assert_eq!(offset, initial);
+                    Ok::<_, ()>(4)
+                }),
+                Ok(4)
+            );
+            assert_eq!(whole.random_device_offset(), u64::MAX);
+            assert_eq!(
+                split.with_random_device_stream(|offset| {
+                    assert_eq!(offset, initial);
+                    Ok::<_, ()>(1)
+                }),
+                Ok(1)
+            );
+            assert_eq!(split.random_device_offset(), initial.saturating_add(1));
+            assert_eq!(
+                split.with_random_device_stream(|offset| {
+                    assert_eq!(offset, initial.saturating_add(1));
+                    Ok::<_, ()>(3)
+                }),
+                Ok(3)
+            );
+            assert_eq!(split.random_device_offset(), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn random_device_stream_holds_alias_lock_while_copying() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(3, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 0));
+        let duplicate = original.clone().with_fd(4);
+
+        assert_eq!(
+            original.with_random_device_stream(|offset| {
+                assert_eq!(offset, 0);
+                // A nonblocking attempt cannot deadlock the copy, and observes
+                // whether another thread could access the shared cursor here.
+                assert!(
+                    std::thread::spawn(move || {
+                        matches!(
+                            duplicate.open_file.try_lock(),
+                            Err(std::sync::TryLockError::WouldBlock)
+                        )
+                    })
+                    .join()
+                    .unwrap()
+                );
+                Ok::<_, ()>(5)
+            }),
+            Ok(5)
+        );
+        assert_eq!(original.random_device_offset(), 5);
     }
 
     #[test]

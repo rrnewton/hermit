@@ -1,6 +1,64 @@
 schema: 3
 bucket: c-programs
 test:
+  - id: c-programs/random-readv-stream
+    description: Random-device scalar and vector reads share exact seeded bytes and cursor state through dup, fork, exec, and copy faults
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/random_readv_stream.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, kvm]
+        backends_disabled:
+          dbt: Random-device cursor, access-mode, and fault semantics have not been qualified on DBT
+          sabre: Random-device cursor, access-mode, and fault semantics have not been qualified on SaBRe
+          liteinst: Random-device cursor, access-mode, and fault semantics have not been qualified on LiteInst
+      naked:
+        ci: false
+        ci_disabled_reason: Native control compares syscall semantics without asserting the entropy variation required by naked mode
+        backends_enabled: []
+        backends_disabled:
+          native: Native control asserts syscall counts, errors, and effects but intentionally does not assert variation in random byte values
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: This canonical-stream fixture has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: This guest asserts one canonical stream and has no schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: Default execution already includes every access, fault, and alias assertion without a separate custom-mode contract
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Default execution already includes every access, fault, and alias assertion; no separate custom-mode contract is declared
+          dbt: Random-device semantics have not been qualified on DBT
+          kvm: Default execution already includes every access, fault, and alias assertion; no separate custom-mode contract is declared
+          sabre: Random-device semantics have not been qualified on SaBRe
+          liteinst: Random-device semantics have not been qualified on LiteInst
   - id: c-programs/procfs-identity-agreement
     description: The guest sees ONE identity per file through stat, /proc/self/maps and fdinfo
     lane: portable
