@@ -32,7 +32,6 @@ use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
-use hermit_manifest_plan::runner::run_cell_with_parity;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
@@ -77,7 +76,6 @@ Selection options:
   --include-occasional             Include occasional cells
   --include-manual                 Include manual cells; requires exact test and mode
   --probe-disabled                 Run one exact disabled cell
-  --parity-reference <ptrace>       Compare non-ptrace verify cells; other selected cells run normally
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
@@ -194,7 +192,6 @@ fn print_command_help(command: &str) -> bool {
              --include-occasional             Include occasional cells\n  \
              --include-manual                 Include manual cells; requires exact test and mode\n  \
              --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
-             --parity-reference <ptrace>       Compare non-ptrace verify cells; other selected cells run normally\n  \
              --prebuilt                       Reuse prepared test programs\n  \
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
@@ -252,7 +249,6 @@ struct Args {
     allow_empty: bool,
     ci_only: bool,
     probe_disabled: bool,
-    parity_reference: Option<String>,
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
     format: String,
@@ -292,6 +288,13 @@ fn set_once(slot: &mut Option<String>, values: &mut impl Iterator<Item = String>
     }
 }
 
+/// `--parity-reference` was removed rather than left unknown, so a caller from
+/// before https://github.com/rrnewton/hermit/issues/3301 learns what replaced it.
+const REMOVED_PARITY_REFERENCE: &str = "--parity-reference was removed: a ptrace \
+     reference run no longer decides a cell's outcome \
+     (https://github.com/rrnewton/hermit/issues/3301). Drop the flag; each selected \
+     verify cell runs its own backend's strict verification.";
+
 fn parse(mut values: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         format: "text".into(),
@@ -314,11 +317,7 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
                 args.probe_disabled = true;
                 args.selection.population = Some(Population::Disabled);
             }
-            "--parity-reference" => set_once(
-                &mut args.parity_reference,
-                &mut values,
-                "--parity-reference",
-            ),
+            "--parity-reference" => fail(REMOVED_PARITY_REFERENCE),
             "--prebuilt" => args.prebuilt = true,
             "--allow-empty" => args.allow_empty = true,
             "--results" => {
@@ -528,22 +527,6 @@ fn validate_args(command: &str, args: &Args) {
         }
         if args.selection.include_manual || args.ci_only {
             fail("--probe-disabled is mutually exclusive with --include-manual and --ci-only");
-        }
-    }
-    if let Some(reference) = args.parity_reference.as_deref() {
-        if command != "run" {
-            fail("--parity-reference is accepted by run only");
-        }
-        if reference != "ptrace" {
-            fail("--parity-reference currently requires ptrace");
-        }
-        if let Some(mode) = args.selection.mode.as_deref() {
-            if mode != "verify" {
-                fail("--parity-reference requires --mode verify when a mode is explicit");
-            }
-        }
-        if args.selection.backend.as_deref() == Some(reference) {
-            fail("--parity-reference must differ from the explicit candidate --backend");
         }
     }
     if args.allow_empty {
@@ -2227,20 +2210,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 context.attempt,
                 |attempt| {
                     let attempt_context = context.with_attempt(attempt);
-                    let result = match args.parity_reference.as_deref() {
-                        Some(reference)
-                            if cell.id.mode == "verify"
-                                && cell
-                                    .id
-                                    .backend
-                                    .as_deref()
-                                    .is_some_and(|backend| backend != reference) =>
-                        {
-                            run_cell_with_parity(&attempt_context, cell, reference)
-                        }
-                        _ => run_cell(&attempt_context, cell),
-                    };
-                    match result {
+                    match run_cell(&attempt_context, cell) {
                         Ok(result) => result,
                         Err(error) => error.into_result(&attempt_context, cell),
                     }
@@ -2430,6 +2400,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -2443,7 +2414,6 @@ mod tests {
     use super::DEFAULT_BUILD_JOBS;
     use super::DEFAULT_VALIDATE_AUDIT_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
-    use super::HELP;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::PINNED_COMMAND_PREFIX;
@@ -2470,50 +2440,28 @@ mod tests {
     use super::validate_args;
     use super::validation_audit_worker_capacity;
 
+    /// Before https://github.com/rrnewton/hermit/issues/3301, `run
+    /// --parity-reference ptrace` sent every non-ptrace verify cell through a
+    /// second ptrace run and a `hermit log-diff` comparison that could turn the
+    /// candidate's PASS into a FAIL. The same mixed selection now runs each
+    /// verify cell once, on its own backend, even when the candidate's log
+    /// differs from ptrace's ("diverged").
     #[test]
-    fn ptrace_parity_policy_is_explicit_and_independent_of_selection() {
-        let args = parse(
-            [
-                "--mode",
-                "verify",
-                "--backend",
-                "kvm",
-                "--probe-disabled",
-                "--test",
-                "fixture/kvm-candidate",
-                "--parity-reference",
-                "ptrace",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        );
-        validate_args("run", &args);
-        assert_eq!(args.parity_reference.as_deref(), Some("ptrace"));
-        assert_eq!(args.selection.backend.as_deref(), Some("kvm"));
-        assert!(args.probe_disabled);
-        assert!(HELP.contains("--parity-reference <ptrace>"));
-    }
-
-    #[test]
-    fn production_mixed_selection_routes_only_candidate_verification_to_parity() {
+    fn production_mixed_selection_runs_each_verify_cell_on_its_own_backend() {
         use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
 
-        use hermit_manifest_plan::backend_parity::BackendParityVerdict;
         use hermit_manifest_plan::runner::ObservedResult;
         use serde_json::json;
 
-        const CHILD: &str = "HERMIT_MIXED_PARITY_FIXTURE";
+        const CHILD: &str = "HERMIT_MIXED_ORDINARY_FIXTURE";
         const TEST: &str =
-            "tests::production_mixed_selection_routes_only_candidate_verification_to_parity";
+            "tests::production_mixed_selection_runs_each_verify_cell_on_its_own_backend";
         if let Some(fixture) = std::env::var_os(CHILD) {
             let fixture = PathBuf::from(fixture);
-            let scenario = fs::read_to_string(fixture.join("scenario")).unwrap();
-            let mut values = vec![
-                "--parity-reference".into(),
-                "ptrace".into(),
+            let values = vec![
                 "--category".into(),
                 "parity".into(),
                 "--ci-only".into(),
@@ -2525,12 +2473,6 @@ mod tests {
                 "--junit".into(),
                 fixture.join("junit.xml").display().to_string(),
             ];
-            match scenario.as_str() {
-                "explicit-chaos" => values.extend(["--mode".into(), "chaos".into()]),
-                "explicit-ptrace" => values.extend(["--backend".into(), "ptrace".into()]),
-                "broad-disabled" => values.push("--probe-disabled".into()),
-                _ => {}
-            }
             let args = parse(values.into_iter());
             validate_args("run", &args);
             let manifests = ManifestSet::load(&fixture).unwrap();
@@ -2538,28 +2480,13 @@ mod tests {
                 .join("../..")
                 .canonicalize()
                 .unwrap();
-            let result = super::run(&root, &manifests, &args);
-            assert_eq!(
-                result,
-                if scenario == "matched" {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            );
+            assert_eq!(super::run(&root, &manifests, &args), ExitCode::SUCCESS);
             return;
         }
 
-        for scenario in [
-            "matched",
-            "diverged",
-            "incomplete-reference",
-            "explicit-chaos",
-            "explicit-ptrace",
-            "broad-disabled",
-        ] {
+        for scenario in ["matched", "diverged"] {
             let fixture = std::env::temp_dir().join(format!(
-                "hermit-harness-mixed-parity-{}-{:?}-{scenario}",
+                "hermit-harness-mixed-ordinary-{}-{:?}-{scenario}",
                 std::process::id(),
                 std::thread::current().id()
             ));
@@ -2627,21 +2554,11 @@ mod tests {
                 serde_json::to_vec(&verification).unwrap(),
             )
             .unwrap();
-            fs::write(path.join("comparison.json"), serde_json::to_vec(&json!({
-                "schema": 1, "verdict": "matched", "selected_messages": {"left": 2, "right": 2},
-                "records": {"compared": 2, "available_left": 2, "available_right": 2, "withheld_incomplete_tail": false},
-                "comparison": {"stream": "info", "record_envelope": "cross_backend_detcore_v1",
-                    "unsafe_strip_lines": false, "canonicalize_host_addresses": true,
-                    "require_structured_events": true, "ignored_line_substrings": [],
-                    "skip_commit": false, "skip_detlog": false,
-                    "included_detlog_kinds": ["syscall", "syscall_result", "other"], "git_diff": false},
-                "first_divergent_syscall": null, "first_divergent_scheduler_turn": null,
-                "first_divergent_virtual_nanoseconds": null, "first_divergent_left_message": null,
-                "first_divergent_right_message": null
-            })).unwrap()).unwrap();
             let backend = path.join("native-backend-adapter");
-            fs::write(&backend, r#"#!/usr/bin/python3
-import hashlib,json,pathlib,sys
+            fs::write(
+                &backend,
+                r#"#!/usr/bin/python3
+import json,pathlib,sys
 root=pathlib.Path(__file__).parent
 a=sys.argv[1:]
 if '--help' in a:
@@ -2654,17 +2571,7 @@ def record(value):
 if a[0]=='log-diff':
  if len(a)==2:
   record({'kind':'normalize','argv':a});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
- assert a[3]=='--json' and a[5:]==['--record-envelope','cross-backend-detcore-v1'],a
- record({'kind':'compare','argv':a})
- left=pathlib.Path(a[1]).read_bytes();right=pathlib.Path(a[2]).read_bytes()
- same=left==right
- report=json.loads((root/'comparison.json').read_text())
- report['inputs']={side:{'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)}
-                   for side,data in [('left',left),('right',right)]}
- if not same:
-  report.update(verdict='diverged',first_divergent_record=1,first_divergent_scheduler_turn=7,
-                first_divergent_virtual_nanoseconds=18,first_divergent_left_message='reference',first_divergent_right_message='candidate')
- pathlib.Path(a[4]).write_text(json.dumps(report));sys.exit(0 if same else 1)
+ record({'kind':'compare','argv':a});sys.exit(3)
 backend=a[a.index('--backend')+1]
 if '--verify-json' not in a:
  assert '--verify' not in a and '--verify-strict' not in a,a
@@ -2674,12 +2581,13 @@ logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
 reference='parity-reference' in str(logdir)
 record({'kind':'run','backend':backend,'reference':reference,'argv':a})
 assert '--verify-strict' in a and '--verify' in a,a
-if scenario=='incomplete-reference' and reference:sys.exit(7)
 logdir.mkdir(parents=True,exist_ok=True)
 value='different' if scenario=='diverged' and backend=='kvm' else 'shared'
 (logdir/'run1_log_fixture.log').write_text('INFO detcore: '+value+'\nINFO detcore: complete\n')
 report.write_bytes((root/'verification.json').read_bytes())
-"#).unwrap();
+"#,
+            )
+            .unwrap();
             fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
             let result = Command::new("timeout")
                 .args(["--kill-after=2s", "30s"])
@@ -2691,7 +2599,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .env("HERMIT_BIN", &backend)
                 .env("E2E_RESULT_ROOT", path.join("artifacts"))
                 .env("E2E_BUILD_ROOT", path.join("build"))
-                .env("E2E_RUN_ID", "mixed-parity-control")
+                .env("E2E_RUN_ID", "mixed-ordinary-control")
                 .env("E2E_MACHINE_SHORTNAME", "native-control")
                 .env("E2E_KERNEL_VERSION", "native-control")
                 .env("E2E_KEEP_VERIFY_LOGS", "1")
@@ -2700,21 +2608,6 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .unwrap();
             fs::write(path.join("child.stdout"), &result.stdout).unwrap();
             fs::write(path.join("child.stderr"), &result.stderr).unwrap();
-            let refusal = match scenario {
-                "explicit-chaos" => Some("requires --mode verify when a mode is explicit"),
-                "explicit-ptrace" => Some("must differ from the explicit candidate --backend"),
-                "broad-disabled" => {
-                    Some("--probe-disabled requires exact --test, --mode, and --backend filters")
-                }
-                _ => None,
-            };
-            if let Some(refusal) = refusal {
-                assert_eq!(result.status.code(), Some(2));
-                assert!(String::from_utf8_lossy(&result.stderr).contains(refusal));
-                assert!(!path.join("results.jsonl").exists());
-                assert!(!path.join("invocations").exists());
-                continue;
-            }
             assert!(
                 result.status.success(),
                 "{scenario}: {}\n{}",
@@ -2733,126 +2626,62 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .lines()
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            let candidates = rows
-                .iter()
-                .filter(|row| row.mode == "verify" && row.backend.as_deref() == Some("kvm"))
-                .collect::<Vec<_>>();
-            let repetitions = if scenario == "diverged" { 2 } else { 1 };
-            assert_eq!(candidates.len(), repetitions);
-            assert_eq!(rows.len(), repetitions + 2);
+            // verify@ptrace, verify@kvm and custom@kvm, each exactly once.
+            assert_eq!(rows.len(), 3, "{scenario}: {rows:#?}");
             for row in &rows {
                 row.require_current_classification().unwrap();
                 row.require_current_timeout_policy().unwrap();
                 assert_eq!(row.execution_cpu_timeout_seconds, Some(5));
                 assert_eq!(row.execution_wall_timeout_seconds, Some(10));
-                if row.mode != "verify" || row.backend.as_deref() == Some("ptrace") {
-                    assert_eq!(row.outcome, "PASS");
-                    assert!(row.backend_parity.is_none());
-                    assert_eq!(row.attempts.len(), 1);
-                }
+                assert_eq!(row.outcome, "PASS", "{scenario}: {row:#?}");
+                assert_eq!(row.result, Some(ObservedResult::Pass), "{scenario}");
+                assert!(row.backend_parity.is_none(), "{scenario}");
+                assert_eq!(row.attempts.len(), 1, "{scenario}: {row:#?}");
             }
-            assert_eq!(rows.iter().filter(|row| row.mode == "custom").count(), 1);
-            assert_eq!(
-                rows.iter()
-                    .filter(|row| row.mode == "verify" && row.backend.as_deref() == Some("ptrace"))
-                    .count(),
-                1
-            );
-            for row in candidates {
-                assert_eq!(row.attempts.len(), 2);
-                if scenario == "incomplete-reference" {
-                    assert_eq!(row.outcome, "ERROR");
-                    assert_eq!(row.result, None);
-                    assert_eq!(
-                        row.failure_class,
-                        Some(hermit_manifest_plan::runner::FailureClass::NoResult)
-                    );
-                    assert_eq!(
-                        row.error_kind.as_deref(),
-                        Some("incomplete-parity-evidence")
-                    );
-                    assert!(row.backend_parity.is_none());
-                } else {
-                    let report = row.backend_parity.as_ref().unwrap();
-                    report.validate("kvm").unwrap();
-                    report
-                        .reference
-                        .verification
-                        .require_canonical_match()
-                        .unwrap();
-                    report
-                        .candidate
-                        .verification
-                        .require_canonical_match()
-                        .unwrap();
-                    assert_eq!(report.reference.backend, "ptrace");
-                    assert_eq!(report.candidate.backend, "kvm");
-                    assert_eq!(
-                        report.verdict,
-                        if scenario == "matched" {
-                            BackendParityVerdict::Matched
-                        } else {
-                            BackendParityVerdict::Diverged
-                        }
-                    );
-                    assert_eq!(
-                        row.result,
-                        Some(if scenario == "matched" {
-                            ObservedResult::Pass
-                        } else {
-                            ObservedResult::ParityFailure
-                        })
-                    );
-                    assert_eq!(
-                        row.outcome,
-                        if scenario == "matched" {
-                            "PASS"
-                        } else {
-                            "FAIL"
-                        }
-                    );
-                }
+            for (mode, backend) in [("verify", "ptrace"), ("verify", "kvm"), ("custom", "kvm")] {
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row.mode == mode && row.backend.as_deref() == Some(backend))
+                        .count(),
+                    1,
+                    "{scenario}: {mode}@{backend}"
+                );
             }
+            let kinds = calls
+                .iter()
+                .map(|call| {
+                    format!(
+                        "{}:{}:{}",
+                        call["kind"].as_str().unwrap(),
+                        call["backend"].as_str().unwrap_or("-"),
+                        call["reference"].as_bool().unwrap_or(false)
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            // The single-log `log-diff` call is the ptrace cell's own golden
+            // normalization, part of its ordinary verification. A two-log
+            // comparison would be recorded as "compare".
+            assert_eq!(calls.len(), 4, "{scenario}: {calls:#?}");
             assert_eq!(
-                calls
-                    .iter()
-                    .filter(|call| call["kind"] == "custom" && call["backend"] == "kvm")
-                    .count(),
-                1
+                kinds,
+                BTreeSet::from([
+                    "custom:kvm:false".to_string(),
+                    "normalize:-:false".to_string(),
+                    "run:kvm:false".to_string(),
+                    "run:ptrace:false".to_string(),
+                ]),
+                "{scenario}: no ptrace reference run and no log-diff comparison"
             );
-            assert_eq!(
-                calls
-                    .iter()
-                    .filter(|call| call["kind"] == "compare")
-                    .count(),
-                if scenario == "incomplete-reference" {
-                    0
-                } else {
-                    repetitions
-                }
-            );
-            assert_eq!(
-                calls
-                    .iter()
-                    .filter(|call| call["kind"] == "run" && call["backend"] == "kvm")
-                    .count(),
-                repetitions
-            );
-            assert_eq!(
-                calls
-                    .iter()
-                    .filter(|call| call["kind"] == "run" && call["reference"] == true)
-                    .count(),
-                repetitions
-            );
-            assert_eq!(
-                calls
-                    .iter()
-                    .filter(|call| call["kind"] == "run"
-                        && call["backend"] == "ptrace"
-                        && call["reference"] == false)
-                    .count(),
-                1
+            let normalized = calls
+                .iter()
+                .find(|call| call["kind"] == "normalize")
+                .unwrap();
+            assert!(
+                normalized["argv"][1]
+                    .as_str()
+                    .unwrap()
+                    .contains("/parity-mixed-verify-ptrace/"),
+                "{scenario}: only the ptrace cell's own log is normalized: {normalized}"
             );
         }
     }
