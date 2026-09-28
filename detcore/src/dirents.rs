@@ -229,6 +229,16 @@ impl DirentFormat {
         (self.name_offset() + name_len + trailer + 7) & !7
     }
 
+    /// The bytes at the start of a record that Linux writes for a name of
+    /// `name_len` bytes. It skips the padding after the name's NUL, except
+    /// that the legacy layout keeps `d_type` in the record's last byte.
+    pub(crate) fn written_len(self, name_len: usize) -> usize {
+        match self {
+            Self::Dirent64 => self.name_offset() + name_len + 1,
+            Self::Legacy => self.record_len(name_len),
+        }
+    }
+
     /// Decode a buffer of records exactly as the kernel wrote it.
     pub(crate) fn parse(self, bytes: &[u8]) -> Result<Vec<DirEntry>, Errno> {
         let mut entries = Vec::new();
@@ -345,8 +355,6 @@ pub(crate) struct DirectoryStream {
     resume: Vec<i64>,
     /// Index of the next entry to return.
     position: u64,
-    /// The host position the kernel was last left at.
-    kernel_position: i64,
 }
 
 impl DirectoryStream {
@@ -376,7 +384,6 @@ impl DirectoryStream {
         }
         self.entries = Some(indexed.into_iter().map(|(_, entry)| entry).collect());
         self.resume = resume;
-        self.kernel_position = end;
     }
 
     pub(crate) fn position(&self) -> u64 {
@@ -397,13 +404,16 @@ impl DirectoryStream {
         self.position = self.position.saturating_add(count as u64);
     }
 
-    /// The host position to move the kernel to, or `None` if it is already
-    /// there. Reading from it returns every entry the stream has not returned,
-    /// but may also repeat some that it has, because the host order differs.
-    /// At the end of the stream it is the end of the directory; without a
-    /// snapshot, it is the start.
-    pub(crate) fn kernel_target(&self) -> Option<i64> {
-        let target = match &self.entries {
+    /// The host position to move the kernel to. Reading from it returns every
+    /// entry the stream has not returned, but may also repeat some that it
+    /// has, because the host order differs. At the end of the stream it is the
+    /// end of the directory; without a snapshot, it is the start.
+    ///
+    /// There is no "already there": a descriptor Detcore does not track moves
+    /// the kernel position with its own reads, so the kernel must be moved
+    /// every time.
+    pub(crate) fn kernel_target(&self) -> i64 {
+        match &self.entries {
             None => 0,
             Some(entries) => {
                 let position = usize::try_from(self.position)
@@ -411,13 +421,7 @@ impl DirectoryStream {
                     .min(entries.len());
                 self.resume.get(position).copied().unwrap_or(0)
             }
-        };
-        (target != self.kernel_position).then_some(target)
-    }
-
-    /// Record that the kernel position was moved to `position`.
-    pub(crate) fn kernel_moved(&mut self, position: i64) {
-        self.kernel_position = position;
+        }
     }
 
     /// The entries the next call returns: those at the current position that
@@ -1132,32 +1136,24 @@ mod test {
         // must read from to return every entry not yet returned.
         let expected = [
             // a b c d: all remain; c is first in host order.
-            (0, Some(0)),
+            (0, 0),
             // b c d remain; c is first in host order.
-            (1, Some(0)),
+            (1, 0),
             // c d remain; c is first in host order.
-            (2, Some(0)),
+            (2, 0),
             // d remains; it follows a, the host position 20.
-            (3, Some(20)),
-            // None remain: the end of the directory, where reading the
-            // snapshot left the kernel.
-            (4, None),
+            (3, 20),
+            // None remain: the end of the directory.
+            (4, 40),
+            (99, 40),
         ];
         for (position, target) in expected {
             stream.position = position;
             assert_eq!(stream.kernel_target(), target, "position {position}");
         }
 
-        stream.position = 3;
-        stream.kernel_moved(20);
-        assert_eq!(stream.kernel_target(), None);
-        stream.position = 99;
-        assert_eq!(stream.kernel_target(), Some(40));
-
         // A rewind drops the snapshot and the kernel returns to the start.
         stream.seek(0);
-        assert_eq!(stream.kernel_target(), Some(0));
-        stream.kernel_moved(0);
-        assert_eq!(stream.kernel_target(), None);
+        assert_eq!(stream.kernel_target(), 0);
     }
 }
