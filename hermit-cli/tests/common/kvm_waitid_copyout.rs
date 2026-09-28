@@ -436,7 +436,17 @@ fn assert_sibling_observations(stdout: &[u8], direction: &str, selector: &str, c
         "exact child consumed once",
         "all children consumed once",
     ];
-    let flags = [0x1000004_u64, 0x21000004, 0x1000004, 0x1000004, 4, 5, 5, 5, 5];
+    let flags = [
+        0x1000004_u64,
+        0x21000004,
+        0x1000004,
+        0x1000004,
+        4,
+        5,
+        5,
+        5,
+        5,
+    ];
     let uid = u32::try_from(calls[0]["uid"].as_u64().unwrap()).unwrap();
     for (index, row) in calls.iter().enumerate() {
         assert_eq!(row["name"], names[index]);
