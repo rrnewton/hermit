@@ -219,6 +219,10 @@ fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error>
     }
 }
 
+fn should_repair_failed_gettimeofday_tv(backend_is_kvm: bool) -> bool {
+    !backend_is_kvm
+}
+
 /// Replaces the host wall-clock time that a `gettimeofday` failing with EFAULT
 /// may have stored in `tv` with virtual time, in exactly the words Linux
 /// stored.
@@ -244,6 +248,10 @@ fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error>
 /// used there. A custom configuration that combines replay data with virtual
 /// time fails closed before probing: a recorded EFAULT does not establish that
 /// this execution performed any stores for a live `time(2)` to reproduce.
+/// KVM does not call this repair: its executor implements `gettimeofday`
+/// directly with an all-zero timeval, so it never stores host time, and it
+/// does not implement the injected `time(2)` probe. Its original EFAULT is
+/// therefore already safe and must be returned unchanged.
 async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
     guest: &mut G,
     tv_addr: AddrMut<'a, Timeval>,
@@ -369,7 +377,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // running the call. Any other error came from the backend, the
                 // tool, a seccomp filter or a replayed log, and says nothing
                 // about what reached `tv`, so memory is left alone.
-                Err(Error::Errno(Errno::EFAULT)) => {
+                Err(Error::Errno(Errno::EFAULT))
+                    if should_repair_failed_gettimeofday_tv(guest.config().backend_is_kvm) =>
+                {
                     require_live_time_store_probe(self.cfg.replay_data.is_some())?;
                     overwrite_failed_gettimeofday_tv(guest, tp.into(), &tv).await?
                 }
@@ -904,6 +914,12 @@ mod tests {
                 classify_time_store_probe("tv_usec", Err(Errno::EFAULT)).unwrap(),
                 TimeStoreProbe::Stopped
             );
+        }
+
+        #[test]
+        fn failed_gettimeofday_repair_is_skipped_only_for_kvm() {
+            assert!(should_repair_failed_gettimeofday_tv(false));
+            assert!(!should_repair_failed_gettimeofday_tv(true));
         }
 
         #[test]
