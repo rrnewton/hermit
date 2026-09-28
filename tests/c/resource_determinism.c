@@ -538,7 +538,19 @@ static void check_sysinfo_memory_matches_configured_memory(void) {
 // required to have crossed a boundary. Two system ticks mean more than 10ms of
 // system time was spent, and for a single thread elapsed time is at least system
 // time, so the elapsed clock must also have crossed at least one boundary.
-enum { SYSTEM_TICK_WORK_BOUND = 100000, SYSTEM_TICKS_REQUIRED = 2 };
+//
+// The bound only turns a clock that never advances into a named failure; it is
+// not a threshold the test is judged by. Reaching two ticks took 362 (parent)
+// and 398 (child) iterations under Hermit ptrace, identical across runs, and
+// 57,449 to 115,215 iterations on native Linux (80 loops over 40 runs), so
+// 1,000,000 leaves more than 8x headroom over the slowest native loop.
+// Exhausting it takes about 0.3 s natively but about 150 s under Hermit ptrace,
+// past the manifest cell's 22 s CPU timeout (and its 57 s wall timeout), so
+// there a stuck clock fails the cell as a timeout rather than with this
+// message. Either way the cell fails. There is deliberately no clock-based
+// give-up: under Hermit it would read virtual time, which a clock bug could
+// stop as well.
+enum { SYSTEM_TICK_WORK_BOUND = 1000000, SYSTEM_TICKS_REQUIRED = 2 };
 
 static void syscall_work_until_system_ticks(clock_t start_stime) {
   for (int i = 0; i < SYSTEM_TICK_WORK_BOUND; ++i) {
