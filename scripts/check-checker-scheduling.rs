@@ -568,6 +568,10 @@ fn lint_checks_recipe(makefile: &str) -> String {
 }
 
 fn self_test() {
+    assert!(
+        !is_invoked("bash -D scripts/check-z.sh", "scripts/check-z.sh"),
+        "bash -D implies -n and executes no commands; treating its script operand as scheduled is silent"
+    );
     // Comment stripping is what separates a real invocation from a mention.
     let sh = "# ./scripts/check-a.sh mentioned in a comment\n./scripts/check-b.sh\n";
     let stripped = strip_comments(sh, "x.sh");
