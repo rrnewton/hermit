@@ -6183,69 +6183,130 @@ async fn native_record_no_store_actual_eof_publishes_one_entry_bound_terminal_wi
     use detcore_model::network_trace::NetworkInputKindV2;
     use detcore_model::network_trace::NetworkReleaseNodeKindV4;
     use detcore_model::network_trace::NetworkShutdownV2;
-    let mut f = NativeNoStoreFixture::new(true, 5, true).await;
-    f.confirm(true); // exact existing confirmation boundary from raw RED
-    let before = f.trace();
-    let frontier = f.frontier();
-    let turn = f.fixture.state.sched.lock().unwrap().turn;
-    let now = f.fixture.state.global_time.lock().unwrap().as_nanos();
-    let cut = before.release_model.nodes().len() as u64;
-    let prerequisites = before
-        .entry_frontier(detcore_model::network_trace::NetworkReceiveEntryCutV4(cut))
-        .unwrap();
-    assert_eq!(
-        f.complete().await,
-        crate::network_replay::NoStoreReturn::Eof
-    );
-    let after = f.trace();
-    after.validate().unwrap();
-    assert_eq!(&after.inputs[..before.inputs.len()], before.inputs);
-    assert_eq!(after.inputs.len(), before.inputs.len() + 1);
-    let input = after.inputs.last().unwrap();
-    assert_eq!(
-        input.event,
-        NetworkInputKindV2::PeerShutdown {
-            stream_offset: 0,
-            direction: NetworkShutdownV2::Write
+    for low_water in [1i32, 2] {
+        let mut f = NativeNoStoreFixture::new(true, 5, true).await;
+        if low_water == 2 {
+            let q = &f.fixture;
+            let fd = q
+                .state
+                .network_runtime
+                .as_ref()
+                .unwrap()
+                .private_receive_original_fixture_fd(q.root.owner(), q.call);
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVLOWAT,
+                        (&low_water as *const i32).cast(),
+                        std::mem::size_of::<i32>() as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            let mut actual = 0i32;
+            let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVLOWAT,
+                        (&mut actual as *mut i32).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            assert_eq!(length as usize, std::mem::size_of::<i32>());
+            assert_eq!(actual, low_water);
+            // Independent native EOF observation on the same actual retained OFD.
+            // This fixture's provider metadata remains an explicit component premise.
+            let mut byte = 0xa5u8;
+            assert_eq!(
+                unsafe {
+                    libc::recv(
+                        fd,
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                },
+                0
+            );
+            assert_eq!(byte, 0xa5);
+            q.state
+                .network_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .change_no_store_fixture(q.root.owner(), q.call, q.lease, 5);
         }
-    );
-    assert_eq!(input.release.receive_entry_cut.0, cut);
-    assert_eq!(input.release.prerequisites, prerequisites);
-    assert_eq!(input.release.not_before_global_time, now);
-    assert_eq!(
-        &after.release_model.nodes()[..cut as usize],
-        before.release_model.nodes()
-    );
-    assert_eq!(after.release_model.nodes().len(), cut as usize + 1);
-    assert_eq!(
-        after.release_model.nodes().last().unwrap().kind,
-        NetworkReleaseNodeKindV4::Input {
-            input_ordinal: input.ordinal
-        }
-    );
-    assert_eq!(
-        after.native_receive_observations,
-        before.native_receive_observations
-    );
-    assert_eq!(frontier, (0, 0, 0, 0, false, false, 1, 1));
-    assert_eq!(f.frontier(), (0, 0, 0, 0, true, true, 0, 0));
-    assert_eq!(f.fixture.pages.bytes(0, 8192), vec![0xa5; 8192]);
-    assert_eq!(f.fixture.state.sched.lock().unwrap().turn, turn);
-    assert_eq!(f.fixture.state.global_time.lock().unwrap().as_nanos(), now);
-    assert!(
-        f.fixture
-            .state
-            .complete_foreground_record_no_store(
-                f.fixture.tid,
-                &f.fixture.thread,
-                f.fixture.call,
-                f.fixture.lease
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(f.trace(), after);
-    f.assert_release().await;
+        f.confirm(true); // exact existing confirmation boundary from raw RED
+        let before = f.trace();
+        let frontier = f.frontier();
+        let turn = f.fixture.state.sched.lock().unwrap().turn;
+        let now = f.fixture.state.global_time.lock().unwrap().as_nanos();
+        let cut = before.release_model.nodes().len() as u64;
+        let prerequisites = before
+            .entry_frontier(detcore_model::network_trace::NetworkReceiveEntryCutV4(cut))
+            .unwrap();
+        assert_eq!(
+            f.complete().await,
+            crate::network_replay::NoStoreReturn::Eof
+        );
+        let after = f.trace();
+        after.validate().unwrap();
+        assert_eq!(&after.inputs[..before.inputs.len()], before.inputs);
+        assert_eq!(after.inputs.len(), before.inputs.len() + 1);
+        let input = after.inputs.last().unwrap();
+        assert_eq!(
+            input.event,
+            NetworkInputKindV2::PeerShutdown {
+                stream_offset: 0,
+                direction: NetworkShutdownV2::Write
+            }
+        );
+        assert_eq!(input.release.receive_entry_cut.0, cut);
+        assert_eq!(input.release.prerequisites, prerequisites);
+        assert_eq!(input.release.not_before_global_time, now);
+        assert_eq!(
+            &after.release_model.nodes()[..cut as usize],
+            before.release_model.nodes()
+        );
+        assert_eq!(after.release_model.nodes().len(), cut as usize + 1);
+        assert_eq!(
+            after.release_model.nodes().last().unwrap().kind,
+            NetworkReleaseNodeKindV4::Input {
+                input_ordinal: input.ordinal
+            }
+        );
+        assert_eq!(
+            after.native_receive_observations,
+            before.native_receive_observations
+        );
+        assert_eq!(frontier, (0, 0, 0, 0, false, false, 1, 1));
+        assert_eq!(f.frontier(), (0, 0, 0, 0, true, true, 0, 0));
+        assert_eq!(f.fixture.pages.bytes(0, 8192), vec![0xa5; 8192]);
+        assert_eq!(f.fixture.state.sched.lock().unwrap().turn, turn);
+        assert_eq!(f.fixture.state.global_time.lock().unwrap().as_nanos(), now);
+        assert!(
+            f.fixture
+                .state
+                .complete_foreground_record_no_store(
+                    f.fixture.tid,
+                    &f.fixture.thread,
+                    f.fixture.call,
+                    f.fixture.lease
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(f.trace(), after);
+        f.assert_release().await;
+    }
 }
 
 #[tokio::test]
@@ -6355,8 +6416,12 @@ async fn native_record_no_store_foreign_missing_unjoined_and_malformed_proofs_ke
 #[tokio::test]
 async fn native_record_no_store_entry_root_mm_grant_cursor_and_frontier_refusals_are_atomic() {
     for variant in 0..11 {
-        let f = NativeNoStoreFixture::new(true, 5, true).await;
-        f.confirm(true);
+        // EOF legitimately completes below SO_RCVLOWAT. Exercise the existing
+        // option-profile refusal with WouldBlock instead, so that it cannot
+        // mask the later independently reached root/MM/grant negatives.
+        let eof = variant != 5;
+        let f = NativeNoStoreFixture::new(eof, 5, true).await;
+        f.confirm(eof);
         let q = &f.fixture;
         let owner = q.root.owner();
         let engine = q.state.network_engine.as_ref().unwrap();

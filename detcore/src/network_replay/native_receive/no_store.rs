@@ -383,8 +383,9 @@ impl NetworkReplayEngine {
             || !channel.inbound.is_empty()
             || origin.physical_observed.bytes != channel.inbound_consumed
             || frontier.stream_offset != channel.inbound_consumed
-            || socket.options.receive_low_water != 1
-            || socket.options.receive_timeout != ReceiveTimeoutV3::Infinite
+            || (source.outcome == NoStoreReturn::WouldBlock
+                && (socket.options.receive_low_water != 1
+                    || socket.options.receive_timeout != ReceiveTimeoutV3::Infinite))
             || !confirmed.matches(source, origin.identity, probe.original_cursor)
             || probe.peek
                 != Some(match source.outcome {
