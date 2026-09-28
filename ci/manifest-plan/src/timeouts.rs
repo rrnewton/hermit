@@ -68,6 +68,12 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 /// unchanged canonical L2 match; `resource-determinism` needed a guest loop long
 /// enough to cross one virtual `times()` tick. Each cell passed five
 /// consecutive strict verify runs on the ptrace backend at the evidence SHA.
+///
+/// Since 2026-09-27 that guest loop waits for two system-CPU ticks instead of
+/// one, so the elapsed-clock check no longer depends on tick phase. Under
+/// ptrace strict verify the loop now ends after 362 (parent) and 398 (child)
+/// iterations, identical across 5 runs, and each of 11 whole verify runs took
+/// 0.9 to 3.2 s of wall time, far inside the unchanged 57 s default wall timeout.
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
