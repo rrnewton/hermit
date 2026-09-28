@@ -2903,6 +2903,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             "test.detcore_unit",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.regular_crates",
             "test.hermit_integration",
             "test.arbitrary_binaries",
@@ -2950,8 +2951,8 @@ report.write_bytes((root/'verification.json').read_bytes())
         // They remain assigned exactly once, but share the integration shard so
         // the hosted validator cannot mistake a standalone zero-test run for a
         // pass.
-        assert_eq!(physical_rows, 25);
-        assert_eq!(resolved.len(), 25);
+        assert_eq!(physical_rows, 26);
+        assert_eq!(resolved.len(), 26);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
