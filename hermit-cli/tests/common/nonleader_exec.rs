@@ -302,6 +302,18 @@ fn run_fixture(scenario: Scenario) {
             // notification shortens each single-step correction tail while
             // retaining the same workload and repeated leader preemptions.
             // The precise target and refusal of every overshoot are unchanged.
+            //
+            // CPU 0 adds about 5 CPU-seconds per execution on this host. The
+            // measured 22-CPU-second whole-case budget fits at most 3 of the 6
+            // executions on CPU 0, not arbitrary placement on smaller runners
+            // whose cpuset includes CPU 0. This is a measured limit, not a
+            // guarantee across hosts or loads: https://github.com/rrnewton/hermit/issues/3265.
+            //
+            // This margin is below the product's calibrated 1,000 RCBs for
+            // EPYC 9D85. With glibc 2.34, the replacement's first post-exec PMU
+            // timer had up to 495 RCBs of skid at the fixed relocation stop
+            // rip 0x7ffff7fd42f3, leaving only 17 RCBs of slack. A glibc or host
+            // change can reintroduce exit 122 at this timer.
             args.insert(8, "--skid-margin=512");
         } else if preempted {
             // Keep the blocked-leader cell's existing early notification.
