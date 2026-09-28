@@ -40,23 +40,36 @@ fn summary(snapshot: &ParityCells) -> String {
 }
 
 fn run() -> Result<(), String> {
-    let mut write = false;
+    // One mode flag at most. `--check --write` used to write, while
+    // `--write --check` was refused: the same two flags gave opposite results
+    // depending on their order.
+    let mut mode: Option<&'static str> = None;
     for arg in std::env::args().skip(1) {
-        match arg.as_str() {
+        let flag = match arg.as_str() {
             help if is_help_flag(help) => {
                 println!("{}", usage());
                 return Ok(());
             }
-            "--check" if !write => {}
-            "--write" => write = true,
+            "--check" => "--check",
+            "--write" => "--write",
             _ => {
+                return Err(format!("unrecognized argument {arg:?}\n{}", usage()));
+            }
+        };
+        match mode.replace(flag) {
+            None => {}
+            Some(first) if first == flag => {
+                return Err(format!("{flag} may be given only once\n{}", usage()));
+            }
+            Some(_) => {
                 return Err(format!(
-                    "unrecognized or conflicting argument {arg:?}\n{}",
+                    "--check and --write are mutually exclusive\n{}",
                     usage()
                 ));
             }
         }
     }
+    let write = mode == Some("--write");
     let root = repo_root()?;
     let path = root.join(PARITY_CELLS_PATH);
     let snapshot = generate(&root)?;

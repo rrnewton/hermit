@@ -199,8 +199,14 @@ impl LogDiffReport {
     /// Schema 1 predates the field, so it must be absent there. From schema 2 a
     /// comparison verdict must carry it, a match must have matched every
     /// selected message on both sides, and a divergence must have matched
-    /// fewer than the longer side selected.
+    /// fewer than the longer side selected. A comparison that selected nothing
+    /// on either side measured nothing, so it carries no prefix whatever its
+    /// verdict: `0 of 0` is not a full match.
+    ///
+    /// The schema is checked here too, so that a caller using this check on its
+    /// own cannot have an unknown schema read as schema 2.
     pub fn require_consistent_matched_prefix(&self) -> Result<(), String> {
+        self.require_readable_schema()?;
         let selected = &self.selected_messages;
         let longer = selected.left.max(selected.right);
         let shorter = selected.left.min(selected.right);
@@ -225,6 +231,16 @@ impl LogDiffReport {
                 "log-diff matched prefix {prefix} exceeds the shorter selected stream ({shorter})"
             )),
             (_, Some(prefix)) => match self.verdict {
+                LogDiffVerdict::NoResult
+                | LogDiffVerdict::Refused
+                | LogDiffVerdict::NoComparableMessages => Err(format!(
+                    "log-diff {:?} report carries a matched prefix",
+                    self.verdict
+                )),
+                _ if longer == 0 => Err(format!(
+                    "log-diff {:?} report carries a matched prefix over 0 | 0 selected messages",
+                    self.verdict
+                )),
                 LogDiffVerdict::Matched | LogDiffVerdict::IdenticalSoFar
                     if prefix != selected.left || prefix != selected.right =>
                 {
@@ -235,12 +251,6 @@ impl LogDiffReport {
                 }
                 LogDiffVerdict::Diverged if prefix >= longer => Err(format!(
                     "log-diff divergence matched all {longer} selected messages"
-                )),
-                LogDiffVerdict::NoResult
-                | LogDiffVerdict::Refused
-                | LogDiffVerdict::NoComparableMessages => Err(format!(
-                    "log-diff {:?} report carries a matched prefix",
-                    self.verdict
                 )),
                 _ => Ok(()),
             },
@@ -416,40 +426,113 @@ mod tests {
             .require_consistent_matched_prefix()
             .unwrap();
 
-        for (label, report) in [
+        // Follow mode stopped before the streams diverged: every selected
+        // message on both sides matched.
+        schema_2(LogDiffVerdict::IdenticalSoFar, 4, 4, Some(4))
+            .require_consistent_matched_prefix()
+            .unwrap();
+
+        for (label, report, message) in [
             (
                 "a match missing its prefix",
                 schema_2(LogDiffVerdict::Matched, 4, 4, None),
+                "log-diff Matched report omitted its matched prefix",
             ),
             (
                 "a partial match",
                 schema_2(LogDiffVerdict::Matched, 4, 4, Some(3)),
+                "log-diff Matched report matched 3 of 4 | 4 selected messages",
             ),
             (
                 "a divergence matching everything",
                 schema_2(LogDiffVerdict::Diverged, 4, 4, Some(4)),
+                "log-diff divergence matched all 4 selected messages",
             ),
             (
                 "a prefix past the shorter side",
                 schema_2(LogDiffVerdict::Diverged, 2, 5, Some(3)),
+                "log-diff matched prefix 3 exceeds the shorter selected stream (2)",
             ),
             (
                 "a divergence missing its prefix",
                 schema_2(LogDiffVerdict::Diverged, 4, 4, None),
+                "log-diff Diverged report omitted its matched prefix",
             ),
             (
                 "a refusal with a prefix",
                 schema_2(LogDiffVerdict::Refused, 0, 0, Some(0)),
+                "log-diff Refused report carries a matched prefix",
+            ),
+            (
+                "a no-result report with a prefix",
+                schema_2(LogDiffVerdict::NoResult, 0, 0, Some(0)),
+                "log-diff NoResult report carries a matched prefix",
+            ),
+            (
+                "an empty comparison with a prefix",
+                schema_2(LogDiffVerdict::NoComparableMessages, 0, 0, Some(0)),
+                "log-diff NoComparableMessages report carries a matched prefix",
+            ),
+            (
+                "a follow-mode report missing its prefix",
+                schema_2(LogDiffVerdict::IdenticalSoFar, 4, 4, None),
+                "log-diff IdenticalSoFar report omitted its matched prefix",
+            ),
+            (
+                "a partial follow-mode match",
+                schema_2(LogDiffVerdict::IdenticalSoFar, 4, 4, Some(3)),
+                "log-diff IdenticalSoFar report matched 3 of 4 | 4 selected messages",
+            ),
+            // 0 == 0 == 0 satisfies "equal to both counts", so these two passed
+            // before the empty-selection rule, as a full match of nothing.
+            (
+                "a match of nothing",
+                schema_2(LogDiffVerdict::Matched, 0, 0, Some(0)),
+                "log-diff Matched report carries a matched prefix over 0 | 0 selected messages",
+            ),
+            (
+                "a follow-mode match of nothing",
+                schema_2(LogDiffVerdict::IdenticalSoFar, 0, 0, Some(0)),
+                "log-diff IdenticalSoFar report carries a matched prefix over 0 | 0 selected messages",
+            ),
+            (
+                "a divergence of nothing",
+                schema_2(LogDiffVerdict::Diverged, 0, 0, Some(0)),
+                "log-diff Diverged report carries a matched prefix over 0 | 0 selected messages",
+            ),
+            // The check on its own must not read an unknown schema as schema 2.
+            (
+                "a future schema",
+                LogDiffReport {
+                    schema: 3,
+                    ..schema_2(LogDiffVerdict::Matched, 4, 4, Some(4))
+                },
+                "log-diff report schema must be one of [1, 2], got 3",
+            ),
+            (
+                "schema zero",
+                LogDiffReport {
+                    schema: 0,
+                    ..schema_2(LogDiffVerdict::Matched, 4, 4, Some(4))
+                },
+                "log-diff report schema must be one of [1, 2], got 0",
             ),
         ] {
-            assert!(
-                report.require_consistent_matched_prefix().is_err(),
-                "{label} must be refused"
+            assert_eq!(
+                report.require_consistent_matched_prefix(),
+                Err(message.to_string()),
+                "{label} must be refused for its own reason"
             );
         }
-        // Nothing compared: nothing measured, and that is consistent.
-        schema_2(LogDiffVerdict::NoComparableMessages, 0, 0, None)
-            .require_consistent_matched_prefix()
-            .unwrap();
+        // Nothing compared: nothing measured, and that is consistent. The
+        // follow-mode timeout can stop before either side selected anything.
+        for verdict in [
+            LogDiffVerdict::NoComparableMessages,
+            LogDiffVerdict::IdenticalSoFar,
+        ] {
+            schema_2(verdict, 0, 0, None)
+                .require_consistent_matched_prefix()
+                .unwrap();
+        }
     }
 }

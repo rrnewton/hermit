@@ -351,6 +351,181 @@ fn test_harness_refuses_the_removed_parity_reference_flag() {
     std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
 }
 
+/// `--probe-disabled` runs ONE disabled cell, so a broad selection with it is
+/// refused before anything runs. A mixed-selection harness test used to cover
+/// the broad case; it was removed with `--parity-reference` in
+/// https://github.com/rrnewton/hermit/issues/3301, and this restores it at the
+/// command line with the exact message. The last two cases pass the
+/// exact-filter check and are refused by the next one, so the filters are what
+/// the first refusal keys on.
+#[test]
+fn test_harness_refuses_a_broad_probe_disabled_selection() {
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let directory = non_repository_dir("broad-probe-disabled");
+    let results = directory.join("results.jsonl");
+    let results_arg = results.to_string_lossy().into_owned();
+    const EXACT: &str =
+        "test-harness: --probe-disabled requires exact --test, --mode, and --backend filters\n";
+    for (arguments, expected) in [
+        (vec!["run", "--probe-disabled"], EXACT),
+        (
+            vec![
+                "run",
+                "--results",
+                results_arg.as_str(),
+                "--category",
+                "backend-parity-c",
+                "--probe-disabled",
+            ],
+            EXACT,
+        ),
+        (
+            vec![
+                "run",
+                "--probe-disabled",
+                "--mode",
+                "verify",
+                "--backend",
+                "kvm",
+            ],
+            EXACT,
+        ),
+        (
+            vec![
+                "run",
+                "--probe-disabled",
+                "--test",
+                "fixture/probe",
+                "--backend",
+                "kvm",
+            ],
+            EXACT,
+        ),
+        (
+            vec![
+                "run",
+                "--probe-disabled",
+                "--test",
+                "fixture/probe",
+                "--mode",
+                "verify",
+            ],
+            EXACT,
+        ),
+        (
+            vec![
+                "plan",
+                "--probe-disabled",
+                "--test",
+                "fixture/probe",
+                "--mode",
+                "verify",
+                "--backend",
+                "kvm",
+            ],
+            "test-harness: --probe-disabled is accepted by run only\n",
+        ),
+        (
+            vec![
+                "run",
+                "--results",
+                results_arg.as_str(),
+                "--probe-disabled",
+                "--test",
+                "fixture/probe",
+                "--mode",
+                "verify",
+                "--backend",
+                "kvm",
+                "--ci-only",
+            ],
+            "test-harness: --probe-disabled is mutually exclusive with --include-manual and \
+             --ci-only\n",
+        ),
+    ] {
+        let output = run_from(harness, &arguments, Some(&directory));
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected,
+            "{arguments:?}"
+        );
+        assert!(!results.exists(), "{arguments:?} created {results:?}");
+    }
+    std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
+}
+
+/// `--check --write` used to write the snapshot while `--write --check` was
+/// refused. Both orders, and a repeated mode flag, are now refused before the
+/// repository is located, so nothing is read or written. The run happens at
+/// the repository root, where a lone `--check` succeeds, so the refusals are
+/// not an artifact of the working directory.
+#[test]
+fn generate_parity_cells_refuses_conflicting_or_repeated_modes() {
+    let binary = env!("CARGO_BIN_EXE_generate-parity-cells");
+    // The refusal repeats the usage text exactly as `--help` prints it.
+    let help = run(binary, &["--help"]);
+    assert!(help.status.success(), "{help:?}");
+    let usage = String::from_utf8(help.stdout).expect("usage is UTF-8");
+    assert!(
+        usage.starts_with("Usage: generate-parity-cells [--check | --write]\n"),
+        "{usage}"
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repository root");
+    let snapshot = root.join("ci/compat-envelope/parity-cells.json");
+    let before = std::fs::read(&snapshot).expect("read the committed snapshot");
+    let modified_before = std::fs::metadata(&snapshot)
+        .and_then(|metadata| metadata.modified())
+        .expect("snapshot mtime");
+    let refusals: [(&[&str], &str); 6] = [
+        (
+            &["--check", "--write"],
+            "--check and --write are mutually exclusive",
+        ),
+        (
+            &["--write", "--check"],
+            "--check and --write are mutually exclusive",
+        ),
+        (&["--write", "--write"], "--write may be given only once"),
+        (&["--check", "--check"], "--check may be given only once"),
+        (&["--bogus"], "unrecognized argument \"--bogus\""),
+        (&["--write", "--bogus"], "unrecognized argument \"--bogus\""),
+    ];
+    for (arguments, message) in refusals {
+        let output = run_from(binary, arguments, Some(&root));
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("generate-parity-cells: {message}\n{usage}"),
+            "{arguments:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&snapshot).expect("reread the committed snapshot"),
+        before
+    );
+    assert_eq!(
+        std::fs::metadata(&snapshot)
+            .and_then(|metadata| metadata.modified())
+            .expect("snapshot mtime"),
+        modified_before,
+        "a refused invocation rewrote {snapshot:?}"
+    );
+
+    let check = run_from(binary, &["--check"], Some(&root));
+    assert!(check.status.success(), "{check:?}");
+    assert!(
+        String::from_utf8_lossy(&check.stdout)
+            .starts_with("ci/compat-envelope/parity-cells.json is canonical and fresh\n"),
+        "{check:?}"
+    );
+}
+
 #[test]
 fn manifest_plan_no_arguments_remains_the_default_text_plan() {
     let output = run(env!("CARGO_BIN_EXE_hermit-manifest-plan"), &[]);

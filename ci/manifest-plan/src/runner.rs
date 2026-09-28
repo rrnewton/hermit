@@ -9475,19 +9475,32 @@ backends_disabled:
     /// fixture Hermit. The fixture records each invocation. It also records any
     /// `log-diff` call and fails it, so a reintroduced cross-backend comparison
     /// cannot pass silently.
-    fn run_production_verify_fixture(backend: &str) -> (CellResult, String, bool) {
+    ///
+    /// `verdict` is the fixture's own same-backend strict-verification verdict.
+    /// A `Diverged` fixture writes a diverged report and exits 1, the shape a
+    /// real `hermit run --verify` produces when its two runs differ.
+    fn run_production_verify_fixture(
+        backend: &str,
+        verdict: Verdict,
+    ) -> (CellResult, String, bool) {
         let root = std::env::temp_dir().join(format!(
-            "hermit-runner-production-verify-{}-{:?}-{backend}",
+            "hermit-runner-production-verify-{}-{:?}-{backend}-{verdict:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(
-            root.join("verification-match.json"),
-            serde_json::to_vec(&parity_fixture_verification(Verdict::Matched)).unwrap(),
+            root.join("verification.json"),
+            serde_json::to_vec(&parity_fixture_verification(verdict)).unwrap(),
         )
         .unwrap();
+        let exit_status = if verdict == Verdict::Diverged {
+            "1"
+        } else {
+            "0"
+        };
+        fs::write(root.join("exit-status"), exit_status).unwrap();
 
         let hermit = root.join("hermit");
         fs::write(
@@ -9523,7 +9536,8 @@ if [ -n "${HERMIT_SABRE_PATH_EVIDENCE-}" ]; then
   printf '%s\n%s\n' "$evidence" "$evidence" > "$HERMIT_SABRE_PATH_EVIDENCE"
 fi
 
-cp "$PWD/verification-match.json" "$verdict"
+cp "$PWD/verification.json" "$verdict"
+exit "$(cat "$PWD/exit-status")"
 "#,
         )
         .unwrap();
@@ -9620,7 +9634,7 @@ cp "$PWD/verification-match.json" "$verdict"
     fn non_ptrace_verify_cells_run_only_their_own_backend() {
         for backend in ["kvm", "liteinst", "sabre"] {
             let (result, invocations, retained_parity_report) =
-                run_production_verify_fixture(backend);
+                run_production_verify_fixture(backend, Verdict::Matched);
             assert_eq!(result.outcome, "PASS", "{backend}: {result:#?}");
             assert_eq!(result.result, Some(ObservedResult::Pass), "{backend}");
             assert_eq!(result.failure_class, None, "{backend}");
@@ -9643,6 +9657,63 @@ cp "$PWD/verification-match.json" "$verdict"
                     InvocationRole::Execution { attempt_index, .. } if attempt_index == "1"
                 ),
                 "{backend}: {observations:#?}"
+            );
+            if backend == "sabre" {
+                assert_eq!(result.execution_path.as_ref().unwrap()["eligible"], true);
+            }
+        }
+    }
+
+    /// The failing half of the test above. Before
+    /// https://github.com/rrnewton/hermit/issues/3301 a non-ptrace cell whose
+    /// own strict verification diverged was a determinism failure, and a SaBRe
+    /// cell kept that result only while its path evidence was eligible. Removing
+    /// the ptrace reference run must not change either fact: the cell fails as a
+    /// product determinism failure, keeps the divergence position its own report
+    /// located, and still runs its backend exactly once.
+    #[test]
+    fn non_ptrace_verify_cells_fail_on_their_own_divergence() {
+        for backend in ["kvm", "liteinst", "sabre"] {
+            let (result, invocations, retained_parity_report) =
+                run_production_verify_fixture(backend, Verdict::Diverged);
+            assert_eq!(result.outcome, "FAIL", "{backend}: {result:#?}");
+            assert_eq!(
+                result.result,
+                Some(ObservedResult::DeterminismFailure),
+                "{backend}"
+            );
+            assert_eq!(
+                result.failure_class,
+                Some(FailureClass::ProductFailure),
+                "{backend}"
+            );
+            assert_eq!(result.error_kind, None, "{backend}");
+            assert!(result.backend_parity.is_none(), "{backend}");
+            assert!(!retained_parity_report, "{backend}");
+            assert_eq!(result.attempts.len(), 1, "{backend}");
+            assert_eq!(
+                verification_verdict(&result.attempts[0]),
+                Some(Verdict::Diverged),
+                "{backend}"
+            );
+            assert_eq!(invocations, format!("run:{backend}\n"));
+            assert_eq!(result.first_divergent_scheduler_turn, Some(7), "{backend}");
+            assert_eq!(
+                result.first_divergent_virtual_nanoseconds,
+                Some(18),
+                "{backend}"
+            );
+            assert_eq!(result.first_divergent_record, Some(2), "{backend}");
+            assert_eq!(result.first_divergent_syscall, Some(1), "{backend}");
+            assert_eq!(
+                result.first_divergent_left_message.as_deref(),
+                Some("candidate-left"),
+                "{backend}"
+            );
+            assert_eq!(
+                result.first_divergent_right_message.as_deref(),
+                Some("candidate-right"),
+                "{backend}"
             );
             if backend == "sabre" {
                 assert_eq!(result.execution_path.as_ref().unwrap()["eligible"], true);

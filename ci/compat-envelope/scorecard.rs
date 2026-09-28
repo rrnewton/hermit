@@ -1476,11 +1476,16 @@ impl ResultRow {
             })
     }
 
-    /// Normal validation publishes `required` rows. A deliberately selected
-    /// disabled cell is admissible only when the row proves that it came from
-    /// the parity path, either with its report or the parity-specific no-result
-    /// disposition. This keeps `--probe-disabled` measurable without turning
-    /// arbitrary disabled runs into scorecard evidence.
+    /// Normal validation publishes `required` rows. A disabled row is
+    /// admissible only when it proves that it came from the parity path, either
+    /// with its report or the parity-specific no-result disposition, so an
+    /// arbitrary disabled run never becomes scorecard evidence.
+    ///
+    /// Since https://github.com/rrnewton/hermit/issues/3301 removed the ptrace
+    /// reference run, no current run writes either proof. This rule therefore
+    /// admits only rows retained from before that change. A `--probe-disabled`
+    /// run now performs only its own backend's verification, and its row is
+    /// refused here.
     fn is_ingestible_classification(&self) -> bool {
         self.classification == "required"
             || (self.classification == "disabled"
@@ -4463,11 +4468,10 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
 
     let mut out = "\n## Cross-backend parity\n\n\
 This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. \
-A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. The CLI can explicitly \
-select eligible not-applicable candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
+A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
-At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification: since https://github.com/rrnewton/hermit/issues/3301 no committed selector runs a ptrace reference, and parity no longer decides a validation outcome. The counts below come from recorded strict ptrace-vs-candidate reports; eligibility does not mean every cell was selected or measured.\n\n\
-| Candidate backend | Ptrace cells selected by full | Not-applicable probe candidates | Measured match | Parity failure | Never measured |\n\
+At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification: since https://github.com/rrnewton/hermit/issues/3301 no committed selector runs a ptrace reference, and parity no longer decides a validation outcome. The counts below come from strict ptrace-vs-candidate reports recorded before that change. No command produces a new one, `--probe-disabled` included: it now runs only the disabled cell's own backend verification. The counts are therefore not refreshed until a new parity producer lands. Eligibility does not mean every cell was selected or measured.\n\n\
+| Candidate backend | Ptrace cells selected by full | Not-applicable candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
     for backend in ordered {
