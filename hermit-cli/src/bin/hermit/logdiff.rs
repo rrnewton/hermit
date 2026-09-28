@@ -652,6 +652,11 @@ fn json_report(
         inputs: None,
         follow_stopped_because: None,
         first_divergent_record: summary.first_divergent_record,
+        // A refused or empty comparison measured no prefix at all; report that
+        // as absent rather than as a zero-length match.
+        matched_prefix_records: summary
+            .matched_prefix_messages
+            .filter(|_| summary.compared_left > 0 || summary.compared_right > 0),
         first_divergent_syscall: summary.first_divergent_syscall,
         comparison: LogDiffComparison {
             stream: stream.to_owned(),
@@ -683,6 +688,7 @@ fn pending_json_report(
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
+        matched_prefix_messages: None,
         first_divergent_syscall: None,
         first_divergent_left_message: None,
         first_divergent_right_message: None,
@@ -1290,6 +1296,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            matched_prefix_messages: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
@@ -1360,6 +1367,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             first_divergent_scheduler_turn: Some(17),
             first_divergent_virtual_nanoseconds: Some(123),
             first_divergent_record: Some(9),
+            matched_prefix_messages: Some(5),
             // A different keyspace from the record index above, deliberately:
             // nine compared records in, only three syscalls completed.
             first_divergent_syscall: Some(3),
@@ -1376,6 +1384,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
         .unwrap();
         assert_eq!(value["verdict"], "diverged");
         assert_eq!(value["selected_messages"]["left"], 8);
+        assert_eq!(value["matched_prefix_records"], 5);
         assert_eq!(value["comparison"]["stream"], "deterministic");
         assert_eq!(value["first_divergent_scheduler_turn"], 17);
         assert_eq!(value["first_divergent_virtual_nanoseconds"], 123);
@@ -1389,34 +1398,35 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             diff_found: false,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            matched_prefix_messages: Some(8),
             ..summary
         };
-        assert_eq!(
-            serde_json::to_value(json_report(
-                &matched,
-                &options,
-                no_records(),
-                RecordEnvelopePolicy::AllRecordsV1,
-            ))
-            .unwrap()["verdict"],
-            "matched"
-        );
+        let matched_value = serde_json::to_value(json_report(
+            &matched,
+            &options,
+            no_records(),
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
+        assert_eq!(matched_value["verdict"], "matched");
+        assert_eq!(matched_value["matched_prefix_records"], 8);
 
         let empty = logdiff::LogDiffSummary {
             compared_left: 0,
             compared_right: 0,
             ..matched
         };
-        assert_eq!(
-            serde_json::to_value(json_report(
-                &empty,
-                &options,
-                no_records(),
-                RecordEnvelopePolicy::AllRecordsV1,
-            ))
-            .unwrap()["verdict"],
-            "no_comparable_messages"
-        );
+        let empty_value = serde_json::to_value(json_report(
+            &empty,
+            &options,
+            no_records(),
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
+        assert_eq!(empty_value["verdict"], "no_comparable_messages");
+        // Nothing was compared, so nothing was measured: absent, not zero.
+        // The key is omitted rather than written as null (see the field doc).
+        assert_eq!(empty_value.get("matched_prefix_records"), None);
 
         let refused = logdiff::LogDiffSummary {
             diff_found: true,
@@ -1432,6 +1442,89 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
         .unwrap();
         assert_eq!(refused["verdict"], "refused");
         assert_eq!(refused["refusal"], "the first log was truncated");
+        assert_eq!(refused.get("matched_prefix_records"), None);
+    }
+
+    /// The matched prefix reaches the JSON report from the real one-shot
+    /// comparator, in selected-message units, for every shape a parity
+    /// consumer scores: identical logs, a divergence at the first selected
+    /// message, a divergence further in, and a strict prefix. Each report also
+    /// passes the schema-2 consistency check a reader applies.
+    #[test]
+    fn json_report_carries_the_matched_prefix_from_the_real_comparator() {
+        let directory = tempfile::tempdir().unwrap();
+        let suffix = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Other);
+        let write = |name: &str, bodies: &[&str]| {
+            let path = directory.path().join(name);
+            let text = bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| {
+                    format!(
+                        "Apr 09 06:08:{:02}.100  INFO detcore: DETLOG {body}{suffix}\n",
+                        index + 1
+                    )
+                })
+                .collect::<String>();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let options = logdiff::LogDiffOpts {
+            comparison: logdiff::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            ..Default::default()
+        };
+        let report = |left: &[&str], right: &[&str]| {
+            let left = write("left.log", left);
+            let right = write("right.log", right);
+            let (summary, left_records, right_records) =
+                try_bitwise_info_v1_with_records(&left, &right, &options).unwrap();
+            let records = LogDiffRecords {
+                compared: left_records.min(right_records),
+                available_left: left_records,
+                available_right: right_records,
+                withheld_incomplete_tail: false,
+            };
+            let report = json_report(
+                &summary,
+                &options,
+                records,
+                RecordEnvelopePolicy::AllRecordsV1,
+            );
+            report.require_consistent_matched_prefix().unwrap();
+            report
+        };
+
+        let identical = report(&["a", "b", "c"], &["a", "b", "c"]);
+        assert_eq!(identical.schema, LOG_DIFF_REPORT_SCHEMA);
+        assert_eq!(identical.verdict, LogDiffVerdict::Matched);
+        assert_eq!(identical.matched_prefix_records, Some(3));
+
+        let at_first = report(&["X", "b", "c"], &["Y", "b", "c"]);
+        assert_eq!(at_first.verdict, LogDiffVerdict::Diverged);
+        assert_eq!(at_first.first_divergent_record, Some(1));
+        assert_eq!(at_first.matched_prefix_records, Some(0));
+
+        let at_fourth = report(&["a", "b", "c", "X", "e"], &["a", "b", "c", "Y", "e"]);
+        assert_eq!(at_fourth.verdict, LogDiffVerdict::Diverged);
+        assert_eq!(at_fourth.first_divergent_record, Some(4));
+        assert_eq!(at_fourth.matched_prefix_records, Some(3));
+
+        // A strict prefix is a divergence, and it matched only the shorter
+        // side. `records.compared` is min(left, right) = 2 here as well, which
+        // is why that bound must not be read as the matched length: it would
+        // say the same 2 for a divergence at the third record of two 5-record
+        // logs.
+        let prefix = report(&["a", "b"], &["a", "b", "c", "d", "e"]);
+        assert_eq!(prefix.verdict, LogDiffVerdict::Diverged);
+        assert_eq!(
+            (
+                prefix.selected_messages.left,
+                prefix.selected_messages.right
+            ),
+            (2, 5)
+        );
+        assert_eq!(prefix.matched_prefix_records, Some(2));
     }
 
     #[test]
@@ -1514,6 +1607,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            matched_prefix_messages: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,

@@ -996,6 +996,21 @@ fn collect_syscalls<'a>(v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
         .collect()
 }
 
+/// Number of leading compared messages that are equal on both sides.
+///
+/// This is the matched prefix in compared-stream units: the zero-based position
+/// of the first differing compared message, or the shorter stream's length when
+/// every shared position agrees. Two equal streams therefore match over their
+/// full length, and a stream that is a strict prefix of the other matches over
+/// the shorter length only -- the extra messages are the divergence.
+fn matched_prefix_length(compared_left: &[String], compared_right: &[String]) -> usize {
+    compared_left
+        .iter()
+        .zip(compared_right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
 fn first_different_message_indices(
     left: &[LogMessage<'_>],
     compared_left: &[String],
@@ -1003,10 +1018,9 @@ fn first_different_message_indices(
     compared_right: &[String],
 ) -> Option<(Option<usize>, Option<usize>)> {
     let common = compared_left.len().min(compared_right.len());
+    let position = matched_prefix_length(compared_left, compared_right);
 
-    if let Some(position) =
-        (0..common).find(|&position| compared_left[position] != compared_right[position])
-    {
+    if position < common {
         return Some((Some(left[position].index), Some(right[position].index)));
     }
 
@@ -1497,6 +1511,17 @@ pub struct LogDiffSummary {
     /// the first N records" is a bound, not a location, and on a long run the
     /// two are far apart; this is the location.
     pub first_divergent_record: Option<usize>,
+    /// Number of leading COMPARED messages that are equal on both sides, in
+    /// the same units as [`Self::compared_left`] and [`Self::compared_right`].
+    ///
+    /// Equal to both compared counts when the streams match. When one stream is
+    /// a strict prefix of the other it is the shorter length, because the extra
+    /// messages are the divergence. None only when the comparison was refused.
+    ///
+    /// This is not [`Self::first_divergent_record`] minus one: that field is a
+    /// raw log-record index, which also counts records outside the compared
+    /// stream.
+    pub matched_prefix_messages: Option<usize>,
     /// How many syscalls the guest had COMPLETED when the divergence appeared,
     /// as detcore's own `finish syscall #N` counter. The fourth unit: a
     /// divergence located at record 108 is easier to act on when you also know
@@ -2026,6 +2051,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            matched_prefix_messages: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
@@ -2180,6 +2206,15 @@ pub fn log_diff_summary_from_strs_with_filter(
             .then_some(first_different)
             .flatten()
             .and_then(|(left_index, right_index)| left_index.or(right_index)),
+        matched_prefix_messages: Some(if diff_found {
+            matched_prefix_length(&prepared_a, &prepared_b)
+        } else {
+            // No difference: the streams agree over their full length. The
+            // external `git diff -w` comparator may accept whitespace-only
+            // differences the exact prefix scan would not, so its verdict,
+            // not the scan, decides a match.
+            compared_a.len().max(compared_b.len())
+        }),
         first_divergent_syscall: diff_found
             .then_some(first_divergent_syscall_candidate)
             .flatten(),
@@ -2698,6 +2733,57 @@ mod test {
         assert_eq!(compare(&same, &same).summary.first_divergent_record, None);
         // And an empty comparison reports no location rather than record zero.
         assert_eq!(compare("", "").summary.first_divergent_record, None);
+    }
+
+    /// The matched prefix counts COMPARED messages, not raw records: equal
+    /// streams match over their full length, a divergence at compared message
+    /// k leaves k - 1 matched, and a strict prefix matches only over the
+    /// shorter length. A non-INFO record ahead of the divergence moves the raw
+    /// record index but not the matched prefix.
+    #[test]
+    fn matched_prefix_counts_leading_equal_compared_messages() {
+        let log = |bodies: &[&str]| {
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| record(index + 1, body))
+                .collect::<String>()
+        };
+        let summary = |left: &str, right: &str| {
+            super::log_diff_summary_from_strs(left, right, &info_opts(), &mut Vec::new())
+                .expect("comparing in-memory strings cannot fail on I/O")
+        };
+
+        let same = log(&["a", "b", "c"]);
+        let identical = summary(&same, &same);
+        assert!(!identical.diff_found);
+        assert_eq!(identical.matched_prefix_messages, Some(3));
+
+        let at_first = summary(&log(&["X", "b", "c"]), &log(&["Y", "b", "c"]));
+        assert!(at_first.diff_found);
+        assert_eq!(at_first.matched_prefix_messages, Some(0));
+        assert_eq!(at_first.first_divergent_record, Some(1));
+
+        let at_third = summary(&log(&["a", "b", "X", "d"]), &log(&["a", "b", "Y", "d"]));
+        assert_eq!(at_third.matched_prefix_messages, Some(2));
+        assert_eq!(at_third.first_divergent_record, Some(3));
+
+        let shorter = summary(&log(&["a", "b"]), &log(&["a", "b", "c", "d"]));
+        assert!(shorter.diff_found);
+        assert_eq!((shorter.compared_left, shorter.compared_right), (2, 4));
+        assert_eq!(shorter.matched_prefix_messages, Some(2));
+
+        let with_debug = format!(
+            "{}Apr 09 06:08:02.100 DEBUG detcore: not compared\n{}",
+            record(1, "a"),
+            record(3, "X")
+        );
+        let unit_mismatch = summary(&with_debug, &log(&["a", "Y"]));
+        assert_eq!(unit_mismatch.matched_prefix_messages, Some(1));
+        assert_eq!(unit_mismatch.first_divergent_record, Some(3));
+
+        let empty = summary("", "");
+        assert_eq!(empty.matched_prefix_messages, Some(0));
     }
 
     /// An untagged line REFUSES the comparison instead of panicking, and the
