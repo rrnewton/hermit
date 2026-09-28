@@ -1174,9 +1174,10 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           # GitHub exposes nested virtualization but leaves /dev/kvm readable
-          # only by root. These shards contain declared KVM cells, so make the
-          # device usable instead of misclassifying permission denial as a
-          # product no-result.
+          # only by root. The hosted-portable profile omits KVM cells because
+          # these runners have no PMU for the KVM guest clock; keep the device
+          # usable so any KVM use that does reach a hosted shard fails as a
+          # product result instead of a permission denial.
           if [[ -e /dev/kvm ]]; then
             sudo chmod a+rw /dev/kvm
             sudo sysctl -w kernel.perf_event_paranoid=-1
@@ -1457,8 +1458,12 @@ jobs:
               and .lane == "portable"
               and .source_tree_dirty == false)
           ' ignored/reduced/results.jsonl >/dev/null
+          # GitHub-hosted runners have no PMU, so the hosted-portable profile
+          # omits KVM cells (HOSTED_PORTABLE_EXCLUDED_BACKENDS in
+          # ci/manifest-plan/src/validation_dag.rs). Local validate still
+          # requires every KVM cell.
           jq -S --argjson expected "$EXPECTED_CELLS" '
-            [.cells[] | select(.lane == "portable")
+            [.cells[] | select(.lane == "portable" and .backend != "kvm")
               | [.lane, .category, .test, .mode, .backend]]
             | select(length == $expected) | sort
           ' ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json
