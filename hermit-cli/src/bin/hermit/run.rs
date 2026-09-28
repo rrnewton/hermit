@@ -4289,14 +4289,14 @@ impl RunOpts {
         // program, and hermit changing its signal dispositions would alter the
         // behaviour being observed.
         //
-        // SAFETY: the closure calls only `prctl(PR_SET_PDEATHSIG)`, which is
-        // async-signal-safe, touches no caller memory, and allocates nothing --
-        // the requirements for a `pre_exec` callback between fork and exec.
+        // SAFETY: the closure calls prctl, statfs, and write without allocation
+        // or stdio locks between fork and exec.
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                     return Err(Errno::last());
                 }
+                hermit::proc_mount::warn_if_readonly_proc();
                 Ok(())
             });
         }
@@ -5066,6 +5066,7 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
+        hermit::proc_mount::warn_if_readonly_proc();
 
         if capture_output && guest_capture.is_some() {
             anyhow::bail!("internal output capture cannot be combined with harness guest capture");
@@ -5154,6 +5155,8 @@ impl RunOpts {
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(Output, u64), Error> {
+        hermit::proc_mount::warn_if_readonly_proc();
+
         // HACK: Use interior mutability to workaround not being able to pass
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();

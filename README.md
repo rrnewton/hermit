@@ -435,6 +435,11 @@ hermit run --namespace-only -- /bin/true
 hermit --log=info run --strace-only -- /bin/true
 ```
 
+If a sandbox denies a writable proc mount, Hermit retries it read-only and
+prints a warning after setup. Reads still work, but guest writes to procfs
+may fail with `EROFS`. Recordings retain the observed proc mode; replay warns
+if its mode differs. Older recordings without this information remain readable.
+
 These are diagnostic modes and do not provide normal determinism. The
 [User Guide](docs/USER_GUIDE.md#troubleshooting) covers host setup, PMU access,
 program visibility, hangs, verification differences, and record/replay. The

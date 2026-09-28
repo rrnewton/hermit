@@ -197,6 +197,10 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// Actual guest proc mount mode after setup. Missing in older recordings or
+    /// when the guest's proc mount could not be inspected; diagnostic only.
+    #[serde(default)]
+    pub proc_readonly: Option<bool>,
     /// Recording-namespace mount roots proven to be Hermit-owned.
     ///
     /// Replay consumes the recorder's raw syscall buffers, so it must apply the
@@ -263,6 +267,7 @@ impl Metadata {
             domainname,
             envs,
             version: RECORD_VERSION,
+            proc_readonly: None,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
             mountinfo_mount_ids_captured: false,

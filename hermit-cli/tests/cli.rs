@@ -1223,6 +1223,13 @@ fn assert_readonly_proc_run(namespace_only: bool) {
         .split_once("\nName:")
         .expect("cat must return both proc mounts and process status");
     readonly_proc::assert_readonly_proc(mounts, status, if namespace_only { 1 } else { 3 });
+    assert_eq!(
+        stderr(&output)
+            .matches(hermit::proc_mount::READONLY_WARNING.trim())
+            .count(),
+        1,
+        "each launch must report the read-only proc mount exactly once: {output:?}"
+    );
 }
 
 #[test]
@@ -1231,8 +1238,128 @@ fn namespace_only_uses_readonly_proc_after_permission_denial() {
 }
 
 #[test]
+fn namespace_only_readonly_proc_warning_tolerates_closed_stderr() {
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+
+    let _guard = hermit_run_guard();
+    let args = [
+        "run",
+        "--namespace-only",
+        "--network=host",
+        "--",
+        "/bin/true",
+    ];
+    let mut descriptors = [-1; 2];
+    // SAFETY: pipe2 initializes both descriptors on success; each resulting
+    // descriptor is transferred into exactly one OwnedFd below.
+    assert_eq!(
+        unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create stderr pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: these are the two distinct descriptors just returned by pipe2.
+    let (reader, writer) = unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
+    };
+    drop(reader);
+    let mut command = readonly_proc_command(&args);
+    command.stderr(Stdio::from(writer));
+    // SAFETY: the callback changes only this child's signal state using
+    // async-signal-safe calls. A broken diagnostic pipe must remain harmless
+    // even when SIGPIPE is neither ignored nor blocked by the caller.
+    unsafe {
+        command.pre_exec(|| {
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            let mut signals = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut signals);
+            libc::sigaddset(&mut signals, libc::SIGPIPE);
+            if libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut()) == -1
+                || libc::sigprocmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command
+        .output()
+        .expect("start namespace-only guest with a broken stderr pipe");
+    assert_success(&output, &args);
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected guest output: {output:?}"
+    );
+}
+
+#[test]
+fn namespace_only_readonly_proc_warning_tolerates_denied_statfs() {
+    let _guard = hermit_run_guard();
+    let args = [
+        "run",
+        "--namespace-only",
+        "--network=host",
+        "--",
+        "/bin/true",
+    ];
+    let mut command = hermit_command(&args);
+    // Deny only the diagnostic probe; container mounts must still complete.
+    deny_syscall(&mut command, libc::SYS_statfs);
+    let output = command
+        .output()
+        .expect("start namespace-only guest with statfs denied");
+    assert_success(&output, &args);
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected guest output: {output:?}"
+    );
+    let stderr = stderr(&output);
+    assert_eq!(
+        stderr
+            .matches("hermit: warning: could not determine the /proc mount mode.")
+            .count(),
+        1,
+        "a failed probe must report the unknown proc mode exactly once: {stderr}"
+    );
+    assert!(
+        !stderr.contains(hermit::proc_mount::READONLY_WARNING.trim()),
+        "a denied probe must not claim to know the proc mode: {stderr}"
+    );
+}
+
+#[test]
 fn run_uses_readonly_proc_after_permission_denial() {
     assert_readonly_proc_run(false);
+}
+
+#[test]
+fn run_verify_uses_readonly_proc_after_permission_denial() {
+    let _guard = hermit_run_guard();
+    let args = [
+        "run",
+        "--verify",
+        "--network=host",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        "/bin/true",
+    ];
+    let output = readonly_proc_command(&args).output().unwrap();
+    assert_success(&output, &args);
+    assert!(stderr(&output).contains("Success: deterministic. Determinism verified."));
+    assert_eq!(
+        stderr(&output)
+            .matches(hermit::proc_mount::READONLY_WARNING.trim())
+            .count(),
+        2,
+        "both verification launches must report their read-only proc once: {output:?}"
+    );
 }
 
 #[test]
@@ -1247,6 +1374,57 @@ fn record_replay_uses_readonly_proc_after_permission_denial() {
         stderr(&output).contains("Success: replay matched recording."),
         "record must complete replay verification under the mount restriction: {output:?}"
     );
+    let stderr = stderr(&output);
+    let (recording, replay) = stderr
+        .split_once(":: Replaying...")
+        .expect("replay started");
+    // These diagnostics inspect the real stopped tracee in each stage, rather
+    // than replaying a recorded statfs result back to the guest.
+    for (stage, diagnostic) in [("recording", recording), ("replay", replay)] {
+        assert_eq!(
+            diagnostic
+                .matches(hermit::proc_mount::READONLY_WARNING.trim())
+                .count(),
+            1,
+            "{stage} must observe a read-only proc mount exactly once: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings() {
+    let _guard = hermit_run_guard();
+    let data = tempfile::tempdir().unwrap();
+    let directory = data.path().to_str().unwrap();
+    let record_args = ["record", "--data-dir", directory, "--", "/bin/true"];
+    let recording = readonly_proc_command(&record_args).output().unwrap();
+    assert_success(&recording, &record_args);
+    let id = fs::read_to_string(data.path().join("last")).unwrap();
+    let metadata_path = data.path().join(id.trim()).join("metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata["proc_readonly"], true, "{metadata}");
+
+    // Model a recording from a writable-proc host, while replay's real mount
+    // remains read-only. A mismatch is diagnostic, not an event-format change.
+    metadata["proc_readonly"] = false.into();
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let replay = readonly_proc_command(&replay_args).output().unwrap();
+    assert_success(&replay, &replay_args);
+    assert!(
+        stderr(&replay)
+            .contains("/proc mount mode differs: recording was read-write, replay is read-only"),
+        "missing proc-mode mismatch warning: {replay:?}"
+    );
+    assert_eq!(stderr(&replay).matches("hermit: warning:").count(), 1);
+
+    metadata.as_object_mut().unwrap().remove("proc_readonly");
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let legacy = readonly_proc_command(&replay_args).output().unwrap();
+    assert_success(&legacy, &replay_args);
+    assert!(stderr(&legacy).contains(hermit::proc_mount::READONLY_WARNING.trim()));
+    assert!(!stderr(&legacy).contains("mount mode differs"));
 }
 
 #[test]
