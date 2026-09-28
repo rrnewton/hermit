@@ -99,12 +99,14 @@ fn bounded_command(program: &Path, arguments: &[&OsStr], seconds: u64) -> Output
 struct Controller {
     child: Option<Child>,
     port_path: PathBuf,
+    contact_path: PathBuf,
     report_path: PathBuf,
 }
 
 impl Controller {
     fn start(program: &Path, directory: &Path) -> (Self, String) {
         let port_path = directory.join("controller.port");
+        let contact_path = directory.join("controller.contact");
         let report_path = directory.join("controller.report");
         let child = Command::new("timeout")
             .args(["--kill-after=1s", &format!("{CONTROLLER_WALL_SECONDS}s")])
@@ -112,6 +114,7 @@ impl Controller {
             .args(["controller"])
             .arg(&port_path)
             .arg(&report_path)
+            .arg(&contact_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -119,6 +122,7 @@ impl Controller {
         let mut controller = Self {
             child: Some(child),
             port_path,
+            contact_path,
             report_path,
         };
 
@@ -168,11 +172,25 @@ impl Controller {
 
     fn stop_without_connection(mut self) {
         let child = self.child.as_mut().expect("controller child exists");
-        child.kill().expect("failed to stop unused TCP controller");
-        let _ = self.finish_child();
+        if child
+            .try_wait()
+            .expect("failed to inspect unused TCP controller")
+            .is_none()
+        {
+            child.kill().expect("failed to stop unused TCP controller");
+        }
+        let output = self.finish_child();
+        assert!(
+            !output.status.success(),
+            "an unused controller must be stopped rather than complete successfully"
+        );
+        assert!(
+            !self.contact_path.exists(),
+            "fail-closed run reached the external controller accept boundary"
+        );
         assert!(
             !self.report_path.exists(),
-            "fail-closed run unexpectedly reached the external controller"
+            "fail-closed run unexpectedly completed the external protocol"
         );
     }
 
@@ -372,6 +390,37 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     assert_success(&output, "native TCP bracket client");
     assert_guest_invariants(&output.stdout, "native TCP bracket client");
     assert_controller_report(&controller.finish());
+}
+
+#[test]
+fn controller_no_contact_oracle_rejects_partial_accepted_connection() {
+    use std::io::Write;
+    use std::net::Shutdown;
+    use std::net::TcpStream;
+
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let evidence = tempfile::tempdir().expect("create controller contact directory");
+    let (controller, port) = Controller::start(fixture, evidence.path());
+    let mut client = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
+        .expect("connect violating partial client");
+    client.write_all(b"x").expect("send partial contact byte");
+    client.shutdown(Shutdown::Write).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !controller.contact_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "controller did not publish accepted-contact witness"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        controller.stop_without_connection();
+    }));
+    assert!(
+        rejected.is_err(),
+        "an accepted partial connection must invalidate the no-contact oracle"
+    );
 }
 
 fn acceptance_evidence_directory() -> (Option<tempfile::TempDir>, PathBuf) {

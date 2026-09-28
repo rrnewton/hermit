@@ -129,7 +129,8 @@ static void publish_text(const char *path, const char *text) {
     fail("rename publication");
 }
 
-static int run_controller(const char *port_path, const char *report_path) {
+static int run_controller(const char *port_path, const char *report_path,
+                          const char *contact_path) {
   set_deadline();
   int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listener < 0)
@@ -158,6 +159,7 @@ static int run_controller(const char *port_path, const char *report_path) {
   int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
   if (client < 0)
     fail("accept controller");
+  publish_text(contact_path, "accepted\n");
   set_socket_timeouts(client);
   close(listener);
 
@@ -350,8 +352,8 @@ static int run_client(const char *port_text, int mismatch) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 4 && strcmp(argv[1], "controller") == 0)
-    return run_controller(argv[2], argv[3]);
+  if (argc == 5 && strcmp(argv[1], "controller") == 0)
+    return run_controller(argv[2], argv[3], argv[4]);
   if (argc == 4 && strcmp(argv[1], "client") == 0) {
     if (strcmp(argv[3], "match") == 0)
       return run_client(argv[2], 0);
@@ -359,7 +361,7 @@ int main(int argc, char **argv) {
       return run_client(argv[2], 1);
   }
   fprintf(stderr,
-          "usage: %s controller PORT_FILE REPORT_FILE | client PORT "
+          "usage: %s controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
           "match|mismatch\n",
           argv[0]);
   return 2;
