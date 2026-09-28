@@ -1,0 +1,291 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Module provides cross platform access to common registers.
+//!
+//! Currently supports aarch64 and x86_64 architectures.
+
+/// A single register.
+#[cfg(target_pointer_width = "64")]
+pub type Reg = u64;
+
+/// A single register.
+#[cfg(target_pointer_width = "32")]
+pub type Reg = u32;
+
+/// The arguments to a syscall.
+pub type ArgRegs = (Reg, Reg, Reg, Reg, Reg, Reg);
+
+/// This trait enables architecture-independent access to general purpose
+/// registers.
+pub trait RegAccess {
+    /// Returns the value of the instruction pointer (aka the program counter).
+    fn ip(&self) -> Reg;
+
+    /// Mutable access to the instruction pointer (aka the program counter).
+    fn ip_mut(&mut self) -> &mut Reg;
+
+    /// Returns the value of the stack pointer.
+    fn stack_ptr(&self) -> Reg;
+
+    /// Mutable access to the stack pointer.
+    fn stack_ptr_mut(&mut self) -> &mut Reg;
+
+    /// Returns the value of the stack frame pointer.
+    ///
+    /// NOTE: The frame pointer is not guaranteed to be available. For example,
+    /// if `-fomit-frame-pointer` was used (often the default), this will not
+    /// return the correct address.
+    fn frame_ptr(&self) -> Reg;
+
+    /// Mutable access to the stack frame pointer.
+    fn frame_ptr_mut(&mut self) -> &mut Reg;
+
+    /// Returns the value of the register where the syscall number is stored.
+    ///
+    /// NOTE: Depending on the context, this may not actually be a syscall
+    /// number.
+    fn syscall(&self) -> Reg;
+
+    /// Mutable access to the register where the syscall number is stored.
+    ///
+    /// NOTE: Depending on the context, this may not actually be a syscall
+    /// number.
+    fn syscall_mut(&mut self) -> &mut Reg;
+
+    /// This is like [`RegAccess::syscall`] except that it is guaranteed to be
+    /// available after the syscall has executed. On x86-64, the syscall number
+    /// is clobbered by the return value when a syscall is executed.
+    ///
+    /// NOTE: Depending on the context, this may not actually be a syscall
+    /// number.
+    fn orig_syscall(&self) -> Reg;
+
+    /// Mutable access to the register where the syscall number is stored.
+    ///
+    /// NOTE: Depending on the context, this may not actually be a syscall
+    /// number.
+    fn orig_syscall_mut(&mut self) -> &mut Reg;
+
+    /// Returns the value of the register where the syscall return value is
+    /// stored.
+    fn ret(&self) -> Reg;
+
+    /// Mutable access to the register where the syscall return value is stored.
+    fn ret_mut(&mut self) -> &mut Reg;
+
+    /// Returns the set of 6 arguments that are used by the syscall instruction.
+    fn args(&self) -> ArgRegs;
+
+    /// Mutable access to the appropriate registers for the syscall arguments.
+    fn set_args(&mut self, args: ArgRegs);
+
+    /// Restore the registers that the syscall instruction architecturally
+    /// clobbers (and that the kernel does not otherwise restore) by copying them
+    /// from `saved`, a snapshot taken before the syscall executed.
+    ///
+    /// On x86-64 the `syscall` instruction clobbers `%rcx` (which holds the
+    /// return instruction pointer) and `%r11` (which holds the saved `RFLAGS`).
+    /// When Reverie injects a syscall from its private trampoline page, these
+    /// end up holding the trampoline's `RIP`/`RFLAGS`; restoring them from the
+    /// guest's own pre-syscall snapshot keeps the injection transparent and
+    /// prevents a tracer-internal address from leaking into the guest.
+    ///
+    /// On aarch64 the `svc` instruction has no equivalent clobber, so this is a
+    /// no-op.
+    fn restore_syscall_clobbers(&mut self, saved: &Self);
+}
+
+#[cfg(target_arch = "x86_64")]
+impl RegAccess for libc::user_regs_struct {
+    fn ip(&self) -> Reg {
+        self.rip
+    }
+
+    fn ip_mut(&mut self) -> &mut Reg {
+        &mut self.rip
+    }
+
+    fn stack_ptr(&self) -> Reg {
+        self.rsp
+    }
+
+    fn stack_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.rsp
+    }
+
+    fn frame_ptr(&self) -> Reg {
+        self.rbp
+    }
+
+    fn frame_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.rbp
+    }
+
+    fn syscall(&self) -> Reg {
+        self.rax
+    }
+
+    fn syscall_mut(&mut self) -> &mut Reg {
+        &mut self.rax
+    }
+
+    fn orig_syscall(&self) -> Reg {
+        // Note that we use orig_rax here because it is still available even
+        // after the syscall has executed.
+        self.orig_rax
+    }
+
+    fn orig_syscall_mut(&mut self) -> &mut Reg {
+        &mut self.orig_rax
+    }
+
+    fn ret(&self) -> Reg {
+        self.rax
+    }
+
+    fn ret_mut(&mut self) -> &mut Reg {
+        &mut self.rax
+    }
+
+    fn args(&self) -> ArgRegs {
+        (self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9)
+    }
+
+    fn set_args(&mut self, args: ArgRegs) {
+        self.rdi = args.0;
+        self.rsi = args.1;
+        self.rdx = args.2;
+        self.r10 = args.3;
+        self.r8 = args.4;
+        self.r9 = args.5;
+    }
+
+    fn restore_syscall_clobbers(&mut self, saved: &Self) {
+        // The `syscall` instruction clobbers %rcx (return RIP) and %r11 (RFLAGS).
+        self.rcx = saved.rcx;
+        self.r11 = saved.r11;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl RegAccess for libc::user_regs_struct {
+    fn ip(&self) -> Reg {
+        self.pc
+    }
+
+    fn ip_mut(&mut self) -> &mut Reg {
+        &mut self.pc
+    }
+
+    fn stack_ptr(&self) -> Reg {
+        self.sp
+    }
+
+    fn stack_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.sp
+    }
+
+    fn frame_ptr(&self) -> Reg {
+        // aarch64 uses x29 for the frame pointer (unless `-fomit-frame-pointer`
+        // is used).
+        self.regs[29]
+    }
+
+    fn frame_ptr_mut(&mut self) -> &mut Reg {
+        &mut self.regs[29]
+    }
+
+    fn syscall(&self) -> Reg {
+        self.regs[8]
+    }
+
+    fn syscall_mut(&mut self) -> &mut Reg {
+        &mut self.regs[8]
+    }
+
+    fn orig_syscall(&self) -> Reg {
+        self.regs[8]
+    }
+
+    fn orig_syscall_mut(&mut self) -> &mut Reg {
+        &mut self.regs[8]
+    }
+
+    fn ret(&self) -> Reg {
+        self.regs[0]
+    }
+
+    fn ret_mut(&mut self) -> &mut Reg {
+        &mut self.regs[0]
+    }
+
+    fn args(&self) -> ArgRegs {
+        (
+            self.regs[0],
+            self.regs[1],
+            self.regs[2],
+            self.regs[3],
+            self.regs[4],
+            self.regs[5],
+        )
+    }
+
+    fn set_args(&mut self, args: ArgRegs) {
+        self.regs[0] = args.0;
+        self.regs[1] = args.1;
+        self.regs[2] = args.2;
+        self.regs[3] = args.3;
+        self.regs[4] = args.4;
+        self.regs[5] = args.5;
+    }
+
+    fn restore_syscall_clobbers(&mut self, _saved: &Self) {
+        // The aarch64 `svc` instruction has no rcx/r11-style clobber to restore.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::MaybeUninit;
+
+    use super::*;
+
+    #[test]
+    fn basic() {
+        let mut regs = unsafe { MaybeUninit::<libc::user_regs_struct>::zeroed().assume_init() };
+
+        assert_eq!(regs.ip(), 0);
+
+        *regs.ip_mut() = 42;
+
+        assert_eq!(regs.ip(), 42);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn restore_syscall_clobbers_copies_rcx_r11() {
+        // `current` simulates registers just after an injected trampoline
+        // syscall: %rcx/%r11 hold the trampoline's RIP/RFLAGS.
+        let mut current = unsafe { MaybeUninit::<libc::user_regs_struct>::zeroed().assume_init() };
+        current.rcx = 0xdead_beef; // e.g. a tracer-internal trampoline address
+        current.r11 = 0x0202;
+        current.rax = 0x1234; // an unrelated register must be left untouched
+
+        // `saved` is the guest's own pre-syscall snapshot.
+        let mut saved = unsafe { MaybeUninit::<libc::user_regs_struct>::zeroed().assume_init() };
+        saved.rcx = 0x4000_1000; // guest's own return RIP
+        saved.r11 = 0x0246; // guest's own RFLAGS
+
+        current.restore_syscall_clobbers(&saved);
+
+        assert_eq!(current.rcx, 0x4000_1000, "rcx must be restored from guest");
+        assert_eq!(current.r11, 0x0246, "r11 must be restored from guest");
+        assert_eq!(current.rax, 0x1234, "other registers must be untouched");
+    }
+}

@@ -1,0 +1,417 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#![cfg(target_arch = "x86_64")]
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+use kvm_ioctls::Kvm;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
+use reverie::GlobalTool;
+use reverie::Guest;
+use reverie::Pid;
+use reverie::Tool;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
+use reverie_kvm::KvmBackend;
+use reverie_kvm::SyscallInfo;
+use reverie_kvm::SyscallRequest;
+use reverie_kvm::Sysno;
+
+const MEMORY_SIZE: usize = 0x10_000;
+const ENTRY_POINT: u64 = 0x1000;
+const FRAME_ADDRESS: u64 = 0x2000;
+const MESSAGE_ADDRESS: u64 = 0x3000;
+const CPUID_RESULT_ADDRESS: u16 = 0x4000;
+
+fn kvm_is_unavailable(error: &kvm_ioctls::Error) -> bool {
+    matches!(error.errno(), libc::ENOENT | libc::EACCES | libc::EPERM)
+}
+
+fn kvm_available(test: &str) -> bool {
+    match Kvm::new() {
+        Ok(_) => true,
+        Err(error) if kvm_is_unavailable(&error) => {
+            if std::env::var_os("REVERIE_REQUIRE_KVM").is_some() {
+                panic!("{test} requires usable /dev/kvm: {error}");
+            }
+            eprintln!("skipping {test}: cannot open /dev/kvm: {error}");
+            false
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+}
+
+#[test]
+fn identifies_unavailable_kvm_errors() {
+    for errno in [libc::ENOENT, libc::EACCES, libc::EPERM] {
+        let error = kvm_ioctls::Error::new(errno);
+        assert!(kvm_is_unavailable(&error));
+    }
+
+    let error = kvm_ioctls::Error::new(libc::EINVAL);
+    assert!(!kvm_is_unavailable(&error));
+}
+
+#[test]
+fn guest_write_syscall_is_intercepted_via_vmcall() {
+    if !kvm_available("guest_write_syscall_is_intercepted_via_vmcall") {
+        return;
+    }
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .memory_mut()
+        .write(MESSAGE_ADDRESS, b"hello")
+        .unwrap();
+    backend
+        .install_syscall(
+            ENTRY_POINT,
+            FRAME_ADDRESS,
+            SyscallRequest::new(libc::SYS_write as u64, [1, MESSAGE_ADDRESS, 5, 0, 0, 0]),
+        )
+        .unwrap();
+
+    let mut intercepted = None;
+    backend
+        .run(|syscall, memory| {
+            let (number, args) = syscall.into_parts();
+            let mut message = vec![0; args.arg2];
+            memory.read(args.arg1 as u64, &mut message).unwrap();
+            intercepted = Some((number, args.arg0, message));
+            args.arg2 as i64
+        })
+        .unwrap();
+
+    assert_eq!(intercepted, Some((Sysno::write, 1, b"hello".to_vec())));
+}
+
+#[test]
+fn guest_program_routes_required_syscalls_via_vmcall() {
+    if !kvm_available("guest_program_routes_required_syscalls_via_vmcall") {
+        return;
+    }
+
+    let expected = [
+        Sysno::read,
+        Sysno::write,
+        Sysno::open,
+        Sysno::close,
+        Sysno::mmap,
+        Sysno::munmap,
+        Sysno::brk,
+        Sysno::ioctl,
+    ];
+    let requests = expected.map(|number| SyscallRequest::new(number.id() as u64, [0; 6]));
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_syscalls(ENTRY_POINT, FRAME_ADDRESS, &requests)
+        .unwrap();
+
+    let mut intercepted = Vec::new();
+    backend
+        .run(|syscall, _memory| {
+            intercepted.push(syscall.number());
+            0
+        })
+        .unwrap();
+
+    assert_eq!(intercepted, expected);
+}
+
+#[test]
+fn deterministic_cpuid_policy_is_visible_inside_vm() {
+    if !kvm_available("deterministic_cpuid_policy_is_visible_inside_vm") {
+        return;
+    }
+
+    let mut program = Vec::new();
+    append_cpuid_probe(&mut program, 0, 0, CPUID_RESULT_ADDRESS);
+    append_cpuid_probe(&mut program, 1, 0, CPUID_RESULT_ADDRESS + 16);
+    append_cpuid_probe(&mut program, 7, 0, CPUID_RESULT_ADDRESS + 32);
+    append_cpuid_probe(&mut program, 7, 1, CPUID_RESULT_ADDRESS + 48);
+    append_cpuid_probe(&mut program, 0xd, 0, CPUID_RESULT_ADDRESS + 64);
+    append_cpuid_probe(&mut program, 0xd, 1, CPUID_RESULT_ADDRESS + 80);
+    append_cpuid_probe(&mut program, 0xd, 2, CPUID_RESULT_ADDRESS + 96);
+    append_cpuid_probe(&mut program, 0xd, 17, CPUID_RESULT_ADDRESS + 112);
+    append_cpuid_probe(&mut program, 0xd, 18, CPUID_RESULT_ADDRESS + 128);
+    append_cpuid_probe(&mut program, 0xd, 19, CPUID_RESULT_ADDRESS + 144);
+    append_cpuid_probe(&mut program, 2, 0, CPUID_RESULT_ADDRESS + 160);
+    append_cpuid_probe(&mut program, 0x8000_0000, 0, CPUID_RESULT_ADDRESS + 176);
+    append_cpuid_probe(&mut program, 0x8000_0001, 0, CPUID_RESULT_ADDRESS + 192);
+    append_cpuid_probe(&mut program, 0x15, 0, CPUID_RESULT_ADDRESS + 208);
+    append_cpuid_probe(&mut program, 0x8000_000b, 0, CPUID_RESULT_ADDRESS + 224);
+    append_cpuid_probe(&mut program, 4, 0, CPUID_RESULT_ADDRESS + 240);
+    append_cpuid_probe(&mut program, 4, 1, CPUID_RESULT_ADDRESS + 256);
+    append_cpuid_probe(&mut program, 0xb, 0, CPUID_RESULT_ADDRESS + 272);
+    append_cpuid_probe(&mut program, 0xb, 1, CPUID_RESULT_ADDRESS + 288);
+    program.push(0xf4); // hlt
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .install_real_mode_program(ENTRY_POINT, &program)
+        .unwrap();
+    backend
+        .run(|_, _| panic!("CPUID program must not issue a syscall"))
+        .unwrap();
+
+    let vendor = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS);
+    assert_eq!(vendor[0], 0x0000_000d);
+    assert_eq!(vendor[1], u32::from_le_bytes(*b"Genu"));
+    assert_eq!(vendor[2], u32::from_le_bytes(*b"ntel"));
+    assert_eq!(vendor[3], u32::from_le_bytes(*b"ineI"));
+
+    let leaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 16);
+    assert_eq!(leaf1[0], 0x0000_0663);
+    assert_eq!(leaf1[1], 0x0000_0800);
+    assert_eq!(
+        leaf1[2],
+        bit(0) | bit(9) | bit(13) | bit(19) | bit(20) | bit(23) | bit(26) | bit(28)
+    );
+    assert_eq!(leaf1[3], 0x078b_fbfd);
+    assert_eq!(leaf1[2] & bit(30), 0, "RDRAND must be hidden");
+
+    let leaf7 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 32);
+    assert_eq!(leaf7, [0; 4]);
+
+    let leaf7_subleaf1 = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 48);
+    assert_eq!(leaf7_subleaf1, [0; 4]);
+
+    let xstate = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 64);
+    // This real-mode program runs before the long-mode bootstrap enables the
+    // YMM state in XCR0. KVM ignores the table's subleaf-0 EBX field and
+    // derives the guest-visible EBX from the currently enabled state, while
+    // ECX continues to report the fixed maximum size.
+    assert_eq!(xstate, [0x0000_0007, 0x0000_0240, 0x0000_0340, 0]);
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 80),
+        [0; 4],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 96),
+        [0x0000_0100, 0x0000_0240, 0, 0],
+    );
+    for offset in [112, 128, 144] {
+        assert_eq!(
+            read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + offset),
+            [0; 4],
+        );
+    }
+
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 160),
+        [0x0000_0001, 0x0000_0000, 0x0000_004d, 0x002c_307d],
+    );
+    let extended = read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 176);
+    assert_eq!(extended[0], 0x8000_000a);
+    assert_eq!(extended[1], u32::from_le_bytes(*b"Genu"));
+    assert_eq!(extended[2], u32::from_le_bytes(*b"ntel"));
+    assert_eq!(extended[3], u32::from_le_bytes(*b"ineI"));
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 192),
+        [0x0000_0663, 0x0000_0000, 0x0000_0001, 0x2010_0800],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 208),
+        xstate,
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 224),
+        xstate,
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 240),
+        [0x0000_0120, 0x01c0_003f, 0x0000_003f, 0x0000_0001],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 256),
+        [0; 4],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 272),
+        [0x0000_0000, 0x0000_0001, 0x0000_0100, 0x0000_0001],
+    );
+    assert_eq!(
+        read_cpuid_result(&backend, CPUID_RESULT_ADDRESS + 288),
+        [0; 4],
+    );
+}
+
+fn append_cpuid_probe(program: &mut Vec<u8>, leaf: u32, subleaf: u32, output: u16) {
+    program.extend_from_slice(&[0x66, 0xb8]); // mov eax, leaf
+    program.extend_from_slice(&leaf.to_le_bytes());
+    program.extend_from_slice(&[0x66, 0xb9]); // mov ecx, subleaf
+    program.extend_from_slice(&subleaf.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0xa2]); // cpuid
+
+    program.extend_from_slice(&[0x66, 0xa3]); // mov [output], eax
+    program.extend_from_slice(&output.to_le_bytes());
+    for (register, offset) in [(0x1e, 4), (0x0e, 8), (0x16, 12)] {
+        program.extend_from_slice(&[0x66, 0x89, register]);
+        program.extend_from_slice(&(output + offset).to_le_bytes());
+    }
+}
+
+fn read_cpuid_result(backend: &KvmBackend, address: u16) -> [u32; 4] {
+    let mut bytes = [0; 16];
+    backend.memory().read(address.into(), &mut bytes).unwrap();
+    std::array::from_fn(|index| {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    })
+}
+
+const fn bit(index: u32) -> u32 {
+    1 << index
+}
+
+#[derive(Default)]
+struct PassthroughTool;
+
+#[reverie::tool]
+impl Tool for PassthroughTool {
+    type GlobalState = ();
+    type ThreadState = ();
+}
+
+#[derive(Default)]
+struct RecordingGlobal {
+    events: AtomicUsize,
+}
+
+#[reverie::global_tool]
+impl GlobalTool for RecordingGlobal {
+    type Request = usize;
+    type Response = ();
+    type Config = ();
+
+    async fn receive_rpc(&self, _from: Pid, event: usize) {
+        self.events.fetch_or(event, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+struct RecordingTool;
+
+#[reverie::tool]
+impl Tool for RecordingTool {
+    type GlobalState = RecordingGlobal;
+    type ThreadState = usize;
+
+    async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, reverie::Error> {
+        let Syscall::Write(write) = syscall else {
+            panic!("expected a typed write syscall, got {syscall:?}");
+        };
+        assert_eq!(write.fd(), 1);
+        let registers = guest.regs().await;
+        assert_eq!(registers.orig_rax, libc::SYS_write as u64);
+        // The guest program loads the transport number and frame address with
+        // two 0x66-prefixed movs (6 bytes each) before the hypercall, so rip
+        // reports the transport instruction 12 bytes into the program.
+        assert_eq!(registers.rip, ENTRY_POINT + 12);
+
+        let mut message = vec![0; write.len()];
+        guest.memory().read_exact(
+            write.buf().expect("write buffer must be non-null"),
+            &mut message,
+        )?;
+        assert_eq!(message, b"hello");
+
+        *guest.thread_state_mut() += 1;
+        guest.send_rpc(1).await;
+        Ok(write.len() as i64)
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        _tid: Pid,
+        global: &G,
+        thread_state: Self::ThreadState,
+        status: ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        assert_eq!(thread_state, 1);
+        assert_eq!(status, ExitStatus::SUCCESS);
+        global.send_rpc(2).await;
+        Ok(())
+    }
+}
+
+#[test]
+fn guest_write_syscall_runs_shared_reverie_tool() {
+    if !kvm_available("guest_write_syscall_runs_shared_reverie_tool") {
+        return;
+    }
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .memory_mut()
+        .write(MESSAGE_ADDRESS, b"hello")
+        .unwrap();
+    backend
+        .install_syscall(
+            ENTRY_POINT,
+            FRAME_ADDRESS,
+            SyscallRequest::new(libc::SYS_write as u64, [1, MESSAGE_ADDRESS, 5, 0, 0, 0]),
+        )
+        .unwrap();
+
+    let global = futures::executor::block_on(backend.run_with_tool::<RecordingTool, _>(
+        (),
+        |_: &SyscallRequest, _: &reverie_kvm::GuestMemory| {
+            panic!("intercepting tool must not inject its write syscall")
+        },
+    ))
+    .unwrap();
+    assert_eq!(global.events.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn default_tool_handler_tail_injects_through_executor() {
+    if !kvm_available("default_tool_handler_tail_injects_through_executor") {
+        return;
+    }
+
+    let mut backend = KvmBackend::new(MEMORY_SIZE).unwrap();
+    backend
+        .memory_mut()
+        .write(MESSAGE_ADDRESS, b"hello")
+        .unwrap();
+    backend
+        .install_syscall(
+            ENTRY_POINT,
+            FRAME_ADDRESS,
+            SyscallRequest::new(libc::SYS_write as u64, [1, MESSAGE_ADDRESS, 5, 0, 0, 0]),
+        )
+        .unwrap();
+
+    let observed = Arc::new(Mutex::new(None));
+    let executor_observed = observed.clone();
+    futures::executor::block_on(backend.run_with_tool::<PassthroughTool, _>(
+        (),
+        move |request: &SyscallRequest, memory: &reverie_kvm::GuestMemory| {
+            let mut message = vec![0; request.args()[2] as usize];
+            memory.read(request.args()[1], &mut message).unwrap();
+            *executor_observed.lock().unwrap() = Some((request.number(), message));
+            request.args()[2] as i64
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some((libc::SYS_write as u64, b"hello".to_vec()))
+    );
+}

@@ -1,0 +1,1973 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+use std::fs::File;
+use std::os::fd::FromRawFd;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use kvm_bindings::CpuId;
+use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+use kvm_bindings::kvm_enable_cap;
+use kvm_bindings::kvm_regs;
+use kvm_bindings::kvm_userspace_memory_region;
+use kvm_bindings::kvm_xsave;
+use kvm_ioctls::Cap;
+use kvm_ioctls::Kvm;
+use kvm_ioctls::VcpuExit;
+use kvm_ioctls::VcpuFd;
+use kvm_ioctls::VmFd;
+use reverie::BackendChildWaitEvent;
+use reverie::BackendChildWaitState;
+use reverie::BackendStatsRequest;
+use reverie::BackendStatsSource;
+use reverie::ExitStatus;
+use reverie::GlobalTool;
+use reverie::Pid;
+use reverie::ThreadOwnership;
+use reverie::Tool;
+
+use crate::CpuidPolicy;
+use crate::Error;
+use crate::GuestMemory;
+use crate::Result;
+use crate::Syscall;
+use crate::SyscallRequest;
+use crate::bootstrap::BOOT_RESERVED_END;
+use crate::bootstrap::MAX_GUEST_THREADS;
+use crate::bootstrap::SYSCALL_FRAME_ADDRESS;
+use crate::bootstrap::SYSCALL_TRAMPOLINE_ADDRESS;
+use crate::bootstrap::SegmentBase;
+use crate::bootstrap::THREAD_SYSCALL_AREA_START;
+use crate::bootstrap::THREAD_SYSCALL_AREA_STRIDE;
+use crate::bootstrap::THREAD_TOOL_STACK_AREA_START;
+use crate::bootstrap::TOOL_STACK_SIZE;
+use crate::bootstrap::TOOL_STACK_TOP;
+use crate::bootstrap::configure_long_mode;
+use crate::bootstrap::configure_long_mode_with_syscall_area;
+use crate::bootstrap::configure_process_syscall_return;
+use crate::bootstrap::configure_user_segments;
+use crate::bootstrap::exception_from_halt;
+use crate::bootstrap::exception_pushes_error_code;
+use crate::bootstrap::set_syscall_return_park;
+use crate::bootstrap::set_user_segment_base;
+use crate::bootstrap::thread_tool_stack_top;
+use crate::elf::LoadedStaticElf;
+use crate::elf::load_static_elf;
+use crate::executor::ChildCompletion;
+use crate::executor::ElfExecutor;
+use crate::executor::ProcessAction;
+use crate::executor::conventional_exit_code;
+use crate::runtime::SyscallExecutor;
+use crate::runtime::ToolContext;
+use crate::stats::KvmBackendStats;
+use crate::stats::KvmExitCollector;
+use crate::syscall::FRAME_SIZE;
+
+/// KVM currently permits userspace exits for this standardized hypercall.
+/// The prototype uses it as a transport opcode and places the syscall frame
+/// address in the first hypercall argument.
+pub const VMCALL_SYSCALL_TRANSPORT: u64 = 12;
+
+const SYSCALL_FRAME_STRIDE: u64 = 4096;
+const PAGE_SIZE: u64 = 4096;
+const VMCALL: [u8; 3] = [0x0f, 0x01, 0xc1];
+const VMMCALL: [u8; 3] = [0x0f, 0x01, 0xd9];
+const HLT: u8 = 0xf4;
+const VMWARE_BACKDOOR_MAGIC: u64 = 0x564d_5868;
+const VMWARE_BACKDOOR_PORT: u64 = 0x5658;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticElfException {
+    vector: u8,
+    instruction_pointer: u64,
+    stack_pointer: u64,
+    rflags: u64,
+}
+
+extern "C" fn interrupt_guest_worker(_signal: libc::c_int) {}
+
+fn worker_interrupt_signal() -> libc::c_int {
+    libc::SIGURG
+}
+
+fn install_worker_interrupt_handler() -> Result<()> {
+    static INSTALL_ERRNO: OnceLock<libc::c_int> = OnceLock::new();
+    let errno = *INSTALL_ERRNO.get_or_init(|| {
+        // SAFETY: action is initialized before sigaction reads it. The handler
+        // performs no operations and exists only to make blocking syscalls
+        // return EINTR during KVM thread-group teardown.
+        unsafe {
+            let mut action = std::mem::zeroed::<libc::sigaction>();
+            action.sa_sigaction = interrupt_guest_worker as *const () as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(worker_interrupt_signal(), &action, std::ptr::null_mut()) == 0 {
+                0
+            } else {
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            }
+        }
+    });
+    if errno == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(errno).into())
+    }
+}
+
+fn set_guest_interrupt_signal_mask(how: libc::c_int) -> Result<bool> {
+    // SAFETY: set and previous are initialized before libc reads or writes them.
+    unsafe {
+        let mut set = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, worker_interrupt_signal());
+        let error = libc::pthread_sigmask(how, &set, &mut previous);
+        if error != 0 {
+            return Err(std::io::Error::from_raw_os_error(error).into());
+        }
+        Ok(libc::sigismember(&previous, worker_interrupt_signal()) == 1)
+    }
+}
+
+#[derive(Default)]
+// TODO-HUMAN-REVIEW(PR-172): Review process-wide KVM worker cancellation state.
+struct GuestThreadGroup {
+    cancelled: AtomicBool,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Propagate worker exit_group to the root vCPU.
+    // TODO-HUMAN-REVIEW(PR-177): Review KVM thread-group exit ordering.
+    exit_status: Mutex<Option<ExitStatus>>,
+    root: Mutex<Option<libc::pthread_t>>,
+    workers: Mutex<Vec<libc::pthread_t>>,
+    // AUTONOMOUS-BOT-IMPLEMENTED: Join cancelled KVM workers before root teardown returns.
+    // TODO-HUMAN-REVIEW(PR-178): Review KVM worker join ordering.
+    worker_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    transport_slots: Mutex<Vec<bool>>,
+}
+
+impl GuestThreadGroup {
+    fn exit_status(&self) -> Option<ExitStatus> {
+        *self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned")
+    }
+
+    fn request_exit_group(&self, status: ExitStatus) {
+        self.exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned")
+            .get_or_insert(status);
+        self.cancelled.store(true, Ordering::Release);
+
+        if let Some(root) = *self.root.lock().expect("KVM guest root lock poisoned") {
+            // SAFETY: root is registered for the lifetime of its run loop.
+            unsafe {
+                libc::pthread_kill(root, worker_interrupt_signal());
+            }
+        }
+        let workers = self.workers.lock().expect("KVM guest worker lock poisoned");
+        for &worker in workers.iter() {
+            // SAFETY: the registry lock keeps each pthread ID live for this call.
+            unsafe {
+                libc::pthread_kill(worker, worker_interrupt_signal());
+            }
+        }
+    }
+
+    fn add_worker_handle(&self, handle: std::thread::JoinHandle<()>) {
+        self.worker_handles
+            .lock()
+            .expect("KVM guest worker-handle lock poisoned")
+            .push(handle);
+    }
+
+    fn join_workers(&self) {
+        // A worker may register a nested clone while an earlier batch is joining.
+        loop {
+            let handles = std::mem::take(
+                &mut *self
+                    .worker_handles
+                    .lock()
+                    .expect("KVM guest worker-handle lock poisoned"),
+            );
+            if handles.is_empty() {
+                return;
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    eprintln!("reverie-kvm guest thread panicked during teardown");
+                }
+            }
+        }
+    }
+
+    fn cancel_workers(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let workers = self.workers.lock().expect("KVM guest worker lock poisoned");
+        for &worker in workers.iter() {
+            // SAFETY: the registry lock keeps each pthread ID live for this call.
+            unsafe {
+                libc::pthread_kill(worker, worker_interrupt_signal());
+            }
+        }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-211): Review KVM exec sibling cancellation ordering.
+    fn rearm_after_exec(&self) {
+        *self
+            .exit_status
+            .lock()
+            .expect("KVM exit-group lock poisoned") = None;
+        self.cancelled.store(false, Ordering::Release);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED: Reuse syscall transports after guest threads exit.
+    // TODO-HUMAN-REVIEW(PR-176): Review KVM transport slot lifecycle.
+    fn reserve_transport_slot(&self, child_tid: i32) -> Result<usize> {
+        let mut slots = self
+            .transport_slots
+            .lock()
+            .expect("KVM transport-slot lock poisoned");
+        if slots.is_empty() {
+            slots.resize(MAX_GUEST_THREADS as usize, false);
+        }
+        let slot = slots
+            .iter()
+            .position(|in_use| !*in_use)
+            .ok_or(Error::GuestThreadLimitExceeded(child_tid))?;
+        slots[slot] = true;
+        Ok(slot)
+    }
+
+    fn release_transport_slot(&self, slot: usize) {
+        let mut slots = self
+            .transport_slots
+            .lock()
+            .expect("KVM transport-slot lock poisoned");
+        if let Some(in_use) = slots.get_mut(slot) {
+            *in_use = false;
+        }
+    }
+}
+
+pub(crate) struct GuestThreadRegistration {
+    group: Arc<GuestThreadGroup>,
+    pthread: libc::pthread_t,
+    root: bool,
+    restore_blocked_signal: bool,
+}
+
+impl Drop for GuestThreadRegistration {
+    fn drop(&mut self) {
+        if self.root {
+            let mut root = self
+                .group
+                .root
+                .lock()
+                .expect("KVM guest root lock poisoned");
+            if *root == Some(self.pthread) {
+                *root = None;
+            }
+        } else {
+            self.group
+                .workers
+                .lock()
+                .expect("KVM guest worker lock poisoned")
+                .retain(|worker| *worker != self.pthread);
+        }
+        if self.restore_blocked_signal {
+            let _ = set_guest_interrupt_signal_mask(libc::SIG_BLOCK);
+        }
+    }
+}
+
+fn duplicate_stdin() -> Result<Option<File>> {
+    // Duplicate before opening /dev/kvm so internal descriptors can never alias
+    // a logically open guest stdin.
+    let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd >= 0 {
+        // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
+        return Ok(Some(unsafe { File::from_raw_fd(fd) }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EBADF) {
+        Ok(None)
+    } else {
+        Err(error.into())
+    }
+}
+
+fn validate_root_pid(pid: i32) -> Result<i32> {
+    if pid > 0 {
+        Ok(pid)
+    } else {
+        Err(Error::InvalidGuestPid(pid))
+    }
+}
+
+/// The PID-namespace init process seen by the deterministic container. The
+/// ptrace backend runs the guest inside a real PID namespace whose `init` is
+/// PID 1, so the conventional root guest (PID 3, see detcore `ROOT_DETPID`) has
+/// `getppid() == 1`. KVM synthesizes the guest identity rather than using a real
+/// namespace, so it must reproduce the same parent value for parity.
+const CONTAINER_INIT_PID: i32 = 1;
+
+/// Deterministic parent PID for the container's root guest, matching the ptrace
+/// backend. A guest that is itself the namespace init (PID 1) has no parent and
+/// reports `getppid() == 0`, exactly as Linux `init` does; any other root guest
+/// is parented to the namespace init (PID 1).
+fn root_parent_pid(root_pid: i32) -> i32 {
+    if root_pid == CONTAINER_INIT_PID {
+        0
+    } else {
+        CONTAINER_INIT_PID
+    }
+}
+
+/// A single-vCPU KVM backend used to exercise the syscall transport.
+pub struct KvmBackend {
+    // Field order ensures the vCPU and VM are dropped before registered memory.
+    pub(crate) vcpu: VcpuFd,
+    vm: VmFd,
+    pub(crate) memory: GuestMemory,
+    _kvm: Kvm,
+    cpuid_policy: CpuidPolicy,
+    hypercall_instruction: [u8; 3],
+    syscall_trampoline_address: u64,
+    pub(crate) syscall_frame_address: u64,
+    thread_group: Arc<GuestThreadGroup>,
+    thread_slot: Option<usize>,
+    is_guest_thread: bool,
+    // Who owns this backend's guest threads. The single value drives BOTH the
+    // CLONE_THREAD worker dispatch path (`run_process_action_with_tool`) and
+    // `futex`/CLEARTID ownership (`is_backend_owned_syscall`), so the two can
+    // never disagree. Propagated to every child backend. This is the *effective*
+    // ownership; when running a tool it is resolved from `thread_ownership_override`
+    // (if set) else the tool's `Tool::thread_ownership` at run entry.
+    pub(crate) thread_ownership: ThreadOwnership,
+    // Explicit caller override for `thread_ownership`. `None` means "follow the
+    // tool" — resolve from `Tool::thread_ownership` at run entry (the safe,
+    // Tool-owned "follow children" default). `Some(_)` forces that ownership
+    // regardless of the tool (set via `set_thread_ownership` /
+    // `unmonitored_threads`), and survives run-entry resolution.
+    thread_ownership_override: Option<ThreadOwnership>,
+    pub(crate) static_elf: Option<LoadedStaticElf>,
+    stdin: Option<File>,
+    pub(crate) root_pid: i32,
+    // One optional collector is shared by every fork and thread backend in the
+    // guest tree. `None` is the allocation-free, update-free default.
+    pub(crate) exit_collector: Option<Arc<KvmExitCollector>>,
+}
+
+struct KvmProcessSnapshot {
+    memory: GuestMemory,
+    registers: kvm_regs,
+    xsave: kvm_xsave,
+    stdin: Option<File>,
+    cpuid_policy: CpuidPolicy,
+}
+
+struct ForkedProcess {
+    pid: i32,
+    backend: KvmBackend,
+    executor: ElfExecutor,
+}
+
+// A process snapshot can be taken while another Tool-owned thread has its own
+// scratch page exposed in the shared user-access map. The fork child must not
+// inherit any of those temporary mappings; normalize only the copied map and
+// leave the parent's live handlers unchanged.
+fn hide_tool_scratch_pages(memory: &GuestMemory) -> Result<()> {
+    memory.unmap_user_range(TOOL_STACK_TOP - TOOL_STACK_SIZE, TOOL_STACK_SIZE)?;
+    memory.unmap_user_range(
+        THREAD_TOOL_STACK_AREA_START,
+        BOOT_RESERVED_END - THREAD_TOOL_STACK_AREA_START,
+    )?;
+    Ok(())
+}
+
+impl KvmBackend {
+    /// Creates a VM with one vCPU and a memory slot starting at GPA zero.
+    pub fn new(memory_size: usize) -> Result<Self> {
+        Self::new_with_cpuid_policy(memory_size, CpuidPolicy::default())
+    }
+
+    /// Creates a VM with an explicitly reserved supervisor standard input.
+    ///
+    /// Callers that initialize async runtimes before KVM should reserve stdin
+    /// first so an originally closed descriptor cannot be reused internally.
+    pub fn new_with_stdin(memory_size: usize, stdin: Option<File>) -> Result<Self> {
+        Self::new_with_cpuid_policy_and_stdin(memory_size, CpuidPolicy::default(), stdin)
+    }
+
+    /// Creates a VM with a caller-selected CPUID feature policy.
+    pub fn new_with_cpuid_policy(memory_size: usize, cpuid_policy: CpuidPolicy) -> Result<Self> {
+        let stdin = duplicate_stdin()?;
+        Self::new_with_cpuid_policy_and_stdin(memory_size, cpuid_policy, stdin)
+    }
+
+    fn new_with_cpuid_policy_and_stdin(
+        memory_size: usize,
+        cpuid_policy: CpuidPolicy,
+        stdin: Option<File>,
+    ) -> Result<Self> {
+        let memory = GuestMemory::new(0, memory_size)?;
+        Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)
+    }
+
+    fn new_with_memory_and_cpuid_policy(
+        memory: GuestMemory,
+        cpuid_policy: CpuidPolicy,
+        stdin: Option<File>,
+    ) -> Result<Self> {
+        install_worker_interrupt_handler()?;
+        let kvm = Kvm::new()?;
+        let vm = kvm.create_vm()?;
+        if !vm.check_extension(Cap::ExitHypercall) {
+            return Err(Error::HypercallExitUnsupported);
+        }
+
+        let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+        // TODO-HUMAN-REVIEW(PR-129): Review host-selected private hypercall transport.
+        let hypercall_instruction = supported_hypercall_instruction(&cpuid)?;
+        cpuid_policy.apply(&mut cpuid)?;
+        let cap = kvm_enable_cap {
+            cap: Cap::ExitHypercall as u32,
+            args: [1_u64 << VMCALL_SYSCALL_TRANSPORT, 0, 0, 0],
+            ..Default::default()
+        };
+        vm.enable_cap(&cap)?;
+
+        let region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: memory.guest_base(),
+            memory_size: memory.len() as u64,
+            userspace_addr: memory.host_address(),
+            flags: 0,
+        };
+        // SAFETY: memory owns a page-aligned mapping that remains live until
+        // after vcpu and vm are dropped, and slot 0 is registered only once.
+        unsafe {
+            vm.set_user_memory_region(region)?;
+        }
+
+        let vcpu = vm.create_vcpu(0)?;
+        vcpu.set_cpuid2(&cpuid)?;
+        Ok(Self {
+            vcpu,
+            vm,
+            memory,
+            _kvm: kvm,
+            cpuid_policy,
+            hypercall_instruction,
+            syscall_trampoline_address: SYSCALL_TRAMPOLINE_ADDRESS,
+            syscall_frame_address: SYSCALL_FRAME_ADDRESS,
+            thread_group: Arc::new(GuestThreadGroup::default()),
+            thread_slot: None,
+            is_guest_thread: false,
+            // Effective ownership before any tool run resolves it. The direct
+            // (non-tool) personality never dispatches threads through a Tool loop,
+            // so Host is the correct effective value there; when a tool runs,
+            // `run_static_elf_with_tool` resolves this from the override or the
+            // tool's `Tool::thread_ownership` (the Tool-owned "follow children"
+            // default).
+            thread_ownership: ThreadOwnership::Host,
+            // No explicit caller override: follow the tool at run entry.
+            thread_ownership_override: None,
+            static_elf: None,
+            stdin,
+            root_pid: 1,
+            exit_collector: None,
+        })
+    }
+
+    /// Enables or disables completed-process-tree KVM exit statistics.
+    ///
+    /// Call this once before entering the guest. Enabling creates the collector
+    /// that every later fork and `CLONE_THREAD` child inherits; disabling drops
+    /// it, so unmeasured runs allocate and update no statistics state.
+    pub fn set_backend_stats_request(&mut self, request: BackendStatsRequest) {
+        self.exit_collector = request
+            .is_enabled()
+            .then(|| Arc::new(KvmExitCollector::default()));
+    }
+
+    /// Returns whether this process tree is collecting KVM exit statistics.
+    pub fn backend_stats_request(&self) -> BackendStatsRequest {
+        BackendStatsRequest::new(self.exit_collector.is_some())
+    }
+
+    /// Records one vCPU exit in the shared process-tree collector, when enabled.
+    ///
+    /// This is an associated function over a disjoint field so callers can use
+    /// it while the live [`VcpuExit`] still borrows the vCPU's `KVM_RUN` mapping.
+    pub(crate) fn record_exit(collector: Option<&KvmExitCollector>, exit: &VcpuExit<'_>) {
+        if let Some(collector) = collector {
+            collector.record(exit);
+        }
+    }
+
+    /// Forces who owns this backend's guest threads (see [`ThreadOwnership`]),
+    /// overriding the tool's own [`reverie::Tool::thread_ownership`].
+    ///
+    /// The single value drives both the CLONE_THREAD worker dispatch path and
+    /// `futex`/CLEARTID ownership, so execution and synchronization can never
+    /// disagree. Normally you do **not** call this: when running a tool the
+    /// ownership is resolved from the tool's `Tool::thread_ownership`, whose
+    /// default is the safe Tool-owned "follow children" model. Call this only to
+    /// force a specific ownership regardless of the tool; the override is sticky
+    /// and survives run-entry resolution. Call it before running.
+    pub fn set_thread_ownership(&mut self, thread_ownership: ThreadOwnership) {
+        self.thread_ownership_override = Some(thread_ownership);
+        self.thread_ownership = thread_ownership;
+    }
+
+    /// Opt this backend's guest threads *out* of tool monitoring: run every
+    /// child thread uninstrumented on the direct host personality with
+    /// host-backed `futex`/CLEARTID synchronization ([`ThreadOwnership::Host`]).
+    ///
+    /// This is the deliberately-named "scary" opt-out. It is **not** `unsafe`
+    /// (it cannot cause undefined behavior), but it is a determinism/coverage
+    /// hazard, so weigh it carefully:
+    ///
+    /// * The tool never sees the opted-out threads' syscalls, so it cannot
+    ///   sanitize, record, or schedule them — determinism is **not** guaranteed
+    ///   for those threads or anything ordered against them.
+    /// * A tool that expects to schedule the whole thread group (e.g. Detcore)
+    ///   has its model broken by unmonitored siblings, and mixing unmonitored
+    ///   threads with tool-owned joins can deadlock a `pthread_join`.
+    ///
+    /// Prefer leaving threads tool-owned (the default). Use this only when a
+    /// backend genuinely cannot or must not drive a thread through the tool.
+    pub fn unmonitored_threads(&mut self) -> &mut Self {
+        self.set_thread_ownership(ThreadOwnership::Host);
+        self
+    }
+
+    /// Resolves the effective [`ThreadOwnership`] for a tool run: an explicit
+    /// caller override ([`Self::set_thread_ownership`] /
+    /// [`Self::unmonitored_threads`]) wins, otherwise follow the tool's
+    /// [`reverie::Tool::thread_ownership`] (default: Tool-owned "follow
+    /// children"). Called once at run entry, before any thread is created.
+    pub(crate) fn resolve_thread_ownership(&mut self, ownership: ThreadOwnership) {
+        self.thread_ownership = self.thread_ownership_override.unwrap_or(ownership);
+    }
+
+    /// Panic-not-hang tripwire enforced at thread creation: the thread's
+    /// *execution* owner (which dispatch arm `run_process_action_with_tool`
+    /// takes) and its *futex/CLEARTID* owner (how `is_backend_owned_syscall`
+    /// classifies `futex`) must agree. They are both derived from the single
+    /// [`ThreadOwnership`] value, so this can only fail if a future change
+    /// reintroduces a second, independent source of truth — exactly the
+    /// split-brain that historically deadlocked `pthread_join` (a Tool-executed
+    /// worker whose `futex` was host-owned: the joiner's host `FUTEX_WAIT` was
+    /// never woken by the exiting worker's logical `CLEARTID`, observed as a
+    /// silent hang / exit=124). Asserting here converts that regression into an
+    /// immediate, clearly-labelled panic instead of a hang.
+    fn debug_assert_thread_ownership_consistent(&self) {
+        debug_assert_eq!(
+            self.thread_ownership.executes_on_tool(),
+            !crate::runtime::is_backend_owned_syscall(
+                libc::SYS_futex as u64,
+                self.thread_ownership,
+            ),
+            "thread execution owner and futex owner disagree for {:?}: a \
+             Tool-executed worker with a host-owned futex (or a host-executed \
+             worker with a Tool-owned futex) deadlocks pthread_join and must be \
+             unrepresentable now that one ThreadOwnership drives both decisions",
+            self.thread_ownership,
+        );
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-238): Review configurable KVM root process identity.
+    pub fn set_root_pid(&mut self, pid: i32) -> Result<()> {
+        let pid = validate_root_pid(pid)?;
+        self.root_pid = pid;
+        if let Some(loaded) = self.static_elf.as_mut() {
+            loaded.pid = pid;
+            loaded.tid = pid;
+            loaded.ppid = root_parent_pid(pid);
+        }
+        Ok(())
+    }
+
+    /// Installs an arbitrary real-mode program and selects it as the vCPU entry point.
+    pub fn install_real_mode_program(&mut self, entry_point: u64, code: &[u8]) -> Result<()> {
+        self.memory.write(entry_point, code)?;
+        self.static_elf = None;
+
+        let mut sregs = self.vcpu.get_sregs()?;
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        self.vcpu.set_sregs(&sregs)?;
+
+        let mut regs = self.vcpu.get_regs()?;
+        regs.rip = entry_point;
+        regs.rflags = 2;
+        self.vcpu.set_regs(&regs)?;
+        Ok(())
+    }
+
+    /// Returns the Tool scratch-page top for this backend. Process leaders use
+    /// the fixed root page; guest threads use the page paired with their
+    /// transport slot.
+    pub(crate) fn tool_stack_top(&self) -> u64 {
+        self.thread_slot
+            .map_or(TOOL_STACK_TOP, thread_tool_stack_top)
+    }
+
+    /// Releases a guest thread's transport and Tool scratch-page slot.
+    ///
+    /// Normal exit paths call this before notifying the scheduler or clearing
+    /// the child TID, so the next guest thread's slot does not depend on when
+    /// the host worker object is destroyed. `Drop` remains the error-path
+    /// fallback.
+    pub(crate) fn release_thread_slot(&mut self) {
+        if let Some(slot) = self.thread_slot.take() {
+            self.thread_group.release_transport_slot(slot);
+        }
+    }
+
+    /// Returns the VM's guest memory.
+    pub fn memory(&self) -> &GuestMemory {
+        &self.memory
+    }
+
+    /// Returns mutable access to the VM's guest memory.
+    pub fn memory_mut(&mut self) -> &mut GuestMemory {
+        &mut self.memory
+    }
+
+    /// Loads a static ELF executable and prepares the vCPU to enter it in long mode.
+    ///
+    /// The initial process personality supports x86-64 `ET_EXEC` images without a
+    /// `PT_INTERP` segment. Dynamic executables require a userspace dynamic linker
+    /// and are deliberately rejected.
+    pub fn install_static_elf(&mut self, image: &[u8], argv0: &str) -> Result<()> {
+        self.install_static_elf_with_args(image, &[argv0], &[])
+    }
+
+    /// Loads a static ELF with an explicit `argv` and `envp` and prepares the
+    /// vCPU to enter it in long mode.
+    ///
+    /// `argv` must be non-empty; `argv[0]` becomes the program name reported to
+    /// the guest (initial stack and `AT_EXECFN`/`readlink("/proc/self/exe")`).
+    /// The guest observes a standard System V initial stack: `argc`, the `argv`
+    /// pointer array, a NULL terminator, the `envp` pointer array, a NULL
+    /// terminator, and the auxiliary vector.
+    pub fn install_static_elf_with_args(
+        &mut self,
+        image: &[u8],
+        argv: &[&str],
+        envp: &[&str],
+    ) -> Result<()> {
+        let cwd = std::env::current_dir()?;
+        self.install_static_elf_with_context(image, argv, envp, &cwd)
+    }
+
+    /// Loads an ELF with explicit arguments, environment, and working directory.
+    pub fn install_static_elf_with_context(
+        &mut self,
+        image: &[u8],
+        argv: &[&str],
+        envp: &[&str],
+        cwd: &Path,
+    ) -> Result<()> {
+        let mut loaded = load_static_elf(&mut self.memory, image, argv, envp, cwd)?;
+        loaded.pid = self.root_pid;
+        loaded.tid = self.root_pid;
+        loaded.ppid = root_parent_pid(self.root_pid);
+        loaded.stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+        configure_long_mode(
+            &mut self.memory,
+            &self.vcpu,
+            loaded.entry_point,
+            loaded.stack_pointer,
+            self.hypercall_instruction,
+        )?;
+        self.memory.enable_user_access();
+        self.static_elf = Some(loaded);
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-228): Review the KVM random-seed configuration API.
+    /// Configure the deterministic seed used by virtual random devices.
+    pub fn set_random_seed(&mut self, seed: u64) -> Result<()> {
+        let loaded = self
+            .static_elf
+            .as_mut()
+            .ok_or(Error::StaticElfNotInstalled)?;
+        loaded.random_seed = seed;
+        Ok(())
+    }
+
+    fn snapshot_process(&self) -> Result<KvmProcessSnapshot> {
+        let memory = self.memory.snapshot()?;
+        hide_tool_scratch_pages(&memory)?;
+        Ok(KvmProcessSnapshot {
+            memory,
+            registers: self.vcpu.get_regs()?,
+            xsave: self.vcpu.get_xsave()?,
+            stdin: self.stdin.as_ref().map(File::try_clone).transpose()?,
+            cpuid_policy: self.cpuid_policy,
+        })
+    }
+
+    fn from_process_snapshot(snapshot: KvmProcessSnapshot) -> Result<Self> {
+        let mut child = Self::new_with_memory_and_cpuid_policy(
+            snapshot.memory,
+            snapshot.cpuid_policy,
+            snapshot.stdin,
+        )?;
+        configure_long_mode(
+            &mut child.memory,
+            &child.vcpu,
+            0,
+            snapshot.registers.rsp,
+            child.hypercall_instruction,
+        )?;
+        child.vcpu.set_regs(&snapshot.registers)?;
+        // SAFETY: this guest setup does not enable dynamically sized XSTATE features.
+        unsafe { child.vcpu.set_xsave(&snapshot.xsave)? };
+        Ok(child)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-172): Review independent vCPU creation from clone3 state.
+    fn from_thread_state(
+        memory: GuestMemory,
+        registers: kvm_regs,
+        xsave: kvm_xsave,
+        stdin: Option<File>,
+        cpuid_policy: CpuidPolicy,
+        child_tid: i32,
+        thread_group: Arc<GuestThreadGroup>,
+    ) -> Result<Self> {
+        let mut child = Self::new_with_memory_and_cpuid_policy(memory, cpuid_policy, stdin)?;
+        child.thread_group = thread_group;
+        child.is_guest_thread = true;
+        let slot = child.thread_group.reserve_transport_slot(child_tid)?;
+        child.thread_slot = Some(slot);
+        let syscall_trampoline_address =
+            THREAD_SYSCALL_AREA_START + slot as u64 * THREAD_SYSCALL_AREA_STRIDE;
+        let syscall_frame_address = syscall_trampoline_address + PAGE_SIZE;
+        child.syscall_trampoline_address = syscall_trampoline_address;
+        child.syscall_frame_address = syscall_frame_address;
+        configure_long_mode_with_syscall_area(
+            &mut child.memory,
+            &child.vcpu,
+            0,
+            registers.rsp,
+            child.hypercall_instruction,
+            syscall_trampoline_address,
+            syscall_frame_address,
+            false,
+        )?;
+        child.vcpu.set_regs(&registers)?;
+        // SAFETY: this guest setup does not enable dynamically sized XSTATE features.
+        unsafe { child.vcpu.set_xsave(&xsave)? };
+        Ok(child)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-156): Review lifecycle-hook exec image replacement API.
+    pub(crate) fn exec_process(
+        &mut self,
+        executor: &mut ElfExecutor,
+        image: &[u8],
+        argv: &[String],
+        envp: &[String],
+    ) -> Result<()> {
+        if self.is_guest_thread {
+            return Err(Error::GuestThreadExecUnsupported);
+        }
+        let user_length = usize::try_from(self.memory.guest_end() - BOOT_RESERVED_END)
+            .expect("guest memory length must fit usize");
+        self.memory.zero_raw(BOOT_RESERVED_END, user_length)?;
+
+        let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut loaded = load_static_elf(&mut self.memory, image, &argv, &envp, executor.cwd())?;
+        loaded.stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+        configure_long_mode(
+            &mut self.memory,
+            &self.vcpu,
+            loaded.entry_point,
+            loaded.stack_pointer,
+            self.hypercall_instruction,
+        )?;
+        self.memory.enable_user_access();
+        executor.replace_after_exec(loaded);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_forked_process(
+        &mut self,
+        executor: &ElfExecutor,
+        child_pid: i32,
+        child_stack: Option<u64>,
+        parent_tid: Option<u64>,
+        child_tid: Option<u64>,
+        clear_child_tid: Option<u64>,
+        clear_sighand: bool,
+        park_syscall_return: bool,
+    ) -> Result<ForkedProcess> {
+        let mut child_executor = executor.fork_child(child_pid, clear_sighand)?;
+        child_executor.set_clear_child_tid(clear_child_tid);
+        if park_syscall_return {
+            set_syscall_return_park(
+                &mut self.memory,
+                self.hypercall_instruction,
+                self.syscall_trampoline_address,
+                self.syscall_frame_address,
+                true,
+            )?;
+            let vcpu_exit = self.vcpu.run()?;
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+            let parked = match vcpu_exit {
+                VcpuExit::Hlt => Ok(()),
+                exit => Err(Error::UnexpectedVcpuExit(format!(
+                    "parent did not park at fork: {exit:?}"
+                ))),
+            };
+            set_syscall_return_park(
+                &mut self.memory,
+                self.hypercall_instruction,
+                self.syscall_trampoline_address,
+                self.syscall_frame_address,
+                false,
+            )?;
+            parked?;
+        }
+        let child_snapshot = self.snapshot_process()?;
+        write_tid_best_effort(&mut self.memory, parent_tid, child_pid);
+
+        let mut child = Self::from_process_snapshot(child_snapshot)?;
+        // Forked children inherit the parent's thread ownership so execution and
+        // `is_backend_owned_syscall`'s futex classification stay consistent.
+        child.thread_ownership = self.thread_ownership;
+        child.exit_collector = self.exit_collector.clone();
+        write_tid_best_effort(&mut child.memory, child_tid, child_pid);
+        let (fs_base, gs_base) = child_executor.segment_bases();
+        set_user_segment_base(&child.vcpu, SegmentBase::Fs, fs_base)?;
+        set_user_segment_base(&child.vcpu, SegmentBase::Gs, gs_base)?;
+        configure_process_syscall_return(
+            &child.memory,
+            &child.vcpu,
+            child.syscall_frame_address,
+            0,
+            child_stack,
+        )?;
+        Ok(ForkedProcess {
+            pid: child_pid,
+            backend: child,
+            executor: child_executor,
+        })
+    }
+
+    fn finish_forked_process(
+        &mut self,
+        executor: &mut ElfExecutor,
+        mut child: ForkedProcess,
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> Result<()> {
+        // A process clone has a private snapshot, so no surviving task can
+        // observe this clear; preserve the child-side ABI.
+        write_tid_best_effort(
+            &mut child.backend.memory,
+            child.executor.take_clear_child_tid(),
+            0,
+        );
+        let completion = executor.child_completion(status);
+        executor.record_child_completion(child.pid, completion)?;
+        executor.append_output(stdout, stderr);
+        configure_process_syscall_return(
+            &self.memory,
+            &self.vcpu,
+            self.syscall_frame_address,
+            i64::from(child.pid),
+            None,
+        )
+    }
+
+    // TODO-HUMAN-REVIEW(PR-156): Review process actions completed during Tool injection.
+    pub(crate) fn run_process_action(
+        &mut self,
+        executor: &mut ElfExecutor,
+        action: ProcessAction,
+        park_syscall_return: bool,
+    ) -> Result<()> {
+        match action {
+            ProcessAction::Fork {
+                child_pid,
+                child_stack,
+                parent_tid,
+                child_tid,
+                clear_child_tid,
+                clear_sighand,
+            } => {
+                let mut child = self.prepare_forked_process(
+                    executor,
+                    child_pid,
+                    child_stack,
+                    parent_tid,
+                    child_tid,
+                    clear_child_tid,
+                    clear_sighand,
+                    park_syscall_return,
+                )?;
+                let (code, stdout, stderr) =
+                    child.backend.run_static_elf_process(&mut child.executor)?;
+                self.finish_forked_process(executor, child, code, stdout, stderr)?;
+            }
+            // TODO-HUMAN-REVIEW(PR-172): Review concurrent CLONE_THREAD lifecycle semantics.
+            ProcessAction::Thread {
+                child_tid,
+                child_stack,
+                parent_tid,
+                child_tid_address,
+                clear_child_tid,
+                tls,
+            } => {
+                let parent_registers = self.vcpu.get_regs()?;
+                let parent_xsave = self.vcpu.get_xsave()?;
+                let (parent_fs, parent_gs) = executor.segment_bases();
+                let mut parent_syscall_frame = vec![0; FRAME_SIZE];
+                self.memory
+                    .read_raw(self.syscall_frame_address, &mut parent_syscall_frame)?;
+
+                if park_syscall_return {
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        true,
+                    )?;
+                    let vcpu_exit = self.vcpu.run()?;
+                    Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+                    let parked = match vcpu_exit {
+                        VcpuExit::Hlt => Ok(()),
+                        exit => Err(Error::UnexpectedVcpuExit(format!(
+                            "parent did not park at thread clone: {exit:?}"
+                        ))),
+                    };
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        false,
+                    )?;
+                    parked?;
+                }
+                let child_registers = self.vcpu.get_regs()?;
+
+                write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
+                write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
+                let child_fs = tls.unwrap_or(parent_fs);
+                let mut child_executor = executor.thread_child(child_tid)?;
+                child_executor.set_thread_context(child_tid, child_fs, parent_gs);
+                child_executor.set_clear_child_tid(clear_child_tid);
+                let child_stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+                let mut child = Self::from_thread_state(
+                    self.memory.clone(),
+                    child_registers,
+                    parent_xsave,
+                    child_stdin,
+                    self.cpuid_policy,
+                    child_tid,
+                    self.thread_group.clone(),
+                )?;
+                // Thread children inherit the parent's thread ownership so
+                // execution and futex classification stay consistent.
+                self.debug_assert_thread_ownership_consistent();
+                child.thread_ownership = self.thread_ownership;
+                child.exit_collector = self.exit_collector.clone();
+                child
+                    .memory
+                    .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Fs, child_fs)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Gs, parent_gs)?;
+                configure_process_syscall_return(
+                    &child.memory,
+                    &child.vcpu,
+                    child.syscall_frame_address,
+                    0,
+                    Some(child_stack),
+                )?;
+
+                self.vcpu.set_regs(&parent_registers)?;
+                configure_process_syscall_return(
+                    &self.memory,
+                    &self.vcpu,
+                    self.syscall_frame_address,
+                    i64::from(child_tid),
+                    None,
+                )?;
+
+                let handle = std::thread::Builder::new()
+                    .name(format!("reverie-kvm-guest-{child_tid}"))
+                    .spawn(move || {
+                        let result = child.run_static_elf_process(&mut child_executor);
+                        child.release_thread_slot();
+                        clear_tid_and_wake(
+                            &mut child.memory,
+                            child_executor.take_clear_child_tid(),
+                        );
+                        let cancelled = child.thread_group.cancelled.load(Ordering::Acquire);
+                        if let Err(error) = result
+                            && !cancelled
+                        {
+                            eprintln!("reverie-kvm guest thread {child_tid} failed: {error}");
+                        }
+                    })?;
+                self.thread_group.add_worker_handle(handle);
+            }
+            ProcessAction::Exec { image, argv, envp } => {
+                if park_syscall_return {
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        true,
+                    )?;
+                    let vcpu_exit = self.vcpu.run()?;
+                    Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+                    let parked = match vcpu_exit {
+                        VcpuExit::Hlt => Ok(()),
+                        exit => Err(Error::UnexpectedVcpuExit(format!(
+                            "process did not park before exec: {exit:?}"
+                        ))),
+                    };
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        false,
+                    )?;
+                    parked?;
+                }
+                // A successful exec terminates every sibling thread before the
+                // new address space becomes visible. Leaving a sibling vCPU
+                // alive lets it execute stale instructions in the replacement
+                // image and can turn an otherwise successful exec into a fault.
+                self.cancel_guest_threads();
+                let result = self.exec_process(executor, &image, &argv, &envp);
+                self.thread_group.rearm_after_exec();
+                result?;
+            }
+        }
+        Ok(())
+    }
+
+    // TODO-HUMAN-REVIEW(PR-192): Review tool lifecycle for KVM fork children.
+    // TODO-HUMAN-REVIEW(PR-235): Review concurrent fork-child Tool execution.
+    pub(crate) async fn run_process_action_with_tool<T>(
+        &mut self,
+        executor: &mut ElfExecutor,
+        action: ProcessAction,
+        park_syscall_return: bool,
+        context: ToolContext<'_, T>,
+    ) -> Result<()>
+    where
+        T: Tool + 'static,
+        T::ThreadState: 'static,
+        T::GlobalState: 'static,
+        <T::GlobalState as GlobalTool>::Config: 'static,
+    {
+        match action {
+            ProcessAction::Fork {
+                child_pid,
+                child_stack,
+                parent_tid,
+                child_tid,
+                clear_child_tid,
+                clear_sighand,
+            } => {
+                let mut child = self.prepare_forked_process(
+                    executor,
+                    child_pid,
+                    child_stack,
+                    parent_tid,
+                    child_tid,
+                    clear_child_tid,
+                    clear_sighand,
+                    park_syscall_return,
+                )?;
+
+                let child_pid = Pid::from_raw(child.pid);
+                let child_tool = T::new(child_pid, &context.config);
+                let child_thread_state = child_tool
+                    .init_thread_state(child_pid, Some((context.tid, context.thread_state)));
+                let global_state = context.global_state.ok_or_else(|| {
+                    Error::UnexpectedVcpuExit(
+                        "forked KVM Tool process requires shared global state".to_owned(),
+                    )
+                })?;
+                let config = context.config;
+                let subscriptions = context.subscriptions;
+                let pending_child_starts = context.pending_child_starts;
+                let raw_child_pid = child.pid;
+                let parent_pid = context.pid;
+                let lifecycle_state = global_state.clone();
+                let auto_reap = executor.child_exit_policy();
+                let completion_notifier = executor.child_completion_notifier();
+                let completion = Arc::new(Mutex::new(None));
+                let child_completion = completion.clone();
+                let (start_sender, start_receiver) = std::sync::mpsc::channel();
+                let handle = std::thread::Builder::new()
+                    .name(format!("reverie-kvm-process-{raw_child_pid}"))
+                    .spawn(move || {
+                        start_receiver.recv().map_err(|_| {
+                            Error::UnexpectedVcpuExit(format!(
+                                "KVM child process {raw_child_pid} lost its parent start gate"
+                            ))
+                        })?;
+                        let result = futures::executor::block_on(
+                            child.backend.run_static_elf_process_with_tool(
+                                &mut child.executor,
+                                child_pid,
+                                // A forked process child is its own leader (tid == pid).
+                                child_pid,
+                                child_tool,
+                                child_thread_state,
+                                global_state,
+                                &config,
+                                &subscriptions,
+                                false,
+                            ),
+                        );
+                        match result {
+                            Ok((status, _, _)) => {
+                                write_tid_best_effort(
+                                    &mut child.backend.memory,
+                                    child.executor.take_clear_child_tid(),
+                                    0,
+                                );
+                                let waitable = !auto_reap.load(Ordering::SeqCst);
+                                let completion =
+                                    ChildCompletion::from_waitability(status, waitable);
+                                *child_completion
+                                    .lock()
+                                    .expect("KVM child completion lock poisoned") =
+                                    Some(completion);
+                                let _ = completion_notifier.send(raw_child_pid);
+                                futures::executor::block_on(
+                                    lifecycle_state.on_backend_child_wait_event(
+                                        BackendChildWaitEvent {
+                                            parent: parent_pid,
+                                            child: child_pid,
+                                            state: BackendChildWaitState::Exited {
+                                                status,
+                                                waitable,
+                                            },
+                                        },
+                                    ),
+                                )
+                                .map_err(Error::Reverie)?;
+                                Ok(())
+                            }
+                            Err(error) => {
+                                *child_completion
+                                    .lock()
+                                    .expect("KVM child completion lock poisoned") =
+                                    Some(ChildCompletion::Failed);
+                                let _ = completion_notifier.send(raw_child_pid);
+                                Err(error)
+                            }
+                        }
+                    })?;
+                pending_child_starts
+                    .lock()
+                    .expect("KVM child-start lock poisoned")
+                    .push(start_sender.clone());
+                executor.register_child_process(raw_child_pid, start_sender, completion, handle);
+                configure_process_syscall_return(
+                    &self.memory,
+                    &self.vcpu,
+                    self.syscall_frame_address,
+                    i64::from(raw_child_pid),
+                    None,
+                )
+            }
+            // `ThreadOwnership::Host`: CLONE_THREAD workers run uninstrumented on
+            // the direct backend personality with host-backed synchronization,
+            // exactly as `run_process_action`'s Thread branch does. Execution and
+            // `futex` ownership are both Host (a single `ThreadOwnership`), so the
+            // joiner's real host `FUTEX_WAIT` and the exiting worker's real host
+            // `CLONE_CHILD_CLEARTID` wake meet on the same futex word — no
+            // deadlock. (The split-brain that deadlocks a join — a Tool-executed
+            // worker whose `futex` is host-owned, so its logical CLEARTID wake
+            // never reaches the host waiter — is unrepresentable now that one
+            // enum drives both decisions.)
+            ProcessAction::Thread { .. } if self.thread_ownership.executes_on_host() => {
+                self.run_process_action(executor, action, park_syscall_return)
+            }
+            // `ThreadOwnership::Tool`: a CLONE_THREAD worker runs its own vCPU on
+            // a fresh OS thread but shares the guest address space, file table,
+            // and process Tool identity with its creator. It is driven through
+            // the same Tool loop as the process leader so Detcore sees its
+            // syscalls, shares its fd model, and schedules it; `futex` routes to
+            // Detcore (runtime.rs) so a join's logical `FUTEX_WAIT` is woken by
+            // the worker's logical `CLEARTID`. This mirrors the physical setup in
+            // `run_process_action`'s Thread branch, but spawns the Tool loop
+            // instead of the direct backend personality.
+            ProcessAction::Thread {
+                child_tid,
+                child_stack,
+                parent_tid,
+                child_tid_address,
+                clear_child_tid,
+                tls,
+            } => {
+                let parent_registers = self.vcpu.get_regs()?;
+                let parent_xsave = self.vcpu.get_xsave()?;
+                let (parent_fs, parent_gs) = executor.segment_bases();
+                let mut parent_syscall_frame = vec![0; FRAME_SIZE];
+                self.memory
+                    .read_raw(self.syscall_frame_address, &mut parent_syscall_frame)?;
+
+                if park_syscall_return {
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        true,
+                    )?;
+                    let vcpu_exit = self.vcpu.run()?;
+                    Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+                    let parked = match vcpu_exit {
+                        VcpuExit::Hlt => Ok(()),
+                        exit => Err(Error::UnexpectedVcpuExit(format!(
+                            "parent did not park at thread clone: {exit:?}"
+                        ))),
+                    };
+                    set_syscall_return_park(
+                        &mut self.memory,
+                        self.hypercall_instruction,
+                        self.syscall_trampoline_address,
+                        self.syscall_frame_address,
+                        false,
+                    )?;
+                    parked?;
+                }
+                let child_registers = self.vcpu.get_regs()?;
+
+                write_tid_best_effort(&mut self.memory, parent_tid, child_tid);
+                write_tid_best_effort(&mut self.memory, child_tid_address, child_tid);
+                let child_fs = tls.unwrap_or(parent_fs);
+                let mut child_executor = executor.thread_child(child_tid)?;
+                child_executor.set_thread_context(child_tid, child_fs, parent_gs);
+                child_executor.set_clear_child_tid(clear_child_tid);
+                let child_stdin = self.stdin.as_ref().map(File::try_clone).transpose()?;
+                let mut child = Self::from_thread_state(
+                    self.memory.clone(),
+                    child_registers,
+                    parent_xsave,
+                    child_stdin,
+                    self.cpuid_policy,
+                    child_tid,
+                    self.thread_group.clone(),
+                )?;
+                // Thread children inherit the parent's thread ownership so
+                // execution and futex classification stay consistent.
+                self.debug_assert_thread_ownership_consistent();
+                child.thread_ownership = self.thread_ownership;
+                child.exit_collector = self.exit_collector.clone();
+                child
+                    .memory
+                    .write_raw(child.syscall_frame_address, &parent_syscall_frame)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Fs, child_fs)?;
+                set_user_segment_base(&child.vcpu, SegmentBase::Gs, parent_gs)?;
+                configure_process_syscall_return(
+                    &child.memory,
+                    &child.vcpu,
+                    child.syscall_frame_address,
+                    0,
+                    Some(child_stack),
+                )?;
+
+                // CLONE_THREAD shares the process (thread-group) identity, so the
+                // worker's Tool carries the creator's pid (tgid) as its detpid,
+                // while the thread state is keyed on the new child tid. This
+                // mirrors reverie-ptrace's `cloned()`, where the child shares the
+                // process Tool identity and receives fresh per-thread state
+                // linked to the parent thread.
+                let tgid = context.pid;
+                let child_tid_pid = Pid::from_raw(child_tid);
+                let child_tool = T::new(tgid, &context.config);
+                let child_thread_state = child_tool
+                    .init_thread_state(child_tid_pid, Some((context.tid, context.thread_state)));
+                let global_state = context.global_state.ok_or_else(|| {
+                    Error::UnexpectedVcpuExit(
+                        "KVM CLONE_THREAD worker requires shared global state".to_owned(),
+                    )
+                })?;
+                let config = context.config;
+                let subscriptions = context.subscriptions;
+
+                self.vcpu.set_regs(&parent_registers)?;
+                configure_process_syscall_return(
+                    &self.memory,
+                    &self.vcpu,
+                    self.syscall_frame_address,
+                    i64::from(child_tid),
+                    None,
+                )?;
+
+                let handle = std::thread::Builder::new()
+                    .name(format!("reverie-kvm-guest-{child_tid}"))
+                    .spawn(move || {
+                        // No explicit start channel: the worker gates itself in
+                        // `handle_thread_start` -> `thread_start_request`, which
+                        // blocks on the Detcore scheduler until the parent's
+                        // clone handler has registered it (create_child_thread).
+                        let result =
+                            futures::executor::block_on(child.run_static_elf_process_with_tool(
+                                &mut child_executor,
+                                tgid,
+                                child_tid_pid,
+                                child_tool,
+                                child_thread_state,
+                                global_state,
+                                &config,
+                                &subscriptions,
+                                false,
+                            ));
+                        child.release_thread_slot();
+                        clear_tid_and_wake(
+                            &mut child.memory,
+                            child_executor.take_clear_child_tid(),
+                        );
+                        let cancelled = child.thread_group.cancelled.load(Ordering::Acquire);
+                        if let Err(error) = &result
+                            && !cancelled
+                        {
+                            eprintln!(
+                                "reverie-kvm guest thread {child_tid} tool loop failed: {error}"
+                            );
+                        }
+                    })?;
+                self.thread_group.add_worker_handle(handle);
+                Ok(())
+            }
+            other => self.run_process_action(executor, other, park_syscall_return),
+        }
+    }
+
+    fn static_elf_exception(&self) -> Result<Option<StaticElfException>> {
+        let registers = self.vcpu.get_regs()?;
+        let Some(vector) = exception_from_halt(registers.rip) else {
+            return Ok(None);
+        };
+        let first_frame_word = usize::from(exception_pushes_error_code(vector));
+        let read_frame_word = |word: usize| -> Result<u64> {
+            let mut bytes = [0; std::mem::size_of::<u64>()];
+            self.memory.read_raw(
+                registers.rsp + ((first_frame_word + word) * bytes.len()) as u64,
+                &mut bytes,
+            )?;
+            Ok(u64::from_le_bytes(bytes))
+        };
+        Ok(Some(StaticElfException {
+            vector,
+            instruction_pointer: read_frame_word(0)?,
+            rflags: read_frame_word(2)?,
+            stack_pointer: read_frame_word(3)?,
+        }))
+    }
+
+    // TODO-HUMAN-REVIEW(PR-202): Review the narrowly matched VMware backdoor probe emulation.
+    pub(crate) fn try_resume_vmware_backdoor_probe(&mut self) -> Result<bool> {
+        let Some(exception) = self.static_elf_exception()? else {
+            return Ok(false);
+        };
+        if exception.vector != 13 {
+            return Ok(false);
+        }
+
+        let registers = self.vcpu.get_regs()?;
+        let mut instruction = [0];
+        if self
+            .memory
+            .read_raw(exception.instruction_pointer, &mut instruction)
+            .is_err()
+            || instruction != [0xed]
+            || registers.rbx & u64::from(u32::MAX) != VMWARE_BACKDOOR_MAGIC
+            || registers.rcx & u64::from(u32::MAX) != VMWARE_BACKDOOR_PORT
+        {
+            return Ok(false);
+        }
+
+        let mut registers = registers;
+        registers.rbx = 0;
+        registers.rip = exception.instruction_pointer + 1;
+        registers.rsp = exception.stack_pointer;
+        registers.rflags = exception.rflags;
+        configure_user_segments(&self.vcpu)?;
+        self.vcpu.set_regs(&registers)?;
+        Ok(true)
+    }
+
+    pub(crate) fn static_elf_halt_error(&self) -> Result<Error> {
+        if let Some(exception) = self.static_elf_exception()? {
+            return Ok(Error::GuestException {
+                vector: exception.vector,
+                instruction_pointer: exception.instruction_pointer,
+                fault_address: self.vcpu.get_sregs()?.cr2,
+            });
+        }
+
+        Ok(Error::UnexpectedVcpuExit(
+            "static ELF halted without exiting".to_string(),
+        ))
+    }
+
+    /// Runs the installed static ELF and its forked children until the root exits.
+    pub fn run_static_elf(&mut self) -> Result<i32> {
+        let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        let mut executor = ElfExecutor::new(loaded, false);
+        let (status, _, _) = self.run_static_elf_process(&mut executor)?;
+        Ok(conventional_exit_code(status))
+    }
+
+    /// Runs the installed ELF process tree and captures its standard output streams.
+    pub fn run_static_elf_captured(&mut self) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let loaded = self.static_elf.take().ok_or(Error::StaticElfNotInstalled)?;
+        let mut executor = ElfExecutor::new(loaded, true);
+        let (status, stdout, stderr) = self.run_static_elf_process(&mut executor)?;
+        Ok((conventional_exit_code(status), stdout, stderr))
+    }
+
+    fn run_static_elf_process(
+        &mut self,
+        executor: &mut ElfExecutor,
+    ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        let _registration = self.register_guest_thread()?;
+        loop {
+            if let Some(status) = self.guest_thread_group_exit_status() {
+                if !self.is_guest_thread {
+                    self.cancel_guest_threads();
+                }
+                let (stdout, stderr) = executor.take_output();
+                return Ok((status, stdout, stderr));
+            }
+            if self.is_guest_thread && self.thread_group.cancelled.load(Ordering::Acquire) {
+                return Ok((ExitStatus::SUCCESS, Vec::new(), Vec::new()));
+            }
+            let vcpu_exit = match self.vcpu.run() {
+                Ok(exit) => exit,
+                Err(error) if error.errno() == libc::EINTR => continue,
+                Err(error) => return Err(error.into()),
+            };
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+            let (segment_update, process_action) = match vcpu_exit {
+                VcpuExit::Hypercall(exit) => {
+                    if exit.nr != VMCALL_SYSCALL_TRANSPORT {
+                        return Err(Error::UnexpectedHypercall(exit.nr));
+                    }
+                    let frame_address = exit.args[0];
+                    if frame_address != self.syscall_frame_address {
+                        return Err(Error::UnexpectedVcpuExit(format!(
+                            "syscall frame is at unexpected address {frame_address:#x}",
+                        )));
+                    }
+                    let return_slot = std::ptr::from_mut(exit.ret) as usize;
+                    let request = SyscallRequest::read_from(&self.memory, frame_address)?;
+                    let result = executor.execute(&request, &self.memory);
+                    SyscallRequest::write_result(&mut self.memory, frame_address, result)?;
+                    // SAFETY: return_slot points into this stopped vCPU's stable KVM_RUN mapping.
+                    unsafe {
+                        (return_slot as *mut u64).write(0);
+                    }
+                    (executor.take_segment(), executor.take_process_action())
+                }
+                VcpuExit::Hlt => {
+                    if self.try_resume_vmware_backdoor_probe()? {
+                        continue;
+                    }
+                    return Err(self.static_elf_halt_error()?);
+                }
+                exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
+            };
+
+            if let Some((segment, address)) = segment_update {
+                set_user_segment_base(&self.vcpu, segment, address)?;
+            }
+
+            if let Some(action) = process_action {
+                self.run_process_action(executor, action, true)?;
+            }
+
+            if let Some(exit) = executor.take_exit() {
+                if exit.group {
+                    self.request_guest_thread_group_exit(exit.status);
+                }
+                if !self.is_guest_thread {
+                    self.cancel_guest_threads();
+                }
+                let (stdout, stderr) = executor.take_output();
+                return Ok((exit.status, stdout, stderr));
+            }
+        }
+    }
+
+    pub(crate) fn register_guest_thread(&self) -> Result<GuestThreadRegistration> {
+        let restore_blocked_signal = set_guest_interrupt_signal_mask(libc::SIG_UNBLOCK)?;
+        // SAFETY: pthread_self returns the live calling thread's identifier.
+        let pthread = unsafe { libc::pthread_self() };
+        if self.is_guest_thread {
+            self.thread_group
+                .workers
+                .lock()
+                .expect("KVM guest worker lock poisoned")
+                .push(pthread);
+        } else {
+            let previous = self
+                .thread_group
+                .root
+                .lock()
+                .expect("KVM guest root lock poisoned")
+                .replace(pthread);
+            assert!(previous.is_none(), "KVM guest root already registered");
+        }
+        Ok(GuestThreadRegistration {
+            group: self.thread_group.clone(),
+            pthread,
+            root: !self.is_guest_thread,
+            restore_blocked_signal,
+        })
+    }
+
+    pub(crate) fn guest_thread_group_exit_status(&self) -> Option<ExitStatus> {
+        self.thread_group.exit_status()
+    }
+
+    pub(crate) fn request_guest_thread_group_exit(&self, status: ExitStatus) {
+        self.thread_group.request_exit_group(status);
+    }
+
+    // TODO-HUMAN-REVIEW(PR-172): Review signal-driven KVM worker cancellation.
+    pub(crate) fn cancel_guest_threads(&self) {
+        self.thread_group.cancel_workers();
+        if !self.is_guest_thread {
+            self.thread_group.join_workers();
+        }
+    }
+
+    /// Installs one syscall frame and a `vmcall`/`vmmcall; hlt` guest program.
+    pub fn install_syscall(
+        &mut self,
+        entry_point: u64,
+        frame_address: u64,
+        request: SyscallRequest,
+    ) -> Result<()> {
+        self.install_syscalls(entry_point, frame_address, &[request])
+    }
+
+    /// Installs a guest program that issues each syscall through a userspace hypercall.
+    ///
+    /// Frames occupy consecutive guest pages because KVM validates this transport
+    /// using the `KVM_HC_MAP_GPA_RANGE` argument shape before exiting to userspace.
+    pub fn install_syscalls(
+        &mut self,
+        entry_point: u64,
+        frame_address: u64,
+        requests: &[SyscallRequest],
+    ) -> Result<()> {
+        if !frame_address.is_multiple_of(SYSCALL_FRAME_STRIDE) {
+            return Err(Error::InvalidSyscallFrameAddress(frame_address));
+        }
+
+        let mut code = Vec::with_capacity(requests.len().saturating_mul(15).saturating_add(1));
+        for (index, request) in requests.iter().copied().enumerate() {
+            let address = SYSCALL_FRAME_STRIDE
+                .checked_mul(index as u64)
+                .and_then(|offset| frame_address.checked_add(offset))
+                .ok_or(Error::InvalidSyscallFrameAddress(frame_address))?;
+            let address =
+                u32::try_from(address).map_err(|_| Error::InvalidSyscallFrameAddress(address))?;
+
+            request.write_to(&mut self.memory, u64::from(address))?;
+
+            // Real mode defaults to 16-bit operands. The 0x66 prefix loads the
+            // complete 32-bit hypercall number and guest-physical frame address.
+            code.extend_from_slice(&[0x66, 0xb8]);
+            code.extend_from_slice(&(VMCALL_SYSCALL_TRANSPORT as u32).to_le_bytes());
+            code.extend_from_slice(&[0x66, 0xbb]);
+            code.extend_from_slice(&address.to_le_bytes());
+            code.extend_from_slice(&self.hypercall_instruction);
+        }
+        code.push(HLT);
+        // Writes the program and installs the real-mode segment/rip/rflags state.
+        self.install_real_mode_program(entry_point, &code)?;
+
+        let mut regs = self.vcpu.get_regs()?;
+        // The guest program loads the transport number and frame address into
+        // rax/rbx itself, so only the MAP_GPA_RANGE argument shape is set here:
+        // KVM validates it before forwarding the enabled hypercall to userspace.
+        regs.rcx = 1;
+        regs.rdx = 0;
+        self.vcpu.set_regs(&regs)?;
+        Ok(())
+    }
+
+    /// Runs until the guest halts, invoking `handler` for each syscall vmcall.
+    pub fn run<F>(&mut self, mut handler: F) -> Result<()>
+    where
+        F: FnMut(Syscall, &GuestMemory) -> i64,
+    {
+        loop {
+            let vcpu_exit = self.vcpu.run()?;
+            Self::record_exit(self.exit_collector.as_deref(), &vcpu_exit);
+            match vcpu_exit {
+                VcpuExit::Hypercall(exit) => {
+                    if exit.nr != VMCALL_SYSCALL_TRANSPORT {
+                        return Err(Error::UnexpectedHypercall(exit.nr));
+                    }
+                    let syscall =
+                        SyscallRequest::read_from(&self.memory, exit.args[0])?.into_syscall()?;
+                    *exit.ret = handler(syscall, &self.memory) as u64;
+                }
+                VcpuExit::Hlt => return Ok(()),
+                exit => return Err(Error::UnexpectedVcpuExit(format!("{exit:?}"))),
+            }
+        }
+    }
+
+    /// Exposes the VM fd for future backend setup without transferring ownership.
+    pub fn vm_fd(&self) -> &VmFd {
+        &self.vm
+    }
+}
+
+impl BackendStatsSource for KvmBackend {
+    type Snapshot = KvmBackendStats;
+
+    /// Snapshots exits from the root and every inherited fork/thread collector.
+    /// End-of-run callers observe a complete tree because the KVM run paths join
+    /// process workers and guest threads before returning to the root caller.
+    fn backend_stats(&self) -> Self::Snapshot {
+        self.exit_collector
+            .as_deref()
+            .map_or_else(KvmBackendStats::default, KvmExitCollector::snapshot)
+    }
+}
+
+impl Drop for KvmBackend {
+    fn drop(&mut self) {
+        self.release_thread_slot();
+        if !self.is_guest_thread {
+            self.cancel_guest_threads();
+        }
+    }
+}
+
+fn write_tid_best_effort(memory: &mut GuestMemory, address: Option<u64>, tid: i32) {
+    if let Some(address) = address {
+        // Linux creates the child even if a clone TID store faults.
+        let _ = memory.write(address, &tid.to_le_bytes());
+    }
+}
+
+// TODO-HUMAN-REVIEW(PR-172): Review CHILD_CLEARTID store and shared futex wake ordering.
+fn clear_tid_and_wake(memory: &mut GuestMemory, address: Option<u64>) {
+    let Some(address) = address else {
+        return;
+    };
+    // Linux treats a failed CHILD_CLEARTID store as best-effort and skips the
+    // wake when the user address is invalid.
+    if memory.write(address, &0_i32.to_le_bytes()).is_err() {
+        return;
+    }
+    let Some(offset) = address.checked_sub(memory.guest_base()) else {
+        return;
+    };
+    let Some(host_address) = memory.host_address().checked_add(offset) else {
+        return;
+    };
+    // SAFETY: the successful write above validates the complete futex word,
+    // and GuestMemory keeps its shared host mapping alive for this call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            host_address,
+            1, // FUTEX_WAKE; the kernel's CHILD_CLEARTID wake is not private.
+            1,
+            0,
+            0,
+            0,
+        );
+    }
+}
+
+fn supported_hypercall_instruction(cpuid: &CpuId) -> Result<[u8; 3]> {
+    let supports_vmcall = cpuid
+        .as_slice()
+        .iter()
+        .find(|entry| entry.function == 1)
+        .is_some_and(|entry| entry.ecx & (1 << 5) != 0);
+    if supports_vmcall {
+        return Ok(VMCALL);
+    }
+
+    let supports_vmmcall = cpuid
+        .as_slice()
+        .iter()
+        .find(|entry| entry.function == 0x8000_0001)
+        .is_some_and(|entry| entry.ecx & (1 << 2) != 0);
+    if supports_vmmcall {
+        return Ok(VMMCALL);
+    }
+    Err(Error::HypercallInstructionUnsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct SlotReleaseLog {
+        group: Arc<GuestThreadGroup>,
+        reused: Mutex<Option<usize>>,
+    }
+
+    #[reverie::global_tool]
+    impl GlobalTool for SlotReleaseLog {
+        type Request = ();
+        type Response = ();
+        type Config = ();
+
+        async fn receive_rpc(&self, _from: Pid, (): ()) {
+            let slot = self
+                .group
+                .reserve_transport_slot(10_000)
+                .expect("exiting worker slot was not released before on_exit_thread");
+            self.group.release_transport_slot(slot);
+            *self.reused.lock().expect("slot result lock poisoned") = Some(slot);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct SlotReleaseTool;
+
+    #[reverie::tool]
+    impl Tool for SlotReleaseTool {
+        type GlobalState = SlotReleaseLog;
+        type ThreadState = ();
+
+        async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
+            &self,
+            _tid: Pid,
+            global: &G,
+            _thread_state: Self::ThreadState,
+            _status: ExitStatus,
+        ) -> std::result::Result<(), reverie::Error> {
+            global.send_rpc(()).await;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn root_guest_pid_must_be_positive() {
+        assert_eq!(validate_root_pid(1).unwrap(), 1);
+        assert_eq!(validate_root_pid(3).unwrap(), 3);
+        assert!(matches!(
+            validate_root_pid(0),
+            Err(Error::InvalidGuestPid(0))
+        ));
+        assert!(matches!(
+            validate_root_pid(-1),
+            Err(Error::InvalidGuestPid(-1))
+        ));
+    }
+
+    #[test]
+    fn root_parent_pid_matches_ptrace_namespace_convention() {
+        // Conventional root guest (detcore ROOT_DETPID == 3) is parented to the
+        // namespace init, so getppid() == 1 exactly as under the ptrace backend.
+        assert_eq!(root_parent_pid(3), 1);
+        // Any non-init root guest is likewise parented to init.
+        assert_eq!(root_parent_pid(2), 1);
+        assert_eq!(root_parent_pid(42), 1);
+        // A guest that is itself the namespace init has no parent (getppid == 0).
+        assert_eq!(root_parent_pid(CONTAINER_INIT_PID), 0);
+    }
+
+    #[test]
+    fn guest_thread_transport_slots_are_bounded_and_reusable() {
+        let group = GuestThreadGroup::default();
+        let mut slots = Vec::new();
+        for tid in 2..2 + MAX_GUEST_THREADS as i32 {
+            slots.push(group.reserve_transport_slot(tid).unwrap());
+        }
+        assert_eq!(slots, (0..MAX_GUEST_THREADS as usize).collect::<Vec<_>>());
+        assert!(matches!(
+            group.reserve_transport_slot(10_000),
+            Err(Error::GuestThreadLimitExceeded(10_000))
+        ));
+
+        let released = slots[slots.len() / 2];
+        group.release_transport_slot(released);
+        assert_eq!(group.reserve_transport_slot(10_001).unwrap(), released);
+    }
+
+    #[test]
+    fn tool_exit_releases_transport_slot_before_exit_callback() {
+        match Kvm::new() {
+            Ok(_) => {}
+            Err(error) if matches!(error.errno(), libc::ENOENT | libc::EACCES | libc::EPERM) => {
+                eprintln!("skipping KVM slot-release test: cannot open /dev/kvm: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+        }
+
+        let group = Arc::new(GuestThreadGroup::default());
+        for tid in 2..MAX_GUEST_THREADS as i32 + 1 {
+            group.reserve_transport_slot(tid).unwrap();
+        }
+        let exiting_slot = group.reserve_transport_slot(10_000).unwrap();
+        assert_eq!(exiting_slot, MAX_GUEST_THREADS as usize - 1);
+
+        let mut backend = KvmBackend::new(16 * 1024 * 1024).unwrap();
+        backend.thread_group = group.clone();
+        backend.thread_slot = Some(exiting_slot);
+        backend.is_guest_thread = true;
+        let log = SlotReleaseLog {
+            group,
+            reused: Mutex::new(None),
+        };
+
+        futures::executor::block_on(backend.notify_tool_exit(
+            SlotReleaseTool,
+            (Pid::from_raw(3), Pid::from_raw(10_000)),
+            &log,
+            &(),
+            (),
+            ExitStatus::SUCCESS,
+        ))
+        .unwrap();
+
+        assert_eq!(backend.thread_slot, None);
+        assert_eq!(*log.reused.lock().unwrap(), Some(exiting_slot));
+    }
+
+    #[test]
+    fn process_snapshot_hides_internal_tool_scratch_pages() {
+        let memory = GuestMemory::new(0, (BOOT_RESERVED_END + PAGE_SIZE) as usize).unwrap();
+        let root_bottom = TOOL_STACK_TOP - TOOL_STACK_SIZE;
+        let first_worker_bottom = thread_tool_stack_top(0) - TOOL_STACK_SIZE;
+        let last_worker_bottom =
+            thread_tool_stack_top(MAX_GUEST_THREADS as usize - 1) - TOOL_STACK_SIZE;
+        let ordinary_page = BOOT_RESERVED_END;
+
+        memory
+            .map_user_range(root_bottom, TOOL_STACK_SIZE, false)
+            .unwrap();
+        memory
+            .map_user_range(first_worker_bottom, TOOL_STACK_SIZE, false)
+            .unwrap();
+        memory
+            .map_user_range(last_worker_bottom, TOOL_STACK_SIZE, false)
+            .unwrap();
+        memory
+            .map_user_range(ordinary_page, PAGE_SIZE, false)
+            .unwrap();
+        let snapshot = memory.snapshot().unwrap();
+
+        hide_tool_scratch_pages(&snapshot).unwrap();
+
+        assert!(memory.user_range_is_mapped(root_bottom, TOOL_STACK_SIZE));
+        assert!(!snapshot.user_range_is_mapped(root_bottom, TOOL_STACK_SIZE));
+        assert!(!snapshot.user_range_is_mapped(first_worker_bottom, TOOL_STACK_SIZE));
+        assert!(!snapshot.user_range_is_mapped(last_worker_bottom, TOOL_STACK_SIZE));
+        assert!(snapshot.user_range_is_mapped(ordinary_page, PAGE_SIZE));
+    }
+
+    #[test]
+    fn guest_thread_group_joins_registered_workers() {
+        let group = Arc::new(GuestThreadGroup::default());
+        let outer_finished = Arc::new(AtomicBool::new(false));
+        let nested_finished = Arc::new(AtomicBool::new(false));
+        let worker_group = group.clone();
+        let worker_finished = outer_finished.clone();
+        let child_finished = nested_finished.clone();
+        group.add_worker_handle(std::thread::spawn(move || {
+            worker_group.add_worker_handle(std::thread::spawn(move || {
+                child_finished.store(true, Ordering::Release);
+            }));
+            worker_finished.store(true, Ordering::Release);
+        }));
+
+        group.join_workers();
+
+        assert!(outer_finished.load(Ordering::Acquire));
+        assert!(nested_finished.load(Ordering::Acquire));
+        assert!(group.worker_handles.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exec_cancellation_joins_and_rearms_the_thread_group() {
+        let group = Arc::new(GuestThreadGroup::default());
+        let worker_group = group.clone();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let finished = worker_finished.clone();
+        group.add_worker_handle(std::thread::spawn(move || {
+            while !worker_group.cancelled.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            finished.store(true, Ordering::Release);
+        }));
+        *group.exit_status.lock().unwrap() = Some(ExitStatus::Exited(127));
+
+        group.cancel_workers();
+        group.join_workers();
+        group.rearm_after_exec();
+
+        assert!(worker_finished.load(Ordering::Acquire));
+        assert!(group.worker_handles.lock().unwrap().is_empty());
+        assert_eq!(group.exit_status(), None);
+        assert!(!group.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn clone_tid_stores_and_clear_are_best_effort() {
+        const TID_ADDRESS: u64 = 0x100;
+
+        let mut memory = GuestMemory::new(0, 4096).unwrap();
+        write_tid_best_effort(&mut memory, Some(TID_ADDRESS), 7);
+        let mut bytes = [0; std::mem::size_of::<i32>()];
+        memory.read(TID_ADDRESS, &mut bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(bytes), 7);
+
+        write_tid_best_effort(&mut memory, Some(TID_ADDRESS), 0);
+        memory.read(TID_ADDRESS, &mut bytes).unwrap();
+        assert_eq!(i32::from_le_bytes(bytes), 0);
+
+        write_tid_best_effort(&mut memory, Some(4095), 9);
+        write_tid_best_effort(&mut memory, None, 9);
+    }
+}

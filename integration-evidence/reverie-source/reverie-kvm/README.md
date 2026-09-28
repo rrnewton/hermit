@@ -1,0 +1,114 @@
+# reverie-kvm
+
+`reverie-kvm` is an x86-64 research backend for driving small KVM guests. It
+creates a VM and vCPU, provides bounded guest-physical memory access, turns a
+guest `vmcall`/`vmmcall` into a typed Reverie syscall event, and can run
+minimal static ELF executables in a bare long-mode process personality.
+
+The host must provide x86-64 KVM, procfs, `openat2` (Linux 5.6 or newer),
+and `utimensat(AT_EMPTY_PATH)` (Linux 5.8 or newer) for full filesystem
+metadata compatibility. Hosts before `fchmodat2` use a held-descriptor procfs
+fallback rather than re-resolving guest paths.
+
+The guest places the syscall number and six arguments in a fixed-size frame in
+guest memory. The hypercall passes the frame address to the host. `run` exposes
+the original raw callback, while `run_with_tool` converts the frame to
+`reverie::syscalls::Syscall` and dispatches a normal `reverie::Tool`. Its guest
+adapter implements the shared `Guest` contracts for memory, registers, stack,
+thread state, global RPC, syscall injection, and tail injection. Until a guest
+kernel supplies Linux syscall semantics, callers provide a `SyscallExecutor`
+for injected and unsubscribed syscalls.
+
+## ELF execution
+
+`install_static_elf` accepts little-endian x86-64 `ET_EXEC` and `ET_DYN` images. It copies `PT_LOAD` segments, zeros BSS, loads one `PT_INTERP` image when present, creates a Linux-style `argc`/`argv`/`envp`/auxv stack, and installs an identity-mapped long-mode address space. The vCPU starts at CPL3. `EFER.SCE`, `STAR`, `LSTAR`, and
+`SFMASK` direct real `SYSCALL` instructions to a ring-0 trampoline that
+serializes the Linux ABI register frame, exits KVM, then returns with
+`SYSRETQ`.
+
+Architectural exceptions (vectors 0 through 31) enter a ring-0 handler on the
+TSS exception stack and exit KVM as `Error::GuestException`, which reports the
+vector, saved guest instruction pointer, and `CR2`. The backend reports faults
+to its caller; it does not yet translate them into Linux signals.
+
+`run_static_elf` supplies a deliberately small Linux personality. It handles process exit, host-backed filesystem descriptors, stdout/stderr writes, deterministic identity, time and random queries, FS/GS bases, `brk`, anonymous and file-backed `mmap`, and common startup no-ops. Unsupported syscalls return `ENOSYS`.
+
+The host-backed filesystem layer includes descriptor duplication, file and
+filesystem metadata, permission and timestamp updates, and bounded
+create/link/rename/unlink operations. A virtual umask is applied to creation
+modes before they are forwarded to the host. The executor also persists signal
+actions, masks, and alternate-stack configuration even though asynchronous
+signal delivery remains outside the current process model. `mincore`, `getcpu`,
+`sched_getaffinity`, and `membarrier` report the deterministic single-vCPU
+topology.
+
+The process personality implements `fork`, `vfork`, process-only `clone`/`clone3`,
+`execve`/`execveat`, and `wait4`. Forked children receive an independent guest
+RAM snapshot and fresh VM/vCPU, inherit duplicated host file descriptions, and
+run to completion before the parent resumes. Legacy process clones support
+`CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, and `CLONE_CHILD_CLEARTID`. A
+bounded glibc pthread clone profile can run child threads that complete without
+parent or sibling progress: each child runs to completion on the shared vCPU
+before its parent resumes. Forked processes receive independent process/thread
+tool state, run subscribed syscall and lifecycle callbacks, and contribute to
+the root tool's shared `GlobalState`. `CLONE_THREAD` workers still execute
+through the KVM personality without per-thread tool lifecycle callbacks.
+
+## Typed syscall decoding
+
+Every valid x86-64 syscall number is decoded through Reverie's complete typed
+syscall table before it reaches the host handler; a number outside that table
+is rejected instead of being forwarded as an untyped request. `install_syscalls`
+builds a small guest program containing consecutive hypercalls, with one
+page-aligned frame per request, so a single KVM run can route several syscalls.
+
+## CPUID policy
+
+Every vCPU receives an explicit CPUID table through `KVM_SET_CPUID2` before
+its first `KVM_RUN`. The default `CpuidPolicy::deterministic` policy replaces
+the host table with a fixed x86-64-v2 profile based on Detcore's CPUID table,
+then removes `RDRAND`, `RDSEED`, TSX, AVX-512 feature bits, and the AVX-512
+extended register state. This keeps standard and extended identity, feature,
+cache, and topology leaves independent of the KVM host. VM creation fails if
+the host lacks an instruction feature required by that baseline. Callers that
+need KVM's full host-supported table can opt into
+`CpuidPolicy::host_supported`.
+
+The KVM integration test executes CPUID inside the VM and copies the resulting
+registers to guest memory. This checks the vCPU-visible table rather than only
+unit-testing the host-side mask.
+
+This is a static vCPU feature policy, not a per-instruction
+`Tool::handle_cpuid_event` callback. The latter still requires the planned
+Linux execution bridge to preserve task-local callback context.
+
+## Relationship to gVisor
+
+gVisor routes Linux filesystem syscalls through its Sentry VFS and the filesystem implementations under `pkg/sentry/fsimpl/`. Those layers own mount-namespace traversal, dentries, file descriptions, metadata, and directory iteration without exposing host descriptors directly. The closest syscall-facing paths are `pkg/sentry/syscalls/linux/sys_file.go` and `sys_getdents.go`.
+
+This backend follows the same separation between the architecture transport and syscall policy: the KVM exit path only carries a Linux register frame, while the executor owns guest descriptor allocation, path resolution, and ABI marshalling. The implementation is intentionally much smaller than gVisor: each opened filesystem descriptor owns a host `File`, relative paths resolve against the captured working directory or an owned directory descriptor, and subscribed calls pass through Detcore, whose tail injection invokes this executor before Detcore post-processes returned metadata; unsubscribed calls invoke the executor directly.
+
+No gVisor code is copied. Unlike the gVisor Sentry VFS and `pkg/sentry/fsimpl/` stack, this crate does not provide a virtual mount namespace, dentry cache, or filesystem implementation. Hermit container setup remains the isolation boundary, not this standalone crate, and a changing host-backed filesystem remains outside the determinism guarantee. Host procfs descriptors are rejected because they would identify the Hermit supervisor rather than a separate guest process.
+
+## Current limits
+
+This crate is not a complete Linux execution backend. Each process has one vCPU
+and fixed-address identity mappings; pthread clones run cooperatively rather than
+concurrently, so programs that require parent/child or sibling interleaving can
+stall. Asynchronous signal delivery, concurrent process scheduling, and hardware
+page-permission enforcement remain unsupported. Host-side
+guest-memory copies track mapped and `PROT_NONE` pages so intercepted syscalls can
+preserve Linux fault and partial-copy behavior; the identity-mapped vCPU page
+tables remain permissive for direct guest loads and stores. Filesystem access forwards into the host namespace with bounded
+memory copies and a guest-owned descriptor table; it does not isolate or
+snapshot host filesystem changes. The current hypercall transport also reuses
+standardized KVM hypercall 12 because it is the only hypercall KVM exposes to
+userspace; that prototype ABI must be replaced before running a stock guest
+kernel.
+
+The deterministic guest procfs surface is currently limited to explicit
+synthetic files, descriptor reopen aliases, and guest-owned descriptor link
+targets. It does not yet enumerate procfs directories, so proc-inspection tools
+that scan the process table remain unsupported.
+
+The ELF loader supports one host interpreter and enough file-backed mapping for small dynamically linked programs. General libc coverage remains bounded by the explicit syscall personality; unsupported operations fail with `ENOSYS` rather than silently bypassing the tool.

@@ -1,0 +1,175 @@
+name: Rust
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C link-arg=-llzma
+
+jobs:
+  regular:
+    name: Regular tests (GitHub-hosted)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+    - name: Rust toolchain
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: clippy, rustfmt
+    - name: Cross-client skill discovery
+      run: |
+        rustc scripts/check-skill-discovery.rs -o "$RUNNER_TEMP/check-skill-discovery"
+        "$RUNNER_TEMP/check-skill-discovery"
+    # reverie-dbt/build.rs compiles the vendored DynamoRIO source on first use.
+    # Cache the content-addressed install tree; both the Actions key and the
+    # restored directory require the exact vendored source + recipe content.
+    - name: Cache DynamoRIO build
+      uses: actions/cache@v4
+      with:
+        path: target/*/reverie-dbt-native-cache/dynamorio-install-*
+        key: dynamorio-${{ runner.os }}-${{ hashFiles('reverie-dbt/vendor/dynamorio/**', 'reverie-dbt/build.rs') }}
+    - name: Build
+      run: cargo build --workspace --all-features
+    - name: DBT virtual identity and pidfd_open policy
+      run: reverie-dbt/scripts/test-identity-policy.sh
+    - name: Test regular workspace cases
+      run: >-
+        cargo test --workspace --all-features --
+        --test-threads=1
+        --skip container::tests::bind_to_low_port
+        --skip container::tests::mount_error_from_child_is_returned
+        --skip container::tests::test_directory_is_available_after_mount
+        --skip container::tests::pin_affinity_to_all_cores
+        --skip tests::domainname
+        --skip tests::hostname
+        --skip tests::local_networking_loopback_flags
+        --skip tests::local_networking_ping
+        --skip tests::local_networking_there_can_be_only_one
+        --skip tests::mount_and_move_tmpfs
+        --skip tests::mount_bind
+        --skip tests::mount_bind_readonly_rejects_writes
+        --skip tests::mount_devpts_basic
+        --skip tests::mount_devpts_isolated
+        --skip tests::mount_proc
+        --skip tests::mount_tmpfs
+        --skip tests::pid_namespace
+        --skip tests::port_isolation
+        --skip tests::seccomp_notify
+        --skip tests::uid_namespace
+    - name: Documentation tests
+      run: cargo test --workspace --doc
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets --all-features
+    - name: Format
+      run: cargo fmt --all -- --check
+
+  hardware:
+    name: Host-dependent tests (self-hosted)
+    if: >-
+      ${{
+        vars.REVERIE_SELF_HOSTED == 'true' &&
+        (
+          github.event_name == 'push' ||
+          (
+            github.event_name == 'workflow_dispatch' &&
+            github.actor == 'rrnewton'
+          ) ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.user.login == 'rrnewton'
+          )
+        )
+      }}
+    runs-on: [self-hosted, Linux, X64, reverie]
+    # AGGRESSIVE 10-minute box on scarce self-hosted hardware. The self-hosted
+    # `reverie` pool is small and shared (observed peak ~4 simultaneous jobs on
+    # one physical host), so a single long job consumes a large fraction of total
+    # capacity for its whole duration; the timeout is RESOURCE PROTECTION, not
+    # merely a hang detector. It is also the enforcement of "short tests only" on
+    # this hardware: the host-dependent test baseline is ~2 minutes, so 10 is
+    # already ~5x headroom, while the job silently wedged at 2h44m (~80x) once and
+    # squatted the runner. A silent hang and a merely-slow job are
+    # indistinguishable without a bound; 10 min converts either into a fast,
+    # definite signal ("re-run on a quiesced runner").
+    #
+    # This 10-minute budget assumes the WARM self-hosted cache (incremental build
+    # + ~2min tests) that is the steady state on a persistent runner. A COLD
+    # DynamoRIO/workspace build can exceed 10 min; per policy that overflow is a
+    # surfaced FINDING, not a reason to pre-emptively raise the bound -- the
+    # informative watchdog below attributes exactly which step overran and for how
+    # long, so a cold-build overflow is diagnosable rather than a bare timeout.
+    timeout-minutes: 10
+
+    steps:
+    # PMU-sensitive tests measure hardware counters whose behaviour changes when
+    # the machine is busy: a measurement taken under host contention is INVALID
+    # and must be discarded, not reported (same principle as the nightly stress
+    # harness validity calibrator). Refuse fast and honestly rather than degrade
+    # into a multi-hour hang. Runs first, before build/test, so it reflects
+    # AMBIENT load (neighbour/fleet), not this job's own build parallelism.
+    - name: Host load precondition (PMU measurement validity)
+      env:
+        MAX_LOAD_PER_CORE: ${{ vars.REVERIE_MAX_LOAD_PER_CORE || '1.5' }}
+        SKIP_LOAD_PRECONDITION: ${{ vars.REVERIE_SKIP_LOAD_PRECONDITION }}
+      run: |
+        set -euo pipefail
+        if [ "${SKIP_LOAD_PRECONDITION:-}" = "true" ]; then
+          echo "REVERIE_SKIP_LOAD_PRECONDITION=true -> skipping host-load precondition."
+          exit 0
+        fi
+        read -r load1 _ < /proc/loadavg
+        cores="$(nproc)"
+        limit="$(awk -v c="$cores" -v m="$MAX_LOAD_PER_CORE" 'BEGIN { printf "%.2f", c * m }')"
+        echo "host 1m-load=$load1 cores=$cores max-per-core=$MAX_LOAD_PER_CORE limit=$limit"
+        over="$(awk -v l="$load1" -v lim="$limit" 'BEGIN { print (l > lim) ? 1 : 0 }')"
+        if [ "$over" = "1" ]; then
+          echo "::error title=Host too loaded to measure (not a product failure)::1-minute load average ${load1} exceeds ${limit} (${cores} cores x ${MAX_LOAD_PER_CORE}). PMU/perf-counter determinism tests cannot be measured validly on a contended host, so this run is refused rather than reporting an invalid measurement. This is NOT a Reverie regression. Remedies: re-run on a quiesced host, add a second 'reverie' self-hosted runner (removes the SPOF), raise vars.REVERIE_MAX_LOAD_PER_CORE, or set vars.REVERIE_SKIP_LOAD_PRECONDITION=true to opt out."
+          exit 1
+        fi
+        echo "Host load within budget; proceeding with host-dependent tests."
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Dependencies
+      run: |
+        # Detect the native package manager dnf-FIRST: the Fedora self-hosted
+        # runners also have apt-get on PATH, but its repos lack cmake/zlib1g-dev,
+        # so keying on `command -v apt-get` took the apt branch and failed with
+        # "Unable to locate package cmake" (exit 100). dnf-first routes each
+        # distro to its own manager.
+        if command -v dnf >/dev/null; then
+          sudo dnf install -y libunwind-devel xz-devel cmake zlib-devel
+        elif command -v apt-get >/dev/null; then
+          sudo apt-get install -y libunwind-dev liblzma-dev cmake zlib1g-dev
+        fi
+    - name: Rust toolchain
+      uses: dtolnay/rust-toolchain@nightly
+    - name: Host-dependent workspace tests
+      env:
+        REVERIE_REQUIRE_KVM: "1"
+      run: |
+        # Informative timeout: this step is the known wedge site (the 2h44m hang
+        # lived here). The job is hard-boxed at timeout-minutes:10, but a bare
+        # GitHub job timeout says only "job cancelled" -- not which step, for how
+        # long, or whether it was a genuine hang vs host-load starvation. Launch a
+        # background watchdog that, ~1-2 min before the hard box, prints this step
+        # + elapsed + two live thread/wchan snapshots of the test tree. It never
+        # fails the build (timeout-minutes stays the enforcement); on the green
+        # path the test finishes first and the watchdog is killed mid-sleep,
+        # costing nothing.
+        scripts/ci-timeout-watchdog.sh \
+          --step "Host-dependent workspace tests" \
+          --soft-deadline 300 --hard-box 540 &
+        watchdog=$!
+        set +e
+        cargo test --workspace --all-features -- --test-threads=1
+        status=$?
+        kill "$watchdog" 2>/dev/null || true
+        wait "$watchdog" 2>/dev/null || true
+        exit "$status"
