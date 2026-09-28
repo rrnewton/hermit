@@ -246,6 +246,26 @@ prepared_nextest_artifact_contract() {
     done
 }
 
+# build-debug publishes the prepared-Nextest record inside build.workspace_on_host.
+# Anything that rebuilds afterward rewrites recorded executables or runtime
+# files (run 36485831200: a DBT staging `cargo build -p detcore-dbt` rewrote
+# target/debug/deps/libdetcore_dbt.{so,rlib}), and every consumer then refuses
+# its inventory. The producer must re-assert the complete record after its last
+# Cargo invocation and before either pack step.
+prepared_nextest_producer_contract() {
+    local workflow_text=$1 body assert_line last_cargo pack_debug pack_nextest
+    body=$(workflow_job_body build-debug "$workflow_text") || return 1
+    assert_line=$(grep -nFx '          ./ci/nextest-binaries.rs assert hosted-portable' <<<"$body" | cut -d: -f1)
+    [[ $assert_line =~ ^[0-9]+$ ]] || return 1
+    last_cargo=$(grep -nE '(^|[^-[:alnum:]_/])cargo[[:space:]]+(build|test|rustc|run|nextest|check|clippy|doc)([[:space:]]|$)' <<<"$body" |
+        grep -vE '^[0-9]+:[[:space:]]*#' | tail -n 1 | cut -d: -f1)
+    pack_debug=$(grep -nFx '      - name: Pack debug prebuilt tree' <<<"$body" | cut -d: -f1)
+    pack_nextest=$(grep -nFx '      - name: Pack prepared Nextest inputs' <<<"$body" | cut -d: -f1)
+    [[ $pack_debug =~ ^[0-9]+$ && $pack_nextest =~ ^[0-9]+$ ]] || return 1
+    ((assert_line < pack_debug && assert_line < pack_nextest)) || return 1
+    [[ -z $last_cargo ]] || ((last_cargo < assert_line))
+}
+
 workflow_job_body() {
     local job=$1 workflow_text=$2
     awk -v marker="  $job:" '
@@ -494,6 +514,26 @@ if [[ $missing_prepared_download == "$workflow_text" ]]; then
     status=1
 elif prepared_nextest_artifact_contract "$missing_prepared_download"; then
     echo "check-shard-coverage.sh: FAIL — prepared-nextest guard accepted a consumer without its artifact download" >&2
+    status=1
+fi
+if ! prepared_nextest_producer_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — build-debug must re-assert the prepared Nextest record after its last Cargo build and before packing" >&2
+    status=1
+fi
+unverified_producer=${workflow_text/$'          ./ci/nextest-binaries.rs assert hosted-portable\n'/}
+if [[ $unverified_producer == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest producer assertion mutation did not change the workflow" >&2
+    status=1
+elif prepared_nextest_producer_contract "$unverified_producer"; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest producer guard accepted a build-debug job without its record assertion" >&2
+    status=1
+fi
+restaged_after_record=${workflow_text/$'      - name: Pack debug prebuilt tree\n'/$'      - name: Stage debug DBT runtime\n        run: cargo build -p detcore-dbt --message-format=json-render-diagnostics\n      - name: Pack debug prebuilt tree\n'}
+if [[ $restaged_after_record == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest restage mutation did not change the workflow" >&2
+    status=1
+elif prepared_nextest_producer_contract "$restaged_after_record"; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest producer guard accepted a Cargo rebuild after the record assertion" >&2
     status=1
 fi
 if ! workflow_wiring_contract "$workflow_text"; then

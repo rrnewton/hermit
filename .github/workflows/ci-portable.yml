@@ -547,21 +547,6 @@ jobs:
           nextest=$(command -v cargo-nextest)
           install -Dm755 "$nextest" target/ci/bin/cargo-nextest
           target/ci/bin/cargo-nextest --version
-      - name: Stage debug DBT runtime
-        run: |
-          set -euo pipefail
-          runtime=$(
-            cargo build -p detcore-dbt --message-format=json-render-diagnostics |
-              jq -r '
-                select(.reason == "compiler-artifact" and .target.name == "detcore_dbt")
-                | .filenames[]
-                | select(endswith(".so"))
-              ' |
-              tail -n 1
-          )
-          test -n "$runtime"
-          test -f "$runtime"
-          install -Dm755 "$runtime" target/debug/deps/libdetcore_dbt.so
       - name: Enumerate constructed portable E2E steps
         id: cells
         run: |
@@ -575,6 +560,29 @@ jobs:
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
+      # build.workspace_on_host already builds detcore-dbt (its first command is
+      # `cargo build --locked -p detcore-dbt`, followed by the feature-unified
+      # workspace build) and then hashes target/debug/deps/libdetcore_dbt.{so,rlib}
+      # into the prepared-Nextest record as runtime files of every -p hermit and
+      # --workspace selection. A step here used to re-run
+      # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
+      # resolves different dependency features from the workspace build (for
+      # example parking_lot, bytes, syn and tracing-core), so Cargo recompiled
+      # reverie-dbt and detcore-dbt and overwrote both unhashed cdylib/rlib
+      # files after they were recorded. Every consumer then refused its inventory:
+      # run 36485831200 lost 12 nodes in 7 test-debug jobs to "prepared
+      # executable, package identity, or runtime file changed", about 5 s after
+      # start and before any test ran. The pack step below ships the recorded
+      # runtime unchanged. Re-verify the whole prepared record here, after the
+      # last step that may touch target/debug and before anything is packed, so
+      # a later mutation fails in this producer instead of in every consumer.
+      - name: Verify prepared Nextest inputs are unchanged
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/ci/rust-script-bin:$PATH"
+          export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"
+          export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
+          ./ci/nextest-binaries.rs assert hosted-portable
       - name: Pack debug prebuilt tree
         run: |
           set -euo pipefail
