@@ -394,6 +394,27 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
 }
 
 #[test]
+fn tcp_controller_accept_window_outlives_provider_startup() {
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let evidence = tempfile::tempdir().expect("create delayed TCP controller directory");
+    let (controller, port) = Controller::start(fixture, evidence.path());
+
+    // The provider and dynamic loader can legitimately need more than the
+    // fixture's five-second connected-socket I/O bound before the guest calls
+    // connect. Cross that old listener SO_RCVTIMEO boundary explicitly: accept
+    // is instead bounded by the controller's separate 30-second alarm.
+    thread::sleep(Duration::from_secs(6));
+    let output = bounded_command(
+        fixture,
+        &[OsStr::new("client"), OsStr::new(&port), OsStr::new("match")],
+        NATIVE_CLIENT_WALL_SECONDS,
+    );
+    assert_success(&output, "delayed native TCP bracket client");
+    assert_guest_invariants(&output.stdout, "delayed native TCP bracket client");
+    assert_controller_report(&controller.finish());
+}
+
+#[test]
 fn controller_no_contact_oracle_rejects_partial_accepted_connection() {
     use std::io::Write;
     use std::net::Shutdown;

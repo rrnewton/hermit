@@ -137,7 +137,6 @@ static int run_controller(const char *port_path, const char *report_path,
   int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listener < 0)
     fail("socket controller");
-  set_socket_timeouts(listener);
 
   struct sockaddr_in address = {
       .sin_family = AF_INET,
