@@ -139,6 +139,13 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "E2E_RESULT_ROOT",
     "E2E_RUN_ID",
     "HERMIT_E2E_EMPTY_WORKDIR",
+    // Forwarded only when set: one pinned epoch for every harness process of a
+    // run, so parity operands from different nodes give their guests one clock,
+    // and the parity post-pass's two activation variables, so a run that
+    // selects or disables parity cells does so inside the pinned root too.
+    "HERMIT_EPOCH",
+    crate::parity::PARITY_POST_PASS_ENV,
+    crate::parity::PARITY_SELECT_ENV,
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
     crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",

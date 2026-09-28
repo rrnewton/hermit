@@ -105,7 +105,8 @@ const PUBLIC_EXECUTION_ENVIRONMENT: &str =
 
 /// Read by `run` only: the parity post-pass after the determinism cells.
 const RUN_ENVIRONMENT: &str =
-    "  E2E_PARITY_SELECT=<TEST@BACKEND,...>   Also measure these parity cells after the run";
+    "  E2E_PARITY_SELECT=<TEST@BACKEND,...>   Also measure these parity cells after the run
+  E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)";
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
@@ -2479,51 +2480,40 @@ fn planned_verify(cells: &[SelectedCell]) -> BTreeSet<(String, String)> {
 }
 
 /// The parity cells this run reports on: the committed selection and
-/// `E2E_PARITY_SELECT`, narrowed by [`parity::post_pass_scope`] to the cells
-/// with a verify side planned here; an explicit cell with neither side is
-/// dropped with a warning. A selection file that cannot be read only warns,
-/// because the parity report must never stop the determinism cells. An
-/// invalid `E2E_PARITY_SELECT` is a usage error, refused before any cell runs
-/// or any output is created.
+/// `E2E_PARITY_SELECT`, resolved by [`parity::resolve_scope`], the same rule
+/// the pressure test uses: the cells with a verify side planned here. An
+/// explicit cell with neither side planned is dropped with a warning.
+/// `E2E_PARITY_POST_PASS=0` turns the post-pass off. A selection file that
+/// cannot be read only warns, because the parity report must never stop the
+/// determinism cells. An invalid `E2E_PARITY_SELECT` or `E2E_PARITY_POST_PASS`
+/// is a usage error, refused before any cell runs or any output is created.
 fn parity_scope(
     root: &Path,
     manifests: &ManifestSet,
     planned: &BTreeSet<(String, String)>,
 ) -> BTreeSet<ParityCellId> {
-    let explicit = std::env::var(parity::PARITY_SELECT_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let matrix = match parity::ParityMatrix::derive(manifests) {
-        Ok(matrix) => matrix,
-        Err(error) => {
-            if explicit.is_some() {
-                fail(format!(
-                    "{}: cannot derive the parity matrix: {error}",
-                    parity::PARITY_SELECT_ENV
-                ));
-            }
-            eprintln!("test-harness: parity post-pass disabled: {error}");
-            return BTreeSet::new();
+    match std::env::var(parity::PARITY_POST_PASS_ENV) {
+        Err(std::env::VarError::NotPresent) => {}
+        Ok(value) if value == "1" => {}
+        Ok(value) if value == "0" => return BTreeSet::new(),
+        Ok(value) => fail(format!(
+            "{} must be 0 or 1, got {value:?}",
+            parity::PARITY_POST_PASS_ENV
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            fail(format!("{} must be 0 or 1", parity::PARITY_POST_PASS_ENV))
         }
-    };
-    let explicit = explicit
-        .map(|value| {
-            parity::parse_parity_select(&value, &matrix)
-                .unwrap_or_else(|error| fail(format!("{}: {error}", parity::PARITY_SELECT_ENV)))
-        })
-        .unwrap_or_default();
-    let selection = match parity::ParitySelection::load(root, &matrix) {
-        Ok(selection) => selection.cells,
-        Err(error) => {
-            eprintln!("test-harness: parity selection ignored: {error}");
-            BTreeSet::new()
-        }
-    };
-    let (scope, warnings) = parity::post_pass_scope(&selection, &explicit, planned);
-    for warning in warnings {
-        eprintln!("test-harness: {warning}");
     }
-    scope
+    let explicit = std::env::var(parity::PARITY_SELECT_ENV).ok();
+    match parity::resolve_scope(root, manifests, explicit.as_deref(), planned) {
+        Ok(scope) => {
+            for warning in &scope.warnings {
+                eprintln!("test-harness: {warning}");
+            }
+            scope.cells
+        }
+        Err(error) => fail(format!("{}: {error}", parity::PARITY_SELECT_ENV)),
+    }
 }
 
 /// Run the parity post-pass over this process's rows once `results.jsonl`,

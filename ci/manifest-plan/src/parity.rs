@@ -30,7 +30,8 @@
 //!
 //! [`post_pass`] is the one mechanism that measures parity, in validate and in
 //! pressure-test alike. It runs after the determinism cells, inside the
-//! harness process, and reads only the logs those cells retained: for each
+//! harness process (validate) or the pressure-test process once every cell of
+//! the series has finished, and reads only the logs those cells retained: for each
 //! cell in scope it compares the ptrace golden with the candidate's log using
 //! `hermit log-diff` and writes one [`ParityRecord`] to `parity.jsonl`. It runs
 //! no guest and never changes a determinism result or an exit status. See
@@ -1334,6 +1335,69 @@ pub fn post_pass_scope(
     (scope, warnings)
 }
 
+/// `0` turns off a harness process's own post-pass; unset or `1` leaves it on.
+/// The pressure test sets `0` on every cell it launches: each of its cells is
+/// a separate harness process holding one side of a comparison, so the
+/// pressure test runs the same post-pass itself once every cell has finished.
+pub const PARITY_POST_PASS_ENV: &str = "E2E_PARITY_POST_PASS";
+
+/// The cells one run reports on, and what shrank that set without refusing
+/// the run.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedScope {
+    pub cells: BTreeSet<ParityCellId>,
+    /// An unreadable selection file, a matrix that cannot be derived when no
+    /// cell was activated explicitly, or an explicit cell neither of whose
+    /// verify sides the run planned. Callers print these and carry on.
+    pub warnings: Vec<String>,
+}
+
+/// Resolve one run's parity scope from the committed selection, the
+/// explicitly activated cells (the value of [`PARITY_SELECT_ENV`] or of
+/// `pressure-test --parity-select`) and the verify cells the run planned,
+/// through [`post_pass_scope`]. The harness and the pressure test both call
+/// this.
+///
+/// It refuses only an invalid explicit value, or a matrix that cannot be
+/// derived while explicit cells were asked for. A selection file that cannot be
+/// read is a warning, because the parity report must never stop the
+/// determinism cells.
+pub fn resolve_scope(
+    root: &Path,
+    manifests: &ManifestSet,
+    explicit: Option<&str>,
+    planned_verify: &BTreeSet<(String, String)>,
+) -> Result<ResolvedScope, String> {
+    let explicit = explicit.filter(|value| !value.trim().is_empty());
+    let matrix = match ParityMatrix::derive(manifests) {
+        Ok(matrix) => matrix,
+        Err(error) if explicit.is_some() => {
+            return Err(format!("cannot derive the parity matrix: {error}"));
+        }
+        Err(error) => {
+            return Ok(ResolvedScope {
+                cells: BTreeSet::new(),
+                warnings: vec![format!("parity post-pass disabled: {error}")],
+            });
+        }
+    };
+    let explicit = explicit
+        .map(|value| parse_parity_select(value, &matrix))
+        .transpose()?
+        .unwrap_or_default();
+    let mut warnings = Vec::new();
+    let selection = match ParitySelection::load(root, &matrix) {
+        Ok(selection) => selection.cells,
+        Err(error) => {
+            warnings.push(format!("parity selection ignored: {error}"));
+            BTreeSet::new()
+        }
+    };
+    let (cells, dropped) = post_pass_scope(&selection, &explicit, planned_verify);
+    warnings.extend(dropped);
+    Ok(ResolvedScope { cells, warnings })
+}
+
 /// The `(test, backend)` verify cells whose logs the post-pass reads: ptrace
 /// and the candidate of every cell in scope whose two sides this process both
 /// planned, except a backend whose inputs cannot be equalized, which is never
@@ -1448,6 +1512,12 @@ pub struct PostPassConfig {
     pub outer_deadline: Option<PostPassDeadline>,
     /// Concurrent `log-diff` comparisons.
     pub jobs: usize,
+    /// `(test, backend)` verify cells whose result rows the caller refused
+    /// to hand over, with its reason. Such a cell ran but has no row a
+    /// comparison can trust, so an operand here is `unavailable` with that
+    /// reason rather than missing. Empty for the harness, which hands over
+    /// every row of its process.
+    pub rejected: BTreeMap<(String, String), String>,
 }
 
 impl PostPassConfig {
@@ -1463,6 +1533,7 @@ impl PostPassConfig {
             budget: PARITY_POST_PASS_BUDGET,
             outer_deadline: None,
             jobs: 1,
+            rejected: BTreeMap::new(),
         }
     }
 
@@ -1827,6 +1898,12 @@ fn measure(
     let history = |test: &str, backend: &str| -> Option<&Vec<CellResult>> {
         histories.get(&(test.to_string(), backend.to_string()))
     };
+    let rejected = |test: &str, backend: &str| -> Option<&str> {
+        config
+            .rejected
+            .get(&(test.to_string(), backend.to_string()))
+            .map(String::as_str)
+    };
 
     let mut records: Vec<Option<ParityRecord>> = vec![None; scope.len()];
     let mut comparisons = Vec::new();
@@ -1856,7 +1933,10 @@ fn measure(
         }
         let candidate_role = format!("{} candidate", cell.backend);
         let candidate_history = history(&cell.test_id, cell.backend.as_str());
-        if candidate_history.is_none() && history(&cell.test_id, PARITY_REFERENCE_BACKEND).is_some()
+        let candidate_rejected = rejected(&cell.test_id, cell.backend.as_str());
+        if candidate_history.is_none()
+            && candidate_rejected.is_none()
+            && history(&cell.test_id, PARITY_REFERENCE_BACKEND).is_some()
         {
             // The candidate was planned elsewhere or not at all, so this
             // process retained no ptrace log for it and writes no golden.
@@ -1873,12 +1953,14 @@ fn measure(
                 config,
                 &cell.test_id,
                 history(&cell.test_id, PARITY_REFERENCE_BACKEND),
+                rejected(&cell.test_id, PARITY_REFERENCE_BACKEND),
             )
         });
         let candidate = retained_operand(
             &cell.test_id,
             &candidate_role,
             candidate_history,
+            candidate_rejected,
             ParityVerdict::CandidateMissing,
         )
         .and_then(|(row, log)| {
@@ -2015,7 +2097,7 @@ fn measure(
 }
 
 fn no_result_row(test: &str, role: &str) -> String {
-    format!("the {role} verify cell of {test} was not run by this harness process")
+    format!("the {role} verify cell of {test} has no result row in this run")
 }
 
 fn path_text(path: &Path) -> String {
@@ -2023,10 +2105,13 @@ fn path_text(path: &Path) -> String {
 }
 
 /// The final row of one verify cell, and its single retained first-run log.
+/// A cell whose row the caller rejected (`rejected`, with its reason) is
+/// unavailable whatever rows it has.
 fn retained_operand(
     test: &str,
     role: &str,
     history: Option<&Vec<CellResult>>,
+    rejected: Option<&str>,
     missing: ParityVerdict,
 ) -> Result<(CellResult, PathBuf), Unusable> {
     let unusable = |verdict, reason: String| Unusable {
@@ -2034,6 +2119,12 @@ fn retained_operand(
         reason,
         log: None,
     };
+    if let Some(why) = rejected {
+        return Err(unusable(
+            ParityVerdict::Unavailable,
+            format!("the {role} verify cell of {test}: {why}"),
+        ));
+    }
     let Some(history) = history else {
         return Err(unusable(missing, no_result_row(test, role)));
     };
@@ -2151,6 +2242,7 @@ fn reference_golden(
     config: &PostPassConfig,
     test: &str,
     history: Option<&Vec<CellResult>>,
+    rejected: Option<&str>,
 ) -> Result<Operand, Unusable> {
     let role = format!("{PARITY_REFERENCE_BACKEND} reference");
     let unavailable = |reason: String| Unusable {
@@ -2159,23 +2251,28 @@ fn reference_golden(
         log: None,
     };
     let (golden, sidecar_path) = golden_paths(&config.output_dir, test).map_err(&unavailable)?;
-    let (row, source) =
-        match retained_operand(test, &role, history, ParityVerdict::ReferenceMissing) {
-            Ok(found) => found,
-            Err(unusable) => {
-                let reusable = (unusable.verdict == ParityVerdict::ReferenceMissing)
-                    .then_some(history)
-                    .flatten()
-                    .and_then(|history| crate::runner::cell_result_after_retries(history).ok())
-                    .and_then(|row| {
-                        existing_golden(&golden, &sidecar_path, row).or_else(|| {
-                            let (golden, sidecar) = golden_paths(&config.artifacts, test).ok()?;
-                            existing_golden(&golden, &sidecar, row)
-                        })
-                    });
-                return reusable.ok_or(unusable);
-            }
-        };
+    let (row, source) = match retained_operand(
+        test,
+        &role,
+        history,
+        rejected,
+        ParityVerdict::ReferenceMissing,
+    ) {
+        Ok(found) => found,
+        Err(unusable) => {
+            let reusable = (unusable.verdict == ParityVerdict::ReferenceMissing)
+                .then_some(history)
+                .flatten()
+                .and_then(|history| crate::runner::cell_result_after_retries(history).ok())
+                .and_then(|row| {
+                    existing_golden(&golden, &sidecar_path, row).or_else(|| {
+                        let (golden, sidecar) = golden_paths(&config.artifacts, test).ok()?;
+                        existing_golden(&golden, &sidecar, row)
+                    })
+                });
+            return reusable.ok_or(unusable);
+        }
+    };
     let write = || -> Result<Operand, String> {
         let parent = golden
             .parent()
@@ -3849,7 +3946,7 @@ mod tests {
                 "fx/absent",
                 ParityBackend::Kvm,
                 ParityVerdict::ReferenceMissing,
-                "was not run by this harness process",
+                "has no result row in this run",
             ),
         ];
         for (test, backend, verdict, reason) in unmeasured {
@@ -4283,7 +4380,7 @@ mod tests {
         );
         assert_eq!(
             record.reason.as_deref(),
-            Some("the kvm candidate verify cell of fx/one was not run by this harness process")
+            Some("the kvm candidate verify cell of fx/one has no result row in this run")
         );
         assert_eq!(
             (record.reference_log.as_ref(), record.candidate_log.as_ref()),
@@ -4296,6 +4393,69 @@ mod tests {
                 .0
                 .exists()
         );
+    }
+
+    /// A verify cell whose row the caller rejected ran, so it is
+    /// `unavailable` with the caller's reason, never missing and never
+    /// compared: as the candidate or the reference, with or without rows.
+    #[test]
+    fn a_rejected_operand_is_unavailable_with_the_callers_reason() {
+        let fixture = Fixture::new("rejected");
+        let rows = vec![
+            fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/two", "kvm", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/three", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/three", "kvm", 1, "PASS", Some(REFERENCE)),
+        ];
+        let scope = BTreeSet::from([
+            parity_cell("fx/one", ParityBackend::Kvm),
+            parity_cell("fx/two", ParityBackend::Kvm),
+            parity_cell("fx/three", ParityBackend::Kvm),
+        ]);
+        let mut config = fixture.config();
+        config.rejected = BTreeMap::from([
+            (("fx/one".into(), "kvm".into()), "why one".to_string()),
+            (("fx/two".into(), "ptrace".into()), "why two".to_string()),
+            (("fx/three".into(), "kvm".into()), "why three".to_string()),
+        ]);
+        let report = post_pass(&config, &scope, &rows).unwrap();
+        assert_eq!(fixture.log_diff_calls(), 0);
+        let found = report
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.test_id.as_str(),
+                    record.verdict,
+                    record.reason.as_deref().unwrap_or(""),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                (
+                    "fx/one",
+                    ParityVerdict::Unavailable,
+                    "the kvm candidate verify cell of fx/one: why one"
+                ),
+                (
+                    "fx/three",
+                    ParityVerdict::Unavailable,
+                    "the kvm candidate verify cell of fx/three: why three"
+                ),
+                (
+                    "fx/two",
+                    ParityVerdict::Unavailable,
+                    "the ptrace reference verify cell of fx/two: why two"
+                ),
+            ]
+        );
+        // The reference of a rejected candidate is still good: its golden is
+        // written and named, so a later `parity compare` can reuse it.
+        assert!(report.records[0].reference_log.is_some());
+        assert!(report.records[0].candidate_log.is_none());
+        assert!(report.records[2].reference_log.is_none());
     }
 
     /// Operands run under different or unrecorded `HERMIT_EPOCH` values are

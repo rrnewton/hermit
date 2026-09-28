@@ -1742,6 +1742,14 @@ fn resolve_run_epoch(
     }
 }
 
+/// The `HERMIT_EPOCH` a harness process started now would give every guest:
+/// the environment's value verbatim, or one sampled from host time. A caller
+/// that launches several harness processes whose logs are compared (the
+/// pressure test's parity post-pass) samples this once and passes it to each.
+pub fn run_epoch_from_env() -> Result<String, String> {
+    resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)
+}
+
 impl RunContext {
     /// A copy of this context whose result row and retained artifacts use the
     /// given cell-attempt ordinal.
