@@ -222,7 +222,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
-    ("test.hermit_unit", 750),
+    // Two proc-fallback container tests and one broken-stderr warning test
+    // retain all 750 prior identities in the prepared Nextest inventory.
+    ("test.hermit_unit", 753),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -234,9 +236,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
-    ("test.hermit_integration", 170),
+    // The read-only proc chroot identity test retains all 170 prior identities.
+    ("test.hermit_integration", 171),
     ("test.arbitrary_binaries", 4),
-    ("test.cli", 79),
+    // Seven proc-fallback, warning, and record/replay tests retain all 79
+    // selected identities under the unchanged shipped CLI skip filters.
+    ("test.cli", 86),
     ("test.liteinst_strict", 24),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -246,7 +251,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.rr_suite_contract", 1),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     ("privileged-test.cli_kvm", 34),
-    ("test.cli_on_host", 79),
+    ("test.cli_on_host", 86),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 34),
@@ -258,9 +263,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 797),
-    // The host variant selects the same two additional clock_determinism tests.
-    ("test.hermit_integration_on_host", 170),
-    ("test.hermit_unit_on_host", 750),
+    // Host variants select the same proc regressions and retain prior identities.
+    ("test.hermit_integration_on_host", 171),
+    ("test.hermit_unit_on_host", 753),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
