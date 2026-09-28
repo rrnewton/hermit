@@ -25,6 +25,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -4465,9 +4466,73 @@ fn open_process_pidfd(pid: u32, role: &str) -> Result<File, String> {
     Ok(unsafe { File::from_raw_fd(descriptor as libc::c_int) })
 }
 
+const DELEGATED_PARENT_FD_ENV: &str = "DAGRUN_DELEGATED_PARENT_FD";
+const DELEGATED_PARENT_CHILD_ENV: &str = "DAGRUN_DELEGATED_PARENT_CHILD";
+static DELEGATED_PAYLOAD_PARENT: OnceLock<SharedCpuCgroupParent> = OnceLock::new();
+
+/// Import the pinned wrapper's inherited parent before any subprocess or
+/// worker starts. The kernel descriptor proves the ancestor; environment
+/// strings alone never authorize a namespace-root cgroup.
+///
+/// # Safety
+/// Call only at single-threaded executable startup, before opening other files.
+/// Any named descriptor must be inherited and not owned by a Rust object.
+/// The function consumes that descriptor and removes the transport variables.
+pub unsafe fn initialize_payload_cgroup_parent() -> Result<(), String> {
+    let descriptor = std::env::var_os(DELEGATED_PARENT_FD_ENV);
+    let child = std::env::var_os(DELEGATED_PARENT_CHILD_ENV);
+    if descriptor.is_none() && child.is_none() {
+        return Ok(());
+    }
+    // SAFETY: the standalone harness calls this at its serial startup boundary,
+    // before loading manifests, spawning a command, or starting worker threads.
+    unsafe {
+        std::env::remove_var(DELEGATED_PARENT_FD_ENV);
+        std::env::remove_var(DELEGATED_PARENT_CHILD_ENV);
+    }
+    let descriptor = descriptor
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<libc::c_int>().ok())
+        .filter(|value| *value >= 3)
+        .ok_or("delegated parent handoff requires a descriptor number above standard I/O")?;
+    // At this serial startup boundary, this is an inherited descriptor, not a
+    // descriptor owned by another Rust object. Establish validity before taking
+    // ownership; all later errors drop it before returning.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(format!(
+            "delegated parent descriptor is unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let ancestor = unsafe { File::from_raw_fd(descriptor) };
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(format!(
+            "cannot seal delegated parent descriptor for later exec: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let child = child.ok_or("delegated parent handoff is missing its child name")?;
+    let parent = SharedCpuCgroupParent::from_delegated_ancestor(&ancestor, &child)
+        .map_err(|error| format!("delegated parent handoff refused: {error}"))?;
+    drop(ancestor);
+    DELEGATED_PAYLOAD_PARENT
+        .set(parent)
+        .map_err(|_| "delegated parent handoff was already imported".to_string())
+}
+
 fn create_payload_cgroup() -> Result<ManualCpuCgroup, String> {
-    let parent = SharedCpuCgroupParent::current()
-        .map_err(|error| format!("mandatory per-run cgroup containment is unavailable: {error}"))?;
+    let parent = if let Some(parent) = DELEGATED_PAYLOAD_PARENT.get() {
+        parent.verify_current().map_err(|error| {
+            format!("retained per-run cgroup parent is no longer current: {error}")
+        })?;
+        parent.clone()
+    } else {
+        SharedCpuCgroupParent::current().map_err(|error| {
+            format!("mandatory per-run cgroup containment is unavailable: {error}")
+        })?
+    };
     parent
         .create_child("manifest-run")
         .map_err(|error| format!("cannot establish mandatory per-run cgroup containment: {error}"))

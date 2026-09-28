@@ -15,7 +15,8 @@
 # digest says what ran, the lock says how to rebuild it. See README.md.
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
-#                                [--src-rw] [--cargo-home DIR] [--env NAME]... -- CMD...
+#                                [--src-rw] [--cargo-home DIR] [--env NAME]...
+#                                [--share-cgroup-parent] -- CMD...
 #
 # --src-rw mounts the source WRITABLE. The default is read-only and stays that
 # way, but a test phase legitimately writes into its own tree (target/ci,
@@ -33,6 +34,10 @@
 # --env, its parent directory is mounted at /dagrun-test-counts and the child is
 # given the translated path. This lets an in-container test producer atomically
 # publish the same evidence file the host scheduler will read after podman exits.
+#
+# --share-cgroup-parent transfers a held ancestor directory to test-harness,
+# which authenticates and closes it at startup. Use it only for that consumer;
+# ordinary pinned commands receive no parent descriptor.
 
 set -euo pipefail
 
@@ -40,6 +45,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
 src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
+share_cgroup_parent=false
 pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -48,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --digest) digest=$2; shift 2 ;;
         --src-rw) src_mode="ro=false"; shift ;;
         --cargo-home) cargo_home=$2; shift 2 ;;
+        --share-cgroup-parent) share_cgroup_parent=true; shift ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -57,6 +64,19 @@ done
 [[ -n "$src" ]] || { echo "run-in-pinned-root: --src is required" >&2; exit 2; }
 [[ -n "$out" ]] || { echo "run-in-pinned-root: --out is required" >&2; exit 2; }
 [[ $# -gt 0 ]] || { echo "run-in-pinned-root: a command is required after --" >&2; exit 2; }
+
+for name in DAGRUN_DELEGATED_PARENT_FD DAGRUN_DELEGATED_PARENT_CHILD; do
+    if [[ -v $name ]]; then
+        echo "run-in-pinned-root: inherited $name is not an owned parent handoff" >&2
+        exit 2
+    fi
+    for requested in "${pass_env[@]}"; do
+        if [[ $requested == "$name" ]]; then
+            echo "run-in-pinned-root: $name is reserved for --share-cgroup-parent" >&2
+            exit 2
+        fi
+    done
+done
 
 # Committed DAG commands are checkout-portable and therefore pass paths relative
 # to the scheduler's repository working directory. Podman bind sources must be
@@ -165,10 +185,70 @@ for name in "${pass_env[@]}"; do
     esac
 done
 
+parent_fd_args=()
+if $share_cgroup_parent; then
+    refuse_parent() {
+        echo "run-in-pinned-root: cannot share current cgroup parent: $*" >&2
+        exit 2
+    }
+    read_current_membership() {
+        local line
+        current_membership=""
+        while IFS= read -r line; do
+            [[ $line == 0::* ]] || continue
+            [[ -z $current_membership ]] || refuse_parent "multiple unified memberships"
+            current_membership=${line#0::}
+        done < /proc/self/cgroup
+        [[ $current_membership == /* && $current_membership != / ]] ||
+            refuse_parent "a nonroot host cgroup is required"
+        case "$current_membership/" in
+            *//*|*/./*|*/../*) refuse_parent "membership is not an absolute normal path" ;;
+        esac
+    }
+    read_current_membership
+    cgroup_membership=$current_membership
+    cgroup_current="/sys/fs/cgroup$cgroup_membership"
+    cgroup_child=${cgroup_membership##*/}
+    cgroup_ancestor=${cgroup_current%/*}
+    [[ -d $cgroup_current && ! -L $cgroup_current &&
+       -d $cgroup_ancestor && ! -L $cgroup_ancestor ]] ||
+        refuse_parent "current cgroup and ancestor must be directories"
+
+    # Bash keeps this explicitly opened descriptor across exec. Podman passes
+    # only this descriptor; the receiver resolves the child with openat2 and
+    # verifies the actual current cgroup before retaining its own CLOEXEC fd.
+    exec {cgroup_parent_fd}<"$cgroup_ancestor"
+    cgroup_fd_path="/proc/$$/fd/$cgroup_parent_fd"
+    [[ $(stat -L -f -c %t -- "$cgroup_fd_path") == 63677270 ]] ||
+        refuse_parent "held ancestor is not on cgroup-v2"
+    [[ $(stat -L -c '%d:%i' -- "$cgroup_fd_path") == \
+       "$(stat -L -c '%d:%i' -- "$cgroup_ancestor")" ]] ||
+        refuse_parent "ancestor pathname changed while opening it"
+    [[ -f $cgroup_current/cgroup.procs && ! -L $cgroup_current/cgroup.procs ]] ||
+        refuse_parent "current membership roster is not a regular control file"
+    cgroup_self_present=false
+    while IFS= read -r member; do
+        [[ $member =~ ^[0-9]+$ ]] || refuse_parent "invalid current membership roster"
+        [[ $member == "$$" ]] && cgroup_self_present=true
+    done < "$cgroup_current/cgroup.procs"
+    $cgroup_self_present || refuse_parent "wrapper is absent from current membership roster"
+    read_current_membership
+    [[ $current_membership == "$cgroup_membership" ]] ||
+        refuse_parent "current membership changed during handoff"
+    [[ $(stat -L -c '%d:%i' -- "$cgroup_fd_path") == \
+       "$(stat -L -c '%d:%i' -- "$cgroup_ancestor")" ]] ||
+        refuse_parent "ancestor pathname changed before handoff"
+    parent_fd_args=(--preserve-fd "$cgroup_parent_fd")
+    env_args+=(-e "DAGRUN_DELEGATED_PARENT_FD=$cgroup_parent_fd"
+               -e "DAGRUN_DELEGATED_PARENT_CHILD=$cgroup_child")
+fi
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
 exec podman run --rm \
+    --cgroups=disabled \
+    "${parent_fd_args[@]}" \
     --privileged \
     --hostname=hermetic-container.local \
     "${device_args[@]}" \

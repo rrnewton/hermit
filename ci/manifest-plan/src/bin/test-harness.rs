@@ -494,6 +494,10 @@ fn main() -> ExitCode {
     }
     let args = parse(values.into_iter());
     validate_args(&command, &args);
+    // SAFETY: startup is still single-threaded and has not opened files or
+    // created children; any transport fd belongs to the inherited handoff.
+    unsafe { hermit_manifest_plan::runner::initialize_payload_cgroup_parent() }
+        .unwrap_or_else(|error| fail(error));
     let root = root();
     let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
     // One front-door schema/inventory authority governs every command, not
