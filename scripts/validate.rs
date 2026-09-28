@@ -8263,185 +8263,263 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     ))
 }
 
-/// Exercise the public labelled-DAG entrypoint used by `.github/workflows/ci-dag.yml`.
+/// Exercise the public constructed-DAG entrypoint used by the hosted workflows.
 ///
-/// A capture runner proves the workflow passes the committed bytes plus the
-/// requested label to dagrun. It executes no workload.
-fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
-    let fixture = tempfile::Builder::new()
-        .prefix("validate-run-dag-flat-")
-        .tempdir()
-        .map_err(|error| format!("raw run-dag: cannot create fixture: {error}"))?;
-    let captured = fixture.path().join("captured.json");
-    let invoked = fixture.path().join("invoked");
-    let runner = fixture.path().join("capture-runner");
-    std::fs::write(
-        &runner,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' invoked >>\"$RUN_DAG_INVOKED\"\ntest \"$1\" = run\ntest \"$2\" = --dag\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\ntest \"$4\" = --labels\ntest \"$5\" = \"$RUN_DAG_EXPECTED_LABEL\"\nshift 5\ntest \"$*\" = \"${RUN_DAG_EXPECTED_SUFFIX:-}\"\ntest -n \"$VALIDATE_RUN_STATE\"\ntest -n \"$E2E_RESULT_ROOT\"\ntest -n \"$E2E_BUILD_ROOT\"\n",
-    )
-    .map_err(|error| format!("raw run-dag: cannot write capture runner: {error}"))?;
-    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("raw run-dag: cannot chmod capture runner: {error}"))?;
+/// Both profiles must reach the tracked Rust runner with explicit result
+/// ownership. Runtime runner, graph, and label overrides must refuse before
+/// construction.
+fn exact_structured_result_producer_count(
+    label: &str,
+    document: &serde_json::Value,
+    expected_producers: usize,
+) -> Result<(usize, usize), String> {
+    let steps = document["steps"]
+        .as_array()
+        .ok_or_else(|| format!("raw run-dag: {label} has no steps array"))?;
+    let mut producers = 0;
+    for step in steps {
+        let group = step["group"]
+            .as_str()
+            .ok_or_else(|| format!("raw run-dag: {label} step has no string group"))?;
+        let job = step["job"]
+            .as_str()
+            .ok_or_else(|| format!("raw run-dag: {label} step has no string job"))?;
+        let tag = format!("{group}.{job}");
+        let manifests = step
+            .get("result_manifests")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                format!("raw run-dag: {label} step {tag} omits explicit result ownership")
+            })?;
+        let structured = manifests
+            .iter()
+            .filter(|manifest| {
+                manifest.as_object().is_some_and(|object| {
+                    ["kind", "schema", "path_env", "owner"]
+                        .iter()
+                        .any(|field| object.contains_key(*field))
+                })
+            })
+            .collect::<Vec<_>>();
+        if structured.len() > 1 {
+            return Err(format!(
+                "raw run-dag: {label} step {tag} declares {} structured test-result entries; expected at most one",
+                structured.len()
+            ));
+        }
+        if let Some(manifest) = structured.first() {
+            let exact = manifest["kind"] == "structured-test-results"
+                && manifest["schema"] == 2
+                && manifest["path_env"] == "DAGRUN_TEST_COUNTS_PATH"
+                && manifest["owner"] == tag;
+            if !exact {
+                return Err(format!(
+                    "raw run-dag: {label} step {tag} has malformed structured test-result ownership; expected kind=structured-test-results schema=2 path_env=DAGRUN_TEST_COUNTS_PATH owner={tag}, got {manifest}"
+                ));
+            }
+            producers += 1;
+        }
+    }
+    if producers != expected_producers {
+        return Err(format!(
+            "raw run-dag: {label} has {producers} exact structured test-result producers; expected {expected_producers}"
+        ));
+    }
+    Ok((steps.len(), producers))
+}
 
-    for (lane, label) in [
-        ("portable", "hosted-portable"),
-        ("privileged", "hosted-privileged"),
-    ] {
+fn first_structured_result_manifest_mut(
+    document: &mut serde_json::Value,
+) -> Result<&mut serde_json::Map<String, serde_json::Value>, String> {
+    document["steps"]
+        .as_array_mut()
+        .and_then(|steps| {
+            steps.iter_mut().find_map(|step| {
+                step["result_manifests"]
+                    .as_array_mut()?
+                    .iter_mut()
+                    .find(|manifest| manifest["kind"] == "structured-test-results")?
+                    .as_object_mut()
+            })
+        })
+        .ok_or_else(|| "raw run-dag mutation fixture has no structured result declaration".into())
+}
+
+fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
+    let inspect =
+        |label: &str, bytes: &[u8], expected_producers: usize| -> Result<(usize, usize), String> {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| format!("raw run-dag: {label} output is not UTF-8: {error}"))?;
+            let document: serde_json::Value = serde_json::from_str(text)
+                .map_err(|error| format!("raw run-dag: {label} is not JSON: {error}"))?;
+            let counts =
+                exact_structured_result_producer_count(label, &document, expected_producers)?;
+            let cfg = dag_from_json(text)
+                .map_err(|error| format!("raw run-dag: {label} is not a valid DAG: {error}"))?;
+            if counts.0 != cfg.steps.len() {
+                return Err(format!(
+                    "raw run-dag: {label} raw and typed step counts disagree: raw={} typed={}",
+                    counts.0,
+                    cfg.steps.len()
+                ));
+            }
+            if cfg.steps.iter().any(|step| {
+                step.cmd.contains("dagrun run") || step.cmd.contains("scripts/validate.rs")
+            }) {
+                return Err(format!(
+                    "raw run-dag: {label} contains a nested scheduler command"
+                ));
+            }
+            Ok(counts)
+        };
+
+    let mut counts = Vec::new();
+    for (lane, expected_producers) in [("portable", 31), ("privileged", 4)] {
         let output = Command::new(root.join("ci/run-dag.sh"))
-            .arg(lane)
+            .args([lane, "json"])
             .current_dir(root)
-            .env("DAGRUN_BIN", &runner)
-            .env("RUN_DAG_CAPTURE", &captured)
-            .env("RUN_DAG_INVOKED", &invoked)
-            .env("RUN_DAG_EXPECTED_LABEL", label)
-            .env("RUN_DAG_EXPECTED_SUFFIX", "")
+            .env_remove("DAGRUN_BIN")
+            .env_remove("DAGRUN_ENGINE")
             .env_remove("RUN_DAG_FILE_OVERRIDE")
+            .env_remove("RUN_DAG_LABEL_OVERRIDE")
             .env_remove("VALIDATE_RUN_STATE")
-            .env_remove("E2E_RESULT_ROOT")
-            .env_remove("E2E_BUILD_ROOT")
             .output()
-            .map_err(|error| format!("raw run-dag: cannot launch {lane}: {error}"))?;
+            .map_err(|error| format!("raw run-dag: cannot launch {lane} json: {error}"))?;
         if !output.status.success() {
             return Err(format!(
-                "raw run-dag: {lane} entrypoint failed with {}: {}{}",
+                "raw run-dag: {lane} json failed with {}: {}{}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-    }
-    let allowed = Command::new(root.join("ci/run-dag.sh"))
-        .args([
-            "portable",
-            "-j",
-            "2",
-            "--show-plan",
-            "--cpu-timeout-multiplier=1.5",
-        ])
-        .current_dir(root)
-        .env("DAGRUN_BIN", &runner)
-        .env("RUN_DAG_CAPTURE", &captured)
-        .env("RUN_DAG_INVOKED", &invoked)
-        .env("RUN_DAG_EXPECTED_LABEL", "hosted-portable")
-        .env(
-            "RUN_DAG_EXPECTED_SUFFIX",
-            "-j 2 --show-plan --cpu-timeout-multiplier=1.5",
-        )
-        .env_remove("VALIDATE_RUN_STATE")
-        .env_remove("E2E_RESULT_ROOT")
-        .env_remove("E2E_BUILD_ROOT")
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch allowed controls: {error}"))?;
-    if !allowed.status.success() {
-        return Err(format!(
-            "raw run-dag: allowed non-selection controls failed with {}: {}{}",
-            allowed.status,
-            String::from_utf8_lossy(&allowed.stdout),
-            String::from_utf8_lossy(&allowed.stderr)
-        ));
-    }
+        counts.push((lane, inspect(lane, &output.stdout, expected_producers)?));
+        if lane == "portable" {
+            let original: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|error| format!("raw run-dag: cannot parse mutation fixture: {error}"))?;
 
-    let captured_bytes = std::fs::read(&captured)
-        .map_err(|error| format!("raw run-dag: capture runner received no DAG: {error}"))?;
-    let committed = std::fs::read(validate_plan::validation_dag_path(root))
-        .map_err(|error| format!("raw run-dag: cannot read committed DAG: {error}"))?;
-    if captured_bytes != committed {
-        return Err("raw run-dag: launcher did not hand dagrun the committed bytes".into());
-    }
+            let mut omitted = original.clone();
+            let owner = omitted["steps"]
+                .as_array_mut()
+                .and_then(|steps| {
+                    steps.iter_mut().find(|step| {
+                        step["result_manifests"]
+                            .as_array()
+                            .is_some_and(|manifests| {
+                                manifests.len() > 1
+                                    && manifests.iter().any(|manifest| {
+                                        manifest["kind"] == "structured-test-results"
+                                    })
+                            })
+                    })
+                })
+                .ok_or("raw run-dag: no nonempty manifest-cell producer for omission control")?;
+            owner["result_manifests"]
+                .as_array_mut()
+                .expect("array selected above")
+                .retain(|manifest| manifest["kind"] != "structured-test-results");
+            let error = exact_structured_result_producer_count(
+                "portable omission mutation",
+                &omitted,
+                expected_producers,
+            )
+            .expect_err("a nonempty E2E manifest list must not hide a missing structured result declaration");
+            if !error.contains("exact structured test-result producers") {
+                return Err(format!(
+                    "raw run-dag: omission mutation refusal was not specific: {error}"
+                ));
+            }
 
-    let alternate = fixture.path().join("alternate.json");
-    std::fs::write(&alternate, b"{\"description\":\"alternate\",\"steps\":[]}")
-        .map_err(|error| format!("raw run-dag: cannot write alternate DAG: {error}"))?;
-    std::fs::remove_file(&invoked)
-        .map_err(|error| format!("raw run-dag: cannot reset invocation marker: {error}"))?;
-    let refused = Command::new(root.join("ci/run-dag.sh"))
-        .arg("portable")
-        .current_dir(root)
-        .env("DAGRUN_BIN", &runner)
-        .env("RUN_DAG_CAPTURE", &captured)
-        .env("RUN_DAG_INVOKED", &invoked)
-        .env("RUN_DAG_EXPECTED_LABEL", "hosted-portable")
-        .env("RUN_DAG_FILE_OVERRIDE", &alternate)
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch override refusal: {error}"))?;
-    let refusal_stderr = String::from_utf8_lossy(&refused.stderr);
-    if refused.status.success()
-        || !refusal_stderr.contains("RUN_DAG_FILE_OVERRIDE was removed")
-        || invoked.exists()
-        || std::fs::read(&captured)
-            .map_err(|error| format!("raw run-dag: cannot re-read captured DAG: {error}"))?
-            != committed
-    {
-        return Err(format!(
-            "raw run-dag: alternate DAG input was not refused without changing the captured committed DAG: status={} stderr={refusal_stderr:?}",
-            refused.status
-        ));
-    }
-
-    for args in [
-        vec!["portable".to_owned(), "--dag".to_owned(), alternate.display().to_string()],
-        vec!["portable".to_owned(), format!("--dag={}", alternate.display())],
-        vec!["portable".to_owned(), "--labels".to_owned(), "full".to_owned()],
-        vec!["portable".to_owned(), "--labels=full".to_owned()],
-        vec!["portable".to_owned(), "--selected".to_owned(), "pre.submodules".to_owned()],
-        vec!["portable".to_owned(), "--selected=pre.submodules".to_owned()],
-        vec!["portable".to_owned(), "--ignore-selected-deps".to_owned()],
-        vec!["portable".to_owned(), "--args".to_owned(), "echo".to_owned()],
-        vec!["portable".to_owned(), "--args=echo".to_owned()],
-        vec!["portable".to_owned(), "--stress".to_owned(), "2".to_owned()],
-        vec!["portable".to_owned(), "--stress=2".to_owned()],
-        vec![
-            "portable".to_owned(),
-            "--resource-caps-path".to_owned(),
-            alternate.display().to_string(),
-        ],
-        vec![
-            "portable".to_owned(),
-            format!("--resource-caps-path={}", alternate.display()),
-        ],
-        vec!["portable".to_owned(), "--small-default-cap".to_owned()],
-        vec![
-            "portable".to_owned(),
-            "--small-default-cap=true".to_owned(),
-        ],
-    ] {
-        let output = Command::new(root.join("ci/run-dag.sh"))
-            .args(&args)
-            .current_dir(root)
-            .env("DAGRUN_BIN", &runner)
-            .env("RUN_DAG_CAPTURE", &captured)
-            .env("RUN_DAG_INVOKED", &invoked)
-            .env("RUN_DAG_EXPECTED_LABEL", "hosted-portable")
-            .output()
-            .map_err(|error| format!("raw run-dag: cannot launch authority refusal: {error}"))?;
+            for (name, field, value, expected) in [
+                ("schema", "schema", serde_json::json!(99), "schema=2"),
+                (
+                    "path",
+                    "path_env",
+                    serde_json::json!("OTHER_RESULT_PATH"),
+                    "path_env=DAGRUN_TEST_COUNTS_PATH",
+                ),
+                ("owner", "owner", serde_json::json!("other.step"), "owner="),
+            ] {
+                let mut changed = original.clone();
+                first_structured_result_manifest_mut(&mut changed)?.insert(field.into(), value);
+                let error = exact_structured_result_producer_count(
+                    &format!("portable {name} mutation"),
+                    &changed,
+                    expected_producers,
+                )
+                .expect_err("a malformed structured result declaration must be refused");
+                if !error.contains(expected) {
+                    return Err(format!(
+                        "raw run-dag: {name} mutation refusal was not specific: {error}"
+                    ));
+                }
+            }
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success()
-            || !stderr.contains("refusing caller graph/selection override")
-            || invoked.exists()
+        let expected_runner = format!(
+            "runner={}",
+            root.join("agent-utils/rs/bin/dagrun").display()
+        );
+        if !stderr.contains("[dagrun] rust")
+            || !stderr.contains(&expected_runner)
+            || !stderr.contains("retained generated DAG directory:")
         {
             return Err(format!(
-                "raw run-dag: authority override {args:?} reached the runner or was not refused: status={} stderr={stderr:?}",
-                output.status
+                "raw run-dag: {lane} did not report the tracked Rust runner and retained DAG: {stderr}"
             ));
         }
     }
-    let cfg = dag_from_json(
-        std::str::from_utf8(&committed)
-            .map_err(|error| format!("raw run-dag: committed DAG is not UTF-8: {error}"))?,
-    )
-    .map_err(|error| format!("raw run-dag: committed DAG is invalid: {error}"))?;
-    let portable = dagrun::select_steps_by_labels(&cfg, &["hosted-portable".into()])?;
-    if portable
-        .steps
-        .iter()
-        .any(|step| step.cmd.contains("dagrun run") || step.cmd.contains("scripts/validate.rs"))
-    {
-        return Err("raw run-dag: portable label contains a nested scheduler command".into());
+
+    for (name, value) in [
+        ("DAGRUN_BIN", "agent-utils/py/bin/dagrun"),
+        ("DAGRUN_ENGINE", "py"),
+        ("RUN_DAG_FILE_OVERRIDE", "ci/dag/validate.json"),
+        ("RUN_DAG_LABEL_OVERRIDE", "full"),
+    ] {
+        let refused = Command::new(root.join("ci/run-dag.sh"))
+            .args(["portable", "json"])
+            .current_dir(root)
+            .env(name, value)
+            .env_remove("VALIDATE_RUN_STATE")
+            .output()
+            .map_err(|error| format!("raw run-dag: cannot launch {name} refusal: {error}"))?;
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.success() || !stderr.contains(name) || stderr.contains("PLAN ONLY") {
+            return Err(format!(
+                "raw run-dag: {name} was not refused before construction: status={} stderr={stderr}",
+                refused.status
+            ));
+        }
+    }
+
+    for args in [
+        ["portable", "json", "--dag"],
+        ["portable", "json", "--labels=full"],
+    ] {
+        let refused = Command::new(root.join("ci/run-dag.sh"))
+            .args(args)
+            .current_dir(root)
+            .env_remove("DAGRUN_BIN")
+            .env_remove("DAGRUN_ENGINE")
+            .env_remove("RUN_DAG_FILE_OVERRIDE")
+            .env_remove("RUN_DAG_LABEL_OVERRIDE")
+            .env_remove("VALIDATE_RUN_STATE")
+            .output()
+            .map_err(|error| format!("raw run-dag: cannot launch {args:?} refusal: {error}"))?;
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.success()
+            || !stderr.contains("refusing caller graph/selection override")
+            || stderr.contains("PLAN ONLY")
+        {
+            return Err(format!(
+                "raw run-dag: {args:?} was not refused before construction: status={} stderr={stderr}",
+                refused.status
+            ));
+        }
     }
 
     Ok(format!(
-        "raw run-dag: public launcher passed the {}-node committed superset plus exact hosted portable/privileged labels; non-selection controls forwarded; alternate DAG and label overrides refused before runner invocation; no nested scheduler command",
-        cfg.steps.len(),
+        "raw run-dag: tracked Rust runner received constructed portable/privileged DAGs with explicit result ownership; counts={counts:?}; runtime runner, graph, and label overrides refused before construction"
     ))
 }
 
