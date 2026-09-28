@@ -65,7 +65,7 @@ fn public_record_uses_the_completed_command_namespace_and_stdio() {
             .env(INNER, "1")
             .map_root()
             .unshare(Namespace::MOUNT | Namespace::PID)
-            .mount(Mount::proc());
+            .mount(Mount::proc().allow_readonly_fallback());
         let output = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -160,7 +160,7 @@ fn public_record_replay_preserves_distinct_forked_child_streams() {
             .env(INNER, "1")
             .map_root()
             .unshare(Namespace::MOUNT | Namespace::PID)
-            .mount(Mount::proc());
+            .mount(Mount::proc().allow_readonly_fallback());
         let output = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -239,7 +239,7 @@ fn public_record_replay_handles_a_deep_serial_fork_chain() {
             .env(INNER, "1")
             .map_root()
             .unshare(Namespace::MOUNT | Namespace::PID)
-            .mount(Mount::proc());
+            .mount(Mount::proc().allow_readonly_fallback());
         let output = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

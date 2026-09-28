@@ -544,7 +544,7 @@ mod tests {
         container
             .unshare(Namespace::PID)
             .map_root()
-            .mount(Mount::proc());
+            .mount(Mount::proc().allow_readonly_fallback());
         container
     }
 

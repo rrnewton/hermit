@@ -72,6 +72,7 @@ rust_binary(
     test_srcs = glob([
         "src/bin/**/*.rs",
         "test-resources/**/*.json",
+        "tests/common/readonly_proc.rs",
     ]),
     deps = [
         "fbsource//third-party/rust:anyhow",

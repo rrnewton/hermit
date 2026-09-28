@@ -1187,7 +1187,7 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
             .env(INNER, "1")
             .map_root()
             .unshare(Namespace::MOUNT | Namespace::PID)
-            .mount(Mount::proc());
+            .mount(Mount::proc().allow_readonly_fallback());
         let output = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

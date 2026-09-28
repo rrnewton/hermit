@@ -4305,7 +4305,7 @@ impl RunOpts {
             .map_root()
             .hostname("hermetic-container.local")
             .domainname("local")
-            .mount(Mount::proc())
+            .mount(Mount::proc().allow_readonly_fallback())
             .mounts(mounts);
 
         match &self.network {
