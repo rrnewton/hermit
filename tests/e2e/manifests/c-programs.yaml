@@ -19,7 +19,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -27,7 +27,6 @@ test:
           dbt: "Not yet qualified for this memfd-backed procfs identity check"
           liteinst: "Not yet qualified for this memfd-backed procfs identity check"
           kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): this cell asserts the identity picture Detcore presents, and native presents none, so there is no naked oracle to run.'
@@ -82,7 +81,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -90,7 +92,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -146,10 +152,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -207,7 +210,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -215,7 +221,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -324,7 +334,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -332,7 +345,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -388,10 +405,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -449,7 +463,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -457,7 +474,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -576,7 +597,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -584,7 +608,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -635,7 +663,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -643,7 +673,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -762,7 +796,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: false
         backends_enabled:
           - ptrace
           - dbt
@@ -770,7 +807,12 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -879,7 +921,8 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: false
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -887,7 +930,8 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -948,7 +992,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -956,7 +1000,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1007,7 +1050,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -1015,7 +1061,8 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -1069,10 +1116,7 @@ test:
         ci:
           ptrace: false
         ci_disabled_reason:
-          ptrace:
-            result: unavailable
-            evidence: tests/c/dbt_unsupported_syscall.c:21
-            reason: This fixture intentionally invokes restart_syscall, which strict ptrace execution rejects as Unsupported and fails closed; the cell needs an expected-refusal contract or syscall support before it can be required validation.
+          ptrace: {"result": "unavailable", "evidence": "tests/c/dbt_unsupported_syscall.c:21", "reason": "This fixture intentionally invokes restart_syscall, which strict ptrace execution rejects as Unsupported and fails closed; the cell needs an expected-refusal contract or syscall support before it can be required validation."}
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -1140,7 +1184,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -1148,7 +1194,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -1209,7 +1259,11 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
+          sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
@@ -1226,7 +1280,11 @@ test:
             - multi
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -1403,7 +1461,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -1411,7 +1472,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -1467,10 +1532,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -1528,7 +1590,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -1536,7 +1601,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -1587,7 +1656,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -1595,7 +1666,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -1651,10 +1726,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -1712,7 +1784,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -1720,7 +1794,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -2307,14 +2382,8 @@ test:
           sabre: true
           liteinst: false
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - dbt
@@ -2569,7 +2638,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -2577,7 +2648,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -2633,10 +2705,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -2699,10 +2768,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -2823,10 +2889,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence"
-            reason: Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names.
+          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -2945,7 +3008,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -2953,7 +3019,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -3004,7 +3074,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -3012,7 +3085,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -3063,7 +3140,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -3071,7 +3151,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -3122,7 +3206,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
+          sabre: true
         backends_enabled:
           - ptrace
           - kvm
@@ -3133,7 +3220,11 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -3184,7 +3275,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -3192,7 +3286,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -3243,7 +3341,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -3251,7 +3352,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -3534,7 +3639,11 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
+          sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
@@ -3551,7 +3660,11 @@ test:
             - multiple
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -3670,7 +3783,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3678,7 +3791,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3729,7 +3841,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3737,7 +3849,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3788,7 +3899,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3796,7 +3907,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3991,7 +4101,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -3999,7 +4111,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -4060,7 +4173,8 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: false
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -4068,7 +4182,8 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -4119,7 +4234,11 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
+          sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
@@ -4127,7 +4246,11 @@ test:
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -4178,7 +4301,11 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
+          sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
@@ -4186,7 +4313,11 @@ test:
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -4237,7 +4368,11 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
+          sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
@@ -4245,7 +4380,11 @@ test:
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -4474,10 +4613,7 @@ test:
           ptrace: true
           liteinst: false
         ci_disabled_reason:
-          liteinst:
-            result: determinism-failure
-            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
-            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
+          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
@@ -4537,7 +4673,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4545,7 +4684,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -4596,7 +4739,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4604,7 +4750,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -4655,7 +4805,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4663,7 +4816,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -4714,7 +4871,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4722,7 +4882,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -4947,7 +5111,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -4955,7 +5121,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -5011,10 +5181,7 @@ test:
           dbt: false
           sabre: true
         ci_disabled_reason:
-          dbt:
-            result: parity-failure
-            evidence: "637b0b19d63facb4cc77174334ed325132b83516; task drain_hermit_2059_to"
-            reason: Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support.
+          dbt: {"result": "parity-failure", "evidence": "637b0b19d63facb4cc77174334ed325132b83516; task drain_hermit_2059_to", "reason": "Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support."}
         backends_enabled:
           - ptrace
           - dbt
@@ -5143,7 +5310,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -5151,7 +5320,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure, crash-error at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 118, 198.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
       naked:
         ci: false
         backends_enabled: []
@@ -5474,7 +5644,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -5482,7 +5654,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -5533,7 +5706,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -5541,7 +5714,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5728,7 +5900,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -5736,7 +5911,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -5787,7 +5966,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -5795,7 +5977,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -5846,7 +6032,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -5854,7 +6043,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -5963,7 +6156,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -5971,7 +6166,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -6080,7 +6276,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -6088,7 +6286,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -6139,7 +6341,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -6147,7 +6352,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -6198,7 +6407,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -6206,7 +6417,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Both canonical full-validation attempts timed out at the 15-second cell limit during Run1 and produced verdict=no_result with no comparison, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -6257,7 +6472,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -6265,7 +6483,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -6574,7 +6796,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -6582,7 +6806,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -6633,7 +6858,8 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: false
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -6641,7 +6867,8 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -6871,7 +7098,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -6879,7 +7109,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -6930,7 +7164,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -6938,7 +7175,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -6989,7 +7230,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: false
         backends_enabled:
           - ptrace
           - dbt
@@ -6997,7 +7241,9 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a timeout; this cell did not pass every repetition cleanly. Retained detail: cell exceeded 15 s before attempt 1 started", "result": "timeout"}
       naked:
         ci: false
         backends_enabled: []
@@ -7048,7 +7294,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -7056,7 +7305,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -7117,7 +7370,8 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: false
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -7125,7 +7379,8 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -7360,7 +7615,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -7368,7 +7625,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -7621,7 +7879,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -7629,7 +7889,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -7896,7 +8157,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -7904,7 +8167,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -8023,7 +8287,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8031,7 +8298,8 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a timeout; this cell did not pass every repetition cleanly. Retained detail: cell exceeded 15 s before attempt 1 started", "result": "timeout"}
       naked:
         ci: false
         backends_enabled: []
@@ -8082,7 +8350,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8090,7 +8358,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8141,7 +8408,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8149,7 +8416,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8200,7 +8466,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8208,7 +8474,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8259,7 +8524,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8267,7 +8532,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8318,7 +8582,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8326,7 +8590,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8377,7 +8640,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -8390,7 +8653,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8441,7 +8703,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: false
+          liteinst: false
         backends_enabled:
           - ptrace
           - liteinst
@@ -8449,7 +8713,9 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
+          liteinst: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -8500,7 +8766,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -8508,7 +8774,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8559,7 +8824,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -8567,7 +8832,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8618,7 +8882,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -8626,7 +8893,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -8677,7 +8948,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -8685,7 +8959,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -8910,7 +9188,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -8918,7 +9199,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -9095,7 +9380,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -9103,7 +9391,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -9154,7 +9446,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -9162,7 +9457,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -9213,7 +9512,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -9221,7 +9523,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -9446,7 +9752,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -9454,7 +9763,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -9505,7 +9818,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -9513,7 +9828,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -9574,7 +9890,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          kvm: false
         backends_enabled:
           - ptrace
           - kvm
@@ -9587,7 +9905,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Cancellation reaches one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          kvm: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 171, 171.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
       naked:
         ci: false
         backends_enabled: []
@@ -9696,7 +10015,9 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          sabre: false
         backends_enabled:
           - ptrace
           - sabre
@@ -9704,7 +10025,8 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
         ci: false
         backends_enabled: []
@@ -9881,7 +10203,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9889,7 +10211,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9940,7 +10261,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9948,7 +10269,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -10057,7 +10377,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -10065,7 +10388,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -10184,7 +10511,10 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
         backends_enabled:
           - ptrace
           - dbt
@@ -10192,7 +10522,11 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
+            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         backends_enabled: []
@@ -10334,10 +10668,20 @@ test:
           liteinst: Chaos scheduling is unsupported by LiteInst
       custom:
         ci: false
-        backends_enabled: []
+        ci_disabled_reason: 'NOT-EXERCISED: the portable hermit integration node owns the ptrace success case; DBT, KVM, and SaBRe do not support interrupting scheduler-managed pipe writes.'
+        args:
+          - --strict
+          - --panic-on-unsupported-syscalls
+        guest_args:
+          ptrace:
+            - signal-interrupt
+        assert:
+          runs: 3
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
         backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
-          dbt: No custom edge-case arguments have been calibrated for this C guest
-          kvm: No custom edge-case arguments have been calibrated for this C guest
-          sabre: No custom edge-case arguments have been calibrated for this C guest
+          dbt: DBT does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
+          kvm: KVM does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
+          sabre: SaBRe does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
           liteinst: No custom edge-case arguments have been calibrated for this C guest

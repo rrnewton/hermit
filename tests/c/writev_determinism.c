@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,6 +204,379 @@ static int check_atomic_full_pipe(void) {
             written, atomic_size, reader_result, iov[0].iov_base, iov[0].iov_len);
     return -1;
   }
+  return 0;
+}
+
+static volatile sig_atomic_t writev_signal_received;
+static int writev_signal_ack_fd = -1;
+
+static void receive_writev_signal(int signal) {
+  (void)signal;
+  int saved_errno = errno;
+  writev_signal_received = 1;
+  if (writev_signal_ack_fd >= 0) {
+    char acknowledged = 'A';
+    (void)write(writev_signal_ack_fd, &acknowledged, sizeof(acknowledged));
+  }
+  errno = saved_errno;
+}
+
+struct writev_signaler_context {
+  pthread_t target;
+  int read_fd;
+  int ack_read_fd;
+  int drain_after_signal;
+  _Atomic int *write_returned;
+  int result;
+  int ack_result;
+  int returned_before_drain;
+  int drain_result;
+};
+
+static void *signal_blocked_writev(void *opaque) {
+  struct writev_signaler_context *context = opaque;
+  struct timespec delay = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+  while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+  }
+  context->result = pthread_kill(context->target, SIGUSR1);
+  if (context->drain_after_signal) {
+    char acknowledged;
+    context->ack_result =
+        read_exact(context->ack_read_fd, &acknowledged, sizeof(acknowledged));
+    struct timespec observation_delay = {
+        .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+    while (nanosleep(&observation_delay, &observation_delay) != 0 &&
+           errno == EINTR) {
+    }
+    context->returned_before_drain = atomic_load_explicit(
+        context->write_returned, memory_order_acquire);
+    char buffer[4096];
+    context->drain_result =
+        read_exact(context->read_fd, buffer, sizeof(buffer));
+  }
+  return NULL;
+}
+
+static int check_signal_interrupts_full_pipe_writev(int restart) {
+  struct sigaction action;
+  struct sigaction old_action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = receive_writev_signal;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = restart ? SA_RESTART : 0;
+  if (sigaction(SIGUSR1, &action, &old_action) != 0) {
+    perror("signal-interrupt sigaction");
+    return -1;
+  }
+
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("signal-interrupt pipe");
+    return -1;
+  }
+  int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    perror("signal-interrupt F_GETPIPE_SZ");
+    return -1;
+  }
+  char *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    perror("signal-interrupt malloc");
+    return -1;
+  }
+  memset(fill, 'F', (size_t)capacity);
+  if (write(pipe_fds[1], fill, (size_t)capacity) != capacity) {
+    perror("signal-interrupt pipe fill");
+    return -1;
+  }
+  free(fill);
+
+  int signal_ack_fds[2];
+  if (pipe(signal_ack_fds) != 0) {
+    perror("signal-interrupt acknowledgement pipe");
+    return -1;
+  }
+
+  writev_signal_received = 0;
+  writev_signal_ack_fd = signal_ack_fds[1];
+  _Atomic int write_returned = 0;
+  struct writev_signaler_context context = {
+      .target = pthread_self(),
+      .read_fd = pipe_fds[0],
+      .ack_read_fd = signal_ack_fds[0],
+      .drain_after_signal = restart,
+      .write_returned = &write_returned,
+      .result = -1,
+      .ack_result = -1,
+      .returned_before_drain = -1,
+      .drain_result = -1,
+  };
+  pthread_t signaler;
+  int create_result =
+      pthread_create(&signaler, NULL, signal_blocked_writev, &context);
+  if (create_result != 0) {
+    fprintf(stderr, "signal-interrupt pthread_create failed: %s\n",
+            strerror(create_result));
+    return -1;
+  }
+
+  char first = 'A';
+  char second = 'B';
+  struct iovec iov[2] = {
+      {.iov_base = &first, .iov_len = 1},
+      {.iov_base = &second, .iov_len = 1},
+  };
+  errno = 0;
+  ssize_t written = writev(pipe_fds[1], iov, 2);
+  int write_errno = errno;
+  atomic_store_explicit(&write_returned, 1, memory_order_release);
+  int join_result = pthread_join(signaler, NULL);
+  writev_signal_ack_fd = -1;
+  close(signal_ack_fds[0]);
+  close(signal_ack_fds[1]);
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  if (sigaction(SIGUSR1, &old_action, NULL) != 0) {
+    perror("signal-interrupt restore sigaction");
+    return -1;
+  }
+
+  int success = context.result == 0 && join_result == 0 && writev_signal_received;
+  success = restart ? success && written == 2 && context.ack_result == 0 &&
+                                  !context.returned_before_drain &&
+                                  context.drain_result == 0
+                    : success && written == -1 && write_errno == EINTR &&
+                          context.drain_result == -1;
+  if (!success) {
+    fprintf(stderr,
+            "full-pipe writev signal result: restart=%d written=%zd errno=%d "
+            "handler=%d pthread_kill=%d pthread_join=%d ack=%d "
+            "returned-before-drain=%d drain=%d\n",
+            restart,
+            written, write_errno, writev_signal_received, context.result,
+            join_result, context.ack_result, context.returned_before_drain,
+            context.drain_result);
+    return -1;
+  }
+  puts(restart ? "writev-signal-restart-ok" : "writev-signal-interrupt-ok");
+  return 0;
+}
+
+enum partial_write_signal_disposition {
+  PARTIAL_SIGNAL_CAUGHT,
+  PARTIAL_SIGNAL_BLOCKED,
+  PARTIAL_SIGNAL_IGNORED,
+  PARTIAL_SIGNAL_MIXED,
+};
+
+struct partial_write_signaler_context {
+  pthread_t target;
+  int read_fd;
+  size_t requested;
+  _Atomic int *write_done;
+  int drain_after_signal;
+  int signal_result;
+  int second_signal_result;
+  int returned_before_signal;
+  int returned_before_drain;
+  int drain_result;
+};
+
+static void *signal_partial_writev(void *opaque) {
+  struct partial_write_signaler_context *context = opaque;
+  struct timespec delay = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+  while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+  }
+  context->returned_before_signal =
+      atomic_load_explicit(context->write_done, memory_order_acquire);
+  context->signal_result = pthread_kill(context->target, SIGUSR1);
+  if (context->second_signal_result != -1) {
+    context->second_signal_result = pthread_kill(context->target, SIGUSR2);
+  }
+  if (!context->drain_after_signal) {
+    return NULL;
+  }
+
+  context->returned_before_drain =
+      atomic_load_explicit(context->write_done, memory_order_acquire);
+  size_t received = 0;
+  char buffer[4096];
+  while (received < context->requested) {
+    size_t remaining = context->requested - received;
+    ssize_t count = read(context->read_fd, buffer,
+                         remaining < sizeof(buffer) ? remaining : sizeof(buffer));
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count <= 0) {
+      context->drain_result = -1;
+      return NULL;
+    }
+    received += (size_t)count;
+  }
+  context->drain_result = 0;
+  return NULL;
+}
+
+static const char *partial_signal_name(
+    enum partial_write_signal_disposition disposition) {
+  switch (disposition) {
+    case PARTIAL_SIGNAL_CAUGHT:
+      return "caught";
+    case PARTIAL_SIGNAL_BLOCKED:
+      return "blocked";
+    case PARTIAL_SIGNAL_IGNORED:
+      return "ignored";
+    case PARTIAL_SIGNAL_MIXED:
+      return "mixed";
+  }
+  return "unknown";
+}
+
+static int check_signal_after_partial_writev(
+    enum partial_write_signal_disposition disposition) {
+  const char *name = partial_signal_name(disposition);
+  struct sigaction action;
+  struct sigaction old_action;
+  struct sigaction second_action;
+  struct sigaction old_second_action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = disposition == PARTIAL_SIGNAL_IGNORED ||
+                              disposition == PARTIAL_SIGNAL_MIXED
+                          ? SIG_IGN
+                          : receive_writev_signal;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;
+  if (sigaction(SIGUSR1, &action, &old_action) != 0) {
+    perror("partial-write sigaction");
+    return -1;
+  }
+  if (disposition == PARTIAL_SIGNAL_MIXED) {
+    memset(&second_action, 0, sizeof(second_action));
+    second_action.sa_handler = receive_writev_signal;
+    sigemptyset(&second_action.sa_mask);
+    if (sigaction(SIGUSR2, &second_action, &old_second_action) != 0) {
+      perror("partial-write second sigaction");
+      return -1;
+    }
+  }
+
+  sigset_t signal_set;
+  sigset_t old_mask;
+  sigemptyset(&signal_set);
+  sigaddset(&signal_set, SIGUSR1);
+  sigaddset(&signal_set, SIGUSR2);
+  int mask_result = pthread_sigmask(
+      disposition == PARTIAL_SIGNAL_BLOCKED ? SIG_BLOCK : SIG_UNBLOCK,
+      &signal_set, &old_mask);
+  if (mask_result != 0) {
+    fprintf(stderr, "partial-write pthread_sigmask failed: %s\n",
+            strerror(mask_result));
+    return -1;
+  }
+
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("partial-write pipe");
+    return -1;
+  }
+  int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    perror("partial-write F_GETPIPE_SZ");
+    return -1;
+  }
+  char *first = malloc((size_t)capacity);
+  char *second = malloc((size_t)capacity);
+  if (first == NULL || second == NULL) {
+    perror("partial-write malloc");
+    return -1;
+  }
+  memset(first, 'A', (size_t)capacity);
+  memset(second, 'B', (size_t)capacity);
+  const size_t requested = 2 * (size_t)capacity;
+  struct iovec iov[2] = {
+      {.iov_base = first, .iov_len = (size_t)capacity},
+      {.iov_base = second, .iov_len = (size_t)capacity},
+  };
+
+  _Atomic int write_done = 0;
+  struct partial_write_signaler_context context = {
+      .target = pthread_self(),
+      .read_fd = pipe_fds[0],
+      .requested = requested,
+      .write_done = &write_done,
+      .drain_after_signal = disposition == PARTIAL_SIGNAL_BLOCKED ||
+                            disposition == PARTIAL_SIGNAL_IGNORED,
+      .signal_result = -1,
+      .second_signal_result =
+          disposition == PARTIAL_SIGNAL_MIXED ? 1 : -1,
+      .returned_before_signal = -1,
+      .returned_before_drain = -1,
+      .drain_result = -1,
+  };
+  pthread_t signaler;
+  int create_result =
+      pthread_create(&signaler, NULL, signal_partial_writev, &context);
+  if (create_result != 0) {
+    fprintf(stderr, "partial-write pthread_create failed: %s\n",
+            strerror(create_result));
+    return -1;
+  }
+
+  writev_signal_received = 0;
+  errno = 0;
+  ssize_t written = writev(pipe_fds[1], iov, 2);
+  int write_errno = errno;
+  atomic_store_explicit(&write_done, 1, memory_order_release);
+  int join_result = pthread_join(signaler, NULL);
+
+  if (disposition == PARTIAL_SIGNAL_BLOCKED) {
+    struct sigaction ignore_action;
+    memset(&ignore_action, 0, sizeof(ignore_action));
+    ignore_action.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_action.sa_mask);
+    if (sigaction(SIGUSR1, &ignore_action, NULL) != 0) {
+      perror("partial-write discard blocked signal");
+      return -1;
+    }
+  }
+  int restore_mask_result = pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
+  int restore_action_result = sigaction(SIGUSR1, &old_action, NULL);
+  int restore_second_action_result =
+      disposition == PARTIAL_SIGNAL_MIXED
+          ? sigaction(SIGUSR2, &old_second_action, NULL)
+          : 0;
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  free(first);
+  free(second);
+
+  int success = context.signal_result == 0 && join_result == 0 &&
+                restore_mask_result == 0 && restore_action_result == 0 &&
+                restore_second_action_result == 0 &&
+                !context.returned_before_signal;
+  if (disposition == PARTIAL_SIGNAL_CAUGHT ||
+      disposition == PARTIAL_SIGNAL_MIXED) {
+    success = success && written > 0 && (size_t)written < requested &&
+              writev_signal_received && context.drain_result == -1 &&
+              (disposition != PARTIAL_SIGNAL_MIXED ||
+               context.second_signal_result == 0);
+  } else {
+    success = success && written == (ssize_t)requested &&
+              !writev_signal_received && !context.returned_before_drain &&
+              context.drain_result == 0;
+  }
+  if (!success) {
+    fprintf(stderr,
+            "partial-write %s result: written=%zd/%zu errno=%d handler=%d "
+            "pthread_kill=%d pthread_join=%d before_signal=%d "
+            "before_drain=%d drain=%d\n",
+            name, written, requested, write_errno, writev_signal_received,
+            context.signal_result, join_result, context.returned_before_signal,
+            context.returned_before_drain, context.drain_result);
+    return -1;
+  }
+  printf("writev-partial-%s-ok\n", name);
   return 0;
 }
 
@@ -426,6 +800,24 @@ int main(int argc, char **argv) {
     puts("writev-determinism-ok");
     return 0;
   }
+  if (argc > 1 && strcmp(argv[1], "signal-interrupt") == 0) {
+    return check_signal_interrupts_full_pipe_writev(0) == 0 ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "signal-restart") == 0) {
+    return check_signal_interrupts_full_pipe_writev(1) == 0 ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "partial-caught") == 0) {
+    return check_signal_after_partial_writev(PARTIAL_SIGNAL_CAUGHT) == 0 ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "partial-blocked") == 0) {
+    return check_signal_after_partial_writev(PARTIAL_SIGNAL_BLOCKED) == 0 ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "partial-ignored") == 0) {
+    return check_signal_after_partial_writev(PARTIAL_SIGNAL_IGNORED) == 0 ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "partial-mixed") == 0) {
+    return check_signal_after_partial_writev(PARTIAL_SIGNAL_MIXED) == 0 ? 0 : 1;
+  }
 
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
@@ -453,7 +845,13 @@ int main(int argc, char **argv) {
 
   if (check_atomic_full_pipe() != 0 || check_readonly_iovec() != 0 ||
       check_large_iovec_snapshot() != 0 || check_large_blocking_pipe() != 0 ||
-      check_failed_write_preserves_metadata() != 0) {
+      check_failed_write_preserves_metadata() != 0 ||
+      check_signal_interrupts_full_pipe_writev(0) != 0 ||
+      check_signal_interrupts_full_pipe_writev(1) != 0 ||
+      check_signal_after_partial_writev(PARTIAL_SIGNAL_CAUGHT) != 0 ||
+      check_signal_after_partial_writev(PARTIAL_SIGNAL_BLOCKED) != 0 ||
+      check_signal_after_partial_writev(PARTIAL_SIGNAL_IGNORED) != 0 ||
+      check_signal_after_partial_writev(PARTIAL_SIGNAL_MIXED) != 0) {
     return 1;
   }
 
