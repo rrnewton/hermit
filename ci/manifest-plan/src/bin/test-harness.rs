@@ -4273,6 +4273,7 @@ sys.exit(1 if failed else 0)
             "test.detcore_unit",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_time",
             "test.regular_crates",
             "test.hermit_integration",
             "test.arbitrary_binaries",
@@ -4321,8 +4322,8 @@ sys.exit(1 if failed else 0)
         // (ci/check-shard-coverage.sh enforces that against the committed cell
         // plan). shared-futex-c and util-c left the integration shard once
         // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell.
-        assert_eq!(physical_rows, 23);
-        assert_eq!(resolved.len(), 23);
+        assert_eq!(physical_rows, 24);
+        assert_eq!(resolved.len(), 24);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
