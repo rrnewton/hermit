@@ -2104,6 +2104,30 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// `path` resolved against this process's working directory, for a child
+/// that runs in another one.
+fn independent_of_cwd(path: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(path).map_err(|error| {
+        format!(
+            "cannot resolve {} against the working directory: {error}",
+            path.display()
+        )
+    })
+}
+
+/// A program path as [`independent_of_cwd`] resolves it, except that a bare
+/// name stays bare so `PATH` still finds it.
+fn program_independent_of_cwd(program: &Path) -> Result<PathBuf, String> {
+    if program
+        .parent()
+        .is_some_and(|parent| parent.as_os_str().is_empty())
+    {
+        Ok(program.to_path_buf())
+    } else {
+        independent_of_cwd(program)
+    }
+}
+
 /// The final row of one verify cell, and its single retained first-run log.
 /// A cell whose row the caller rejected (`rejected`, with its reason) is
 /// unavailable whatever rows it has.
@@ -2380,17 +2404,34 @@ fn compare(
         }
     }
     let _ = fs::remove_file(&json);
+    // The child runs in the artifacts directory, so each path it is handed
+    // must not depend on this process's working directory: a relative
+    // `--results`, `E2E_RESULT_ROOT`, `--artifacts` or `HERMIT_BIN` would
+    // otherwise resolve a second time below the artifacts directory.
+    let spawn_paths = (|| {
+        Ok::<_, String>((
+            program_independent_of_cwd(&config.hermit_bin)?,
+            independent_of_cwd(&comparison.reference.log)?,
+            independent_of_cwd(&comparison.candidate.log)?,
+            independent_of_cwd(&json)?,
+            independent_of_cwd(&config.artifacts)?,
+        ))
+    })();
+    let (program, reference, candidate, report_path, child_dir) = match spawn_paths {
+        Ok(paths) => paths,
+        Err(error) => return unavailable(error),
+    };
     let timeout = config.log_diff_timeout.min(deadline.at - now);
     runs.fetch_add(1, Ordering::SeqCst);
     let (status, stderr) = match run_bounded(
-        Command::new(&config.hermit_bin)
+        Command::new(&program)
             .arg("log-diff")
-            .arg(&comparison.reference.log)
-            .arg(&comparison.candidate.log)
+            .arg(&reference)
+            .arg(&candidate)
             .arg("--json")
-            .arg(&json)
+            .arg(&report_path)
             .args(["--record-envelope", PARITY_RECORD_ENVELOPE])
-            .current_dir(&config.artifacts),
+            .current_dir(&child_dir),
         timeout,
     ) {
         Ok(outcome) => outcome,
@@ -4509,6 +4550,70 @@ mod tests {
                     .to_string(),
             ]
         );
+    }
+
+    /// `path` spelled relative to this process's working directory.
+    fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").unwrap())
+    }
+
+    /// A relative artifacts directory and a relative hermit, as a relative
+    /// `--results`, `E2E_RESULT_ROOT` or `HERMIT_BIN` gives, are measured
+    /// exactly as their absolute spellings are: the comparison runs in the
+    /// artifacts directory and must not resolve them a second time below it.
+    #[test]
+    fn relative_artifacts_and_hermit_paths_are_still_measured() {
+        // Deeper than the working directory, so that resolving the relative
+        // spelling a second time from the artifacts directory cannot climb to
+        // `/`, where surplus `..` components would hide the mistake.
+        let depth = std::env::current_dir().unwrap().components().count();
+        let label = format!("relative-paths{}", "/d".repeat(depth));
+        let top = std::env::temp_dir().join(format!(
+            "hermit-parity-post-pass-{}-relative-paths",
+            std::process::id()
+        ));
+        let fixture = Fixture::new(&label);
+        let rows = vec![
+            fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/one", "kvm", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/one", "liteinst", 1, "PASS", Some(DIVERGENT)),
+        ];
+        let scope = BTreeSet::from([
+            parity_cell("fx/one", ParityBackend::Kvm),
+            parity_cell("fx/one", ParityBackend::Liteinst),
+        ]);
+        let artifacts = relative_to_cwd(&fixture.artifacts());
+        let relative_hermit = relative_to_cwd(&fixture.hermit);
+        assert!(artifacts.is_relative() && relative_hermit.is_relative());
+        // The absolute hermit isolates the logs and the report path; the
+        // relative one adds the program path.
+        for (pass, hermit) in [fixture.hermit.clone(), relative_hermit].iter().enumerate() {
+            let config = PostPassConfig::new(&artifacts, hermit, "run-1", SHA);
+            let report = post_pass(&config, &scope, &rows).unwrap();
+            let verdicts = report
+                .records
+                .iter()
+                .map(|record| (record.backend, record.verdict, record.reason.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                verdicts,
+                [
+                    (ParityBackend::Kvm, ParityVerdict::Matched, None),
+                    (ParityBackend::Liteinst, ParityVerdict::Diverged, None),
+                ],
+                "hermit {}",
+                hermit.display()
+            );
+            assert_eq!(fixture.log_diff_calls(), 2 * (pass + 1));
+            assert_eq!(read_records(&config.output), report.records);
+        }
+        drop(fixture);
+        let _ = fs::remove_dir_all(&top);
     }
 
     fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
