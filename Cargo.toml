@@ -58,3 +58,22 @@ repository = "https://github.com/facebookexperimental/hermit"
 # detcore/src/digest.rs.
 [profile.dev.package.sha2]
 opt-level = 3
+
+[patch."https://github.com/rrnewton/reverie.git"]
+nostd-print = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/experimental/nostd-print" }
+reverie-core = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie" }
+reverie-dbt = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-dbt" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-liteinst" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-memory" }
+reverie-preload = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-preload" }
+reverie-process = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-process" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-ptrace" }
+reverie-rpc = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/experimental/reverie-rpc" }
+reverie-rpc-macros = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/experimental/reverie-rpc-macros" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-rpc-transport" }
+reverie-sabre = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/experimental/reverie-sabre" }
+reverie-sabre-macros = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/experimental/reverie-sabre-macros" }
+reverie-sabre-stats = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/experimental/reverie-sabre-stats" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/reverie-syscalls" }
+safeptrace = { path = "/home/newton/work/dev-hermit/ignored/liteinst-lane-claude/medium-645/reverie/safeptrace" }
