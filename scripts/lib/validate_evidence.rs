@@ -24,7 +24,7 @@ use super::validate_test_results::NodeTestResultsInput;
 use super::validate_test_results::RetainedTestResults;
 use super::validate_test_results::SelectedTestProducers;
 
-// Retain cumulative evidence when the two existing selectors request parity.
+// Retain cumulative schema-10 evidence for the exact selected plan.
 pub const ENABLED: bool = true;
 
 pub struct SelectedEvidence {
@@ -101,7 +101,16 @@ impl SelectedEvidence {
         };
         let cfg = plan.constructed_dag()?;
         plan.planned_cells()?;
-        plan.planned_backend_parity_relations()?;
+        // Retained schema-10 plans may still carry ptrace parity relations and
+        // keep reading through the ledger; a plan constructed now never does
+        // (https://github.com/rrnewton/hermit/issues/3301).
+        let relations = plan.planned_backend_parity_relations()?;
+        if !relations.is_empty() {
+            return Err(format!(
+                "newly constructed plan selects {} backend parity relation(s); backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)",
+                relations.len()
+            ));
+        }
         let producers = SelectedTestProducers::from_constructed_plan_steps(
             &cfg.steps,
             plan.compatibility_selected,
@@ -514,18 +523,12 @@ mod tests {
                 .unwrap();
         expected.sort();
         assert_eq!(prepared.plan.planned_cells().unwrap(), expected);
-        assert!(
-            prepared
-                .plan
-                .planned_backend_parity_relations()
-                .unwrap()
-                .iter()
-                .any(|relation| {
-                    relation.candidate.test == "backend-parity-c/pid-probe"
-                        && relation.candidate.mode == "verify"
-                        && relation.candidate.backend == "liteinst"
-                        && relation.reference_backend == "ptrace"
-                })
+        // The requalified liteinst verify cell runs ordinary same-backend
+        // verification; no ptrace reference relation is selected
+        // (https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(
+            prepared.plan.planned_backend_parity_relations().unwrap(),
+            Vec::new()
         );
         assert_eq!(
             std::fs::read(scratch.path().join(&prepared.reference.path)).unwrap(),
@@ -547,5 +550,42 @@ mod tests {
         );
         // Preserve the existing ptrace selection and mutation controls as well.
         super::super::requalification_plan_bracket(root).unwrap();
+
+        // A selection that still asks for the reference run stays readable as
+        // a retained plan, but publishing it as a new plan is refused.
+        let planted_scratch = tempfile::tempdir().unwrap();
+        let mut planted = build_plan(root, &args, planted_scratch.path()).unwrap();
+        let selection = planted.committed_selection.take().unwrap();
+        assert_eq!(selection, dag_to_json(&planted.cfg));
+        assert_eq!(selection.matches("--prebuilt --results").count(), 1);
+        let selection = selection.replace(
+            "--prebuilt --results",
+            "--prebuilt --parity-reference ptrace --results",
+        );
+        planted.cfg = super::super::dag_from_json(&selection).unwrap();
+        assert_eq!(dag_to_json(&planted.cfg), selection);
+        planted.committed_selection = Some(selection);
+        let refusal = SelectedEvidence::capture(root, &planted)
+            .unwrap()
+            .publish(
+                planted_scratch.path(),
+                &planted,
+                "requalification-planted-parity",
+                &"a".repeat(40),
+            )
+            .err()
+            .expect("a new plan that selects backend parity must be refused");
+        // The owner node's whole declared population is what a planted
+        // reference flag would compare: liteinst 97, KVM 75 and SaBRe 1.
+        assert_eq!(
+            refusal,
+            "newly constructed plan selects 173 backend parity relation(s); backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
+        );
+        assert!(
+            !planted_scratch
+                .path()
+                .join("ignored/validate/artifacts/requalification-planted-parity/constructed-plan.json")
+                .exists()
+        );
     }
 }
