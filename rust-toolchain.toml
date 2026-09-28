@@ -1,5 +1,5 @@
 [toolchain]
-# @fb-only: path = "../../third-party-buck/platform010/build/rust/llvm-fb-15"
+# @fb-only: path = "../../../third-party/rust-toolchain/rustup/current/basic"
 # Pinned so the OSS Buck2 build is reproducible. The shim's Rust toolchain is
 # `system_rust_toolchain`, which runs whatever `rustc` is on PATH; under rustup
 # that resolves through this file, so a floating `nightly` gives a cold reviewer

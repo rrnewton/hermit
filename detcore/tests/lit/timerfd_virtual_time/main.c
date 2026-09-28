@@ -13,7 +13,9 @@
 // CHECK: timerfd expirations=1 elapsed_ns={{[0-9]+}} requested_ns=10000000
 // CHECK: timerfd respected clock deadline
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
