@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::fd::DetInode;
+use detcore_model::fd::RawInode;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
@@ -3073,14 +3075,24 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
 /// The distinct raw `(device, inode)` pairs of one `maps`/`smaps` snapshot, in
 /// the order their FIRST mapping line appears in the text.
 ///
-/// This is the order in which the caller mints deterministic identities for
-/// files it has not seen before, so it must be an order the guest controls.
-/// The text is in address order, and Hermit makes guest addresses
-/// deterministic. The raw numbers are not guest-controlled: Linux hands out
-/// shmem and memfd inodes from per-CPU batches, so two memfds created in the
-/// same guest order can get raw inodes in either numeric order. Minting in
-/// sorted raw order (a `BTreeSet`, as this used to be) let that host numbering
-/// decide which file got the lower deterministic inode.
+/// This is the order in which [`mint_mapping_identities`] mints deterministic
+/// identities for files the run has not seen before, so it must be a function
+/// of bytes the guest already observes. The text qualifies: `sanitize_maps`
+/// renders every raw line -- addresses, permissions, offsets and pathnames
+/// included -- in its original order and rewrites only the device and inode
+/// columns, so the line order is already guest-visible output. It is
+/// reproducible because the addresses are. On the ptrace and LiteInst
+/// backends, `init_tracee` in `reverie/reverie-ptrace/src/tracer.rs` calls
+/// `personality(PER_LINUX | ADDR_NO_RANDOMIZE)` in the child's `pre_exec`
+/// closure installed by `TracerBuilder::spawn`, and LiteInst launches through
+/// that same `TracerBuilder` (`reverie-liteinst/src/backend.rs`).
+///
+/// The raw numbers are not guest-controlled: Linux hands out shmem and memfd
+/// inodes from per-CPU batches, so two memfds created in the same guest order
+/// can get raw inodes in either numeric order. Minting in sorted raw order (a
+/// `BTreeSet`, as this used to be) let that host numbering decide which file
+/// got the lower deterministic inode, and likewise which raw device got the
+/// lower deterministic device.
 pub(crate) fn mapping_identities_in_text_order(contents: &str) -> Vec<(u64, u64)> {
     let mut seen = BTreeSet::new();
     contents
@@ -3088,6 +3100,47 @@ pub(crate) fn mapping_identities_in_text_order(contents: &str) -> Vec<(u64, u64)
         .filter_map(mapping_header_identity)
         .filter(|pair| seen.insert(*pair))
         .collect()
+}
+
+/// The run-global identity pools a `maps`/`smaps` snapshot mints from.
+///
+/// Production implements this over the guest's RPCs to the global
+/// `InodePool`/`DevicePool` (the same pools `stat` uses); unit tests implement
+/// it over the pools directly. Both then run the one minting loop in
+/// [`mint_mapping_identities`], so the ORDER of the mint calls -- the thing
+/// that decides which file gets which deterministic number -- is tested as
+/// production executes it rather than through a copy.
+pub(crate) trait MappingIdentityMinter {
+    /// The deterministic inode for `raw_inode`, minting one on first sight.
+    async fn inode(&mut self, raw_inode: RawInode) -> DetInode;
+    /// The deterministic device for `raw_device`, minting one on first sight.
+    async fn device(&mut self, raw_device: u64) -> u64;
+}
+
+/// Mint the deterministic `(device, inode)` of every backed mapping in one
+/// `maps`/`smaps` snapshot, keyed by raw `(device, inode)`, for
+/// `sanitize_maps`/`sanitize_smaps` to render.
+///
+/// Pairs are visited strictly in [`mapping_identities_in_text_order`]; each
+/// pair asks for its inode first and then its device. A raw inode listed in
+/// `stdio_by_raw_inode` reports that fixed stdio identity (the one fdinfo
+/// reports for the same fd) and does NOT consume a pooled inode.
+pub(crate) async fn mint_mapping_identities<M: MappingIdentityMinter>(
+    contents: &[u8],
+    stdio_by_raw_inode: &BTreeMap<RawInode, DetInode>,
+    minter: &mut M,
+) -> BTreeMap<(u64, u64), (u64, u64)> {
+    let mut identities = BTreeMap::new();
+    let raw_pairs = mapping_identities_in_text_order(&String::from_utf8_lossy(contents));
+    for (raw_dev, raw_inode) in raw_pairs {
+        let det_inode = match stdio_by_raw_inode.get(&raw_inode) {
+            Some(inode) => *inode,
+            None => minter.inode(raw_inode).await,
+        };
+        let det_dev = minter.device(raw_dev).await;
+        identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
+    }
+    identities
 }
 
 /// Rewrite the device and inode of one mapping header from the caller-supplied
