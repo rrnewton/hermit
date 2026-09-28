@@ -131,6 +131,37 @@ fn decode_failed_error(bytes: &[u8]) -> Option<SerializableError> {
     }
 }
 
+/// Failure-only same-image fallback. The original owner supplies all physical
+/// observations; neither a bare exit125 nor an error-shaped byte prefix grants
+/// result authority. Successful values remain impossible to deserialize here.
+pub(super) fn reported_failed_cleanup<T>(
+    cause: OwnedRunFailure,
+    cleanup: &OwnedFinalization<T>,
+) -> Option<SerializableError> {
+    failed_cleanup_frame(
+        cause,
+        cleanup.cleanup().observation(),
+        cleanup.result_eof(),
+        cleanup.provisional_bytes(),
+    )
+}
+
+fn failed_cleanup_frame(
+    cause: OwnedRunFailure,
+    observation: ChildCleanupObservation,
+    result_eof: bool,
+    bytes: &[u8],
+) -> Option<SerializableError> {
+    if result_eof
+        && observation == ChildCleanupObservation::Reaped(ExitStatus::Exited(125))
+        && cause == OwnedRunFailure::ChildStatus(ExitStatus::Exited(125))
+    {
+        decode_failed_error(bytes)
+    } else {
+        None
+    }
+}
+
 fn retain<T: 'static, F: 'static>(
     run: OwnedFinalization<T>,
     factory: F,
@@ -326,14 +357,7 @@ where
         }
         OwnedFinalize::Failed { cause, cleanup } => {
             let observation = cleanup.cleanup().observation();
-            let reported = if cleanup.result_eof()
-                && observation == ChildCleanupObservation::Reaped(ExitStatus::Exited(125))
-                && cause == OwnedRunFailure::ChildStatus(ExitStatus::Exited(125))
-            {
-                decode_failed_error(cleanup.provisional_bytes())
-            } else {
-                None
-            };
+            let reported = reported_failed_cleanup(cause, &cleanup);
             let actual_exit = matches!(observation, ChildCleanupObservation::Reaped(_));
             // A direct-child exit never proves arbitrary descendant retirement;
             // an absent/malformed frame cannot strengthen that evidence.
@@ -418,6 +442,70 @@ mod tests {
                 .is_none()
         );
         assert!(decode_failed_error(&[255; 64]).is_none());
+    }
+
+    #[test]
+    fn failed_cleanup_frame_requires_original_125_eof_and_exact_error_frame() {
+        let cause = OwnedRunFailure::ChildStatus(ExitStatus::Exited(125));
+        let observed = ChildCleanupObservation::Reaped(ExitStatus::Exited(125));
+        let error = reported(
+            hermit::FailureKind::PolicyRefusal,
+            Some(hermit::HermitCleanupStage::PtraceCleanup),
+        );
+        let frame = encode(Ok(Err(error.clone())));
+        assert_eq!(
+            failed_cleanup_frame(cause, observed, true, &frame),
+            Some(error)
+        );
+        assert!(failed_cleanup_frame(cause, observed, false, &frame).is_none());
+        for code in [0, 1, 122, 124, 126] {
+            assert!(
+                failed_cleanup_frame(
+                    OwnedRunFailure::ChildStatus(ExitStatus::Exited(code)),
+                    observed,
+                    true,
+                    &frame,
+                )
+                .is_none()
+            );
+            assert!(
+                failed_cleanup_frame(
+                    cause,
+                    ChildCleanupObservation::Reaped(ExitStatus::Exited(code)),
+                    true,
+                    &frame,
+                )
+                .is_none()
+            );
+        }
+        for other in [
+            OwnedRunFailure::Cancelled,
+            OwnedRunFailure::Startup(StartupError::MissingResult),
+        ] {
+            assert!(failed_cleanup_frame(other, observed, true, &frame).is_none());
+        }
+        assert!(
+            failed_cleanup_frame(
+                cause,
+                ChildCleanupObservation::ExitedWithoutWaitStatus,
+                true,
+                &frame,
+            )
+            .is_none()
+        );
+        for end in 0..frame.len() {
+            assert!(failed_cleanup_frame(cause, observed, true, &frame[..end]).is_none());
+        }
+        let mut trailing = frame;
+        trailing.push(0);
+        for invalid in [
+            trailing,
+            encode(Ok(Ok(73))),
+            encode(Err(StartupError::Protocol)),
+            encode(Ok(Err(reported(hermit::FailureKind::PolicyRefusal, None)))),
+        ] {
+            assert!(failed_cleanup_frame(cause, observed, true, &invalid).is_none());
+        }
     }
 
     #[test]

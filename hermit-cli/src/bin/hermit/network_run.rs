@@ -1242,6 +1242,22 @@ fn finalize_owned(
                     child_status = Some(status);
                     child_terminal = true;
                 }
+                if let Some(reported) =
+                    super::owned_container::reported_failed_cleanup(cause, &cleanup)
+                {
+                    let stage = reported.cleanup_stage().expect("staged failure only");
+                    let error = classify_container_result::<RunValue>(Ok(Err(reported)))
+                        .expect_err("a failed transport child cannot publish a value")
+                        .context(format!(
+                            "network backend cleanup unconfirmed at {stage:?}; physical controller exit observed; no backend cleanup success is claimed"
+                        ));
+                    eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {error:#}");
+                    primary = Some(match primary.take() {
+                        Some(earlier) => earlier
+                            .context(format!("secondary unresolved child failure: {error:#}")),
+                        None => error,
+                    });
+                }
                 primary.get_or_insert_with(|| owned_failure(cause));
                 child_cleanup = Some(cleanup);
             }
@@ -1665,6 +1681,131 @@ mod tests {
             "an ordinary encoded guest exit is not a controller policy refusal"
         );
     }
+
+    #[test]
+    fn actual_failed_owned_child_preserves_staged_refusal_without_claiming_cleanup() {
+        use super::super::owned_container::PublishedFailureExit;
+
+        for stage in [
+            hermit::HermitCleanupStage::PtraceCleanup,
+            hermit::HermitCleanupStage::GlobalStateCleanup,
+        ] {
+            for (kind, expected_exit) in [
+                (hermit::FailureKind::PolicyRefusal, 122),
+                (hermit::FailureKind::RunTimeout, 124),
+                (hermit::FailureKind::Error, 125),
+            ] {
+                for prior in [false, true] {
+                    let started = Container::new().run_with_startup_owned(
+                        Duration::from_secs(2),
+                        &mut |_| Ok(()),
+                        &mut |_| Ok(()),
+                        &mut |_| -> (Wire, PublishedFailureExit) {
+                            // A staged error is a wire premise, not a fabricated
+                            // backend owner or proof of successful native cleanup.
+                            // Use the production deferred drop: the actual child
+                            // flushes its error, closes the writer, then exits125.
+                            let reported: SerializableError =
+                                serde_json::from_value(serde_json::json!({
+                                    "error": "original primary failure",
+                                    "context": [],
+                                    "kind": kind,
+                                    "cleanup_stage": stage,
+                                }))
+                                .unwrap();
+                            (Err(reported), PublishedFailureExit::new(true, None))
+                        },
+                    );
+                    let primary =
+                        prior.then(|| Error::new(std::io::Error::from_raw_os_error(libc::EIO)));
+                    let error =
+                        finalize_owned(Some(started), None, None, primary, None).unwrap_err();
+                    assert_eq!(
+                        error.downcast_ref::<PolicyRefusal>().is_some(),
+                        !prior && kind == hermit::FailureKind::PolicyRefusal
+                    );
+                    assert_eq!(
+                        super::super::failure_exit_code(&error),
+                        if prior { 125 } else { expected_exit },
+                        "{error:#}"
+                    );
+                    if prior {
+                        assert_eq!(
+                            error
+                                .downcast_ref::<std::io::Error>()
+                                .unwrap()
+                                .raw_os_error(),
+                            Some(libc::EIO)
+                        );
+                    }
+                    let diagnostic = format!("{error:#}");
+                    assert!(
+                        diagnostic.contains("original primary failure"),
+                        "{diagnostic}"
+                    );
+                    assert!(diagnostic.contains(&format!("{stage:?}")), "{diagnostic}");
+                    assert!(diagnostic.contains("cleanup unconfirmed"), "{diagnostic}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn actual_failed_owned_child_rejects_success_unstaged_and_unrelated_exit_frames() {
+        use super::super::owned_container::PublishedFailureExit;
+
+        struct OtherExit(i32);
+        impl Drop for OtherExit {
+            fn drop(&mut self) {
+                unsafe { libc::_exit(self.0) }
+            }
+        }
+        for case in 0..4 {
+            let started = Container::new().run_with_startup_owned(
+                Duration::from_secs(2),
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+                &mut |_| -> (Wire, (PublishedFailureExit, Option<OtherExit>)) {
+                    let wire = if case == 0 {
+                        Ok(RunValue::Run(ExitStatus::Exited(0), None))
+                    } else {
+                        Err(serde_json::from_value(serde_json::json!({
+                            "error": "unqualified policy words",
+                            "context": [],
+                            "kind": hermit::FailureKind::PolicyRefusal,
+                            "cleanup_stage": (case != 1).then_some(hermit::HermitCleanupStage::PtraceCleanup),
+                        })).unwrap())
+                    };
+                    (
+                        wire,
+                        (
+                            PublishedFailureExit::new(case < 2, None),
+                            (case >= 2).then(|| OtherExit(if case == 2 { 42 } else { 124 })),
+                        ),
+                    )
+                },
+            );
+            let error = finalize_owned(Some(started), None, None, None, None).unwrap_err();
+            assert!(
+                error.downcast_ref::<PolicyRefusal>().is_none(),
+                "case {case}: {error:#}"
+            );
+            assert_eq!(
+                super::super::failure_exit_code(&error),
+                if case == 3 { 124 } else { 125 },
+                "case {case}: {error:#}"
+            );
+            if case < 2 {
+                assert_eq!(
+                    super::super::classify_failure(&error),
+                    "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Exited(125)",
+                    "the production deferred exit must follow complete result publication"
+                );
+            }
+            assert!(!format!("{error:#}").contains("unqualified policy words"));
+        }
+    }
+
     #[test]
     fn actual_missing_125_zero_crash_and_prior_failure_cannot_claim_policy() {
         for (code, prior) in [
