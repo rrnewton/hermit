@@ -472,8 +472,14 @@ pub(crate) fn isolate_command_parent(exact: &str, prepare: bool) -> bool {
     const CHILD: &str = "HERMIT_COMMAND_PARENT_TEST_CHILD";
     if std::env::var(CHILD).ok().as_deref() == Some(exact) {
         let mut enabled: libc::c_int = -1;
-        assert_eq!(unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut enabled, 0, 0, 0) }, 0);
-        assert_eq!(enabled, 0, "subreaper ownership is not inherited across fork");
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut enabled, 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            enabled, 0,
+            "subreaper ownership is not inherited across fork"
+        );
         if prepare {
             prepare_command_parent().unwrap();
             prepare_command_parent().unwrap();
@@ -491,8 +497,17 @@ pub(crate) fn isolate_command_parent(exact: &str, prepare: bool) -> bool {
     let mut terminal = false;
     while Instant::now() < deadline {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::waitid(libc::P_PID, child.id(), &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) }, 0);
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            },
+            0
+        );
         let pid = unsafe { info.si_pid() };
         if pid != 0 {
             assert_eq!(pid, child.id() as i32);
@@ -508,11 +523,20 @@ pub(crate) fn isolate_command_parent(exact: &str, prepare: bool) -> bool {
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
     let actual = child.wait().unwrap();
-    assert!(terminal && actual.success(), "isolated command parent: {actual}");
+    assert!(
+        terminal && actual.success(),
+        "isolated command parent: {actual}"
+    );
     assert_eq!(unsafe { libc::kill(-(child.id() as i32), 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
-    assert_eq!(unsafe { libc::waitpid(child.id() as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
-    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+    assert_eq!(
+        unsafe { libc::waitpid(child.id() as i32, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
     true
 }
 
@@ -522,26 +546,48 @@ mod tests {
 
     #[test]
     fn command_without_subreaper_refuses_before_spawning() {
-        if isolate_command_parent("unix_guard_terminal::tests::command_without_subreaper_refuses_before_spawning", false) {
+        if isolate_command_parent(
+            "unix_guard_terminal::tests::command_without_subreaper_refuses_before_spawning",
+            false,
+        ) {
             return;
         }
         let no_children = || {
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            assert_eq!(unsafe { libc::waitid(libc::P_ALL, 0, &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_ALL,
+                        0,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
         };
         no_children();
         let error = CommandFlight::start(&mut Command::new("/bin/true"))
-            .err().expect("unprepared command parent spawned a child");
+            .err()
+            .expect("unprepared command parent spawned a child");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(error.to_string(), "command parent must retain child-subreaper ownership");
+        assert_eq!(
+            error.to_string(),
+            "command parent must retain child-subreaper ownership"
+        );
         no_children();
     }
 
     #[test]
     fn command_waits_for_descendant_absence_after_leader_reap() {
-        if isolate_command_parent("unix_guard_terminal::tests::command_waits_for_descendant_absence_after_leader_reap", true) {
+        if isolate_command_parent(
+            "unix_guard_terminal::tests::command_waits_for_descendant_absence_after_leader_reap",
+            true,
+        ) {
             return;
         }
         let mut flight = CommandFlight::start(
@@ -587,7 +633,10 @@ mod tests {
 
     #[test]
     fn command_observed_after_original_deadline_stays_failed() {
-        if isolate_command_parent("unix_guard_terminal::tests::command_observed_after_original_deadline_stays_failed", true) {
+        if isolate_command_parent(
+            "unix_guard_terminal::tests::command_observed_after_original_deadline_stays_failed",
+            true,
+        ) {
             return;
         }
         let mut flight = CommandFlight::start(&mut Command::new("/bin/true")).unwrap();

@@ -1170,13 +1170,7 @@ fn run_owned(
         (None, None) => None,
         (None, Some(_)) => unreachable!("accepted-only startup cannot launch a guard"),
     };
-    finalize_owned(
-        container_result,
-        guard,
-        accepted,
-        primary,
-        failed_backing,
-    )
+    finalize_owned(container_result, guard, accepted, primary, failed_backing)
 }
 
 /// The exact child terminal precedes both service drains: the provider lifetime

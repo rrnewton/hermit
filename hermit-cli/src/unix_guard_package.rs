@@ -3,10 +3,11 @@
 //! Discovery never loads BPF or grants a runtime capability. A missing package,
 //! incompatible kernel, or inaccessible private root is a pre-guest refusal.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::io::Read;
-use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
@@ -239,55 +240,237 @@ impl GuardDeploymentRoots {
     /// Refuse another privileged load at the durable unresolved-attempt bound.
     /// This never removes pins, receipts or units.
     pub fn admit_launch(&self) -> io::Result<()> {
-        let uid=unsafe{libc::getuid()};
-        let bpffs=open_private_directory(&self.writable_paths[0],uid,true)?;
-        let recovery=open_private_directory(&self.writable_paths[1],uid,false)?;
-        if directory_identity(bpffs.as_fd())?!=directory_identity(self.bpffs.as_fd())?
-            || directory_identity(recovery.as_fd())?!=directory_identity(self.recovery.as_fd())? {
+        let uid = unsafe { libc::getuid() };
+        let bpffs = open_private_directory(&self.writable_paths[0], uid, true)?;
+        let recovery = open_private_directory(&self.writable_paths[1], uid, false)?;
+        if directory_identity(bpffs.as_fd())? != directory_identity(self.bpffs.as_fd())?
+            || directory_identity(recovery.as_fd())? != directory_identity(self.recovery.as_fd())?
+        {
             return Err(io::Error::other("guard deployment root identity changed"));
         }
-        let before=guard_admission_census(self.bpffs.as_fd(),self.recovery.as_fd(),uid)?;
-        if before.unresolved.len()>=MAX_UNRESOLVED_GUARD_LAUNCHES {return Err(io::Error::other("Unix guard unresolved launch admission bound reached"));}
-        let after=guard_admission_census(self.bpffs.as_fd(),self.recovery.as_fd(),uid)?;
-        if before!=after || directory_identity(bpffs.as_fd())?!=directory_identity(self.bpffs.as_fd())?
-            || directory_identity(recovery.as_fd())?!=directory_identity(self.recovery.as_fd())? {
-            return Err(io::Error::other("guard deployment roots changed during admission census"));
+        let before = guard_admission_census(self.bpffs.as_fd(), self.recovery.as_fd(), uid)?;
+        if before.unresolved.len() >= MAX_UNRESOLVED_GUARD_LAUNCHES {
+            return Err(io::Error::other(
+                "Unix guard unresolved launch admission bound reached",
+            ));
+        }
+        let after = guard_admission_census(self.bpffs.as_fd(), self.recovery.as_fd(), uid)?;
+        if before != after
+            || directory_identity(bpffs.as_fd())? != directory_identity(self.bpffs.as_fd())?
+            || directory_identity(recovery.as_fd())? != directory_identity(self.recovery.as_fd())?
+        {
+            return Err(io::Error::other(
+                "guard deployment roots changed during admission census",
+            ));
         }
         Ok(())
     }
 }
 
-fn directory_names(directory:BorrowedFd<'_>,bound:usize)->io::Result<BTreeSet<String>>{
-    let fd=unsafe{libc::openat(directory.as_raw_fd(),c".".as_ptr(),libc::O_RDONLY|libc::O_DIRECTORY|libc::O_CLOEXEC|libc::O_NOFOLLOW)};
-    if fd<0{return Err(io::Error::last_os_error());}let raw=unsafe{libc::fdopendir(fd)};
-    if raw.is_null(){let error=io::Error::last_os_error();unsafe{libc::close(fd);}return Err(error);}
-    struct Stream(*mut libc::DIR);impl Drop for Stream{fn drop(&mut self){unsafe{libc::closedir(self.0);}}}let stream=Stream(raw);let mut names=BTreeSet::new();
-    loop{unsafe{*libc::__errno_location()=0;}let entry=unsafe{libc::readdir(stream.0)};if entry.is_null(){let error=io::Error::last_os_error();if error.raw_os_error()!=Some(0){return Err(error);}break;}
-        let bytes=unsafe{std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())};if matches!(bytes.to_bytes(),b"."|b".."){continue;}let name=bytes.to_str().map_err(|_|io::Error::other("guard recovery basename is not UTF-8"))?;
-        if names.len()>=bound||!names.insert(name.to_owned()){return Err(io::Error::other("guard deployment population exceeded fixed bound"));}}
+fn directory_names(directory: BorrowedFd<'_>, bound: usize) -> io::Result<BTreeSet<String>> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let raw = unsafe { libc::fdopendir(fd) };
+    if raw.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error);
+    }
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let stream = Stream(raw);
+    let mut names = BTreeSet::new();
+    loop {
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error);
+            }
+            break;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if matches!(bytes.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let name = bytes
+            .to_str()
+            .map_err(|_| io::Error::other("guard recovery basename is not UTF-8"))?;
+        if names.len() >= bound || !names.insert(name.to_owned()) {
+            return Err(io::Error::other(
+                "guard deployment population exceeded fixed bound",
+            ));
+        }
+    }
     Ok(names)
 }
-fn exact_hex(value:&str,bytes:usize)->bool{value.len()==bytes*2&&!value.bytes().all(|b|b==b'0')&&value.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
-fn guard_receipt_file(directory:BorrowedFd<'_>,name:&str,uid:u32)->io::Result<File>{
-    let name=std::ffi::CString::new(name).map_err(io::Error::other)?;let raw=unsafe{libc::openat(directory.as_raw_fd(),name.as_ptr(),libc::O_RDONLY|libc::O_CLOEXEC|libc::O_NOFOLLOW)};if raw<0{return Err(io::Error::last_os_error());}
-    let file=unsafe{File::from_raw_fd(raw)};let metadata=file.metadata()?;if !metadata.is_file()||metadata.uid()!=uid||metadata.mode()&0o7777!=0o600||metadata.nlink()!=1||metadata.len()>65_536{return Err(io::Error::other("guard recovery receipt shape differs"));}Ok(file)
+fn exact_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes * 2
+        && !value.bytes().all(|b| b == b'0')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn guard_terminal_complete(directory:BorrowedFd<'_>,name:&str,incarnation:u64,uid:u32)->io::Result<bool>{
-    let file=guard_receipt_file(directory,name,uid)?;
-    let mut text=String::new();file.take(65_537).read_to_string(&mut text)?;if text.len()>65_536||!text.ends_with('\n'){return Ok(false);}
-    let mut terminal=0;let mut last=false;for line in text.lines(){let matches=serde_json::from_str::<serde_json::Value>(line).ok().is_some_and(|row|row.get("schema").and_then(|v|v.as_u64())==Some(1)&&row.get("stage").and_then(|v|v.as_str())==Some("terminal")&&row.pointer("/guard/incarnation").and_then(|v|v.as_u64())==Some(incarnation));if matches{terminal+=1;}last=matches;}Ok(terminal==1&&last)
+fn guard_receipt_file(directory: BorrowedFd<'_>, name: &str, uid: u32) -> io::Result<File> {
+    let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    let raw = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(raw) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() > 65_536
+    {
+        return Err(io::Error::other("guard recovery receipt shape differs"));
+    }
+    Ok(file)
 }
-#[derive(Eq,PartialEq)]struct GuardAdmissionCensus{pins:BTreeSet<String>,receipts:BTreeSet<String>,unresolved:BTreeSet<String>}
-fn guard_admission_census(bpffs:BorrowedFd<'_>,recovery:BorrowedFd<'_>,uid:u32)->io::Result<GuardAdmissionCensus>{
-    let pins=directory_names(bpffs,64)?;let receipt_names=directory_names(recovery,384)?;let mut unresolved=BTreeSet::new();for name in &pins{let suffix=name.strip_prefix("ug-").ok_or_else(||io::Error::other("unexpected Unix guard pin-root entry"))?;if !exact_hex(suffix,8){return Err(io::Error::other("Unix guard pin-root identity differs"));}
-        let c=std::ffi::CString::new(name.as_str()).map_err(io::Error::other)?;let mut stat=std::mem::MaybeUninit::<libc::stat>::uninit();if unsafe{libc::fstatat(bpffs.as_raw_fd(),c.as_ptr(),stat.as_mut_ptr(),libc::AT_SYMLINK_NOFOLLOW)}!=0{return Err(io::Error::last_os_error());}let stat=unsafe{stat.assume_init()};
-        if stat.st_mode&libc::S_IFMT!=libc::S_IFDIR||stat.st_uid!=uid||stat.st_mode&0o7777!=0o700{return Err(io::Error::other("Unix guard pin-root entry shape differs"));}unresolved.insert(suffix.to_owned());}
-    let mut receipts=BTreeMap::<String,BTreeSet<String>>::new();for name in &receipt_names{let(identity,role)=name.split_once('.').ok_or_else(||io::Error::other("Unix guard recovery filename lacks role"))?;
-        if !exact_hex(identity,16)||!matches!(role,"terminal.jsonl"|"stdout.log"|"stderr.log"){return Err(io::Error::other("Unix guard recovery identity or role differs"));}if !receipts.entry(identity.to_owned()).or_default().insert(role.to_owned()){return Err(io::Error::other("Unix guard recovery role repeated"));}}
-    for(identity,roles)in receipts{let prefix=&identity[..16];let incarnation=u64::from_str_radix(prefix,16).map_err(io::Error::other)?;let terminal=format!("{identity}.terminal.jsonl");
-        let complete_roles=roles.len()==3&&roles.contains("terminal.jsonl")&&roles.contains("stdout.log")&&roles.contains("stderr.log");
-        let complete=if complete_roles{guard_receipt_file(recovery,&format!("{identity}.stdout.log"),uid)?;guard_receipt_file(recovery,&format!("{identity}.stderr.log"),uid)?;guard_terminal_complete(recovery,&terminal,incarnation,uid)?}else{false};if !complete{unresolved.insert(prefix.to_owned());}}
-    Ok(GuardAdmissionCensus{pins,receipts:receipt_names,unresolved})
+fn guard_terminal_complete(
+    directory: BorrowedFd<'_>,
+    name: &str,
+    incarnation: u64,
+    uid: u32,
+) -> io::Result<bool> {
+    let file = guard_receipt_file(directory, name, uid)?;
+    let mut text = String::new();
+    file.take(65_537).read_to_string(&mut text)?;
+    if text.len() > 65_536 || !text.ends_with('\n') {
+        return Ok(false);
+    }
+    let mut terminal = 0;
+    let mut last = false;
+    for line in text.lines() {
+        let matches = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|row| {
+                row.get("schema").and_then(|v| v.as_u64()) == Some(1)
+                    && row.get("stage").and_then(|v| v.as_str()) == Some("terminal")
+                    && row.pointer("/guard/incarnation").and_then(|v| v.as_u64())
+                        == Some(incarnation)
+            });
+        if matches {
+            terminal += 1;
+        }
+        last = matches;
+    }
+    Ok(terminal == 1 && last)
+}
+#[derive(Eq, PartialEq)]
+struct GuardAdmissionCensus {
+    pins: BTreeSet<String>,
+    receipts: BTreeSet<String>,
+    unresolved: BTreeSet<String>,
+}
+fn guard_admission_census(
+    bpffs: BorrowedFd<'_>,
+    recovery: BorrowedFd<'_>,
+    uid: u32,
+) -> io::Result<GuardAdmissionCensus> {
+    let pins = directory_names(bpffs, 64)?;
+    let receipt_names = directory_names(recovery, 384)?;
+    let mut unresolved = BTreeSet::new();
+    for name in &pins {
+        let suffix = name
+            .strip_prefix("ug-")
+            .ok_or_else(|| io::Error::other("unexpected Unix guard pin-root entry"))?;
+        if !exact_hex(suffix, 8) {
+            return Err(io::Error::other("Unix guard pin-root identity differs"));
+        }
+        let c = std::ffi::CString::new(name.as_str()).map_err(io::Error::other)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                bpffs.as_raw_fd(),
+                c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || stat.st_uid != uid
+            || stat.st_mode & 0o7777 != 0o700
+        {
+            return Err(io::Error::other("Unix guard pin-root entry shape differs"));
+        }
+        unresolved.insert(suffix.to_owned());
+    }
+    let mut receipts = BTreeMap::<String, BTreeSet<String>>::new();
+    for name in &receipt_names {
+        let (identity, role) = name
+            .split_once('.')
+            .ok_or_else(|| io::Error::other("Unix guard recovery filename lacks role"))?;
+        if !exact_hex(identity, 16)
+            || !matches!(role, "terminal.jsonl" | "stdout.log" | "stderr.log")
+        {
+            return Err(io::Error::other(
+                "Unix guard recovery identity or role differs",
+            ));
+        }
+        if !receipts
+            .entry(identity.to_owned())
+            .or_default()
+            .insert(role.to_owned())
+        {
+            return Err(io::Error::other("Unix guard recovery role repeated"));
+        }
+    }
+    for (identity, roles) in receipts {
+        let prefix = &identity[..16];
+        let incarnation = u64::from_str_radix(prefix, 16).map_err(io::Error::other)?;
+        let terminal = format!("{identity}.terminal.jsonl");
+        let complete_roles = roles.len() == 3
+            && roles.contains("terminal.jsonl")
+            && roles.contains("stdout.log")
+            && roles.contains("stderr.log");
+        let complete = if complete_roles {
+            guard_receipt_file(recovery, &format!("{identity}.stdout.log"), uid)?;
+            guard_receipt_file(recovery, &format!("{identity}.stderr.log"), uid)?;
+            guard_terminal_complete(recovery, &terminal, incarnation, uid)?
+        } else {
+            false
+        };
+        if !complete {
+            unresolved.insert(prefix.to_owned());
+        }
+    }
+    Ok(GuardAdmissionCensus {
+        pins,
+        receipts: receipt_names,
+        unresolved,
+    })
 }
 
 /// Private persistent receipt directory for a service that owns no bpffs pins.
@@ -341,7 +524,9 @@ impl RecoveryDeploymentRoot {
     /// exact recovery census. This grants no native provider capability.
     pub fn open_accepted() -> io::Result<Self> {
         if unsafe { libc::getuid() } != unsafe { libc::geteuid() } {
-            return Err(io::Error::other("guard startup requires matching real/effective uid"));
+            return Err(io::Error::other(
+                "guard startup requires matching real/effective uid",
+            ));
         }
         let state = match std::env::var_os("XDG_STATE_HOME") {
             Some(path) => PathBuf::from(path),
@@ -487,9 +672,13 @@ fn reject_ancestor(start: BorrowedFd<'_>, target: RecoveryDirectoryIdentity) -> 
 
 #[cfg(test)]
 mod recovery_root_tests {
-    use super::*;
     use std::os::unix::fs::PermissionsExt;
-    fn private_file(path:&Path,bytes:&[u8]){std::fs::write(path,bytes).unwrap();std::fs::set_permissions(path,std::fs::Permissions::from_mode(0o600)).unwrap();}
+
+    use super::*;
+    fn private_file(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     #[test]
     fn accepted_recovery_does_not_require_unrelated_bpffs() {
@@ -502,7 +691,10 @@ mod recovery_root_tests {
         assert!(held.is_dir());
         assert_eq!(held.uid(), unsafe { libc::getuid() });
         assert_eq!(held.mode() & 0o7777, 0o700);
-        assert_eq!(recovery.writable_path, state.path().join("hermit/network-guard"));
+        assert_eq!(
+            recovery.writable_path,
+            state.path().join("hermit/network-guard")
+        );
     }
 
     #[test]
@@ -522,7 +714,8 @@ mod recovery_root_tests {
         std::fs::write(&file, b"not a directory").unwrap();
         assert!(RecoveryDeploymentRoot::open_at(&file).is_err());
         assert!(RecoveryDeploymentRoot::open_at(&state.path().join("absent")).is_err());
-    }    #[test]
+    }
+    #[test]
     fn accepted_and_guard_roots_are_actual_disjoint_directories() {
         let state = tempfile::tempdir().unwrap();
         let guard =
@@ -578,26 +771,67 @@ mod recovery_root_tests {
     #[test]
     fn accepted_roots_refuse_symlink_alias_wrong_mode_missing_and_wrong_owner_expectation() {
         let temp = tempfile::tempdir().unwrap();
-        let root = RecoveryDeploymentRoot::open_named_state_directory(temp.path(), "network-accepted").unwrap();
+        let root =
+            RecoveryDeploymentRoot::open_named_state_directory(temp.path(), "network-accepted")
+                .unwrap();
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&root.writable_path, &alias).unwrap();
         assert!(RecoveryDeploymentRoot::open_at(&alias).is_err());
-        assert!(root.require_disjoint(root.directory.as_fd(), &alias).is_err());
+        assert!(
+            root.require_disjoint(root.directory.as_fd(), &alias)
+                .is_err()
+        );
         assert!(RecoveryDeploymentRoot::open_at(&temp.path().join("missing")).is_err());
         let other_uid = unsafe { libc::getuid() }.wrapping_add(1);
         assert!(open_private_directory(&root.writable_path, other_uid, false).is_err());
-        std::fs::set_permissions(&root.writable_path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::set_permissions(&root.writable_path, std::fs::Permissions::from_mode(0o750))
+            .unwrap();
         assert!(root.identity().is_err());
         assert!(RecoveryDeploymentRoot::open_at(&root.writable_path).is_err());
     }
     #[test]
-    fn guard_census_bounds_unresolved_pin_and_receipt_identities_without_deletion(){
-        let temp=tempfile::tempdir().unwrap();let pins=temp.path().join("pins");let receipts=temp.path().join("receipts");std::fs::create_dir(&pins).unwrap();std::fs::create_dir(&receipts).unwrap();
-        std::fs::set_permissions(&pins,std::fs::Permissions::from_mode(0o700)).unwrap();std::fs::set_permissions(&receipts,std::fs::Permissions::from_mode(0o700)).unwrap();
-        for ordinal in 1u64..=7{let identity=format!("{ordinal:016x}{ordinal:016x}");private_file(&receipts.join(format!("{identity}.terminal.jsonl")),b"retained failure\n");let pin=pins.join(format!("ug-{ordinal:016x}"));std::fs::create_dir(&pin).unwrap();std::fs::set_permissions(pin,std::fs::Permissions::from_mode(0o700)).unwrap();}
-        let completed=17u64;let identity=format!("{completed:016x}{completed:016x}");private_file(&receipts.join(format!("{identity}.terminal.jsonl")),format!("{{\"schema\":1,\"stage\":\"terminal\",\"guard\":{{\"incarnation\":{completed}}}}}\n").as_bytes());private_file(&receipts.join(format!("{identity}.stdout.log")),b"");private_file(&receipts.join(format!("{identity}.stderr.log")),b"");
-        let pin_fd=File::open(&pins).unwrap();let receipt_fd=File::open(&receipts).unwrap();let uid=unsafe{libc::getuid()};assert_eq!(guard_admission_census(pin_fd.as_fd(),receipt_fd.as_fd(),uid).unwrap().unresolved.len(),7);
-        let eighth=pins.join("ug-0000000000000008");std::fs::create_dir(&eighth).unwrap();std::fs::set_permissions(&eighth,std::fs::Permissions::from_mode(0o700)).unwrap();let before=directory_names(pin_fd.as_fd(),64).unwrap();let count=guard_admission_census(pin_fd.as_fd(),receipt_fd.as_fd(),uid).unwrap().unresolved.len();assert_eq!(count,MAX_UNRESOLVED_GUARD_LAUNCHES);assert_eq!(directory_names(pin_fd.as_fd(),64).unwrap(),before);
+    fn guard_census_bounds_unresolved_pin_and_receipt_identities_without_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let pins = temp.path().join("pins");
+        let receipts = temp.path().join("receipts");
+        std::fs::create_dir(&pins).unwrap();
+        std::fs::create_dir(&receipts).unwrap();
+        std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&receipts, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for ordinal in 1u64..=7 {
+            let identity = format!("{ordinal:016x}{ordinal:016x}");
+            private_file(
+                &receipts.join(format!("{identity}.terminal.jsonl")),
+                b"retained failure\n",
+            );
+            let pin = pins.join(format!("ug-{ordinal:016x}"));
+            std::fs::create_dir(&pin).unwrap();
+            std::fs::set_permissions(pin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let completed = 17u64;
+        let identity = format!("{completed:016x}{completed:016x}");
+        private_file(&receipts.join(format!("{identity}.terminal.jsonl")),format!("{{\"schema\":1,\"stage\":\"terminal\",\"guard\":{{\"incarnation\":{completed}}}}}\n").as_bytes());
+        private_file(&receipts.join(format!("{identity}.stdout.log")), b"");
+        private_file(&receipts.join(format!("{identity}.stderr.log")), b"");
+        let pin_fd = File::open(&pins).unwrap();
+        let receipt_fd = File::open(&receipts).unwrap();
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(
+            guard_admission_census(pin_fd.as_fd(), receipt_fd.as_fd(), uid)
+                .unwrap()
+                .unresolved
+                .len(),
+            7
+        );
+        let eighth = pins.join("ug-0000000000000008");
+        std::fs::create_dir(&eighth).unwrap();
+        std::fs::set_permissions(&eighth, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = directory_names(pin_fd.as_fd(), 64).unwrap();
+        let count = guard_admission_census(pin_fd.as_fd(), receipt_fd.as_fd(), uid)
+            .unwrap()
+            .unresolved
+            .len();
+        assert_eq!(count, MAX_UNRESOLVED_GUARD_LAUNCHES);
+        assert_eq!(directory_names(pin_fd.as_fd(), 64).unwrap(), before);
     }
-
 }
