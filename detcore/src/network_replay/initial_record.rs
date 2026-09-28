@@ -56,6 +56,14 @@ pub(crate) fn initial_record_call_supported(call: Syscall) -> bool {
                 // and the scheduler consumes that held-generation projection
                 // before either parent or child can publish descriptor state.
                 | Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork
+                // These scalar synchronization and stream operations already
+                // have exact Detcore handlers. Futex and poll join the
+                // scheduler's modeled blocking state; recvfrom joins the
+                // authenticated network physical-effect protocol. Keep sendto
+                // and vectored/message variants refused until their distinct
+                // transmission, guest-memory, and descriptor-transfer joins
+                // are complete.
+                | Sysno::futex | Sysno::poll | Sysno::recvfrom
                 // Neither touches the descriptor table: strict rseq returns
                 // ENOSYS without entering Linux, and readlink reads a path.
                 | Sysno::rseq | Sysno::readlink
@@ -144,6 +152,24 @@ mod tests {
 
         // These neighboring task/table mutations have no native-effect join.
         for number in [Sysno::execve, Sysno::execveat, Sysno::unshare, Sysno::setns] {
+            assert!(!initial_record_call_supported(raw(number)), "{number:?}");
+        }
+    }
+    #[test]
+    fn initial_record_admits_modeled_thread_and_scalar_stream_effects() {
+        for number in [Sysno::futex, Sysno::poll, Sysno::recvfrom] {
+            assert!(initial_record_call_supported(raw(number)), "{number:?}");
+        }
+
+        // Message/vector operations have different guest-memory and descriptor
+        // transfer contracts; the scalar admission must not authorize them.
+        for number in [
+            Sysno::sendto,
+            Sysno::sendmsg,
+            Sysno::recvmsg,
+            Sysno::sendmmsg,
+            Sysno::recvmmsg,
+        ] {
             assert!(!initial_record_call_supported(raw(number)), "{number:?}");
         }
     }
