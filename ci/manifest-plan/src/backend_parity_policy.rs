@@ -1,4 +1,11 @@
-//! The two existing manifest selectors which request ptrace parity.
+//! Exact command bytes for the two backend-parity-c manifest selectors.
+//!
+//! The generator emits only the ordinary spellings: since
+//! https://github.com/rrnewton/hermit/issues/3301 no newly constructed plan
+//! asks the harness for a ptrace reference run, and the generator's invariants
+//! refuse a step that does. The parity spellings stay here only so that
+//! schema-10 plans retained before that change keep reading with the cells and
+//! parity relations they were published with.
 //!
 //! The generator and retained-plan reader share exact command bytes; a reader
 //! never infers execution policy from a substring of an arbitrary shell command.

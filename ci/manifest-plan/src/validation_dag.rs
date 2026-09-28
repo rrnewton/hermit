@@ -1656,6 +1656,22 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 }
 
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
+    // Backend parity is a scored comparison, not a gate
+    // (https://github.com/rrnewton/hermit/issues/3301). No newly constructed
+    // plan asks the harness for a ptrace reference run. Plans retained before
+    // that change stay readable through
+    // `backend_parity_policy::selects_ptrace_parity`, which this check does
+    // not touch.
+    if let Some(step) = cfg
+        .steps
+        .iter()
+        .find(|step| step.cmd.contains("--parity-reference"))
+    {
+        return Err(format!(
+            "{} passes --parity-reference; backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)",
+            step.tag()
+        ));
+    }
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
@@ -2882,26 +2898,29 @@ sys.exit(37)
     }
 
     #[test]
-    fn parity_activation_preserves_the_two_existing_mixed_bucket_selectors() {
-        let dag = generate(&repo_root().unwrap()).unwrap();
-        let parity = dag
-            .steps
-            .iter()
-            .filter(|step| step.cmd.contains("--parity-reference"))
-            .collect::<Vec<_>>();
+    fn new_plans_never_request_a_ptrace_parity_reference() {
+        let root = repo_root().unwrap();
+        let dag = generate(&root).unwrap();
         assert_eq!(
-            parity
+            dag.steps
                 .iter()
-                .map(|step| format!("{}.{}", step.group, step.job))
+                .filter(|step| step.cmd.contains("--parity-reference"))
+                .map(|step| step.tag())
                 .collect::<Vec<_>>(),
-            [
-                "e2e.manifest_backend_parity_c",
-                "e2e.manifest_backend_parity_c_on_host"
-            ]
+            Vec::<String>::new(),
+            "https://github.com/rrnewton/hermit/issues/3301 removed the ptrace reference run from every generated step"
         );
-        for step in parity {
-            assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 1);
-            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results"));
+        // The two former parity selectors keep their population, width and
+        // resources; only the reference flag is gone.
+        let selectors = [
+            "e2e.manifest_backend_parity_c",
+            "e2e.manifest_backend_parity_c_on_host",
+        ];
+        for tag in selectors {
+            let step = dag.steps.iter().find(|step| step.tag() == tag).unwrap();
+            assert!(step.cmd.contains(
+                "--category backend-parity-c --ci-only --allow-empty --prebuilt --results"
+            ));
             assert_eq!(step.jobs_flag.as_deref(), Some("--jobs"));
             assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             let selector = step.manifest.as_ref().unwrap();
@@ -2912,6 +2931,29 @@ sys.exit(37)
             assert_eq!(selector.backend, None);
             assert_eq!(step.hint.resources.get("manifest_guest"), Some(&8));
             assert!(!step.cmd.contains("--probe-disabled"));
+        }
+        // A planted reference flag on either selector is refused by the
+        // generator's own invariants, with the reason named.
+        let cells = expected_cells(&root).unwrap();
+        assert_invariants(&dag, &cells).unwrap();
+        for tag in selectors {
+            let mut planted = dag.clone();
+            let step = planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            assert_eq!(step.cmd.matches("--prebuilt --results").count(), 1);
+            step.cmd = step.cmd.replace(
+                "--prebuilt --results",
+                "--prebuilt --parity-reference ptrace --results",
+            );
+            assert_eq!(
+                assert_invariants(&planted, &cells).unwrap_err(),
+                format!(
+                    "{tag} passes --parity-reference; backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
+                )
+            );
         }
     }
 
