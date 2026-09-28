@@ -35,7 +35,8 @@ const READBACK: &str = "hermit-unix-readback";
 const MAX_UNRESOLVED_GUARD_LAUNCHES: usize = 8;
 const GUARD_BOUNDED_PIN_PREFIX: &str = "ugb1-";
 const GUARD_LEGACY_PIN_PREFIX: &str = "ug-";
-pub(crate) const GUARD_BOUNDED_RECEIPT_PREFIX: &str = "guard-b1-";
+#[doc(hidden)]
+pub const GUARD_BOUNDED_RECEIPT_PREFIX: &str = "guard-b1-";
 
 #[derive(Deserialize)]
 struct Contract {

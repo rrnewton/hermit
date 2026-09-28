@@ -26,6 +26,7 @@ use hermit::Error;
 use hermit::SerializableError;
 use hermit::unix_guard::GuardOutcome;
 use hermit::unix_guard::prepare_guard;
+use hermit::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX;
 use hermit::unix_guard_package::GuardDeploymentRoots;
 use hermit::unix_guard_package::PackagedUnixGuard;
 use hermit::unix_guard_terminal::GuardDrainEvidence;
@@ -929,24 +930,15 @@ fn run_owned(
             let unit = format!("hermit-unix-{identity}.service");
             let mut evidence = receipt_file(
                 &roots.writable_paths[1],
-                &format!(
-                    "{}{identity}.terminal.jsonl",
-                    crate::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX
-                ),
+                &format!("{}{identity}.terminal.jsonl", GUARD_BOUNDED_RECEIPT_PREFIX),
             )?;
             let stdout = receipt_file(
                 &roots.writable_paths[1],
-                &format!(
-                    "{}{identity}.stdout.log",
-                    crate::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX
-                ),
+                &format!("{}{identity}.stdout.log", GUARD_BOUNDED_RECEIPT_PREFIX),
             )?;
             let stderr = receipt_file(
                 &roots.writable_paths[1],
-                &format!(
-                    "{}{identity}.stderr.log",
-                    crate::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX
-                ),
+                &format!("{}{identity}.stderr.log", GUARD_BOUNDED_RECEIPT_PREFIX),
             )?;
             emit(
                 &mut evidence,
