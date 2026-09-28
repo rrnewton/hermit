@@ -13,6 +13,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -460,6 +461,20 @@ fn acceptance_evidence_directory() -> (Option<tempfile::TempDir>, PathBuf) {
     (Some(temporary), path)
 }
 
+fn accepted_recovery_argument(evidence: &Path) -> String {
+    let path = evidence.join("accepted-recovery");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "create private accepted-provider recovery directory {}: {error}",
+                path.display()
+            )
+        });
+    format!("--network-accepted-recovery={}", path.display())
+}
+
 #[test]
 fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
     super::network_boundary::initialize("tcp");
@@ -467,6 +482,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     let fixture = &super::workload("c_network_replay_tcp_bracket").path;
     let (_temporary_evidence, evidence) = acceptance_evidence_directory();
     let trace = evidence.join("network.trace");
+    let accepted_recovery = accepted_recovery_argument(&evidence);
 
     // Policy 1: deterministic execution without a trace cannot touch even the
     // waiting loopback controller. This also proves that refusal is prompt.
@@ -491,6 +507,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     fs::create_dir(&record_directory).expect("create record controller directory");
     let (controller, port) = Controller::start(fixture, &record_directory);
     let mut record_arguments = common_run_arguments(0, 1_000_000);
+    record_arguments.push(accepted_recovery.clone());
     record_arguments.push(format!("--record-networking={}", trace.display()));
     let recorded = safehermit_command(
         &evidence,
@@ -517,6 +534,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
         let report = evidence.join(format!("{label}.verify.json"));
         let mut arguments = common_run_arguments(*seed, *max_timeslice);
         arguments.extend([
+            accepted_recovery.clone(),
             "--verify".into(),
             "--verify-strict".into(),
             "--keep-logs".into(),
@@ -547,6 +565,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     // A changed outbound byte must terminate replay instead of consulting the
     // network or silently accepting a different request stream.
     let mut mismatch_arguments = common_run_arguments(0, 1_000_000);
+    mismatch_arguments.push(accepted_recovery.clone());
     mismatch_arguments.push(format!("--replay-networking={}", trace.display()));
     let mismatch = safehermit_command(
         &evidence,
@@ -565,6 +584,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     // guest can attempt the fresh host connection.
     let missing_trace = evidence.join("missing.trace");
     let mut missing_arguments = common_run_arguments(0, 1_000_000);
+    missing_arguments.push(accepted_recovery);
     missing_arguments.push(format!("--replay-networking={}", missing_trace.display()));
     let missing = safehermit_command(
         &evidence,
