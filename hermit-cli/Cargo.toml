@@ -20,10 +20,14 @@ crate-type = ["rlib", "cdylib"]
 # in-crate dispatch code.
 [features]
 default = []
+# Native controls exercise real KVM ownership/RPC helpers without a VM.
+kvm-native-test-support = ["reverie-kvm/native-test-support"]
 dbt = ["dep:detcore-dbt", "dep:reverie-dbt"]
 sabre = []
 e9patch = []
 third-party-backends = ["dbt", "sabre", "e9patch"]
+# Hardware qualification selected only by the existing KVM validation nodes.
+kvm-execution-tests = []
 
 [dependencies]
 anyhow = "1.0.103"
