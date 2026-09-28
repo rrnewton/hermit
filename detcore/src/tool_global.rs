@@ -4410,13 +4410,14 @@ mod tests {
         scheduler.runqueue_push_back(dettid);
     }
 
-    // Exercise the real external registration method and global RPC without a
-    // backend or a guest process. Any unexpected guest operation fails the test.
+    // Exercise external registration and post-exec through the real global RPC
+    // without a backend or guest process. Unexpected guest operations fail.
     struct ExternalRegistrationGuest<'a> {
         global: &'a GlobalState,
         config: &'a Config,
         thread: crate::ThreadState<()>,
         requests: Mutex<Vec<GlobalRequest>>,
+        post_exec: bool,
     }
 
     struct ExternalRegistrationStack;
@@ -4484,6 +4485,11 @@ mod tests {
             None
         }
 
+        fn auxv(&self) -> reverie::Auxv {
+            assert!(self.post_exec, "external registration must not read auxv");
+            reverie::Auxv::from_entries([])
+        }
+
         fn memory(&self) -> Self::Memory {
             panic!("external registration must not access guest memory")
         }
@@ -4497,7 +4503,13 @@ mod tests {
         }
 
         async fn regs(&mut self) -> libc::user_regs_struct {
-            panic!("external registration must not read guest registers")
+            assert!(
+                self.post_exec,
+                "external registration must not read guest registers"
+            );
+            // SAFETY: every field is an integer register word. Post-exec hooks
+            // may log these synthetic registers but never execute them.
+            unsafe { std::mem::zeroed() }
         }
 
         async fn stack(&mut self) -> Self::Stack {
@@ -4755,6 +4767,7 @@ mod tests {
             config: &config,
             thread,
             requests: Mutex::new(Vec::new()),
+            post_exec: false,
         };
         let child = DetTid::from_raw(18);
         let exit_signal = if flags.contains(CloneFlags::CLONE_THREAD) {
@@ -5787,6 +5800,84 @@ mod tests {
             GlobalResponse::MarkPastFirstExecve(fd_blocking)
         );
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_exec_deletes_armed_disarmed_and_non_notifying_timers() {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            // This test enters one callback while the caller owns its turn;
+            // no guest instructions or PMU timer are needed to drive it.
+            max_timeslice: None,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let leader = DetTid::from_raw(17);
+        let detpid = DetPid::from_raw(17);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(leader, leader, true);
+        let next_request = Ivar::new();
+        install_test_registration(&state, leader, next_request.clone());
+        let tool = Detcore::new(reverie::Pid::from_raw(leader.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(leader.as_raw()), None);
+        thread.detpid = Some(detpid);
+        thread.thread_logical_time.add_syscall_with_cost(137);
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: true,
+        };
+        let t = LogicalTime::from_nanos;
+        let [periodic, disarmed, silent] = {
+            let mut timers = guest.thread.posix_timers.lock().unwrap();
+            let periodic = timers.create(Some(libc::SIGUSR2));
+            let disarmed = timers.create(Some(libc::SIGALRM));
+            let silent = timers.create(None);
+            timers.settime(periodic, 50, Some(t(100)), t(0));
+            timers.settime(silent, 0, Some(t(200)), t(0));
+            [periodic, disarmed, silent]
+        };
+
+        // Drive the production callback, including its actual global RPCs.
+        // Removing its clear_for_exec call must leave these IDs live and fail.
+        // A second successful exec also exercises deletion of an empty table.
+        for _ in 0..2 {
+            let old_mm = guest.thread.mm_id;
+            super::prepare_exec(&mut guest, old_mm, Default::default()).await;
+            guest.thread.mm_id = old_mm.for_exec(detpid);
+            let before = guest.thread.thread_logical_time.as_nanos();
+            tokio::time::timeout(Duration::from_secs(2), tool.handle_post_exec(&mut guest))
+                .await
+                .expect("post-exec must finish within the caller's scheduler turn")
+                .unwrap();
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), before);
+            assert!(
+                next_request.try_read().is_none(),
+                "post-exec unexpectedly yielded"
+            );
+            let mut timers = guest.thread.posix_timers.lock().unwrap();
+            for id in [periodic, disarmed, silent] {
+                assert!(!timers.contains(id), "post-exec retained POSIX timer {id}");
+                assert_eq!(timers.gettime(id, t(10)), None);
+                assert_eq!(timers.settime(id, 0, Some(t(300)), t(10)), None);
+                assert_eq!(timers.signal(id), None);
+                assert!(!timers.remove(id));
+            }
+        }
+        let mut timers = guest.thread.posix_timers.lock().unwrap();
+        let new = timers.create(Some(libc::SIGUSR1));
+        assert_eq!(new, 3);
+        assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
+        assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
     }
 
     #[tokio::test]

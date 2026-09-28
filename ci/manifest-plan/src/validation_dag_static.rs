@@ -228,7 +228,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
     // controls retain all 783 prior identities.
-    // Five exec POSIX timer lifecycle controls retain all 797 prior identities.
+    // Five exec POSIX timer lifecycle tests retain all 797 prior identities.
     ("test.detcore_unit", 802),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
