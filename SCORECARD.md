@@ -73,4 +73,4 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Run history
 
-Detailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history.
+Detailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history. The ledger's [scorecard/SCORECARD.md](https://github.com/rrnewton/hermit_test_ledger/blob/main/scorecard/SCORECARD.md) opens with when it was last regenerated and which validate run it came from. This catalogue carries no run timestamp: it is regenerated when the manifest or plan changes, not when a validate run lands.

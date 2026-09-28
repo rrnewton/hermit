@@ -335,7 +335,7 @@ fn decode_catalogue(bytes: &[u8]) -> Result<TrackedCells, String> {
 }
 
 fn catalogue_history_notice() -> &'static str {
-    "\n## Run history\n\nDetailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history.\n"
+    "\n## Run history\n\nDetailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history. The ledger's [scorecard/SCORECARD.md](https://github.com/rrnewton/hermit_test_ledger/blob/main/scorecard/SCORECARD.md) opens with when it was last regenerated and which validate run it came from. This catalogue carries no run timestamp: it is regenerated when the manifest or plan changes, not when a validate run lands.\n"
 }
 
 /// Declares that `observations` are a DERIVED PROJECTION, not the source of
@@ -3372,10 +3372,16 @@ fn run() -> Result<(), String> {
         "show" => {
             no_more(&mut args)?;
             let derived = derive(&root)?;
-            print!("{}", render_scorecard(&derived));
-            if let Some(mut tracked) = load_existing(&root)? {
-                refresh_measurement(&mut tracked);
-                print!("{}", render_measurement_section(&tracked));
+            match load_existing(&root)? {
+                Some(mut tracked) => {
+                    refresh_measurement(&mut tracked);
+                    print!(
+                        "{}",
+                        with_regeneration_notice(render_scorecard(&derived), &tracked)
+                    );
+                    print!("{}", render_measurement_section(&tracked));
+                }
+                None => print!("{}", render_scorecard(&derived)),
             }
             print!("{}", render_evidence_coverage(&root)?);
         }
@@ -5720,11 +5726,12 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
         compare_file(&root.join(CELLS), &encoded_catalogue(&cells)?)?;
     } else {
         // Read the old checked-in generation until its exact archive is verified.
+        // The same bytes `generated_files` writes, notice included.
         compare_file(
             &root.join(SCORECARD),
             &format!(
                 "{}{}",
-                render_scorecard(&derived),
+                with_regeneration_notice(render_scorecard(&derived), &cells),
                 render_measurement_section(&cells)
             ),
         )?;
@@ -8499,12 +8506,134 @@ fn generated_files(derived: &Derived, tracked: &TrackedCells) -> Result<Generate
     Ok(GeneratedFiles {
         scorecard: format!(
             "{}{}",
-            render_scorecard(derived),
+            with_regeneration_notice(render_scorecard(derived), tracked),
             render_measurement_section(tracked)
         )
         .into_bytes(),
         cells: encoded_cells(tracked)?.into_bytes(),
     })
+}
+
+const SCORECARD_TITLE: &str = "# Compatibility scorecard\n\n";
+
+/// Most validate runs named individually in the regeneration notice; the rest
+/// are counted. A projection normally binds a handful of runs.
+const REGENERATION_NOTICE_RUNS: usize = 8;
+
+/// Put [`render_regeneration_notice`] directly under the title, where a reader
+/// of the ledger scorecard sees it first.
+fn with_regeneration_notice(scorecard: String, tracked: &TrackedCells) -> String {
+    let notice = render_regeneration_notice(tracked);
+    if notice.is_empty() {
+        return scorecard;
+    }
+    match scorecard.strip_prefix(SCORECARD_TITLE) {
+        Some(rest) => format!("{SCORECARD_TITLE}{notice}{rest}"),
+        None => format!("{notice}{scorecard}"),
+    }
+}
+
+/// The ledger scorecard's first paragraph: when it was last regenerated, from
+/// which ledger commit, and which validate run it came from.
+///
+/// Owner directive 2026-09-28: the scorecard carries a last-regenerated
+/// timestamp and the validate run it came from. Every value is read from the
+/// `projection` recorded in `scorecard/cells.json`, so rendering the same
+/// cells.json again reproduces these bytes exactly; nothing here reads the
+/// clock or the network.
+///
+/// "The validate run it came from" is the run whose comparison bindings were
+/// captured from the same series tree this projection read
+/// (`snapshot.tree == projection.source_tree`): the ledger publisher appends
+/// one validate run's rows and then regenerates, so that run is the one this
+/// regeneration published. Measured on ledger 7d28c1f: 1030 bindings from
+/// `validate-buck-validate-cargo-5ee668223a15-...` share the projection's
+/// series tree 81b15087; two older runs (1029 each, current) and one retained
+/// run (348) still supply other comparisons, and are listed separately.
+///
+/// The Hermit catalogue (`SCORECARD.md` in the Hermit tree) has no projection
+/// and renders no notice: it changes when the manifest changes, not when a
+/// validate run lands, so a timestamp there would not describe any run.
+fn render_regeneration_notice(tracked: &TrackedCells) -> String {
+    let Some(projection) = tracked.projection.as_ref() else {
+        return String::new();
+    };
+    let repository = projection
+        .source_repository
+        .as_deref()
+        .unwrap_or(projection.source.as_str());
+    let source = match projection.source_commit.as_deref() {
+        Some(commit) => format!("`{repository}` commit `{commit}`"),
+        None => format!("`{repository}` (commit not recorded)"),
+    };
+    let mut out = format!(
+        "Last regenerated **{}** from {source}, reading {} series row(s).",
+        projection.refreshed_at, projection.rows_read
+    );
+    let mut newest: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut others: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for binding in projection
+        .comparison_attempt_bindings_v1
+        .iter()
+        .flat_map(|bindings| bindings.bindings.iter())
+        .filter(|binding| binding.provenance == ObservationProvenance::Validate)
+    {
+        let in_snapshot = projection.source_tree.as_deref() == Some(binding.snapshot.tree.as_str());
+        if in_snapshot {
+            *newest.entry(binding.run_id.as_str()).or_default() += 1;
+        } else {
+            let kind = match binding.kind {
+                AttemptBindingKind::Current => "current",
+                AttemptBindingKind::Retained => "retained",
+            };
+            *others.entry((binding.run_id.as_str(), kind)).or_default() += 1;
+        }
+    }
+    let list = |runs: Vec<(String, usize)>| -> String {
+        let mut runs = runs;
+        runs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total = runs.len();
+        let mut named = runs
+            .into_iter()
+            .take(REGENERATION_NOTICE_RUNS)
+            .map(|(label, count)| format!("{label} ({count})"))
+            .collect::<Vec<_>>();
+        if total > REGENERATION_NOTICE_RUNS {
+            named.push(format!("and {} more", total - REGENERATION_NOTICE_RUNS));
+        }
+        named.join(", ")
+    };
+    if projection.source_tree.is_none() {
+        out.push_str(
+            " The projection does not record its series tree, so the validate run it came from \
+cannot be identified.",
+        );
+    } else if newest.is_empty() {
+        out.push_str(" No validate run's comparisons were captured from this series snapshot.");
+    } else {
+        out.push_str(&format!(
+            " Validate run published in this series snapshot, with its cell comparisons: {}.",
+            list(
+                newest
+                    .into_iter()
+                    .map(|(run, count)| (format!("`{run}`"), count))
+                    .collect()
+            )
+        ));
+    }
+    if !others.is_empty() {
+        out.push_str(&format!(
+            " Earlier validate runs still supplying comparisons: {}.",
+            list(
+                others
+                    .into_iter()
+                    .map(|((run, kind), count)| (format!("`{run}` {kind}"), count))
+                    .collect()
+            )
+        ));
+    }
+    out.push_str("\n\n");
+    out
 }
 
 fn write_observation_files(
@@ -29653,5 +29782,185 @@ mod command_ledger_identity_scope_tests {
         fs::remove_dir(&ledger).unwrap();
         fs::rename(&held, &ledger).unwrap();
         assert!(verified(&ledger));
+    }
+}
+
+#[cfg(test)]
+mod regeneration_notice_tests {
+    use super::*;
+
+    const TREE: &str = "81b15087598ba3bfc3069a9b26f80d445ece03b8";
+    const OLDER_TREE: &str = "2222222222222222222222222222222222222222";
+
+    fn binding(
+        test: &str,
+        run_id: &str,
+        tree: &str,
+        kind: AttemptBindingKind,
+    ) -> ComparisonAttemptBinding {
+        ComparisonAttemptBinding {
+            cell: CellId {
+                lane: "portable".into(),
+                category: "c-programs".into(),
+                test: test.into(),
+                mode: "verify".into(),
+                backend: "ptrace".into(),
+            },
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: "5".repeat(40),
+            detcore_tree: "4".repeat(40),
+            run_id: run_id.into(),
+            evidence_sha256: "6".repeat(64),
+            attempt: 1,
+            result: ObservedResult::Pass,
+            kind,
+            producer_hermit_sha: "4".repeat(40),
+            input: AttemptBindingInput {
+                file_sha256: "a".repeat(64),
+                file_bytes: 1,
+                line: 1,
+                row_sha256: "b".repeat(64),
+            },
+            snapshot: AttemptBindingSnapshot {
+                repository: TEST_LEDGER_REPOSITORY.into(),
+                source: "series".into(),
+                commit: "6af85b80566730f212cf6c7a550d409cc27ae782".into(),
+                tree: tree.into(),
+                rows_sha256: "c".repeat(64),
+            },
+            events: Vec::new(),
+        }
+    }
+
+    fn tracked(source_tree: Option<&str>, bindings: Vec<ComparisonAttemptBinding>) -> TrackedCells {
+        TrackedCells {
+            schema: SCHEMA,
+            projection: Some(ObservationProjection {
+                source: "series".into(),
+                source_repository: Some(TEST_LEDGER_REPOSITORY.into()),
+                source_commit: Some("48faf973c125ed12ffa9beaa66e78e394ac06c7d".into()),
+                source_tree: source_tree.map(str::to_owned),
+                refreshed_at: "2026-09-28T09:16:36Z".into(),
+                rows_read: 96721,
+                pre_series_corpus: true,
+                comparison_attempt_bindings_v1: Some(ComparisonAttemptBindings {
+                    schema: 1,
+                    authority: ATTEMPT_BINDING_AUTHORITY.into(),
+                    bindings,
+                    retired_canonical_comparisons: Vec::new(),
+                    retired_backend_parity_comparisons: Vec::new(),
+                }),
+            }),
+            cells: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_notice_names_the_timestamp_ledger_commit_and_the_run_in_this_snapshot() {
+        // The live ledger 7d28c1f shape, reduced: the run appended in the
+        // projection's own series tree, an older current run, a retained run.
+        let cells = tracked(
+            Some(TREE),
+            vec![
+                binding(
+                    "c-programs/a",
+                    "run-newest",
+                    TREE,
+                    AttemptBindingKind::Current,
+                ),
+                binding(
+                    "c-programs/b",
+                    "run-newest",
+                    TREE,
+                    AttemptBindingKind::Current,
+                ),
+                binding(
+                    "c-programs/a",
+                    "run-older",
+                    OLDER_TREE,
+                    AttemptBindingKind::Current,
+                ),
+                binding(
+                    "c-programs/c",
+                    "run-retained",
+                    OLDER_TREE,
+                    AttemptBindingKind::Retained,
+                ),
+            ],
+        );
+        let notice = render_regeneration_notice(&cells);
+        assert_eq!(
+            notice,
+            "Last regenerated **2026-09-28T09:16:36Z** from \
+`https://github.com/rrnewton/hermit_test_ledger.git` commit \
+`48faf973c125ed12ffa9beaa66e78e394ac06c7d`, reading 96721 series row(s). \
+Validate run published in this series snapshot, with its cell comparisons: `run-newest` (2). \
+Earlier validate runs still supplying comparisons: `run-older` current (1), \
+`run-retained` retained (1).\n\n"
+        );
+        // Rendering the same cells.json twice is byte-identical: nothing reads
+        // the clock, so a re-render cannot manufacture a diff.
+        assert_eq!(render_regeneration_notice(&cells), notice);
+        // It sits directly under the title.
+        let placed = with_regeneration_notice(format!("{SCORECARD_TITLE}body\n"), &cells);
+        assert_eq!(placed, format!("{SCORECARD_TITLE}{notice}body\n"));
+    }
+
+    #[test]
+    fn the_notice_says_when_the_run_cannot_be_identified_instead_of_guessing() {
+        let bindings = vec![binding(
+            "c-programs/a",
+            "run-older",
+            OLDER_TREE,
+            AttemptBindingKind::Current,
+        )];
+        let unrecorded = render_regeneration_notice(&tracked(None, bindings.clone()));
+        assert!(
+            unrecorded.contains("does not record its series tree"),
+            "{unrecorded}"
+        );
+        assert!(
+            !unrecorded.contains("published in this series snapshot"),
+            "{unrecorded}"
+        );
+        let none_in_snapshot = render_regeneration_notice(&tracked(Some(TREE), bindings));
+        assert!(
+            none_in_snapshot
+                .contains("No validate run's comparisons were captured from this series snapshot."),
+            "{none_in_snapshot}"
+        );
+        assert!(
+            none_in_snapshot.contains("`run-older` current (1)"),
+            "{none_in_snapshot}"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_without_a_projection_renders_no_notice() {
+        let catalogue = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: Vec::new(),
+        };
+        assert_eq!(render_regeneration_notice(&catalogue), "");
+        let body = format!("{SCORECARD_TITLE}body\n");
+        assert_eq!(with_regeneration_notice(body.clone(), &catalogue), body);
+    }
+
+    #[test]
+    fn a_long_run_list_names_the_largest_runs_and_counts_the_rest() {
+        let mut bindings = Vec::new();
+        for index in 0..(REGENERATION_NOTICE_RUNS + 3) {
+            bindings.push(binding(
+                &format!("c-programs/t{index}"),
+                &format!("run-{index:02}"),
+                OLDER_TREE,
+                AttemptBindingKind::Current,
+            ));
+        }
+        let notice = render_regeneration_notice(&tracked(Some(TREE), bindings));
+        assert!(notice.contains("and 3 more."), "{notice}");
+        assert!(notice.contains("`run-00` current (1)"), "{notice}");
+        assert!(!notice.contains("`run-10`"), "{notice}");
     }
 }
