@@ -9,9 +9,13 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+#[path = "common/readonly_proc.rs"]
+mod readonly_proc;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -28,6 +32,7 @@ use reverie::process::Namespace;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const RUNS: usize = 5;
+const FORCE_READONLY_PROC_ENV: &str = "HERMIT_CHROOT_FORCE_READONLY_PROC";
 // The fixed accounting expectations below use this explicit fractional input.
 // Other procfs probes continue to exercise the ordinary host-captured default.
 const ACCOUNTING_EPOCH: &str = "2026-01-01T00:00:00.123456789Z";
@@ -1174,6 +1179,32 @@ fn fdinfo_mount_ids_match_mountinfo_without_aliasing() {
 }
 
 #[test]
+fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent_with_readonly_proc() {
+    let mut command = Command::new(std::env::current_exe().expect("find test binary"));
+    command
+        .args([
+            "--exact",
+            "chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+            "--nocapture",
+        ])
+        .env(FORCE_READONLY_PROC_ENV, "1");
+    // SAFETY: Only this child's descendants inherit the filter; installation
+    // uses async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(readonly_proc::deny_writable_mounts);
+    }
+    let output = command
+        .output()
+        .expect("run chroot mountinfo test with writable mounts denied");
+    assert!(
+        output.status.success(),
+        "chroot mountinfo test failed with writable mounts denied:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
     const INNER: &str = "HERMIT_CHROOT_MOUNTINFO_SUBSET_INNER";
     if std::env::var_os(INNER).is_none() {
@@ -1205,6 +1236,13 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
     }
 
     let _guard = hermit_run_lock();
+    if std::env::var_os(FORCE_READONLY_PROC_ENV).is_some() {
+        readonly_proc::assert_readonly_proc(
+            &fs::read_to_string("/proc/mounts").expect("read restricted namespace mounts"),
+            &fs::read_to_string("/proc/self/status").expect("read restricted namespace status"),
+            1,
+        );
+    }
     let root = tempfile::tempdir().expect("create chroot");
     let build = tempfile::tempdir().expect("create guest build directory");
     let controller_program = build.path().join("chroot-mountinfo-fdinfo");
@@ -1235,6 +1273,19 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         MsFlags::empty(),
         None::<&str>,
     )
+    .or_else(|error| match error {
+        // Mount::mount is private to Reverie. This fixture must mount in its
+        // current namespace before capturing identities, so mirror its opt-in
+        // policy here: retry only a denied fresh proc mount, read-only.
+        nix::errno::Errno::EPERM => mount(
+            Some("proc"),
+            &proc_target,
+            Some("proc"),
+            MsFlags::MS_RDONLY,
+            None::<&str>,
+        ),
+        error => Err(error),
+    })
     .expect("mount procfs inside chroot");
 
     let captured_mount_ids =
