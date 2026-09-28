@@ -9,12 +9,29 @@
 
 set -euo pipefail
 
-if (($# != 1)); then
-    echo "usage: $0 FIXTURE_ROOT" >&2
+if (($# < 1 || $# > 2)) || { (($# == 2)) && [[ $2 != --pinned-toolchain ]]; }; then
+    echo "usage: $0 FIXTURE_ROOT [--pinned-toolchain]" >&2
     exit 2
 fi
 
 readonly FIXTURE_ROOT=$1
+readonly PINNED_TOOLCHAIN=${2:-}
+toolchain_targets=()
+if [[ -n $PINNED_TOOLCHAIN ]]; then
+    # This mode is selected explicitly by the image fixture producer. The
+    # image supplies these tools; never fall back to host rustup or host PATH.
+    for compiler in cargo rustc; do
+        target=$(readlink -f -- "/bin/$compiler") || {
+            echo "compat fixtures: cannot resolve pinned /bin/$compiler" >&2
+            exit 2
+        }
+        if [[ ! -f $target || ! -x $target || ${target##*/} == rustup ]]; then
+            echo "compat fixtures: pinned /bin/$compiler is not an executable toolchain target" >&2
+            exit 2
+        fi
+        toolchain_targets+=("$target")
+    done
+fi
 rm -rf "$FIXTURE_ROOT"
 mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov" \
     "$FIXTURE_ROOT/lsof" "$FIXTURE_ROOT/df" "$FIXTURE_ROOT/toolchain"
@@ -27,8 +44,13 @@ cp "$PWD/README.md" "$FIXTURE_ROOT/README.md"
 # `--base-env=minimal` deliberately excludes the user's rustup directory. The
 # cargo workload still needs the active toolchain, so expose exactly cargo and
 # rustc through this run-owned fixture rather than passing through the host PATH.
-ln -s "$(rustup which cargo)" "$FIXTURE_ROOT/toolchain/cargo"
-ln -s "$(rustup which rustc)" "$FIXTURE_ROOT/toolchain/rustc"
+if [[ -n $PINNED_TOOLCHAIN ]]; then
+    ln -s "${toolchain_targets[0]}" "$FIXTURE_ROOT/toolchain/cargo"
+    ln -s "${toolchain_targets[1]}" "$FIXTURE_ROOT/toolchain/rustc"
+else
+    ln -s "$(rustup which cargo)" "$FIXTURE_ROOT/toolchain/cargo"
+    ln -s "$(rustup which rustc)" "$FIXTURE_ROOT/toolchain/rustc"
+fi
 
 gcc -O2 -Wall -Wextra -Werror -Wl,--build-id=none \
     "$PWD/tests/compat/localhost_http_server.c" \
