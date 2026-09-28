@@ -107,13 +107,17 @@ struct Controller {
 
 impl Controller {
     fn start(program: &Path, directory: &Path) -> (Self, String) {
+        Self::start_with_mode(program, directory, "controller")
+    }
+
+    fn start_with_mode(program: &Path, directory: &Path, mode: &str) -> (Self, String) {
         let port_path = directory.join("controller.port");
         let contact_path = directory.join("controller.contact");
         let report_path = directory.join("controller.report");
         let child = Command::new("timeout")
             .args(["--kill-after=1s", &format!("{CONTROLLER_WALL_SECONDS}s")])
             .arg(program)
-            .args(["controller"])
+            .arg(mode)
             .arg(&port_path)
             .arg(&report_path)
             .arg(&contact_path)
@@ -158,6 +162,10 @@ impl Controller {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn start_page_backed(program: &Path, directory: &Path) -> (Self, String) {
+        Self::start_with_mode(program, directory, "page-controller")
     }
 
     fn finish(mut self) -> String {
@@ -392,6 +400,28 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     assert_success(&output, "native TCP bracket client");
     assert_guest_invariants(&output.stdout, "native TCP bracket client");
     assert_controller_report(&controller.finish());
+}
+
+#[test]
+fn network_replay_page_backed_fixture_has_the_exact_native_contract() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let evidence = tempfile::tempdir().expect("create native page-backed bracket directory");
+    let (controller, port) = Controller::start_page_backed(fixture, evidence.path());
+    let output = bounded_command(
+        fixture,
+        &[OsStr::new("page-client"), OsStr::new(&port)],
+        NATIVE_CLIENT_WALL_SECONDS,
+    );
+    assert_success(&output, "native page-backed TCP bracket client");
+    assert_eq!(
+        std::str::from_utf8(&output.stdout).unwrap(),
+        "page-bytes=65536 page-fnv1a64=8d8f5f9042a8fd22\n"
+    );
+    assert_eq!(
+        controller.finish(),
+        "page-bytes=65536\npage-fnv1a64=8d8f5f9042a8fd22\n"
+    );
 }
 
 #[test]

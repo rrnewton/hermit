@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -26,6 +27,7 @@
 #include <unistd.h>
 
 #define PAYLOAD_SIZE 3
+#define PAGE_PAYLOAD_SIZE (64 * 1024)
 #define FIXTURE_DEADLINE_SECONDS 8
 #define CONTROLLER_ACCEPT_DEADLINE_SECONDS 30
 
@@ -87,6 +89,25 @@ static void receive_exact(int fd, void *raw, size_t length) {
   }
 }
 
+static void read_exact(int fd, void *raw, size_t length) {
+  char *bytes = raw;
+  while (length != 0) {
+    /* The production private-Read contract deliberately admits at most 512
+     * bytes per exact scalar Call. Multiple calls also force fragment cursor
+     * advancement instead of validating only a fragment's first window. */
+    size_t request = length < 512 ? length : 512;
+    ssize_t received = read(fd, bytes, request);
+    if (received < 0 && errno == EINTR)
+      continue;
+    if (received < 0)
+      fail("read");
+    if (received == 0)
+      fail_message("peer closed before the page-backed input completed");
+    bytes += received;
+    length -= (size_t)received;
+  }
+}
+
 static uint64_t fnv1a64_update(uint64_t digest, const void *raw, size_t length) {
   const unsigned char *bytes = raw;
   for (size_t index = 0; index < length; ++index) {
@@ -101,6 +122,19 @@ static uint64_t expected_outbound_digest(void) {
   digest = fnv1a64_update(digest, REQUEST, sizeof(REQUEST) - 1);
   digest = fnv1a64_update(digest, PROGRESS, sizeof(PROGRESS) - 1);
   return fnv1a64_update(digest, COMPLETION, sizeof(COMPLETION) - 1);
+}
+
+static unsigned char page_payload_byte(size_t index) {
+  return (unsigned char)((index * 131u + index / 251u + 17u) & 0xffu);
+}
+
+static uint64_t page_payload_digest(void) {
+  uint64_t digest = UINT64_C(14695981039346656037);
+  for (size_t index = 0; index < PAGE_PAYLOAD_SIZE; ++index) {
+    unsigned char byte = page_payload_byte(index);
+    digest = fnv1a64_update(digest, &byte, 1);
+  }
+  return digest;
 }
 
 static void publish_text(const char *path, const char *text) {
@@ -206,6 +240,58 @@ static int run_controller(const char *port_path, const char *report_path,
       OUTBOUND_HEX, (unsigned long long)expected_outbound_digest());
   if (report_length <= 0 || (size_t)report_length >= sizeof(report))
     fail_message("controller report did not fit its fixed buffer");
+  publish_text(report_path, report);
+  return 0;
+}
+
+static int run_page_controller(const char *port_path, const char *report_path,
+                               const char *contact_path) {
+  signal(SIGPIPE, SIG_IGN);
+  alarm(CONTROLLER_ACCEPT_DEADLINE_SECONDS);
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listener < 0)
+    fail("socket page controller");
+  struct sockaddr_in address = {
+      .sin_family = AF_INET,
+      .sin_port = htons(0),
+      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+  };
+  if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0)
+    fail("bind page controller");
+  socklen_t address_length = sizeof(address);
+  if (getsockname(listener, (struct sockaddr *)&address, &address_length) != 0)
+    fail("getsockname page controller");
+  if (listen(listener, 1) != 0)
+    fail("listen page controller");
+  char port[32];
+  int port_length = snprintf(port, sizeof(port), "%u\n", ntohs(address.sin_port));
+  if (port_length <= 0 || (size_t)port_length >= sizeof(port))
+    fail_message("page controller port did not fit its publication buffer");
+  publish_text(port_path, port);
+  int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (client < 0)
+    fail("accept page controller");
+  alarm(FIXTURE_DEADLINE_SECONDS);
+  publish_text(contact_path, "accepted\n");
+  set_socket_timeouts(client);
+  close(listener);
+  unsigned char *payload = malloc(PAGE_PAYLOAD_SIZE);
+  if (payload == NULL)
+    fail("malloc page payload");
+  for (size_t index = 0; index < PAGE_PAYLOAD_SIZE; ++index)
+    payload[index] = page_payload_byte(index);
+  send_all(client, payload, PAGE_PAYLOAD_SIZE);
+  free(payload);
+  if (shutdown(client, SHUT_WR) != 0)
+    fail("shutdown page controller");
+  close(client);
+  char report[160];
+  int report_length = snprintf(report, sizeof(report),
+                               "page-bytes=%u\npage-fnv1a64=%016llx\n",
+                               PAGE_PAYLOAD_SIZE,
+                               (unsigned long long)page_payload_digest());
+  if (report_length <= 0 || (size_t)report_length >= sizeof(report))
+    fail_message("page controller report did not fit its fixed buffer");
   publish_text(report_path, report);
   return 0;
 }
@@ -355,9 +441,52 @@ static int run_client(const char *port_text, int mismatch) {
   return 0;
 }
 
+static int run_page_client(const char *port_text) {
+  set_deadline();
+  char *end = NULL;
+  unsigned long parsed = strtoul(port_text, &end, 10);
+  if (end == port_text || *end != '\0' || parsed == 0 || parsed > UINT16_MAX)
+    fail_message("invalid page controller port");
+  int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (socket_fd < 0)
+    fail("socket page client");
+  set_socket_timeouts(socket_fd);
+  struct sockaddr_in address = {
+      .sin_family = AF_INET,
+      .sin_port = htons((uint16_t)parsed),
+      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+  };
+  if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+    fail("connect page client");
+  unsigned char *payload = mmap(NULL, PAGE_PAYLOAD_SIZE, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (payload == MAP_FAILED)
+    fail("mmap page receive");
+  read_exact(socket_fd, payload, PAGE_PAYLOAD_SIZE);
+  for (size_t index = 0; index < PAGE_PAYLOAD_SIZE; ++index) {
+    if (payload[index] != page_payload_byte(index))
+      fail_message("page-backed input changed bytes");
+  }
+  uint64_t digest = fnv1a64_update(UINT64_C(14695981039346656037), payload,
+                                   PAGE_PAYLOAD_SIZE);
+  /* This mode qualifies only the real page-backed byte producer.  The main
+   * protocol retains the independent EOF assertion; do not turn an empty Read
+   * into a substitute for the 64-KiB payload evidence here. */
+  if (munmap(payload, PAGE_PAYLOAD_SIZE) != 0)
+    fail("munmap page receive");
+  close(socket_fd);
+  printf("page-bytes=%u page-fnv1a64=%016llx\n", PAGE_PAYLOAD_SIZE,
+         (unsigned long long)digest);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 5 && strcmp(argv[1], "controller") == 0)
     return run_controller(argv[2], argv[3], argv[4]);
+  if (argc == 5 && strcmp(argv[1], "page-controller") == 0)
+    return run_page_controller(argv[2], argv[3], argv[4]);
+  if (argc == 3 && strcmp(argv[1], "page-client") == 0)
+    return run_page_client(argv[2]);
   if (argc == 4 && strcmp(argv[1], "client") == 0) {
     if (strcmp(argv[3], "match") == 0)
       return run_client(argv[2], 0);
@@ -366,7 +495,8 @@ int main(int argc, char **argv) {
   }
   fprintf(stderr,
           "usage: %s controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
-          "match|mismatch\n",
+          "match|mismatch | page-controller PORT_FILE REPORT_FILE CONTACT_FILE | "
+          "page-client PORT\n",
           argv[0]);
   return 2;
 }
