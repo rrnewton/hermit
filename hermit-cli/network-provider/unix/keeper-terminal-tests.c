@@ -65,7 +65,7 @@ ssize_t __wrap_write(int fd,const void *bytes,size_t size) {
 int __wrap_fdatasync(int fd) {assert(fd==900);return 0;}
 int __wrap_close(int fd) {assert(fd>=200 && fd<UG_MAPS+UG_LINKS+601);return 0;}
 int __wrap_unlinkat(int fd,const char *name,int flags) {
-    if(flags==AT_REMOVEDIR) {assert(fd==902 && !strcmp(name,"ug-test"));dir_present=false;return 0;}
+    if(flags==AT_REMOVEDIR) {assert(fd==902 && !strcmp(name,"ugb1-test"));dir_present=false;return 0;}
     assert(fd==901 && flags==0);int i=slot_name(name);
     if(unlink_error==i+1) {errno=EACCES;return -1;}
     assert(pins[i]);pins[i]=false;unlinks++;return 0;
@@ -75,7 +75,7 @@ int __wrap_fstat(int fd,struct stat *st) {
     st->st_dev=subject.directory_dev;st->st_ino=subject.directory_ino;return 0;
 }
 int __wrap_fstatat(int fd,const char *name,struct stat *st,int flags) {
-    assert(fd==902 && !strcmp(name,"ug-test") && flags==AT_SYMLINK_NOFOLLOW);
+    assert(fd==902 && !strcmp(name,"ugb1-test") && flags==AT_SYMLINK_NOFOLLOW);
     if(dir_present) {memset(st,0,sizeof(*st));st->st_mode=S_IFDIR;
         st->st_dev=subject.directory_dev;st->st_ino=subject.directory_ino;return 0;}
     errno=ENOENT;return -1;
@@ -87,7 +87,7 @@ int bpf_link__destroy(struct bpf_link *p) {
 void bpf_object__close(struct bpf_object *p) {assert(p==(void *)123);object_closed=true;}
 static void fresh(void) {
     memset(&subject,0,sizeof(subject));memset(&status_value,0,sizeof(status_value));
-    subject.record=900;subject.pin_dir=901;subject.pin_root=902;strcpy(subject.directory_name,"ug-test");
+    subject.record=900;subject.pin_dir=901;subject.pin_root=902;strcpy(subject.directory_name,"ugb1-test");
     subject.directory_dev=17;subject.directory_ino=19;
     subject.incarnation=7;subject.creator=30;subject.creator_sequence=9;subject.controller=31;
     subject.prepared=true;subject.object=(void *)123;subject.links_count=UG_LINKS;

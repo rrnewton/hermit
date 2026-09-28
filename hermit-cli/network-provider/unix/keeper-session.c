@@ -175,7 +175,7 @@ int ug_session_open(int elf,int bpffs_root,int recovery_root,u64 incarnation,
     if(fs.f_type!=BPF_FS_MAGIC || !S_ISDIR(roots[0].st_mode) || !S_ISDIR(roots[1].st_mode))return fail(EINVAL);
     /* These roots must be externally owned private locations. Never adopt an
      * existing run directory or follow a preexisting leaf. */
-    char name[32];snprintf(name,sizeof(name),"ug-%016llx",(unsigned long long)incarnation);
+    char name[32];snprintf(name,sizeof(name),"ugb1-%016llx",(unsigned long long)incarnation);
     strcpy(s->directory_name,name);
     s->pin_root=fcntl(bpffs_root,F_DUPFD_CLOEXEC,3);if(s->pin_root<0)return -1;
     s->record=openat(recovery_root,name,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);

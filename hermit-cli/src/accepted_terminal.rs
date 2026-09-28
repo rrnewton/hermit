@@ -1522,6 +1522,13 @@ pub struct AcceptedRecovery {
 /// grouped sibling. Bound those unresolved populations across fresh CLI
 /// processes; completed receipts do not consume this budget.
 const MAX_UNRESOLVED_ACCEPTED_LAUNCHES: usize = 8;
+// The old unbounded protocol used `accepted-<run>.*`. Keep those files as
+// evidence, but never charge them to the first bounded protocol's budget.
+// A future incompatible custody protocol must mint a new prefix rather than
+// deleting or silently reinterpreting retained evidence.
+const ACCEPTED_BOUNDED_PREFIX: &str = "accepted-b1-";
+const ACCEPTED_LEGACY_PREFIX: &str = "accepted-";
+const MAX_ACCEPTED_RECOVERY_ENTRIES: usize = 4096;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptFileIdentity {
@@ -1642,9 +1649,9 @@ fn receipt_label(label: &str) -> io::Result<()> {
 }
 fn receipt_names(label: &str) -> [String; 3] {
     [
-        format!("accepted-{label}.terminal.jsonl"),
-        format!("accepted-{label}.stdout.log"),
-        format!("accepted-{label}.stderr.log"),
+        format!("{ACCEPTED_BOUNDED_PREFIX}{label}.terminal.jsonl"),
+        format!("{ACCEPTED_BOUNDED_PREFIX}{label}.stdout.log"),
+        format!("{ACCEPTED_BOUNDED_PREFIX}{label}.stderr.log"),
     ]
 }
 fn receipt_identity(file: &File) -> io::Result<ReceiptFileIdentity> {
@@ -2871,7 +2878,7 @@ fn accepted_directory_names(
         let name = bytes
             .to_str()
             .map_err(|_| io::Error::other("accepted recovery basename is not UTF-8"))?;
-        if names.len() >= 384 || !names.insert(name.to_owned()) {
+        if names.len() >= MAX_ACCEPTED_RECOVERY_ENTRIES || !names.insert(name.to_owned()) {
             return Err(io::Error::other(
                 "accepted recovery entry population exceeded fixed bound",
             ));
@@ -2882,15 +2889,24 @@ fn accepted_directory_names(
 fn accepted_labels(names: &BTreeSet<String>) -> io::Result<BTreeMap<String, BTreeSet<String>>> {
     let mut labels = BTreeMap::<String, BTreeSet<String>>::new();
     for name in names {
-        let suffix = name
-            .strip_prefix("accepted-")
-            .ok_or_else(|| io::Error::other("unexpected file in accepted recovery root"))?;
+        let (suffix, current) = if let Some(suffix) = name.strip_prefix(ACCEPTED_BOUNDED_PREFIX) {
+            (suffix, true)
+        } else if let Some(suffix) = name.strip_prefix(ACCEPTED_LEGACY_PREFIX) {
+            (suffix, false)
+        } else {
+            return Err(io::Error::other(
+                "unexpected file in accepted recovery root",
+            ));
+        };
         let (label, extension) = suffix
             .split_once('.')
             .ok_or_else(|| io::Error::other("accepted recovery filename lacks role"))?;
         receipt_label(label)?;
         if !matches!(extension, "terminal.jsonl" | "stdout.log" | "stderr.log") {
             return Err(io::Error::other("unexpected accepted recovery file role"));
+        }
+        if !current {
+            continue;
         }
         if !labels
             .entry(label.to_owned())
@@ -2909,7 +2925,16 @@ fn admit_accepted_launch(
 ) -> io::Result<()> {
     let identity = root.identity()?;
     let names = accepted_directory_names(root)?;
-    if names.len().checked_add(3).is_none_or(|count| count > 384) {
+    let labels = accepted_labels(&names)?;
+    let current_entries = labels.values().try_fold(0usize, |total, roles| {
+        total
+            .checked_add(roles.len())
+            .ok_or_else(|| io::Error::other("accepted recovery population overflow"))
+    })?;
+    if current_entries
+        .checked_add(3)
+        .is_none_or(|count| count > 384)
+    {
         return Err(io::Error::other(
             "accepted recovery lacks bounded receipt capacity",
         ));
@@ -2920,7 +2945,7 @@ fn admit_accepted_launch(
         "stderr.log".to_owned(),
     ]);
     let mut unresolved = 0usize;
-    for (label, roles) in accepted_labels(&names)? {
+    for (label, roles) in labels {
         let completed = if roles == complete_roles {
             let terminal = receipt_open(root.directory.as_fd(), &receipt_names(&label)[0], false)?;
             let bytes = receipt_read(&terminal)?;
@@ -2973,7 +2998,12 @@ pub fn validate_accepted_recovery_directory(
         .iter()
         .flat_map(|label| receipt_names(label))
         .collect::<BTreeSet<_>>();
-    if names != declared {
+    let current_names = names
+        .iter()
+        .filter(|name| name.starts_with(ACCEPTED_BOUNDED_PREFIX))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if current_names != declared {
         return Err(io::Error::other(
             "accepted recovery three-file population differs",
         ));
@@ -3257,6 +3287,16 @@ mod recovery_receipt_tests {
     fn accepted_admission_bounds_unresolved_launches_without_deleting_evidence() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Pre-transition evidence remains byte-for-byte present but cannot
+        // exhaust the bounded protocol introduced after it was created.
+        std::fs::write(
+            temp.path().join(format!(
+                "{ACCEPTED_LEGACY_PREFIX}{}.terminal.jsonl",
+                "aa".repeat(16)
+            )),
+            b"legacy retained failure\n",
+        )
+        .unwrap();
         for ordinal in 1..=MAX_UNRESOLVED_ACCEPTED_LAUNCHES {
             let label = format!("{ordinal:032x}");
             std::fs::write(
@@ -3293,7 +3333,7 @@ mod recovery_receipt_tests {
         admitted.initialize(artifact()).unwrap();
         assert_eq!(
             std::fs::read_dir(temp.path()).unwrap().count(),
-            MAX_UNRESOLVED_ACCEPTED_LAUNCHES - 1 + 3
+            MAX_UNRESOLVED_ACCEPTED_LAUNCHES - 1 + 3 + 1
         );
     }
     #[test]

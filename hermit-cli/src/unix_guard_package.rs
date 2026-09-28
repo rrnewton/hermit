@@ -33,6 +33,9 @@ const OBJECT: &str = "unix-guard.bpf.o";
 const HELPER: &str = "hermit-unix-keeper";
 const READBACK: &str = "hermit-unix-readback";
 const MAX_UNRESOLVED_GUARD_LAUNCHES: usize = 8;
+const GUARD_BOUNDED_PIN_PREFIX: &str = "ugb1-";
+const GUARD_LEGACY_PIN_PREFIX: &str = "ug-";
+pub(crate) const GUARD_BOUNDED_RECEIPT_PREFIX: &str = "guard-b1-";
 
 #[derive(Deserialize)]
 struct Contract {
@@ -399,9 +402,13 @@ fn guard_admission_census(
     let receipt_names = directory_names(recovery, 384)?;
     let mut unresolved = BTreeSet::new();
     for name in &pins {
-        let suffix = name
-            .strip_prefix("ug-")
-            .ok_or_else(|| io::Error::other("unexpected Unix guard pin-root entry"))?;
+        let (suffix, current) = if let Some(suffix) = name.strip_prefix(GUARD_BOUNDED_PIN_PREFIX) {
+            (suffix, true)
+        } else if let Some(suffix) = name.strip_prefix(GUARD_LEGACY_PIN_PREFIX) {
+            (suffix, false)
+        } else {
+            return Err(io::Error::other("unexpected Unix guard pin-root entry"));
+        };
         if !exact_hex(suffix, 8) {
             return Err(io::Error::other("Unix guard pin-root identity differs"));
         }
@@ -425,19 +432,30 @@ fn guard_admission_census(
         {
             return Err(io::Error::other("Unix guard pin-root entry shape differs"));
         }
-        unresolved.insert(suffix.to_owned());
+        if current {
+            unresolved.insert(suffix.to_owned());
+        }
     }
     let mut receipts = BTreeMap::<String, BTreeSet<String>>::new();
     for name in &receipt_names {
-        let (identity, role) = name
+        let (raw_identity, role) = name
             .split_once('.')
             .ok_or_else(|| io::Error::other("Unix guard recovery filename lacks role"))?;
+        let (identity, current) =
+            if let Some(identity) = raw_identity.strip_prefix(GUARD_BOUNDED_RECEIPT_PREFIX) {
+                (identity, true)
+            } else {
+                (raw_identity, false)
+            };
         if !exact_hex(identity, 16)
             || !matches!(role, "terminal.jsonl" | "stdout.log" | "stderr.log")
         {
             return Err(io::Error::other(
                 "Unix guard recovery identity or role differs",
             ));
+        }
+        if !current {
+            continue;
         }
         if !receipts
             .entry(identity.to_owned())
@@ -450,14 +468,22 @@ fn guard_admission_census(
     for (identity, roles) in receipts {
         let prefix = &identity[..16];
         let incarnation = u64::from_str_radix(prefix, 16).map_err(io::Error::other)?;
-        let terminal = format!("{identity}.terminal.jsonl");
+        let terminal = format!("{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.terminal.jsonl");
         let complete_roles = roles.len() == 3
             && roles.contains("terminal.jsonl")
             && roles.contains("stdout.log")
             && roles.contains("stderr.log");
         let complete = if complete_roles {
-            guard_receipt_file(recovery, &format!("{identity}.stdout.log"), uid)?;
-            guard_receipt_file(recovery, &format!("{identity}.stderr.log"), uid)?;
+            guard_receipt_file(
+                recovery,
+                &format!("{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.stdout.log"),
+                uid,
+            )?;
+            guard_receipt_file(
+                recovery,
+                &format!("{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.stderr.log"),
+                uid,
+            )?;
             guard_terminal_complete(recovery, &terminal, incarnation, uid)?
         } else {
             false
@@ -798,21 +824,42 @@ mod recovery_root_tests {
         std::fs::create_dir(&receipts).unwrap();
         std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&receipts, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let legacy = 99u64;
+        let legacy_identity = format!("{legacy:016x}{legacy:016x}");
+        private_file(
+            &receipts.join(format!("{legacy_identity}.terminal.jsonl")),
+            b"legacy retained failure\n",
+        );
+        let legacy_pin = pins.join(format!("{GUARD_LEGACY_PIN_PREFIX}{legacy:016x}"));
+        std::fs::create_dir(&legacy_pin).unwrap();
+        std::fs::set_permissions(legacy_pin, std::fs::Permissions::from_mode(0o700)).unwrap();
         for ordinal in 1u64..=7 {
             let identity = format!("{ordinal:016x}{ordinal:016x}");
             private_file(
-                &receipts.join(format!("{identity}.terminal.jsonl")),
+                &receipts.join(format!(
+                    "{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.terminal.jsonl"
+                )),
                 b"retained failure\n",
             );
-            let pin = pins.join(format!("ug-{ordinal:016x}"));
+            let pin = pins.join(format!("{GUARD_BOUNDED_PIN_PREFIX}{ordinal:016x}"));
             std::fs::create_dir(&pin).unwrap();
             std::fs::set_permissions(pin, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let completed = 17u64;
         let identity = format!("{completed:016x}{completed:016x}");
-        private_file(&receipts.join(format!("{identity}.terminal.jsonl")),format!("{{\"schema\":1,\"stage\":\"terminal\",\"guard\":{{\"incarnation\":{completed}}}}}\n").as_bytes());
-        private_file(&receipts.join(format!("{identity}.stdout.log")), b"");
-        private_file(&receipts.join(format!("{identity}.stderr.log")), b"");
+        private_file(&receipts.join(format!("{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.terminal.jsonl")),format!("{{\"schema\":1,\"stage\":\"terminal\",\"guard\":{{\"incarnation\":{completed}}}}}\n").as_bytes());
+        private_file(
+            &receipts.join(format!(
+                "{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.stdout.log"
+            )),
+            b"",
+        );
+        private_file(
+            &receipts.join(format!(
+                "{GUARD_BOUNDED_RECEIPT_PREFIX}{identity}.stderr.log"
+            )),
+            b"",
+        );
         let pin_fd = File::open(&pins).unwrap();
         let receipt_fd = File::open(&receipts).unwrap();
         let uid = unsafe { libc::getuid() };
@@ -823,7 +870,7 @@ mod recovery_root_tests {
                 .len(),
             7
         );
-        let eighth = pins.join("ug-0000000000000008");
+        let eighth = pins.join(format!("{GUARD_BOUNDED_PIN_PREFIX}0000000000000008"));
         std::fs::create_dir(&eighth).unwrap();
         std::fs::set_permissions(&eighth, std::fs::Permissions::from_mode(0o700)).unwrap();
         let before = directory_names(pin_fd.as_fd(), 64).unwrap();

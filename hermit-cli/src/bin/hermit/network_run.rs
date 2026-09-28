@@ -929,10 +929,25 @@ fn run_owned(
             let unit = format!("hermit-unix-{identity}.service");
             let mut evidence = receipt_file(
                 &roots.writable_paths[1],
-                &format!("{identity}.terminal.jsonl"),
+                &format!(
+                    "{}{identity}.terminal.jsonl",
+                    crate::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX
+                ),
             )?;
-            let stdout = receipt_file(&roots.writable_paths[1], &format!("{identity}.stdout.log"))?;
-            let stderr = receipt_file(&roots.writable_paths[1], &format!("{identity}.stderr.log"))?;
+            let stdout = receipt_file(
+                &roots.writable_paths[1],
+                &format!(
+                    "{}{identity}.stdout.log",
+                    crate::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX
+                ),
+            )?;
+            let stderr = receipt_file(
+                &roots.writable_paths[1],
+                &format!(
+                    "{}{identity}.stderr.log",
+                    crate::unix_guard_package::GUARD_BOUNDED_RECEIPT_PREFIX
+                ),
+            )?;
             emit(
                 &mut evidence,
                 serde_json::json!({"schema":1,"stage":"before_launch","incarnation":incarnation,"loader_unit":unit}),
