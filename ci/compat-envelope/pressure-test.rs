@@ -3143,12 +3143,44 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String, String), CellBu
     decode_budgets(&manifest_matrix_json(root, "execution budgets")?)
 }
 
-/// The declared expected guest exit of every verify cell that has one, from the
-/// same typed manifest matrix that supplies execution budgets.
-fn load_expected_exits(
-    root: &Path,
-) -> Result<BTreeMap<(String, String, String), SeriesExpectedExit>, String> {
-    decode_expected_exits(&manifest_matrix_json(root, "declared guest exits")?)
+/// One summarize's typed manifest matrix, produced on first use and then reused.
+///
+/// summarize() needs both the execution budgets (inside the run-contract check)
+/// and the declared expected guest exits from the same matrix. Sharing one
+/// `hermit-manifest-plan --format matrix-json` invocation keeps both decodes on
+/// identical bytes and runs the subprocess once per summarize. The matrix is
+/// loaded lazily so that a run contract refused before its budget check still
+/// does not start the subprocess.
+struct ManifestMatrix<'a> {
+    root: &'a Path,
+    json: Option<Vec<u8>>,
+}
+
+impl<'a> ManifestMatrix<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self { root, json: None }
+    }
+
+    fn json(&mut self) -> Result<&[u8], String> {
+        if self.json.is_none() {
+            self.json = Some(manifest_matrix_json(
+                self.root,
+                "execution budgets and declared guest exits",
+            )?);
+        }
+        Ok(self.json.as_deref().expect("manifest matrix was just loaded"))
+    }
+
+    fn budgets(&mut self) -> Result<BTreeMap<(String, String, String), CellBudget>, String> {
+        decode_budgets(self.json()?)
+    }
+
+    /// The declared expected guest exit of every verify cell that has one.
+    fn expected_exits(
+        &mut self,
+    ) -> Result<BTreeMap<(String, String, String), SeriesExpectedExit>, String> {
+        decode_expected_exits(self.json()?)
+    }
 }
 
 fn manifest_matrix_json(root: &Path, purpose: &str) -> Result<Vec<u8>, String> {
@@ -4656,6 +4688,24 @@ fn validate_run_contract(
     metadata: &RunMetadata,
     allow_dirty_exact_cell: bool,
 ) -> Result<BTreeMap<CellId, bool>, String> {
+    validate_run_contract_with_matrix(
+        root,
+        results,
+        metadata,
+        allow_dirty_exact_cell,
+        &mut ManifestMatrix::new(root),
+    )
+}
+
+/// validate_run_contract(), taking its execution budgets from `matrix` so a
+/// caller that also needs other matrix fields reads the matrix only once.
+fn validate_run_contract_with_matrix(
+    root: &Path,
+    results: &Path,
+    metadata: &RunMetadata,
+    allow_dirty_exact_cell: bool,
+    matrix: &mut ManifestMatrix<'_>,
+) -> Result<BTreeMap<CellId, bool>, String> {
     let cells_file_fields = [
         metadata.cells_file.is_some(),
         metadata.cells_file_sha256.is_some(),
@@ -4923,7 +4973,7 @@ fn validate_run_contract(
     } else if metadata.manifest_guest_cap_explicit || metadata.kvm_guest_cap_explicit {
         return Err("explicit retained guest caps have no observed memory budget".into());
     }
-    let budgets = load_budgets(root)?;
+    let budgets = matrix.budgets()?;
     let budgets = match metadata.timeout_policy {
         Some(policy) => resolve_budgets(budgets, policy, &expected.keys()
             .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
@@ -6590,8 +6640,17 @@ fn summarize(
             metadata.hermit_sha, current
         ));
     }
-    let expected = validate_run_contract(root, results, &metadata, allow_dirty_exact_cell)?;
-    let expected_exits = load_expected_exits(root)?;
+    // One manifest matrix supplies both the run contract's execution budgets
+    // and each verify cell's declared expected guest exit.
+    let mut matrix = ManifestMatrix::new(root);
+    let expected = validate_run_contract_with_matrix(
+        root,
+        results,
+        &metadata,
+        allow_dirty_exact_cell,
+        &mut matrix,
+    )?;
+    let expected_exits = matrix.expected_exits()?;
     let loaded_runner_evidence = if typed_runner_evidence.is_some() {
         None
     } else if let Some(evidence) = load_retained_runner_evidence(results)? {
@@ -15204,6 +15263,212 @@ mod pressure_sample_tests {
         }
 
         cleanup.remove().unwrap();
+    }
+
+    /// Retain `PROMOTION_REPETITIONS` passing repetitions of `cell`, each one
+    /// matched canonical verify attempt whose report records the guest
+    /// disposition `guest` and whose Hermit process ended with `hermit`, then
+    /// run the real summarize() and return its result with summary.json.
+    fn summarize_matched_verify_repetitions(
+        root: &Path,
+        checked: &CheckedScorecard<'_>,
+        cell: &TrackedCell,
+        label: &str,
+        guest: (Option<i32>, Option<i32>),
+        hermit: (Option<i32>, Option<i32>),
+    ) -> (Result<(), String>, JsonValue) {
+        let results = env::temp_dir().join(format!(
+            "hermit-pressure-summary-declared-exit-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&results).unwrap();
+        let cleanup = SelfTestDirectory::new(results.clone());
+        let selection = CellSelection {
+            test: Some(cell.id.test.clone()),
+            mode: Some(cell.id.mode.clone()),
+            backend: Some(cell.id.backend.clone()),
+            repetitions: Some(PROMOTION_REPETITIONS),
+            run_id_prefix: Some(format!("declared-exit-{label}")),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            green: true,
+            ..CellSelection::default()
+        };
+        let (mut metadata, _) =
+            write_plan_after_scorecard_check(checked, &results, &results.join("dag.json"), &selection)
+                .unwrap();
+        metadata.source_tree_dirty = false;
+        fs::write(
+            results.join("run.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let mut inner = declared_exit_attempt(guest, hermit);
+        inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+        let mut evidence = BTreeMap::new();
+        for repetition in 1..=PROMOTION_REPETITIONS {
+            let slug = cell_run_slug(&cell.id, Some(repetition));
+            let run_id =
+                cell_evidence_run_id(&cell.id, Some(repetition), metadata.run_id_prefix.as_deref());
+            let cell_dir = results.join("cells").join(&slug);
+            fs::create_dir_all(&cell_dir).unwrap();
+            fs::write(cell_dir.join("harness-status"), "0\n").unwrap();
+            let artifact = results.join("runs").join(&run_id).join("attempt-1");
+            let logs = artifact.join("verify-logs/verify-1");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
+            fs::write(logs.join("run2_log_fixture.log"), "INFO second\n").unwrap();
+            fs::write(logs.join("normalized-ptrace-golden.log"), "INFO normalized\n").unwrap();
+            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
+            fs::write(
+                verification_report_path(&artifact),
+                inner.verification_report.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut row = history_row(&cell.id.mode, "PASS", 1, vec![inner.clone()]);
+            row.run_id = run_id;
+            row.run_index = Some(repetition as u64);
+            row.hermit_sha = metadata.hermit_sha.clone();
+            row.test = cell.id.test.clone();
+            row.category = cell.id.category.clone();
+            row.lane = cell.id.lane.clone();
+            row.backend = Some(cell.id.backend.clone());
+            row.classification = if cell.is_applicable() {
+                "required"
+            } else {
+                "disabled"
+            }
+            .into();
+            row.argv = inner.argv.clone();
+            row.guest_argv = inner.guest_argv.clone();
+            row.env = inner.env.clone();
+            row.cwd = inner.cwd.clone();
+            row.shell_command = inner.shell_command.clone();
+            row.timeout_seconds = 57;
+            row.execution_cpu_timeout_seconds = Some(22);
+            row.execution_wall_timeout_seconds = Some(57);
+            row.artifact_dir = artifact.to_string_lossy().into_owned();
+            fs::write(
+                cell_dir.join("results.jsonl"),
+                format!("{}\n", serde_json::to_string(&row).unwrap()),
+            )
+            .unwrap();
+            evidence.insert(
+                format!("cell.{slug}"),
+                RunnerEvidence {
+                    seen: true,
+                    ok: true,
+                    ..RunnerEvidence::default()
+                },
+            );
+        }
+        let outcome = summarize(root, &results, false, Some(&evidence), true);
+        let summary: JsonValue =
+            serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap();
+        cleanup.remove().unwrap();
+        (outcome, summary)
+    }
+
+    #[test]
+    fn summary_qualifies_nonzero_matched_evidence_only_for_the_manifest_declared_cell() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let checked = check_scorecard(&root).unwrap();
+        // All three declared cells are green on ptrace, so draw both the
+        // declared cell and its control from the green population.
+        let available = pressure_cells(
+            &root,
+            &CellSelection {
+                green: true,
+                repetitions: Some(PROMOTION_REPETITIONS),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap();
+        let declared_exits =
+            decode_expected_exits(&manifest_matrix_json(&root, "declared guest exits").unwrap())
+                .unwrap();
+        let key = |cell: &TrackedCell| {
+            (
+                cell.id.test.clone(),
+                cell.id.mode.clone(),
+                cell.id.backend.clone(),
+            )
+        };
+        // The real manifest declares util-c/pmu-skid's verify cell to exit 3.
+        let declared = available
+            .selected
+            .iter()
+            .find(|cell| {
+                cell.id.test == "util-c/pmu-skid"
+                    && cell.id.mode == "verify"
+                    && cell.id.backend == "ptrace"
+            })
+            .expect("the green population selects util-c/pmu-skid verify ptrace");
+        assert_eq!(
+            declared_exits.get(&key(declared)),
+            Some(&SeriesExpectedExit::Code(3))
+        );
+        // Any other green ptrace verify cell that declares nothing is the control.
+        let undeclared = available
+            .selected
+            .iter()
+            .find(|cell| {
+                cell.id.mode == "verify"
+                    && cell.id.backend == "ptrace"
+                    && !declared_exits.contains_key(&key(cell))
+            })
+            .expect("the green population selects an undeclared ptrace verify cell");
+
+        // Byte-identical evidence: the report and Hermit both end with code 3.
+        let exit3 = (Some(3), None);
+        let (outcome, summary) = summarize_matched_verify_repetitions(
+            &root, &checked, declared, "declared", exit3, exit3,
+        );
+        outcome.unwrap();
+        let cell = &summary["repeated_cells"][0];
+        assert_eq!(cell["cell"]["test"], "util-c/pmu-skid", "{summary}");
+        assert_eq!(cell["passes"], PROMOTION_REPETITIONS, "{summary}");
+        assert_eq!(cell["qualifying_passes"], PROMOTION_REPETITIONS, "{summary}");
+        assert_eq!(cell["unknown_history_repetitions"], 0, "{summary}");
+
+        let (_, summary) = summarize_matched_verify_repetitions(
+            &root, &checked, undeclared, "undeclared", exit3, exit3,
+        );
+        let cell = &summary["repeated_cells"][0];
+        assert_eq!(cell["cell"]["test"], undeclared.id.test.as_str(), "{summary}");
+        assert_eq!(cell["passes"], PROMOTION_REPETITIONS, "{summary}");
+        assert_eq!(cell["qualifying_passes"], 0, "{summary}");
+        assert_eq!(
+            cell["unknown_history_repetitions"], PROMOTION_REPETITIONS,
+            "{summary}"
+        );
+        assert!(
+            summary.to_string().contains(
+                "pressure_evidence matched report contradicts its inner process disposition"
+            ),
+            "{summary}"
+        );
+
+        // A declared cell still refuses a code other than the declared one.
+        let exit4 = (Some(4), None);
+        let (_, summary) = summarize_matched_verify_repetitions(
+            &root, &checked, declared, "declared-wrong-code", exit4, exit4,
+        );
+        let cell = &summary["repeated_cells"][0];
+        assert_eq!(cell["cell"]["test"], "util-c/pmu-skid", "{summary}");
+        assert_eq!(cell["qualifying_passes"], 0, "{summary}");
     }
 
     #[test]
