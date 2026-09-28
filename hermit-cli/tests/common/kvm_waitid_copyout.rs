@@ -386,12 +386,171 @@ fn assert_ignored_signal_trace(log: &[u8], stdout: &[u8]) {
     );
 }
 
+fn assert_sibling_observations(stdout: &[u8], direction: &str, selector: &str, consume: &str) {
+    let text = std::str::from_utf8(stdout).expect("complete sibling fixture UTF-8");
+    assert!(text.ends_with('\n'));
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("complete sibling JSON observation"))
+        .collect();
+    let fault = consume == "efault";
+    assert_eq!(rows.len(), if fault { 11 } else { 10 });
+    let summary = rows.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["direction"], direction);
+    assert_eq!(summary["selector"], selector);
+    assert_eq!(summary["consume"], consume);
+    assert_eq!(summary["calls"], 9);
+    assert_eq!(summary["passed"], true);
+    let leader = summary["leader"].as_u64().unwrap();
+    let worker = summary["worker"].as_u64().unwrap();
+    let child = summary["child"].as_u64().unwrap();
+    assert!(leader > 0 && worker > 0 && child > 0);
+    assert!(leader != worker && leader != child && worker != child);
+    let (creator, waiter) = if direction == "leader-child" {
+        (leader, worker)
+    } else {
+        (worker, leader)
+    };
+    let calls: Vec<_> = rows[..rows.len() - 1]
+        .iter()
+        .filter(|row| row["type"] == "wait")
+        .collect();
+    assert_eq!(calls.len(), 9);
+    let names = [
+        if direction == "leader-child" {
+            "creator leader proves readiness before pthread_create"
+        } else {
+            "creator worker proves child waitability"
+        },
+        "sibling owner restriction leaves child intact",
+        "first sibling peek values and padding",
+        "repeated sibling peek values and padding",
+        if fault {
+            "usage fault precedes every info store"
+        } else {
+            "sibling consumption values and padding"
+        },
+        "exact child consumed once",
+        "all children consumed once",
+        "exact child consumed once",
+        "all children consumed once",
+    ];
+    let flags = [0x1000004_u64, 0x21000004, 0x1000004, 0x1000004, 4, 5, 5, 5, 5];
+    let uid = u32::try_from(calls[0]["uid"].as_u64().unwrap()).unwrap();
+    for (index, row) in calls.iter().enumerate() {
+        assert_eq!(row["name"], names[index]);
+        assert_eq!(row["child"].as_u64(), Some(child));
+        assert_eq!(row["uid"].as_u64(), Some(u64::from(uid)));
+        assert_eq!(row["options"].as_u64(), Some(flags[index]));
+        let owner_call = index == 0 || index >= 7;
+        assert_eq!(
+            row["tid"].as_u64(),
+            Some(if owner_call { creator } else { waiter })
+        );
+        let all = match index {
+            0 | 5 | 7 => false,
+            6 | 8 => true,
+            _ => selector == "all",
+        };
+        assert_eq!(row["which"], if all { 0 } else { 1 });
+        let error = if index == 1 || index >= 5 {
+            libc::ECHILD
+        } else if index == 4 && fault {
+            libc::EFAULT
+        } else {
+            0
+        };
+        assert_eq!(row["errno"], error);
+        assert_eq!(row["rc"], if error == 0 { 0 } else { -1 });
+        assert_eq!(row["before"], "a5".repeat(160));
+        let mut expected = [0xa5_u8; 160];
+        if !(index == 4 && fault) {
+            let fields = if error == 0 {
+                [
+                    libc::SIGCHLD as u32,
+                    0,
+                    libc::CLD_EXITED as u32,
+                    u32::try_from(child).unwrap(),
+                    uid,
+                    73,
+                ]
+            } else {
+                [0; 6]
+            };
+            for (offset, value) in [0, 4, 8, 16, 20, 24].into_iter().zip(fields) {
+                expected[16 + offset..20 + offset].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(320);
+        for byte in expected {
+            encoded.push(HEX[usize::from(byte >> 4)] as char);
+            encoded.push(HEX[usize::from(byte & 15)] as char);
+        }
+        assert_eq!(row["after"], encoded, "entire caller arena at row {index}");
+    }
+    if fault {
+        let usage = &rows[5];
+        assert_eq!(usage["type"], "usage");
+        let before = usage["before"].as_str().unwrap();
+        assert!((8192..=131072).contains(&before.len()));
+        assert_eq!(before.len() % 2, 0);
+        assert!(before.as_bytes().chunks_exact(2).all(|pair| pair == b"a5"));
+        assert_eq!(usage["after"], before);
+        assert!(
+            rows[..5]
+                .iter()
+                .chain(rows[6..10].iter())
+                .all(|row| row["type"] == "wait")
+        );
+    } else {
+        assert!(rows[..9].iter().all(|row| row["type"] == "wait"));
+    }
+}
+
 pub(super) fn run(mode: &str) {
     let (expected, children) = match mode {
         "terminal" => (TERMINAL_CASES, 23),
         "errors" => (ERROR_CASES, 5),
         _ => panic!("unknown waitid fixture mode"),
     };
+    run_fixture(
+        mode,
+        "kvm_waitid_copyout.c",
+        &[mode],
+        |stdout| assert_observations(stdout, mode, expected, children),
+        |full_log, stdout| {
+            if mode == "errors" {
+                assert_ignored_signal_trace(full_log, stdout);
+            }
+        },
+    );
+}
+
+pub(super) fn run_sibling(direction: &str, selector: &str, consume: &str) {
+    assert!(matches!(direction, "leader-child" | "worker-child"));
+    assert!(matches!(selector, "pid" | "all"));
+    assert!(matches!(consume, "success" | "efault"));
+    let mode = format!("sibling-{direction}-{selector}-{consume}");
+    run_fixture(
+        &mode,
+        "kvm_waitid_sibling.c",
+        &[direction, selector, consume],
+        |stdout| assert_sibling_observations(stdout, direction, selector, consume),
+        |_, _| {},
+    );
+}
+
+// Shared compile, resource bounds and complete typed verification. The callers
+// retain their own additional guest assertions; none replaces the policy below.
+fn run_fixture(
+    mode: &str,
+    fixture_name: &str,
+    guest_args: &[&str],
+    check_stdout: impl Fn(&[u8]),
+    check_log: impl Fn(&[u8], &[u8]),
+) {
     let _lock = super::hermit_run_guard();
     // One shared deadline includes fixture compilation and the two-guest
     // verification, inside the existing 57-second outer test timeout.
@@ -411,7 +570,9 @@ pub(super) fn run(mode: &str) {
         "KVM waitid copyout artifacts retained at {}",
         root.display()
     );
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kvm_waitid_copyout.c");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture_name);
     fs::copy(&fixture, root.join("guest.c")).expect("retain exact fixture source");
     let guest = root.join("program");
     let compile = root.join("compile");
@@ -448,7 +609,7 @@ pub(super) fn run(mode: &str) {
     let logs = directory.join("verify-logs");
     fs::create_dir_all(&logs).unwrap();
     let report_path = directory.join("verification.json");
-    let args = [
+    let mut args = vec![
         "--log=info",
         "run",
         "--base-env=minimal",
@@ -467,8 +628,8 @@ pub(super) fn run(mode: &str) {
         "--env=TZ=UTC",
         "--",
         guest.to_str().unwrap(),
-        mode,
     ];
+    args.extend_from_slice(guest_args);
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
     let remaining = deadline
@@ -477,7 +638,7 @@ pub(super) fn run(mode: &str) {
     let status = bounded_command_with_timeout(&mut command, &directory, remaining);
     assert_eq!(status.code(), Some(0), "both guests must actually succeed");
     let stdout = bounded_read(&directory.join("stdout"), 64 * MIB);
-    assert_observations(&stdout, mode, expected, children);
+    check_stdout(&stdout);
     let report = VerificationReport::from_current_json_slice(&bounded_read(&report_path, 16 * MIB))
         .expect("complete current typed verification report");
     report
@@ -536,9 +697,7 @@ pub(super) fn run(mode: &str) {
         assert_eq!(paths.len(), 1, "one retained full log per actual guest");
         let full_log = bounded_read(&paths[0], 64 * MIB);
         assert!(!full_log.is_empty());
-        if mode == "errors" {
-            assert_ignored_signal_trace(&full_log, &stdout);
-        }
+        check_log(&full_log, &stdout);
     }
     assert!(
         Instant::now() < deadline,
