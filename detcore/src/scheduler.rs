@@ -616,6 +616,10 @@ pub struct Scheduler {
     /// releases virtual-time-gated input and observes readiness; it never
     /// consumes bytes on behalf of a thread.
     network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
+    /// Fixed when the engine is installed, before scheduling starts. Sampling
+    /// under the global-time mutex must not acquire the engine mutex in the
+    /// reverse order of network publication (engine, then global time).
+    network_capture_uses_host_time: bool,
     /// Shared existing stream publication notification; no separate queue.
     fd_read_changed: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -3175,6 +3179,7 @@ impl Scheduler {
             committed_time: Default::default(),
             blocked: Default::default(),
             network_engine: None,
+            network_capture_uses_host_time: true,
             fd_read_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             fd_read_test_cut: Default::default(),
@@ -3238,6 +3243,9 @@ impl Scheduler {
             self.network_engine.is_none(),
             "network engine installed twice"
         );
+        self.network_capture_uses_host_time = engine
+            .as_ref()
+            .is_none_or(|engine| engine.lock().unwrap().mode() != NetworkEngineMode::Replay);
         self.network_engine = engine;
     }
 
@@ -6625,18 +6633,22 @@ impl Scheduler {
     }
 
     /// Capture is an external input boundary: only its genuinely idle elapsed
-    /// intervals enter virtual time. Replay uses recorded release times and
-    /// never starts this clock. An explicit sample also makes exact boundary
-    /// tests possible without sleeps or timing tolerances.
+    /// intervals enter virtual time. Replay uses recorded release times instead
+    /// of host elapsed time, including when it must perform a local original
+    /// effect such as close. Keep its idle marker until that effect completes:
+    /// it also prevents empty-queue maintenance from fast-forwarding timers.
+    /// An explicit sample permits exact tests without sleeps or tolerances.
     fn sample_network_capture_clock(&mut self, time: &mut GlobalTime, now: Instant) {
         for (tid, operation) in &self.network_capture_blockers {
             assert_eq!(self.blocked.external_io_blockers.get(tid), Some(operation));
         }
         if let Some(previous) = self.network_capture_idle_since.take() {
-            time.add_extra_time(
-                now.checked_duration_since(previous)
-                    .expect("monotonic network capture clock went backwards"),
-            );
+            let elapsed = now
+                .checked_duration_since(previous)
+                .expect("monotonic network capture clock went backwards");
+            if self.network_capture_uses_host_time {
+                time.add_extra_time(elapsed);
+            }
         }
         if self.network_capture_is_idle() {
             self.network_capture_idle_since = Some(now);
@@ -9626,6 +9638,55 @@ mod test {
         );
         assert!(scheduler.network_capture_blockers.is_empty());
         assert!(scheduler.network_capture_idle_since.is_none());
+    }
+
+    #[test]
+    fn replay_physical_effect_wait_never_imports_host_elapsed_time() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let trace = NetworkReplayEngine::record(config.epoch)
+            .into_recorded_versioned_trace()
+            .unwrap();
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let replay = NetworkReplayEngine::replay_from_reader(std::io::Cursor::new(bytes)).unwrap();
+        scheduler.set_network_engine(Some(Arc::new(Mutex::new(replay))));
+        let mut time = GlobalTime::new(&config);
+        let initial = time.as_nanos();
+        let tid = DetTid::from_raw(103);
+        let operation = start_test_network_capture(&mut scheduler, tid);
+        let start = Instant::now();
+        scheduler.sample_network_capture_clock(&mut time, start);
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_secs(30));
+        assert_eq!(time.as_nanos(), initial);
+        assert!(scheduler.network_capture_idle_since.is_some());
+
+        let mut continuation = Resources::new(tid);
+        continuation.insert(
+            ResourceID::BlockedExternalContinue(operation),
+            Permission::RW,
+        );
+        scheduler
+            .next_turns
+            .get(&tid)
+            .unwrap()
+            .req
+            .put(Ok(continuation.clone()));
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(tid));
+        assert!(scheduler.network_capture_blockers.is_empty());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        scheduler.sample_network_capture_clock(&mut time, start + Duration::from_secs(60));
+        assert_eq!(time.as_nanos(), initial);
+        assert!(scheduler.network_capture_idle_since.is_none());
+
+        // The host wait contributes no replay time, but completed scheduler
+        // work must still contribute its ordinary deterministic time quantum.
+        let expected = GlobalTime::new(&config).add_scheduler_time();
+        let global = Mutex::new(time);
+        scheduler.bump_global_time(&global, &Ok(continuation));
+        assert_eq!(global.lock().unwrap().as_nanos(), expected);
+        assert!(expected > initial);
     }
 
     #[test]
