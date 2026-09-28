@@ -238,8 +238,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The fractional-boot /proc/uptime and round-up sysinfo(2) uptime
     // regressions retain all 797 prior identities.
     // The fixed-boot-instant /proc/stat btime regression retains all 799 prior
-    // identities (`cargo nextest list` measured 800).
-    ("test.detcore_unit", 800),
+    // identities.
+    // The every-representable-offset btime regression and the btime-only-for-
+    // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
+    // measured 802).
+    ("test.detcore_unit", 802),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -268,7 +271,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 800),
+    ("test.detcore_unit_on_host", 802),
     // The host variant selects the same two additional clock_determinism tests.
     ("test.hermit_integration_on_host", 170),
     ("test.hermit_unit_on_host", 750),

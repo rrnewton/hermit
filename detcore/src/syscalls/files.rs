@@ -1289,7 +1289,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         let contents = self.snapshot_procfs(guest, call).await?;
         let virtual_uptime_seconds = self.calculate_procfs_uptime(guest).await?;
-        let virtual_boot_time_seconds = self.calculate_procfs_boot_time()?;
+        // Only `/proc/stat` renders btime. Computing it for every snapshot let
+        // an unrepresentable boot instant refuse unrelated files such as
+        // `/proc/uptime`.
+        let needs_boot_time = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_boot_time())?;
+        let virtual_boot_time_seconds = needs_boot_time
+            .then(|| self.calculate_procfs_boot_time())
+            .transpose()?;
         let virtual_realtime_seconds = i64::try_from(thread_observe_time(guest).await.as_secs())
             .map_err(|_| Errno::EOVERFLOW)?;
         // TODO-HUMAN-REVIEW(PR-863): Use configured guest memory for meminfo.

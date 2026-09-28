@@ -108,13 +108,16 @@ fn procfs_uptime_seconds(
 /// Derive it from the boot instant itself, never as `floor(now) - uptime`: for
 /// a fractional boot those two floors round independently, so ordinary
 /// elapsed time would move `btime` back and forth by one second.
+///
+/// Config accepts every u64 offset, and an offset above `i64::MAX` can still
+/// place the boot instant inside time64_t. Subtract in i128, where every such
+/// difference is exact, and range-check only the result. `None` means the
+/// boot instant itself precedes `i64::MIN` seconds.
 fn procfs_boot_time_seconds(
     boot: crate::types::LogicalTime,
     uptime_offset_seconds: u64,
 ) -> Option<i64> {
-    i64::try_from(boot.as_secs())
-        .ok()?
-        .checked_sub(i64::try_from(uptime_offset_seconds).ok()?)
+    i64::try_from(i128::from(boot.as_secs()) - i128::from(uptime_offset_seconds)).ok()
 }
 
 fn prlimit_targets_current_process(
@@ -421,6 +424,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Whole-second `/proc/stat` `btime`, fixed for the life of the run.
+    ///
+    /// `EOVERFLOW` only when the boot instant precedes `i64::MIN` seconds.
+    /// Only snapshots that render `btime` may ask, so that refusal stays
+    /// local to `/proc/stat`.
     pub(super) fn calculate_procfs_boot_time(&self) -> Result<i64, Error> {
         procfs_boot_time_seconds(
             crate::types::DetTime::new(&self.cfg).as_nanos(),
@@ -684,6 +691,30 @@ mod tests {
             )
         );
 
+        assert_eq!(procfs_boot_time_seconds(boot, u64::MAX), None);
+    }
+
+    #[test]
+    fn procfs_boot_time_is_exact_for_every_offset_whose_result_fits() {
+        // Config accepts every u64 offset. 2026-01-01T00:00:00Z minus 2^63 s
+        // is -9223372035087550208, which time64_t represents even though the
+        // offset alone exceeds i64::MAX.
+        let boot = LogicalTime::from_secs(1_767_225_600);
+        assert_eq!(procfs_boot_time_seconds(boot, 0), Some(1_767_225_600));
+        assert_eq!(
+            procfs_boot_time_seconds(boot, 1 << 63),
+            Some(-9_223_372_035_087_550_208)
+        );
+        // The result, not the offset, bounds the domain: exactly i64::MIN is
+        // representable and one second earlier is not.
+        assert_eq!(
+            procfs_boot_time_seconds(boot, 1_767_225_600 + (1 << 63)),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            procfs_boot_time_seconds(boot, 1_767_225_600 + (1 << 63) + 1),
+            None
+        );
         assert_eq!(procfs_boot_time_seconds(boot, u64::MAX), None);
     }
 

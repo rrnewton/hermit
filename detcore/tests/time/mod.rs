@@ -107,6 +107,54 @@ fn proc_stat_btime_is_fixed_for_a_fractional_epoch() {
     );
 }
 
+/// Config accepts every u64 `sysinfo_uptime_offset`. An offset of 2^63 still
+/// places the boot instant inside time64_t (2026-01-01 minus 2^63 s is
+/// -9223372035087550208), so `/proc/stat` must render it exactly, and files
+/// that never show `btime`, such as `/proc/uptime` and `/proc/meminfo`, must
+/// not depend on it at all. Only a boot instant below `i64::MIN` seconds is
+/// unrepresentable, and that refuses `/proc/stat` alone.
+#[test]
+fn procfs_reads_accept_every_uptime_offset() {
+    const EPOCH_SECONDS: u64 = 1_767_225_600;
+    for (offset, expected_btime) in [
+        (120, Some(1_767_225_480)),
+        (1 << 63, Some(-9_223_372_035_087_550_208)),
+        (EPOCH_SECONDS + (1 << 63), Some(i64::MIN)),
+        (EPOCH_SECONDS + (1 << 63) + 1, None),
+    ] {
+        let config = detcore::Config {
+            virtualize_time: true,
+            epoch: "2026-01-01T00:00:00Z".parse().unwrap(),
+            sysinfo_uptime_offset: offset,
+            ..Default::default()
+        };
+        check_fn_with_config::<Detcore, _>(
+            move || {
+                // Logical time starts at the epoch, and the guest has used far
+                // less than a second of it by this first read.
+                let uptime = std::fs::read_to_string("/proc/uptime").unwrap();
+                assert_eq!(uptime, format!("{offset}.00 0.00\n"));
+                let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+                assert!(meminfo.starts_with("MemTotal:"), "{meminfo:?}");
+                let stat = std::fs::read_to_string("/proc/stat");
+                match expected_btime {
+                    Some(expected) => {
+                        let stat = stat.unwrap();
+                        let line = stat
+                            .lines()
+                            .find(|line| line.starts_with("btime "))
+                            .unwrap();
+                        assert_eq!(line["btime ".len()..].parse::<i64>().unwrap(), expected);
+                    }
+                    None => assert_eq!(stat.unwrap_err().raw_os_error(), Some(libc::EOVERFLOW)),
+                }
+            },
+            config,
+            true,
+        );
+    }
+}
+
 #[test]
 fn tod_is_stable() {
     let config = detcore::Config {
