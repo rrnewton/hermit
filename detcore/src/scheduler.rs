@@ -13908,6 +13908,19 @@ mod initial_native_root_tests {
                 .map_err(std::io::Error::other)
         })
     }
+    fn activate_replay(
+        sched: &mut Scheduler,
+        engine: &mut NetworkReplayEngine,
+        association: &InitialTableAssociation,
+        claim: &InitialTableClaim,
+        pin: &OwnedFd,
+    ) -> std::io::Result<()> {
+        sched.admit_initial_native_root(association, pin, None, |logical| {
+            engine
+                .admit_initial_replay_census(association, claim, logical)
+                .map_err(std::io::Error::other)
+        })
+    }
     #[test]
     fn owned_initial_record_census_activates_both_capabilities_at_one_commit() {
         let (mut sched, _, association, claim, pin) = fixture(false);
@@ -14041,17 +14054,47 @@ mod initial_native_root_tests {
         );
     }
     #[test]
-    fn owned_initial_record_census_refuses_v4_replay_without_partial_activation() {
-        let (mut sched, _, association, claim, pin) = fixture(false);
-        let mut engine = NetworkReplayEngine::replay_native_receive(
+    fn owned_initial_replay_census_authenticates_v2_v3_and_v4_without_changing_trace_mode() {
+        let epoch = chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+        let v2 = NetworkReplayEngine::record(epoch)
+            .into_recorded_versioned_trace()
+            .unwrap();
+        let v3 = NetworkReplayEngine::record_shadow(epoch)
+            .into_recorded_versioned_trace()
+            .unwrap();
+        let v4 = detcore_model::network_trace::NetworkTrace::V4(
             NetworkReplayEngine::controlled_replay_two_row_trace(),
+        );
+        for trace in [v2, v3, v4] {
+            let (mut sched, _, association, claim, pin) = fixture(false);
+            let mut engine = NetworkReplayEngine::replay_versioned(trace).unwrap();
+            let mode = engine.mode();
+            let accepted = engine.accepted_mode();
+            activate_replay(&mut sched, &mut engine, &association, &claim, &pin).unwrap();
+            assert!(engine.fd_table_capability());
+            assert_eq!(engine.mode(), mode);
+            assert_eq!(engine.accepted_mode(), accepted);
+            assert_eq!(
+                engine.fd_table_fixture_files(association.owner()),
+                Some(crate::types::FilesId::initial(association.owner().thread))
+            );
+        }
+    }
+
+    #[test]
+    fn owned_initial_replay_census_refuses_changed_claim_without_partial_activation() {
+        let (mut sched, _, association, mut claim, pin) = fixture(false);
+        let trace = NetworkReplayEngine::record(
+            chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
         )
+        .into_recorded_versioned_trace()
         .unwrap();
+        let mut engine = NetworkReplayEngine::replay_versioned(trace).unwrap();
+        claim.through_generation += 1;
         let retained = snapshot(&sched, &engine);
-        assert!(activate(&mut sched, &mut engine, &association, &claim, &pin).is_err());
+        assert!(activate_replay(&mut sched, &mut engine, &association, &claim, &pin).is_err());
         assert_eq!(snapshot(&sched, &engine), retained);
         assert!(!engine.fd_table_capability());
-        assert!(!engine.accepted_mode());
     }
 
     #[test]

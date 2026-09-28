@@ -3120,6 +3120,14 @@ impl GlobalTool for GlobalState {
                                                         claim,
                                                         process,
                                                     )
+                                                } else if engine.mode()
+                                                    == crate::network_replay::NetworkEngineMode::Replay
+                                                {
+                                                    engine.admit_initial_replay_census(
+                                                        association,
+                                                        claim,
+                                                        process,
+                                                    )
                                                 } else {
                                                     engine.admit_initial_record_census(
                                                         association,

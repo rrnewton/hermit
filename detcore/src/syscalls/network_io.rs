@@ -1014,8 +1014,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         NetworkConnectionResultV2::Error(errno),
                     ))) => break errno_result(errno),
                     NetworkReply::Connection(None) => {
-                        self.wait_for_network(guest, open_file, NetworkWaitKind::Readable)
-                            .await;
+                        self.wait_for_network(
+                            guest,
+                            open_file,
+                            NetworkWaitKind::Readable,
+                            call.signal_interrupt_errno(),
+                        )
+                        .await?;
                     }
                     reply => {
                         break Err(engine_error(format!("unexpected connect reply {reply:?}")));
@@ -2345,7 +2350,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         nonblocking: bool,
     ) -> Result<i64, Error> {
         let outcome = self
-            .replay_stream_receive(guest, open_file, call.len(), nonblocking)
+            .replay_stream_receive(
+                guest,
+                open_file,
+                call.len(),
+                nonblocking,
+                0,
+                call.signal_interrupt_errno(),
+            )
             .await?;
         match outcome {
             NetworkStreamReceive::Bytes(bytes) => {
@@ -2479,7 +2491,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             NetworkPolicy::Replay => {
                 let outcome = self
-                    .replay_stream_receive(guest, open_file, maximum, nonblocking)
+                    .replay_stream_receive(
+                        guest,
+                        open_file,
+                        maximum,
+                        nonblocking,
+                        0,
+                        call.signal_interrupt_errno(),
+                    )
                     .await?;
                 match outcome {
                     NetworkStreamReceive::Bytes(bytes) => {
@@ -2537,6 +2556,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 timeout,
                 remaining_address: None,
             },
+            call.signal_interrupt_errno(),
             policy,
         )
         .await
@@ -2568,6 +2588,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 timeout,
                 remaining_address: call.timeout().map(|address| address.as_raw()),
             },
+            call.signal_interrupt_errno(),
             policy,
         )
         .await
@@ -2578,6 +2599,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         live_call: Syscall,
         state: NetworkPollState,
+        interrupt_errno: Errno,
         policy: NetworkPolicy,
     ) -> Result<i64, Error> {
         if self.shadow_mode(guest).await? {
@@ -2685,7 +2707,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         },
                         Permission::R,
                     );
-                    resource_request(guest, resources).await;
+                    resources.set_signal_interrupt_errno(interrupt_errno);
+                    if matches!(
+                        resource_request(guest, resources).await,
+                        ResumeStatus::Signaled(_)
+                    ) {
+                        return Err(interrupt_errno.into());
+                    }
                 }
             }
             NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
@@ -2739,7 +2767,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     SelectTimeoutAddress::Timeval(address.as_raw())
                 }),
         )?;
-        self.network_select_common(guest, call.into(), state, policy)
+        self.network_select_common(guest, call.into(), state, Errno::EINTR, policy)
             .await
     }
 
@@ -2772,7 +2800,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     SelectTimeoutAddress::Timespec(address.as_raw())
                 }),
         )?;
-        self.network_select_common(guest, call.into(), state, policy)
+        self.network_select_common(guest, call.into(), state, Errno::EINTR, policy)
             .await
     }
 
@@ -2781,6 +2809,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         live_call: Syscall,
         state: NetworkSelectState,
+        interrupt_errno: Errno,
         policy: NetworkPolicy,
     ) -> Result<i64, Error> {
         if self.shadow_mode(guest).await? {
@@ -2907,7 +2936,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         },
                         Permission::R,
                     );
-                    resource_request(guest, resources).await;
+                    resources.set_signal_interrupt_errno(interrupt_errno);
+                    if matches!(
+                        resource_request(guest, resources).await,
+                        ResumeStatus::Signaled(_)
+                    ) {
+                        return Err(interrupt_errno.into());
+                    }
                 }
             }
             NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
@@ -2947,11 +2982,51 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "stream recvfrom with source-address output is not yet representable",
             ));
         }
-        let read = syscalls::Read::new()
-            .with_fd(call.fd())
-            .with_buf(call.buf())
-            .with_len(call.len());
-        self.network_read(guest, read, policy, false).await
+        let nonblocking = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.is_nonblocking())?;
+        match policy {
+            NetworkPolicy::Record => {
+                // Execute the actual recvfrom so message flags retain their
+                // Linux meaning.  The Read-shaped value below is only a local
+                // description of the scalar output buffer for trace capture.
+                let result = self.live_network_syscall(guest, call.into()).await;
+                let read = syscalls::Read::new()
+                    .with_fd(call.fd())
+                    .with_buf(call.buf())
+                    .with_len(call.len());
+                self.capture_scalar_network_read(guest, open_file, read, &result)
+                    .await?;
+                result
+            }
+            NetworkPolicy::Replay => {
+                let outcome = self
+                    .replay_stream_receive(
+                        guest,
+                        open_file,
+                        call.len(),
+                        nonblocking,
+                        call.flags(),
+                        call.signal_interrupt_errno(),
+                    )
+                    .await?;
+                match outcome {
+                    NetworkStreamReceive::Bytes(bytes) => {
+                        if !bytes.is_empty() {
+                            guest
+                                .memory()
+                                .write_exact(call.buf().ok_or(Errno::EFAULT)?, &bytes)?;
+                        }
+                        Ok(bytes.len() as i64)
+                    }
+                    NetworkStreamReceive::EndOfFile => Ok(0),
+                    NetworkStreamReceive::Error(errno) => errno_result(errno),
+                    NetworkStreamReceive::WouldBlock => Err(Errno::EAGAIN.into()),
+                    NetworkStreamReceive::Pending => unreachable!(),
+                }
+            }
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
     }
 
     async fn network_sendto<G: Guest<Self>>(
@@ -3123,6 +3198,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         open_file: OpenFileId,
         maximum: usize,
         nonblocking: bool,
+        flags: i32,
+        interrupt_errno: Errno,
     ) -> Result<NetworkStreamReceive, Error> {
         loop {
             let now = thread_observe_time(guest).await;
@@ -3135,7 +3212,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     open_file,
                     maximum,
                     nonblocking,
-                    flags: 0,
+                    flags,
                     receive_low_water: 1,
                 },
             )
@@ -3143,8 +3220,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .map_err(engine_rpc_error)?
             {
                 NetworkReply::StreamReceive(NetworkStreamReceive::Pending) => {
-                    self.wait_for_network(guest, open_file, NetworkWaitKind::Readable)
-                        .await;
+                    self.wait_for_network(
+                        guest,
+                        open_file,
+                        NetworkWaitKind::Readable,
+                        interrupt_errno,
+                    )
+                    .await?;
                 }
                 NetworkReply::StreamReceive(outcome) => return Ok(outcome),
                 reply => return Err(engine_error(format!("unexpected receive reply {reply:?}"))),
@@ -3157,10 +3239,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         open_file: OpenFileId,
         kind: NetworkWaitKind,
-    ) {
+        interrupt_errno: Errno,
+    ) -> Result<(), Error> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::NetworkWait { open_file, kind }, Permission::R);
-        resource_request(guest, resources).await;
+        resources.set_signal_interrupt_errno(interrupt_errno);
+        if matches!(
+            resource_request(guest, resources).await,
+            ResumeStatus::Signaled(_)
+        ) {
+            Err(interrupt_errno.into())
+        } else {
+            Ok(())
+        }
     }
 
     async fn live_network_syscall<G: Guest<Self>>(
@@ -4670,8 +4761,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         if pin.nonblocking {
                             return Err(Errno::EAGAIN.into());
                         }
-                        self.wait_for_network(guest, listener, NetworkWaitKind::Readable)
-                            .await;
+                        self.wait_for_network(
+                            guest,
+                            listener,
+                            NetworkWaitKind::Readable,
+                            call.signal_interrupt_errno(),
+                        )
+                        .await?;
                     }
                     reply => {
                         return Err(engine_error(format!(
@@ -8382,6 +8478,269 @@ mod original_file_delegate_error_tests {
         }
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("local zero Read must not observe ingress time")
+        }
+    }
+
+    struct LegacyFlagsGuest<'a> {
+        config: &'a Config,
+        thread: crate::ThreadState<usize>,
+        engine: Mutex<crate::network_replay::NetworkReplayEngine>,
+        now: LogicalTime,
+        resume: Option<ResumeStatus>,
+    }
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for LegacyFlagsGuest<'_> {
+        async fn send_rpc(
+            &self,
+            request: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            use crate::network_replay::NetworkReceiveOptions;
+            use crate::network_replay::StreamReceiveOutcome;
+            let mut engine = self.engine.lock().unwrap();
+            let response = match request.2 {
+                GlobalRequest::GlobalTimeLowerBound => {
+                    GlobalResponse::GlobalTimeLowerBound(self.now)
+                }
+                GlobalRequest::RequestResources(resources, _) => {
+                    assert!(resources.signal_interrupt_errno().is_some());
+                    GlobalResponse::RequestResources(
+                        self.resume.clone().expect("wait response fixture missing"),
+                    )
+                }
+                GlobalRequest::Network(request) => {
+                    let reply = match request {
+                        NetworkRequest::StreamSocketState { open_file } => {
+                            NetworkReply::StreamSocketState(
+                                engine.stream_socket_state(open_file).unwrap(),
+                            )
+                        }
+                        NetworkRequest::ReleaseEligible(now) => NetworkReply::ReadyChannels(
+                            engine.release_eligible(now).unwrap().into_iter().collect(),
+                        ),
+                        NetworkRequest::ReceiveStream {
+                            open_file,
+                            maximum,
+                            nonblocking,
+                            flags,
+                            receive_low_water,
+                        } => {
+                            let outcome = engine
+                                .receive_stream_with_options(
+                                    open_file,
+                                    NetworkReceiveOptions {
+                                        maximum,
+                                        nonblocking,
+                                        flags,
+                                        receive_low_water,
+                                    },
+                                )
+                                .unwrap();
+                            NetworkReply::StreamReceive(match outcome {
+                                StreamReceiveOutcome::Bytes(bytes) => {
+                                    NetworkStreamReceive::Bytes(bytes)
+                                }
+                                StreamReceiveOutcome::EndOfFile => NetworkStreamReceive::EndOfFile,
+                                StreamReceiveOutcome::Error(errno) => {
+                                    NetworkStreamReceive::Error(errno)
+                                }
+                                StreamReceiveOutcome::WouldBlock => {
+                                    NetworkStreamReceive::WouldBlock
+                                }
+                                StreamReceiveOutcome::Pending => NetworkStreamReceive::Pending,
+                            })
+                        }
+                        other => panic!("unexpected network request: {other:?}"),
+                    };
+                    GlobalResponse::Network(Ok(reply))
+                }
+                other => panic!("unexpected request: {other:?}"),
+            };
+            (None, response)
+        }
+        fn config(&self) -> &Config {
+            self.config
+        }
+    }
+    #[reverie::tool]
+    impl Guest<Detcore<FailingDelegate>> for LegacyFlagsGuest<'_> {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+        fn tid(&self) -> Tid {
+            Tid::from_raw(self.thread.dettid.as_raw())
+        }
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            LocalMemory::new()
+        }
+        fn thread_state(&self) -> &crate::ThreadState<usize> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<usize> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("unexpected regs")
+        }
+        async fn stack(&mut self) -> NoStack {
+            panic!("unexpected stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("unexpected daemonization")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+            panic!("a delegate failure must not manufacture physical invocation")
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+            panic!("unexpected tail injection")
+        }
+        fn set_timer(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), Error> {
+            panic!("unexpected timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("unexpected clock")
+        }
+    }
+
+    #[tokio::test]
+    async fn adversarial_v2_recv_peek_retains_payload_in_actual_adapter() {
+        use detcore_model::network_trace::NetworkChannelV2;
+        use detcore_model::network_trace::NetworkTraceV2;
+
+        use crate::network_replay::NetworkReplayEngine;
+        use crate::network_replay::StreamReceiveOutcome;
+        for flags in [0, libc::MSG_PEEK] {
+            let mut config = Config::default();
+            config.network_trace.policy = NetworkPolicy::Replay;
+            let tid = Tid::from_raw(73);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            thread
+                .add_fd(77, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let ofd = thread.socket_open_file_id(77).unwrap();
+            let now =
+                LogicalTime::from_nanos(config.epoch.timestamp_nanos_opt().unwrap() as u64 + 1);
+            let channel = NetworkChannelId(1);
+            let trace = NetworkTraceV2 {
+                epoch: config.epoch,
+                channels: vec![NetworkChannelV2 {
+                    id: channel,
+                    transport: NetworkTransportV2::Tcp,
+                    role: NetworkEndpointRoleV2::OutboundClient,
+                    local_address: None,
+                    peer_address: Some(NetworkAddressV2::Inet4 {
+                        address: [127, 0, 0, 1],
+                        port: 1234,
+                    }),
+                    accepted_from: None,
+                }],
+                inputs: vec![NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: now,
+                        after_transmitted_offset: 0,
+                    },
+                    event: NetworkInputKindV2::StreamBytes {
+                        stream_offset: 0,
+                        bytes: b"abc".to_vec(),
+                    },
+                }],
+                outputs: vec![],
+            };
+            let mut engine = NetworkReplayEngine::replay(trace).unwrap();
+            engine.bind(ofd, channel).unwrap();
+            let mut guest = LegacyFlagsGuest {
+                config: &config,
+                thread,
+                engine: Mutex::new(engine),
+                now,
+                resume: None,
+            };
+            let mut buffer = [0u8; 1];
+            let call = syscalls::Recvfrom::new()
+                .with_fd(77)
+                .with_buf(AddrMut::from_ptr(buffer.as_mut_ptr()))
+                .with_len(1)
+                .with_flags(flags);
+            let result = tool
+                .network_recvfrom(&mut guest, call, NetworkPolicy::Replay)
+                .await
+                .unwrap();
+            assert_eq!(result, 1);
+            assert_eq!(buffer, [b'a']);
+            let remaining = guest
+                .engine
+                .lock()
+                .unwrap()
+                .receive_stream(ofd, 3, true)
+                .unwrap();
+            assert_eq!(
+                remaining,
+                StreamReceiveOutcome::Bytes(if flags == 0 {
+                    b"bc".to_vec()
+                } else {
+                    b"abc".to_vec()
+                }),
+                "recv flags {flags} changed consumption"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_network_wait_surfaces_signal_with_the_syscall_specific_errno() {
+        use crate::network_replay::NetworkReplayEngine;
+
+        for (resume, interrupt, expected) in [
+            (ResumeStatus::Normal, Errno::EINTR, None),
+            (
+                ResumeStatus::Signaled(None),
+                Errno::EINTR,
+                Some(Errno::EINTR),
+            ),
+            (
+                ResumeStatus::Signaled(None),
+                Errno::ERESTARTSYS,
+                Some(Errno::ERESTARTSYS),
+            ),
+        ] {
+            let mut config = Config::default();
+            config.sequentialize_threads = true;
+            let tid = Tid::from_raw(74);
+            let tool: Detcore<FailingDelegate> = Detcore::new(tid, &config);
+            let mut thread = tool.init_thread_state(tid, None);
+            thread.detpid = Some(crate::DetPid::from_raw(tid.as_raw()));
+            thread
+                .add_fd(78, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let open_file = thread.socket_open_file_id(78).unwrap();
+            let mut guest = LegacyFlagsGuest {
+                config: &config,
+                thread,
+                engine: Mutex::new(NetworkReplayEngine::record(config.epoch)),
+                now: LogicalTime::from_nanos(1),
+                resume: Some(resume),
+            };
+            let result = tool
+                .wait_for_network(&mut guest, open_file, NetworkWaitKind::Readable, interrupt)
+                .await;
+            match expected {
+                None => result.unwrap(),
+                Some(errno) => {
+                    assert!(
+                        matches!(&result, Err(Error::Errno(actual)) if *actual == errno),
+                        "wait returned {result:?}, expected {errno}"
+                    )
+                }
+            }
         }
     }
 

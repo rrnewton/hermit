@@ -663,6 +663,71 @@ impl NetworkReplayEngine {
         Ok(())
     }
 
+    /// Replay authenticates the live initial descriptor table at the same
+    /// stopped-root/scheduler commit as Record.  The serialized network trace
+    /// is not authority for a host task, MM, files_struct, or descriptor slot;
+    /// those facts come only from the retained association and census claim.
+    /// Unlike Record, Replay already owns its decoded channel/accepted model,
+    /// so admission must not apply the untouched-Record predicate or mutate
+    /// that model.
+    pub(crate) fn admit_initial_replay_census(
+        &mut self,
+        association: &crate::network_runtime::InitialTableAssociation,
+        claim: &crate::network_runtime::InitialTableClaim,
+        process: DetPid,
+    ) -> Result<(), NetworkReplayError> {
+        if self.mode() != NetworkEngineMode::Replay {
+            return Err(NetworkReplayError::WrongMode);
+        }
+        if self.fd_table_capability()
+            || !self.fd_lifecycle.mutations.is_empty()
+            || !self.fd_publications.is_empty()
+            || !self.fd_installations.is_empty()
+            || !self.fd_publication_history.is_empty()
+        {
+            return Err(protocol(
+                "initial Replay capability was already issued or publication started",
+            ));
+        }
+        association
+            .validate_root_identity()
+            .map_err(|e| protocol(&e.to_string()))?;
+        association
+            .check_claim(claim)
+            .map_err(|e| protocol(&e.to_string()))?;
+        // No trace version currently serializes an inherited-socket identity
+        // join.  Matching only the numeric slot would mint authority, so keep
+        // the same fail-closed boundary as Record.
+        if claim.view.descriptors.iter().any(|row| {
+            crate::fd::FdType::from_initial_profile(
+                row.mode,
+                row.status_flags,
+                row.device_major,
+                row.device_minor,
+            ) == Some(crate::fd::FdType::Socket)
+        }) {
+            return Err(protocol(
+                "initial Replay socket profile enrollment is not implemented",
+            ));
+        }
+        let owner = association.owner();
+        self.check_stream_owner(owner)?;
+        self.lifetime
+            .register_census(
+                TaskOwner {
+                    tid: owner.thread,
+                    mm: owner.mm,
+                },
+                process,
+                claim.view.files,
+                &claim.slots,
+                claim.through_generation,
+            )
+            .map_err(|e| protocol(&e.to_string()))?;
+        self.fd_lifecycle.capability = Some(NetworkFdTableCapability(()));
+        Ok(())
+    }
+
     pub(crate) fn register_initial_census(
         &mut self,
         association: &crate::network_runtime::InitialTableAssociation,
