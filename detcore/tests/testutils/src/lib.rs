@@ -802,7 +802,7 @@ where
         .unshare(Namespace::PID)
         .map_uid(uid, uid)
         .map_gid(gid, gid)
-        .mount(Mount::proc())
+        .mount(Mount::proc().allow_readonly_fallback())
         .run_with_deferred_drop(run)?
         .finalize()
 }

@@ -444,7 +444,7 @@ pub fn default_container(pin_threads: bool) -> Container {
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
-        .mount(Mount::proc());
+        .mount(Mount::proc().allow_readonly_fallback());
 
     apply_affinity(&mut container, pin_threads);
     container
@@ -497,7 +497,7 @@ pub(super) fn image_container(
     // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which
     // defers dir creation to the pre-exec child on a tiny clone stack).
     let proc_target = rootfs.join("proc");
-    container.mount(Mount::proc().target(&proc_target));
+    container.mount(Mount::proc().allow_readonly_fallback().target(&proc_target));
 
     // A minimal /dev. An OCI image layer ships no device nodes, so without this
     // the guest sees an empty /dev on a read-only root: `> /dev/null` fails with
@@ -1122,8 +1122,62 @@ pub fn classify_container_result<T>(
 }
 
 #[cfg(test)]
+#[path = "../../../tests/common/readonly_proc.rs"]
+mod readonly_proc;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn namespace_proc_contents() -> Result<(String, String), String> {
+        Ok((
+            fs::read_to_string("/proc/mounts").map_err(|error| error.to_string())?,
+            fs::read_to_string("/proc/self/status").map_err(|error| error.to_string())?,
+        ))
+    }
+
+    #[test]
+    fn default_container_uses_readonly_proc_fallback() {
+        // The outer child confines the irreversible seccomp filter to this test.
+        let (mounts, status) = Container::new()
+            .run(|| {
+                readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
+                default_container(false)
+                    .run(namespace_proc_contents)
+                    .map_err(|error| format!("{error:?}"))?
+            })
+            .unwrap()
+            .expect("default container should retry its denied proc mount read-only");
+        readonly_proc::assert_readonly_proc(&mounts, &status, 1);
+    }
+
+    #[test]
+    fn image_container_uses_readonly_proc_fallback() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let tmpfs = tempfile::tempdir().unwrap();
+        for directory in ["proc", "tmp", "dev/pts"] {
+            fs::create_dir_all(rootfs.path().join(directory)).unwrap();
+        }
+        for node in crate::image::DEV_BIND_TARGETS {
+            File::create(rootfs.path().join("dev").join(node)).unwrap();
+        }
+
+        let (mounts, status) = Container::new()
+            .run(|| {
+                readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
+                let (mut container, _identity) =
+                    image_container(rootfs.path(), tmpfs.path(), false, true)
+                        .map_err(|error| error.to_string())?;
+                // This closure is already loaded, so the image needs no executable
+                // or libraries. It reads the proc mount after entering the chroot.
+                container
+                    .run(namespace_proc_contents)
+                    .map_err(|error| format!("{error:?}"))?
+            })
+            .unwrap()
+            .expect("image container should retry its denied proc mount read-only");
+        readonly_proc::assert_readonly_proc(&mounts, &status, 1);
+    }
 
     /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for
     /// one release the two channels disagreed about what happened.
