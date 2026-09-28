@@ -36,10 +36,12 @@ impl Driver {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !thread_stop.load(Ordering::Acquire) {
-                        let progress = controller.drive_once();
-                        // Retain any known response and any transport failure
-                        // before terminating. A failed provider result is data.
-                        retain()?;
+                        let progress = controller.drive_once_retained(&retain);
+                        if progress.is_err() {
+                            // A poll/readiness error can arise after the normal
+                            // publication callback. Preserve it before exit too.
+                            retain()?;
+                        }
                         progress?;
                     }
                     retain()

@@ -272,10 +272,30 @@ pub(super) struct Controller {
     changed: tokio::sync::Notify,
 }
 impl Controller {
-    /// The owned native driver calls this even if every RPC future was dropped.
-    /// IO is nonblocking under the mutex; the bounded poll holds no model lock.
+    #[cfg(test)]
     pub(super) fn drive_once(&self) -> io::Result<()> {
-        let writable = {
+        self.drive_once_retained(|| Ok(()))
+    }
+
+    /// Retain completed effects before waiting for the next transport edge.
+    /// Collection consumers may depend on that publication before they can
+    /// submit another request. Waiting first adds an idle-poll timeout to each
+    /// completed phase even when its exact response is already owned.
+    pub(super) fn drive_once_retained(
+        &self,
+        retain: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.drive_once_retained_with_poll(retain, |descriptors| unsafe {
+            libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 50)
+        })
+    }
+
+    fn drive_once_retained_with_poll(
+        &self,
+        retain: impl FnOnce() -> io::Result<()>,
+        poll: impl FnOnce(&mut [libc::pollfd]) -> i32,
+    ) -> io::Result<()> {
+        let progress = (|| {
             let mut state = self.state.lock().unwrap();
             if let Some(error) = &state.failure {
                 return Err(io::Error::other(error.clone()));
@@ -285,8 +305,12 @@ impl Controller {
                 self.changed.notify_waiters();
                 return Err(error);
             }
-            !state.pending_send.is_empty()
-        };
+            Ok(!state.pending_send.is_empty())
+        })();
+        // Preserve known replies and failures even if transport progress failed.
+        // The state mutex has been released; publication may acquire it again.
+        retain()?;
+        let writable = progress?;
         let mut descriptors = [
             libc::pollfd {
                 fd: self.ready.as_raw_fd(),
@@ -299,7 +323,7 @@ impl Controller {
                 revents: 0,
             },
         ];
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 50) };
+        let result = poll(&mut descriptors);
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -1490,6 +1514,109 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_response_is_retained_before_the_next_idle_poll() {
+        use super::super::accepted_provider::CallStatus;
+        use super::super::accepted_provider::Observation;
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let controller =
+            Controller::new(unsafe { OwnedFd::from_raw_fd(sockets[0]) }, [6; 16]).unwrap();
+        let mut provider =
+            AcceptedSession::new(unsafe { OwnedFd::from_raw_fd(sockets[1]) }, [6; 16]).unwrap();
+        let sequence = controller
+            .prepare(
+                Effect::Observation(1),
+                owner(),
+                &Request::ReadStatus,
+                || Ok(vec![]),
+            )
+            .unwrap();
+        controller.drive_once().unwrap();
+        assert!(
+            matches!(provider.try_receive().unwrap(), Some(Received::Request(s)) if s == sequence)
+        );
+        let reply = Reply::Status(Observation {
+            status: CallStatus {
+                operation: "ap_read_status".into(),
+                returned: 0,
+                errno: None,
+            },
+            raw: super::super::accepted_provider_ffi::Status::default().into(),
+        });
+        provider
+            .dispatch(sequence, |_, _| Ok(serde_json::to_vec(&reply).unwrap()))
+            .unwrap();
+        assert!(provider.try_reply(sequence).unwrap());
+        let retained = std::cell::Cell::new(false);
+        let polled = std::cell::Cell::new(false);
+        controller
+            .drive_once_retained_with_poll(
+                || {
+                    assert!(matches!(
+                        controller.retained_response(sequence)?,
+                        Some(Reply::Status(_))
+                    ));
+                    retained.set(true);
+                    Ok(())
+                },
+                |descriptors| {
+                    assert!(
+                        retained.get(),
+                        "completed response waited before custody publication"
+                    );
+                    assert_eq!(descriptors.len(), 2);
+                    assert_eq!(descriptors[0].events, libc::POLLIN);
+                    polled.set(true);
+                    0
+                },
+            )
+            .unwrap();
+        assert!(polled.get(), "an idle driver must still wait, not spin");
+    }
+
+    #[test]
+    fn failed_transport_retains_custody_without_entering_idle_poll() {
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let controller =
+            Controller::new(unsafe { OwnedFd::from_raw_fd(sockets[0]) }, [6; 16]).unwrap();
+        drop(unsafe { OwnedFd::from_raw_fd(sockets[1]) });
+        let retained = std::cell::Cell::new(false);
+        let error = controller
+            .drive_once_retained_with_poll(
+                || {
+                    assert!(controller.state.lock().unwrap().failure.is_some());
+                    retained.set(true);
+                    Ok(())
+                },
+                |_| panic!("failed transport entered an idle wait"),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(retained.get());
+    }
 
     #[test]
     fn newly_queued_request_wakes_the_native_driver_once() {
