@@ -1,0 +1,193 @@
+validate: base: STALE, 2 behind origin/main — forced past the freshness gate
+== phase boundary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split
+== FETCH phase   (host, WITH network): cargo fetch --locked, no build output
+
+:::: FETCH PHASE -- host, network ALLOWED, download only
+dns github.com: RESOLVED
+dns crates.io: RESOLVED
+dns static.crates.io: RESOLVED
+assert-no-network: route-table: REACHABLE (0 non-loopback route(s), 1 non-loopback interface(s))
+assert-no-network: dns github.com: RESOLVED
+assert-no-network: dns crates.io: RESOLVED
+assert-no-network: dns static.crates.io: RESOLVED
+assert-no-network: tcp 1.1.1.1:443: refused
+assert-no-network: tcp 8.8.8.8:53: refused
+assert-no-network: NEGATIVE CONTROL PASSED -- network is reachable here, so the probe can detect one.
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/5f829a04c0a8df85/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/ea43a74c69f612af/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/914eb5845ec9abe9/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/59ea0555bb7bb866/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/2162d8a3b81d996d/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/74f4de48268e496d/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/cfee71cd74153651/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/dbfbd1f3870f1cf4/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/344d4004465230b9/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/cd189eff27bcb3f6/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/91a6f85b46f9a093/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/a1bd4437bae839b6/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/6b330abf7c0ddfd4/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/55ba5f117f6432d6/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/40aa044d7d34c808/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/f8017f227c95ed9a/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/93265ab9957e4aba/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/2952a53430d12a42/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/cae18980d4930ac8/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/62ac2bfb61938d72/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/76d1a06784c51374/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/e306610591edf591/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/d409f34a1c6de4ee/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/fc33cf509da19b1c/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/3872522b0d01e12d/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/81da3f1d442cc879/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/b7908774f65bce43/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/6972560c9ef2290f/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+    Updating crates.io index
+    Updating git repository `https://github.com/rrnewton/reverie.git`
+     Locking 217 packages to highest compatible versions
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding sha2 v0.10.9 (available: v0.11.0)
+      Adding syn v2.0.119 (available: v3.0.6)
+      Adding toml v0.8.23 (available: v1.1.6+spec-1.1.0)
+      Adding toml_edit v0.22.27 (available: v0.25.15+spec-1.1.0)
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/5f829a04c0a8df85/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/ea43a74c69f612af/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/914eb5845ec9abe9/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/59ea0555bb7bb866/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/2162d8a3b81d996d/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/74f4de48268e496d/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/cfee71cd74153651/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/dbfbd1f3870f1cf4/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/344d4004465230b9/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/cd189eff27bcb3f6/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/91a6f85b46f9a093/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/a1bd4437bae839b6/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/6b330abf7c0ddfd4/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/55ba5f117f6432d6/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/40aa044d7d34c808/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/f8017f227c95ed9a/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/93265ab9957e4aba/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/2952a53430d12a42/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/cae18980d4930ac8/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/62ac2bfb61938d72/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/76d1a06784c51374/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/e306610591edf591/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/d409f34a1c6de4ee/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/fc33cf509da19b1c/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/3872522b0d01e12d/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/81da3f1d442cc879/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/b7908774f65bce43/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/6972560c9ef2290f/Cargo.toml
+workspace: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-rust-script-packages.SeKF9z3Z/Cargo.toml
+prepare-rust-scripts: fetched dependencies for 28 entrypoints into /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo
+:::: FETCH PHASE complete -- every byte checked against its Cargo.lock

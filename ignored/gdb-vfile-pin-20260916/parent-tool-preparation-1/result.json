@@ -1,0 +1,19 @@
+{
+  "actual_exit": 0,
+  "elapsed_seconds": 65.23837447888218,
+  "source_equal": true,
+  "resources_final": {
+    "memory.max": "8589934592\n",
+    "memory.peak": "1200787456\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0\n",
+    "memory.swap.max": "0\n",
+    "pids.max": "1024\n",
+    "pids.peak": "69\n",
+    "pids.events": "max 0\n",
+    "cpu.max": "400000 100000\n",
+    "cpu.stat": "usage_usec 219874132\nuser_usec 212042784\nsystem_usec 7831347\nnice_usec 0\nnr_periods 645\nnr_throttled 146\nthrottled_usec 858733\nnr_bursts 0\nburst_usec 0\n"
+  },
+  "head": "7c4df11ca6ae4b92196d04297e6a650d7e10915e",
+  "status": "?? HANDOFF.md\n",
+  "cache_note": "Prepared private cache. Real ordinary ci-hub --help only; no validator or admission mutation."
+}

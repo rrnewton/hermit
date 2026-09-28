@@ -1,0 +1,25 @@
+{
+  "elapsed_seconds": 1821.6764018288814,
+  "binding_present": true,
+  "terminal": {
+    "time_ns": 1789603307587137791,
+    "cgroup_exists": false,
+    "properties": {
+      "Id": "dagrun-108548.scope",
+      "LoadState": "not-found",
+      "ActiveState": "inactive",
+      "SubState": "dead",
+      "InvocationID": "",
+      "Result": "success",
+      "RuntimeMaxUSec": "infinity",
+      "ControlGroup": "",
+      "CPUQuotaPerSecUSec": "infinity",
+      "MemoryMax": "infinity",
+      "MemorySwapMax": "infinity",
+      "TasksMax": "infinity"
+    }
+  },
+  "errors": [],
+  "limitations": "one-second samples may miss short child groups/final counter increments; native driver profiles remain authoritative; never bootstrap-only coverage",
+  "workload_signals_sent": false
+}

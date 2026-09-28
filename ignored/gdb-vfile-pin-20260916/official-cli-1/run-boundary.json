@@ -1,0 +1,26 @@
+{
+  "pid": 108548,
+  "stat": "108548 (python3.12) R 108540 108032 108032 0 -1 4194304 26544 18911 0 0 12 10 6 10 20 0 1 0 176041455 251289600 3329 18446744073709551615 4123920 13047456 140734048461120 0 0 0 0 16781312 2 0 0 0 17 201 0 0 0 0 0 10485760 13047456 13049856 140734048469019 140734048469369 140734048469369 140734048481227 0\n",
+  "cgroup": "0::/user.slice/user-212630.slice/user@212630.service/app.slice/gdb-vfile-pin-932f7130-bootstrap1-20260916.scope\n",
+  "head": "932f7130ea3c77dcdb2547b6834f46f08bf593f0",
+  "tree": "f274d598795e7f784ad7cb46c168f92a937e9dac",
+  "all_1712_source_entries_equal": true,
+  "submodules": "2781b1054efc3a9c561dbed35584a6fca1ed8676 agent-utils (v0.11.0-650-g2781b10)\n 39e5c18e7e43236b7ca0fb1eb647fe9c93e3934e third-party/rr (5.9.0-163-g39e5c18e)",
+  "environment_changes": {
+    "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo",
+    "XDG_CACHE_HOME": "/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache",
+    "TMPDIR": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp",
+    "CARGO_HTTP_CAINFO": "/etc/pki/tls/certs/fb_certs.pem",
+    "DEV_HERMIT_PARENT": "/home/newton/work/dev-hermit",
+    "DAGRUN_LOG_DIR": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/nodes",
+    "E2E_RUN_ID": "gdb-vfile-pin-932f7130ea-20260916-cli-1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "ca": {
+    "path": "/etc/pki/tls/certs/fb_certs.pem",
+    "realpath": "/etc/pki/tls/certs/fb_certs.pem",
+    "sha256": "c61f1588a293a23df78c75cc72e65b39a60fc0c6cbce316301f6f6ed31b97881",
+    "uid": 0,
+    "mode": 33188
+  }
+}

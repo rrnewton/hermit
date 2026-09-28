@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--unit=hermit-gdb-vfile-pin-compose2-20260917",
+    "--property=CPUQuota=400%",
+    "--property=MemoryMax=8G",
+    "--property=MemorySwapMax=0",
+    "--property=TasksMax=1024",
+    "--property=RuntimeMaxSec=900s",
+    "timeout",
+    "--signal=TERM",
+    "--kill-after=5s",
+    "890s",
+    "python3",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/composition-2/merge.py"
+  ],
+  "source_sha256": "1cad41ff2bab05cab8a50e68f64d9559cebcad3c11f6e6b1219277b7e76a4c5f",
+  "started_ns": 1789603990964583440
+}

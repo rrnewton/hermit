@@ -1,0 +1,53 @@
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+spec = json.loads(Path(sys.argv[1]).read_text())
+out = Path(spec['output'])
+slot = Path(spec['source'])
+def save(name, value):
+    with (out / name).open('x') as f:
+        json.dump(value, f, indent=2)
+        f.write('\n')
+def git(*args):
+    return subprocess.check_output(['git', *args], cwd=slot).decode().strip()
+assert git('rev-parse', 'HEAD') == spec['head']
+assert git('rev-parse', 'HEAD^{tree}') == spec['tree']
+assert git('status', '--porcelain') == ''
+frozen = json.loads(Path(spec['source_binding']).read_text())
+for name, row in frozen['entries'].items():
+    row = dict(row, path=name)
+    path = slot / row['path']
+    if row['type'] == 'blob':
+        raw = os.fsencode(os.readlink(path)) if row['mode'] == '120000' else path.read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == row['sha256'], row['path']
+        assert row['mode'] == '120000' or row['mode'] == ('100755' if path.stat().st_mode & 0o111 else '100644')
+    else:
+        assert subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD']).decode().strip() == row['blob']
+for key in os.environ:
+    if key.startswith(('DAGRUN_', 'VALIDATE_', 'HERMIT_VALIDATE_', 'HERMIT_TEST_', 'NEXTEST_', 'RUN_NODE_', 'RUST_SCRIPT_')) or key in ['CARGO_TARGET_DIR', 'CARGO_BUILD_JOBS', 'HERMIT_INSTALL_DIR', 'RUSTUP_TOOLCHAIN', 'RUSTFLAGS', 'LD_LIBRARY_PATH', 'LD_PRELOAD']:
+        raise RuntimeError('unexpected inherited runtime/configuration override: ' + key)
+cargo = slot / 'ignored/hermetic/split/cargo'
+assert not cargo.is_symlink()
+assert hashlib.sha256((cargo / 'config.toml').read_bytes()).hexdigest() == 'e36ce2ec7de39d1ea2276c016bb660190b960cf4ef23dda9414661bc40ef45b3'
+tmp = out / 'runtime-tmp'
+tmp.mkdir(mode=0o700)
+env = dict(os.environ)
+env.update(CARGO_HOME=str(cargo), XDG_CACHE_HOME=spec['host_cache'], TMPDIR=str(tmp),
+           CARGO_HTTP_CAINFO='/etc/pki/tls/certs/fb_certs.pem', DEV_HERMIT_PARENT='/home/newton/work/dev-hermit',
+           DAGRUN_LOG_DIR=str(out / 'nodes'), E2E_RUN_ID=spec['run_id'], PYTHONDONTWRITEBYTECODE='1')
+ca = Path(env['CARGO_HTTP_CAINFO'])
+save('run-boundary.json', {'pid': os.getpid(), 'stat': Path('/proc/self/stat').read_text(), 'cgroup': Path('/proc/self/cgroup').read_text(),
+                          'head': git('rev-parse', 'HEAD'), 'tree': git('rev-parse', 'HEAD^{tree}'), 'all_1712_source_entries_equal': True,
+                          'submodules': git('submodule', 'status', '--recursive'), 'environment_changes': {k: env[k] for k in ['CARGO_HOME', 'XDG_CACHE_HOME', 'TMPDIR', 'CARGO_HTTP_CAINFO', 'DEV_HERMIT_PARENT', 'DAGRUN_LOG_DIR', 'E2E_RUN_ID', 'PYTHONDONTWRITEBYTECODE']},
+                          'ca': {'path': str(ca), 'realpath': str(ca.resolve()), 'sha256': hashlib.sha256(ca.read_bytes()).hexdigest(), 'uid': ca.stat().st_uid, 'mode': ca.stat().st_mode}})
+argv = ['with-proxy', './scripts/validate.rs', *spec['driver_arguments']]
+save('driver-command.json', {'argv': argv, 'cwd': str(slot), 'node_wall_sum': 9600,
+                             'whole_run_seconds': 11400, 'bootstrap_scope_seconds': 13200,
+                             'actual_driver_policy': 'ordinary authenticated shared dagrun scope,90%-MemAvailable cap, original per-node budgets; no bootstrap CPU/tasks inheritance claim',
+                             'canonical_validation_receipt': False})
+os.chdir(slot)
+os.execvpe(argv[0], argv, env)

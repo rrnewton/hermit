@@ -1,0 +1,9 @@
+{
+  "kind": "readback-only assertion",
+  "actual_exit": 1,
+  "assumption": "all113 prepared CLI tests have ignored=false",
+  "observed": "one existing ignored test: run_dbt_verifies_fresh_physical_workdirs",
+  "correction": "selected = all identities minus unchanged skip matches minus ignored; require exact78 PASS/exit0 identities",
+  "test_rerun": false,
+  "product_changes": false
+}

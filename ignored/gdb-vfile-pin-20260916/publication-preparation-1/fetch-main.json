@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "with-proxy",
+    "git",
+    "fetch",
+    "origin",
+    "main"
+  ],
+  "observed_ns": 1789603665496203774,
+  "actual_exit": 0,
+  "stdout": "",
+  "stderr": "From https://github.com/rrnewton/hermit\n * branch                main       -> FETCH_HEAD\n"
+}

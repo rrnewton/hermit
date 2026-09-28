@@ -1,0 +1,26 @@
+{
+  "argv": [
+    "systemd-run",
+    "--user",
+    "--collect",
+    "--quiet",
+    "--unit=gdb-vfile-pin-932f7130-observer1-20260916.service",
+    "--property=Type=exec",
+    "--property=PrivateUsers=no",
+    "--property=PrivateMounts=no",
+    "--property=CPUQuota=200%",
+    "--property=MemoryMax=1G",
+    "--property=MemorySwapMax=0",
+    "--property=TasksMax=128",
+    "--property=RuntimeMaxSec=13200",
+    "--property=StandardOutput=append:/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/observer/stdout.log",
+    "--property=StandardError=append:/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/observer/stderr.log",
+    "--",
+    "python3",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/integration-observer.source",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/spec.json"
+  ],
+  "exit_code": 0,
+  "stdout": "",
+  "stderr": ""
+}

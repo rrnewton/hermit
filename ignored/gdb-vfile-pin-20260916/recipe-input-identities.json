@@ -1,0 +1,40 @@
+{
+  "old_pin": "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e",
+  "landed_pin": "d87a03a312421d34dee81dae71aa395b40231e63",
+  "fetched_main": "d87a03a312421d34dee81dae71aa395b40231e63",
+  "monotonic_ancestor_exit": 0,
+  "inputs": {
+    "reverie-dbt/build.rs": {
+      "old_object": "0ff8ae24b97464044735ba79ea74765ba4ac3ff0",
+      "new_object": "0ff8ae24b97464044735ba79ea74765ba4ac3ff0",
+      "kind": "blob",
+      "identical": true
+    },
+    "reverie-dbt/vendor/dynamorio": {
+      "old_object": "a3c41e5d3630c06ba9ff94d5a779792273268df5",
+      "new_object": "a3c41e5d3630c06ba9ff94d5a779792273268df5",
+      "kind": "tree",
+      "identical": true
+    },
+    "third-party": {
+      "old_object": "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a",
+      "new_object": "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a",
+      "kind": "tree",
+      "identical": true
+    },
+    "reverie-dbt/Cargo.toml": {
+      "old_object": "8da5d73a60b920b3077a57836e7fa5fb9c66edb7",
+      "new_object": "8da5d73a60b920b3077a57836e7fa5fb9c66edb7",
+      "kind": "blob",
+      "identical": true
+    }
+  },
+  "history": "d87a03a312421d34dee81dae71aa395b40231e63 Keep GDB sessions open for unsupported vFile probes\nf83b6d8f45b5092676d9ffa1d99a742660eac661 Add a cumulative paused counter read for in-guest boundaries\n",
+  "delta_stat": " reverie-ptrace/src/gdbstub/commands/base/_vFile.rs |  67 ++++++-\n reverie-ptrace/src/gdbstub/server.rs               | 104 ++++++++++\n reverie-ptrace/src/gdbstub/session.rs              |   3 +\n reverie-ptrace/src/in_guest.rs                     |  75 +++++++-\n reverie-ptrace/src/in_guest/tests.rs               | 212 +++++++++++++++++++++\n reverie-ptrace/src/perf.rs                         |  58 ++++++\n reverie-ptrace/src/perf/tests.rs                   |  97 ++++++++++\n 7 files changed, 608 insertions(+), 8 deletions(-)\n",
+  "graph": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+  "graph_common_dir": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+  "source_common_dir": "/home/newton/work/dev-hermit/hermit/.git",
+  "selected_host_CMAKE": null,
+  "selected_host_CMAKE_GENERATOR": null,
+  "qualification": "Exact source/recipe identity, not a new timing measurement or guest receipt. Build-script host selections and content-key construction are read separately."
+}

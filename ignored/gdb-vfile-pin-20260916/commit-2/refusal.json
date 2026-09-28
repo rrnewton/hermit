@@ -1,0 +1,6 @@
+{
+  "actual_exit": 1,
+  "scope_seconds": 0.270635152,
+  "reason": "Recorder preflight used unstaged git diff after prior attempt had staged exactly12 owned paths; it refused before who-am-i/hook/commit. Corrected attempt3 compares whole HEAD-to-working-tree diff and retains exact staged path-set assertion.",
+  "head": "4e7c0636ff105f333d81fa6560069a267e8d60a8"
+}

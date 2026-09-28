@@ -1,0 +1,275 @@
+[
+  {
+    "argv": [
+      "git",
+      "init",
+      "--bare",
+      "--quiet",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.03272545291110873,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "/usr/bin/with-proxy",
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "fetch",
+      "--no-tags",
+      "https://github.com/rrnewton/reverie.git",
+      "refs/heads/main:refs/heads/main"
+    ],
+    "actual_exit": 0,
+    "seconds": 2.3064007109496742,
+    "stdout": "",
+    "stderr": "From https://github.com/rrnewton/reverie\n * [new branch]      main       -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "refs/heads/main"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.021984657971188426,
+    "stdout": "d87a03a312421d34dee81dae71aa395b40231e63\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "merge-base",
+      "--is-ancestor",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e",
+      "d87a03a312421d34dee81dae71aa395b40231e63"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.022165238857269287,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e:reverie-dbt/build.rs"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.02352688484825194,
+    "stdout": "0ff8ae24b97464044735ba79ea74765ba4ac3ff0\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "d87a03a312421d34dee81dae71aa395b40231e63:reverie-dbt/build.rs"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.022135003935545683,
+    "stdout": "0ff8ae24b97464044735ba79ea74765ba4ac3ff0\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "cat-file",
+      "-t",
+      "0ff8ae24b97464044735ba79ea74765ba4ac3ff0"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.024487528018653393,
+    "stdout": "blob\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e:reverie-dbt/vendor/dynamorio"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.02220031199976802,
+    "stdout": "a3c41e5d3630c06ba9ff94d5a779792273268df5\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "d87a03a312421d34dee81dae71aa395b40231e63:reverie-dbt/vendor/dynamorio"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.022547172848135233,
+    "stdout": "a3c41e5d3630c06ba9ff94d5a779792273268df5\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "cat-file",
+      "-t",
+      "a3c41e5d3630c06ba9ff94d5a779792273268df5"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.02085762401111424,
+    "stdout": "tree\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e:third-party"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.021624046145007014,
+    "stdout": "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "d87a03a312421d34dee81dae71aa395b40231e63:third-party"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.021751597989350557,
+    "stdout": "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "cat-file",
+      "-t",
+      "fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.024106214987114072,
+    "stdout": "tree\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e:reverie-dbt/Cargo.toml"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.026227592024952173,
+    "stdout": "8da5d73a60b920b3077a57836e7fa5fb9c66edb7\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "d87a03a312421d34dee81dae71aa395b40231e63:reverie-dbt/Cargo.toml"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.02462936216033995,
+    "stdout": "8da5d73a60b920b3077a57836e7fa5fb9c66edb7\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "cat-file",
+      "-t",
+      "8da5d73a60b920b3077a57836e7fa5fb9c66edb7"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.021624005865305662,
+    "stdout": "blob\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "show",
+      "d87a03a312421d34dee81dae71aa395b40231e63:reverie-dbt/build.rs"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.025133328046649694,
+    "stdout": "/*\n * Copyright (c) Meta Platforms, Inc. and affiliates.\n * All rights reserved.\n *\n * This source code is licensed under the BSD-style license found in the\n * LICENSE file in the root directory of this source tree.\n */\n\nuse std::env;\nuse std::ffi::OsStr;\nuse std::ffi::OsString;\nuse std::fs;\nuse std::io;\nuse std::os::unix::fs::PermissionsExt;\nuse std::path::Path;\nuse std::path::PathBuf;\nuse std::process;\nuse std::process::Command;\nuse std::time::Instant;\nuse std::time::SystemTime;\nuse std::time::UNIX_EPOCH;\n\nuse sha2::Digest;\nuse sha2::Sha256;\n\n// AUTONOMOUS-BOT-IMPLEMENTED\n// TODO-HUMAN-REVIEW(#53): validate the pinned dr_invoke_syscall_as_app mmap fix.\nconst DYNAMORIO_REVISION: &str = \"929840ad9190e5086775e8debc0f0b79b4208d59\";\nconst MAX_PARALLEL_JOBS: usize = 16;\n// Provenance: three clean builds of this curated source tree on 2026-08-03:\n// 13.91s and 14.54s with 16 jobs on a development runner, and 71.49s with 4 jobs on a\n// GitHub-hosted runner. Their elapsed-seconds * requested-jobs proxies were\n// 222.56, 232.64, and 285.96 job-seconds. The CI ratchet is 2x the slowest\n// observation, rounded up; local source installs report without enforcing it.\nconst CI_MAX_BUILD_JOB_SECONDS: f64 = 572.0;\n\nfn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    println!(\"cargo:rerun-if-changed=vendor/dynamorio\");\n    println!(\"cargo:rerun-if-env-changed=CMAKE\");\n    println!(\"cargo:rerun-if-env-changed=CMAKE_GENERATOR\");\n    println!(\"cargo:rerun-if-env-changed=CI\");\n    println!(\"cargo:rerun-if-env-changed=REVERIE_DBT_MAX_BUILD_SECONDS\");\n\n    if env::var(\"CARGO_CFG_TARGET_OS\").as_deref() != Ok(\"linux\")\n        || env::var(\"CARGO_CFG_TARGET_ARCH\").as_deref() != Ok(\"x86_64\")\n    {\n        return;\n    }\n\n    let manifest_dir = PathBuf::from(required_env(\"CARGO_MANIFEST_DIR\"));\n    let source_dir = manifest_dir.join(\"vendor/dynamorio\");\n    let revision = fs::read_to_string(source_dir.join(\"REVISION\"))\n        .expect(\"the vendored DynamoRIO source is missing its REVISION marker\");\n    assert_eq!(\n        revision.trim(),\n        DYNAMORIO_REVISION,\n        \"the vendored DynamoRIO source revision marker changed\"\n    );\n    for required in [\n        \"CMakeLists.txt\",\n        \"core/lib/globals_shared.h\",\n        \"core/unix/memcache.c\",\n        \"tools/drdeploy.c\",\n        \"ext/drmgr/drmgr.c\",\n        \"ext/drreg/drreg.c\",\n        \"ext/drwrap/drwrap.c\",\n        \"ext/drx/drx.c\",\n    ] {\n        assert!(\n            source_dir.join(required).is_file(),\n            \"the vendored DynamoRIO source is incomplete: missing {required}\"\n        );\n    }\n\n    let out_dir = PathBuf::from(required_env(\"OUT_DIR\"));\n    let cmake = env::var_os(\"CMAKE\").unwrap_or_else(|| OsString::from(\"cmake\"));\n    let generator = env::var_os(\"CMAKE_GENERATOR\");\n    let source_key = source_recipe_key(\n        &source_dir,\n        &manifest_dir.join(\"build.rs\"),\n        &cmake,\n        generator.as_deref(),\n    );\n    let cache_root = cache_root_for_out_dir(&out_dir);\n    let install_dir = cache_root.join(format!(\"dynamorio-install-{source_key}\"));\n    let drrun = install_dir.join(\"bin64/drrun\");\n    let observed_at = SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n        .expect(\"system time predates the Unix epoch\")\n        .as_secs();\n\n    let _invalid_install = if install_dir.exists() && !install_is_usable(&install_dir, &source_key)\n    {\n        println!(\n            \"cargo:warning=DynamoRIO build cache INVALID key=sha256:{source_key} install={}; rebuilding\",\n            install_dir.display()\n        );\n        StagingDirectory::quarantine(&cache_root, &install_dir, &source_key)\n    } else {\n        None\n    };\n\n    if !install_is_usable(&install_dir, &source_key) {\n        println!(\n            \"cargo:warning=DynamoRIO build cache MISS key=sha256:{source_key} observed_unix_seconds={observed_at}\"\n        );\n        let staging = StagingDirectory::create(&cache_root, &source_key);\n        let build_dir = staging.path().join(\"build\");\n        let staged_install = staging.path().join(\"install\");\n        build_dynamorio(\n            &source_dir,\n            &build_dir,\n            &staged_install,\n            &cmake,\n            generator.as_deref(),\n        );\n        write_install_attestation(&staged_install, &source_key);\n        assert!(\n            install_is_usable(&staged_install, &source_key),\n            \"DynamoRIO source build produced an incomplete install at {}\",\n            staged_install.display()\n        );\n        let published = publish_install(&staged_install, &install_dir, &source_key);\n        println!(\n            \"cargo:warning=DynamoRIO build cache {} key=sha256:{source_key} install={}\",\n            if published { \"PUBLISHED\" } else { \"RACE-HIT\" },\n            install_dir.display()\n        );\n    } else {\n        println!(\n            \"cargo:warning=DynamoRIO build cache HIT key=sha256:{source_key} observed_unix_seconds={observed_at} install={}\",\n            install_dir.display()\n        );\n    }\n\n    println!(\n        \"cargo:rustc-env=REVERIE_DBT_DYNAMORIO_HOME={}\",\n        install_dir.display()\n    );\n    println!(\n        \"cargo:rustc-env=REVERIE_DBT_DYNAMORIO_CMAKE={}\",\n        install_dir.join(\"cmake\").display()\n    );\n    println!(\n        \"cargo:rustc-env=REVERIE_DBT_DYNAMORIO_DRRUN={}\",\n        drrun.display()\n    );\n}\n\n/// Put native artifacts outside Cargo's package-fingerprint directory.\n///\n/// Cargo gives the same package a different `OUT_DIR` when build-dependency\n/// profiles differ (for example, `cargo build` versus `cargo doc`). Cargo uses\n/// both `build/reverie-dbt-HASH/out` for workspace packages and\n/// `build/reverie-dbt/HASH/out` for some external consumers. In either layout,\n/// the profile directory above `build` is the narrowest cache scope the\n/// fingerprints can safely share.\nfn shared_cache_root(out_dir: &Path) -> Option<PathBuf> {\n    let fingerprint_dir = out_dir.parent()?;\n    let fingerprint_parent = fingerprint_dir.parent()?;\n    let cargo_build_dir = if fingerprint_parent.file_name() == Some(OsStr::new(\"build\")) {\n        fingerprint_parent\n    } else if fingerprint_parent.file_name() == Some(OsStr::new(\"reverie-dbt\")) {\n        let candidate = fingerprint_parent.parent()?;\n        (candidate.file_name() == Some(OsStr::new(\"build\"))).then_some(candidate)?\n    } else {\n        return None;\n    };\n    Some(cargo_build_dir.parent()?.join(\"reverie-dbt-native-cache\"))\n}\n\n/// Unknown Cargo layouts must not abort the consuming build or share an\n/// unproven cache scope. Fall back to this fingerprint's own `OUT_DIR`; the\n/// first use rebuilds and later uses may reuse only that isolated entry.\nfn cache_root_for_out_dir(out_dir: &Path) -> PathBuf {\n    shared_cache_root(out_dir).unwrap_or_else(|| {\n        println!(\n            \"cargo:warning=DynamoRIO shared cache disabled for unrecognized OUT_DIR {}; rebuilding in an isolated cache\",\n            out_dir.display()\n        );\n        out_dir.join(\"reverie-dbt-native-cache\")\n    })\n}\n\nconst REQUIRED_INSTALL_ARTIFACTS: &[&str] = &[\n    \"bin64/drrun\",\n    \"cmake/DynamoRIOConfig.cmake\",\n    \"cmake/DynamoRIOTarget64.cmake\",\n    \"cmake/DynamoRIOTarget64-release.cmake\",\n    \"include/dr_api.h\",\n    \"lib64/release/libdynamorio.so\",\n    \"lib64/release/libdrpreload.so\",\n    \"ext/include/drmgr.h\",\n    \"ext/include/drreg.h\",\n    \"ext/include/drwrap.h\",\n    \"ext/include/drx.h\",\n    \"ext/lib64/release/libdrmgr.so\",\n    \"ext/lib64/release/libdrreg.so\",\n    \"ext/lib64/release/libdrwrap.so\",\n    \"ext/lib64/release/libdrx.so\",\n];\nconst ELF_INSTALL_ARTIFACTS: &[&str] = &[\n    \"bin64/drrun\",\n    \"lib64/release/libdynamorio.so\",\n    \"lib64/release/libdrpreload.so\",\n    \"ext/lib64/release/libdrmgr.so\",\n    \"ext/lib64/release/libdrreg.so\",\n    \"ext/lib64/release/libdrwrap.so\",\n    \"ext/lib64/release/libdrx.so\",\n];\nconst INSTALL_MANIFEST: &str = \".reverie-dbt-install.sha256\";\nconst INSTALL_PROVENANCE: &str = \".reverie-dbt-install.provenance\";\nconst INSTALL_PROVENANCE_SCHEMA: &str = \"reverie-dbt-dynamorio-install-v1\";\n\nfn install_is_usable(install_dir: &Path, expected_source_key: &str) -> bool {\n    let artifacts_present = REQUIRED_INSTALL_ARTIFACTS.iter().all(|relative| {\n        install_dir\n            .join(relative)\n            .metadata()\n            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)\n    });\n    if !artifacts_present {\n        return false;\n    }\n    let drrun_executable = install_dir\n        .join(\"bin64/drrun\")\n        .metadata()\n        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0);\n    if !drrun_executable\n        || !ELF_INSTALL_ARTIFACTS\n            .iter()\n            .all(|relative| has_elf_magic(&install_dir.join(relative)))\n    {\n        return false;\n    }\n\n    let Some((recorded_manifest, actual_manifest, recorded_provenance)) =\n        fs::read_to_string(install_dir.join(INSTALL_MANIFEST))\n            .ok()\n            .zip(install_manifest_contents(install_dir).ok())\n            .zip(fs::read_to_string(install_dir.join(INSTALL_PROVENANCE)).ok())\n            .map(|((recorded, actual), provenance)| (recorded, actual, provenance))\n    else {\n        return false;\n    };\n    if recorded_manifest != actual_manifest {\n        return false;\n    }\n    recorded_provenance == install_provenance(expected_source_key, &recorded_manifest)\n}\n\nfn has_elf_magic(path: &Path) -> bool {\n    fs::read(path)\n        .ok()\n        .is_some_and(|contents| contents.starts_with(b\"\\x7fELF\"))\n}\n\nfn write_install_attestation(install_dir: &Path, source_key: &str) {\n    let contents = install_manifest_contents(install_dir).unwrap_or_else(|error| {\n        panic!(\n            \"failed to inventory DynamoRIO install {}: {error}\",\n            install_dir.display()\n        )\n    });\n    fs::write(install_dir.join(INSTALL_MANIFEST), contents).unwrap_or_else(|error| {\n        panic!(\n            \"failed to write DynamoRIO install manifest in {}: {error}\",\n            install_dir.display()\n        )\n    });\n    let manifest = fs::read_to_string(install_dir.join(INSTALL_MANIFEST))\n        .expect(\"the just-written DynamoRIO install manifest must be readable\");\n    fs::write(\n        install_dir.join(INSTALL_PROVENANCE),\n        install_provenance(source_key, &manifest),\n    )\n    .unwrap_or_else(|error| {\n        panic!(\n            \"failed to write DynamoRIO install provenance in {}: {error}\",\n            install_dir.display()\n        )\n    });\n}\n\nfn install_provenance(source_key: &str, manifest: &str) -> String {\n    let manifest_digest = Sha256::digest(manifest.as_bytes());\n    format!(\n        \"schema={INSTALL_PROVENANCE_SCHEMA}\\nsource_recipe_sha256={source_key}\\nmanifest_sha256={manifest_digest:x}\\n\"\n    )\n}\n\nfn install_manifest_contents(install_dir: &Path) -> io::Result<String> {\n    fn walk(root: &Path, directory: &Path, lines: &mut Vec<String>) -> io::Result<()> {\n        let mut paths = fs::read_dir(directory)?\n            .map(|entry| entry.map(|entry| entry.path()))\n            .collect::<io::Result<Vec<_>>>()?;\n        paths.sort();\n        for path in paths {\n            let relative = path.strip_prefix(root).map_err(io::Error::other)?;\n            if relative == Path::new(INSTALL_MANIFEST) || relative == Path::new(INSTALL_PROVENANCE)\n            {\n                continue;\n            }\n            let file_type = fs::symlink_metadata(&path)?.file_type();\n            if file_type.is_dir() {\n                walk(root, &path, lines)?;\n            } else if file_type.is_symlink() {\n                lines.push(format!(\n                    \"symlink {} {}\",\n                    fs::read_link(&path)?.display(),\n                    relative.display()\n                ));\n            } else if file_type.is_file() {\n                let mut hasher = Sha256::new();\n                hasher.update(fs::read(&path)?);\n                lines.push(format!(\n                    \"sha256:{:x} {}\",\n                    hasher.finalize(),\n                    relative.display()\n                ));\n            } else {\n                return Err(io::Error::other(format!(\n                    \"unsupported installed artifact {}\",\n                    path.display()\n                )));\n            }\n        }\n        Ok(())\n    }\n\n    let mut lines = Vec::new();\n    walk(install_dir, install_dir, &mut lines)?;\n    Ok(format!(\"{}\\n\", lines.join(\"\\n\")))\n}\n\n/// Atomically publish a complete install without overwriting another builder.\n///\n/// Two Cargo invocations can miss simultaneously. They may both do temporary\n/// work, but directory rename ensures consumers observe either no cache entry\n/// or one complete immutable install. The loser verifies and reuses the winner.\nfn publish_install(staged_install: &Path, install_dir: &Path, source_key: &str) -> bool {\n    publish_install_after_precheck(staged_install, install_dir, source_key, || {})\n}\n\nfn publish_install_after_precheck<F>(\n    staged_install: &Path,\n    install_dir: &Path,\n    source_key: &str,\n    after_precheck: F,\n) -> bool\nwhere\n    F: FnOnce(),\n{\n    assert!(\n        install_is_usable(staged_install, source_key),\n        \"refusing to publish incomplete DynamoRIO install {}\",\n        staged_install.display()\n    );\n    if install_dir.exists() {\n        if install_is_usable(install_dir, source_key) {\n            return false;\n        }\n        panic!(\n            \"refusing to replace incomplete DynamoRIO cache entry {}\",\n            install_dir.display()\n        );\n    }\n    after_precheck();\n\n    match fs::rename(staged_install, install_dir) {\n        Ok(()) => true,\n        Err(error) if install_is_usable(install_dir, source_key) => {\n            println!(\n                \"cargo:warning=another builder published the DynamoRIO cache entry first: {error}\"\n            );\n            false\n        }\n        Err(error) => panic!(\n            \"failed to atomically publish DynamoRIO install {} -> {}: {error}\",\n            staged_install.display(),\n            install_dir.display()\n        ),\n    }\n}\n\nstruct StagingDirectory {\n    path: PathBuf,\n}\n\nimpl StagingDirectory {\n    fn create(cache_root: &Path, source_key: &str) -> Self {\n        fs::create_dir_all(cache_root).unwrap_or_else(|error| {\n            panic!(\n                \"failed to create DynamoRIO cache root {}: {error}\",\n                cache_root.display()\n            )\n        });\n        let nonce = SystemTime::now()\n            .duration_since(UNIX_EPOCH)\n            .expect(\"system time predates the Unix epoch\")\n            .as_nanos();\n        for attempt in 0..100 {\n            let path = cache_root.join(format!(\n                \".staging-{source_key}-{}-{nonce}-{attempt}\",\n                process::id()\n            ));\n            match fs::create_dir(&path) {\n                Ok(()) => return Self { path },\n                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,\n                Err(error) => panic!(\n                    \"failed to create DynamoRIO staging directory {}: {error}\",\n                    path.display()\n                ),\n            }\n        }\n        panic!(\"failed to allocate a unique DynamoRIO staging directory\")\n    }\n\n    fn path(&self) -> &Path {\n        &self.path\n    }\n\n    fn quarantine(cache_root: &Path, install_dir: &Path, source_key: &str) -> Option<Self> {\n        let nonce = SystemTime::now()\n            .duration_since(UNIX_EPOCH)\n            .expect(\"system time predates the Unix epoch\")\n            .as_nanos();\n        for attempt in 0..100 {\n            let path = cache_root.join(format!(\n                \".invalid-{source_key}-{}-{nonce}-{attempt}\",\n                process::id()\n            ));\n            if path.exists() {\n                continue;\n            }\n            match fs::rename(install_dir, &path) {\n                Ok(()) => return Some(Self { path }),\n                Err(_) if !install_dir.exists() || install_is_usable(install_dir, source_key) => {\n                    return None;\n                }\n                Err(error) => panic!(\n                    \"failed to quarantine unusable DynamoRIO cache entry {} -> {}: {error}\",\n                    install_dir.display(),\n                    path.display()\n                ),\n            }\n        }\n        panic!(\"failed to allocate a unique DynamoRIO quarantine path\")\n    }\n}\n\nimpl Drop for StagingDirectory {\n    fn drop(&mut self) {\n        if let Err(error) = fs::remove_dir_all(&self.path)\n            && error.kind() != std::io::ErrorKind::NotFound\n        {\n            eprintln!(\n                \"reverie-dbt: failed to remove staging directory {}: {error}\",\n                self.path.display()\n            );\n        }\n    }\n}\n\nfn source_recipe_key(\n    source_dir: &Path,\n    build_script: &Path,\n    cmake: &std::ffi::OsStr,\n    generator: Option<&std::ffi::OsStr>,\n) -> String {\n    let mut hasher = Sha256::new();\n    hash_tree(&mut hasher, source_dir, source_dir);\n    hash_file(&mut hasher, b\"build.rs\", build_script);\n    hash_value(&mut hasher, b\"CMAKE\", cmake.as_encoded_bytes());\n    hash_value(\n        &mut hasher,\n        b\"CMAKE_GENERATOR\",\n        generator.map_or(b\"<unset>\", std::ffi::OsStr::as_encoded_bytes),\n    );\n    format!(\"{:x}\", hasher.finalize())\n}\n\nfn hash_value(hasher: &mut Sha256, name: &[u8], value: &[u8]) {\n    hasher.update(b\"value\\0\");\n    hasher.update(name.len().to_le_bytes());\n    hasher.update(name);\n    hasher.update(value.len().to_le_bytes());\n    hasher.update(value);\n}\n\nfn hash_tree(hasher: &mut Sha256, root: &Path, directory: &Path) {\n    let mut entries = fs::read_dir(directory)\n        .unwrap_or_else(|error| panic!(\"failed to read {}: {error}\", directory.display()))\n        .map(|entry| {\n            entry\n                .unwrap_or_else(|error| {\n                    panic!(\"failed to inspect {}: {error}\", directory.display())\n                })\n                .path()\n        })\n        .collect::<Vec<_>>();\n    entries.sort();\n\n    for path in entries {\n        let relative = path\n            .strip_prefix(root)\n            .expect(\"vendored path escaped its root\");\n        if path.is_dir() {\n            hasher.update(b\"directory\\0\");\n            hash_name(hasher, relative);\n            hash_tree(hasher, root, &path);\n        } else {\n            hash_file(hasher, relative.as_os_str().as_encoded_bytes(), &path);\n        }\n    }\n}\n\nfn hash_file(hasher: &mut Sha256, name: &[u8], path: &Path) {\n    hasher.update(b\"file\\0\");\n    hasher.update(name.len().to_le_bytes());\n    hasher.update(name);\n    let contents =\n        fs::read(path).unwrap_or_else(|error| panic!(\"failed to read {}: {error}\", path.display()));\n    hasher.update(contents.len().to_le_bytes());\n    hasher.update(contents);\n}\n\nfn hash_name(hasher: &mut Sha256, path: &Path) {\n    let name = path.as_os_str().as_encoded_bytes();\n    hasher.update(name.len().to_le_bytes());\n    hasher.update(name);\n}\n\nfn build_dynamorio(\n    source_dir: &Path,\n    build_dir: &Path,\n    install_dir: &Path,\n    cmake: &std::ffi::OsStr,\n    generator: Option<&std::ffi::OsStr>,\n) {\n    let started = Instant::now();\n    let mut configure = Command::new(cmake);\n    configure\n        .arg(\"-S\")\n        .arg(source_dir)\n        .arg(\"-B\")\n        .arg(build_dir)\n        .arg(\"-DCMAKE_BUILD_TYPE=Release\")\n        .arg(format!(\"-DCMAKE_INSTALL_PREFIX={}\", install_dir.display()))\n        .args([\n            \"-DBUILD_TESTS=OFF\",\n            \"-DBUILD_SAMPLES=OFF\",\n            \"-DBUILD_DOCS=OFF\",\n            \"-DBUILD_CLIENTS=OFF\",\n            \"-DBUILD_EXT=ON\",\n            \"-DBUILD_TOOLS=ON\",\n        ]);\n    if let Some(generator) = generator {\n        configure.arg(\"-G\").arg(generator);\n    }\n    run(&mut configure, \"configure DynamoRIO\");\n\n    let mut build = Command::new(cmake);\n    build.arg(\"--build\").arg(build_dir).args([\n        \"--config\",\n        \"Release\",\n        \"--target\",\n        \"install\",\n        \"--parallel\",\n    ]);\n    let jobs = env::var(\"NUM_JOBS\")\n        .ok()\n        .and_then(|value| value.parse::<usize>().ok())\n        .unwrap_or(1)\n        .clamp(1, MAX_PARALLEL_JOBS);\n    build.arg(jobs.to_string());\n    run(&mut build, \"build and install DynamoRIO\");\n\n    let seconds = started.elapsed().as_secs_f64();\n    println!(\"cargo:warning=DynamoRIO source build completed in {seconds:.2}s (jobs={jobs})\");\n    if let Ok(limit) = env::var(\"REVERIE_DBT_MAX_BUILD_SECONDS\") {\n        let limit = limit\n            .parse::<f64>()\n            .expect(\"REVERIE_DBT_MAX_BUILD_SECONDS must be a positive number\");\n        assert!(\n            limit > 0.0,\n            \"REVERIE_DBT_MAX_BUILD_SECONDS must be positive\"\n        );\n        assert!(\n            seconds <= limit,\n            \"DynamoRIO source build took {seconds:.2}s, exceeding the {limit:.2}s CI ratchet\"\n        );\n    } else if env::var_os(\"CI\").is_some() {\n        enforce_ci_build_ratchet(seconds, jobs);\n    }\n}\n\nfn enforce_ci_build_ratchet(seconds: f64, jobs: usize) {\n    let job_seconds = seconds * jobs as f64;\n    assert!(\n        job_seconds <= CI_MAX_BUILD_JOB_SECONDS,\n        \"DynamoRIO source build took {seconds:.2}s with {jobs} jobs ({job_seconds:.2} job-seconds), exceeding the {CI_MAX_BUILD_JOB_SECONDS:.2} job-second CI ratchet\"\n    );\n}\n\nfn run(command: &mut Command, description: &str) {\n    eprintln!(\"reverie-dbt: {description}: {command:?}\");\n    let status = command\n        .status()\n        .unwrap_or_else(|error| panic!(\"failed to {description}: {error}\"));\n    assert!(status.success(), \"failed to {description}: {status}\");\n}\n\nfn required_env(name: &str) -> OsString {\n    env::var_os(name).unwrap_or_else(|| panic!(\"Cargo did not set {name}\"))\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    const TEST_SOURCE_KEY: &str =\n        \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\";\n\n    #[test]\n    fn source_recipe_key_changes_with_source_or_recipe() {\n        let directory = tempfile::tempdir().unwrap();\n        let source = directory.path().join(\"source\");\n        fs::create_dir_all(source.join(\"nested\")).unwrap();\n        fs::write(source.join(\"nested/input.c\"), \"first\\n\").unwrap();\n        let recipe = directory.path().join(\"build.rs\");\n        fs::write(&recipe, \"recipe one\\n\").unwrap();\n        let initial = source_recipe_key(&source, &recipe, \"cmake\".as_ref(), None);\n        assert_eq!(\n            initial,\n            source_recipe_key(&source, &recipe, \"cmake\".as_ref(), None)\n        );\n\n        fs::write(source.join(\"nested/input.c\"), \"second\\n\").unwrap();\n        let source_changed = source_recipe_key(&source, &recipe, \"cmake\".as_ref(), None);\n        assert_ne!(initial, source_changed);\n\n        fs::write(&recipe, \"recipe two\\n\").unwrap();\n        let recipe_changed = source_recipe_key(&source, &recipe, \"cmake\".as_ref(), None);\n        assert_ne!(source_changed, recipe_changed);\n\n        let cmake_changed = source_recipe_key(&source, &recipe, \"custom-cmake\".as_ref(), None);\n        assert_ne!(recipe_changed, cmake_changed);\n\n        let generator_changed = source_recipe_key(\n            &source,\n            &recipe,\n            \"custom-cmake\".as_ref(),\n            Some(\"Ninja\".as_ref()),\n        );\n        assert_ne!(cmake_changed, generator_changed);\n    }\n\n    #[test]\n    fn workspace_and_consumer_fingerprints_share_one_profile_cache() {\n        let directory = tempfile::tempdir().unwrap();\n        for profile in [\"debug\", \"release\"] {\n            let workspace_first = directory\n                .path()\n                .join(format!(\"target/{profile}/build/reverie-dbt-first/out\"));\n            let workspace_second = directory\n                .path()\n                .join(format!(\"target/{profile}/build/reverie-dbt-second/out\"));\n            let consumer_first = directory\n                .path()\n                .join(format!(\"target/{profile}/build/reverie-dbt/first/out\"));\n            let consumer_second = directory\n                .path()\n                .join(format!(\"target/{profile}/build/reverie-dbt/second/out\"));\n            let expected = directory\n                .path()\n                .join(format!(\"target/{profile}/reverie-dbt-native-cache\"));\n\n            for out_dir in [\n                workspace_first,\n                workspace_second,\n                consumer_first,\n                consumer_second,\n            ] {\n                assert_eq!(shared_cache_root(&out_dir), Some(expected.clone()));\n                assert_eq!(cache_root_for_out_dir(&out_dir), expected);\n            }\n        }\n    }\n\n    #[test]\n    fn unrecognized_out_dir_uses_an_isolated_cache() {\n        let directory = tempfile::tempdir().unwrap();\n        let out_dir = directory.path().join(\"unrecognized/layout/out\");\n        assert_eq!(shared_cache_root(&out_dir), None);\n        assert_eq!(\n            cache_root_for_out_dir(&out_dir),\n            out_dir.join(\"reverie-dbt-native-cache\")\n        );\n    }\n\n    fn complete_fixture(path: &Path, marker: &str) {\n        for relative in REQUIRED_INSTALL_ARTIFACTS {\n            let artifact = path.join(relative);\n            fs::create_dir_all(artifact.parent().unwrap()).unwrap();\n            if ELF_INSTALL_ARTIFACTS.contains(relative) {\n                fs::write(\n                    &artifact,\n                    [\n                        b\"\\x7fELF\".as_slice(),\n                        relative.as_bytes(),\n                        marker.as_bytes(),\n                    ]\n                    .concat(),\n                )\n                .unwrap();\n            } else {\n                fs::write(&artifact, marker).unwrap();\n            }\n        }\n        let drrun = path.join(\"bin64/drrun\");\n        let mut permissions = drrun.metadata().unwrap().permissions();\n        permissions.set_mode(0o755);\n        fs::set_permissions(drrun, permissions).unwrap();\n        write_install_attestation(path, TEST_SOURCE_KEY);\n    }\n\n    #[test]\n    fn atomic_publish_never_overwrites_a_complete_winner() {\n        let directory = tempfile::tempdir().unwrap();\n        let first = directory.path().join(\"first\");\n        let second = directory.path().join(\"second\");\n        let published = directory.path().join(\"published\");\n        complete_fixture(&first, \"first\");\n        complete_fixture(&second, \"second\");\n\n        assert!(publish_install(&first, &published, TEST_SOURCE_KEY));\n        assert!(!publish_install(&second, &published, TEST_SOURCE_KEY));\n        assert!(\n            fs::read_to_string(published.join(\"bin64/drrun\"))\n                .unwrap()\n                .ends_with(\"first\")\n        );\n        assert!(\n            second.exists(),\n            \"losing builder still owns its staging tree\"\n        );\n    }\n\n    #[test]\n    fn concurrent_publishers_produce_one_complete_winner() {\n        let directory = tempfile::tempdir().unwrap();\n        let first = directory.path().join(\"first\");\n        let second = directory.path().join(\"second\");\n        let published = directory.path().join(\"published\");\n        complete_fixture(&first, \"first\");\n        complete_fixture(&second, \"second\");\n        let barrier = std::sync::Barrier::new(2);\n\n        let (first_won, second_won) = std::thread::scope(|scope| {\n            let first_thread = scope.spawn(|| {\n                barrier.wait();\n                publish_install(&first, &published, TEST_SOURCE_KEY)\n            });\n            let second_thread = scope.spawn(|| {\n                barrier.wait();\n                publish_install(&second, &published, TEST_SOURCE_KEY)\n            });\n            (first_thread.join().unwrap(), second_thread.join().unwrap())\n        });\n\n        assert_ne!(first_won, second_won, \"exactly one publisher must win\");\n        assert!(install_is_usable(&published, TEST_SOURCE_KEY));\n        let marker = fs::read_to_string(published.join(\"bin64/drrun\")).unwrap();\n        assert!(marker.ends_with(\"first\") || marker.ends_with(\"second\"));\n    }\n\n    #[test]\n    fn publisher_losing_after_precheck_reuses_winner_without_panicking() {\n        let directory = tempfile::tempdir().unwrap();\n        let winner = directory.path().join(\"winner\");\n        let loser = directory.path().join(\"loser\");\n        let published = directory.path().join(\"published\");\n        complete_fixture(&winner, \"winner\");\n        complete_fixture(&loser, \"loser\");\n\n        let loser_won = publish_install_after_precheck(&loser, &published, TEST_SOURCE_KEY, || {\n            assert!(publish_install(&winner, &published, TEST_SOURCE_KEY))\n        });\n\n        assert!(\n            !loser_won,\n            \"the publisher that lost the race must fall back\"\n        );\n        assert!(loser.exists(), \"the loser must retain its staging tree\");\n        assert!(install_is_usable(&published, TEST_SOURCE_KEY));\n        assert!(\n            fs::read_to_string(published.join(\"bin64/drrun\"))\n                .unwrap()\n                .ends_with(\"winner\")\n        );\n    }\n\n    #[test]\n    fn self_consistent_wrong_elf_does_not_match_publisher_provenance() {\n        let directory = tempfile::tempdir().unwrap();\n        let install = directory.path().join(\"install\");\n        complete_fixture(&install, \"correct\");\n        assert!(install_is_usable(&install, TEST_SOURCE_KEY));\n\n        fs::copy(\n            install.join(\"lib64/release/libdrpreload.so\"),\n            install.join(\"lib64/release/libdynamorio.so\"),\n        )\n        .unwrap();\n        let forged_manifest = install_manifest_contents(&install).unwrap();\n        fs::write(install.join(INSTALL_MANIFEST), forged_manifest).unwrap();\n\n        assert!(\n            !install_is_usable(&install, TEST_SOURCE_KEY),\n            \"regenerating a self-consistent inventory must not rewrite publisher provenance\"\n        );\n    }\n\n    #[test]\n    fn attestation_is_bound_to_the_expected_source_recipe() {\n        let directory = tempfile::tempdir().unwrap();\n        let install = directory.path().join(\"install\");\n        complete_fixture(&install, \"correct\");\n\n        assert!(install_is_usable(&install, TEST_SOURCE_KEY));\n        assert!(!install_is_usable(\n            &install,\n            \"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"\n        ));\n    }\n\n    #[test]\n    #[should_panic(expected = \"refusing to replace incomplete DynamoRIO cache entry\")]\n    fn incomplete_cache_entry_fails_closed() {\n        let directory = tempfile::tempdir().unwrap();\n        let staged = directory.path().join(\"staged\");\n        let incomplete = directory.path().join(\"incomplete\");\n        complete_fixture(&staged, \"complete\");\n        fs::create_dir(&incomplete).unwrap();\n        publish_install(&staged, &incomplete, TEST_SOURCE_KEY);\n    }\n\n    #[test]\n    fn deleted_runtime_library_is_quarantined_and_rebuilt() {\n        let directory = tempfile::tempdir().unwrap();\n        let cache = directory.path().join(\"cache\");\n        let install = cache.join(\"dynamorio-install-key\");\n        complete_fixture(&install, \"original\");\n        assert!(install_is_usable(&install, TEST_SOURCE_KEY));\n\n        fs::remove_file(install.join(\"lib64/release/libdynamorio.so\")).unwrap();\n        assert!(!install_is_usable(&install, TEST_SOURCE_KEY));\n        let quarantined = StagingDirectory::quarantine(&cache, &install, \"key\")\n            .expect(\"the unusable entry must be quarantined\");\n        assert!(!install.exists());\n\n        let staged = directory.path().join(\"replacement\");\n        complete_fixture(&staged, \"replacement\");\n        assert!(publish_install(&staged, &install, TEST_SOURCE_KEY));\n        assert!(install_is_usable(&install, TEST_SOURCE_KEY));\n        drop(quarantined);\n    }\n\n    #[test]\n    fn measured_clean_builds_satisfy_the_ci_ratchet() {\n        for (seconds, jobs) in [(13.91, 16), (14.54, 16), (71.49, 4)] {\n            enforce_ci_build_ratchet(seconds, jobs);\n        }\n    }\n\n    #[test]\n    #[should_panic(expected = \"exceeding the 572.00 job-second CI ratchet\")]\n    fn throughput_regression_fails_the_ci_ratchet() {\n        enforce_ci_build_ratchet(144.0, 4);\n    }\n}\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "diff",
+      "--stat",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e",
+      "d87a03a312421d34dee81dae71aa395b40231e63"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.024056860944256186,
+    "stdout": " reverie-ptrace/src/gdbstub/commands/base/_vFile.rs |  67 ++++++-\n reverie-ptrace/src/gdbstub/server.rs               | 104 ++++++++++\n reverie-ptrace/src/gdbstub/session.rs              |   3 +\n reverie-ptrace/src/in_guest.rs                     |  75 +++++++-\n reverie-ptrace/src/in_guest/tests.rs               | 212 +++++++++++++++++++++\n reverie-ptrace/src/perf.rs                         |  58 ++++++\n reverie-ptrace/src/perf/tests.rs                   |  97 ++++++++++\n 7 files changed, 608 insertions(+), 8 deletions(-)\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "log",
+      "--first-parent",
+      "--format=%H %s",
+      "a158914eceeca02a9ab4c7dd4e9916926d5e5c1e..d87a03a312421d34dee81dae71aa395b40231e63"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.024403562070801854,
+    "stdout": "d87a03a312421d34dee81dae71aa395b40231e63 Keep GDB sessions open for unsupported vFile probes\nf83b6d8f45b5092676d9ffa1d99a742660eac661 Add a cumulative paused counter read for in-guest boundaries\n",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git",
+      "rev-parse",
+      "--git-common-dir"
+    ],
+    "actual_exit": 0,
+    "seconds": 0.019505843985825777,
+    "stdout": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/target/ci/reverie-graph.git\n",
+    "stderr": ""
+  }
+]

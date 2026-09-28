@@ -1,0 +1,817 @@
+budget ordering: 16 baseline inversion(s), 23 portable sharded + 12 privileged nodes checked
+warning: expected one comparison-evidence line, found 0; reporting unknown
+warning: expected one comparison-evidence line, found 2; reporting unknown
+warning: verification attempts reported different comparison evidence; reporting unknown
+determinism-stress comparison evidence self-test: positive and refusal directions pass
+generate-test-footprints: ci/test-footprints.json is current
+PASS: splitter assigns every hunk once and reproduces the source tree
+Cloning into '/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/.tmpMrpMKu/repo/agent-utils'...
+done.
+safe-ci scope self-test: ERROR: planted refusal.
+safe-ci scope self-test: WARNING: planted refusal; running UNBOXED (--allow-cgroup-failure).
+[safe-ci] outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope: memory.max=104857600 (bound), memory.swap.max=0 (disabled), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: observed cgroup /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope/step-child has no ancestor matching promised unit missing.scope
+[safe-ci] expected-refusal: observed cgroup /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope/step-child has no ancestor matching promised unit fixture
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope: memory.max=104849408 (MISMATCH), memory.swap.max=0 (disabled), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope: memory.max=UNREADABLE (MISMATCH), memory.swap.max=0 (disabled), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope: memory.max=104857600 (bound), memory.swap.max=1 (MISMATCH), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope: memory.max=104857600 (bound), memory.swap.max=UNREADABLE (MISMATCH), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope: memory.max=104857600 (bound), memory.swap.max=0 (disabled), memory.oom.group=0 (MISMATCH)
+[safe-ci] expected-refusal: outer memory.oom.group=1 write failed at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-604665-1789601858958260623/fixture.scope/memory.oom.group (Is a directory (os error 21))
+Cloning into '/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/pressure-clone-self-test-604665-1789601862994760551/ignored/pressure-fresh-TFgemTeR'...
+done.
+HEAD is now at 7f253b9 fixture
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 10 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/prerequisites-runner-positive/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] WARNING: steps are UNBOXED (no cgroup containment). Teardown is a process-group kill plus a /proc descendant sweep, not an atomic cgroup.kill. A budget can only be enforced as far as the kill reaches.
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 10 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/prerequisites-runner-pre.submodules/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 10 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/prerequisites-runner-pre.reverie_pin/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 10 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/prerequisites-runner-build.rust_scripts/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 10 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/prerequisites-runner-gate.manifest/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 22 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/direct-scheduler/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stmanifest-cli self-test: PASS
+PASS: ci/run-with-reverie-dbt-budget.sh reaches its wrapped command at the recorded pin
+PASS: ci/run-with-reverie-dbt-budget.sh refuses a mismatched pin, by pin mismatch, without running the command
+PASS: small extra stdout is rejected explicitly without running the command
+PASS: large extra stdout is rejected explicitly without running the command
+PASS: a pin-mismatch refusal exits 75 and runs nothing
+PASS: a wrapped compile-failure status (101) exits 101
+PASS: a wrapped generic failure (1) exits 1
+PASS: a wrapped success exits 0
+PASS: the usage error still exits 2
+run-with-reverie-dbt-budget-test.sh: OK
+Submodule path 'agent-utils': checked out '2781b1054efc3a9c561dbed35584a6fca1ed8676'
+compatibility scorecard: projected 0 cell(s) from 0 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+compatibility scorecard: projected 0 cell(s) from 1 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 0 cell(s) from 1 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files unchanged
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 0 cell(s) from 1 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 series event(s) were represented once by richer direct validation evidence
+scorecard self-test: reconciliation pass-and-no-result refused unchanged
+scorecard self-test: reconciliation no-result-and-pass refused unchanged
+scorecard self-test: reconciliation pass-and-failure refused unchanged
+compatibility scorecard: projected 1 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 1 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files unchanged
+  1 series event(s) were represented once by richer direct validation evidence
+scorecard self-test: reconciliation different-attempt passed twice identically
+compatibility scorecard: projected 1 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 1 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files unchanged
+  1 series event(s) were represented once by richer direct validation evidence
+scorecard self-test: reconciliation different-run passed twice identically
+compatibility scorecard: projected 1 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 1 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files unchanged
+  1 series event(s) were represented once by richer direct validation evidence
+scorecard self-test: reconciliation previously-projected passed twice identically
+scorecard self-test: reconciliation wrong-explicit-attempt refused unchanged
+compatibility scorecard: projected 0 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 current result row(s) determined no canonical product result; their exact invocation evidence was retained
+    determined nothing: portable/system-utils/system-utils/record-getpid/replay@ptrace (outcome=ERROR, reason=NO_RESULT: attempt 1 did not produce a comparison (status=Some(125), signal=None))
+  2 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 0 cell(s) from 2 canonical series row(s), then merged 1 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files unchanged
+  1 current result row(s) determined no canonical product result; their exact invocation evidence was retained
+    determined nothing: portable/system-utils/system-utils/record-getpid/replay@ptrace (outcome=ERROR, reason=NO_RESULT: attempt 1 did not produce a comparison (status=Some(125), signal=None))
+  2 series event(s) were represented once by richer direct validation evidence
+scorecard self-test: reconciliation multiple-current-attempts passed twice identically
+scorecard self-test: reconciliation conflicting-current-attempts refused unchanged
+compatibility scorecard: projected 0 cell(s) from 1 canonical series row(s), then merged 0 pass, 1 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 0 cell(s) from 1 canonical series row(s), then merged 0 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 current result row(s) determined no canonical product result; their exact invocation evidence was retained
+    determined nothing: portable/system-utils/system-utils/record-getpid/replay@ptrace (outcome=ERROR, reason=attempt 1 recorded 1 HERMIT_SKID_OVERSHOOT report(s))
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard: projected 0 cell(s) from 1 canonical series row(s), then merged 0 pass, 0 located divergence, and 0 unlocated divergence validate observation(s) at 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+compatibility scorecard: generated files changed
+  1 current result row(s) determined no canonical product result; their exact invocation evidence was retained
+    determined nothing: portable/system-utils/system-utils/record-getpid/replay@ptrace (outcome=ERROR, reason=NO_RESULT: attempt 1 did not produce a comparison (status=Some(125), signal=None))
+  1 series event(s) were represented once by richer direct validation evidence
+compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, iat accounting is unavailable; a best-effort procfs process-group CPU floor will police 1 step(s) (largest 5s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/direct-scheduler/runner-profile (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+validate: unknown argument: --run-on-dirty-tree (try --help)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 9 step(s) (largest 10s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-self-test-runner-logs-bBs3kQ (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] WARNING: steps are UNBOXED (no cgroup containment). Teardown is a process-group kill plus a /proc descendant sweep, not an atomic cgroup.kill. A budget can only be enforced as far as the kill reaches.
+validate: --run-timeout needs a positive number of SECONDS
+validate: --run-timeout needs a positive number of SECONDS
+validate: --run-timeout needs a positive number of SECONDS
+validate: --run-timeout needs a positive number of SECONDS
+validate: --write-constructed-dag needs a FILE
+validate: --write-generated-plan needs a FILE
+validate: choose only one constructed-plan output form
+validate: choose only one constructed-plan output form
+safe-ci scope self-test: ERROR: planted refusal.
+safe-ci scope self-test: WARNING: planted refusal; running UNBOXED (--allow-cgroup-failure).
+[safe-ci] outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope: memory.max=104857600 (bound), memory.swap.max=0 (disabled), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: observed cgroup /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope/step-child has no ancestor matching promised unit missing.scope
+[safe-ci] expected-refusal: observed cgroup /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope/step-child has no ancestor matching promised unit fixture
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope: memory.max=104849408 (MISMATCH), memory.swap.max=0 (disabled), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope: memory.max=UNREADABLE (MISMATCH), memory.swap.max=0 (disabled), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope: memory.max=104857600 (bound), memory.swap.max=1 (MISMATCH), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope: memory.max=104857600 (bound), memory.swap.max=UNREADABLE (MISMATCH), memory.oom.group=1 (enabled)
+[safe-ci] expected-refusal: outer cgroup audit at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope: memory.max=104857600 (bound), memory.swap.max=0 (disabled), memory.oom.group=0 (MISMATCH)
+[safe-ci] expected-refusal: outer memory.oom.group=1 write failed at /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/safe-ci-scope-self-test-775539-1789601997674270184/fixture.scope/memory.oom.group (Is a directory (os error 21))
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 2 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 3 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+validate: 2 planned node(s) DID NOT RUN; the scheduler returned them in not_launched after it stopped admitting work (fail-fast or outer run budget): fixture.pending_a, fixture.pending_b. They are accounted for, but the lane remains incomplete and cannot be green.
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 3 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 2 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539nfrastructure-refusal, and divergence-without-a-comparison brackets pass
+compatibility scorecard: tracked table and 5760 comparable cells are current; selected regression denominator 734 = 731 comparable + 3 custom
+compatibility scorecard: tracked table and 5760 comparable cells are current; selected regression denominator 734 = 731 comparable + 3 custom
+[pre.submodules] ▶ START  Verify repository submodules without initializing or repairing them
+[pre.submodules] ✓ PASS   Verify repository submodules without initializing or repairing them (0s)
+[pre.reverie_pin] ▶ START  Reverie pin consistency
+[pre.reverie_pin] ✓ PASS   Reverie pin consistency (0s)
+[build.rust_scripts] ▶ START  Build every tracked rust-script before graph consumers run
+[build.rust_scripts] ✓ PASS   Build every tracked rust-script before graph consumers run (0s)
+[setup.manifest_plan] ▶ START  Build the manifest-plan binaries the metadata validation runs
+[setup.manifest_plan] ✓ PASS   Build the manifest-plan binaries the metadata validation runs (0s)
+[gate.manifest] ▶ START  Centralized test manifest and inventory
+[gate.manifest] ✓ PASS   Centralized test manifest and inventory (0s)
+[build.runtime_release] ▶ START  Prepare DBT native resources, then build release Hermit and backend artifacts
+[setup.nextest] ▶ START  cargo-nextest available
+[setup.nextest] ✓ PASS   cargo-nextest available (0s)
+[build.workspace] ▶ START  Prepare DBT native resources, then build all debug workspace targets
+[build.runtime_release] ✓ PASS   Prepare DBT native resources, then build release Hermit and backend artifacts (0s)
+[build.workspace] ✓ PASS   Prepare DBT native resources, then build all debug workspace targets (0s)
+[build.e2e_artifact] ▶ START  Publish a verified content-addressed Hermit binary and complete backend-resource bundle
+[build.e2e_artifact] ✓ PASS   Publish a verified content-addressed Hermit binary and complete backend-resource bundle (0s)
+[build.liteinst_runtime_release] ▶ START  Build and stage the release LiteInst runtime
+[build.liteinst_runtime_release] ✓ PASS   Build and stage the release LiteInst runtime (0s)
+[pre.submodules] ▶ START  Verify repository submodules without initializing or repairing them
+
+DAGRUN STEP ERROR [pre.submodules]
+[pre.submodules] ✗ FAIL   Verify repository submodules without initializing or repairing them (0s, exit 17)
+[pre.submodules] ----- detail -----
+[pre.submodules] ----- end detail -----
+[pre.submodules] ▶ START  Verify repository submodules without initializing or repairing them
+[pre.submodules] ✓ PASS   Verify repository submodules without initializing or repairing them (0s)
+[pre.reverie_pin] ▶ START  Reverie pin consistency
+
+DAGRUN STEP ERROR [pre.reverie_pin]
+[pre.reverie_pin] ✗ FAIL   Reverie pin consistency (0s, exit 17)
+[pre.reverie_pin] ----- detail -----
+[pre.reverie_pin] ----- end detail -----
+[pre.submodules] ▶ START  Verify repository submodules without initializing or repairing them
+[pre.submodules] ✓ PASS   Verify repository submodules without initializing or repairing them (0s)
+[pre.reverie_pin] ▶ START  Reverie pin consistency
+[pre.reverie_pin] ✓ PASS   Reverie pin consistency (0s)
+[build.rust_scripts] ▶ START  Build every tracked rust-script before graph consumers run
+
+DAGRUN STEP ERROR [build.rust_scripts]
+[build.rust_scripts] ✗ FAIL   Build every tracked rust-script before graph consumers run (0s, exit 17)
+[build.rust_scripts] ----- detail -----
+[build.rust_scripts] ----- end detail -----
+[pre.submodules] ▶ START  Verify repository submodules without initializing or repairing them
+[pre.submodules] ✓ PASS   Verify repository submodules without initializing or repairing them (0s)
+[pre.reverie_pin] ▶ START  Reverie pin consistency
+[pre.reverie_pin] ✓ PASS   Reverie pin consistency (0s)
+[build.rust_scripts] ▶ START  Build every tracked rust-script before graph consumers run
+[build.rust_scripts] ✓ PASS   Build every tracked rust-script before graph consumers run (0s)
+[setup.manifest_plan] ▶ START  Build the manifest-plan binaries the metadata validation runs
+[setup.manifest_plan] ✓ PASS   Build the manifest-plan binaries the metadata validation runs (0s)
+[gate.manifest] ▶ START  Centralized test manifest and inventory
+
+DAGRUN STEP ERROR [gate.manifest]
+[gate.manifest] ✗ FAIL   Centralized test manifest and inventory (0s, exit 17)
+[gate.manifest] ----- detail -----
+[gate.manifest] ----- end detail -----
+  prerequisite scheduler: ten-node positive and four failed-preflight controls retain exact execution identities
+  prerequisite runner logs: all five fixtures preserve inherited journal/step bytes and restore the log directory
+[build.shared] ▶ START  
+[build.shared] ✓ PASS    (0s)
+[cell.run-01] ▶ START  
+[cell.run-02] ▶ START  
+[cell.run-02] ✓ PASS    (0s)
+[cell.run-03] ▶ START  
+[cell.run-01] ✓ PASS    (1s)
+[cell.run-04] ▶ START  
+[cell.run-04] ✓ PASS    (1s)
+[cell.run-05] ▶ START  
+
+DAGRUN STEP ERROR [cell.run-03]
+[cell.run-03] ✗ FAIL    (1s, exit 1)
+[cell.run-03] ----- detail -----
+[cell.run-03] ----- end detail -----
+[cell.run-06] ▶ START  
+[cell.run-05] ✓ PASS    (1s)
+[cell.run-07] ▶ START  
+[cell.run-06] ✓ PASS    (1s)
+[cell.run-08] ▶ START  
+[cell.run-07] ✓ PASS    (0s)
+[cell.run-09] ▶ START  
+[cell.run-08] ✓ PASS    (0s)
+[cell.run-10] ▶ START  
+[cell.run-09] ✓ PASS    (0s)
+[cell.run-11] ▶ START  
+[cell.run-10] ✓ PASS    (0s)
+[cell.run-12] ▶ START  
+[cell.run-11] ✓ PASS    (0s)
+[cell.run-13] ▶ START  
+[cell.run-12] ✓ PASS    (0s)
+[cell.run-14] ▶ START  
+[cell.run-13] ✓ PASS    (0s)
+[cell.run-15] ▶ START  
+[cell.run-14] ✓ PASS    (0s)
+[cell.run-16] ▶ START  
+[cell.run-15] ✓ PASS    (0s)
+[cell.run-17] ▶ START  
+[cell.run-16] ✓ PASS    (0s)
+[cell.run-18] ▶ START  
+
+DAGRUN STEP ERROR [cell.run-17]
+[cell.run-17] ✗ FAIL    (0s, exit 1)
+[cell.run-17] ----- detail -----
+[cell.run-17] ----- end detail -----
+[cell.run-19] ▶ START  
+[cell.run-18] ✓ PASS    (0s)
+[cell.run-20] ▶ START  
+[cell.run-19] ✓ PASS    (0s)
+[cell.run-20] ✓ PASS    (0s)
+[pressure.summarize] ▶ START  
+[pressure.summarize] ✓ PASS    (0s)
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| **Total** | **1** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 1/1 terminally passed; 0/1 passed cleanly; flaky.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism f-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 2 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ step "fixture.aborted_peer": procfs process-group CPU accounting is unavailable, so the 30s CPU-time budget CANNOT be enforced for this step; only the wall timeout still applies.
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 4 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ step "fixture.family_peer": procfs process-group CPU accounting is unavailable, so the 30s CPU-time budget CANNOT be enforced for this step; only the wall timeout still applies.
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 2 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 3 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 1 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 1 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-scheduler-accounting-775539-1789601998/dagrun-evidence (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+validate: --envelope-compare needs a FILE
+validate: validation levels cannot be combined with focused validation modes
+validate: --all/--full-run requires level full and forbids every focused or selective mode
+validate: choose only one focused validation mode
+validate: verbosity must be an integer from 1 through 5, got "0"
+validate: verbosity must be an integer from 1 through 5, got "6"
+validate: verbosity must be an integer from 1 through 5, got "loud"
+Preparing worktree (new branch 'tool')
+Cloning into '/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-tool-root-775539-1789602030/other-root'...
+done.
+validate: per-cell series updated from 2 retained row(s) under /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-series-writer-775539-1789602032/results: fixture append accepted
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 4 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-self-test-runner-logs-bBs3kQ (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+[scheduler] ⚠ UNCONTAINED run: exact cgroup cpu.stat accounting is unavailable; a best-effort procfs process-group CPU floor will police 4 step(s) (largest 30s), but it can miss processes that leave the group and not-yet-reaped exits. `capabilities` cannot express that quality difference.
+[scheduler] per-step logs + test-boundary journal: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-self-test-runner-logs-bBs3kQ (set DAGRUN_LOG_DIR to relocate, DAGRUN_NO_STEP_LOGS=1 to disable)
+[scheduler] CONTAINMENT: unboxed — unboxed: no containment (no containment manager was established for this run)
+validate: --sequential-lanes was removed when validation moved to one labelled DAG; select the committed full graph instead
+ailure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| **Total** | **1** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 1/1 terminally passed; 0/1 passed cleanly; flaky.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 |
+| **Total** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 0/1 terminally passed; 0/1 passed cleanly; incomplete because 1 check(s) have no trustworthy result.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| **Total** | **1** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 1/1 terminally passed; 0/1 passed cleanly; flaky.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| **Total** | **1** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 1/1 terminally passed; 1/1 passed cleanly; passed every repetition.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 1/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| **Total** | **1** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 1/1 terminally passed; 1/1 passed cleanly; passed every repetition.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
+| **Total** | **1** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 1/1 terminally passed; 1/1 passed cleanly; passed every repetition.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-retry/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 |
+| **Total** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 0/1 terminally passed; 0/1 passed cleanly; incomplete because 1 check(s) have no trustworthy result.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-prerequisite/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 |
+| **Total** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 0/1 terminally passed; 0/1 passed cleanly; incomplete because 1 check(s) have no trustworthy result.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-empty-timeout/summary.json
+# Repeated red-cell results
+
+Final-result denominator: one framework-selected result per selected cell repetition; `attempted` counts every attributable harness attempt.
+
+Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric.
+
+| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ptrace` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `dbt` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kvm` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `sabre` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `liteinst` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `native` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 1 |
+| **Total** | **0** | **0** | **0** | **0** | **0** | **0** | **0** | **1** | **1** |
+
+Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal.
+
+Repeated result: 0/1 terminally passed; 0/1 passed cleanly; incomplete because 1 check(s) have no trustworthy result.
+Sample classification for `portable/data-handling/data-handling/jq-json-transform/naked@native`: incomplete; 0/1 qualifying first attempts.
+Summary: /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/hermit-pressure-self-test-604665-1789601862994760551/summarize-empty-oom/summary.json
+compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass
+  runner log isolation: pass and exit 23 retained; outer bytes unchanged
+  inner freshness skip: new option accepted, old option refused, and help names only the two inner checks
+[pre.submodules] ▶ START  inert committed preflight
+[compatprep.fixtures] ▶ START  Functional compatibility fixtures for direct outer-DAG probes
+[compatprep.fixtures] ✓ PASS   Functional compatibility fixtures for direct outer-DAG probes (1s)
+[pre.submodules] ✓ PASS   inert committed preflight (1s)
+[pre.reverie_pin] ▶ START  inert committed preflight
+[pre.reverie_pin] ✓ PASS   inert committed preflight (0s)
+[build.rust_scripts] ▶ START  inert committed preflight
+[build.rust_scripts] ✓ PASS   inert committed preflight (0s)
+[setup.manifest_plan] ▶ START  inert committed preflight
+[setup.manifest_plan] ✓ PASS   inert committed preflight (0s)
+[gate.manifest] ▶ START  inert committed preflight
+[gate.manifest] ✓ PASS   inert committed preflight (0s)
+[test.hermit_modes] ▶ START  Portable Hermit mode cases (skips default_ and chaos_buck_)
+[compat.echo] ▶ START  legacy below-L2 stripped verify compatibility: echo
+[compat.true] ▶ START  legacy below-L2 stripped verify compatibility: true
+[compat.true] ✓ PASS   legacy below-L2 stripped verify compatibility: true (1s)
+[compat.echo] ✓ PASS   legacy below-L2 stripped verify compatibility: echo (1s)
+[test.hermit_modes] ✓ PASS   Portable Hermit mode cases (skips default_ and chaos_buck_) (1s)
+  portable strict compatibility: 189 direct outer nodes without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution
+  raw run-dag: public launcher passed the 1598-node committed superset plus exact hosted portable/privileged labels; non-selection controls forwarded; alternate DAG and label overrides refused before runner invocation; no nested scheduler command
+  raw run-dag engine: default Rust executed the structured committed fixture; explicit Python refused before its marker could execute
+  shard coverage: old 60s/512 MiB bounds refused; 600s/1 GiB hard bounds retain the 64 MiB warm estimate
+  FAIL listed_fails known fail-closed under --portable-strict (planted: refused by fail-closed --strict); STILL BLOCKING -- this mode does not exempt listed rows
+  WARN listed_passes passed but is listed as known fail-closed under --portable-strict (planted: expected to be refused); the EXPECTATION is STALE -- drop it from the known-failure table
+  WARN bounded_diag is a bounded portable diagnostic: planted: bounded portable diagnostic
+
+COMPATIBILITY SUMMARY (5 measured programs, mode legacy below-L2 stripped verify)
+Category               | Programs |   passing
+----------------------------------------------
+other                  |        5 |       2/5
+----------------------------------------------
+TOTAL                  |        5 |       2/5
+P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.
+  FAIL listed_fails known fail-closed under --portable-strict (planted: refused by fail-closed --strict); STILL BLOCKING -- this mode does not exempt listed rows
+  WARN listed_passes passed but is listed as known fail-closed under --portable-strict (planted: expected to be refused); the EXPECTATION is STALE -- drop it from the known-failure table
+  WARN bounded_diag is a bounded portable diagnostic: planted: bounded portable diagnostic
+  NO_RESULT unknown_execution produced no product result; excluded from the measured denominator
+  NO_RESULT aborted_execution produced no product result; excluded from the measured denominator
+
+COMPATIBILITY SUMMARY (5 measured programs, mode legacy below-L2 stripped verify)
+Category               | Programs |   passing
+----------------------------------------------
+other                  |        5 |       2/5
+----------------------------------------------
+TOTAL                  |        5 |       2/5
+P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.
+  WARN listed_fails known fail-closed under --strict (planted: refused by fail-closed --strict; nonblocking)
+  WARN listed_passes passed but is listed as known fail-closed under --strict (planted: expected to be refused); the EXPECTATION is STALE -- drop it from the known-failure table
+
+COMPATIBILITY SUMMARY (5 measured programs, mode legacy below-L2 stripped verify)
+Category               | Programs |   passing
+----------------------------------------------
+other                  |        5 |       2/5
+----------------------------------------------
+TOTAL                  |        5 |       2/5
+P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.
+  corpora: strict=193 sabre=212 rr=174 (filtered to 139) e9patch=172
+[fixture.intentional_skip] SKIPPED reason=empty-manifest-bucket
+[fixture.pass] ▶ START  validate scheduler accounting fixture
+[fixture.pass] ✓ PASS   validate scheduler accounting fixture (0s)
+[fixture.fail] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.fail]
+[fixture.fail] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.fail] ----- detail -----
+[fixture.fail] ----- end detail -----
+[fixture.fail] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.fail]
+[fixture.fail] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.fail] ----- detail -----
+[fixture.fail] ----- end detail -----
+[fixture.pending_a] ▶ START  validate scheduler accounting fixture
+[fixture.pending_a] ✓ PASS   validate scheduler accounting fixture (0s)
+[fixture.pending_b] ▶ START  validate scheduler accounting fixture
+[fixture.pending_b] ✓ PASS   validate scheduler accounting fixture (0s)
+[fixture.dependency_failure] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.dependency_failure]
+[fixture.dependency_failure] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.dependency_failure] ----- detail -----
+[fixture.dependency_failure] ----- end detail -----
+[fixture.abort_failure] ▶ START  validate scheduler accounting fixture
+[fixture.aborted_peer] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.abort_failure]
+[fixture.abort_failure] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.abort_failure] ----- detail -----
+[fixture.abort_failure] ----- end detail -----
+[fixture.aborted_peer] ⊘ ABORT  validate scheduler accounting fixture (1s — eager-exit after another step failed; --keep-going would continue independent work)
+[fixture.family_failure] ▶ START  validate scheduler accounting fixture
+[fixture.family_peer] ▶ START  validate scheduler accounting fixture
+[fixture.independent_family] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.family_failure]
+[fixture.family_failure] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.family_failure] ----- detail -----
+[fixture.family_failure] ----- end detail -----
+[fixture.independent_family] ✓ PASS   validate scheduler accounting fixture (1s)
+[fixture.family_peer] ⊘ ABORT  validate scheduler accounting fixture (1s — eager-exit after another step failed; --keep-going would continue independent work)
+[fixture.intentional_skip] SKIPPED reason=empty-manifest-bucket
+[fixture.allowed_failure] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.allowed_failure]
+[fixture.allowed_failure] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.allowed_failure] ----- detail -----
+[fixture.allowed_failure] ----- end detail -----
+[fixture.environmental] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.environmental]
+[fixture.environmental] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.environmental] ----- detail -----
+[fixture.environmental] ----- end detail -----
+[fixture.prerequisite] ▶ START  validate scheduler accounting fixture
+[fixture.prerequisite] ✓ PASS   validate scheduler accounting fixture (0s)
+[fixture.dependent] ▶ START  validate scheduler accounting fixture
+[fixture.dependent] ✓ PASS   validate scheduler accounting fixture (0s)
+🧱 fixture.environmental: observed environmental signature bpfjailer-banner on attempt 1; terminal hypothesis UNCONFIRMED; aggregate result is reported separately in the node table.
+[e2e.manifest_attempt] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [e2e.manifest_attempt]
+[e2e.manifest_attempt] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[e2e.manifest_attempt] ----- detail -----
+[e2e.manifest_attempt] ----- end detail -----
+[fixture.ordinary_structured] ▶ START  validate scheduler accounting fixture
+
+DAGRUN STEP ERROR [fixture.ordinary_structured]
+[fixture.ordinary_structured] ✗ FAIL   validate scheduler accounting fixture (0s, exit 1)
+[fixture.ordinary_structured] ----- detail -----
+[fixture.ordinary_structured] ----- end detail -----
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  ✅ ptrace-strict-verify     2/2 (100%)
+  ✅ ptrace-pipeline          2/2 (100%)
+  ✅ ptrace-record-replay     2/2 (100%)
+  ✅ kvm-verify               2/2 (100%)
+  ✅ dbt-verify               2/2 (100%)
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  ⚠️  ptrace-strict-verify     1/2 (50%) FLAKY/FAILING
+  ✅ ptrace-pipeline          2/2 (100%)
+  ✅ ptrace-record-replay     2/2 (100%)
+  ✅ kvm-verify               2/2 (100%)
+  ✅ dbt-verify               2/2 (100%)
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  ✅ ptrace-strict-verify     2/2 (100%)
+  ✅ ptrace-pipeline          2/2 (100%)
+  ✅ ptrace-record-replay     2/2 (100%)
+  ⚠️  kvm-verify               1/2 (50%) FLAKY/FAILING — NONBLOCKING: this row was dead code in validate.sh (`backend_selector_supported` is undefined, so the guard was always false) and has never been measured; reporting it, not ratcheting it.
+  ✅ dbt-verify               2/2 (100%)
+
+== Envelope monotonicity vs /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-envelope-selftest-775539/equal.json ==
+  ✅ l1_pass  3 >= baseline 3
+  ✅ l2_pass  3 >= baseline 3
+  ✅ l3_pass  3 >= baseline 3
+  ✅ l4_pass  3 >= baseline 3
+  ✅ rr_pass  3 >= baseline 3
+  ✅ total    3 >= baseline 3
+
+== Envelope monotonicity vs /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-envelope-selftest-775539/higher.json ==
+  ❌ REGRESSION l1_pass  3 < baseline 99
+  ✅ l2_pass  3 >= baseline 0
+  ✅ l3_pass  3 >= baseline 0
+  ✅ l4_pass  3 >= baseline 0
+  ✅ rr_pass  3 >= baseline 0
+  ✅ total    3 >= baseline 0
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  NO_RESULT ptrace-strict-verify     1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT ptrace-pipeline          1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT ptrace-record-replay     1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT kvm-verify               1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT dbt-verify               1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  NO_RESULT ptrace-strict-verify     0/2 selected repetition(s) produced a product result
+  NO_RESULT ptrace-pipeline          0/2 selected repetition(s) produced a product result
+  NO_RESULT ptrace-record-replay     0/2 selected repetition(s) produced a product result
+  NO_RESULT kvm-verify               0/2 selected repetition(s) produced a product result
+  NO_RESULT dbt-verify               0/2 selected repetition(s) produced a product result
+
+== Super stress pass rates ==
+Repetitions: 1; scheduler width: 1; online CPUs: 1
+  ✅ ptrace-strict-verify     1/1 (100%)
+  ✅ ptrace-pipeline          1/1 (100%)
+  ✅ ptrace-record-replay     1/1 (100%)
+  ✅ kvm-verify               1/1 (100%)
+  ✅ dbt-verify               1/1 (100%)
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  NO_RESULT ptrace-strict-verify     0/2 selected repetition(s) produced a product result
+  NO_RESULT ptrace-pipeline          0/2 selected repetition(s) produced a product result
+  NO_RESULT ptrace-record-replay     0/2 selected repetition(s) produced a product result
+  ⚠️  kvm-verify               0/1 product result(s) passed (0%); 1 of 2 selected repetition(s) did not produce a product result — NONBLOCKING: this row was dead code in validate.sh (`backend_selector_supported` is undefined, so the guard was always false) and has never been measured; reporting it, not ratcheting it.
+  ⚠️  dbt-verify               0/1 product result(s) passed (0%); 1 of 2 selected repetition(s) did not produce a product result — NONBLOCKING: this row was dead code in validate.sh (`backend_selector_supported` is undefined, so the guard was always false) and has never been measured; reporting it, not ratcheting it.
+
+== Super stress pass rates ==
+Repetitions: 2; scheduler width: 1; online CPUs: 1
+  ⚠️  ptrace-strict-verify     0/1 product result(s) passed (0%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT ptrace-pipeline          1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT ptrace-record-replay     1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT kvm-verify               1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  NO_RESULT dbt-verify               1/1 product result(s) passed (100%); 1 of 2 selected repetition(s) did not produce a product result
+  safe-ci scope: containment, promised-scope ancestor, outer memory/swap/OOM-group, optional RuntimeMax, and per-step cgroups bracketed
+  safe-ci scope: real outer -> step child -> nested boxed step passed
+  retry bounds: 46 nextest node(s) keep test events live; outer DAG nodes run once; default nextest cap including grace=59s and largest nextest cap including grace=59s leave at least 61s in every enclosing nextest node; 29 manifest node(s) fit both cell attempts with their production prebuilt/non-prebuilt preparation and execution windows at CPU 1x/wall 1x and representative CPU 1.25x/wall 1.5x, leaving at least 344s at the configured multipliers; invalid, inverted, and oversized policies are refused
+  scheduler accounting: complete and allowed-failure plans accepted; fail-fast, skipped, aborted, one-shot outer execution, inner manifest retry identity, and terminal failure/incompleteness summary bracketed
+  budget reason: 10 producer-rendered reason(s) classified; retry-eligible = ["wall budget", "cpu budget"];          the SIGSEGV arm contains the word "timeout" and is correctly NOT eligible; all eight independent OOM/CPU/wall combinations retain their typed attribution through poisoned presentation text
+  summary listing: count and enumeration agree across 10 cases (the 9-failure shape named in full, the cap states its remainder, a budget kill is counted and named without being folded into the failure count, and the two refusal sites' shared cap is whole at the cap, declares +1 and +7 above it, and is silent when empty)
+  super source: 32 rows, 3 synthetic expansions, 26 nextest rows, 4 malformed tables refused; stress verdict bracketed
+  envelope: 15 nodes (3 probes x 5 levels) all capped, l4->l2 edges present, scoring bracketed 1 full / 1 skip-zero, comparison bracketed 1 accept / 2 refuse
+  history: cache bracketed 4 accept / 20 refuse (incl. both cross-producer counter traps), estimate bracketed thin/median/no-ledger/fail-poison, selective baseline bracketed slot-preference/explicit/missing-commit
+  receipt: eligibility bracketed 1 accept / 11 refuse (no label was touched; the predicate is pure)
+  runtime: one retry per cell; environmental classifier bracketed 16 accept / 18 refuse (incl. the proxy/VCS classes and the 5 measured build-tool phrasings, one of them spanning a cargo Caused-by block), node-detail extraction 1 hit / 2 miss (incl. partial), retry verdict 1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, CPU-vs-wall hints 2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock 2 accept (incl. the sequential re-claim) / 11 concurrent-refuse / 1 safety-refuse, registry registration 1 success / 1 lock-refuse / 1 write-refuse / 1 create-before-flock race-refuse, census 1 live / 1 stale-reaped / 1 cpu-active
+  classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; missing super repetitions remain unmeasured
+  rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse
+  envelope CLI: 3 accepted form(s), 4 refused misuse(s) (the refusal messages above are expected)
+  super plan: 146 boxed node(s), all capped; caps audit bracketed 1 accept / 1 refusal
+  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), 2 negative(s) inert (complete run, unknown counts); refusal -> exit 75/COULD_NOT_RUN, product failure -> exit 1/FAILED, clean -> exit 0/PASSED
+  pin gate: receipt-producing pass requires the observed gate; off-the-record selected pass does not claim a receipt
+  scorecard write-back: receipt-producing top-level run only; nested and off-the-record runs inert
+HOST-INAPPLICABLE: dropped result-consumer dependency edge full-scorecard.compatibility -> privileged-e2e.manifest_backend_parity_c — the consumer still RUNS and judges the incomplete result set itself; it is not skipped.
+HOST-INAPPLICABLE: dropped result-consumer dependency edge privileged-scorecard.compatibility -> privileged-only-e2e.manifest_backend_parity_c — the consumer still RUNS and judges the incomplete result set itself; it is not skipped.
+  node vacuity: 2 withheld / 7 not-withheld (3 un-withholding, 3 nothing-withheld, 1 empty-bucket), 1 transformed command bound / 15 refused, accounting parser 1 good / 3 malformed, dependents 1 edge-dropped / 1 refusal / 1 inert, actual plan 1 bucket withheld / 1 scorecard edge dropped / 0 other changes
+  host capability: 1 withheld / 3 not-withheld (capable, undeclared, dependent-refusal), probe conjunction 1 absent / 7 present-on-doubt, vocabulary closed, shipped DAG declares it; this machine's cpuid-faulting probe says PRESENT (arch_prctl(ARCH_SET_CPUID, 0) = 0; /proc/cpuinfo advertises cpuid_fault)
+  coverage schema: 1/1 real judgement -> schema 5; 4/4 unresolved shapes -> schema 5/null
+  cell-results schema: current payload -> schema 7; absent payload -> schema 5
+  rebase freshness: stale admission still refuses; exact-commit evidence is separate from hard-green or soft-green landing authorization
+  test-node coverage: 2 structured-positive / 1 structured-zero / 3 absent; printed banners alone remain absent
+  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; direct compatibility rows joined the outer denominator without hiding an unknown pass count; compatibility rows carried terminal verdicts and latest attempt ordinals; fail-then-unreported refused; 0/0/0 preserved
+  ledger gate origin: fallback, terminal attempts, and failure classes stayed typed
+  requalification plan: exact five-field identity resolved to committed owner e2e.manifest_applications; its dependency closure and declared result population stayed unchanged; graph and source mutations both refused
+Initialized empty Git repository in /home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/runtime-tmp/validate-tool-root-775539-1789602030/state-root/.git/
+[main (root-commit) 9b8b1ef] fixture
+ 4 files changed, 13 insertions(+)
+ create mode 100644 .gitmodules
+ create mode 100755 ci-hub/ci-hub
+ create mode 100644 ci-hub/ledger/validate_rows.py
+ create mode 100644 ci-hub/validate/finalize_receipt.py
+HEAD is now at 9b8b1ef fixture
+  tool-root split: sealed descriptor authority, digest, receipt finalizer, and remediation preserve immutable code/state separation
+  validate series writer: checkout identity and both appended attempts carried
+  no-result propagation: 75 stayed distinct; 0 passed; 8 other exits and mixed 75+failure stayed RED
+  missing-artifact hint: 1 --only candidate / 3 non-qualifying shapes; other profiles silent
+Selective validation: selected 1 requested portable DAG node(s); committed dependency closure contains 2/261 node(s):
+  pre.reverie_pin
+Selective validation: selected 1 requested portable DAG node(s); committed dependency closure contains 13/261 node(s):
+  e2e.manifest_applications
+Selective validation: no CI-relevant changes since baseline — nothing beyond committed preflight runs (0/261 lane nodes). The ledger's coverage record will show zero planned test nodes, so this cannot be misread as a full pass.
+  selective subset: typed ID selection retained pre.reverie_pin and dependency pre.submodules; unknown IDs refused; no-change retained exact preflight; source bytes unchanged
+Selective validation: privileged public node cpuid.faulting maps to committed node privileged-only-cpuid.faulting
+  only plan: requested IDs plus committed preflight selected through dagrun; old privileged public IDs map explicitly, unknown portable and privileged IDs refuse, outside dependencies drop, selected edges remain, nested scheduler absent, and source/selected-step bytes are guarded both ways
+  self-output: 7 own-output shape(s) excused, 8 foreign change(s) still dirty, 0 live entr(y/ies) from the real checkout all correctly classified
+  checkout attribution: clean disposable + Hermit summary remains anchored; dirty in-place source refuses
+  product front door: publishing requires authority; clean quick/focused local iteration is off the record; dirty/full local forms and diagnostics bracketed
+  product front door process: full/focused/nested missing-authority runs refused before validation state
+  dag-config: portable carries 3 cap(s), default_step_timeout=600s; cleared-caps refusal names 16 starved step(s)
+  dag-config: privileged carries 3 cap(s), default_step_timeout=600s; cleared-caps refusal names 0 starved step(s)
+[pre.submodules] ▶ START  manifest producer dependency fixture
+[setup.manifest_plan] ▶ START  manifest producer dependency fixture
+[pre.submodules] ✓ PASS   manifest producer dependency fixture (0s)
+[pre.reverie_pin] ▶ START  manifest producer dependency fixture
+[setup.manifest_plan] ✓ PASS   manifest producer dependency fixture (0s)
+[gate.manifest] ▶ START  manifest producer dependency fixture
+[pre.reverie_pin] ✓ PASS   manifest producer dependency fixture (0s)
+[gate.manifest] ✓ PASS   manifest producer dependency fixture (0s)
+[pre.submodules] ▶ START  manifest producer dependency fixture
+[setup.manifest_plan] ▶ START  manifest producer dependency fixture
+
+DAGRUN STEP ERROR [setup.manifest_plan]
+[setup.manifest_plan] ✗ FAIL   manifest producer dependency fixture (0s, exit 23)
+[setup.manifest_plan] ----- detail -----
+[setup.manifest_plan] ----- end detail -----
+[pre.submodules] ✓ PASS   manifest producer dependency fixture (0s)
+[pre.reverie_pin] ▶ START  manifest producer dependency fixture
+[pre.reverie_pin] ✓ PASS   manifest producer dependency fixture (0s)
+  manifest producer edge: absent output built before gate; producer failure dependency-skips gate
+  full plan: 270 committed labelled node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; removed sequential-lanes spelling refused
+  missing agent-utils stays a bootstrap failure; with agent-utils present, missing rr is a typed pre.submodules failure across scope re-exec
+
+✅ validate SELF-TEST (exit 0) — profile self-test @ 932f7130ea3c77dcdb2547b6834f46f08bf593f0
+   force-full policy brackets, shell quoting, corpus counts, super gate table, envelope scoring/comparison, ledger cache, receipt eligibility, and the selective/only subset builders all passed
+   policy/data brackets are inert; the cgroup bracket runs only inside a bounded disposable scope and neither publishes nor writes the real ledger
+   nodes: none executed (stopped before the DAG ran)
+   durable log: (none — stopped before one was opened)
+   wall 5m01s | CPU 3m25s (user 3m09s, sys 17s) | CPU/wall 0.7x across 1 cores
+FINAL_VALIDATE_STATUS: PASSED
+test-harness: completed 7 independent validation audits with up to 2 concurrent workers
+PASS: 13 YAML manifests, 734 required cells

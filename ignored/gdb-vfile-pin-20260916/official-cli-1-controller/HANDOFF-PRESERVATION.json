@@ -1,0 +1,8 @@
+{
+  "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/HANDOFF.md",
+  "preserved": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/HANDOFF-preserved.md",
+  "sha256": "d079649b74ab74668a334c5739a911ce63b0bcd3ff34e0b8433232e943f8170e",
+  "bytes": 1112,
+  "operation": "rename own untracked handoff into own ignored evidence; restore exact bytes after terminal",
+  "no_source_exemption": true
+}

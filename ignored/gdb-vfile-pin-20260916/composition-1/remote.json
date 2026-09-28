@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "/usr/bin/with-proxy",
+    "git",
+    "ls-remote",
+    "origin",
+    "refs/heads/main"
+  ],
+  "actual_exit": 0,
+  "seconds": 0.4348562238737941
+}

@@ -1,0 +1,143 @@
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+spec = json.loads(Path(sys.argv[1]).read_text())
+out = Path(spec['output']) / 'observer'
+slot = Path(spec['source'])
+log = Path(spec['output']) / 'FULL.log'
+def save(name, value):
+    with (out / name).open('x') as f:
+        json.dump(value, f, indent=2)
+        f.write('\n')
+def proc(pid):
+    raw = Path(f'/proc/{pid}/stat').read_text()
+    tail = raw.rsplit(') ', 1)[1].split()
+    return {'pid': pid, 'start': int(tail[19]), 'ppid': int(tail[1]), 'state': tail[0]}
+def props(unit):
+    names = 'Id,LoadState,ActiveState,SubState,InvocationID,ControlGroup,MemoryMax,MemorySwapMax,CPUQuotaPerSecUSec,TasksMax,RuntimeMaxUSec,Result'
+    p = subprocess.run(['systemctl', '--user', 'show', unit, '--property=' + names], capture_output=True, text=True, timeout=5)
+    assert p.returncode == 0, p.stderr
+    return dict(line.split('=', 1) for line in p.stdout.splitlines())
+def live(pid, start, fd):
+    assert proc(pid)['start'] == start, 'driver generation changed'
+    signal.pidfd_send_signal(fd, 0)
+def snapshot(path):
+    names = ['cpu.max', 'cpu.stat', 'memory.max', 'memory.swap.max', 'memory.oom.group',
+             'memory.events', 'memory.events.local', 'memory.current', 'memory.peak',
+             'pids.max', 'pids.current', 'pids.peak', 'pids.events', 'cgroup.events', 'cgroup.procs']
+    result = {}
+    for name in names:
+        try:
+            result[name] = (path / name).read_text()
+        except OSError as e:
+            result[name] = {'errno': e.errno, 'error': str(e)}
+    return result
+host = subprocess.run(['python3', '/home/newton/work/dev-hermit/ci-hub/health/host_process_context.py'], capture_output=True, text=True)
+save('host-view.json', {'exit_code': host.returncode, 'stdout': host.stdout, 'stderr': host.stderr})
+assert host.returncode == 0
+started = time.monotonic()
+binding = None
+fd = None
+errors = []
+terminal = None
+try:
+    while time.monotonic() - started < 600:
+        text = log.read_text(errors='replace') if log.exists() else ''
+        names = set(re.findall(r're-exec inside transient systemd scope (dagrun-\d+\.scope)', text))
+        assert len(names) <= 1, 'ambiguous actual driver scope in owned log'
+        if not names:
+            if (Path(spec['output']) / 'launcher-result.json').exists():
+                raise RuntimeError('driver ended before an actual scope was bound')
+            time.sleep(.2)
+            continue
+        unit = next(iter(names))
+        p = props(unit)
+        if p['ActiveState'] != 'active' or not p['InvocationID']:
+            time.sleep(.2)
+            continue
+        pid = int(unit.removeprefix('dagrun-').removesuffix('.scope'))
+        before = proc(pid)
+        fd = os.pidfd_open(pid)
+        live(pid, before['start'], fd)
+        base = Path(f'/proc/{pid}')
+        argv = [part.decode() for part in (base / 'cmdline').read_bytes().split(b'\0') if part]
+        exe = os.readlink(base / 'exe')
+        assert os.readlink(base / 'cwd') == str(slot)
+        assert argv[1:] == spec['driver_arguments'] and Path(exe).name.startswith('validate_')
+        # Read only the named non-secret run identity into retained evidence.
+        env = dict(item.split(b'=', 1) for item in (base / 'environ').read_bytes().split(b'\0') if b'=' in item)
+        assert env.get(b'E2E_RUN_ID') == spec['run_id'].encode()
+        del env
+        group = Path('/sys/fs/cgroup' + p['ControlGroup'])
+        membership = (base / 'cgroup').read_text().strip()
+        if membership != '0::' + p['ControlGroup'] + '/supervisor':
+            os.close(fd)
+            fd = None
+            time.sleep(.2)
+            continue
+        st = group.stat()
+        digest = hashlib.sha256((base / 'exe').read_bytes()).hexdigest()
+        live(pid, before['start'], fd)
+        again = props(unit)
+        assert again['InvocationID'] == p['InvocationID'] and again['ControlGroup'] == p['ControlGroup']
+        binding = {'unit': unit, 'invocation_id': p['InvocationID'], 'driver': before, 'argv': argv,
+                   'cwd': str(slot), 'exe': exe, 'exe_sha256': digest, 'run_id': spec['run_id'],
+                   'cgroup': str(group), 'device': st.st_dev, 'inode': st.st_ino,
+                   'properties': p, 'first_raw': snapshot(group), 'time_ns': time.time_ns(),
+                   'attachment_seconds': time.monotonic() - started,
+                   'authority': 'owned log selects candidate only; pidfd/generation/cwd/argv/exe/run-id/InvocationID/supervisor/cgroup inode verified'}
+        save('binding.json', binding)
+        break
+    assert binding is not None, 'no authenticated actual scope within attachment bound'
+    group = Path(binding['cgroup'])
+    known = {}
+    with (out / 'observations.jsonl').open('x') as stream:
+        while time.monotonic() - started < spec['observer_seconds']:
+            if not group.exists():
+                terminal = {'time_ns': time.time_ns(), 'cgroup_exists': False, 'properties': props(binding['unit'])}
+                break
+            st = group.stat()
+            assert (st.st_dev, st.st_ino) == (binding['device'], binding['inode'])
+            p = props(binding['unit'])
+            assert p['InvocationID'] == binding['invocation_id']
+            groups = [group]
+            rows = []
+            while groups:
+                current = groups.pop()
+                if len(rows) >= 8192:
+                    raise RuntimeError('owned cgroup subtree exceeds observation bound')
+                try:
+                    st = current.stat()
+                    identity = (st.st_dev, st.st_ino)
+                    key = str(current.relative_to(group))
+                    if key in known and known[key] != identity:
+                        raise RuntimeError('cgroup path reused with another inode: ' + key)
+                    known[key] = identity
+                    rows.append({'relative': key, 'device': st.st_dev, 'inode': st.st_ino, 'raw': snapshot(current)})
+                    groups.extend(p for p in current.iterdir() if p.is_dir() and not p.is_symlink())
+                except FileNotFoundError:
+                    rows.append({'relative': str(current.relative_to(group)), 'vanished_during_sample': True})
+            if stream.tell() > 128 * 1024 * 1024:
+                raise RuntimeError('observer output exceeded128MiB; no complete observation claim')
+            stream.write(json.dumps({'time_ns': time.time_ns(), 'properties': p, 'groups': rows}) + '\n')
+            stream.flush()
+            time.sleep(1)
+        assert terminal is not None, 'observer deadline reached before actual scope absence'
+        assert terminal['properties']['ActiveState'] == 'inactive'
+except BaseException as error:
+    errors.append(repr(error))
+    raise
+finally:
+    if fd is not None:
+        os.close(fd)
+    save('result.json', {'elapsed_seconds': time.monotonic() - started, 'binding_present': binding is not None,
+                         'terminal': terminal, 'errors': errors,
+                         'limitations': 'one-second samples may miss short child groups/final counter increments; native driver profiles remain authoritative; never bootstrap-only coverage',
+                         'workload_signals_sent': False})

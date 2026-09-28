@@ -1,0 +1,29 @@
+Scope: scanned 18 tracked Cargo.toml and 3 tracked Cargo.lock files; 10 files contain 46 Reverie revision entries.
+Scope exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included.
+Pin read from checkout HEAD 932f7130ea3c77dcdb2547b6834f46f08bf593f0.
+LiteInst cache keys: 0 revision-keyed token(s) all track the pin (d87a03a).
+DBT budget bindings: 3 binding(s) all equal the pin (d87a03a).
+Reverie pin is locally consistent: d87a03a312421d34dee81dae71aa395b40231e63 (46 revision entries across 10 tracked Cargo metadata files; remote policy not evaluated, --offline)
+Scope: 21 tracked Cargo metadata file(s) PLUS tracked submodule gitlinks; 5 git dependency/ies pinned. Untracked, generated and vendored copies are EXCLUDED by design.
+  OK    https://github.com/facebookexperimental/rust-shed  4 entries @ 84a82026bc1d
+  FLOAT https://github.com/facebookexperimental/rust-shed  tracked by branch=main -- KNOWN EXCEPTION: branch=main since before 2026-08-24; the manifests are autocargo-generated from Meta's internal Buck targets, so pinning it is an owner decision rather than a hand edit. Only the lockfile records what was built (84a82026 at time of writing). Filed separately.
+  OK    https://github.com/rr-debugger/rr  1 entry @ 39e5c18e7e43
+  OK    https://github.com/rrnewton/agent-utils  1 entry @ 2781b1054efc
+  OK    https://github.com/rrnewton/liteinst2  2 entries @ 95ee5e6917fa
+  OK    https://github.com/rrnewton/reverie  46 entries @ d87a03a31242
+check-git-pin-uniformity.rs: OK -- every REVISION-PINNED git dependency is pinned at exactly one revision
+  ⚠️ 1 dependency/ies are NOT PINNED AT ALL and were excluded from that statement, by approved exception: https://github.com/facebookexperimental/rust-shed
+  A BRANCH IS NOT A PIN -- it moves under you. Uniformity cannot be asserted over a dependency that names one.
+Scope: 21 tracked Cargo metadata file(s) PLUS tracked submodule gitlinks; 5 git dependency/ies pinned. Untracked, generated and vendored copies are EXCLUDED by design.
+  OK    https://github.com/facebookexperimental/rust-shed  4 entries @ 84a82026bc1d
+  FLOAT https://github.com/facebookexperimental/rust-shed  tracked by branch=main -- KNOWN EXCEPTION: branch=main since before 2026-08-24; the manifests are autocargo-generated from Meta's internal Buck targets, so pinning it is an owner decision rather than a hand edit. Only the lockfile records what was built (84a82026 at time of writing). Filed separately.
+  OK    https://github.com/rr-debugger/rr  1 entry @ 39e5c18e7e43
+  OK    https://github.com/rrnewton/agent-utils  1 entry @ 2781b1054efc
+  OK    https://github.com/rrnewton/liteinst2  2 entries @ 95ee5e6917fa
+  OK    https://github.com/rrnewton/reverie  46 entries @ d87a03a31242
+check-git-pin-uniformity.rs: OK -- every REVISION-PINNED git dependency is pinned at exactly one revision
+  ⚠️ 1 dependency/ies are NOT PINNED AT ALL and were excluded from that statement, by approved exception: https://github.com/facebookexperimental/rust-shed
+  A BRANCH IS NOT A PIN -- it moves under you. Uniformity cannot be asserted over a dependency that names one.
+Scope: checking 1 nested Cargo workspace(s) for lockfile freshness (liteinst-runtime-build).
+OK: liteinst-runtime-build/Cargo.lock is fresh versus its manifest.
+All 1 nested workspace lockfile(s) are fresh.

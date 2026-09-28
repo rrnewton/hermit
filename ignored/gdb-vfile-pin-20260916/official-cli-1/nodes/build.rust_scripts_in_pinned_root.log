@@ -1,0 +1,782 @@
+dns github.com: refused (gaierror)
+dns crates.io: refused (gaierror)
+dns static.crates.io: refused (gaierror)
+assert-no-network: route-table: no route (0 non-loopback routes, 0 non-loopback interfaces)
+assert-no-network: dns github.com: refused
+assert-no-network: dns crates.io: refused
+assert-no-network: dns static.crates.io: refused
+assert-no-network: tcp 1.1.1.1:443: refused
+assert-no-network: tcp 8.8.8.8:53: refused
+assert-no-network: OK -- no route, no DNS, no raw TCP. This environment is isolated.
+assert-build-dependencies: OK -- 18/18 executable build dependencies are present.
+assert-build-dependencies: OK -- 4/4 native libraries and development headers are present.
+assert-build-dependencies: OK -- 87/87 absolute guest paths are executable files.
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/5f829a04c0a8df85/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/ea43a74c69f612af/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/914eb5845ec9abe9/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/59ea0555bb7bb866/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/2162d8a3b81d996d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/74f4de48268e496d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cfee71cd74153651/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/dbfbd1f3870f1cf4/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/344d4004465230b9/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cd189eff27bcb3f6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/91a6f85b46f9a093/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/a1bd4437bae839b6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/6b330abf7c0ddfd4/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/55ba5f117f6432d6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/40aa044d7d34c808/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/f8017f227c95ed9a/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/93265ab9957e4aba/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/2952a53430d12a42/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cae18980d4930ac8/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/62ac2bfb61938d72/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/76d1a06784c51374/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/e306610591edf591/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/d409f34a1c6de4ee/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/fc33cf509da19b1c/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/3872522b0d01e12d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/81da3f1d442cc879/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/b7908774f65bce43/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/6972560c9ef2290f/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+     Locking 217 packages to latest compatible versions
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding sha2 v0.10.9 (available: v0.11.0)
+      Adding syn v2.0.119 (available: v3.0.6)
+      Adding toml v0.8.23 (available: v1.1.4+spec-1.1.0)
+      Adding toml_edit v0.22.27 (available: v0.25.13+spec-1.1.0)
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.25
+   Compiling serde_core v1.0.229
+   Compiling serde v1.0.229
+   Compiling libc v0.2.189
+    Checking memchr v2.8.3
+    Checking cfg-if v1.0.5
+   Compiling autocfg v1.5.1
+    Checking itoa v1.0.18
+    Checking hashbrown v0.17.1
+    Checking equivalent v1.0.2
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling rustix v1.1.5
+   Compiling libm v0.2.16
+   Compiling num-traits v0.2.19
+   Compiling version_check v0.9.5
+    Checking pin-project-lite v0.2.17
+    Checking indexmap v2.14.2
+    Checking linux-raw-sys v0.12.1
+   Compiling generic-array v0.14.7
+   Compiling syn v3.0.6
+   Compiling syn v2.0.119
+   Compiling memoffset v0.9.1
+   Compiling syscalls v0.6.18
+   Compiling cfg_aliases v0.2.2
+    Checking ryu v1.0.23
+   Compiling nix v0.30.1
+    Checking typenum v1.20.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling paste v1.0.15
+    Checking errno v0.3.14
+   Compiling convert_case v0.6.0
+    Checking signal-hook-registry v1.4.8
+    Checking utf8parse v0.2.2
+   Compiling virtue v0.0.18
+   Compiling unicode-xid v0.2.6
+    Checking iana-time-zone v0.1.65
+    Checking anstyle-parse v1.0.0
+    Checking bitflags v2.13.2
+    Checking unty v0.0.4
+    Checking colorchoice v1.0.5
+   Compiling anyhow v1.0.104
+    Checking anstyle v1.0.14
+   Compiling radium v0.7.0
+   Compiling bincode_derive v2.0.1
+    Checking once_cell v1.21.4
+    Checking anstyle-query v1.1.5
+    Checking unicode-width v0.2.2
+    Checking is_terminal_polyfill v1.70.2
+    Checking anstream v1.0.0
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking tap v1.0.1
+   Compiling heck v0.5.0
+   Compiling signal-hook v0.4.4
+    Checking strsim v0.11.1
+    Checking unicase v2.9.0
+   Compiling crc32fast v1.5.2
+    Checking clap_lex v1.1.1
+    Checking rand_core v0.10.1
+    Checking wyz v0.5.1
+    Checking digest v0.10.7
+    Checking tracing-core v0.1.36
+    Checking funty v2.0.0
+    Checking simd-adler32 v0.3.10
+    Checking unsafe-libyaml-norway v0.2.15
+   Compiling getrandom v0.4.3
+    Checking cpufeatures v0.2.17
+    Checking adler2 v2.0.1
+    Checking sha2 v0.10.9
+    Checking miniz_oxide v0.9.1
+    Checking unsafe-libyaml v0.2.11
+    Checking bytesize v2.7.0
+    Checking futures-sink v0.3.34
+   Compiling parking_lot_core v0.9.12
+    Checking futures-core v0.3.34
+    Checking shell-words v1.1.1
+    Checking smallvec v1.16.1
+    Checking futures-channel v0.3.34
+    Checking flate2 v1.1.10
+    Checking futures-task v0.3.34
+    Checking scopeguard v1.2.0
+    Checking slab v0.4.12
+    Checking futures v0.1.31
+    Checking futures-io v0.3.34
+    Checking lock_api v0.4.14
+    Checking twox-hash v2.1.4
+    Checking static_assertions v1.1.0
+   Compiling object v0.39.1
+   Compiling thiserror v2.0.20
+   Compiling cpp_demangle v0.5.1
+   Compiling serde_derive v1.0.229
+   Compiling serde_repr v0.1.21
+   Compiling clap_derive v4.6.7
+   Compiling futures-macro v0.3.34
+    Checking terminal_size v0.4.4
+   Compiling thiserror-impl v2.0.20
+   Compiling tokio-macros v2.7.2
+    Checking clap_builder v4.6.7
+    Checking futures-util v0.3.34
+    Checking parking_lot v0.12.5
+   Compiling derive_more-impl v1.0.0
+   Compiling tracing-attributes v0.1.31
+    Checking twox-hash v1.6.3
+    Checking ruzstd v0.8.3
+    Checking mio v1.2.3
+    Checking socket2 v0.6.5
+    Checking toml_write v0.1.2
+    Checking typed-arena v2.0.2
+    Checking clap v4.6.7
+    Checking fastrand v2.5.0
+    Checking hex v0.4.3
+    Checking lazy_static v1.5.0
+    Checking cpufeatures v0.3.1
+   Compiling procfs v0.18.0
+   Compiling object v0.36.7
+    Checking foldhash v0.1.5
+    Checking bytes v1.12.1
+    Checking winnow v0.7.15
+    Checking tracing v0.1.44
+    Checking hashbrown v0.15.5
+    Checking tempfile v3.27.0
+    Checking chacha20 v0.10.2
+    Checking colored v2.2.0
+    Checking tokio v1.53.1
+    Checking ruzstd v0.7.3
+    Checking memmap2 v0.9.11
+    Checking aho-corasick v1.1.5
+    Checking chrono v0.4.45
+    Checking bincode v2.0.1
+    Checking reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Checking bitvec v1.1.1
+    Checking serde_norway v0.9.42
+    Checking serde_yaml v0.9.34+deprecated
+    Checking futures-executor v0.3.34
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking futures v0.3.34
+    Checking procfs-core v0.18.0
+    Checking toml_edit v0.22.27
+    Checking dagrun v0.15.0 (/src/agent-utils/rs/dagrun)
+    Checking regex-syntax v0.8.11
+    Checking derive_more v1.0.0
+    Checking reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Checking rustc-demangle v0.1.28
+    Checking gimli v0.33.0
+    Checking fallible-iterator v0.3.0
+    Checking bitflags v1.3.2
+    Checking raw-cpuid v10.7.0
+    Checking regex-automata v0.4.18
+    Checking linked-hash-map v0.5.6
+    Checking reverie-process v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Checking rand v0.10.2
+   Compiling async-trait v0.1.92
+    Checking csv-core v0.1.13
+    Checking never-say-never v6.6.666
+    Checking yansi v1.0.1
+    Checking diff v0.1.13
+    Checking arrayvec v0.5.2
+    Checking byteorder v1.5.0
+    Checking pretty v0.12.5
+    Checking pretty_assertions v1.4.1
+    Checking rand_distr v0.6.0
+    Checking csv v1.4.0
+    Checking addr2line v0.26.1
+    Checking toml v0.8.23
+    Checking regex v1.13.1
+    Checking rand_pcg v0.10.2
+    Checking fs2 v0.4.3
+    Checking manifest-to-commands_ae038590b4b5f62da894fdfc v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/fc33cf509da19b1c)
+    Checking update_spreadsheet_5f1a7faed20eb82f1dfa39eb v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/81da3f1d442cc879)
+    Checking nextest-timeout-config_cf4d3b7f5856ee8874c5312c v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/2162d8a3b81d996d)
+    Checking manifest-cli_ebb7bfae82ac044bd62e8e23 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/6972560c9ef2290f)
+    Checking hermit-code-coverage_3185d390edb9c474def1a04a v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/e306610591edf591)
+    Checking bisect-probe_5fbc8958596ecb395ae09162 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/344d4004465230b9)
+    Checking select-tests_98c0b900b8f79b18e4ccb7de v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cfee71cd74153651)
+    Checking power-to-weight_b29cb4e2b3ad561a802287ed v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/74f4de48268e496d)
+    Checking structured-test-results_ee4c6de738f77fba1bf5c48f v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/dbfbd1f3870f1cf4)
+    Checking nextest-test-results_612a44975661ea992fd66d52 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/59ea0555bb7bb866)
+    Checking docs-pages-contract_e0d2d6cb1f1a9032b32db343 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/76d1a06784c51374)
+    Checking check-record-version-floor_ac15c5ed7a71f36bd8258df1 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/f8017f227c95ed9a)
+    Checking check-exit-status-class_28b6c2fda2c440424a74f8d8 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/a1bd4437bae839b6)
+    Checking check-nested-lockfiles_ff9ce396fe45301dff1bdd6d v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/40aa044d7d34c808)
+    Checking detcore-model v0.2.0 (/src/detcore-model)
+    Checking runner_health_8a372051316cb63778a98cef v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/3872522b0d01e12d)
+    Checking check-skill-discovery_b86b09f32d17243a98f6a689 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/2952a53430d12a42)
+    Checking check-dbt-runtime-abi_1a4eb072226540516395dcd2 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/91a6f85b46f9a093)
+    Checking check-github-actions-triggers_41686efb6533ea36c8d5958c v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/55ba5f117f6432d6)
+    Checking log_timeslice_cf7630744e3948982192a48b v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/d409f34a1c6de4ee)
+    Checking check-reverie-pin_91e08fe1d4e3305b596f312d v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/93265ab9957e4aba)
+    Checking check-checker-scheduling_b093feb8b909755434079bd2 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cd189eff27bcb3f6)
+    Checking check-git-pin-uniformity_4df9d3b82ebc36a6f946ef23 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/6b330abf7c0ddfd4)
+    Checking reverie-core v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Checking detcore-backend-source_d4929287aa1a1bcd44485448 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/62ac2bfb61938d72)
+    Checking hermit-manifest-plan v0.2.0 (/src/ci/manifest-plan)
+    Checking hermit-detcore v0.2.0 (/src/detcore)
+    Checking validate_d47fa2fb645760353d03e1fc v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/b7908774f65bce43)
+    Checking nextest-binaries_a8cca7602d87183074ad8e98 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/914eb5845ec9abe9)
+    Checking scorecard_753d765b8f6b6aad8ab4aea6 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/ea43a74c69f612af)
+    Checking pressure-test_b59e2627fef235cd282d47aa v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/5f829a04c0a8df85)
+    Checking cross-backend-detlog-diff_a3faf6a1e04a16d7e5261625 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cae18980d4930ac8)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.54s
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/5f829a04c0a8df85/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/ea43a74c69f612af/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/914eb5845ec9abe9/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/59ea0555bb7bb866/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/2162d8a3b81d996d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/74f4de48268e496d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cfee71cd74153651/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/dbfbd1f3870f1cf4/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/344d4004465230b9/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cd189eff27bcb3f6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/91a6f85b46f9a093/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/a1bd4437bae839b6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/6b330abf7c0ddfd4/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/55ba5f117f6432d6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/40aa044d7d34c808/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/f8017f227c95ed9a/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/93265ab9957e4aba/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/2952a53430d12a42/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cae18980d4930ac8/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/62ac2bfb61938d72/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/76d1a06784c51374/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/e306610591edf591/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/d409f34a1c6de4ee/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/fc33cf509da19b1c/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/3872522b0d01e12d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/81da3f1d442cc879/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/b7908774f65bce43/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/6972560c9ef2290f/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.25
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.189
+   Compiling serde v1.0.229
+   Compiling memchr v2.8.3
+   Compiling cfg-if v1.0.5
+   Compiling itoa v1.0.18
+   Compiling autocfg v1.5.1
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.2
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling libm v0.2.16
+   Compiling rustix v1.1.5
+   Compiling num-traits v0.2.19
+   Compiling version_check v0.9.5
+   Compiling pin-project-lite v0.2.17
+   Compiling syn v3.0.6
+   Compiling linux-raw-sys v0.12.1
+   Compiling syn v2.0.119
+   Compiling indexmap v2.14.2
+   Compiling generic-array v0.14.7
+   Compiling memoffset v0.9.1
+   Compiling syscalls v0.6.18
+   Compiling cfg_aliases v0.2.2
+   Compiling ryu v1.0.23
+   Compiling nix v0.30.1
+   Compiling typenum v1.20.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling paste v1.0.15
+   Compiling errno v0.3.14
+   Compiling signal-hook-registry v1.4.8
+   Compiling convert_case v0.6.0
+   Compiling utf8parse v0.2.2
+   Compiling iana-time-zone v0.1.65
+   Compiling bitflags v2.13.2
+   Compiling virtue v0.0.18
+   Compiling unicode-xid v0.2.6
+   Compiling anstyle-parse v1.0.0
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling radium v0.7.0
+   Compiling once_cell v1.21.4
+   Compiling anstyle-query v1.1.5
+   Compiling unicode-width v0.2.2
+   Compiling bincode_derive v2.0.1
+   Compiling anyhow v1.0.104
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling unty v0.0.4
+   Compiling anstream v1.0.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling signal-hook v0.4.4
+   Compiling strsim v0.11.1
+   Compiling unicase v2.9.0
+   Compiling crc32fast v1.5.2
+   Compiling serde_derive v1.0.229
+   Compiling serde_repr v0.1.21
+   Compiling clap_lex v1.1.1
+   Compiling rand_core v0.10.1
+   Compiling tap v1.0.1
+   Compiling heck v0.5.0
+   Compiling wyz v0.5.1
+   Compiling clap_derive v4.6.7
+   Compiling digest v0.10.7
+   Compiling derive_more-impl v1.0.0
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing-core v0.1.36
+   Compiling funty v2.0.0
+   Compiling terminal_size v0.4.4
+   Compiling clap_builder v4.6.7
+   Compiling simd-adler32 v0.3.10
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling cpufeatures v0.2.17
+   Compiling getrandom v0.4.3
+   Compiling adler2 v2.0.1
+   Compiling chrono v0.4.45
+   Compiling bincode v2.0.1
+   Compiling reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling serde_norway v0.9.42
+   Compiling bitvec v1.1.1
+   Compiling derive_more v1.0.0
+   Compiling reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling clap v4.6.7
+   Compiling miniz_oxide v0.9.1
+   Compiling sha2 v0.10.9
+   Compiling tracing v0.1.44
+   Compiling unsafe-libyaml v0.2.11
+   Compiling bytesize v2.7.0
+   Compiling futures-sink v0.3.34
+   Compiling parking_lot_core v0.9.12
+   Compiling futures-core v0.3.34
+   Compiling shell-words v1.1.1
+   Compiling smallvec v1.16.1
+   Compiling futures-channel v0.3.34
+   Compiling dagrun v0.15.0 (/src/agent-utils/rs/dagrun)
+   Compiling flate2 v1.1.10
+   Compiling futures-macro v0.3.34
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling futures-task v0.3.34
+   Compiling scopeguard v1.2.0
+   Compiling slab v0.4.12
+   Compiling futures v0.1.31
+   Compiling futures-io v0.3.34
+   Compiling lock_api v0.4.14
+   Compiling twox-hash v2.1.4
+   Compiling static_assertions v1.1.0
+   Compiling object v0.39.1
+   Compiling detcore-model v0.2.0 (/src/detcore-model)
+   Compiling thiserror v2.0.20
+   Compiling cpp_demangle v0.5.1
+   Compiling futures-util v0.3.34
+   Compiling parking_lot v0.12.5
+   Compiling twox-hash v1.6.3
+   Compiling ruzstd v0.8.3
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling thiserror-impl v2.0.20
+   Compiling tokio-macros v2.7.2
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling fastrand v2.5.0
+   Compiling hex v0.4.3
+   Compiling lazy_static v1.5.0
+   Compiling futures-executor v0.3.34
+   Compiling cpufeatures v0.3.1
+   Compiling procfs v0.18.0
+   Compiling object v0.36.7
+   Compiling foldhash v0.1.5
+   Compiling bytes v1.12.1
+   Compiling winnow v0.7.15
+   Compiling toml_write v0.1.2
+   Compiling typed-arena v2.0.2
+   Compiling hashbrown v0.15.5
+   Compiling futures v0.3.34
+   Compiling chacha20 v0.10.2
+   Compiling tokio v1.53.1
+   Compiling colored v2.2.0
+   Compiling procfs-core v0.18.0
+   Compiling tempfile v3.27.0
+   Compiling toml_edit v0.22.27
+   Compiling ruzstd v0.7.3
+   Compiling hermit-manifest-plan v0.2.0 (/src/ci/manifest-plan)
+   Compiling memmap2 v0.9.11
+   Compiling aho-corasick v1.1.5
+   Compiling regex-syntax v0.8.11
+   Compiling rustc-demangle v0.1.28
+   Compiling gimli v0.33.0
+   Compiling fallible-iterator v0.3.0
+   Compiling bitflags v1.3.2
+   Compiling addr2line v0.26.1
+   Compiling raw-cpuid v10.7.0
+   Compiling regex-automata v0.4.18
+   Compiling reverie-process v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling rand v0.10.2
+   Compiling linked-hash-map v0.5.6
+   Compiling async-trait v0.1.92
+   Compiling csv-core v0.1.13
+   Compiling never-say-never v6.6.666
+   Compiling yansi v1.0.1
+   Compiling diff v0.1.13
+   Compiling arrayvec v0.5.2
+   Compiling byteorder v1.5.0
+   Compiling reverie-core v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling pretty v0.12.5
+   Compiling pretty_assertions v1.4.1
+   Compiling csv v1.4.0
+   Compiling rand_distr v0.6.0
+   Compiling regex v1.13.1
+   Compiling toml v0.8.23
+   Compiling rand_pcg v0.10.2
+   Compiling hermit-detcore v0.2.0 (/src/detcore)
+   Compiling fs2 v0.4.3
+   Compiling manifest-to-commands_ae038590b4b5f62da894fdfc v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/fc33cf509da19b1c)
+   Compiling update_spreadsheet_5f1a7faed20eb82f1dfa39eb v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/81da3f1d442cc879)
+   Compiling nextest-timeout-config_cf4d3b7f5856ee8874c5312c v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/2162d8a3b81d996d)
+   Compiling manifest-cli_ebb7bfae82ac044bd62e8e23 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/6972560c9ef2290f)
+   Compiling hermit-code-coverage_3185d390edb9c474def1a04a v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/e306610591edf591)
+   Compiling select-tests_98c0b900b8f79b18e4ccb7de v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cfee71cd74153651)
+   Compiling power-to-weight_b29cb4e2b3ad561a802287ed v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/74f4de48268e496d)
+   Compiling bisect-probe_5fbc8958596ecb395ae09162 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/344d4004465230b9)
+   Compiling docs-pages-contract_e0d2d6cb1f1a9032b32db343 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/76d1a06784c51374)
+   Compiling check-exit-status-class_28b6c2fda2c440424a74f8d8 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/a1bd4437bae839b6)
+   Compiling check-nested-lockfiles_ff9ce396fe45301dff1bdd6d v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/40aa044d7d34c808)
+   Compiling check-skill-discovery_b86b09f32d17243a98f6a689 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/2952a53430d12a42)
+   Compiling check-dbt-runtime-abi_1a4eb072226540516395dcd2 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/91a6f85b46f9a093)
+   Compiling check-github-actions-triggers_41686efb6533ea36c8d5958c v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/55ba5f117f6432d6)
+   Compiling runner_health_8a372051316cb63778a98cef v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/3872522b0d01e12d)
+   Compiling check-reverie-pin_91e08fe1d4e3305b596f312d v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/93265ab9957e4aba)
+   Compiling check-checker-scheduling_b093feb8b909755434079bd2 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cd189eff27bcb3f6)
+   Compiling log_timeslice_cf7630744e3948982192a48b v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/d409f34a1c6de4ee)
+   Compiling check-git-pin-uniformity_4df9d3b82ebc36a6f946ef23 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/6b330abf7c0ddfd4)
+   Compiling check-record-version-floor_ac15c5ed7a71f36bd8258df1 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/f8017f227c95ed9a)
+   Compiling detcore-backend-source_d4929287aa1a1bcd44485448 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/62ac2bfb61938d72)
+   Compiling structured-test-results_ee4c6de738f77fba1bf5c48f v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/dbfbd1f3870f1cf4)
+   Compiling nextest-test-results_612a44975661ea992fd66d52 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/59ea0555bb7bb866)
+   Compiling validate_d47fa2fb645760353d03e1fc v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/b7908774f65bce43)
+   Compiling nextest-binaries_a8cca7602d87183074ad8e98 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/914eb5845ec9abe9)
+   Compiling scorecard_753d765b8f6b6aad8ab4aea6 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/ea43a74c69f612af)
+   Compiling pressure-test_b59e2627fef235cd282d47aa v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/5f829a04c0a8df85)
+   Compiling cross-backend-detlog-diff_a3faf6a1e04a16d7e5261625 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cae18980d4930ac8)
+    Finished `release` profile [optimized] target(s) in 1m 14s
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/5f829a04c0a8df85/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/ea43a74c69f612af/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/914eb5845ec9abe9/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/59ea0555bb7bb866/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/2162d8a3b81d996d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/74f4de48268e496d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cfee71cd74153651/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/dbfbd1f3870f1cf4/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/344d4004465230b9/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cd189eff27bcb3f6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/91a6f85b46f9a093/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/a1bd4437bae839b6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/6b330abf7c0ddfd4/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/55ba5f117f6432d6/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/40aa044d7d34c808/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/f8017f227c95ed9a/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/93265ab9957e4aba/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/2952a53430d12a42/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/cae18980d4930ac8/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/62ac2bfb61938d72/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/76d1a06784c51374/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/e306610591edf591/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/d409f34a1c6de4ee/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/fc33cf509da19b1c/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/3872522b0d01e12d/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/81da3f1d442cc879/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/b7908774f65bce43/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/hermit-rust-script-packages.6FMB6wJk/6972560c9ef2290f/Cargo.toml
+workspace: /tmp/hermit-rust-script-packages.6FMB6wJk/Cargo.toml
+   Compiling itoa v1.0.18
+   Compiling hashbrown v0.17.1
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.189
+   Compiling equivalent v1.0.2
+   Compiling memchr v2.8.3
+   Compiling syn v3.0.6
+   Compiling zmij v1.0.23
+   Compiling cfg-if v1.0.5
+   Compiling rustix v1.1.5
+   Compiling ryu v1.0.23
+   Compiling linux-raw-sys v0.12.1
+   Compiling typenum v1.20.1
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling indexmap v2.14.2
+   Compiling num-traits v0.2.19
+   Compiling anstyle v1.0.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling colorchoice v1.0.5
+   Compiling once_cell v1.21.4
+   Compiling anstyle-query v1.1.5
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling anstream v1.0.0
+   Compiling generic-array v0.14.7
+   Compiling memoffset v0.9.1
+   Compiling unicase v2.9.0
+   Compiling unicode-width v0.2.2
+   Compiling tap v1.0.1
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.1
+   Compiling wyz v0.5.1
+   Compiling errno v0.3.14
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling radium v0.7.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling digest v0.10.7
+   Compiling derive_more v1.0.0
+   Compiling tracing-core v0.1.36
+   Compiling signal-hook v0.4.4
+   Compiling winnow v0.7.15
+   Compiling toml_write v0.1.2
+   Compiling iana-time-zone v0.1.65
+   Compiling unsafe-libyaml v0.2.11
+   Compiling pin-project-lite v0.2.17
+   Compiling unty v0.0.4
+   Compiling funty v2.0.0
+   Compiling cpufeatures v0.2.17
+   Compiling tracing v0.1.44
+   Compiling sha2 v0.10.9
+   Compiling bitflags v2.13.2
+   Compiling serde_json v1.0.151
+   Compiling anyhow v1.0.104
+   Compiling nix v0.30.1
+   Compiling getrandom v0.4.3
+   Compiling bytesize v2.7.0
+   Compiling shell-words v1.1.1
+   Compiling csv-core v0.1.13
+   Compiling fastrand v2.5.0
+   Compiling csv v1.4.0
+   Compiling check-checker-scheduling_b093feb8b909755434079bd2 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/cd189eff27bcb3f6)
+   Compiling runner_health_8a372051316cb63778a98cef v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/3872522b0d01e12d)
+   Compiling check-reverie-pin_91e08fe1d4e3305b596f312d v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/93265ab9957e4aba)
+   Compiling check-exit-status-class_28b6c2fda2c440424a74f8d8 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/a1bd4437bae839b6)
+   Compiling serde_derive v1.0.229
+   Compiling serde_repr v0.1.21
+   Compiling clap_derive v4.6.7
+   Compiling bisect-probe_5fbc8958596ecb395ae09162 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/344d4004465230b9)
+   Compiling terminal_size v0.4.4
+   Compiling clap_builder v4.6.7
+   Compiling tempfile v3.27.0
+   Compiling check-nested-lockfiles_ff9ce396fe45301dff1bdd6d v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/40aa044d7d34c808)
+   Compiling docs-pages-contract_e0d2d6cb1f1a9032b32db343 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/76d1a06784c51374)
+   Compiling check-git-pin-uniformity_4df9d3b82ebc36a6f946ef23 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/6b330abf7c0ddfd4)
+   Compiling check-record-version-floor_ac15c5ed7a71f36bd8258df1 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/f8017f227c95ed9a)
+   Compiling check-github-actions-triggers_41686efb6533ea36c8d5958c v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/55ba5f117f6432d6)
+   Compiling clap v4.6.7
+   Compiling serde v1.0.229
+   Compiling syscalls v0.6.18
+   Compiling serde_norway v0.9.42
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling chrono v0.4.45
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling bitvec v1.1.1
+   Compiling toml_edit v0.22.27
+   Compiling bincode v2.0.1
+   Compiling reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling hermit-code-coverage_3185d390edb9c474def1a04a v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/e306610591edf591)
+   Compiling reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling dagrun v0.15.0 (/src/agent-utils/rs/dagrun)
+   Compiling toml v0.8.23
+   Compiling nextest-timeout-config_cf4d3b7f5856ee8874c5312c v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/2162d8a3b81d996d)
+   Compiling manifest-to-commands_ae038590b4b5f62da894fdfc v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/fc33cf509da19b1c)
+   Compiling detcore-model v0.2.0 (/src/detcore-model)
+   Compiling hermit-manifest-plan v0.2.0 (/src/ci/manifest-plan)
+   Compiling nextest-test-results_612a44975661ea992fd66d52 v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/59ea0555bb7bb866)
+   Compiling structured-test-results_ee4c6de738f77fba1bf5c48f v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/dbfbd1f3870f1cf4)
+   Compiling validate_d47fa2fb645760353d03e1fc v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/b7908774f65bce43)
+   Compiling pressure-test_b59e2627fef235cd282d47aa v0.1.0 (/tmp/hermit-rust-script-packages.6FMB6wJk/5f829a04c0a8df85)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.42s
+prepare-rust-scripts: built 28 entrypoints and 17 test harnesses in /src/target/ci/rust-scripts

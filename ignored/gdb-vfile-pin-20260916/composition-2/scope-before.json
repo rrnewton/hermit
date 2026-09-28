@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "systemctl",
+    "--user",
+    "show",
+    "hermit-gdb-vfile-pin-compose2-20260917.scope",
+    "--property=InvocationID,ControlGroup,CPUQuotaPerSecUSec,MemoryMax,MemorySwapMax,TasksMax,RuntimeMaxUSec"
+  ],
+  "actual_exit": 0,
+  "seconds": 0.008795375004410744
+}

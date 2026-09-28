@@ -1,0 +1,10 @@
+{
+  "path": "/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache",
+  "dev": 48,
+  "inode": 779192484,
+  "mode": 448,
+  "uid": 212630,
+  "cargo_manifest_ancestors": [],
+  "created_for": "own prior normal commit hook; now ordinary parent help preparation",
+  "outside_pin_workspace": true
+}

@@ -1,0 +1,35 @@
+[
+  {
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/gdb-replay-diagnostic-20260916/private-cache/cargo/registry/cache",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/registry/cache",
+    "actual_exit": 0,
+    "seconds": 2.7960996150504798,
+    "entries": 2048,
+    "bytes": 299796646,
+    "unchanged_donor": true,
+    "independent_inodes": true,
+    "copied_bytes_equal": true
+  },
+  {
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/gdb-replay-diagnostic-20260916/private-cache/cargo/registry/index",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/registry/index",
+    "actual_exit": 0,
+    "seconds": 1.6745938989333808,
+    "entries": 1366,
+    "bytes": 68271165,
+    "unchanged_donor": true,
+    "independent_inodes": true,
+    "copied_bytes_equal": true
+  },
+  {
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/gdb-replay-diagnostic-20260916/private-cache/cargo/git",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/git",
+    "actual_exit": 0,
+    "seconds": 9.162539640907198,
+    "entries": 16196,
+    "bytes": 703558677,
+    "unchanged_donor": true,
+    "independent_inodes": true,
+    "copied_bytes_equal": true
+  }
+]

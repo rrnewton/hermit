@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "with-proxy",
+    "/home/newton/work/dev-hermit/ci-hub/ci-hub",
+    "--help"
+  ],
+  "cwd": "/home/newton/work/dev-hermit",
+  "pid": 3640985,
+  "generation": 176005244,
+  "started_ns": 1789601123691895037
+}

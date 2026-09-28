@@ -1,0 +1,18 @@
+      # [2022.01.25] RN Created this file for the following.
+      [net]
+      git-fetch-with-cli = true   # use the `git` executable for git operations
+
+      # [2022.01.25] Messing with proxies.
+      [http]
+      # debug = false               # HTTP debugging
+      #proxy = "host:port"         # HTTP proxy in libcurl format
+      proxy = "fwdproxy:8080"         # HTTP proxy in libcurl format
+      #ssl-version = "tlsv1.3"     # TLS version to use
+      #ssl-version.max = "tlsv1.3" # maximum TLS version
+      #ssl-version.min = "tlsv1.1" # minimum TLS version
+      #timeout = 30                # timeout for each HTTP request, in seconds
+      #low-speed-limit = 10        # network timeout threshold (bytes/sec)
+      #cainfo = "cert.pem"         # path to Certificate Authority (CA) bundle
+      #check-revoke = true         # check for SSL certificate revocation
+      #multiplexing = true         # HTTP/2 multiplexing
+      #user-agent = "…"            # the user-agent header

@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "git",
+    "add",
+    "--",
+    "Cargo.lock",
+    "ci/configure-build-jobs.sh",
+    "ci/run-with-reverie-dbt-budget.sh",
+    "detcore-dbt/Cargo.toml",
+    "detcore-model/Cargo.toml",
+    "detcore-sabre/Cargo.toml",
+    "detcore/Cargo.toml",
+    "detcore/tests/testutils/Cargo.toml",
+    "hermit-cli/Cargo.toml",
+    "hermit-install/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/runtime/Cargo.toml"
+  ],
+  "actual_exit": 0,
+  "seconds": 0.06850008782930672
+}

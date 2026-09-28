@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "git",
+    "commit",
+    "-F",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/composition-2/merge-message.txt"
+  ],
+  "actual_exit": 0,
+  "seconds": 3.326901108957827
+}

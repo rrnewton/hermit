@@ -1,0 +1,14 @@
+{
+  "main": "59cbd3c64d8f304b2c477a153b0239fca7a8572a",
+  "parent": "4e7c0636ff105f333d81fa6560069a267e8d60a8",
+  "same_five_blobs_as_reviewed_f6c": true,
+  "paths": [
+    "ci/dag/validate.json",
+    "ci/manifest-plan/src/validation_dag_static.rs",
+    "detcore/src/lib.rs",
+    "detcore/src/tool_global.rs",
+    "detcore/src/tool_local.rs"
+  ],
+  "patch_sha256": "a6cec42d62b8d6739dfaf4ffa9decd9f54119d5bed62c849744298673ae15a4c",
+  "no_pin_path_overlap": true
+}

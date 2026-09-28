@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "/usr/bin/with-proxy",
+    "git",
+    "fetch",
+    "origin",
+    "main"
+  ],
+  "actual_exit": 0,
+  "seconds": 0.4853680219966918
+}

@@ -1,0 +1,21 @@
+{
+  "utc": "2026-09-16T23:29:16.076767+00:00",
+  "head": "932f7130ea3c77dcdb2547b6834f46f08bf593f0",
+  "tree": "f274d598795e7f784ad7cb46c168f92a937e9dac",
+  "base": "59cbd3c64d8f304b2c477a153b0239fca7a8572a",
+  "remote_observed": "59cbd3c64d8f304b2c477a153b0239fca7a8572a",
+  "fresh_remote_ancestor_exit": 0,
+  "canonical_local_behind_ahead": "0\t2",
+  "source_binding_sha256": "649e8810df9f5ac0f9a82a208c7fbf0c4fbe810566f7b371c32cea94bc4a899d",
+  "spec_sha256": "fcb41c15745c2ffdf586b1d7c93b32a549f302523c6efdc9fd72c4276d684131",
+  "closure_sha256": "9a979fd73cc5baa46aa286a4cb0648bfb4e8cad67825d079c72ed4a371d3bf1f",
+  "pin_patch_sha256": "6e9338d0f661ec1db8a399b494509ab6e9b08a125b601f93937482f6715a88da",
+  "actual_launch_command": [
+    "python3",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/integration-launch.source",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/spec.json"
+  ],
+  "full_log": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/FULL.log",
+  "runtime_started": false,
+  "root_release_pending": true
+}

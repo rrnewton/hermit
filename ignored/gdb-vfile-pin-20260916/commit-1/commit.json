@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "git",
+    "commit",
+    "--only",
+    "-F",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/commit-1/message.txt",
+    "--",
+    "Cargo.lock",
+    "ci/configure-build-jobs.sh",
+    "ci/run-with-reverie-dbt-budget.sh",
+    "detcore-dbt/Cargo.toml",
+    "detcore-model/Cargo.toml",
+    "detcore-sabre/Cargo.toml",
+    "detcore/Cargo.toml",
+    "detcore/tests/testutils/Cargo.toml",
+    "hermit-cli/Cargo.toml",
+    "hermit-install/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/runtime/Cargo.toml"
+  ],
+  "actual_exit": 1,
+  "seconds": 3.4343396509066224
+}

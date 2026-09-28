@@ -1,0 +1,100 @@
+[
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/cli-500938aae101cf8c",
+    "path": "/src/target/debug/deps/cli-500938aae101cf8c",
+    "size": 304667728,
+    "mode": 33261,
+    "sha256": "f973078f2e41b5550cf44d61d812abb9a4ff860fe7493f6934be2e3611fb61b6"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libdetcore_dbt.rlib",
+    "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+    "size": 64197046,
+    "mode": 33188,
+    "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libdetcore_dbt.so",
+    "path": "/src/target/debug/deps/libdetcore_dbt.so",
+    "size": 161689744,
+    "mode": 33261,
+    "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libhermit.rlib",
+    "path": "/src/target/debug/deps/libhermit.rlib",
+    "size": 305643334,
+    "mode": 33188,
+    "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libhermit.so",
+    "path": "/src/target/debug/deps/libhermit.so",
+    "size": 325016688,
+    "mode": 33261,
+    "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+    "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+    "size": 10053526,
+    "mode": 33188,
+    "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+    "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+    "size": 54247520,
+    "mode": 33261,
+    "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+    "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+    "size": 79434474,
+    "mode": 33188,
+    "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+    "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+    "size": 131474104,
+    "mode": 33261,
+    "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+    "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+    "size": 935124,
+    "mode": 33188,
+    "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+    "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+    "size": 50623136,
+    "mode": 33261,
+    "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/hermit",
+    "path": "/src/target/debug/hermit",
+    "size": 399847664,
+    "mode": 33261,
+    "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/hermit-dap",
+    "path": "/src/target/debug/hermit-dap",
+    "size": 7110976,
+    "mode": 33261,
+    "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+  },
+  {
+    "host_path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug/verification-report",
+    "path": "/src/target/debug/verification-report",
+    "size": 298010784,
+    "mode": 33261,
+    "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+  }
+]

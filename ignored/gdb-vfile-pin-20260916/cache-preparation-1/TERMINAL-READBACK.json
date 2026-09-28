@@ -1,0 +1,33 @@
+{
+  "utc": "2026-09-16T23:25:56.894913+00:00",
+  "scope_query_exit": 0,
+  "scope_properties": "LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+  "bound_cgroup_absent": true,
+  "original_generation_absent": true,
+  "files": {
+    "identity.json": "d42c3d4df467dd839d2dd5d2ab68833f193c3bca1db597596fbdc5f560369d0c",
+    "debug-source-before.json": "c966421a9b018529ca2a1255d4dff62940ae637db1ba3459a665673273c57d9c",
+    "debug-copy.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "debug-copy.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "copies.json": "73c434fc261590160116d6af3c10489fa5256331e474457d8645f9702e3417ad",
+    "debug-source-after.json": "c966421a9b018529ca2a1255d4dff62940ae637db1ba3459a665673273c57d9c",
+    "debug-destination.json": "34fb8e7fdc0f65b64c646bba8726ca574d5375f8f6bc0b903209d5d94d431e89",
+    "release-source-before.json": "1a123635ef8348c0c799f1891842c83afab519cbee85883221e9cdc93463f296",
+    "release-copy.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "release-copy.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "release-source-after.json": "1a123635ef8348c0c799f1891842c83afab519cbee85883221e9cdc93463f296",
+    "release-destination.json": "c9c5514ee57c7727f8b32657a82487e7653adededf9780849fd6ead99c9959c6",
+    "registry-source-before.json": "9cac88a5f9a2bb6953169a978c43becdb0b90d2ec31e3b0e3630bdb39429ce01",
+    "registry-copy.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "registry-copy.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "registry-source-after.json": "9cac88a5f9a2bb6953169a978c43becdb0b90d2ec31e3b0e3630bdb39429ce01",
+    "registry-destination.json": "7ddc32be9c4977f8329480e055083cfb85d925242035c2a717d5696389a177db",
+    "git-source-before.json": "902514675115d871081b9c5acb79ff9d7397fe1fcb353c767671c84b702cbbc5",
+    "git-copy.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "git-copy.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "git-source-after.json": "902514675115d871081b9c5acb79ff9d7397fe1fcb353c767671c84b702cbbc5",
+    "git-destination.json": "5d2e1ea4626bc72f30c1fcf53046fc367b1ac9715cd756febd45a185daf75447",
+    "resources-final.json": "d27772ae9032db38a86a370dc19c6826eb16b2150fb6ad5b4be01131aac759c1",
+    "result.json": "3082f8a88c763a87aeba6b56f2e93b7a287da4ecdfc1d419ca80402b98b4be4c"
+  }
+}

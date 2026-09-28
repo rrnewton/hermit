@@ -1,0 +1,16 @@
+{
+  "cache": {
+    "unit": "hermit-gdb-vfile-pin-cache-1-20260916.scope",
+    "actual_query_exit": 0,
+    "properties": "LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+    "cgroup_absent": true,
+    "result_sha256": "3082f8a88c763a87aeba6b56f2e93b7a287da4ecdfc1d419ca80402b98b4be4c"
+  },
+  "parent-prep": {
+    "unit": "hermit-gdb-vfile-pin-parent-prep-1-20260916.scope",
+    "actual_query_exit": 0,
+    "properties": "LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+    "cgroup_absent": true,
+    "result_sha256": "92bf0e9968e7d011934696f1f50a65a36566db17f950695aea72c2245c83365c"
+  }
+}

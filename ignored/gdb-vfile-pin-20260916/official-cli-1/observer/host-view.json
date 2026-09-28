@@ -1,0 +1,5 @@
+{
+  "exit_code": 0,
+  "stdout": "FULL PROCESS VIEW process_context=full reason=initial PID namespace pid:[4026531836] with PID 1 systemd rc=0\n",
+  "stderr": ""
+}

@@ -1,0 +1,4241 @@
+{
+  "parent-ci-hub": {
+    "repo": "/home/newton/work/dev-hermit",
+    "head": "2bb20cb33a58966cbdbe5aa5fcca2ff293f61caf",
+    "entries": {
+      "ci-hub/README.md": {
+        "index_object": "921f71f793ef313d09b69bf9ea63db135498a3c6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "24a6149015d1a919e4cbba7907b77124c8dd850cb1dd7e1dc64fc48003a04a51"
+      },
+      "ci-hub/TOOL-COST-AUDIT.md": {
+        "index_object": "b1f7b9cc78b8a5ade14c6c521c26406bb5990dc7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "99ecb8c2de30ea1bdc54c693d4d6e49146f174e9c5fdff00365e9276ff9ea02e"
+      },
+      "ci-hub/TOOL-COST-CONVENTION.md": {
+        "index_object": "a35dee009d805bb5cdbd3df05d5f4d10f99b2a0c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d0d5174ea0bf74e93f833dc17cb6c5afb66834263557065cf86f446932fa0f59"
+      },
+      "ci-hub/attribution/README.md": {
+        "index_object": "b8150ac597949a8dc0e2821eea4979234a8cab2e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0099d65a3699a2f9fc300abef89de2d3cebb4d2e44e2a855a2d7fb4a2455dfce"
+      },
+      "ci-hub/attribution/attribution.py": {
+        "index_object": "b2cdd3f9538c981a2aa3709e1ed4746f437e79ca",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dbf75e008cb8b82200d6a59a705aa74ef4d90603fbafbe82e874ca81c29c0c50"
+      },
+      "ci-hub/attribution/capture-run.sh": {
+        "index_object": "59e86bf182bcb61fa3e8dadeced987b8b95245a1",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "8faec5f0dcf0e55c65e10a29fbddb7d03694c25e06740fb4015a7c0527c2318a"
+      },
+      "ci-hub/attribution/pending-stress-wiring.md": {
+        "index_object": "8581d534360227ca40ed1744b0abce7fbaea30f4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ce9cc1ab1622d2935dbd8012b29bf57f726d2419f3796bcfb0370e95eb6d0dd5"
+      },
+      "ci-hub/attribution/tests/test_attribution.py": {
+        "index_object": "af784c27cba1885bdfb9dbfd69fbf8cde989e62f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "47409d54a06a5460ddf91211c65a2dd6bd742c7fe5df84c4c32fb93ddf40218d"
+      },
+      "ci-hub/attribution/tests/test_attribution_clause_brackets.py": {
+        "index_object": "ca43905c22eda88703501e02e4a14c890d8dc36b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dd19a9ddb371a36662f33e5a8f141f112fe89dc1337ebda8515996ac8610d47c"
+      },
+      "ci-hub/bin/agent-tool": {
+        "index_object": "a127eb03142a825a268bbf1d80439beef471d692",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ae273758492db0dcc09fc735042a87dcb11eb97e6423bf1730944d8a9db1c37d"
+      },
+      "ci-hub/bin/ancestry-audit": {
+        "index_object": "d28d47c195b2832f4a9fb8ec2e5a60d8c74dc0f2",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3be24c198cb811c720b12bd6123fdeb8903187876a44853c9e5775ef053c00fc"
+      },
+      "ci-hub/bin/cap-log": {
+        "index_object": "39404d8bfb498e2c74f6036989586b849d2573cc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ac2768447b923ba6432e7fa261bad8042145bcd1fa2fcd413402bc27748fe767"
+      },
+      "ci-hub/bin/changes-requested-gate": {
+        "index_object": "ec9d3f6a272b3660efaad437f1a7ccb44c810eff",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "490b7938aef6b1f794827f75ce9cdfe9bf941e5566e2df0ddbf8c49b5cc3c353"
+      },
+      "ci-hub/bin/claim-edit": {
+        "index_object": "beae8304dabcd7d8a52d120db205060dde8b8b4b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "d41bdb3b749bb5d6f3a1d65ee0fe5c1d34dd60e8a17c6574a1b3861eff70bd9d"
+      },
+      "ci-hub/bin/close-task": {
+        "index_object": "30fbe19818b7c683fa5fabde0cad36f2d7fd003a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ebe52f5aa3053cb88b88378b67b47d21efce922847e5b464eecb829cac4d0b5a"
+      },
+      "ci-hub/bin/commit-verdict": {
+        "index_object": "591e7cb099139db2a66bcd461f9c60b4276539df",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b1c9204a09bec8e197fe64272fd448ff5dbcda9b0733497de9f40b4e666e04fa"
+      },
+      "ci-hub/bin/edit-owners": {
+        "index_object": "86ad2bf00d8df79b09b42dd31e7d3aed4d274781",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7dd28d5ae0fb7a8533b9771c21c18d1fcfb5fa8483d349adec670ccf779e5dfa"
+      },
+      "ci-hub/bin/escalate": {
+        "index_object": "69e3f4b2c7bd25777d8cf74aa50194cd59c2a4e3",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "30781116f667c0591a85aaba1f89aaa08872f502c20d7d6d4d2acc1a656ee8d5"
+      },
+      "ci-hub/bin/gh": {
+        "index_object": "3ea23402617591fe69926b6af471a8b06cbaf374",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "960a25f1e11d6e1f3f15a8e9a65b01423f430eb218d511e0bf934d4782c46d1d"
+      },
+      "ci-hub/bin/gh-api": {
+        "index_object": "f58d88e4a14d6c50cc6d2859d4d832ccd857c391",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "f7b4d25b69dc008ad443dc12725a1f8c94034be23f8fbaf84135d24d2e55aa31"
+      },
+      "ci-hub/bin/gh-merge-verified": {
+        "index_object": "4e90a65316aedda52f74f93387d754e0816ee351",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7ce23e72db82810518103421f585caf8164ba233e1944855d2cf65619db1afe2"
+      },
+      "ci-hub/bin/gh-merge-verified-grammar-test": {
+        "index_object": "77f6e7226b2120c4ac43553001e3504b602dd024",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "99cf3c0a3590a06c9eb6882487e3bdf8a89610eae2168226cdd8e1197c4511f3"
+      },
+      "ci-hub/bin/gh-merge-verified-test": {
+        "index_object": "7fe4b68dea7837c9957d64ed95bc9a9e64056afb",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b5d5c31f47813378cb19bbee79bb4f9cb6ce0ba3cfc85b2ff579255d03b313d8"
+      },
+      "ci-hub/bin/gh-task-option-test": {
+        "index_object": "073318bc2ddf6ec59dba20f2a2b6d8ca7fedc153",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0fa1a0f0c3333281858a79dfd96fde6682af6977d5f76f3b8d5a575210813260"
+      },
+      "ci-hub/bin/git-push-verified": {
+        "index_object": "adba9aa82d9e99049a42b9008ef55bbb57a23ee4",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "647c905385c2fece4615fe727e273840a2200cb974698fc49b11cb08cf343aef"
+      },
+      "ci-hub/bin/health-tick": {
+        "index_object": "5b1a659ec3ab67116fdf080d6ff9fba73a7968e3",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "775de587951beebb30fa3d8ed05b5f23b6dfa4f9fc4484d33081362af2c69cc2"
+      },
+      "ci-hub/bin/load-probe": {
+        "index_object": "b15b1d31b2e512af628143e8a41d42eb5fbb6f0f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "2c1cce977d0f381b19a494560bf26a360dcfe4eb32a9278b7983db5e435afce4"
+      },
+      "ci-hub/bin/main-health": {
+        "index_object": "8cf7d3a6896c201cd8889957267b32521e920a89",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "571528d2e91855fed358c8fb899cbea6d01e3b28b227f4243e185610a8d81b07"
+      },
+      "ci-hub/bin/manual-run": {
+        "index_object": "6eff9ad10dec6ba21c083369f613302f668aae72",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7ac3b617e8055c744ea355d0d83cd9b1854bad51d77ae2111115b20fe7453fa6"
+      },
+      "ci-hub/bin/pr-head-ci": {
+        "index_object": "ea2cbf0efe0a9e326f026b8bac23105b8c781704",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "6cfadc3303305106fc5bf558bb55faa3cf811db273f0f985ca79dd1297b68b5f"
+      },
+      "ci-hub/bin/pr-status": {
+        "index_object": "4a1d5d0dd3658acc0694a5a370daeed000787e1f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3dbd57b033ba2ec944e6a1beb2b71237617c0c7d772014e360ff9fa767564e64"
+      },
+      "ci-hub/bin/publication-exempt": {
+        "index_object": "5ec6df4ca3603ac9731534f36ecd6e65e256e92c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "961f7c584fe451b9b570177a3d69cbf60d45246c6d811e74dac5a98d09c550a4"
+      },
+      "ci-hub/bin/reconcile-receipts": {
+        "index_object": "74a0ab1310a5022a7b06c519fcb3bac01b83271b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3285afcb1ade59a3ae2ab1e81dc3515a2a530b67cb24fe992a23eff4284add48"
+      },
+      "ci-hub/bin/refusal-predicate-gate-probes": {
+        "index_object": "94223339532bb27c646bbdcc57787b5ccea6bbf1",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "06f972d0ee926ce341215497468ec84d4112f2f8b060b907a199092ebd5b3fd9"
+      },
+      "ci-hub/bin/review-attest": {
+        "index_object": "a6370d2c3e04f7aa392974f798009400e5aece8d",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b9bed5f1e4460216e2e05668ac1f25c118e869e5f880cabe5c9c09b20c11b66d"
+      },
+      "ci-hub/bin/run-health-escalation": {
+        "index_object": "e43436f21cb3e7e624163053eb767146dd720995",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c6012b1dac887d79ee15ee2dc3ad48ad89b4ed457fa8cec175d1c132f2e70042"
+      },
+      "ci-hub/bin/tg-dup-scan": {
+        "index_object": "f079992486d009059606461fcaa9adb33acc3eb2",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5f8b47e71f10f46aa2227750d7f2f0bb382a44bbb3c7f4ae44046b4168e9a658"
+      },
+      "ci-hub/bin/tg-guard-shim": {
+        "index_object": "58b78775169b693732af7feaf2cc83f41027747a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7603d61967774f0c9f95b550200f35f6cd1bd88333c6852943d562c45d6aa71a"
+      },
+      "ci-hub/bin/tg-note-verified": {
+        "index_object": "e5e4efde9e3f5e254e12d063f1594a1f057c6b63",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "20c629815bbe77fb36d0664d29ce88af95ff4beb8ec15e7304307b99ccbfbb73"
+      },
+      "ci-hub/bin/tool-cost": {
+        "index_object": "fa624263b24ed98cc8f60170ebb26f96a9fe940c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "33a8e1828289c1655e14f26a8b193466e5e7b0243ecab853c7a5d12623eb7d3c"
+      },
+      "ci-hub/bin/who-am-i": {
+        "index_object": "5788588b0c3ecc687330fe1473e0699a63923e67",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "2c0e36880631a16841bc6e3a8de1900a6a39b83b3f0de52b22e8b06c97bd9d25"
+      },
+      "ci-hub/bin/wrkslots": {
+        "index_object": "220f935866729923e846c1d085949c8902bf77fc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "56ae5c51026575f4d32b455785e4904b10b60d18ddab028b6337318e654a3c10"
+      },
+      "ci-hub/bin/wrkslots-audit": {
+        "index_object": "669012a8ecab03a925334c58ea0e7d70c6a863ca",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5afcafdf5af4f13c06bba11ea13e4446fdc31bfdfa402361a7cfad7f0036691d"
+      },
+      "ci-hub/check_outcome.py": {
+        "index_object": "3bd75785a261f6c021f8997e8330b7ee2c863796",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9e2a96f610007d6043daee3e05e0b30395518ea93113b0109fafd0d31e8ee5ee"
+      },
+      "ci-hub/ci-hub": {
+        "index_object": "574972101c771c6e2273f832d5c3bafd8888cc22",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "a6e693c02a011d8e8f5d091f54ebf94580ee483e16d9f51def14bbcc69289b6e"
+      },
+      "ci-hub/ci-hub.rs": {
+        "index_object": "572725976901e1d4801b6e2b2abbc55bb1e3fca3",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "27dd42a44e1dd4f3ae346df3bf97475588678ac41c69a40ca7dbc3bc7d5e0700"
+      },
+      "ci-hub/closure/README.md": {
+        "index_object": "09822e7ef4b484d2bc2646a3e0a27a0e93a07d55",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "03904cfcd248e2c9ecb9ed0de1d5cad7d67591c3f95daa0e2aa7f64cb31fee6e"
+      },
+      "ci-hub/closure/ancestry_audit.py": {
+        "index_object": "3fe2c59c5d7cc0a7443f9a24ac7c47d7f29eb55c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ddfee58216e2a3a1e0730883d86374f9932045e423fd7ac45a29c4e217093f10"
+      },
+      "ci-hub/closure/artifact_triage.py": {
+        "index_object": "4492758489d7fd111791f19edcdd848426824e24",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "98248a1d4d915ad3cb21cdeed7be320f289b843b9e6e240403978e44cd732698"
+      },
+      "ci-hub/closure/content_presence.py": {
+        "index_object": "24a4507430a25c964b543c0888efbb876024630a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "a05c961236938e25700a98050852fc835dd8c6df13857a0eba5b3adceb0c08cb"
+      },
+      "ci-hub/closure/drain_publication.py": {
+        "index_object": "6729b3f4b7fc6830b689cbfda148fa51a464ccac",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6d114c7f8ebd20a4fd6ccc892490620397eb60c753abd4c235efafdbb5583318"
+      },
+      "ci-hub/closure/landing_evidence.py": {
+        "index_object": "276ae388edbea5ed6a0f8774e9deb0704859c12c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0a17eaf54df2d89090b73958b00ce5a1e9ad1bdcb8f6f515036b3e0722641ea8"
+      },
+      "ci-hub/closure/publication_record.py": {
+        "index_object": "2b6a980f99b4211232834ec8ee99f19d73dbc77b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "06f7aed5f10297c35434b86f073916a8d037db08e1b44368d625a285c4d584bf"
+      },
+      "ci-hub/closure/test_content_presence.py": {
+        "index_object": "39d9e4e77cd2ea557b9bc10dc682da4d4752c29f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3451def0f37bbed491763875856d43d50df5293952b3386b2c124229d58a9455"
+      },
+      "ci-hub/closure/test_landing_evidence.py": {
+        "index_object": "536afbcdfc9cd22e3aaf249b4863d3aa06ff8947",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "981b3ae3bbe77a58b65e3171eccecb881a99964e33daee6982f8f0a6bb768a8b"
+      },
+      "ci-hub/closure/tests/test_drain_publication.py": {
+        "index_object": "f5021cd06c120dde9153cd43df5e6e63fd1d33f3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7aac463e93a1fa0d5bde27129b7515dc56724e81ff32766467e1c9f59686b4b5"
+      },
+      "ci-hub/closure/tests/test_publication_exempt.py": {
+        "index_object": "ed42a778ced0e2dbc08b991169d5834286c14c1b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7f981c3d182d82749839dde76c1490046de9b60654e7c39b3f6a2084b026648c"
+      },
+      "ci-hub/closure/tests/test_publication_record.py": {
+        "index_object": "36c759422504f17020e023e4e5deb9d83629e5cc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b66d50bf1ae6bcec226cd2874b715b6c31a7a02f0900517a9a14a312acba4651"
+      },
+      "ci-hub/closure/tests/test_verified_close.py": {
+        "index_object": "b32181ac3267c000d5c35be939cf684436e286c3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0fd728354e44b1e0b9461f715a44c5372a13028e232ba648f632e4b0a129fea6"
+      },
+      "ci-hub/closure/verified_close.py": {
+        "index_object": "1a3c9d54356eaab7bb8afa844a3e54f06ea76bf5",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "96d13ecce4acbdcd19b78c3f2b0d96a4972a2d4f5fcbdd49b09bf69ba14b6cd7"
+      },
+      "ci-hub/compatibility-website/export_inputs.py": {
+        "index_object": "90dced215f5e65805e98f560edd6b93c16589644",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ca1a05ca2ba14ba903d02c6470e7f0f2d354f718f5b86bdba581d56a179822df"
+      },
+      "ci-hub/compatibility-website/reduce.py": {
+        "index_object": "63eee431b1c96c7ca1fdfef24d1aaedff97f318b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b8a3f6588a9eeaf8a858fae5e1795f9570428e35a4e5dc6a255852d083a42b00"
+      },
+      "ci-hub/containers/README.md": {
+        "index_object": "e6e3f5d2f2eb084be1dad27d12f59311a4455ae7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3245b685a306be40483bdcef1858b1c973669a6bb4068617a482504f645820d1"
+      },
+      "ci-hub/directives/README.md": {
+        "index_object": "ea01baa9e196eaf0b46f6cdd94e2b4722a3a4875",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "63bceeb4cb0c7e3b01a89b8bc5d703cdc2eb7e92b7f5f18e9805681cfd33626f"
+      },
+      "ci-hub/directives/check.py": {
+        "index_object": "914605e8876dd53871a80ca7a8244e6b75d42dcc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e16112e408c060bca46a270b88a68c3f096245202c7b4c6d2bdecc5697ce1922"
+      },
+      "ci-hub/directives/ledger.json": {
+        "index_object": "2c84a93063c96322be93664420c1da7d6cace061",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "183d9a0762d031074da07fb2a1c5f2c2ad7e24df3693fd0a7abddb6c0b675c50"
+      },
+      "ci-hub/directives/tests/test_check.py": {
+        "index_object": "195f3326eba8fe23e0cace1abd589dd8d07995f8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "29d87dd0ffd5b5c95bd5f789a70f8972d94e1382b511f34828bbad44c7ad6e24"
+      },
+      "ci-hub/directives/tests/test_tg_landed.py": {
+        "index_object": "86977e5f7757fa8e7b6bedcb1a99ee9bf1f3a347",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "58e4cf28e061b549768120aaeb27da7e308a2e1eab95a646cd169da419e7ad70"
+      },
+      "ci-hub/directives/tg_landed.py": {
+        "index_object": "5f2f395f16ec8082ca2c85fd1a4f693eef499642",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7711d5ca3bfadcf5afc9bdbedcd742f6368f84521e524dc9116842999013c7cb"
+      },
+      "ci-hub/greentime/README.md": {
+        "index_object": "cf52b680146571e164894b47facedc62e2d09aa6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5adf97f7a34e79665c8f6bf13a893b878fc2b2bf197016ad33f6209ddd93e089"
+      },
+      "ci-hub/greentime/tests/test_timeline.py": {
+        "index_object": "ebc80b754c8fe4a525a07353fa87ef8a2b3b1e55",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fd3d2c6c0061b74ffe6d74b7852a23facacd0fe8f0422989785f2d27c5c8fa0e"
+      },
+      "ci-hub/greentime/timeline.py": {
+        "index_object": "3139754f2c15a2d85e11e3375807bc2c8377ec00",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "11bae072e9b287db108127f47404ec24df880a8737a70c0e6c935eaf3c737272"
+      },
+      "ci-hub/health/README.md": {
+        "index_object": "9884f8a6d8e0dee908f4f6f5ba86071047947e19",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "cf58d2577ee2b0957257ec94a1b8bb4c46186a53ed98ffc198fce4066aff245c"
+      },
+      "ci-hub/health/actions_job_outcome.py": {
+        "index_object": "5fab3ff9a6434e16254c767c84957c5ff5c834c5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "91ccc60756dba0ca15c14be9c1643457c72a7b54ddbfae1df92ffa972e9c1e0c"
+      },
+      "ci-hub/health/agent-container-reconcile-bridge.rs": {
+        "index_object": "c7dc39a7561a3a86e44a51fc326defa98750e98c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "991b129fbbe92cc0240b0c99547aeb030c54ea9b4e1e89ce37f92d2226e74725"
+      },
+      "ci-hub/health/agent_liveness_probe.py": {
+        "index_object": "36424164a3e0c789d126914195c5ebfe43ad48ef",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2bf2d9190da1e28978619b37eb456134fb6d9666f2fd1ef9befa48ae618f3528"
+      },
+      "ci-hub/health/approval_binding.py": {
+        "index_object": "2a3015d38c098bafbbdd4d4e7d8dbf2ae0e45622",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1e4b02aced5b9b6e8582912ce94b3a03ddb272b7f118c1be56ffee74924e48f9"
+      },
+      "ci-hub/health/bounded_gate.py": {
+        "index_object": "6b6d5d687cd77144bb4b3684440a0fe62846e570",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0cd9ae243e1f82f3e6d51cb459ac3428d055d154fd1bb5bafa913e56e9f06750"
+      },
+      "ci-hub/health/btrfs_headroom.py": {
+        "index_object": "51fc3e51d4cf12b7fe48faa0789dd93ac50d0550",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b8a1d691a496e777630d2ae659b76fffe0f23bc4bae8cbc8b4f7226baea1770a"
+      },
+      "ci-hub/health/ci-batch.json": {
+        "index_object": "2230184d04cb4e1bea8491d7e132b12c51825ed1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2a39017674d98f7eb20862e9b11d631410f1649ca2c2e3b5eeeaf2960e38aecd"
+      },
+      "ci-hub/health/ci-mode.json": {
+        "index_object": "78cc8049fee3049cbb715174f5a762aec104a38c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "09cb9b63df93f9d7b6dd456afb3cdece316f910b145793685633ebb2c3bde72d"
+      },
+      "ci-hub/health/deleted_tool_absent.py": {
+        "index_object": "4500a220b086b85471d6af63f579aee37b6ac7c8",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c56d90990fe545686f58fd4239f079f33f179b1a5dfd4cafeaf1733df07452df"
+      },
+      "ci-hub/health/drain_reconcile.py": {
+        "index_object": "82a3d86e3c8f4a0d97f96a192aafcc5e292d838c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "4fee5b4856b7795e813ab52049b0bb259c39275668014859962a4f6cae735857"
+      },
+      "ci-hub/health/gate_refire.py": {
+        "index_object": "3f2ecde97506bddc943f2a15da809db9390434d8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7f747e1c3cae371b3b54a9ab337b492c26a2090c9dfcfeb3b610d3f5558326b6"
+      },
+      "ci-hub/health/gate_runner_presence.py": {
+        "index_object": "f05237df681b8b2294e677148f96d35ad60beb19",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "4eefa8e0050cebaaf325e3be3153e1de01aa08cec9db088282459d95d0406582"
+      },
+      "ci-hub/health/gate_set_integrity.py": {
+        "index_object": "5caf48b34805fdfe1435914b4720f567eb46a582",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7a137aa6a259fe50b634492cb5476c4558fc7dbb2aa3e15bb94d2e1311876705"
+      },
+      "ci-hub/health/github_main_health.py": {
+        "index_object": "f7c40b05ed5cd699fe5df5351052fe0355d43a78",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "8557dd2ade676a891c5d5af570b78cc7896779580ff2387a1a012f4a1b9e3b9d"
+      },
+      "ci-hub/health/holder_liveness.py": {
+        "index_object": "917e6b96eb6c79d8543c10524f30eff15e03065a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7b3217b796b18520be74f07581382eb3e868ddc3e5422b19e0e4b38d254e701b"
+      },
+      "ci-hub/health/host_process_context.py": {
+        "index_object": "b96683f4954503c925477d1549327259024d3a30",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8e3ad5a70c7a9cc2ef20cd2f0a574f36e1f9d6c5d3a0a07cdb8326145a11823a"
+      },
+      "ci-hub/health/integration_tip_validate.py": {
+        "index_object": "83cd6364f8685368d7b41fa23675335248b17210",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "d0fdeeecf8ad5286b99c1fe001328f3af1f50ad4cc3ff2f254d98f4fc1185e3e"
+      },
+      "ci-hub/health/landing_composition.py": {
+        "index_object": "31e3a15904ef0dc6ae888916f60219304000cb9c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "290a69d1bcf4160495a8c65182c1416d4e6a9031117ae4a3a42d4f4455c3872b"
+      },
+      "ci-hub/health/lane_shortfall.py": {
+        "index_object": "1fc85799d4f9f84159e1fc647b11194e79d6336b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1c0f542ee2891c8e7a8071590ba4790d60fdf143e4798f7d6babbf87fdcde594"
+      },
+      "ci-hub/health/ledger_referenced_objects.py": {
+        "index_object": "723f9c7ab0e09757cff94d3b924c0e48141f2eaf",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "932178d2faa352cf48899ce004663f11edade1fd85a88c8d2bfeb7c0f4ea4aa5"
+      },
+      "ci-hub/health/ledger_spool_backlog.py": {
+        "index_object": "880d829a889fbd4112d8a1078e92347dd8529c7d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e7626a39f4dc06deea247cbd87e134d56362afabad17cd454e33fc0a957aaaba"
+      },
+      "ci-hub/health/load_probe.py": {
+        "index_object": "6e729bd035041d4a22f6bc143b9b04524ddb9864",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b6c70f71218334758ee0be803692d1a6d69d4e9f42a7a0a6bc8b68237264a378"
+      },
+      "ci-hub/health/manual_run.py": {
+        "index_object": "7721ef986e96533899db77786928965a9d846b5b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "91f930922f16a6b3ce61a99f235afe5273fc4aded6e610aab5da4909ff8461cb"
+      },
+      "ci-hub/health/operational_health.py": {
+        "index_object": "03a85fb8cae062a893a8f50c967f1b02b3c5d3c1",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "2bfa044dbb69518806b21406a3c9f02ac3cec5aab80b1b7087e61ae61b787184"
+      },
+      "ci-hub/health/orphaned_refusals.py": {
+        "index_object": "9806555c59ef10b70497b5f05ffaa5b0e43ebb41",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c595c8d5a087ac5a77839ce6a2db6d666e3f7126c923709506b2d72e6b4b758a"
+      },
+      "ci-hub/health/pr_status.py": {
+        "index_object": "2e453ccb88f400658f2966d9d0e2d0e4509fb1e8",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "a4d4ad07a86709c9f346ff6ce9e806e49933d6f49fb73bd99fcce6332db5d748"
+      },
+      "ci-hub/health/pr_tip_reachability.py": {
+        "index_object": "a7ff4d1a8aa22da3527163f7604b603542d5682a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b03445e79f28e65ad11f47a25a6b309f3cb5623127986269cfae619868505330"
+      },
+      "ci-hub/health/removal_handoff_writer.py": {
+        "index_object": "03518b98f404037088e2afea9a1dab3b0b345994",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4ff2c20f02289ccb022ebc5ba2ab876f88ec2b52672733455badcff7d42c45ed"
+      },
+      "ci-hub/health/requirements.txt": {
+        "index_object": "4718c15c0ac88b46da2cace5ec1074060638d7f9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6922dd4e188931099f9174c50ac429294f4796919a184cab8b2509484b921dc2"
+      },
+      "ci-hub/health/rescue-reconcile-baseline.txt": {
+        "index_object": "ec6c6a25501e5c56ce9783c396e336956b5a1068",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3443cc4631cbee5b58d8321530ece5d0e80bdb93514fd58fdb01dca329f7fde3"
+      },
+      "ci-hub/health/rescue_ref_reconcile.py": {
+        "index_object": "a13dd3f62912bd6b2e095a7fe11ffb875ad260b9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "beb2ac8c2675a6533b283d593a2aec943287073e3cec75651c824cb33accfb5e"
+      },
+      "ci-hub/health/residue_sweep.py": {
+        "index_object": "2ecb613d598000642967e38cdbf5815a80353143",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b26f7e3f8fdd34ad0c42f192b633f70c4ad526b39c9a626081cd430dedc758be"
+      },
+      "ci-hub/health/reverie_pin_lag.py": {
+        "index_object": "3635c588e34aa7bb3faa1cd9f9f4e8c60d749e6f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "65d6fc9c67a41ad8eb0d0402745b368b2499600a77e1617b5dcf09f904fef15d"
+      },
+      "ci-hub/health/rust_script_cache_cleanup.py": {
+        "index_object": "f63297ef6b4d5a4aa21aa83723814d7d635aa256",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9391ed2ef61edd635e77badde1c72b77754cc7c9623b0b5987e197582649b70a"
+      },
+      "ci-hub/health/site_publication_lag.py": {
+        "index_object": "f4175ce85f145d7514ec78c7636e3357ddcebc22",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "731e4a1434c065df4f24fc25a2230c14b89f3f3d4682747b82dc8c7ed7a3f45f"
+      },
+      "ci-hub/health/skill-contradiction-denylist.txt": {
+        "index_object": "03f9ff9673d2615259143bb794b70f83e3542b2e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "017d69d68a0f02d638541d6de2cba7fad46211f5c9550816ed757de2f2c4c6a3"
+      },
+      "ci-hub/health/slot_agent_parity.py": {
+        "index_object": "2a2e7fabd5b150173a61fef716fce5dbc1c37e6a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "93f85367777d96a69ea52c6261190e9a2c43f2104c09c23ba01f472658f1154b"
+      },
+      "ci-hub/health/slot_disk_residue.py": {
+        "index_object": "1654b6e40c7e03b4bcfcb3b5fc90c4c6e6eda83c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "a38b4c3dfe5a3c0d8f7000f9a24b3d9c654dcec1020bc3d7a961ff2894c63c17"
+      },
+      "ci-hub/health/test_pr_status_staleness.py": {
+        "index_object": "412654faac22632b8f12c00723403ebbc01fa118",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "11adebc76d0f434aedfab886415a2eb134519d7fe529db2843756579e242ce37"
+      },
+      "ci-hub/health/tests/fixtures/actions_job_92645431859.json": {
+        "index_object": "508757767ff84da2c10d810eb171ecc06194624e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c30034b1667b140cef4e2644d7eef002ba9a5770c652d3119dfb64808f7731e8"
+      },
+      "ci-hub/health/tests/fixtures/actions_job_92660569815.json": {
+        "index_object": "837feee99a9b3e1534cf977f34cabd949cde1127",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "be878cb04ce8a3d1c2908e1c0124eef634322ce307ff03fd8bc759d6be885c62"
+      },
+      "ci-hub/health/tests/fixtures/actions_job_92670128104.json": {
+        "index_object": "78578fe1807c3587cbe92cc3e85806254e496c44",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "13be944bb77345458ad42109d33b8449626274f384c68b69bc46d792efb25501"
+      },
+      "ci-hub/health/tests/fixtures/pr2625_withdrawal_pair.json": {
+        "index_object": "bc685fe71d56545072de6e558e66e17471339a4d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5142cb404ab861f000605ecb3e0a918dc899828244807351e7253583cf903eab"
+      },
+      "ci-hub/health/tests/test_actions_job_outcome.py": {
+        "index_object": "c7fe367096c6b5eeec92a903c0b69517ebfb3fdf",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d26fb3509e50d7a137dc37406b65251c5b79c9c200e87ae3f603f0cb7ee28672"
+      },
+      "ci-hub/health/tests/test_agent_liveness_probe.py": {
+        "index_object": "f62054138e2f457c2f1228871a176079d2c48e74",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3c8766a5d949f2dd4f9b5dc43f31869c7d513068ef4aede8767b0bb9630d4ebf"
+      },
+      "ci-hub/health/tests/test_approval_binding.sh": {
+        "index_object": "927181d9f0e761084674b3defb010cb0554ff576",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "e002ca8e60ac2822bfeeb9e03fc3894d8808ff33b81a508a66c4436a235466b5"
+      },
+      "ci-hub/health/tests/test_approval_binding_grammar.py": {
+        "index_object": "c68dcf68fb20260acfb037424c0a8507c6f8b92d",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3d96125256525ac1a54f304b0612fadb7f40e472e7c65dc2996f4fa3d3ea6de7"
+      },
+      "ci-hub/health/tests/test_approval_binding_retires.py": {
+        "index_object": "088820ec7ff351e1c42dac817789f45c5da88cb5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d6b2349453c2306af10f7af76a36eb37f74711e9a2105fca5ebda13ba604c8f3"
+      },
+      "ci-hub/health/tests/test_approval_binding_single_grammar.py": {
+        "index_object": "cd86e8fa9b47bdf56d7f839f033bfb4a0be80cc7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a6d7c10c47d80b28a862ef3651594e223952dddab0c2fc5c71922fee1a8971ea"
+      },
+      "ci-hub/health/tests/test_bounded_gate.py": {
+        "index_object": "35ce3c53a85e7b16e6836a341d6cebd7abbd84c7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "16dd4969e02271cd15d2e7df163800bff119874bfbd96dbcbffacddce9018294"
+      },
+      "ci-hub/health/tests/test_btrfs_headroom.py": {
+        "index_object": "1f29dde2e8fed3b177680806f279526c94c3fb6f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0750cdb20072716f813613785f648b10e1634962c130e2793a882dde06f83346"
+      },
+      "ci-hub/health/tests/test_cap_log.py": {
+        "index_object": "58c2d842c66293c22b371b2163d7afcea6adf322",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c668ad6d7a9783687a33b64e1f285619e36edc1f7349dce9356026845702a0cd"
+      },
+      "ci-hub/health/tests/test_disclosure_behind_role_tag.py": {
+        "index_object": "7c9ffc3cd6fb75f693941e89fc290cc3783e3565",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dc0e13b93e6beb858128531e2da8094c4c39b964f0e5cdb60aca40fc15222a59"
+      },
+      "ci-hub/health/tests/test_drain_reconcile.py": {
+        "index_object": "1a832302ec0a26d549e35080b31a7df144b4f343",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "08b31c7818500f144ef59431bac1f3523db67f331ddd077373d0af7036d6f299"
+      },
+      "ci-hub/health/tests/test_gate_refire.py": {
+        "index_object": "1cd9199c31274bfe62b8a2c6c0b5664885b34119",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9822ebe8d96420ac71c8a96ed1a2493b678c0442e0b974e83143774e44839982"
+      },
+      "ci-hub/health/tests/test_gate_runner_presence.sh": {
+        "index_object": "df94b47457ffea30e68adf488537bba13d42710e",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5b4b89ad003a308237b3bd1e3edf468228d77ef845c72bd2416a38bf1ec39f55"
+      },
+      "ci-hub/health/tests/test_gate_set_integrity.py": {
+        "index_object": "1d5a35cb79e12c1d0e3a425781d9eda88b5d9990",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c3141f18605c70a23bf2742e029ea8e93379704208fc2a1f90e6eab699a4ed5f"
+      },
+      "ci-hub/health/tests/test_gate_variant_space.py": {
+        "index_object": "12f96d5646bab5ca40257595941cb708bef1753a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "8788d5fa3aaf9344afed2a8819961196b2b59f8d337337582d63a0d059ef843e"
+      },
+      "ci-hub/health/tests/test_github_main_health.py": {
+        "index_object": "3c12e4ed64ce5af726174863bb620edb1e92877a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "af1c54b2b280287742c64980ee9b90eab5e435e795a67c6bdea07961826d64cb"
+      },
+      "ci-hub/health/tests/test_health_help.py": {
+        "index_object": "801a95ec2d341ce94372e8126546575105226516",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e25793d0d9904bdef9e7570e1d0ca8e14699ee5cb443fd593164045f61a982de"
+      },
+      "ci-hub/health/tests/test_holder_liveness.py": {
+        "index_object": "41161a52f29268695191a53130ad6c06f30592a3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ef728a069bd06813544672669a4c27119bdc579cb351b14e8e85d20e2af18769"
+      },
+      "ci-hub/health/tests/test_host_process_context.py": {
+        "index_object": "427ee31987649d1902b3355136758c8abaf1aca7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6d0ebc4d1e8e3358a49a7766f5457cfd54d15afd1f1a233d1a4a1162574969ae"
+      },
+      "ci-hub/health/tests/test_integration_tip_validate.py": {
+        "index_object": "4d0d52a07d722368396c4cf9a4060ee0132fc3db",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5b3459bc3cfbdfefae336e1d4d199aa61b5e06c59b42c9ed972684bcdebb0cc2"
+      },
+      "ci-hub/health/tests/test_integration_tip_validate_fetch.py": {
+        "index_object": "8dbd32e85841519d15733de67c17ae22583c3c11",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3ac5217a7341cc2ee6f4769dc9a23a4f15b1126a02dc2bdb9cf14086df25694f"
+      },
+      "ci-hub/health/tests/test_integration_tip_validate_reporting.py": {
+        "index_object": "c51bb42e0b5a6a65a81645cb5040a2dfa7fd9af1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "993caa5f0744ef815a0a1fe51f3591ba8238d8666d8a79aa0136e5056e4315d1"
+      },
+      "ci-hub/health/tests/test_landing_composition.py": {
+        "index_object": "def4e459b45bb7dc48e08430408b4f10fcf85121",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "60d2624bd0e21de64257ad100ae5d19dff104204ce8c16caad69cf6bba6805a3"
+      },
+      "ci-hub/health/tests/test_landing_observability_tick.py": {
+        "index_object": "da42b2baf6ec4d8aa280b5f10439438bf1f8c521",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c3eec6ad8d05840cff1faf5f7a70802500eb78f83f0b621d3a754e098ffafbbb"
+      },
+      "ci-hub/health/tests/test_ledger_referenced_objects.py": {
+        "index_object": "037c480f33116c9568fabfe14fce5c3f3dbaa9ba",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "541069bf2cd18ad7bfcb2403bb20938ca3f51778530a64c54ea61dc812e9df2b"
+      },
+      "ci-hub/health/tests/test_ledger_spool_backlog.py": {
+        "index_object": "22ff307b674e4c86316bc19eaa566a6a3085e010",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3aee8baee189565b332a738e02e2e2db940fa9d25cd051ad62a7f0e84bed176e"
+      },
+      "ci-hub/health/tests/test_load_probe.py": {
+        "index_object": "57d8ca11184e5ae54ab40a0d0f0c2c4f035b4d25",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "cf4a9b59e3ea9ecdfa9cf3eebeea423afba49ff75f09dfbeb0c943fb8a1e3669"
+      },
+      "ci-hub/health/tests/test_manual_run.py": {
+        "index_object": "7d600d2871555cdf75f46be27790adf7b6437e0c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "aa5314b84667f59f02acd71b23722bd0f3fd43ee7ebe7604824a2df12a885d05"
+      },
+      "ci-hub/health/tests/test_marker_axis_space.py": {
+        "index_object": "4243f4ddd4e1db068f0731fc16aac97bb77db76b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "84a7fd38db2f88fd6010be4400b700246b4e9b6f05944528dc003739271b695a"
+      },
+      "ci-hub/health/tests/test_marker_issuer.py": {
+        "index_object": "faf8e72f2ffb70e41bcb48bfdda42c317f098cfb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "585fee32838cb1ff6c89a55045a635665cebbe438786a1ca726b7090e861c6ac"
+      },
+      "ci-hub/health/tests/test_marker_polarity_matrix.py": {
+        "index_object": "0dffe3210db0dc3dd703eab66cf26d8b29ef3c10",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b0c0e1161c4dcdb049c824a4c72eb27ebebd234a90e3326e19cdd1c7b99495e2"
+      },
+      "ci-hub/health/tests/test_marker_variant_space.py": {
+        "index_object": "ed6cfd6e06a42dcd097472cc813331ae34f59ce3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "15e8683b4948da143631754dc4325c0b64770538a1b9c5dfac3570d9ee3d0d56"
+      },
+      "ci-hub/health/tests/test_memory_skill_contradiction_scan.py": {
+        "index_object": "06c3992b7a0029559bf2bcb7836f83064a9f6a87",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "94494bdbc472dbbf14c663c2dcdd2a11d663001d7e7e6cd050dfb3c2b010e58f"
+      },
+      "ci-hub/health/tests/test_merge_gate_authority.py": {
+        "index_object": "e2088fec1f526bd2193ada0f1357ab7909d98622",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e36011e9ba1d57fc588c888bd5709b141aeb48378aa0c00661b7690518943614"
+      },
+      "ci-hub/health/tests/test_merge_verifier_issuer.py": {
+        "index_object": "15d64d7df71710a5d28875dc927c0f202b174cfc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4ab6badcd12fe51631f41cca7556e68b1f46b6da638c4450960f7000dea5e2c1"
+      },
+      "ci-hub/health/tests/test_operational_health.py": {
+        "index_object": "1ae0cdbf6eabef1b504874816cc86e4f9ac862b5",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "27c2f07fcb6bc99bfa88da74a7b0a79e5b32a9e8be7e108e725ef17d9e0e9ec1"
+      },
+      "ci-hub/health/tests/test_orphaned_task_detector_fails_closed.py": {
+        "index_object": "b683bfffa54a681d929d29a83dd15952d8e586c9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9043c896fa8823fc9bc514615fb3f3c3ed660aa39b96dd9d3dc580c73ae34ae3"
+      },
+      "ci-hub/health/tests/test_pr_status.py": {
+        "index_object": "2d963d821faf16bc19b10bc17f75506df91a95d0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ea4132051292927a9b0eeb00aa2ce9a0960ebde6e3a217d30c4db324e72b6f12"
+      },
+      "ci-hub/health/tests/test_pr_tip_reachability.py": {
+        "index_object": "5848b9fb21f0d80c554bd633c4af9eb637e2809e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2b98a1b173b8391abfbbdb1adb0d9b49bf3b3171551624bcf6dfb7a4eb2a75bd"
+      },
+      "ci-hub/health/tests/test_refusal_message_names_its_cause.py": {
+        "index_object": "dcf814e7c5157232dc6a5f6f8e76e4256eaa5fd8",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "a242bd2ea10fcdddacbbf9eaf711f49f26da6ac8321663aaf583f446d0ff2a06"
+      },
+      "ci-hub/health/tests/test_rescue_ref_reconcile.py": {
+        "index_object": "a5f5ef937e19d27b0339979b728efebc76513cfd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c27b4146d487ab64556deff37ddcbf2348ebdaaf50e1b90a2b4f90009a606ad9"
+      },
+      "ci-hub/health/tests/test_residue_sweep.py": {
+        "index_object": "55f5f4c7571d5c7812636e6132c7298a3406d0fe",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "df644f0a6a6105a732cc06d996faa4d1a1c271ffb5e131f2f98db11306650985"
+      },
+      "ci-hub/health/tests/test_retirement_requires_refusal.py": {
+        "index_object": "26eb149910ed374fdd6a552081e0332be0548172",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b8925df0dc3bc08eefee1d79c2b18ccf95ab1b71e36d787e873e47ce8290467e"
+      },
+      "ci-hub/health/tests/test_reverie_pin_lag.py": {
+        "index_object": "663681d27edf317471cbaf74f7b1ac60950e7393",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "32953c8a4f60092f4a69b1d589d1d0d20d107bca1fafbd6ae2890be966055ac0"
+      },
+      "ci-hub/health/tests/test_review_authority_without_fleet_identity.py": {
+        "index_object": "4dd7fb6d2df27ac440d26c95f428f57dc6399721",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5c2dc5b1e53e9c3e88e42e1b53e2d83026162066497fc3a6c6ce718a87e0d85a"
+      },
+      "ci-hub/health/tests/test_review_label_reconcile.py": {
+        "index_object": "c2370d2ce5cbb066d4cf501f9ff3e9010777d501",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bdf01b3507aefafc7ce238362ad59d61741ac0c334a0dcbbe6cfa0f66f468ebc"
+      },
+      "ci-hub/health/tests/test_rust_script_cache_cleanup.py": {
+        "index_object": "0c614df9255f24ad2416195d4c7e2fb08c71b577",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "33de2cec4874c57af734f081dfce67842a76e9508121ba0c14699256a34a2f45"
+      },
+      "ci-hub/health/tests/test_site_publication_lag.py": {
+        "index_object": "341c3ede48f888cef47cce1787bd79507b5b693d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b2f569bbb7dc112aa3cd6650c002c65a306cb60d8797bcd648f06514174ae29a"
+      },
+      "ci-hub/health/tests/test_slot_disk_residue.py": {
+        "index_object": "297210045c6e7b08b1016649a4f989f995a47e94",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "910f3488d27048df2567a1d980234f318968233aac81bd2058adf0ee233f104d"
+      },
+      "ci-hub/health/tests/test_tick_code_currency.py": {
+        "index_object": "7210f0a8a34216bae7639315ec2a9f318090f245",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "677a1a31b4c2ce0ff51e2bd1a02035aa5beca67ad49b7370c54ac5fdc5524f5a"
+      },
+      "ci-hub/health/tests/test_unbindable_refusal_is_retirable.py": {
+        "index_object": "86b4fd988ec1eddff75084cfa5ea6bd153af84fb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0d73668e24dcf4e2ab085f853681f279c55f8e420a5357f95bee2ef7624df201"
+      },
+      "ci-hub/health/tests/test_undecorate_block.py": {
+        "index_object": "defc382950e3d85c2083689b487fbafb11604433",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a9d7476cd09234ab226618ba5759da9ff5359d8cbf95c6fba054b3a9741fe670"
+      },
+      "ci-hub/health/tests/test_unevaluated_head.sh": {
+        "index_object": "1b87eaae797034b123b1e50bfb4e6a0da627a3ca",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "9ac31f664dd10c8acb2bfc23ec0c86c78b7ddead9fb9d0148bf5fd328d03a04a"
+      },
+      "ci-hub/health/tests/test_unevaluated_head_states.py": {
+        "index_object": "35de90bfcf200c3828da1c1aa0e69132e578ca19",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "670a5af0b297f7a9de712abdb486f9bde66ed4dab6645842214586cce4e9ba45"
+      },
+      "ci-hub/health/tests/test_unpushed_change_clone_commits.py": {
+        "index_object": "8bc12fd3b4aa8b173449df51c36dff0675174298",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0eb51ca003172d1ba3832691c38d63e64cc2832e9fcf89772e15fdd3c21dde78"
+      },
+      "ci-hub/health/tests/test_unpushed_parent_commits_budget.py": {
+        "index_object": "51486884b53084ba0142366debbd115a29ade58d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0b1890ccef7c5221bdfc55865632d085f296165bdcf5142021dd7b65728c1030"
+      },
+      "ci-hub/health/tests/test_unreadable_line_degrades_not_blinds.py": {
+        "index_object": "c74d90cdde2ccc7a81005abfe60879003f597bd4",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "f581a21e0c7e46e9ffc40cc26ce86ccbe437986a754f113b11cc1a605685b641"
+      },
+      "ci-hub/health/tests/test_validate_checkout_cleanup.py": {
+        "index_object": "0187bf4fa50351dd70b721f420f354eb6b3c40b8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "07e5344a96e22ae429d9a733c35d65eb70f4a849b15479130fb24bfae484fbf8"
+      },
+      "ci-hub/health/tests/test_validate_run_code_currency.py": {
+        "index_object": "afaff4d18f1a6e2f52367a4e422f603042dd85d8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f50a17ae56cce357a7ed20f1cc8a02d9d42c23cf183c6a73ebba6d16597dfe6f"
+      },
+      "ci-hub/health/tests/test_validate_summary.py": {
+        "index_object": "38743564c9d0533d4a4cbc8c94a8ebcf59690fcb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "681d9db43ca547d3179475e948007a1ba1fefef6d9ff22aa0c53ba9e465c528a"
+      },
+      "ci-hub/health/tests/test_withdrawal_quotes_refusal.py": {
+        "index_object": "cec753d578c9c48fa850493cd3aea6cd17415c51",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f807f42701246072ad42a8dadd831dc4d7e7e26821b979012d616dcdea073e44"
+      },
+      "ci-hub/health/tests/test_withdrawal_scope.py": {
+        "index_object": "f96dad21635ca03a0d0e23d93bdffcfaa3d80961",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "34b86950caa16dc28a2c60dab11a4ace4089caa1d4789d282fdf0bb8865e97dd"
+      },
+      "ci-hub/health/tests/test_wrkslots_audit_result.py": {
+        "index_object": "0519063bf87687645368d1cadf5b1a6219163089",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "656cb3858a174e0c16226520a343ceeb9a73d3d84012800f6ea485a8395c464f"
+      },
+      "ci-hub/health/tests/test_wrkslots_doctor_findings.py": {
+        "index_object": "0fd82b95d35a982af492c2f3f1a6fb1d496736bf",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2061831173388d25818be0e356656248b0f84f4671f3f9f116c403a5dc17bc01"
+      },
+      "ci-hub/health/tick-hub.yaml": {
+        "index_object": "f8df91535c5ccafe8c142a8d51b9d6480a8990b2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "79fdb9f0a3bf9cf146e59c4abee84c7e417e639344b7b322baca2cf1424c6493"
+      },
+      "ci-hub/health/tick_code_currency.py": {
+        "index_object": "d57255947122a50d7b6b962683c5ac49730f6776",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "50b3468f27d0cc1eaa5bdfefba9f7d62fb7a68cfb6f020cdad1b650c1871534e"
+      },
+      "ci-hub/health/unevaluated_head.py": {
+        "index_object": "accce484ace42cafca8669847a49d48b8575ce86",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ddbf310d20a23353cfa5f94678cadb4ede50fe1e3aad06fece840602363ee24e"
+      },
+      "ci-hub/health/units/hermit-tooling-link.service": {
+        "index_object": "dc0016344135efed3b0fe8fc245412af90c629d8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e92216318aa501700a00926c75d96dbc27deea7b60113b8cefc1401496f2c9be"
+      },
+      "ci-hub/health/units/hermit-tooling-link.timer": {
+        "index_object": "daa1d30508180e23d4a284eabd26d6b2790cea64",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "50aa7c2ddd90e30a5d68c15e5dd09ef35d0f4b9e8e2d33736e57d38000a456d9"
+      },
+      "ci-hub/health/unpushed_change_clone_commits.py": {
+        "index_object": "878f436ae4221bb0fbbf054915275a0cae9c4e8c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5e8a43d91cc2945cb7e792800c34172c68e84eeeba819a68a19589453485f825"
+      },
+      "ci-hub/health/unpushed_parent_commits.py": {
+        "index_object": "7114c33bb7902b3d54ce81ebb6c1e244b7144cb1",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "fc8fbaa24ea87a9d237cd983ebf439ec3447f1cc74127cef47a7a9444d790efc"
+      },
+      "ci-hub/health/validate_checkout_cleanup.py": {
+        "index_object": "2ad4ad1b5ed0620f37b5bde2ab6ddbe28631c75b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2f33980a09154514fdecc7e3a1b27139f51d0169809556552d5f384c1b92e3b6"
+      },
+      "ci-hub/health/validate_run_code_currency.py": {
+        "index_object": "129b2f130a04ed1a4fb2d4b604fb3c7dd5e58623",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "385787198c43e7a29f3493ec3d816f422ea2177106da6063729dacc8f19f176b"
+      },
+      "ci-hub/health/wrkslots_audit_contract.py": {
+        "index_object": "d92496bb4f7b39b5d2867b7b8bae1f59deb2f018",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "94562f0f14faa073a44a8bb52a1cc33eb043a5762ae816fb909735c4aa7dbf7d"
+      },
+      "ci-hub/health/wrkslots_audit_result.py": {
+        "index_object": "90b2d62552792d95af9da2659873644c9694cdfd",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "bf347456baf534a08f19e3f470549b028884cd624870dad962b50866de987dd6"
+      },
+      "ci-hub/health/wrkslots_doctor_findings.py": {
+        "index_object": "7a6ad55283b749f95d19a0b1a6995347f5e93d49",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "08fce9e7df350b5f1649a6ffcd27234fccfd78dfc1522ff1a4a50d32f5975350"
+      },
+      "ci-hub/history/README.md": {
+        "index_object": "7530d9ad0116b7a0c8a5c1a11a0d1ee7cc1c5233",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f7f4fd4994fa0db1e9392adab36464f93721f451a39d7b39cfd65c0abd4cb72f"
+      },
+      "ci-hub/history/SUBMODULE-BUMPS.md": {
+        "index_object": "e522f132b5aa673459a7a66cbc92c4fea7a1a04e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3f258b75b1cac3f9826c469d318f057fdc69dae25e262a11012666149be0fcbf"
+      },
+      "ci-hub/history/gha_rows.py": {
+        "index_object": "6966dfb6944f2c978ff58944cd2c576645813c42",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ba77ae1e885bc0422e1bfff7596e76ec68e0ed588e4938fd32faa73fe3b134d8"
+      },
+      "ci-hub/history/ingest.py": {
+        "index_object": "5ef560da3cd3603fc212a7bba0c2421fd68be86e",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "525e5a4da53742a154021c8618974d5b8bd9b5bc6aab9cc5e2865fbf5d21a866"
+      },
+      "ci-hub/history/query.py": {
+        "index_object": "4de98155e71ebc34e55b7825fb1b433be027d0d6",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b32f232220a0f687393c482cfd0433c7b91368cd70c37d2c504b2a04b499c65e"
+      },
+      "ci-hub/history/tests/test_history.py": {
+        "index_object": "c1afc5c74f9792a4cdf418bf668b02d21a04de66",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "51fec3d7f14956a0a3b11954a9cb2b7ea5ee8a902cfa5446944160951cf2a417"
+      },
+      "ci-hub/history/tests/test_validate_time_ratchet.py": {
+        "index_object": "0ce7225e877f3b356854c728ad1a0e85f03bca10",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a3fbc11389d59ca4a1774e53ab335328bfb84ffd8b988e91fa9a33a8ec82f670"
+      },
+      "ci-hub/history/validate_time_ratchet.py": {
+        "index_object": "4ebdacaaead5946e7d85f45888ca3f2fc07d720b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "a8903861e9d32576217885678d610724dd9681a1449b47fcd37c9cdd49f03df6"
+      },
+      "ci-hub/landing/README.md": {
+        "index_object": "61eaf4f6a582ccd3ce449979fbe3593397fa8c0f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "90b3da08fb3ce08bab7a0c3918fd368c22f4f79bc52434ca2ab548929e7ff412"
+      },
+      "ci-hub/landing/cherry_pick_context.py": {
+        "index_object": "7e942145da8a6dc0f29a08d90ea6ce92ba751c7d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fc822ebeb5117f5d3a20b27e4299020c91bd946eb351ffb7da36e9f7adcad855"
+      },
+      "ci-hub/landing/closed_pr_dispositions.tsv": {
+        "index_object": "2112373ef2f8089550c84e0b40f195e3f0808619",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9a2cc556e0db754e373786c0592cb08ce3159a3e9bc6a13ac917b5906e18749e"
+      },
+      "ci-hub/landing/coalesce_guard.py": {
+        "index_object": "d89c521c1eda906d3a6d756e96d2e1a8f6b763b7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4bcd6496817e65a93e273a70bdc4b78a01574ae26eface14220adfe9b3b7838e"
+      },
+      "ci-hub/landing/exact-head-validation-authority.sh": {
+        "index_object": "80ecf85396bce39aade25585f74cbda789649b50",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "cf7d4d46ca35ffb60494a59de7477ef27f64edbe7b980b08f2bc6f90f9b5e065"
+      },
+      "ci-hub/landing/land-pr.sh": {
+        "index_object": "ba4b003b84ea0562ec5050e48364ebeecb0d6fd6",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "2f389e27db4ca506b76dd11cfc14269bd997c7ee87ef0f6c6811a691bfc80326"
+      },
+      "ci-hub/landing/landing-lock.sh": {
+        "index_object": "0b984d68053f09521394b746b60a0dcb0493554b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "06d8d51062e61551a4d6077c471901a57da90f76e97fc3b810a46e1cc6c48e84"
+      },
+      "ci-hub/landing/local-validation-eligibility.sh": {
+        "index_object": "01baf709486caf5a55dd85dc17d0f8a6392bfb85",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "bd5cb82d4b14eca6a63730c9e9deadfdba9b8dccc7d22f50f115e9fc7eb53879"
+      },
+      "ci-hub/landing/main_soft_green.py": {
+        "index_object": "8f6777cc28ab2ed59576e5e633674efa16ba9f35",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "aa806c412b6ccf2e3064c47f24762b1cd1b5a50bc17725d8f0a2b633cd9d6021"
+      },
+      "ci-hub/landing/merge-gate-status.jq": {
+        "index_object": "1aaa293f1aef8d46c1c976903db6e0e9678f3e16",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2ce6a930cc1acd8029369281e0e2f43c62e0de7a0eac5825d24474be246a6821"
+      },
+      "ci-hub/landing/parallel-prevalidate.sh": {
+        "index_object": "b14d47b367adffedfd1af1d72e7b78e21637ebc7",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5646181ed57baf7faf836b1d4cf677ad9859c3fe47d6268fac5ea770a7d7a773"
+      },
+      "ci-hub/landing/pr_head_ci.py": {
+        "index_object": "c86f93b431c550231bdd44fabf73f87e9465a27f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "759f51218ab5e3fe973c9fb4e2cfaf9b7e3c1f71b993db0b943a55628e94283b"
+      },
+      "ci-hub/landing/preflight.py": {
+        "index_object": "4439146eb5bf74dc9291c1dbc6256c0adfc20ce8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5ea26ecd9a80310d81ddd44316f51ef9ececa83242da1be7753c0582cdb6463c"
+      },
+      "ci-hub/landing/publish_comment.py": {
+        "index_object": "b1efa91eaa0742f873e01216e9588f57f1de5969",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b4a597440cb109d924429639edd5bd84c0bf94c837f9ad574bd1207c768270d7"
+      },
+      "ci-hub/landing/rebase_wrapper.py": {
+        "index_object": "b91663ef972268e97018e47d628101a2b5346f9f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "59874c468447385e4ce0ff307fd9242db48537c6c92fe1b86465d05cd7f455a6"
+      },
+      "ci-hub/landing/reconcile_receipts.py": {
+        "index_object": "eef92972fedb800c04818572eb85dd1d0b10db48",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "505adcf4ffb0acc099fc7d63c9e7e1d0eecbddfc86f705793f8762fc8cfc055c"
+      },
+      "ci-hub/landing/review_rebase.py": {
+        "index_object": "81e8c72187acdd394696d2822bc630227f58a9a4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7568d479da672bc11e38d3c2cf49c3eb09808b198e87c3599e5a051bea94cb81"
+      },
+      "ci-hub/landing/soft_inherit.py": {
+        "index_object": "ffd3cfbb5a1e84cb34dee1aad1c177985acbec29",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5ccdf9ee89ead9fa9649554527fb0561394e59a8ea2ff1cf7378b307ec6fd95c"
+      },
+      "ci-hub/landing/staged-freshness.sh": {
+        "index_object": "0fdb0999731e9d89c606aa1623903c4c837f5476",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b1498dbc094f0f390d2f3ad911e46124fe758338f34b67c9d2f8ec35c86cbe2c"
+      },
+      "ci-hub/landing/task_pr_join.py": {
+        "index_object": "76e836faae5c6b232f0e537e53c47fbf9414e81e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "151cdb46f3710d08d52e6cc28ce2aceba41df69d00e246497f5bd68d97d94fc1"
+      },
+      "ci-hub/landing/task_pr_record.py": {
+        "index_object": "91ad30295eb6438c1a6b6f93ad725cfa741a9d70",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6fa0143bf3b252ffa9aaa18eea7a44fe47879ba99a235402d607662ea150e137"
+      },
+      "ci-hub/landing/test-exact-head-validation-authority.sh": {
+        "index_object": "1cb4fe6d57c5535c9f46740ff08bbeb578b78016",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0a4f92fac6eceb506d88d49cb413d1ac12297b00c7683095d77d47dcbf47508d"
+      },
+      "ci-hub/landing/test-local-validation-eligibility.sh": {
+        "index_object": "d38ab3a6e0e925bb106e4bb2327fc3db040c2f95",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "d5aa84383bf8ac9260423e19ab0552f0efa536a9c25d6faaa666b37d59ed5612"
+      },
+      "ci-hub/landing/test-no-op-rebase-behaviour.sh": {
+        "index_object": "06cec6b72f0f6af3039e01644bae04f20f680ad4",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "2c5dbbde3c31fdf746b8472653c63f32da76607fb07ea105f259ed8c1488928c"
+      },
+      "ci-hub/landing/test-no-op-rebase-routing.sh": {
+        "index_object": "4a171777b3984aa9446ceeaf78c2458a54d3dd71",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "24a7e9b038cedbb7d46ebbe2fcbd183b0da9781d753875b40d81f57ffc74808d"
+      },
+      "ci-hub/landing/test_cherry_pick_context.py": {
+        "index_object": "8fa4997695d30ce6a694236fdf73ce8b05e84bf5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f631a41c3ee80afcb1d9fa59d8e882d7628b75db2066e9cf116d04ea3dccbebb"
+      },
+      "ci-hub/landing/test_land_pr_repo_routing.py": {
+        "index_object": "16e8cac3db48310e21b207d1ab27bf19e5a5a86d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "02d54dc424f9675e1acca34960bc2c84f1f779164d99e1b628d0623d5d3fd28b"
+      },
+      "ci-hub/landing/test_main_soft_green.py": {
+        "index_object": "c87e30562f2c968dddc3eba9a9e8c9e600450352",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "881fe82c7bc82f40bfd8f17689291a347a96c6cd497c539c09152c0a37e43daa"
+      },
+      "ci-hub/landing/test_pr_head_ci.py": {
+        "index_object": "e2659070a457140474c6937067e60376c2f183ae",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "dfac4c7b7fe4093af3e5946bafe12f98fe4016833ab76faa14174828c1f744a2"
+      },
+      "ci-hub/landing/test_preflight.py": {
+        "index_object": "a5602bfd6072da11e2995c66b1d40cfddc9ed232",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "48def708f164163d1a8e033c1b5fc25be79e336aaf8470b115dd39c0f148dc80"
+      },
+      "ci-hub/landing/test_publish_comment.py": {
+        "index_object": "068fe95a3e93e08e867e835b14463214bcea5a92",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ae10e26fb3bd37d4fcda3900527f667f3a4ce9c4ddd08fec1cb9c82a52c82abc"
+      },
+      "ci-hub/landing/test_rebase_wrapper.py": {
+        "index_object": "527d7ecf6adb58d51771672c2c2cc835513d50ee",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0059747e830284c14b1aa605256b6576c16eeafc13d9884fa19fba621d79762f"
+      },
+      "ci-hub/landing/test_reconcile_receipts.py": {
+        "index_object": "fec88a813cadb4e271deb4d85f9418f8681ce5ff",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ffe713eb04436a613aba53a151be4fd317be3bcf5bb9e53f5dc9924300e601ab"
+      },
+      "ci-hub/landing/test_review_rebase.py": {
+        "index_object": "82e85fbf8899f098cb3a53d834bf7c69b347beb2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e942a279bc10d7c02a31a5b117da4197b5d656816fae398f498d5c6aff206ec8"
+      },
+      "ci-hub/landing/test_soft_inherit.py": {
+        "index_object": "a6c9b448471c5b547fad18abfc6d533e3e4f00af",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "70e07903a3bd1c89f2b4a886556c9cd6c3cedb6dedbcfbd857722a86d98bf9e9"
+      },
+      "ci-hub/landing/test_task_pr_join.py": {
+        "index_object": "439e3d2538e99f4a13d20af52466f68b95d9bf3a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4e50783d6ea013c38c9adc5edb4396496676421cd3e6fad63f13b65bacc69677"
+      },
+      "ci-hub/landing/test_union_rebase_result.py": {
+        "index_object": "c94b2f75cc6a3d9a8f885c31b57990ee543e6e79",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ed91aeb43280a74cc0fa55a1ef13fb724a6b3856d2097704a8ff26dfc93de236"
+      },
+      "ci-hub/landing/testdata/ci-hub-stub": {
+        "index_object": "13e8cf819b9cd98c9e5149024d65083d4eae1820",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "cefcac0ceb723b789084654d72aee528d8dd7e88d7ea7fa7fe88ebafbbfbad49"
+      },
+      "ci-hub/landing/testdata/flock": {
+        "index_object": "f283eeddbdc37de55475ba40e1f8badc2df654db",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "59faf723114ae486c25a7341de1be63b3cc26b9e15c4537e3a879f5e9d073318"
+      },
+      "ci-hub/landing/testdata/gh": {
+        "index_object": "4ee0a55ea4290d1f6172eda1dc06dc026addadfc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7fa973a9c16699bdc4003bea1e4925e1ebbd55b5ed47ca71c652cd7bf0dd81be"
+      },
+      "ci-hub/landing/testdata/git": {
+        "index_object": "4f85090d4f92c71d2b5ab40bf595e33a1a8ef4f3",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3bfb6ce52f746105531b56e8212c15a2048fb66cfd704447b4ba79eb4d8d7870"
+      },
+      "ci-hub/landing/testdata/jq": {
+        "index_object": "18bf7b021f10ef3b75e25d77c6192955fb6c5577",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "fee11eb2408ab276a7024eb31b0ca8ee9127a8e0c015bab2ec3ca28571d98bd2"
+      },
+      "ci-hub/landing/testdata/pr-head-ci-stub": {
+        "index_object": "2b967096fdbf66368ac590b0495a6304a1d3cd54",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "60e1e8b53c11de45d63685230117ed675d2728c8102289acffdf47f55994a22e"
+      },
+      "ci-hub/landing/testdata/python3": {
+        "index_object": "c2dc60b289e6ca585cb309e3f0fc7436b41c8dfc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "31ee56d623743a82cd7d9876e32b15843d55b13b19568dc7618763fa1d3d5b6f"
+      },
+      "ci-hub/landing/testdata/timeout": {
+        "index_object": "052362a5fa58a2a8fc84867d52d2bfdaa8bd2fd9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "8c5b9c311aafb367132483426614285ce8ac10ee75f956475c2fbde65467f75d"
+      },
+      "ci-hub/landing/testdata/union-rebase-stub": {
+        "index_object": "50a31f3618f72cf79a5c03a913ba2327b5d4ceab",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "74e65f30dc37f5a29041b7270360fca0526610b8e2f33b74ceb9ab68939f6dc3"
+      },
+      "ci-hub/landing/testdata/with-proxy": {
+        "index_object": "9fa3c8e3ed37eec90615d031768afa2e8f4defe9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "40fcc98f3ca14ae19f6868f5c18c2e5e22a0b14f6fab6463069bd4702976fa29"
+      },
+      "ci-hub/landing/tests/test_coalesce_guard.py": {
+        "index_object": "a45e55e04c6d2eb6eb103cffa0073407db8db953",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ba66087870769c0cae822eecdaaf8137d52ef2fa470b9d1b2df6dde63a62c2f1"
+      },
+      "ci-hub/landing/union-rebase.sh": {
+        "index_object": "20e4f38b54b77320d20ca18c346b7643c608f8ab",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "708cfa5449ec593aaae98c3975de507ef634b83ccd2112e820040781d755db86"
+      },
+      "ci-hub/landing/union_rebase_result.py": {
+        "index_object": "1c4d04fe52efa9a91fcdc87540df606a18a8a8d2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3189cf9f919fa84b39f14c6e770fc4fcdd499d23ded7a35c391e0fa9ff273b2a"
+      },
+      "ci-hub/landing/worktree-mutation-fence.sh": {
+        "index_object": "46895c7eecfef44e9753117a57a601453ec13071",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "157992bae5ab7763c96864990c1dfd01fb645a07951468b8879d476a18cf62a5"
+      },
+      "ci-hub/ledger/README.md": {
+        "index_object": "cb973f089a45dfbdad9eae971357b92addc57cae",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0478f8d2ca5049073c0e17038c5a0f63115bfbcd163c3085f7582a6f4a141bbf"
+      },
+      "ci-hub/ledger/check-ledger-events.rs": {
+        "index_object": "5a31ef86c6ef1d8e275958aa0c5facd7adc98aa6",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "9f4f16c1d878de06f44d06ca73eb7ebb658446bc7c9faa4e44304541d8bd4f82"
+      },
+      "ci-hub/ledger/check-ledger-parses.rs": {
+        "index_object": "0fe2bb32286719b1d5b98bfa73605e69467e6346",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "dad396f5733dec691f5e7716a4de32fb6fc978abbe887b5939d897da50352831"
+      },
+      "ci-hub/ledger/github_index.py": {
+        "index_object": "f904389b9836c32a836c130bf228f7294642bf86",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4880be8043bbd5adc7afdc69f6f6e961d1f2124bbfdba7b0ef7b2121f1861f3d"
+      },
+      "ci-hub/ledger/launch_publish_backlog.sh": {
+        "index_object": "7ccd9ebe5a72e2aa867bc57a153e08706efed4db",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c25ea648ee90620168105b2e8050cc5287cc8d1869e6a1458bcdca3a64dd6780"
+      },
+      "ci-hub/ledger/ledger.py": {
+        "index_object": "f5b50f002d4c2740e26a310f3b168533f8288ae1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1dbca820a59bbf767cbbe5bbbf0472aac06e064b7658856466963aa85f573d70"
+      },
+      "ci-hub/ledger/publish_backlog.py": {
+        "index_object": "128da44798a6ee6a57b755af6966072c6ada4229",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ebb8a8791c58e31ac1438b5864507f64452d731f1bf7af18047d3049c60539e9"
+      },
+      "ci-hub/ledger/publisher.py": {
+        "index_object": "e0f38a6d26fcbd60d0f755e8271d33aaae52fc56",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "11e7254db8e79a8e4b71425d3bcdbeb6da83ea6221d936aa8357630fb7961ebb"
+      },
+      "ci-hub/ledger/tests/test_cross_checkout_visibility.py": {
+        "index_object": "5fa2e55dcaa41cfa9e71288821dd56a5520ed5e5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b151b0df461a14a98eee58f0962a708601f03a80597b6ca39f6719e3744ed4d5"
+      },
+      "ci-hub/ledger/tests/test_github_index.py": {
+        "index_object": "79678de61b4910bc4adb02caa334f7f727a6b8b3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "069d1bbd37bbce88818c6b4c59e72ccb0d367652dd991d7bb452d3f52c7e86b1"
+      },
+      "ci-hub/ledger/tests/test_launch_publish_backlog.sh": {
+        "index_object": "ba07519ceea7335a4a14dacdc5814bbadb33dfbc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "df40c68ad3765594f34d5c8d923c75eb8325926fa14ee62e369b89ca94d26d94"
+      },
+      "ci-hub/ledger/tests/test_ledger_invariants.py": {
+        "index_object": "de979c7e6cbc6f741a7f2ba025973f33ba0823ca",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8339c226d2611fa40cf57efa7c120739ad94a4a5c9967246a81da689236b0a05"
+      },
+      "ci-hub/ledger/tests/test_ledger_publisher.py": {
+        "index_object": "bd41a842c04f2e5afb02a165f34fe4996e15cc3d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "adb7924b0df47b0eaf8885f5bfc479a35d2e3e580127e4f4fe1603624d1e2530"
+      },
+      "ci-hub/ledger/tests/test_publish_retention.py": {
+        "index_object": "aa93eced5458c5eb0fcdeed9b5176eb4c2154cb6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ccc11a10620360e671c801143a844bf5fcab9917edc5f5381ebd03545cfc07a1"
+      },
+      "ci-hub/ledger/tests/test_validate_rows.py": {
+        "index_object": "61010090d5c8098af23d2f77e7a86e1946afca55",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2b50fe82b2d7c7713ba57c31cf98e45cdb694f600f1e74ef257cbfc164e78d9c"
+      },
+      "ci-hub/ledger/tests/test_validation_cleanup_publication.py": {
+        "index_object": "c33edcb390fae06d2956e6038aa2f5209b725d08",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ecf686aaadcbd3fc4212750668f1cf69f304420111841a8b0b57b0d7b60e3dcf"
+      },
+      "ci-hub/ledger/validate_rows.py": {
+        "index_object": "945dc63f5e9d35f96b495713cb6e42cd1b0a06f5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "82019febad42437854997e5f7efee29f007c29cb16a25e42b9d60f041c646a9a"
+      },
+      "ci-hub/ledger/validation_cleanup_publication.py": {
+        "index_object": "66bc6cd54b554b2a352a088845bdb65a586f2e56",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3bce1acb38e410798437c76f13dcdac0121f3ebd0b67d871552c35ebfbfdc745"
+      },
+      "ci-hub/lib/agent_identity.py": {
+        "index_object": "133be2789bb49697466890c4f3cb04e2985d3d4f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "307953301f86e9f8ea3af335dc8d2821bbfb90d688676863f383e659f9d8660d"
+      },
+      "ci-hub/lib/agent_snapshot.py": {
+        "index_object": "6136d5679aaf2a0e8e6d70ea2af57107e8efd462",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d8d951ea8023d6a37070467f2eba0442468aa6d8aa8b9524e49ea54d590b0b4b"
+      },
+      "ci-hub/lib/bounded_capture.py": {
+        "index_object": "1688cdd2a9ffda5bbcefe9f29624aef76be7f1ab",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "30fc8e4879e7e31809a88faa5d72191c316251cb8c6f4983c2c6f0ede8841863"
+      },
+      "ci-hub/lib/bounded_output.rs": {
+        "index_object": "8103ec7986bd417d2e9cc8459e827c822b989d20",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a993c6b1738df7ab21258bd69981a36337d64a7fdb3b57f766900b40a7a7b4dd"
+      },
+      "ci-hub/lib/disclosure_tag.py": {
+        "index_object": "527e8c9143fa197c482ecdd108742d1d91c3bbaf",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "aec3500af1eed5e8b5f6fc477d5833075b07938e6d8cab12a89e9e94007bfbca"
+      },
+      "ci-hub/lib/edit_record.py": {
+        "index_object": "c037ced641d592c51bbcf82c5c6b18e3ced43587",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0554bf8ac4a38b05458e24f681dec09d889e2ebc9ac30a2a80f72b56801c5167"
+      },
+      "ci-hub/lib/failure_obligations.rs": {
+        "index_object": "ae0130d1c96262a10478ecf5819d6575b6ce60de",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "de31348ed06f2edc4cbdfd087d3e59d13435f436e897ac0493c73902898c418b"
+      },
+      "ci-hub/lib/fetch_ref.py": {
+        "index_object": "1c539fd79960cbdfa148ef5378af84acf2df90f1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "111daf91b83fe2f555a60c60dd5545776a4d56f19ccfbad1ddb5f5fdcd1ed10b"
+      },
+      "ci-hub/lib/git_env.py": {
+        "index_object": "6fe3196164320654e8f4e1bd086e3df161a8bbcd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dd62d2bc3405a5b56f3426941a50b928af483b8f4b04b0e26b0a1c212687067e"
+      },
+      "ci-hub/lib/history_queries.rs": {
+        "index_object": "eb836e179e439f194ace36812f19907d1ae866b3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2da63b7814789cd6ea0ffde8d1c98499b2e8219447a7cdf49159eb7d3311a17c"
+      },
+      "ci-hub/lib/kill_signature.py": {
+        "index_object": "1ce9268f70d1d61009a5f525f27e99be7f66e2b9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ae1464e2ff6accf0c4224959ffd6ab3e5d6c949d6d61763863d42f19d07d9459"
+      },
+      "ci-hub/lib/landing_lock.rs": {
+        "index_object": "cbbcec1c520437b6fd860f130ff6aec5db96ff34",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ac014e586d018c78a256fccb6a1674fa6272805a3615f5f518c68c45a314c1fe"
+      },
+      "ci-hub/lib/lease.rs": {
+        "index_object": "0717fd00a0a8e2c9eee47dde50378f6cfae91f4c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3613396cfda456c225c9664678deea8378e4628c1ee5fab23338808bc51cfc57"
+      },
+      "ci-hub/lib/ledger_event.rs": {
+        "index_object": "9ae9448d8e48e256b19ce5960f3127f902084ceb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "afbfaeda22f7047719c00ee4bb5b33e4cdab3adddbeb24608d0ca892ce7c109b"
+      },
+      "ci-hub/lib/measured.rs": {
+        "index_object": "c07eacb22b98ea90a19442787a0b420e7b87c3fa",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8ae6eca19b0c486e78ac1a031b962bf4cee1bcdcd056e5ffed7e8124682d77ec"
+      },
+      "ci-hub/lib/ops_state.py": {
+        "index_object": "6835288b7d1be3062595430821990ac4c8a34afe",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0cb5345f254e27b732d79422ad2d950626a99203d00fcc06856eb3f7621b5ffa"
+      },
+      "ci-hub/lib/published_receipt.rs": {
+        "index_object": "c8eb5bd99fccd0874194da6b1305aad0400b7927",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9baea4036c59858318c11a42f59b1de05f69c2eaf325f2ab8b9a0a5ab624f45c"
+      },
+      "ci-hub/lib/qualifying_receipt.rs": {
+        "index_object": "4f99c275090fdc111086cdfb9344b352bdcd19e9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "502dce80c4c50aa383ee9748dbbcd62a0a644c3f144e04333a9e50acd68b5c37"
+      },
+      "ci-hub/lib/records.rs": {
+        "index_object": "cfd87116a18466557ef6418fac2d132af5b78016",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "99e940b1fec342901ea928221ea7840fb2be60321141a419ad6602712c88d8fd"
+      },
+      "ci-hub/lib/taskgraph_db.py": {
+        "index_object": "bd7dde26a71334c9f40a695387ab0c6f85f7edb3",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3726adffbad81573dc26eb6e715928f1bc873751854cf6dd4c63a457c63643c6"
+      },
+      "ci-hub/lib/tests/test_agent_identity.py": {
+        "index_object": "1a2b7c98e32f8a0f6ec79949c5764eb07212b899",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b0947239a436aec1cd5dce9a03f1d4a8cad9fe7ca22314d378600bb618800597"
+      },
+      "ci-hub/lib/tests/test_agent_snapshot.py": {
+        "index_object": "791cc6dc6449caafeda48011ab2a0c412a0111df",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d9c3c6b618691a9e7e4a4a55c6ea110ad54349efb2a136ec9d0a0447aead5717"
+      },
+      "ci-hub/lib/tests/test_bounded_capture.py": {
+        "index_object": "7313f90b5197c3c82a79cab04a1f547cee48e5db",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0860901488d4decf2aa270f380b3736d53ff54b51d013a0d00ee010b7f4a496e"
+      },
+      "ci-hub/lib/tests/test_edit_record.py": {
+        "index_object": "29defe3ee101aeef288777c12b61f2764f6d8a97",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "85bec256e2d003425d1eb0aa182c59371c5852b2191c9cba86e97e089571fa4e"
+      },
+      "ci-hub/lib/tests/test_fetch_ref.py": {
+        "index_object": "735273ced39144297402c056d0cc8d108defdd79",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9e987ecd8dba140968c6bf2348a5e4816871b6def30139e35b3252514b2b337d"
+      },
+      "ci-hub/lib/tests/test_git_env.py": {
+        "index_object": "027819462a3cc5d232ddd06cbeb4f4241c7e1c1a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6252400aa97593205f3da54b8c98cf0975e629617cbbb60acdc5b4c26fe3a07e"
+      },
+      "ci-hub/lib/tests/test_measured_compile_fail.sh": {
+        "index_object": "328f6c0043cb37a9a68fc2e42517b5b7aaa03a92",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1f4567be1ef62cef9607eff8d7702f877729858423d8e2ae16a437ed8177cf0e"
+      },
+      "ci-hub/lib/tests/test_ops_state.py": {
+        "index_object": "449a681f099a5c6f2812b369bee304655dc05852",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "011aed929c813fb4f54243869d4d79873852ee989757a70cd2074c0e9333e564"
+      },
+      "ci-hub/lib/tests/test_taskgraph_db.py": {
+        "index_object": "570e5b22c071aee93c9cdb99d6e943741d415b55",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "764b2dd90a88b114ed26a0865c42b4513cdaf0954e8992cbe3aa6d3bc449b4ef"
+      },
+      "ci-hub/lib/tests/test_tool_cost.py": {
+        "index_object": "788681104dba05e5de47fe3800c3ca1fadb89118",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "018e306e34c5414f31625ba0aedf5e89120bfb41016c92cbef01a075d4829b92"
+      },
+      "ci-hub/lib/tests/test_worktree_registry.py": {
+        "index_object": "735b61a7a60b8c31129a2d6ac745fd5d30857148",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5142493eee89d31636a65f4246a79f5058e461bc8e7abc609f51957e48332eaf"
+      },
+      "ci-hub/lib/tool_cost.py": {
+        "index_object": "9243cd9c246dc0000a121055b25840d5ca3a6e68",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0fae327419ad88d3db911503df35c10e65507c98a2ec884778bb6981cbfece5b"
+      },
+      "ci-hub/lib/validate_lock.rs": {
+        "index_object": "7129379d499a9d60b067b434d61224cc97edd6fb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ad6917f692b3f9e4cb2781692c8ed517ea9f1c3d66c512f6e8f1793b34ec852c"
+      },
+      "ci-hub/lib/validate_run_handle.rs": {
+        "index_object": "bc9608765f3febfd4550334e42bd0b2c90fe58ba",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "235b92f00a90832d597e42779766bed6e07e7c370eb59c508ef9f57ad5b22d64"
+      },
+      "ci-hub/lib/validate_status.rs": {
+        "index_object": "356e37780ec0930f6d38deb73a08540c347d7d32",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "66b0640ea97394aa085999a2562ba0101e0c9913e94fc3ad391658d013da840c"
+      },
+      "ci-hub/lib/worktree_registry.py": {
+        "index_object": "2509a9b58c25a05c61a5f9122e6c54b0cc83c107",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "58f8bda41c1478d66e34846c0a3930b515756ce99f1f9535ccdfb8fae64c1dbb"
+      },
+      "ci-hub/litmus/strace_attach_litmus.sh": {
+        "index_object": "9b6945c58af41b5e168069507dd429473e5eefa0",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3216dd49dc360e441c4a61c4b2c1e4f634a8abffafdd760ece1721302dbbd1cc"
+      },
+      "ci-hub/litmus/tests/test_strace_attach_litmus.sh": {
+        "index_object": "b21301d78131350abc922a6c6859267780bef546",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "8baa75c2828e888b5bb2d4249cf0f7ebcd398a02ec88fa412a854e915c43f76b"
+      },
+      "ci-hub/main-metrics/README.md": {
+        "index_object": "a88e3927a7aa0f21557a66f74ead9b75b7939cff",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c8bb997003b95f5d8dcd60105b413af63b4eaa6ae84c13428ee93ab6d3cd9f61"
+      },
+      "ci-hub/main-metrics/tests/test_wall_series.py": {
+        "index_object": "55a210432101c5124e3667a8b9bdbb386dfa2e39",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7d800acd25f30ee4b5abaaa606405f39adcdc7b28d54e9de3c04c32693fe763d"
+      },
+      "ci-hub/main-metrics/wall_series.py": {
+        "index_object": "d9338835a88387395ff731caaf11b3eeb3d6ad71",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b2d784b75a5c3df86022b48bca8c32dafeba05d8d73445d9edd4a862cf1c7ad1"
+      },
+      "ci-hub/parity/guests/detlog_syscalls.c": {
+        "index_object": "d02ecbdeb154c32a6c78f8900236962eab504616",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "eb6f6966ef379a8dbac7dc55c6a8d2542ba3b259229bc373cda7678c6377717b"
+      },
+      "ci-hub/parity/guests/entropy_instructions.c": {
+        "index_object": "1d1c5d43e2e27d3722d753baac074e23032f412a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d6f95bcd91980da69ef14f32d73850b9c014505f0d2e4112b82fc438b4aeec74"
+      },
+      "ci-hub/parity/guests/heap_fragment_reuse.c": {
+        "index_object": "7c47e2dcec3b677d538d9effc7cb3d9fd7caf6e8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4760311f36d52ef98c8dc43efdad475756d5f3c79205a4ce41a741fcedefec29"
+      },
+      "ci-hub/parity/guests/stack_deep_recursion.c": {
+        "index_object": "86035b2b65eb77bef615db155aef961faacb96e0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b34a0c6ba1042fc6ccf05d7c07cf553ea044749ac10698c3b70f5eab71c956cf"
+      },
+      "ci-hub/parity/guests/stdout_bytes.c": {
+        "index_object": "c09cb2a8db82fc8c8250b27ded27231756766989",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2e913fab0d21ccb660bca99845766e4ba1baccab24f3a6268f7d9062fc96d6e6"
+      },
+      "ci-hub/parity/measure-dimensions.sh": {
+        "index_object": "c6b01a034d880ef4159c4f4c0d1d7da76ea3fce9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c9ce6d3e872081e7cec649dec6efe999d59d1bd6af549d0a7b15b7e5d159fed6"
+      },
+      "ci-hub/parity/prefix_depth.sh": {
+        "index_object": "43cce1a4bf7c1e90c68bbd74e0d8e061dcf180c9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b3e67808ed6f4ea69d547e190554068b466b2c0ce1783235fdb53cb754c3667d"
+      },
+      "ci-hub/parity/reference-guests.json": {
+        "index_object": "92da761b20ea1529fc8739e47aeeb70b591399cb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bb4a9e759e89d2cef6fd9805e06d7b77edb3d9a9dd8fd5bb2afe060a76fff88a"
+      },
+      "ci-hub/parity/reference_guest.py": {
+        "index_object": "0f03d768df815ec98a117bb08d3622ada77d8265",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "68a0a666b68ffa1121b31e75a9c44f76a27824d07ca77c967900f03f59a256b1"
+      },
+      "ci-hub/parity/tests/stub_hermit.sh": {
+        "index_object": "10b4abe05066e31dcf3e94c612e92547882cf398",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "eb5d931c41473eaf9f93e445c1ad32efe6d0a55173060cb27f3f191e39e0bcdd"
+      },
+      "ci-hub/parity/tests/test_prefix_depth_zero.sh": {
+        "index_object": "03f656fe7765a1319880e58146601e21e7e8f18b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1e2d3c85a58280d283d07c20d8a3f5335dadc40f7b2df304a0de82b254178f6e"
+      },
+      "ci-hub/parity/tests/test_reference_guest.py": {
+        "index_object": "583caac40b263e70cafe625766504407a68c6c1a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a0da9a6af02b4995634de337911b7885aac0ddc3c674db86a7051c9578c5ce89"
+      },
+      "ci-hub/pin/auto_bump.py": {
+        "index_object": "1bf13bc2edfd0e6c272fcc18644f102e1a9d7de3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6e96c4825293f975ed14a4d57e2fd47cf4e0d958f81eb68c96d9a46af4d5b746"
+      },
+      "ci-hub/pin/bump_job.py": {
+        "index_object": "619ceb253fb4ba99c8b3bcb806cc7f92f775d399",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8be5294857d16db250f23bc99bbb5cd4460002abce171890f57c1955b7f17b59"
+      },
+      "ci-hub/pin/tests/test_auto_bump.py": {
+        "index_object": "de25b8058f68d50a881783aebd4f5a43ebd9f419",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0538ad61efdf65225cf50c63dc002b97b008ac8a2a9b605e2a73842469831b9d"
+      },
+      "ci-hub/pin/tests/test_bump_wiring.py": {
+        "index_object": "26252c36ca2e70e20cca14a4c80033b62175f015",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "24da956144d1349ea84e3a3043d7970342e85815c1e38c6046ff69901f275b6e"
+      },
+      "ci-hub/pin/validation_gate.py": {
+        "index_object": "cc23d89e66786f6e2a6f7aef5c9960aa50d6fc26",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "95551f5096cd5db71e03ab8795dbb61c372a9eadf044d326ad6bac8eaded3697"
+      },
+      "ci-hub/provenance.py": {
+        "index_object": "42eb5dba765acfd5010c8d9381c2ab6ea08572d0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e9864e5ce877b3d32ea8016eabcfeada5d54f08bb33244db65d82359ec820e31"
+      },
+      "ci-hub/qualifying_receipt.py": {
+        "index_object": "5c520754686328e1d10f0110e2d9ec64a779ee81",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e12d780d2d126348fd53e0972d3f1a1449a39aaf51eb2847f1452d70df2a4757"
+      },
+      "ci-hub/ratchet/metrics.json": {
+        "index_object": "6a2e29e6544f0f222ceef8b51ce7cd9ea98095f1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fa8ca39359e274b96d064a73e6b08d9c31c4977ea35f9562e405a12ad9c8a3d6"
+      },
+      "ci-hub/ratchet/ratchet.py": {
+        "index_object": "599dfe777657f2bfcfd52759e914cc88b6ad4406",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7abc025b123293c9919ebf48659a11d7ed7c00a94cfc6adda73b380ef061124d"
+      },
+      "ci-hub/ratchet/tests/test_ratchet.py": {
+        "index_object": "a2f00061e9fee23820dad84d5e9bc58598df33ae",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4d2acf4937c7d89ae63656360ca6c775cc24f0d6b8cb407924bf1112884204cf"
+      },
+      "ci-hub/remediation/nonzero_result.py": {
+        "index_object": "bbf3ef773944aafafd29045545fb27d06027d895",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "328bcd6dad66e125b41d9de8725c371eeee26c887ffe2a7952c95e5650b3bf20"
+      },
+      "ci-hub/remediation/protocol.py": {
+        "index_object": "41089ae6a2ac12b02b4914c430b84e81b22a154f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "4f1bd9f33f725d076b12e4c8d49ea72f574cdd2e3cec9e0d50450143749a0f27"
+      },
+      "ci-hub/remediation/test_nonzero_result.py": {
+        "index_object": "66cfdd788edb281ad5046854c9cd0b3e82855de2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5278feb4b628c51a50ab4dbe886ad161220260cf2973b6d07714a63ccb712293"
+      },
+      "ci-hub/remediation/tests/test_nonzero_result.py": {
+        "index_object": "ec6f8b5e207a57e8750e0d5c3303df140939d995",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "10a11dcecb882662a826d625f48a42b2997857fa3aebcaa7beb83c56ab1a12f8"
+      },
+      "ci-hub/remediation/tests/test_protocol.py": {
+        "index_object": "37db967a02286d6daa8de25cb8e9150ae4f53448",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2c708d55fb0ec306007a4d24fbf1f7c93b293f88f418a0ea128d386aa020f681"
+      },
+      "ci-hub/review_contract.py": {
+        "index_object": "315d44de5b0a8206ee1749d7887c385033a0173e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1b0d798e55f8a5976a4334255a5e7de1792a79e81c6d27034d31d11d4294c18d"
+      },
+      "ci-hub/runners/.env.example": {
+        "index_object": "b4a9591bf8b0b30d10023f4f40afa242b6d4a85c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "74fbf5aba77a5a010ce59cf3525681bd5e6a1b3d3c0c690307d410c8c98eed8e"
+      },
+      "ci-hub/runners/.gitignore": {
+        "index_object": "8354fb808a852281634b9bce28478160a2d163d0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e273d762aa759d5911add04dc365e53e01ab67657088396d1382135d9c54ff0c"
+      },
+      "ci-hub/runners/Containerfile": {
+        "index_object": "1da4b0ddb6604afb622d9868e52ce8e860b9548d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5c204712109e75e5505f1116b1246bbe0e1651e43caeac53bf3ded73f982e487"
+      },
+      "ci-hub/runners/Containerfile.gate": {
+        "index_object": "792ebd832fd3619090f4494a20340fa9231607e0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f3d9e6ae0d991009acfab08315c259a89ed35f518136647b694bd0859ab31c33"
+      },
+      "ci-hub/runners/Makefile": {
+        "index_object": "8381d8ba72689f62b770f632c3a157a8579cbc57",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "faf90b644fa88a29ee35d92a59f57f1e8a5f7561b57fa07ca357e871c1d12a52"
+      },
+      "ci-hub/runners/README.md": {
+        "index_object": "de0061f484e48c533ad7f7b89277c73cc82f3ff2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7194337225c8c96800b60b717de8bba66a62672701902cbecea4100a149cafd0"
+      },
+      "ci-hub/runners/ci-status.py": {
+        "index_object": "2df004252039ea7f2b792f7410b50e1c1415cca3",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "dbd90b8c478fa6fb4f3a81f22b2d81be4154404196da20882226fc85b0e19189"
+      },
+      "ci-hub/runners/drain-runner.sh": {
+        "index_object": "89e2f537d598a0cbca7dc81f1b762da030e9f09c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ed1b48693d2cc13a9e3e72579faa47fa521f28d6a5820a8fd4fb582fb1caa33a"
+      },
+      "ci-hub/runners/ensure-runner-autostart.sh": {
+        "index_object": "64d3302d815f27510aeef30b632218dc252c8f1b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c3a81e23de6992167c9b5348244e6c3c0c05eee83b6785133aeefdb9e5e8f8a3"
+      },
+      "ci-hub/runners/init-runner.sh": {
+        "index_object": "9abab989a279fa924aa1b694073c12dcfe8dbdbf",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1d90e9a45abded4e12f07657acf237c08924305b75925434e49d711c04345f59"
+      },
+      "ci-hub/runners/instances/reverie/.env.example": {
+        "index_object": "70416d3db3e756ade2bfe83c35cdf09ae0908f63",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e050e2b24bf12f5f082dc039db47c14cb01472ec7919a9f7b33d81a9e3f48f91"
+      },
+      "ci-hub/runners/lane_health.py": {
+        "index_object": "218b06e6a27b10ef555630b277335e3d57f37ce1",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "db3c7d71e647f4c33d9dc4f3a9123bb838116147af5fa5a11c8ee5f5d6d62671"
+      },
+      "ci-hub/runners/migrate-rootful.sh": {
+        "index_object": "e868316927532633579afa3798b873ea2755543f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "4172486316fb180e1b98596612d22596a6cf26dad76e84957ce249448cf44d64"
+      },
+      "ci-hub/runners/podman-host.sh": {
+        "index_object": "5f0d32bb5ab1bbace30e7819a37c439f739c1fd2",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0522bc3b0282c1e058c2649f4b581aa67ad6072193323c7f7fe220ab22460bf4"
+      },
+      "ci-hub/runners/podman-root.sh": {
+        "index_object": "ecee61ab80e1b54ce716e8b2b13fe7a45118dec4",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "926e06c105d1bb7cceb5049c75c95a87c3a222bdfdf1bbf588cd95408428b2dc"
+      },
+      "ci-hub/runners/queue_health.py": {
+        "index_object": "1a9746a35f67b12c3b63d248349df82f356e8c57",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "72d137c56222e1c37fa8d1ad3166d10abb21e3e55c4fb35cc4b947e56e922ef3"
+      },
+      "ci-hub/runners/start-runner.sh": {
+        "index_object": "fed395c35925f2517a7b775fdcfd53b8b1670ded",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "435d264bb02fefc0366144f6ca9be2be205d307ce01432bdc16e094caa2d0760"
+      },
+      "ci-hub/runners/stop-runner.sh": {
+        "index_object": "7b688995cfc4580cd066521672f3ec90d188754a",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "fc28eb67cb2f319036c102185e603b1d4f1038be80ef909e1e9bcf53c162fc56"
+      },
+      "ci-hub/runners/tests/test_lane_health.py": {
+        "index_object": "e137f0b72b77507688fa7364dccd24dc987c2b03",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d8e3d6b8cf92df63a28604b0289e048ee0531dccaf34cd4baecfb09aadb39902"
+      },
+      "ci-hub/runners/tests/test_queue_health.py": {
+        "index_object": "390a29e2feb83ae3e80262468bad0d906d438b01",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0d7b714e6a414b485f8b4ba939b7607e75ac8ce064f6b2f1839bf6695cd79b30"
+      },
+      "ci-hub/runners/verify_runner_limits.py": {
+        "index_object": "bd3d2642199713f0fd35639b8d7e432ad60c95a2",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "d86253a7b95daae8ad83c0a2e357721dddac8fca8041e0ab1bb0d2c330dad730"
+      },
+      "ci-hub/series/README.md": {
+        "index_object": "cbaceb79394a8be71d45367b11c13f01ae691c3d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1ec4afc7b50bed4d8dbd2775872601551dc0c7ab200375ac66fe3102cc8e6407"
+      },
+      "ci-hub/series/check-series-rows.rs": {
+        "index_object": "f4c93c75b11ee3058016af7e73d4ebe9de167931",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "529e4c25c85f86d22f3f1b20f25327d3b5e8e709e32a72f31b2544ab2e5d33c6"
+      },
+      "ci-hub/series/pressure_schedule.py": {
+        "index_object": "4c0889c0e6ef8e6ee192b3b7afc8685f76bbfdc6",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "d79ffe8af5a84d77ed82da8dfd23aa7dfbf0ab9d712207f421ab5a5890e74e32"
+      },
+      "ci-hub/series/series.py": {
+        "index_object": "b04350b7b57c121722458e6548f47071b7c6420b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b42a60562d7fa537765709287f098965070cf52785bcaeea6c2266902a66eb53"
+      },
+      "ci-hub/series/tests/test_pressure_schedule.py": {
+        "index_object": "7ec9e0efbe7523218ee749aa80bf3be5c78029de",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3a9bbbb67124362b2370d2a9e009fc45c94a4057967f76695c13cbb9062d4c86"
+      },
+      "ci-hub/series/tests/test_series_invariants.py": {
+        "index_object": "ee3a7772f8f01e37b7816bb16830075ea5cd484f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e965848714ebd0d1f0ad1bd493c36e9cd7ad6b302dea473db1b515233d301f1c"
+      },
+      "ci-hub/stranded/stranded_sweep.py": {
+        "index_object": "c206e0d095be79f1d53dc895c1521ab0b94a340c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6ec2c31af09fa401c73735e89fa75cb26de9225a3ea6ceb7331dab47412b5cb8"
+      },
+      "ci-hub/stranded/tests/test_stranded_sweep.py": {
+        "index_object": "c30d1e21dc64da12bc5df3f17f9454ffdf3f000f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "388606561f30d3aa03ec076e83d0c1b66837aec9123a55ff4ff22d4e696fc47d"
+      },
+      "ci-hub/stress/README.md": {
+        "index_object": "2369a9b2dd3d707004112fd86620a9acda6ba1d7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e010f60a2085b0b079026cb0227a31a36f8556bc5893992ceefac4a7ce95e94c"
+      },
+      "ci-hub/stress/burst-build.sh": {
+        "index_object": "496c684758f6d3f4b580b7a77ed506b50f2f7ffc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "86c8c29389400db8ceb7dbdf9f1b5e0aebc0209d0d1c464de6e5d0788400ccc1"
+      },
+      "ci-hub/stress/burst-prebuilt.sh": {
+        "index_object": "4b37b34846ea77d89847fea435b0234f589a2793",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1da7047daa89326530e25c80dec736cc7be66917adeb510dbee70b5e4dac741b"
+      },
+      "ci-hub/stress/check_freshness.py": {
+        "index_object": "7eaaf4fc6ca3dc612c2b89bb19930ffed7d1c3f2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "731d5f79f01c5c6b53e7d3c570803723a39c605d253ed9e94c9582da9c5306f4"
+      },
+      "ci-hub/stress/matched-burst.sh": {
+        "index_object": "669635ddeba0eb42bf08096773fcb73744fa1858",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "e5829abc3c1ff7949ea81d2484e015c4a627055ef04dbe48d5fdcfdcfc4fa438"
+      },
+      "ci-hub/stress/nightly-stress.workflow.yml": {
+        "index_object": "575eea9a0c9c9c3a4b48b5bcb95dc412dbf4c4ab",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ed9e1e245455a3d91dcd29c3f984d6cbd39ef3ae5848c9463728637fd1e94294"
+      },
+      "ci-hub/stress/nightly.sh": {
+        "index_object": "d07e50645cc6e9c5a65a4ef6b9b7b9bbce638d2e",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ba3647bf74a475bcc1111b1efb957034174197ce0b3084d875452e049a472f16"
+      },
+      "ci-hub/stress/stress-burst": {
+        "index_object": "0ed41d6b8debcd7f786dab848138ac5409250741",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "d6a3fa60daa891da08975fc1ef81aacc70a68a0c3b0b167160de20ff8693b222"
+      },
+      "ci-hub/stress/stress_rows.py": {
+        "index_object": "26bdeaa66d28460eb4696986cc00447110b2d5c2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e54fc287670a84d0c8412c9ff20ab3a2a9d2d3030edc747f6d837fd5bb290813"
+      },
+      "ci-hub/stress/stress_store.py": {
+        "index_object": "976c1bac014371983c830a661d7c45b56229ad08",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3262554fdd008d9bb0405f336d854f4039e2a3b6c2566feb707f4139fd5cfb8f"
+      },
+      "ci-hub/stress/test_check_freshness.py": {
+        "index_object": "972f1d7bbf46afabcfee1ace9c91c0744314d514",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ee377547ef7afe2c19a4db7f183f3acc97e2dbaef2421a0dc14489586f078231"
+      },
+      "ci-hub/stress/test_stress_rows.py": {
+        "index_object": "f8b186e08f80362e8ed42279f0728fb6c305087f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d53b4549e203ef5b09df90456ef6890c511707a4b7cbd5054d7b3b1f3691c4c7"
+      },
+      "ci-hub/taskgraph/label_taxonomy.py": {
+        "index_object": "ed6b985d2909c5adebb16984762ac403bea445aa",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5132cf53599c674897fec6187172a86907811fa0e72c9fd18abd817e9f0e3946"
+      },
+      "ci-hub/taskgraph/tests/test_label_taxonomy.py": {
+        "index_object": "bed3885d527aa32da0e516e7445cdf3b86bcfae8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "24f661528c43e31f703d905042de066c49783eb7d57e8fac197a9a677f447a19"
+      },
+      "ci-hub/taskgraph/tests/test_unowned_backlog.py": {
+        "index_object": "793bbc162e85aa0768fae5b6196f350be93dcb86",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "04da1d6926771aec79b1ff7359351799a75699c8eb44a7a1cfb29c3ab06d4fa7"
+      },
+      "ci-hub/taskgraph/unowned_backlog.py": {
+        "index_object": "de6e617f270bf63482cde3e85e56ae3700e9685f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "3e6ffba3497e6e932ce8966dca1577ab9707e84c6052ba7693866160ae8db579"
+      },
+      "ci-hub/tests/README.md": {
+        "index_object": "a0249e8b007bad3245d2d849c59bda46e128e2be",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "536d357fa8fa864239eff15183345ba39b17a3665121d98712e3c855d360c59c"
+      },
+      "ci-hub/tests/documented_commands.py": {
+        "index_object": "3ccabb0db32f2be4257fbf9316232acce888c644",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "731d3d5445d03b3006ea52a20d09c12a15516777aea867ba800bf8fed5c85080"
+      },
+      "ci-hub/tests/live_health_probe.py": {
+        "index_object": "c5ffa5a05f42515bfee2a43fb0925d12108c6e79",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ca036732c12cb26074ccd177bf6f9f1aec6908ef2b6cde6e81a92867cead71d3"
+      },
+      "ci-hub/tests/requirements-workflow.txt": {
+        "index_object": "7345f250f23f668c1016f96cf5ba9a21d0869119",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "93c4ab5f175d24229e46ec70a8ecaeb6db8b36e3f54d8005808044c060acbc92"
+      },
+      "ci-hub/tests/run_python_suites.py": {
+        "index_object": "fa6cbadd198abd78263d0bd3d79e2c47d48b1449",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5d6691ffab25dd397ee097b14e1db69d30488f4a8e70fcfea320bf11ba05a6ff"
+      },
+      "ci-hub/tests/test_agent_facing_messages.py": {
+        "index_object": "a961bab309f2f2ccd40ccc6b0ac7a8a847630388",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "df3a92b164af2fbbfa97ff9113ab9a4263ec85c67f298ec1fbc478971332f911"
+      },
+      "ci-hub/tests/test_agent_podman.py": {
+        "index_object": "7ada38f11af05193d302411222bfdceb9aff541a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d6102d2035ad0ea91d0de37132f3c366ee817a81314549f19d154f7c5016fad5"
+      },
+      "ci-hub/tests/test_agent_tool_pin_equivalence.py": {
+        "index_object": "45623f09b37ce4fdf4978c80eb4edc3edd58d793",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d509ac31927707c755ee8ec19cff863f72eb02502f5483dcd2a74d0b6df42b2c"
+      },
+      "ci-hub/tests/test_check_outcome.py": {
+        "index_object": "5388127f4dd2639f35e4da41346ca0f0baa34602",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "cb29721dcd0eb7ac5b9f0508c1de82575a7bf815b9b66a561bdd49531692625a"
+      },
+      "ci-hub/tests/test_check_outcome_status_gate.py": {
+        "index_object": "636fcb01e5fafed7f53850853c2ab6940fd1f726",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a0afd42c17f3c0346cdf51f85307af98e5ec6e6c008ac0284d66387dd2428936"
+      },
+      "ci-hub/tests/test_checkout_pr_pin_binding.py": {
+        "index_object": "9f86724b398892982a9b715a02b81b857d97d33a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0df77b23ed7013f0a461ab79d443029833a757e4ae5c1d5c3b9adfd3f436d69f"
+      },
+      "ci-hub/tests/test_cherry_pick_context_gate.py": {
+        "index_object": "ee923bd5021164f6d98c5194d7012498e7b20bc0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b09a18bde902f5e9eea89c58fdd12c519720ee92d5a3f1f77ca79a9680e65a5e"
+      },
+      "ci-hub/tests/test_ci_hub_validate_cache.py": {
+        "index_object": "48303fc93d9ad3894737bde0f9921778f88ecedc",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "9c072bd7248a7a42f4c96ded81c64eae9acf08b511f47cbd0bcb17164b92490e"
+      },
+      "ci-hub/tests/test_codex_slot_sentinel.py": {
+        "index_object": "849b4f55d530b437acd6b421c23b2cf2978e114e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "47b664d2c86ead1077eb981834f04df6e76b23c262a5b84044b18640f7e536e1"
+      },
+      "ci-hub/tests/test_compatibility_website_export_inputs.py": {
+        "index_object": "e25810bb9893a55d5a48544f3b6315764211252f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "db884b392ecc7a7fab1d827692cc6873e50c1997fc3ccfc0676b8b6e25e98841"
+      },
+      "ci-hub/tests/test_compatibility_website_reduce.py": {
+        "index_object": "066126cfb5f69f37f3d325f80812892fd0687028",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "afd12f83f8c3b26ea5e9ea706a65b9ca65574e17f84677b349a3471d0abd431c"
+      },
+      "ci-hub/tests/test_documented_commands.py": {
+        "index_object": "d41014fc99ff76695c670fd819fafe22aaa78f42",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c2de740ef4d9525c6718aec459330ec7c3fca147344fde5f01ada5e29823529b"
+      },
+      "ci-hub/tests/test_escalate.py": {
+        "index_object": "0e3ba70e8cbf819edb36a78803e1eb5861e53765",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "03b2e06c1d1ad1019c4339f4a313924dd8b9864914bfaf6c88730069453ea446"
+      },
+      "ci-hub/tests/test_escalate_taskgraph.py": {
+        "index_object": "d1a1f9dbad814380cb7142d58cc4a34de467559a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "abf63ec32573ea9903af6232001671bb07e5c2a1b8dd7007110031ba6e1222ea"
+      },
+      "ci-hub/tests/test_executed_tests_consumer_registry.py": {
+        "index_object": "04adfa0f1651ff4f529cbf508844516b8fcad283",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4725146ee325ccc90fabbfad8849dbf7b36e1860491e3e03e2051696254ea76d"
+      },
+      "ci-hub/tests/test_gh_comment_attribution.py": {
+        "index_object": "c9ec210f5872cbd24a77da7dff56db68886c3951",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ebfeef85ccfacf4821fb3eb28d65f791ee63541f06217807398d26874bf422ba"
+      },
+      "ci-hub/tests/test_git_push_verified.py": {
+        "index_object": "c507f18e70fcbe926d5c45164e37a35e6b9ba68d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8bfb9eef9b3f8d5e9dd874d624424df2f4af0cf4eb9b6c4fcca8096e5c6643ca"
+      },
+      "ci-hub/tests/test_health_tick_escalation.py": {
+        "index_object": "e0b5c6d98d67065814be521884e7551c767ffa6a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1aa57f984b6f859a03c46494a8ab53c6727a9801eba7e1659d2221507bc80d81"
+      },
+      "ci-hub/tests/test_health_tick_evaluation_provenance.py": {
+        "index_object": "3e526b700a0205a726c6bc94da82a5be479d81fc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1cd0db29545586ec4aaad86551775ecb03243762cd392f0cefb05bc3873b5f3c"
+      },
+      "ci-hub/tests/test_hourly_prompt_flags.py": {
+        "index_object": "544ed30425f6e80235b90178936dbf811ea304cf",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0bf58f478a17b75f687b33001cc0482371f8f7a8b205b10f75912fbbe4a612dc"
+      },
+      "ci-hub/tests/test_live_health_probe.py": {
+        "index_object": "a9808e4c0e579733b7a50654013551d10deff02c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "774e6c0067d7404f53e64e07a21e20c0c1a6b45f36af960f2ca33c75718698aa"
+      },
+      "ci-hub/tests/test_nightly_stress_alarm.py": {
+        "index_object": "841e4ba82bd59a1297feb7dc41b9f13018178470",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0ed751ec646e6a447c5eda893c4f0f6fe31a7cb68c1e817366baa7358c465957"
+      },
+      "ci-hub/tests/test_operational_bounds.py": {
+        "index_object": "44aa56cd3618bc6665e4f8c7de772dcacaca3cbc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ee61cd38b6afb64e1d917f78dbb2cdbb98a2ffda18971e083f292e6dd506442a"
+      },
+      "ci-hub/tests/test_pr_status_ledger.py": {
+        "index_object": "0c48a0afd49989f520d140b482cadc9e713e6ca4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "12196e1898546b856f47a88d4109eca0d158e85ad59045c4c66c523000d7b192"
+      },
+      "ci-hub/tests/test_provenance.py": {
+        "index_object": "7d62fb8b03ae8a3a7118b647d420424ecc70d2a0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "463076570a159e9b786eb080929943e145ab4d8b7a012bf264e56dce86a5aaa4"
+      },
+      "ci-hub/tests/test_published_scorecards_are_tiered.py": {
+        "index_object": "d8e0c79d401766da64ea647d818af2e7096cb1a8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7152cf69bd5c1855a0f02a69d02f839e877db862ce2c7ba4707643e44e2e044d"
+      },
+      "ci-hub/tests/test_qualifying_receipt_capture.py": {
+        "index_object": "c75ede77c218d2e30aca4ca3ee5ba8a938040b2b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "eb9416d725debffd7f3d759c4099c44ab52f6755bf7c2a107b48464dd0d1286d"
+      },
+      "ci-hub/tests/test_refusal_predicate_gate_probes.py": {
+        "index_object": "390032e32abe49f6595c582d222e1006eb1f10e1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e672816866b897d0e66b7e058e9a64caa63e05775507f869f39fe086b5c73a79"
+      },
+      "ci-hub/tests/test_review_attest.py": {
+        "index_object": "18da1d4ef4cead2c224812475a2e7be689cf0b9e",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "c00988b8250b5932047d18d7c6390cf4b349a036adda0e9f4a0f4b5c8bae7224"
+      },
+      "ci-hub/tests/test_review_contract.py": {
+        "index_object": "2cfa67c3e2b470b8c227ec3ecb92048b0fa93454",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8247721f5cd251edd7e66e272a9c8a38ad9a9a366b79dc77ff9630f4655b971f"
+      },
+      "ci-hub/tests/test_run_health_escalation.py": {
+        "index_object": "ff3fff5061294f18b06d0fa841a6cfb18e18064b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e383b0e2bab22893aefe34827f5860a160845da4c7eb13dcb36f1f6d551b23fe"
+      },
+      "ci-hub/tests/test_run_python_suites.py": {
+        "index_object": "485fe558722a579d425a18d108d67db9d768fe51",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9266bb30acb59028bc5e3ed3a2d71e73e60053f571bd5ea2cdb14cbb4c423269"
+      },
+      "ci-hub/tests/test_slot_agent_parity.py": {
+        "index_object": "66b1981534a21573e2c6b4858234353b1373c69c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c1a15d46c6afb97f60e54f678366b48b69dd6252bb9e0d5983ebf7ad488a92c7"
+      },
+      "ci-hub/tests/test_tick_frequency.py": {
+        "index_object": "fad72763abf1c6c53bdef065632eea1d389d9303",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e85f5fd0607c09c75c6ef65171f515a55470d97c23f69ffea6193fcc1cf943c8"
+      },
+      "ci-hub/tests/test_worktree_interface.py": {
+        "index_object": "7c1fe0541090f1a47f9dc0e26986ad3505a3203e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dfca4e30dc4928eafc40a51f12ea8ed8c143fc6c128f66c894a2d55bd14aae1a"
+      },
+      "ci-hub/tests/test_wrkslots_audit_job.py": {
+        "index_object": "6986f46ba1555c5e0f67f70feb2beba6f1089422",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "b2ef8a566c49706b8c433b3a7f53d08af713ac988521fa2d600ef5402837a60c"
+      },
+      "ci-hub/timeout_audit/port_gate.py": {
+        "index_object": "83eb4f93fe37115d0325314b614dfebef4531733",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b61bbdcb1428eea07c036e01cb47e8e1218947046028f77b21ee608327898024"
+      },
+      "ci-hub/timeout_audit/tests/test_port_gate.py": {
+        "index_object": "13f9204c20042ca8258bbc4393a1dcb136db942e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2de2107fc1deeca737316ed8926fa5eb01663b173129f4a7c2832a8e9075b37e"
+      },
+      "ci-hub/validate/README.md": {
+        "index_object": "4db933e710f0df87f74bc21ccc1da9ed8916cccb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1bd83697f192c418ea5b25dfba135f4bffebfebe500bae708ae197aecd3f659e"
+      },
+      "ci-hub/validate/__init__.py": {
+        "index_object": "4447b012fa8e422e20c73cd43c33d961a1629336",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b657c0705b2798768dc5a19f7685a0b5e4190af6a64ec9b0d83d2d5be6e41ff5"
+      },
+      "ci-hub/validate/aggregate.py": {
+        "index_object": "9afa16ffbb616cfc5e75cb64346c39feacb87a41",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "dede24a56a72cd03a393559e3b7e3e166b88ba3d94a98c3946d43672348c30b2"
+      },
+      "ci-hub/validate/anchor_select.py": {
+        "index_object": "c51b72b7ed71fdbbcec2697a69471ef17606c550",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "813b524e45a55d1d6734418a8ec94e92d8b1a6f810f0a94a1b78e1dc6dbad783"
+      },
+      "ci-hub/validate/attribute_reds.py": {
+        "index_object": "8c72f52e9cc9936fe66e4e54831a41be33c69ff8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "74c1c1983e22e2e13897fc6fa93baa44424c2f8498e7bf5b84ccfb85220159d6"
+      },
+      "ci-hub/validate/backend_factor.py": {
+        "index_object": "962693dc7dfb4f59e3ed8c44178238c942d51de6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e3b2769168ba3d9409dfb141acf24867390becbded61f3b03b33e4819775a28c"
+      },
+      "ci-hub/validate/correct_owner_watch_handles.py": {
+        "index_object": "a8753aafab9d1060a7e4336ad12724c31bd1af47",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "404c4169aa85a27947e142fcf976a57d541232bc081a7b6b126e203a90f7ced7"
+      },
+      "ci-hub/validate/failure_evidence.py": {
+        "index_object": "f0b680de43476a5be135aa6620b3f1a692bebe46",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d5eac80d23c2f761e0af0a61d9c610709552140500513053fd0ba0366f5aa405"
+      },
+      "ci-hub/validate/final_validate_status.py": {
+        "index_object": "61bcace2bee27cb1d4699699a432d2e7adb1ea4f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d784565d46330d56b81ace62644c2c4891bffaa561f1d2d756a081ca2c2219c0"
+      },
+      "ci-hub/validate/finalize_receipt.py": {
+        "index_object": "a14a19d6364b31105259fd2ded9753c5a4b7fec2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f4e5423f6ab4dcae562fd1618fb4b05c91c010df0116214cf58b00fc9c760670"
+      },
+      "ci-hub/validate/flake_class.py": {
+        "index_object": "7901f8def5a3ef43fdfde99dae7158cb8340915b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a174c69263efaa13f64a90cd93b2a42429dd60a9ca3fcca63ba092bb9752c03f"
+      },
+      "ci-hub/validate/flaky-cells.json": {
+        "index_object": "ea42efec0d7cc0e9a16913ce341021e1f8b83756",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "37b35c4a920b329a98aa015954f031cc0590cca489a7634fef499f3b01a6f8ea"
+      },
+      "ci-hub/validate/flaky_cells.py": {
+        "index_object": "75da6d94165b35f2e62bdccf275bc9894347ce59",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "faedba7bc07b91edae0405c0ea10893754a57f4f3c5d7f5be09ca98b6685aec0"
+      },
+      "ci-hub/validate/gate_completeness.py": {
+        "index_object": "3e7da5e5e1446c75e62cadc0e1bdb6503e85edda",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d3fa78d8174fec776e606373ff38beeedd7786b66ecd4a00f617d4db5dd35e67"
+      },
+      "ci-hub/validate/gate_floors.py": {
+        "index_object": "97c73ef34ee4bb264ee634e8cf553a668e4fb45c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0afe6635b761ed67bc5604bd74e0155793d84768922b9ae83f71a116d8ebf756"
+      },
+      "ci-hub/validate/gitmodules_lint.py": {
+        "index_object": "7facd671da8d3dc59199ca8ec086a57f342f2985",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "951818be012cb7b32f8633c108cbff411c6e6081c6bb82008c676093f4232285"
+      },
+      "ci-hub/validate/green_class.py": {
+        "index_object": "aa118bc7fee1692eaf5311c9f7439962cdf5a2b3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c1df43b4353450c5d589c017213663fd56b90f8d204d6d80b6846f49d18d145e"
+      },
+      "ci-hub/validate/immutable_tool_authority.py": {
+        "index_object": "7ff33d539c730be58517b85e12f90b5dbe433d60",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "cd9dbcb99d0cc8d8e9dfebeeaaa0546a6d0eae525477e858277cb7c1a6c28bdd"
+      },
+      "ci-hub/validate/livelock_class.py": {
+        "index_object": "63df4a1e6f0c6838073ee55aa8cd67522e9ea999",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5910401071435bed29e90731733276526eef23f94e8435c56c9964d626133646"
+      },
+      "ci-hub/validate/migrate_run_identities.py": {
+        "index_object": "983359a59c15b340ea6849ed2b7b9f71d48c4e04",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "cc79c10d0c4b6487a5d2cc5d041294a7200884fb2f86db5ef45d4047940b7ae3"
+      },
+      "ci-hub/validate/mutation_suite.py": {
+        "index_object": "5f1e289870335fb7bc158a4eb608453d7b8674ff",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "62d0ce81663837cf7cce6f28495e0a26ac8e2327ebd603512534b61e974f2744"
+      },
+      "ci-hub/validate/pane_lifecycle.py": {
+        "index_object": "faff2cb179e4385c5bee7e9bc59100c1c217c138",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "57facb123b2e23c54b6515d263e7266ad7331db3406fa1bb493cc6b256885239"
+      },
+      "ci-hub/validate/pane_owner.py": {
+        "index_object": "bee938c613b3c5e03fb26c8d9d00c35693c80261",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a29c82de495ff0e144924f4840022dcb6379caad7e920e78389f1083939824e0"
+      },
+      "ci-hub/validate/pane_watch.py": {
+        "index_object": "d9700e7a3516b3d6c119d99ff509c93a481eefb8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2544247896ea026564050e869af451ecaa8d554565793afe1ca9f6cff6938743"
+      },
+      "ci-hub/validate/parity_gate.py": {
+        "index_object": "f2c3c70c214fb5c8527e10a66d233d9a12f981fc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a043ec407447cc920eaa3efb5a48c7faf09708f3f59b135c8bf2260cd0b655d4"
+      },
+      "ci-hub/validate/preflight_anchor.py": {
+        "index_object": "47626c138efc5494a5572a9e7b4b51dae5523d0c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "9ac84d808724241f626f602cc00b25dc67a1e97fe1c4e3f80f374c056fb01db1"
+      },
+      "ci-hub/validate/preflight_validate.py": {
+        "index_object": "f7bdc1b8499c9bc3b8a764c192784b214fe4b235",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "96a18a7d5c4d5aabe46f94539a840c12f59129325d0da027749cf4d8b33a411e"
+      },
+      "ci-hub/validate/producer-definition.json": {
+        "index_object": "45fe5d02b16693ca88f6df660e48514131d69c93",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "483405f9c79365feb277267c7e2cae5a329b56a8bd8df674dfcb5790de1c2856"
+      },
+      "ci-hub/validate/qualified_rows.py": {
+        "index_object": "73fd2676e920c131dc87dca010ba130af8e4590b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d39a30fbc810fc9667f8138298221c6410ddd4b97cdc82e4e8aac57109066ac4"
+      },
+      "ci-hub/validate/qualifying-receipt.json": {
+        "index_object": "a90c89255548c5a3a731dafbc15522816e41705d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a5ef4121c26379a78327eb16f8c2d837ab3c71bff983706f28cfcb5b4e8abb02"
+      },
+      "ci-hub/validate/rebase-base-floors.json": {
+        "index_object": "1acfc6b4c29d2a1cb541fed6acf48b4af9f9ee53",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "526286e22d5544defc84389ab802e19dee22e1dff0c2d11e8c026f14eaea6dde"
+      },
+      "ci-hub/validate/retry_class.py": {
+        "index_object": "972da21d0e4ce934abc4f0b56891fbe1b74ecce5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "758b7722aceda007722ca8d764ce6fc23b41e4f7cf706e8b7f59b7635c7929ae"
+      },
+      "ci-hub/validate/reverie_node.py": {
+        "index_object": "172c0da20b65d0145d2c555c740f5bedc7e87b4b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1083d4f27ca6559535dbbe44010b4402d230c62e6424d644dce5924f83ff19c4"
+      },
+      "ci-hub/validate/reverie_safe_ci.py": {
+        "index_object": "d5355a14a5e1a53ac49677ad932b7c774dab4377",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ebe1277ea683917f48f176eb51519f6694e9ac0a79a73c59387bfbcb0a3a9f16"
+      },
+      "ci-hub/validate/run_registry.py": {
+        "index_object": "b725f317ef8328a8e43f8ac42ef875e32e87885f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "cb973cfcbd5b302cb5cc7dd4cee528014c7f9d5a5d54550305be5d9993514045"
+      },
+      "ci-hub/validate/run_with_validate_deadline.py": {
+        "index_object": "4cddba3f9d11c559f760c54799398141345fc886",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e0bb33005f31e46548d7fadb220341187715be3ca5976743a6d611f9a0512f1e"
+      },
+      "ci-hub/validate/sabre_reach.py": {
+        "index_object": "078f28aafa56088fd08615042d75e74bc93fd57b",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "7fda459cf9f6d3b3459e19a8f8442cea03f007815cd0650e9ea470d0b4fb97d5"
+      },
+      "ci-hub/validate/scan-finalize.sh": {
+        "index_object": "d590383e8e506ff48a441da98f95cceb1564312c",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "34c599978e69902fd67e5af8d74144bf585c322ec011717b478be9f8822c48ce"
+      },
+      "ci-hub/validate/scope_declaration.py": {
+        "index_object": "156b6afaf1963c01d837512a367a44d435a54d13",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "44b5fcae0c51dd2a43dc77c464fa25cfbe78142040b294dc6ddbb9a47ff51884"
+      },
+      "ci-hub/validate/service_result.py": {
+        "index_object": "1f533f633398b20ee0c67f0545fe3309be929ead",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b62b3cab47a2f3d68e2c1d552208fb02ced6ebcc00c3b5ca972e2b7d8dd8b6f8"
+      },
+      "ci-hub/validate/signal_crosscheck.py": {
+        "index_object": "831d4e05c2565ac0f262c8cc3f93328ab3c97e90",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dd956a3bbf77c7b3ba5410303318b50bf405c4386596cd6c9dbff1639e9af16e"
+      },
+      "ci-hub/validate/start_unit.py": {
+        "index_object": "21d7be09d2848660115c0eec09a918bcfc36e517",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c96b87b5e4b4678163510a80d0b94eefee270a03b50fdbf0c724d11d5740b7b4"
+      },
+      "ci-hub/validate/stop_units.py": {
+        "index_object": "8330bf4c20f7a2ea19f76d195c8d965c401bc4bb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "214742a35296bb926e6aa97099562a0207dce35ea1685f4ec9de51ea3083a0bc"
+      },
+      "ci-hub/validate/test_anchor_select.py": {
+        "index_object": "3e0353d7146a0167ef1b628d5515f5c3bb52c11f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "328ef1e936305f67c5c411292eabcb4325a0ba30c2d81b60bad58302a1a791bd"
+      },
+      "ci-hub/validate/test_failure_evidence_solo_rerun.py": {
+        "index_object": "b41c2cff810da52875a6c62e93934dddd37d1fab",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2ce23034dd563c343a8a26937125cb1d3a90fb0b9e4f57daf05fe7223430e554"
+      },
+      "ci-hub/validate/test_finalize_receipt.py": {
+        "index_object": "9767ec7463695a452ec27ef9b153300f7fb2fd43",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2482247e442f73d05e19efc6e36da0c43eac6cffb7eeef1372a31bc68e793e0d"
+      },
+      "ci-hub/validate/test_green_class.py": {
+        "index_object": "343c3ce8b4b11b238e4862adf2d6c910688412a1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "86b76a90d26b8e767b6506b1e5315314171cab4ebb18a46731b2978af9154fc0"
+      },
+      "ci-hub/validate/test_green_class_predicate_wiring.py": {
+        "index_object": "99336d62a6233e89c6f38f0254130f6fc4eda151",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "75194d6a2b9b0b70cd87685b6d7f586d18c80caee8f3580aae24cf37f60da428"
+      },
+      "ci-hub/validate/test_livelock_class.py": {
+        "index_object": "a7091e5bf08d67c7270c1cc0ac2c87c0bcb741e9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2413265ac624dd82db72e200644380af05fb565b214198579eba1ffc01074263"
+      },
+      "ci-hub/validate/test_pane_lifecycle.py": {
+        "index_object": "152a5025420f55046fc1812ad9bebd0b0b6e2766",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1ada34a4e51bd2db489aa8e451962ab855f63c50c9e02145e6de9878c004edae"
+      },
+      "ci-hub/validate/tests/test_aggregate.py": {
+        "index_object": "48d5c842aac0a6526689e71c740cd85d1352178d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d2e11418baebb3ac773e0d6a01e5001caae7467b2514dc4c1e2e688976b1f975"
+      },
+      "ci-hub/validate/tests/test_anchor_select_clause_brackets.py": {
+        "index_object": "4b34a558b49a05327843e3791496861564c75efd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "48a1a57f19a89324f86f74eb109e4477a0a58eeeb6e08f7dec0dd5df8c087b30"
+      },
+      "ci-hub/validate/tests/test_anchor_select_coverage_parity.py": {
+        "index_object": "eeaba4d8c0728dc049223324d712ce990c2da5f9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5203fa63d6c504fac42da965bbd03978c34988756dd02689e064100a06778d2e"
+      },
+      "ci-hub/validate/tests/test_attribute_reds.py": {
+        "index_object": "d86befffeccd5d9e15cde1632ab62b107786dadd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "290a7acdd3a49ebb83ebd66ca56846e143f20d07a6de0c1ef36651c124ac05b4"
+      },
+      "ci-hub/validate/tests/test_backend_factor.py": {
+        "index_object": "8f97ac151f55130324d2be4b413b2b98f7c5ece7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1a5a170f6fa5f1d32bbf3544ac65c8c59c382da9e42fb1061d9c5bcc2b57f6d9"
+      },
+      "ci-hub/validate/tests/test_correct_owner_watch_handles.py": {
+        "index_object": "b3dfb9370edb3925f4ccddfc7f911796152c51f0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d896391f4d5dc5d3d619459a5da103325325df4abcdf336c4dfd7b853a8301a1"
+      },
+      "ci-hub/validate/tests/test_failure_evidence.py": {
+        "index_object": "24ac1bd288b11463e5b280d81415d1724b32f253",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d852d109d3ab4ba5d48130a3b217412017763a25f7bf53d6530e1053a58443f7"
+      },
+      "ci-hub/validate/tests/test_final_validate_status.py": {
+        "index_object": "d615c3bd8ae0ebe28fae18f6dbbfa015b1321f8e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "39c0984b71a774eca22ea86a743e6f0c855d3c0cd40529f27b53e83127dc0b9f"
+      },
+      "ci-hub/validate/tests/test_flake_class.py": {
+        "index_object": "b6b5abed9f84f458a0cfb79a948559232ef4ffe9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "edef822f3c7b1e01e4df419a0d179067046727d13ee26b3a2b91c3f3a8ace2d4"
+      },
+      "ci-hub/validate/tests/test_flaky_cells.py": {
+        "index_object": "15a3c0b726e58fbc278d31d7316e6434a6387348",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d0b3c259df458f9a2863c686538b2f4eb72381f6b1e42f8e029e763bd0f1a8ce"
+      },
+      "ci-hub/validate/tests/test_gate_completeness.py": {
+        "index_object": "c60fe5f7b66622381bf5842ab8ffa5ca9ca946a2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7022f67db1383cfa3edb52407a9f0372f08396fd2e6123c66434dd6562a0a092"
+      },
+      "ci-hub/validate/tests/test_gate_floors.py": {
+        "index_object": "b2a4b750b1b78851ca061b3d9cbfc593e9c6f9d0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fc596b3aea04da488d27ddccf4d6e8a2cea84c742141e7ec4fe86e5d5a471b14"
+      },
+      "ci-hub/validate/tests/test_gitmodules_lint.py": {
+        "index_object": "60aaad4aaac874045042032ad0d24a6ddf35df4d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bf3ead9b1aa2a80c17efe634fb0776604b4ab5df5a4ab57f4a4a45e566a742d2"
+      },
+      "ci-hub/validate/tests/test_green_class_wiring.py": {
+        "index_object": "2d6909a820f25ff5873ea30f72dac1c6e13e1ae3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "445ec1545e8abfa2745468743d773db5eec560f3af96d4a7f559b35a8f0baf43"
+      },
+      "ci-hub/validate/tests/test_immutable_tool_authority.py": {
+        "index_object": "b396c8b29250a79844cb3e7f3ea2544b0f40afad",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fb8098bd12994e65f7452c0667c1d2a7b195dbe248c9e1122fa6fdfa3a30cb71"
+      },
+      "ci-hub/validate/tests/test_ledger_reader_allowlist.py": {
+        "index_object": "26227efe5a765cd0ed183cc1be2747afac1eab09",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dedbbe7681f2196973683fa6122f668f70c1ab8ce80581b085d21e0a1637e09c"
+      },
+      "ci-hub/validate/tests/test_migrate_run_identities.py": {
+        "index_object": "8f81440e61f504ac2bf967b571f683acf59d6ed2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c0d92cb3ccb0f475aecdf9d20384d1eb5edb28bba807a05a9cf8d82bc61d23ec"
+      },
+      "ci-hub/validate/tests/test_mutation_suite.py": {
+        "index_object": "15d6cf3bdf38ba097136fdd4a53c4bd9b7661d7a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b6fbc60c7a5fd89e30ebe15008aed63c9748491e6f9c9c22f3c371960e33e134"
+      },
+      "ci-hub/validate/tests/test_node_timing.py": {
+        "index_object": "7b1ede7d4b73e051b421f969d89e9d956aacc020",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "61e8c14a7c97d9573c4b7e9cc533ae4ca6f3bed347edf7087c230ead24e1c425"
+      },
+      "ci-hub/validate/tests/test_pane_watch.py": {
+        "index_object": "48297b1c566f10463a39a868f9aaf7a728855aef",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4b0aaa8b1f66d51186ba617a31be37fcd402a0f676d9f97d75c35aa0fe49148b"
+      },
+      "ci-hub/validate/tests/test_parallel_validate_paths.py": {
+        "index_object": "d515584a5238ab6b1ec2bc72fd78edeac1c8be10",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4f1cea99be5761bfc22d0463ef7d72228d2dff39f4e110ba06cf45b2297449a1"
+      },
+      "ci-hub/validate/tests/test_parity_gate.py": {
+        "index_object": "ca8c36e1d6c068ee0debe62b245a808036257f2b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d53f808412a0830911e95adfd37e01e10dcaee5ed995e6ba92c7496880be989f"
+      },
+      "ci-hub/validate/tests/test_preflight_anchor.py": {
+        "index_object": "e5275398ed50dd46d02dc30124b8c56aa76770a6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "451c83d5eced3a982cddae467861fafde8b1575d2207055aea5ca1a20bc84157"
+      },
+      "ci-hub/validate/tests/test_preflight_validate.py": {
+        "index_object": "f5d145da3aaa1ae1df11b594f49b299250cfa421",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "317de78e038e3018b0bc83b92de6a31ec3d7044e6e5271d24f2d75bd2703ba46"
+      },
+      "ci-hub/validate/tests/test_private_cargo_home.py": {
+        "index_object": "f83b4619c1921cf205b1b0c5a5d47558f273be9f",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "8704bd9b97bc89a743eebb9aaf39af59ef4ead3aa0117403f7aa3be42fe23c7a"
+      },
+      "ci-hub/validate/tests/test_producer_provenance.py": {
+        "index_object": "7a8832d47532e8831a8c0208ec7ca4e3061e6801",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2f4b4c3ff0b0db3ea5d5a83d739b4c11c5ad915204ff092ae9fbdc5701aeb178"
+      },
+      "ci-hub/validate/tests/test_published_tool_authority.py": {
+        "index_object": "690a13d40d3c3b88d4c0cb092d957fd75da633c6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "33f5c375ec99d6e672fe1b6e6874e6a6b868429cee1602c813f46aa9ca9f1367"
+      },
+      "ci-hub/validate/tests/test_qualified_rows.py": {
+        "index_object": "c045aafa169e0733b3c8ff099329802b800dfbd4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8f8edacce64b956b048fec8348504aa04ce81ce3cd5e62c2dd791f1a70eaa679"
+      },
+      "ci-hub/validate/tests/test_qualifying_receipt_mutation.py": {
+        "index_object": "11603e7c4f364ae7e28c134de84fb2d33e5d97e6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "eb234d64b0a65691afcc9625307a4890c11298808d80c5d75b3d309f77ee1d82"
+      },
+      "ci-hub/validate/tests/test_receipt_base_boundary.py": {
+        "index_object": "81a54a1588c2c683f9480d19765c91e31cf1d9f7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "aa2748dc973c358eaa1071cf056699eab09ee52c70f5703eb84022338a0c5ced"
+      },
+      "ci-hub/validate/tests/test_retry_class.py": {
+        "index_object": "22fabd98257d83f9fc972f3970d580ba8c553b2a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "76d79309fc4a5a7ac9f563f0073ce6e120b07da3a2690311dc823ddc01b93326"
+      },
+      "ci-hub/validate/tests/test_reverie_validate.py": {
+        "index_object": "cfce6cbcb0a1a181d7901fba9b19a683bcf5a472",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9df82c8437b6d8817394e04ac00ef2af9924f782fc641737bc94530d4b7177fe"
+      },
+      "ci-hub/validate/tests/test_run_registry.py": {
+        "index_object": "41e80c05eef45a8d00cce66e5e9d591d4f14dfea",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d7c62a066411e7911282b7a8329cb494066ebb2bb41968273e34cdaa51df5da7"
+      },
+      "ci-hub/validate/tests/test_run_with_validate_deadline.py": {
+        "index_object": "b0c51915bf213fb9b72a3b263056ffd666a4749b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b8a43137268ba33a99d5e38dbc4a7556b3b51c6323d5579e4b64659374605d66"
+      },
+      "ci-hub/validate/tests/test_sabre_reach.py": {
+        "index_object": "e1c8215fa2db7325160d57bd7a200e64b598ab62",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "171e6092d9aed855f7a16f0c359562c2c4f5f55630bef3fed3835cbc54fc4b8f"
+      },
+      "ci-hub/validate/tests/test_scope_declaration.py": {
+        "index_object": "d324d6cd8754b25fe22f7c7ef511d6aa14f8b070",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d63880688f4abd2678fe2d0b6a75ebb9553f5d6d40495450367bac6d0b842516"
+      },
+      "ci-hub/validate/tests/test_service_result.py": {
+        "index_object": "b019e21c4ec0af789ac6659c4ce91652c7b335a9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "eb14f5eacfe29c01100cd36da703ca90b0a78d5ed449b23d80c3a43c0afd140d"
+      },
+      "ci-hub/validate/tests/test_signal_crosscheck.py": {
+        "index_object": "c67d6ee416c53def0c561e9ac4d1a52a0741ac98",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "95a2487ccb17faec537d7e9111e72991ceea72bce0aaedb74c1295ebec6d5d01"
+      },
+      "ci-hub/validate/tests/test_start_unit.py": {
+        "index_object": "1cd47351461f103b0e1a13e0a631951ab5380feb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "60ade9d74a2330fd9e613faf4b3d78c7a7d3c5164534c264ca834fdcce495c04"
+      },
+      "ci-hub/validate/tests/test_start_unit_env.py": {
+        "index_object": "2f0da67d1f0284fe9cd77dfd26e2a6e223ec8b3f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a64851d9418ed9f1859077a0c8b443d77dcbd2b56b018d59fd0a0fb19ec477e0"
+      },
+      "ci-hub/validate/tests/test_stop_units.py": {
+        "index_object": "c01f9c0186c90270d5cec4944dccbdc5a449ed7c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "acad458ee1ddcb8adb418bfd925ddab0171bb43197064f58075dec783f6aa24c"
+      },
+      "ci-hub/validate/tests/test_totality.py": {
+        "index_object": "5a0baf837b844069c1bb6b4fd14bb8a82385a29d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "de576e739dcc0fb3bba59b60675ab74404adbecf5be7a2f92f342767290a1b90"
+      },
+      "ci-hub/validate/tests/test_wall_cpu_ratchet.py": {
+        "index_object": "e332dae91eb6a8af80c85df0a64bfe3a5a5b698a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "696582687443fb8b8c73574aef15758d97addb037f6b4d77b17c858dc35e4d3a"
+      },
+      "ci-hub/validate/totality.py": {
+        "index_object": "e745ac2dd3203cb7247dd199a06ffecf4054bd9e",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5af21e241073b8b36806c6958cd7015c19df36dd802ef64fae7dee2f3478de77"
+      },
+      "ci-hub/validate/wall_cpu_ratchet.py": {
+        "index_object": "ef49a192bce3ec1e8660fee5bc909c97046b6518",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "689bd02b23a3ccff0aa7825608a2f3b8f1998bbf44ce7d3f5265ab117a09e564"
+      },
+      "ci-hub/validation/finalize_producer_transition.py": {
+        "index_object": "716d7c9414dfa0351fe291b1bbc9ca1dfa864b43",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2de5ee8957c03bcb193986af032f4f11496f2bc22b2b89ea558fe29b3a1539e9"
+      },
+      "ci-hub/validation/fixtures/reverie-run150.json": {
+        "index_object": "aed4f04490d3853bd1b3e60f38e73ca4c174e3c7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c6037137812d4d188afdf694ada914b749b6888813c73a111e600eaf4cfd3c58"
+      },
+      "ci-hub/validation/publish_receipt.py": {
+        "index_object": "50a414f8bbad824c85bacd9ad002e1d85511e168",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "e4b10f634e44b5fea9f320fa0fb76f7f93d699c4fdbad5c804a6656a0cea8f63"
+      },
+      "ci-hub/validation/test_apply_local_label_receipt_reuse.sh": {
+        "index_object": "3308e2f4e6cdc745f3f0003275bf207c28de0df9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "97d153eec33cb63977b3c201656e9a0ca12781f035f14b336257014aef4983e5"
+      },
+      "ci-hub/validation/test_apply_local_label_reconcile.sh": {
+        "index_object": "1818e330b34dfaac74a1a1f739582273371b0c5e",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "ecd8fac00f768af9b35f74ff6770cb2ea71e536f4d6c24bdb2c3c2f92580a92f"
+      },
+      "ci-hub/validation/test_finalize_producer_transition.py": {
+        "index_object": "76165c7f8aac4c6abc1506d88b14c046396488b1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "442e7b452e5d1463664acf5660414cf49bda265087b971a50fae285dc5d8a8c9"
+      },
+      "ci-hub/validation/test_gate_definition_binding.sh": {
+        "index_object": "0740dc0482bfcfa0087c7e4efbcca4a959ec5026",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "094b89fe8965407718d63c0ef3629a3e21cd3a03d7371cbe01ad60736771a690"
+      },
+      "ci-hub/validation/test_local_producer_authority.py": {
+        "index_object": "fbe86ebd32d8129aa21fe525afd4432ba379f3ec",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ab371f2aec4183bf7cdf349fd26c5d28c72f8a8f84e506bb75e9a2f8b6dc13ab"
+      },
+      "ci-hub/validation/test_producer_definition_call_sites.py": {
+        "index_object": "93c1885b14f6de40c70539295a24080202cc5fa5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0cf54fafe449f06a42a2b5f111a53029a3e4a6a98a399d13e858a727d184cd1f"
+      },
+      "ci-hub/validation/test_producer_definition_undereferenceable.py": {
+        "index_object": "bce004a6235a31110bec01d8c9a3704673b2faa8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7a914ddc0d57d62d996a6a5fc52be67c33a29ac55c122a02f7789bcd72dacb9d"
+      },
+      "ci-hub/validation/test_publish_receipt.py": {
+        "index_object": "d111ca6416eebba84c14e7981b083d4614ca1dd1",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "1079a0282b4ab4455e60b83de28c1a8047ea75747144e58986ce355692f7ef5d"
+      },
+      "ci-hub/validation/test_verifier_provisioning.sh": {
+        "index_object": "c2468c39c64942aae40f08b91ed4d3357a5a97b0",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "5f59c447e90829d1dc70230499c5c40143e69763095f50137d2d522eeba9561a"
+      },
+      "ci-hub/validation/test_verify_receipt.sh": {
+        "index_object": "eb5811b4f7cd69d39566f6294aa00d24095d31f9",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "01d8781436653595a4c0455aa395f1101cee9b373ae608f6ce753da94fc492ad"
+      },
+      "ci-hub/validation/verify_receipt.sh": {
+        "index_object": "1e8462e57a174847c30db2b8c8dc3db46da454df",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "0ff90ad5203bab76903eb852cfba355f48dec9ea64fa596f089fa47a2f9a3dd9"
+      }
+    }
+  },
+  "primary-manifest-plan": {
+    "repo": "/home/newton/work/dev-hermit/hermit",
+    "head": "97af4c31246e2017a91b62d89e8019005f8b0c6b",
+    "entries": {
+      "Cargo.lock": {
+        "index_object": "71c21c5a76922ba3a5206c0baacbdd4378dba80a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a63dfeba0309571d628186eee273aa9561cd1d75dc9758f93a77908bc6f5f42b"
+      },
+      "Cargo.toml": {
+        "index_object": "d4972dbbd620f8ec6d710c7c433c5d930c293c77",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "61fe9f5c4a726beb73ac4117c0ca2a3b6604e115cf8cbdf3bc36889e9265b3b4"
+      },
+      "ci/manifest-plan/Cargo.toml": {
+        "index_object": "f034b2b879952040ab5db1f18581413405fd1d1f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "98bc9c24e4c0deef113140e961c04d332dc96ec7767802454de716d146459d0c"
+      },
+      "ci/manifest-plan/failure-class-schema.json": {
+        "index_object": "da412931c1803be5ba228f18fbda079c961e278c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4f2712fb696774497bbc4941d6eda05b3829636006399947f31d322b8f31dc4e"
+      },
+      "ci/manifest-plan/src/bin/generate-test-footprints.rs": {
+        "index_object": "014ce3ce6ee011f7bb2c8ce0fa3b02c16a554c57",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7b09ff733721ee8801f6c212b161c99762771d5713949ea3ef4ae58c84d67e1d"
+      },
+      "ci/manifest-plan/src/bin/generate-validation-dag.rs": {
+        "index_object": "dab39ba18d747df24dabb0cc946bdbf5d8953902",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "100204e9a96abc20b066b494467e1688a13bbaf9e01cb1ecab01cffcbe29e2d1"
+      },
+      "ci/manifest-plan/src/bin/manifest-metadata.rs": {
+        "index_object": "79665eaa4543da414b8d1c0632d48b088e195099",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "231cb273c0c91d7e26816a4ae78ab903861e220e453230d17e536537618daab4"
+      },
+      "ci/manifest-plan/src/bin/nextest-cpu-wrapper.rs": {
+        "index_object": "1f827317df1af81991743edb99ded0fc22094a5a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d1d59c7a59dd7e28c42e082d30a4c69c9df8b977020553f5658e7d6f1d3f9deb"
+      },
+      "ci/manifest-plan/src/bin/strict-green-authority.rs": {
+        "index_object": "a283898a39697767a9de46a46626774588b6adc4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5b930a5ea653bf4ab84ac3f0eaafa903cab13c20e35b42e58fd9e94d4d46b43f"
+      },
+      "ci/manifest-plan/src/bin/test-harness.rs": {
+        "index_object": "ad4581b477116ef7e067faef3f871a928419a8dc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c6bf8530b243049511a4efcae75bb609ca91912a211226509b692b159e315bc6"
+      },
+      "ci/manifest-plan/src/ci_selection.rs": {
+        "index_object": "1851e66be73146da79161b86cd65a5d1ff040c42",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8e2b5207b11a80be52dbb4873bd3038d277c82a4291efaa10a62af65edacfae3"
+      },
+      "ci/manifest-plan/src/cli_help.rs": {
+        "index_object": "23b8dfb09889cae6795e79ec9b97f589946db4f0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "831c6a1cdfa514277c0897ef2160ededb2935a09240901db723c32fc16fd843c"
+      },
+      "ci/manifest-plan/src/environmental_block.rs": {
+        "index_object": "4ec3182f7a5ba6ed4691d932bb5602966e59e8cd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b607cf4920e501c0b34cfe12bad163bff125adc30a5050ca8bc0c94eba636fd3"
+      },
+      "ci/manifest-plan/src/host_capability.rs": {
+        "index_object": "8137651324e02da9eb9556411d99b6e314d55d2e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c7ab6b0699f38dcc7422268a7c4dca466c3b22cffd3234791c890213236ff735"
+      },
+      "ci/manifest-plan/src/ledger.rs": {
+        "index_object": "0d737c4dc0d4facac7ebad0be2cda3cf16f69acb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5f03e7edf9176387ede82a409ec835bc80ea06f57b12d062fea0ceb7e5e97529"
+      },
+      "ci/manifest-plan/src/lib.rs": {
+        "index_object": "506a5c5832661a31727ef918ad40fa6a3171b1b4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "480bbad4023c031407b55d2765d0ec4ab2ac78b4e8db2ff6ae5b42ff6cb37980"
+      },
+      "ci/manifest-plan/src/main.rs": {
+        "index_object": "c13f64f78059f71d0c1ae84d2512126f743e83cd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ccce1d907f565d93b77786b6d3a5599dd64238a89cfac46445179a177ea3503a"
+      },
+      "ci/manifest-plan/src/manifest_metadata.rs": {
+        "index_object": "b6d7fcea3e1b489e6a53e95e55d331811edd999a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "19958fe4763178e52930bade5f26d147649e18705a23f9a9b6fda1adbbca9d81"
+      },
+      "ci/manifest-plan/src/manifest_value.rs": {
+        "index_object": "dff73cebda20d4c54bf56609e8c10df7c3e5253f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4190d161ca2caf474eba892685ad562923331aecc1c9608352089fd8f6c2dab8"
+      },
+      "ci/manifest-plan/src/nextest_binaries.rs": {
+        "index_object": "ecaf6135340bbafcbb19aa27f211e02440e7da4e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a7afb31ecf52beb4e1448b3d5a7eb2c3f23a533f1d02ded8e03b924affdba770"
+      },
+      "ci/manifest-plan/src/nextest_build_selections.rs": {
+        "index_object": "a2b6aab644d2058b4b08f0280fc0675c3975dabe",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f90af7d66e20d0b3134a57c0aa169923e36fe2f9234f90162c5812c1c4c2fb15"
+      },
+      "ci/manifest-plan/src/nextest_cpu.rs": {
+        "index_object": "35e03425d8fed1f319fe2a2bbfce4879ba0a9fc1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b6d3e1980e31301e1cf56c9784ba66d972329b22da6b7f5e7e85126b692e483c"
+      },
+      "ci/manifest-plan/src/runner.rs": {
+        "index_object": "40bd930a76340075dfe3c7913b2c5ee32239d908",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2e48779d00ca711573cecc5aa36a1de27113cd05fef640631b82d731f79d3b12"
+      },
+      "ci/manifest-plan/src/service_result.rs": {
+        "index_object": "b138f1937c2af8269755cfeb3311c4f2dec3c8b8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "74a904c703f1f62e3d4d4ca030bad7719c63b84a41b9154adc59afe45655b785"
+      },
+      "ci/manifest-plan/src/stress_series.rs": {
+        "index_object": "15f29a743af33a8507a1872b548dec08d8dc6110",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "04edfbb14ac446a0f39ee195f0c77d14940f940fab16fa62287847c1b4eb0bd9"
+      },
+      "ci/manifest-plan/src/timeouts.rs": {
+        "index_object": "d4cfe464f851df78ddf72e7980220bf32b66c609",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "60cd11367fa09489d98ae72558fe1974075d32b8db0a9930739ca98873ae7c89"
+      },
+      "ci/manifest-plan/src/validation_dag.rs": {
+        "index_object": "9a8540e15daa3613fe94f57d3b558c0e879f55ee",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f8635d4d47325d7330f7d71b9cc573e68b3d1e25ca67b75934242f0ea9b8e94d"
+      },
+      "ci/manifest-plan/src/validation_dag_static.rs": {
+        "index_object": "882885ad6638b5f8f463eef9a7374bfb69e350d6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "006ab98c5136ad0afa8200cd3c324537ebd170de02d5e3c928db6e038f0b85f0"
+      },
+      "ci/manifest-plan/tests/cli_help.rs": {
+        "index_object": "85f9c9446cb97c6b0ef9b2dc9876d760b2ebb162",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f997ec6893f230a9aaf5f30c5d5eb8acc389b0706d7f3cedcb0aed9fe5f120f6"
+      },
+      "ci/manifest-plan/tests/plan_refuses_unknown_test_id.rs": {
+        "index_object": "2b808ee3dc2a00ca51f60bad46df811486119c82",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bf14dada6c4305a9b81f8872ea67239d13cb904759c2014ce3cf02b160ba693f"
+      },
+      "ci/manifest-plan/validation-service-result-schema.json": {
+        "index_object": "23e5ef853ec402af8a9af148cb6104d161a5d324",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5b278e7185731d45c2fa3bd28109d1a654c145eb7c7afcff4a2480b676e01b69"
+      },
+      "rust-toolchain.toml": {
+        "index_object": "acb9297208527a3348d314fb1c4211b2bbe95b9c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ebc34b4ae748901f43512c30bbb1881b6db8e014edab9317903bcfb868c7d140"
+      }
+    }
+  },
+  "primary-au-rs": {
+    "repo": "/home/newton/work/dev-hermit/hermit/agent-utils",
+    "head": "2781b1054efc3a9c561dbed35584a6fca1ed8676",
+    "entries": {
+      "rs/Cargo.lock": {
+        "index_object": "631b89250d4f15e7aa0a09672217a826a574a81a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "af5c0c57ff9b8da8da5b84bd62c7fa6c3068b3e80b71d2e4153c94c97e7ea139"
+      },
+      "rs/Cargo.toml": {
+        "index_object": "d2af54a6b4708678a534c13e121cda8cb69af3b9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f79d435e5bbea2f1f0efb480643aacd1aab525a92580598a3b4f998b9ba88ac7"
+      },
+      "rs/README.md": {
+        "index_object": "37325db3f48d5e8ac48fcab5d9b2b2ba863390f1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "136e399b049b645d45628e87569f901130f12d55013de4f4706b492cb7edf13b"
+      },
+      "rs/bin/cargo-runner": {
+        "index_object": "b8b0c541db7b20a1194f5c0f10401e7ab3734a19",
+        "mode": 493,
+        "uid": 212630,
+        "sha256": "14bdaf9b3e9ff979cf77badfd5651a1796798cf396cf5f0b29e867f70128d8d6"
+      },
+      "rs/bin/cpuset-alloc": {
+        "index_object": "aec20d125b6d94176955207a85abdaf6cf0f987b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d8cc6594cc2f24751fab9e5254efde30e4c559c8bf1a73b0891df75a9c49e0ce"
+      },
+      "rs/bin/dagrun": {
+        "index_object": "aec20d125b6d94176955207a85abdaf6cf0f987b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d8cc6594cc2f24751fab9e5254efde30e4c559c8bf1a73b0891df75a9c49e0ce"
+      },
+      "rs/bin/herdr-agent": {
+        "index_object": "aec20d125b6d94176955207a85abdaf6cf0f987b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d8cc6594cc2f24751fab9e5254efde30e4c559c8bf1a73b0891df75a9c49e0ce"
+      },
+      "rs/bin/herdr-run": {
+        "index_object": "aec20d125b6d94176955207a85abdaf6cf0f987b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d8cc6594cc2f24751fab9e5254efde30e4c559c8bf1a73b0891df75a9c49e0ce"
+      },
+      "rs/bin/pr-landing-planner": {
+        "index_object": "aec20d125b6d94176955207a85abdaf6cf0f987b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d8cc6594cc2f24751fab9e5254efde30e4c559c8bf1a73b0891df75a9c49e0ce"
+      },
+      "rs/bin/tick-hub": {
+        "index_object": "aec20d125b6d94176955207a85abdaf6cf0f987b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d8cc6594cc2f24751fab9e5254efde30e4c559c8bf1a73b0891df75a9c49e0ce"
+      },
+      "rs/dagrun/Cargo.toml": {
+        "index_object": "10d8d0190a1e1a64424792723ae0d760ba566167",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "de88a5419c14cf4c3b68df01e4b00a36d53364c127cd7d0bdad8a8b8251182da"
+      },
+      "rs/dagrun/LICENSE": {
+        "index_object": "30cff7403da04711c46979a06f6bf8eb10ee088a",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "a2553752ed447e1147617c1b0bc46775232bbc2c9bf4654516721f9d488191d2"
+      },
+      "rs/dagrun/README.md": {
+        "index_object": "8a6f4dc64d2bfdb60ff87f09cf264a485ff654ba",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "7b9ae1aaaf97b0bf65376f9c58a0ad635b4654d6d9b937cbb042f32116c5f406"
+      },
+      "rs/dagrun/src/admission.rs": {
+        "index_object": "e91ae9f3396744e16faec5e61617d538a8ba0a9f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6ae28cf972e2d991e829c76d6c9728349e739ae9f442b0e66ef1d8067a5ce568"
+      },
+      "rs/dagrun/src/ambient.rs": {
+        "index_object": "c98e235cd47600251c07af85baa1d9e4d5479f77",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e212170fec0ff94c77dc449d7993a1e01d35b1889c2cad9240d8e9b4b9359fef"
+      },
+      "rs/dagrun/src/attribution.rs": {
+        "index_object": "da7db6ea31ccfa862c457b968b02e85d517ecccd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e071b8412a82805a123d81f727c1abf5805a39bb92552c46482e8cc06ba12a57"
+      },
+      "rs/dagrun/src/bin/cpuset_alloc.rs": {
+        "index_object": "446de36fbc321c2051082c17f8bb081ea6ff39d8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4a3a655da72b54e46283d1e12d46b264c26796ebc0c7173e0f64de0cb379cdb1"
+      },
+      "rs/dagrun/src/capabilities.rs": {
+        "index_object": "79739edd00b75a5c38341f72203c85556abf4934",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9b4513cc89d211ea15932106d500a87e45fc5822bebd1b1863e9bb81b035e805"
+      },
+      "rs/dagrun/src/cgroup.rs": {
+        "index_object": "cded4bfab1e3561e29449c41488f3f37267fc3de",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5946767fb10377f70fbf14260275417f232582ced80086b71fd5a4bbc1d665c1"
+      },
+      "rs/dagrun/src/cli.rs": {
+        "index_object": "5bc6545af065020b222df8e51710b0e2e0a2e110",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8211756c23a18f5e8799ccc5bd088c621ed048dab01f4cbf291df5aa0464cbec"
+      },
+      "rs/dagrun/src/cpuset_allocator.rs": {
+        "index_object": "a2e78a4853ae05bc926a7512f339e74b452a29b9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "089a83853c8fd72e79071e19ad8d018dde8b2f427a8d09df059d8259ac300f54"
+      },
+      "rs/dagrun/src/embedded_userguide.md": {
+        "index_object": "440ffd7507483eee753649730689fac79c6ee83b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "d356b8da61793b6931ba4c5b1620cf9b3ac338d2b8b0a5fa59b56202bf3251fa"
+      },
+      "rs/dagrun/src/estimates.rs": {
+        "index_object": "637eb82c1e1962c0dc8e3b1367e760f6564d0cc0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b392b24c6ca56fbff0e1fcc164bb17c70a317a422975ef336cfb60daa6aa292a"
+      },
+      "rs/dagrun/src/io.rs": {
+        "index_object": "38b592f36d4afc5dca00e29972ac9eebee97bc6d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ca484e136a239d4ef0a33a3607ed1daa989aef8a91a533fa693ff814d1ef1c0a"
+      },
+      "rs/dagrun/src/lib.rs": {
+        "index_object": "2bd398bf87dfb390f01099fab8a5ff620dbc1af7",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f7dbf6b1f7ed48c4600aa84d894e4c0d14800347230c8cf46fde0f601c056d9f"
+      },
+      "rs/dagrun/src/main.rs": {
+        "index_object": "856658af34bea3c98311ed7228bd5ae84dfe8ed1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "14722be7f86c83900a88251ef8db3c3dee8b54d2264b6be35ec44430ade20d81"
+      },
+      "rs/dagrun/src/memory_feedback.rs": {
+        "index_object": "792862acc36bda7cf9b927136fb1c6f68a5a07e5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "877e4efed71058faa21faaca99a32ea782ded37d23efed5ea066968ec0385bb2"
+      },
+      "rs/dagrun/src/model.rs": {
+        "index_object": "b47412ed7caf36cc243187cb89d8a97c4f629b26",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bf7d502acdb67e1734427aa8ace64d47edd25a0a29a387589e603c5272b023e0"
+      },
+      "rs/dagrun/src/perflog.rs": {
+        "index_object": "aa2099fb6bbd82c80a5a2a6252fc68fc5af852d0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4847c6a7b834d4f1f2d4560380b3ffe31c6e86b076deadfd952fd2ba7646806a"
+      },
+      "rs/dagrun/src/proccpu.rs": {
+        "index_object": "e9eb6ee1ef7ddbc63a674f7f62526a65fff37e8f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ec1aa0112d194a3abebecd48765e02900de7e5eb0ddc21c67ee691d0ca5f939a"
+      },
+      "rs/dagrun/src/profile_capture.rs": {
+        "index_object": "8fea3388f390ee3949fff9771072e25377194d3a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c1efe4a15d537768d0381dd0f05ee54c46649ac3ef7d7f5bb75481eb3db3a10f"
+      },
+      "rs/dagrun/src/profile_enrich.rs": {
+        "index_object": "c29e2d451780998b2f425142203f1fabdd50622b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "842f2bccf7d6d59461343ad63c34fe367944bf696fa7bed4fe679e9855f9c0d8"
+      },
+      "rs/dagrun/src/profile_report.rs": {
+        "index_object": "10570800c045efceb802d55e348152ec398d3a5a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "89cba90d61d67aa9c3c5bb115d0ce0cff810a571e541c70a72e1b1d0a7a4bfae"
+      },
+      "rs/dagrun/src/reservation.rs": {
+        "index_object": "bc7f3b3a31da56e76d6e017c3126f325c9f3cd00",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a99095a2482f27135aec033b484e645217f97ef8d70173c1616867e9a96e51f1"
+      },
+      "rs/dagrun/src/resource_caps.rs": {
+        "index_object": "1a1f8b43a33873e82ce6939ca4591ac4f35ad23e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "44f8f056753c722e02baac9381c1c23cf87e88a71d5e14f7d00cbd609171d86c"
+      },
+      "rs/dagrun/src/scheduler.rs": {
+        "index_object": "8bdc7138d9cf6fb02e744259a06a212433e14d41",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "01f79adaf9806dad5c3ba340b6a2dfc74b9dfcd00060eae5d34ff8170dc2aa00"
+      },
+      "rs/dagrun/src/sizing.rs": {
+        "index_object": "f4ef89b0ff395d7f6db716aa6e30cae1b05536e3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2b529dd9e31d3e239ee5d41af22c14e9fdf0e033e9be9094d91fae2be1ff10ce"
+      },
+      "rs/dagrun/src/summary.rs": {
+        "index_object": "f4bb00baa3fb02b37953293e7beb463c6c8ff29e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b145ecc99386b151d41d077fba57162ac2cc9c0b4bddc252484940dc4fa39059"
+      },
+      "rs/dagrun/src/sweep.rs": {
+        "index_object": "96aed563457b1f0fd26ac9b595b0c81afbe45515",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e6221838d177ed60ff6f234db25e4270b1caf74fcf425d6cefbd78a934f2cb87"
+      },
+      "rs/dagrun/src/sync.rs": {
+        "index_object": "dec4258a374d3320d86668c430be76c34adbec2b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "c22dc69845cd7f1b14baa03d70a881c29f5b74898c53874e19605a790b30d402"
+      },
+      "rs/dagrun/src/test_results.rs": {
+        "index_object": "f3fe618189f2cdfd9084cb03ff4c52a5d11c968f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f30bd386a0799b9deb14c7862aaaee3ba402e5454e7f0c856588f2177ab449a5"
+      },
+      "rs/dagrun/src/viz.rs": {
+        "index_object": "04e6a84bf6b942c48136d3bb2d9a686ac52899cb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "5751600ace5de69a7060d88401da24d1b824b91802e1584d8e2afb84cba50fa1"
+      },
+      "rs/dagrun/tests/boxed_stdin_smoke.rs": {
+        "index_object": "6c91d169e0cea42329d0f43cbfa5afc3e64225b5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bfb929f31482d31ac79cd4be2fe81c09c1ed125cd5cb19112605cf84f20e0d73"
+      },
+      "rs/dagrun/tests/boxing_smoke.rs": {
+        "index_object": "eda7b4a2b2de257f376c809151bb95d1efbfa7d4",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1faa708397fa995d133cb50ce7bc8351734b84fb60f56e89eb989865782b388d"
+      },
+      "rs/dagrun/tests/cmdtype.rs": {
+        "index_object": "ce2ead2f536e62e731bbefcda0467b449c8d3729",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d980c94b6d2de43cc898d4ef699fa58a0d1d7b98073572a43bd9215a0cb951df"
+      },
+      "rs/dagrun/tests/core_box_smoke.rs": {
+        "index_object": "c0d7c1a279207c7fac13ac9fda37ac75657ff648",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6155176c5ab1dec5c6702dca71ad90e06ab43a3499a38ce168795ffdff14d51d"
+      },
+      "rs/dagrun/tests/cpu_breach_units.rs": {
+        "index_object": "0e5c0a3e582dae2a14a1d5badbe02fd74d11dfa6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "2de329ed53d8b45e41071dbde1b8817db8ad0e824befbecd3012b3f81add33bf"
+      },
+      "rs/dagrun/tests/cpu_timeout_smoke.rs": {
+        "index_object": "a44cc1d05574e600e99cff5a67afa3be30ec5f23",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "618b82b7222d16f2e7c991231503e40e1b4c71d2e387464e0b216d371fc175d2"
+      },
+      "rs/dagrun/tests/default_cap_smoke.rs": {
+        "index_object": "ba54c8a9db643ef89f12c3fe02427b2fb384ee5f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fda2f59244915b32872c256b9d52c1c54fb5c13c32a57f2303160c251a627038"
+      },
+      "rs/dagrun/tests/enforcement_flag_brackets.rs": {
+        "index_object": "44740e7b5b31fa57040bbb6760284e904ec0f3d8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "82de676ebefc07f6e66fa13d4f470eb4eb040aee3d9267794c8178089d876f63"
+      },
+      "rs/dagrun/tests/enforcement_manifest.rs": {
+        "index_object": "904eef787aaf00cb3b24db3a3b8a83244d089e47",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1a7631fd7187a96edf05816a485af4cef205bc11da70015ae7d57b2aaba994d4"
+      },
+      "rs/dagrun/tests/fixtures/test-runner-probe/.config/nextest.toml": {
+        "index_object": "275f36b34b6183bedb5b1ebe8d82b17754af14fc",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "31b0e3851a37631d07e608fa1055b45e93e13b2e500c93b419ccb8aeb83f32f4"
+      },
+      "rs/dagrun/tests/fixtures/test-runner-probe/.gitignore": {
+        "index_object": "b83d22266ac8aa2f8df2edef68082c789727841d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+      },
+      "rs/dagrun/tests/fixtures/test-runner-probe/Cargo.lock": {
+        "index_object": "17e9132018ea1d2c019e345e2696fbfb9aff5040",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1a401b68ddab63a9db723b082410d586906135a7ff700e6dfd66b3b8c07e6152"
+      },
+      "rs/dagrun/tests/fixtures/test-runner-probe/Cargo.toml": {
+        "index_object": "4245ab23c4384dcd7480e96159b7771cfb3e7fdd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7be7334bc5c0ff4d72c33fcebf271bf4956691f43fd5efdd65b1d2251f4e0ec8"
+      },
+      "rs/dagrun/tests/fixtures/test-runner-probe/src/lib.rs": {
+        "index_object": "769db40c6292eaaa645f921af028fba5889f4368",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9a462cd8fac8a9dbc9c7d507e5e9c070835483e769b137e1f84e72f78207012c"
+      },
+      "rs/dagrun/tests/label_selection_api.rs": {
+        "index_object": "820b221297adee77e59a71f5ee3d91dbb59d552a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "677e6c560ac2b9691dc4584797481d81d62e3b296913a587a7482470f0dab96a"
+      },
+      "rs/dagrun/tests/max_mem_outer_scope_smoke.rs": {
+        "index_object": "f1be5d72c3004440d3e7baefdcba839f931eb662",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e5bf87c34e28112f28ce89d6f59ccf776cdda7b4c73201b21aa28c6e61f72051"
+      },
+      "rs/dagrun/tests/nested_run_smoke.rs": {
+        "index_object": "cf6299be55b40d70a20cab566e53bf5ace449403",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "992095265eb61b78916d3b92fe55cbb207e81cb233ad06bf267bf60083c07bde"
+      },
+      "rs/dagrun/tests/profile_timeseries_smoke.rs": {
+        "index_object": "0005250bfe4cff269cd7652257d72a52eee658f9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6424b4c96ad3e8e093050f0f0cf447b122d2ed09694d12080991a1f664ac382b"
+      },
+      "rs/dagrun/tests/resource_caps_shared.rs": {
+        "index_object": "e066a73a5433c606e99709bc61940fbb8763f448",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8d9e5f48eeee668a970d83396e6ebf3d3b632d9c8f5c359efbfc185f8da65a2f"
+      },
+      "rs/dagrun/tests/result_error_terminal_smoke.rs": {
+        "index_object": "ce79708de26a2ac91a3bf21bac7d776d8dbaf08e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ee1cd95643259d5831ea059b402a1bf07b45d24e71afccd7d0b6be2990f0388d"
+      },
+      "rs/dagrun/tests/run_timeout_smoke.rs": {
+        "index_object": "02489378d8ec968351b671df1f493ed84c1328d8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "7154a6ae833c023569522ccc490a6b4f5b45468c91ec4e041e21f4fa2a8c2188"
+      },
+      "rs/dagrun/tests/scope_attempt_smoke.rs": {
+        "index_object": "30f3d9d9d54bf2155810ef74f674658135068469",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b54f2ea31b1a1f65bcd9f3d686c158e525cf552092bbb83aa9a04e6f96d92ca5"
+      },
+      "rs/dagrun/tests/sweep_target_time_smoke.rs": {
+        "index_object": "5b2eb85d951f0223fefec5fb90457867da9d2cfb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f0e2ba819aaecfc941f6a26fd09a0a638f75a13eaf8fe2d77c6ce4ff20c08836"
+      },
+      "rs/dagrun/tests/termination_attribution_smoke.rs": {
+        "index_object": "8e755224155f3442d49d92cf3c078531c3d14e8b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ef310f8fd7308375c274f3d24b8b0a190ee5585041f813755f91590f573f4447"
+      },
+      "rs/dagrun/tests/test_runner_integration_smoke.rs": {
+        "index_object": "d45b775e54b988145068a6ceeaa76c4b299d7b26",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "0f4cdf3db01577221fb69d088f1403dbb677c405195472e58f6584cbfefc81ab"
+      },
+      "rs/dagrun/tests/unboxed_cpu_timeout_smoke.rs": {
+        "index_object": "fe39dc4440a3644e062c0d6f136db289f2b7787f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "29a308f08e490b8f6e17d5c07759817e589a76c429b2c0a1b02c05aad37a15ef"
+      },
+      "rs/dagrun/tests/unsafe_no_cgroups_smoke.rs": {
+        "index_object": "6d9be3150bb1a4dd8e024f7e80d94893a43ee1f5",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ce610071d775a241a85d78c2e31cd4a6c7a6d7101fa35ba929360d61470b324c"
+      },
+      "rs/dagrun/tests/verbosity_smoke.rs": {
+        "index_object": "228347e9544c143b30392326b93bc6133e729806",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "db1da278ee1073f55197d9257194f0be4b21bdf7026f1723a8a54da990328c6b"
+      },
+      "rs/dagrun/tests/wall_backstop_enforcement.rs": {
+        "index_object": "57d936121bb5f1eff9930e0a568de0e35beaea6a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "94d463421371c3b9350221f140ec23b966a13cc3fb9e4e6407311040bf2a905d"
+      },
+      "rs/dagrun/tests/wall_timeout_derivation.rs": {
+        "index_object": "12c899a8353227ad6e07d07936db67df71555b92",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "58faa8fcf1ed5401d3876e605d2d5ed83bfcebc56f67e9d7201921e4983fc680"
+      },
+      "rs/herdr-run/Cargo.toml": {
+        "index_object": "bf1f43c1ad841a57fe19992c58bc3409d0a09a94",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "20a863d71a62235dabf2ffbabda7dfb63abcecfd3b8a32de6e3df88b94f43290"
+      },
+      "rs/herdr-run/LICENSE": {
+        "index_object": "30cff7403da04711c46979a06f6bf8eb10ee088a",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "a2553752ed447e1147617c1b0bc46775232bbc2c9bf4654516721f9d488191d2"
+      },
+      "rs/herdr-run/README.md": {
+        "index_object": "b62376db23a153699a787abec3a01e8c1a044230",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "a1e6574cadd2b36d0a590f6a251c1bebed714ff3be250d04d29ced5e6471d631"
+      },
+      "rs/herdr-run/src/agent.rs": {
+        "index_object": "e6a77a2691a5f97c4fd69865c3e07bc3e35fbfb0",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1061a317f00aa24850d56da9362225cf88697f774fe0a891f94d0cfde028cbf6"
+      },
+      "rs/herdr-run/src/agent_cli.rs": {
+        "index_object": "f9ad942284eca5c23baec26e58c04e39b585a5ac",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4fa32b649de0de6dbef0e17569529171aa62ffe2997aa32c1e9f28b7f4d0e400"
+      },
+      "rs/herdr-run/src/agent_main.rs": {
+        "index_object": "20dfdb46dea3695e90629d1dc98b97ca090d1e19",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f872698b82150539a76f09572f1c90616c2284244086d3605729e731e78d649c"
+      },
+      "rs/herdr-run/src/allowlist.rs": {
+        "index_object": "abf804805b5c54ad8dc1c4a579ac35bafae1a357",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e82f0ab51d59ec6658ee660a9d71b5dc02c1814188ec8af83f846064d4d69b95"
+      },
+      "rs/herdr-run/src/audit.rs": {
+        "index_object": "91598bfede9ffbd463e1a48b6baedfe9c644614e",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d808d0afefb1bc0e7ffa3719e707c2cb69877704f510081b3ab3010fd0874c36"
+      },
+      "rs/herdr-run/src/cli.rs": {
+        "index_object": "4695345f77fcdc2303d1b1f99c06866712246e1c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ef994859f8c9a307f96461d0d0cae2709bd88f4deaaabba286de95fd56ad5b30"
+      },
+      "rs/herdr-run/src/client.rs": {
+        "index_object": "35a619182b86b1a80cb2b0d696fd0cd0e33acb10",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "297e40582b1260577f4dff712604042dcb6a29f731ccc33ecc94340f954d67fa"
+      },
+      "rs/herdr-run/src/config.rs": {
+        "index_object": "9cb3b5cf60da1454ddd0eeba0fdc655e7c9c8fc3",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "525d275c13b4fea0e37742a6464a1f17aa23f374d7aa0f61d18115d3de4db203"
+      },
+      "rs/herdr-run/src/config_template.yaml": {
+        "index_object": "f6bbaef11757945470a6a5de5ca9afa22b270359",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "362232d238218abbc64e9d8482dfa878197b4fd1fbdd68eb04d0385a6491330f"
+      },
+      "rs/herdr-run/src/embedded_agent_userguide.md": {
+        "index_object": "0dc55e6538d22f43c2cf3b9677a194b889629c08",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "c12e07694f2d1c61cc37c4b2c6aa5bfa5352d649fe91bf9780afe20a528655fc"
+      },
+      "rs/herdr-run/src/embedded_quickstart.md": {
+        "index_object": "0e9fdc736e4722d242aaaf892f0b26070d4e0224",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "8d6b4e818aef0e7c1c79438189917a0c50eeb816e7243f50ddd5f273e6b5539b"
+      },
+      "rs/herdr-run/src/embedded_userguide.md": {
+        "index_object": "85644d78cd9dcb17b11bf6934e0ba783fbed4414",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "05829591bea61594bad8f4598b2718abf71699d954930ba4d1022a7f043f4eff"
+      },
+      "rs/herdr-run/src/error.rs": {
+        "index_object": "f5bf1a5e8161ae6f81a8b92d2782839781b5dfbd",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "f96c3946d1df4ebcf098b8e3f34eab416609bc17ecd3e2ffa5a4d15807ab9e71"
+      },
+      "rs/herdr-run/src/identity.rs": {
+        "index_object": "92037d1fdba59b0d716729ac761c0da756e4a939",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "3a3273e4d1bb5d380e7a93aa7afe1eaf062dae06a5e6663a182f708b0fbff2e0"
+      },
+      "rs/herdr-run/src/init.rs": {
+        "index_object": "64c179280fab9a8818c6eec4d7dd436da6249c38",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e991de06bcb4c8917ff5f1144d196757b630679cb7fcff8baf49dc9a69d5fe51"
+      },
+      "rs/herdr-run/src/lib.rs": {
+        "index_object": "b7972e9281c904ce4582edcf9a34e541fd6375b2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "03c482a76b942e8665f296e9b5203bb923258155f48b0dbfb11961aac03d1abe"
+      },
+      "rs/herdr-run/src/main.rs": {
+        "index_object": "692dec2dd401306fd546e2c60c0b175350d27630",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "9692e146e7c0261c47ac4f9b3b88d8c80b0a9eed36c071faa91715c753d94d3e"
+      },
+      "rs/herdr-run/src/readiness.rs": {
+        "index_object": "5d920a61b7530a790a096806b9d9805002ac355a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "52a8198c4f3cd3c7e9f9ba545c0cb52dd4f16930775cd5b32a6c0e22788b49dd"
+      },
+      "rs/herdr-run/src/reap.rs": {
+        "index_object": "a9bc40c641dce3f4f5a6f6b8bab05a3b809c0e0c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "67f299c95aa08ad0361bda3129b689085fe892af1e49dd53aeae45d1ced6737c"
+      },
+      "rs/herdr-run/src/retention.rs": {
+        "index_object": "2f20c7a149edc814b32a8e05b040fabdb9bf3903",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "495efefffd60007cfc414730f0c7d440aec7d3cf8862622bfa45982e7445ba80"
+      },
+      "rs/herdr-run/src/runner.rs": {
+        "index_object": "aad6f7d50c09c0e8be7031cb5996ae25144e85a8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a57c078609e8ac54cb8dfb32171d103361d512668fd1b23f43dfce62f6e49880"
+      },
+      "rs/herdr-run/src/session.rs": {
+        "index_object": "0c2e4ed87383d3bd0bbeca923ddf5c8f2e041d5a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "e1ee6216a986a840582d2137232936f1cce2986a0bbcaacd0e4256cd5483f429"
+      },
+      "rs/herdr-run/src/state.rs": {
+        "index_object": "ef771cc3f2046a4a421cced355c71fb8e9979713",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "fcd0ddfcf5945b16704140b14bd34a91826507d449885be67a98c6fbd6b0f17f"
+      },
+      "rs/herdr-run/src/status.rs": {
+        "index_object": "9be1c9868b7a9d7629d3b572eddde1c0eaf4d417",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "95bf6991951e81e4c23be5f0eac00367ca6fdf0c44241914df183259a363c338"
+      },
+      "rs/herdr-run/src/sweep.rs": {
+        "index_object": "c4c6f79f90eab773022464790101b71c685b3c10",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "03b4e1e9fa4f39638965ed36cbc7a652fd8c652bd33dc5d2d6171f87a65e8282"
+      },
+      "rs/herdr-run/src/timefmt.rs": {
+        "index_object": "507e4640311e22f39c2f98a0adefd9beac6503b2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "a3a4ee98587c056302fd511cff6011abb6687019514e2a9982ff091ff380b789"
+      },
+      "rs/pr-landing-planner/Cargo.toml": {
+        "index_object": "b56554acc2a1273720568145df9d6f29e851b6eb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4e570ce0fa9c1c84ee40fccf1cc779023395d7b1901e5aca0abac6a6f9d649a5"
+      },
+      "rs/pr-landing-planner/LICENSE": {
+        "index_object": "30cff7403da04711c46979a06f6bf8eb10ee088a",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "a2553752ed447e1147617c1b0bc46775232bbc2c9bf4654516721f9d488191d2"
+      },
+      "rs/pr-landing-planner/README.md": {
+        "index_object": "63475db0c6812d67120e71495087235286301ca4",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "fa534e7a42d45b8d452473bf47c3ab843c8786a64749b1bbf04f4320d08c2e39"
+      },
+      "rs/pr-landing-planner/src/classify.rs": {
+        "index_object": "9df761bad04d3f4c1f4491d7f8246a31167a1ca8",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1625c2a05451ef6b9042479b7b7226fffa888c61e10fd16b08182695e360ed09"
+      },
+      "rs/pr-landing-planner/src/cli.rs": {
+        "index_object": "f0ec76c0f326d8a0537e82255f0124d2d8e54d40",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "affb48c187c45243d2ed737018b2ffc0d598ac685fd874c6e847a893ab1f695f"
+      },
+      "rs/pr-landing-planner/src/collect.rs": {
+        "index_object": "b84c034d0581a18d7447163587eceda56275615d",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "64333a404107ee657ec89f90f1bee84a84d75b0ef2400835b30ef15b10be8c0c"
+      },
+      "rs/pr-landing-planner/src/context.rs": {
+        "index_object": "a271f18598df68385e81576d9ddbaa0a9526a9cf",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b05d11ea3b20983cf23ab13a0652b11485d601d3734a1e320f2561dfa7ea693d"
+      },
+      "rs/pr-landing-planner/src/embedded_userguide.md": {
+        "index_object": "e997b3445e632aa9d89fef65547e72a7afd5fef1",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "7837ad73f3df4805cc01059433d786db620da579eee5252f6392d86a64e5c080"
+      },
+      "rs/pr-landing-planner/src/emit.rs": {
+        "index_object": "4068d83e59257562921537686aadd4fe739a89eb",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "de607f2d28c8104a5ffe8487381ddf958ebbe4aa561e3cba37fe4143bd22a571"
+      },
+      "rs/pr-landing-planner/src/fixture.rs": {
+        "index_object": "dc6f608724c6f1f1c32a8dcec1721d90c40be092",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4f73b887f546a43903e05a2dd8d2f8119d08b4dc991fd7542695c9e79c66a7af"
+      },
+      "rs/pr-landing-planner/src/graph.rs": {
+        "index_object": "14710d206d4e1f19c1f709468ce9b5132fad6e03",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "6ef059a703343d46a06dbfb6bdb19a3d7dee4298ef0f9fd7569127489cf4e05a"
+      },
+      "rs/pr-landing-planner/src/host.rs": {
+        "index_object": "7316045e0fbaed057f48dc498edde89f292a91ff",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b636ba47c50c72cab460b8f0b865ce03420ac479f28195660692978c020b742c"
+      },
+      "rs/pr-landing-planner/src/lib.rs": {
+        "index_object": "235705e8fa5b095bd3da903c4e47605de24bbde1",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "89342ae2e021a29b0599f9736b919b93cc68631943187de5b3fea4ebf1121c94"
+      },
+      "rs/pr-landing-planner/src/main.rs": {
+        "index_object": "8ea4753ed728562ebecffbdce8b750624f2931ba",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "633a93db81d64922117bcdc682e2f6c393f050b636d27e73122f161febe8dbdc"
+      },
+      "rs/pr-landing-planner/src/mechanism.rs": {
+        "index_object": "0952e95c59c4fb7990f1a0fb4b9e9f2c58de6049",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "dc569a085aec43cd4ec659674ad5793b03ed886ee77f9247c54172432f2f07d6"
+      },
+      "rs/pr-landing-planner/src/model.rs": {
+        "index_object": "c63912a483c37426bfc6577e5a261ebe367a01ed",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bac70ff60be85e4887c3f3f6eb1ca60a66154f5bfc4ae2846322bcf21bad14c3"
+      },
+      "rs/pr-landing-planner/src/plan.rs": {
+        "index_object": "f1aaad72f2d18c8c22da769821a2fb9cf8a9b51b",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "00ae8ad82fb6dc4f2805799408c4cf6c72e1f49e26789bca8a0854e85712a2e1"
+      },
+      "rs/pr-landing-planner/src/priority.rs": {
+        "index_object": "1b12903cc3a5726adfeea41e889b1b19673298ac",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "4ea8d9ef394289948406dd362b1f2798390ed6f69660daafa227296f5158dfa5"
+      },
+      "rs/tick-hub/Cargo.toml": {
+        "index_object": "addadf6908e269c1b93cddfd205545dfdbf0e9af",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "977176274edb67f3a90e47eca22f0a87cde4b77de86627283bf4def9f8106582"
+      },
+      "rs/tick-hub/LICENSE": {
+        "index_object": "30cff7403da04711c46979a06f6bf8eb10ee088a",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "a2553752ed447e1147617c1b0bc46775232bbc2c9bf4654516721f9d488191d2"
+      },
+      "rs/tick-hub/README.md": {
+        "index_object": "0def67bc4121918d23a0aa2f4e91ed492f5f800b",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "a440b0adbacc1e20cdfbcf0537d1865a2086f8acf7dd7ad059b210304a78a483"
+      },
+      "rs/tick-hub/src/cadence.rs": {
+        "index_object": "0e626cba9b55aaab593553abf67e3e7a68431bd9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1bec6848a83187c7ae9c372f11d528f706c1545e4ab67cfec3eee5f7b2c45e18"
+      },
+      "rs/tick-hub/src/cli.rs": {
+        "index_object": "761026d0634eeee0b663f5d02687c7495fd0cf46",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "8733a71e284e9167ee351c587b7b8a066bb207b3adecad84df1742f2d35fa8f4"
+      },
+      "rs/tick-hub/src/embedded_userguide.md": {
+        "index_object": "56dd15d5adde3ad14b0c88ffecab7abc405a2ab6",
+        "mode": 511,
+        "uid": 212630,
+        "sha256": "dbf59e8e7a33572c891078028b604ec9f5be0f2bf073df4722fc300c03b6e62d"
+      },
+      "rs/tick-hub/src/emit.rs": {
+        "index_object": "05b1a3ee019a8bf15e31ecc147f18c1849f0530c",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "d9815f06a42e735076cd49af9e3d3b25380d74a506314fae9b1911f8b5efba69"
+      },
+      "rs/tick-hub/src/engine.rs": {
+        "index_object": "1e7bfa2fd53b53b3117099b1e0a0b7ffb2a4a813",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "39bdf6f3ada863b6acfc78ef0a1cf1a518ad1dfe03bcd16aa471ebe0581766bf"
+      },
+      "rs/tick-hub/src/io.rs": {
+        "index_object": "a9ce6ace6de2e40684a72fdd72f10eead6145b7a",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "10af89ebf6fe9fafbc6e5d309d6bf03f68015c8778417feb389e341c6f57398a"
+      },
+      "rs/tick-hub/src/lib.rs": {
+        "index_object": "0e073b80f3e57e9317c6ea18eeda60aa63ae0188",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "b8e7a8916264cb65d5c2b0cbcc210382f9789238acb3ac5212949b4d3bab36dd"
+      },
+      "rs/tick-hub/src/main.rs": {
+        "index_object": "421b88dd780da734049ffe816fa583b8a806abb6",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "078d01c35e54282494b98a5f860539542869654665a5774208d13702b3e84f34"
+      },
+      "rs/tick-hub/src/model.rs": {
+        "index_object": "ab3f867e7f64d9c161d5d445bf9bda863bdc76ba",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "aa6d0217b9f70472c7c486ace48b29d6a883826c7d18be7472bc3c4dd2f40af6"
+      },
+      "rs/tick-hub/src/probes.rs": {
+        "index_object": "a5ae56bee331aac2afd4476f0252625b05eee3aa",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "1fc7ea419b283ea65dfa7f6dcbd58eaea35c2678ef456b4bec8d3ab311e97d96"
+      },
+      "rs/tick-hub/src/protocols.rs": {
+        "index_object": "543453535f753dc6a8b364c107695c46ba674f1f",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "ac711b3581dc87b256dda02eaac691f0df981bed1a261ebdf7eeb20e0f4332ba"
+      },
+      "rs/tick-hub/src/state.rs": {
+        "index_object": "ec46e19c65722a18e1d7c08288f8b5c8241f7dc2",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "841704297214215a5d897fd6daf5c8de950acc380aa89544c5bf40d9879815b2"
+      },
+      "rs/tick-hub/src/text.rs": {
+        "index_object": "44ac460f0af4905d6df63f3e3e1fa4b77fb6c3f9",
+        "mode": 420,
+        "uid": 212630,
+        "sha256": "bd37a55753633ace85b9c19fe40a58d91bbcbeaaa0be849117cdf60105d88fa5"
+      }
+    }
+  },
+  "protected-plugin": {
+    "sha256": "d0aa281848be8a9be4ba472cc271db0c615ddaed1500fee9c0291345f7e62c4b",
+    "dev": 48,
+    "ino": 771963684,
+    "size": 64037,
+    "mode": 420,
+    "mtime_ns": 1789579938232888373,
+    "ctime_ns": 1789579938232888373
+  }
+}

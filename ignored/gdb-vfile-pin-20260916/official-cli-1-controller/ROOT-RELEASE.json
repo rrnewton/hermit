@@ -1,0 +1,15 @@
+{
+  "released_at": "2026-09-16T23:31:01.233649+00:00",
+  "head": "932f7130ea3c77dcdb2547b6834f46f08bf593f0",
+  "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916",
+  "run": "official-cli-1",
+  "one_attempt_authorized": true,
+  "artifact_hashes": {
+    "ADMISSION-PACKET.md": "902f54e941d7d3e19fcb1d441a58594bca642d82667b7c5dea00e7a7a4801605",
+    "READINESS.json": "a207772529818805f377636747530f1d160e0d7a80b75b811933783f723b6f8f",
+    "spec.json": "fcb41c15745c2ffdf586b1d7c93b32a549f302523c6efdc9fd72c4276d684131",
+    "FROZEN-RUN-SOURCE.json": "649e8810df9f5ac0f9a82a208c7fbf0c4fbe810566f7b371c32cea94bc4a899d"
+  },
+  "scope": "unchanged official selected test.cli 78 cases; original 12-node closure; no canonical full-main claim",
+  "notes": "Root read exact launcher/run/spec and verified byte-identical prior observer mechanism. Bootstrap4CPU/8GiB/1024; observer2CPU/1GiB/128; actual sibling policy is separate. Preserve any fresh admission refusal; no automatic retry."
+}

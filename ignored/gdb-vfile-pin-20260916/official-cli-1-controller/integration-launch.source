@@ -1,0 +1,62 @@
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+spec_path = Path(sys.argv[1]).resolve()
+spec = json.loads(spec_path.read_text())
+out = Path(spec['output'])
+slot = Path(spec['source'])
+scripts = Path(__file__).parent
+assert not out.exists()
+out.mkdir(mode=0o700)
+(out / 'observer').mkdir(mode=0o700)
+(out / 'nodes').mkdir(mode=0o700)
+def save(name, value):
+    with (out / name).open('x') as f:
+        json.dump(value, f, indent=2)
+        f.write('\n')
+save('spec.json', spec)
+save('controller-bindings.json', {name: hashlib.sha256((scripts / name).read_bytes()).hexdigest() for name in ['integration-launch.source', 'integration-run.source', 'integration-observer.source']})
+q = subprocess.run(['with-proxy', 'git', '-C', str(slot), 'ls-remote', 'origin', 'refs/heads/main'], capture_output=True, text=True, timeout=60)
+save('fresh-main.json', {'exit_code': q.returncode, 'stdout': q.stdout, 'stderr': q.stderr})
+assert q.returncode == 0 and len(q.stdout.split()) == 2
+remote_head = q.stdout.split()[0]
+q = subprocess.run(['git', '-C', str(slot), 'merge-base', '--is-ancestor', remote_head, spec['head']], capture_output=True, text=True, timeout=30)
+save('fresh-main-ancestry.json', {'remote_head': remote_head, 'candidate_head': spec['head'], 'exit_code': q.returncode, 'stdout': q.stdout, 'stderr': q.stderr})
+assert q.returncode == 0
+q = subprocess.run(['git', '-C', str(slot), 'rev-list', '--left-right', '--count', 'origin/main...HEAD'], capture_output=True, text=True, timeout=30)
+save('canonical-local-ancestry.json', {'exit_code': q.returncode, 'stdout': q.stdout, 'stderr': q.stderr})
+assert q.returncode == 0 and q.stdout.split()[0] == '0'
+for unit in [spec['bootstrap_unit'], spec['observer_unit']]:
+    q = subprocess.run(['systemctl', '--user', 'show', unit, '--property=LoadState', '--value'], capture_output=True, text=True, timeout=5)
+    assert q.stdout.strip() == 'not-found'
+observer = ['systemd-run', '--user', '--collect', '--quiet', '--unit=' + spec['observer_unit'],
+            '--property=Type=exec', '--property=PrivateUsers=no', '--property=PrivateMounts=no',
+            '--property=CPUQuota=200%', '--property=MemoryMax=1G', '--property=MemorySwapMax=0',
+            '--property=TasksMax=128', '--property=RuntimeMaxSec=13200',
+            '--property=StandardOutput=append:' + str(out / 'observer/stdout.log'),
+            '--property=StandardError=append:' + str(out / 'observer/stderr.log'),
+            '--', 'python3', str(scripts / 'integration-observer.source'), str(spec_path)]
+q = subprocess.run(observer, capture_output=True, text=True)
+save('observer-launch.json', {'argv': observer, 'exit_code': q.returncode, 'stdout': q.stdout, 'stderr': q.stderr})
+assert q.returncode == 0
+argv = ['systemd-run', '--user', '--scope', '--unit=' + spec['bootstrap_unit'], '--property=Delegate=yes',
+        '--property=CPUQuota=400%', '--property=MemoryMax=8G', '--property=MemorySwapMax=0',
+        '--property=TasksMax=1024', '--property=RuntimeMaxSec=13200', '--',
+        'python3', str(scripts / 'integration-run.source'), str(spec_path)]
+start = time.monotonic()
+with (out / 'FULL.log').open('xb') as log:
+    process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, cwd=slot)
+    save('launch.json', {'argv': argv, 'launcher_pid': os.getpid(), 'systemd_run_pid': process.pid,
+                         'started_ns': time.time_ns(), 'head': spec['head'], 'slot': str(slot), 'full_log': str(out / 'FULL.log')})
+    print(json.dumps({'pid': process.pid, 'bootstrap': spec['bootstrap_unit'], 'observer': spec['observer_unit'], 'slot': str(slot), 'head': spec['head'], 'full_log': str(out / 'FULL.log')}), flush=True)
+    code = process.wait()
+save('launcher-result.json', {'actual_exit': code, 'elapsed_seconds': time.monotonic() - start,
+                             'source_status': subprocess.check_output(['git', 'status', '--porcelain'], cwd=slot).decode(),
+                             'interpretation': 'read real driver/tests/profiles and separately bound actual-scope observer; no full/canonical receipt credit'})
+print(json.dumps({'actual_exit': code, 'elapsed_seconds': time.monotonic() - start, 'output': str(out)}), flush=True)
+raise SystemExit(code)

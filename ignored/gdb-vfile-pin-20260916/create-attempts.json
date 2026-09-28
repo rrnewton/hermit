@@ -1,0 +1,17 @@
+[
+  {
+    "attempt": 1,
+    "exec": 91484,
+    "actual_exit": 3,
+    "reason": "configuration lock busy after supported30s wait; no fallback or pin mutation"
+  },
+  {
+    "attempt": 2,
+    "exec": 44734,
+    "state": "canonical create and recursive submodule hook completed; exec44734 closed",
+    "normal_scope": "hermit-gdb-vfile-pin-create-2-20260916.scope",
+    "owner_pid": 2162531,
+    "owner_start": 166139008,
+    "actual_exit": 0
+  }
+]

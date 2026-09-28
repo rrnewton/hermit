@@ -1,0 +1,94 @@
+{
+  "time_ns": 1789603410026221941,
+  "units": {
+    "dagrun-108548.scope": {
+      "argv": [
+        "systemctl",
+        "--user",
+        "show",
+        "dagrun-108548.scope",
+        "--property=Id,LoadState,ActiveState,SubState,InvocationID,ControlGroup,Result,ExecMainCode,ExecMainStatus"
+      ],
+      "exit": 0,
+      "stdout": "Id=dagrun-108548.scope\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\nResult=success\nControlGroup=\n",
+      "stderr": ""
+    },
+    "gdb-vfile-pin-932f7130-bootstrap1-20260916.scope": {
+      "argv": [
+        "systemctl",
+        "--user",
+        "show",
+        "gdb-vfile-pin-932f7130-bootstrap1-20260916.scope",
+        "--property=Id,LoadState,ActiveState,SubState,InvocationID,ControlGroup,Result,ExecMainCode,ExecMainStatus"
+      ],
+      "exit": 0,
+      "stdout": "Id=gdb-vfile-pin-932f7130-bootstrap1-20260916.scope\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\nResult=success\nControlGroup=\n",
+      "stderr": ""
+    },
+    "gdb-vfile-pin-932f7130-observer1-20260916.service": {
+      "argv": [
+        "systemctl",
+        "--user",
+        "show",
+        "gdb-vfile-pin-932f7130-observer1-20260916.service",
+        "--property=Id,LoadState,ActiveState,SubState,InvocationID,ControlGroup,Result,ExecMainCode,ExecMainStatus"
+      ],
+      "exit": 0,
+      "stdout": "Id=gdb-vfile-pin-932f7130-observer1-20260916.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\nResult=success\nExecMainCode=0\nExecMainStatus=0\nControlGroup=\n",
+      "stderr": ""
+    }
+  },
+  "original_generations": {
+    "108151": {
+      "expected_start": 176041396,
+      "proc_absent": true,
+      "original_generation_absent": true
+    },
+    "108540": {
+      "expected_start": 176041453,
+      "proc_absent": true,
+      "original_generation_absent": true
+    },
+    "108548": {
+      "expected_start": 176041455,
+      "proc_absent": true,
+      "original_generation_absent": true
+    }
+  },
+  "cgroup_paths": {
+    "/sys/fs/cgroup/user.slice/user-212630.slice/user@212630.service/dagrun.slice/dagrun-108548.scope": false,
+    "/sys/fs/cgroup/user.slice/user-212630.slice/user@212630.service/app.slice/gdb-vfile-pin-932f7130-bootstrap1-20260916.scope": false,
+    "/sys/fs/cgroup/user.slice/user-212630.slice/user@212630.service/app.slice/gdb-vfile-pin-932f7130-observer1-20260916.service": false
+  },
+  "launcher": {
+    "actual_exit": 0,
+    "elapsed_seconds": 1821.7614709590562,
+    "source_status": "",
+    "interpretation": "read real driver/tests/profiles and separately bound actual-scope observer; no full/canonical receipt credit"
+  },
+  "observer": {
+    "elapsed_seconds": 1821.6764018288814,
+    "binding_present": true,
+    "terminal": {
+      "time_ns": 1789603307587137791,
+      "cgroup_exists": false,
+      "properties": {
+        "Id": "dagrun-108548.scope",
+        "LoadState": "not-found",
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "InvocationID": "",
+        "Result": "success",
+        "RuntimeMaxUSec": "infinity",
+        "ControlGroup": "",
+        "CPUQuotaPerSecUSec": "infinity",
+        "MemoryMax": "infinity",
+        "MemorySwapMax": "infinity",
+        "TasksMax": "infinity"
+      }
+    },
+    "errors": [],
+    "limitations": "one-second samples may miss short child groups/final counter increments; native driver profiles remain authoritative; never bootstrap-only coverage",
+    "workload_signals_sent": false
+  }
+}

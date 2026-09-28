@@ -1,0 +1,93 @@
+[dagrun] discarding missing cached Rust artifact(s) for dagrun
+[dagrun] rust cache=refreshed source=d96608fc061e binary=a7c69d49584f
+/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/agent-utils/rs/target/x86_64-unknown-linux-gnu/release/dagrun
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling syn v3.0.3
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling autocfg v1.5.1
+   Compiling libc v0.2.189
+   Compiling bitflags v2.13.1
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling syn v2.0.119
+   Compiling rustix v1.1.4
+   Compiling memoffset v0.9.1
+   Compiling syscalls v0.6.18
+   Compiling zmij v1.0.23
+   Compiling unicode-segmentation v1.13.3
+   Compiling utf8parse v0.2.2
+   Compiling itoa v1.0.18
+   Compiling linux-raw-sys v0.12.1
+   Compiling typenum v1.20.1
+   Compiling cfg_aliases v0.2.2
+   Compiling nix v0.30.1
+   Compiling anstyle-parse v1.0.0
+   Compiling convert_case v0.6.0
+   Compiling num-traits v0.2.19
+   Compiling serde_repr v0.1.21
+   Compiling paste v1.0.15
+   Compiling radium v0.7.0
+   Compiling cfg-if v1.0.4
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling hashbrown v0.17.1
+   Compiling serde_json v1.0.151
+   Compiling equivalent v1.0.2
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling unicode-xid v0.2.6
+   Compiling derive_more-impl v1.0.0
+   Compiling anstream v1.0.0
+   Compiling indexmap v2.14.0
+   Compiling terminal_size v0.4.4
+   Compiling errno v0.3.14
+   Compiling unicase v2.9.0
+   Compiling ryu v1.0.23
+   Compiling unicode-width v0.2.2
+   Compiling anyhow v1.0.104
+   Compiling signal-hook v0.4.4
+   Compiling memchr v2.8.3
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.0
+   Compiling tap v1.0.1
+   Compiling virtue v0.0.18
+   Compiling heck v0.5.0
+   Compiling once_cell v1.21.4
+   Compiling tracing-core v0.1.36
+   Compiling clap_derive v4.6.4
+   Compiling bincode_derive v2.0.1
+   Compiling wyz v0.5.1
+   Compiling clap_builder v4.6.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling derive_more v1.0.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling tracing-attributes v0.1.31
+   Compiling iana-time-zone v0.1.65
+   Compiling unty v0.0.4
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling funty v2.0.0
+   Compiling pin-project-lite v0.2.17
+   Compiling tracing v0.1.44
+   Compiling bitvec v1.1.1
+   Compiling serde_norway v0.9.42
+   Compiling bincode v2.0.1
+   Compiling chrono v0.4.45
+   Compiling digest v0.10.7
+   Compiling reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+   Compiling clap v4.6.4
+   Compiling bytesize v2.4.2
+   Compiling shell-words v1.1.1
+   Compiling cpufeatures v0.2.17
+   Compiling unsafe-libyaml v0.2.11
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling sha2 v0.10.9
+   Compiling detcore-model v0.2.0 (/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/detcore-model)
+   Compiling dagrun v0.15.0 (/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/agent-utils/rs/dagrun)
+   Compiling hermit-manifest-plan v0.2.0 (/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ci/manifest-plan)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 27s

@@ -1,0 +1,50 @@
+{
+  "actual_exit": 0,
+  "seconds": 41.936844057170674,
+  "source_equal": true,
+  "commands": [
+    {
+      "name": "default-warnings",
+      "argv": [
+        "./scripts/check-default-build-warnings.sh"
+      ],
+      "actual_exit": 0,
+      "seconds": 38.87971352506429
+    },
+    {
+      "name": "fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "actual_exit": 0,
+      "seconds": 2.6522254990413785
+    },
+    {
+      "name": "shell-syntax",
+      "argv": [
+        "bash",
+        "-n",
+        "ci/configure-build-jobs.sh",
+        "ci/run-with-reverie-dbt-budget.sh"
+      ],
+      "actual_exit": 0,
+      "seconds": 0.0031304180156439543
+    },
+    {
+      "name": "whitespace",
+      "argv": [
+        "git",
+        "diff",
+        "--check",
+        "fe41081742652fce09fc22f20469df10fa09ddaa",
+        "HEAD"
+      ],
+      "actual_exit": 0,
+      "seconds": 0.040676534874364734
+    }
+  ]
+}

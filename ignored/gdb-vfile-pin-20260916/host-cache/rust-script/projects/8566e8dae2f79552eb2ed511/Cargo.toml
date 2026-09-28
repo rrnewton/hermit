@@ -1,0 +1,14 @@
+[[bin]]
+name = "check-nested-lockfiles_8566e8dae2f79552eb2ed511"
+path = "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/scripts/check-nested-lockfiles.rs"
+
+[dependencies]
+
+[package]
+authors = ["Anonymous"]
+edition = "2021"
+name = "check-nested-lockfiles_8566e8dae2f79552eb2ed511"
+version = "0.1.0"
+
+[profile.release]
+strip = true

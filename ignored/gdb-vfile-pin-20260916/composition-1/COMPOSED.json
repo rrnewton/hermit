@@ -1,0 +1,10 @@
+{
+  "head": "932f7130ea3c77dcdb2547b6834f46f08bf593f0",
+  "tree": "f274d598795e7f784ad7cb46c168f92a937e9dac",
+  "main": "59cbd3c64d8f304b2c477a153b0239fca7a8572a",
+  "prior_pin_head": "7c4df11ca6ae4b92196d04297e6a650d7e10915e",
+  "pin_patch_sha256": "6e9338d0f661ec1db8a399b494509ab6e9b08a125b601f93937482f6715a88da",
+  "incoming_five_blobs_exact": true,
+  "tracked_clean": true,
+  "actual_tag": "[hermit2, degraded-unresolved, gpt-6-astra, devbig014, role=impl]"
+}

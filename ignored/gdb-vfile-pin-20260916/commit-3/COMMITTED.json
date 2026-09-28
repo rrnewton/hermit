@@ -1,0 +1,23 @@
+{
+  "head": "7c4df11ca6ae4b92196d04297e6a650d7e10915e",
+  "tree": "cfaf0c64fdebfbef1c4eb425e9304ccd5d660664",
+  "base": "4e7c0636ff105f333d81fa6560069a267e8d60a8",
+  "patch_sha256": "6e9338d0f661ec1db8a399b494509ab6e9b08a125b601f93937482f6715a88da",
+  "paths": [
+    "Cargo.lock",
+    "ci/configure-build-jobs.sh",
+    "ci/run-with-reverie-dbt-budget.sh",
+    "detcore-dbt/Cargo.toml",
+    "detcore-model/Cargo.toml",
+    "detcore-sabre/Cargo.toml",
+    "detcore/Cargo.toml",
+    "detcore/tests/testutils/Cargo.toml",
+    "hermit-cli/Cargo.toml",
+    "hermit-install/Cargo.toml",
+    "liteinst-runtime-build/Cargo.lock",
+    "liteinst-runtime-build/runtime/Cargo.toml"
+  ],
+  "actual_tag": "[hermit2, degraded-unresolved, gpt-6-astra, devbig014, role=impl]",
+  "body_sha256": "c6bccfb01fe0f62bc9fc582eec49046057a494d632e63f63825127fb9703c4e6",
+  "tracked_clean": true
+}

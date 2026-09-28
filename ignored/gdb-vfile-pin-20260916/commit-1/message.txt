@@ -1,0 +1,15 @@
+Pin Reverie unsupported vFile handling
+
+[hermit2, degraded-unresolved, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Advance Hermit's uniform Reverie dependency to the landed unsupported-vFile repair from https://github.com/rrnewton/reverie/pull/559. Unknown GDB host-I/O probes now receive the protocol's empty unsupported response so replay can continue to the existing classifier and fault-injection checks. The pin range also includes the preceding landed paused-counter API change; this commit carries no temporary CLI diagnostic edits.
+
+Update eight Cargo manifests, both tracked locks and the two coupled CI pin bindings. Carry the existing native DynamoRIO build budget by identical build-script and vendored-source inputs, without changing the 16-job clamp or 1050 effective-job-second threshold. This is not a new timing measurement.
+
+Validation
+
+Normal pin ancestry/uniformity policy, locked whole-workspace all-target check, supported whole-workspace Clippy with warnings denied, workspace fmt, shell syntax and whitespace checks all passed in 113.980 seconds under 4 CPUs and 8 GiB. No Hermit guest result is claimed yet; the unchanged official 78-case CLI selection with 35 existing filters is planned. The upstream repair separately passed all 39 gdbstub tests (138 unrelated tests filtered), with two intended old-source failures. No test assertion, comparison policy, timeout, filter, node budget or verdict classification changes here.
+
+Task: vision-ci-signal-is-trustworthy-end-to-end

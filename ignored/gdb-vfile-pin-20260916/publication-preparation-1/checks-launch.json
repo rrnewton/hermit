@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--unit=hermit-gdb-vfile-pin-publish-checks1-20260917",
+    "--property=CPUQuota=400%",
+    "--property=MemoryMax=8G",
+    "--property=MemorySwapMax=0",
+    "--property=TasksMax=1024",
+    "--property=RuntimeMaxSec=900s",
+    "timeout",
+    "--signal=TERM",
+    "--kill-after=5s",
+    "890s",
+    "python3",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/publication-checks-1.py"
+  ],
+  "source_sha256": "1e53ef592eb9f0d5ecf1f11e4b8880eab0fd7c18d90ea5ac7ac34084e325eb4a",
+  "started_ns": 1789604098379541563
+}

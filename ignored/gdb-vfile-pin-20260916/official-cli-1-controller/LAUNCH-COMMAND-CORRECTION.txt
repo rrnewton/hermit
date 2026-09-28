@@ -1,0 +1,5 @@
+Command transcription correction to the preceding launch note: the actual retained argv separates option values. The exact command is:
+
+with-proxy ./scripts/validate.rs full --allow-local-off-the-record-run --selected test.cli -j 1 --no-label-pr --verbose --run-timeout 11400
+
+The earlier prose omitted spaces around two option values. The executed argv, source, limits and run are unchanged; driver-command.json retains the actual argument array.

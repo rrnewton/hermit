@@ -1,0 +1,72 @@
+{
+  "actual_exit": 0,
+  "seconds": 113.98045663000084,
+  "source_equal": true,
+  "commands": [
+    {
+      "name": "pin-policy",
+      "argv": [
+        "./ci/run-reverie-pin-check.sh",
+        "--repo",
+        "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916",
+        "--base-ref",
+        "4e7c0636ff105f333d81fa6560069a267e8d60a8"
+      ],
+      "actual_exit": 0,
+      "seconds": 3.1308131678961217
+    },
+    {
+      "name": "workspace-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--workspace",
+        "--all-targets"
+      ],
+      "actual_exit": 0,
+      "seconds": 84.97202801797539
+    },
+    {
+      "name": "default-warnings",
+      "argv": [
+        "./scripts/check-default-build-warnings.sh"
+      ],
+      "actual_exit": 0,
+      "seconds": 22.76588310697116
+    },
+    {
+      "name": "fmt",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "actual_exit": 0,
+      "seconds": 2.6940242499113083
+    },
+    {
+      "name": "shell-syntax",
+      "argv": [
+        "bash",
+        "-n",
+        "ci/configure-build-jobs.sh",
+        "ci/run-with-reverie-dbt-budget.sh"
+      ],
+      "actual_exit": 0,
+      "seconds": 0.003202740103006363
+    },
+    {
+      "name": "whitespace",
+      "argv": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "actual_exit": 0,
+      "seconds": 0.05467342701740563
+    }
+  ]
+}

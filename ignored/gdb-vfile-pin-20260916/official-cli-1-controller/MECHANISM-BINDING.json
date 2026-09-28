@@ -1,0 +1,17 @@
+{
+  "integration-launch.source": {
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/gdb-replay-diagnostic-20260916/official-cli-2-controller/integration-launch.source",
+    "sha256": "8b0bffa40947ce01a347459d615f11a75ce38c639c14971dbf61568fe605cf87",
+    "byte_identical": true
+  },
+  "integration-run.source": {
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/gdb-replay-diagnostic-20260916/official-cli-2-controller/integration-run.source",
+    "sha256": "c4d9205e0e20bfdf0cb9c96d41128ef74077a88046dc6f1fb2aaba292c23f184",
+    "byte_identical": true
+  },
+  "integration-observer.source": {
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/gdb-replay-diagnostic-20260916/official-cli-2-controller/integration-observer.source",
+    "sha256": "aa39d7ffc945493624750db0031d781542724edaaf1f9ffe56ea95cbaddd6a5f",
+    "byte_identical": true
+  }
+}

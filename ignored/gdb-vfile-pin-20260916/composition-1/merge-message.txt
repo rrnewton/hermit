@@ -1,0 +1,11 @@
+Compose landed robust clocks with the Reverie pin
+
+[hermit2, degraded-unresolved, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Bring the already-landed robust owner-clock repair into the GDB protocol pin candidate before its official CLI qualification. The five incoming source/count files are byte-identical to reviewed main59cbd3c6, whose selected679 Detcore and158 integration tests passed. Preserve the twelve-file d87a Reverie pin patch exactly and keep all existing test identities, selectors, node limits and comparison policies.
+
+The pin separately passed the normal policy, locked workspace check, default workspace Clippy and format checks. This append-only composition has not yet run the planned official78-case CLI selection; no combined guest result or full-main receipt is claimed.
+
+Task: vision-ci-signal-is-trustworthy-end-to-end

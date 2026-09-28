@@ -1,0 +1,24 @@
+[
+  {
+    "name": "seed-cache",
+    "argv": [
+      "/usr/local/fbcode/platform010/bin/python3.12",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/seed-cache.py"
+    ],
+    "actual_exit": 0,
+    "seconds": 17.156548348022625
+  },
+  {
+    "name": "normal-update",
+    "argv": [
+      "./ci/run-reverie-pin-check.sh",
+      "--repo",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916",
+      "--update-to-latest",
+      "--base-ref",
+      "4e7c0636ff105f333d81fa6560069a267e8d60a8"
+    ],
+    "actual_exit": 2,
+    "seconds": 9.511520829051733
+  }
+]

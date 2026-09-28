@@ -1,0 +1,23 @@
+{
+  "cache": "/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache",
+  "argv": [
+    "with-proxy",
+    "/home/newton/work/dev-hermit/ci-hub/ci-hub",
+    "--help"
+  ],
+  "cwd": "/home/newton/work/dev-hermit",
+  "environment_updates": {
+    "XDG_CACHE_HOME": "/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache",
+    "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo",
+    "CARGO_HTTP_CAINFO": "/etc/pki/tls/certs/fb_certs.pem"
+  },
+  "scope": {
+    "cpu": 4,
+    "memory_bytes": 8589934592,
+    "swap_bytes": 0,
+    "tasks": 1024,
+    "seconds": 900
+  },
+  "prepared_cache_not_cold_claim": true,
+  "mechanism": "Same normal public ci-hub --help as previously successful robust parent-tool-preparation-3; new own external cache, no borrowed cache/authority. Actual source/plugin guard retained."
+}

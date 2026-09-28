@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "/home/newton/work/dev-hermit/ci-hub/bin/who-am-i",
+    "--tag",
+    "--role",
+    "impl"
+  ],
+  "actual_exit": 0,
+  "seconds": 0.11906205606646836
+}

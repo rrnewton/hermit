@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--unit=gdb-vfile-pin-932f7130-bootstrap1-20260916.scope",
+    "--property=Delegate=yes",
+    "--property=CPUQuota=400%",
+    "--property=MemoryMax=8G",
+    "--property=MemorySwapMax=0",
+    "--property=TasksMax=1024",
+    "--property=RuntimeMaxSec=13200",
+    "--",
+    "python3",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/integration-run.source",
+    "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/spec.json"
+  ],
+  "launcher_pid": 108151,
+  "systemd_run_pid": 108540,
+  "started_ns": 1789601485781372845,
+  "head": "932f7130ea3c77dcdb2547b6834f46f08bf593f0",
+  "slot": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916",
+  "full_log": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/FULL.log"
+}

@@ -1,0 +1,2730 @@
+{
+  "schema": 2,
+  "repository": "/src",
+  "target": "/src/target",
+  "sources": {
+    "/build/.cargo/git/checkouts/liteinst2-0930caeadc20b5d7/95ee5e6": "df9147fd50344fb5dc3e7312e0dc0b68b972ed468306091de52f747635fc9506",
+    "/build/.cargo/git/checkouts/reverie-2fc770f7a9c80803/d87a03a": "689878ff4be107547136bb6551b910de4ec28eee60e53413ecfcd26f73929671",
+    "/build/.cargo/git/checkouts/rust-shed-fa90e11be1f0cc76/84a8202": "89775eaecedfedf7b9c46662888989719ee5907e1e2b528684e1d26e3065f707",
+    "/src": "7d7f04ba7f21eb2a3898ad468541ea206c77ca06fc0f27e020e4c64ba56252d8",
+    "/src/agent-utils": "d2ffac35a5cbe3c90892e493b4d9dd4a3dade7caa1d70ebc068ae556a96aa842"
+  },
+  "rustc": "rustc 1.99.0-nightly (26ae60a9e 2026-07-28)\nbinary: rustc\ncommit-hash: 26ae60a9eeb20b4935be49d7a931a650fa1d2923\ncommit-date: 2026-07-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n",
+  "cargo_config": {
+    "/.cargo/config": null,
+    "/.cargo/config.toml": null,
+    "/build/.cargo/config": null,
+    "/build/.cargo/config.toml": null,
+    "/src/.cargo/config": null,
+    "/src/.cargo/config.toml": null
+  },
+  "build_environment": {
+    "CARGO_TARGET_DIR": "/src/target",
+    "LIBRARY_PATH": "/nix/store/9c63z3yin12raf78daif8c3j12l4vjs4-libunwind-1.8.3/lib:/nix/store/6ppdi802js8s56d0nwxwi6jkdxpzqvv1-elfutils-0.195/lib:/nix/store/zks9mfsn4rqr6z9g6pcj2xqzcsplj0nb-zlib-1.3.2/lib:/nix/store/1mf3lj0mldr8732yvzjc12fig2407b3d-openssl-3.6.3/lib"
+  },
+  "cargo_metadata": {
+    "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/cargo.json",
+    "size": 1364628,
+    "mode": 33188,
+    "sha256": "6157c8d110f841a32466b3e15f39640eda2651d1e088d37c654eda7e3428f852"
+  },
+  "selections": {
+    "0635b7260cfa0b53b731d4b7cdc1ba4979d7859b3337cc88c44111cb8f9fbcd2": {
+      "build_args": [
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_misc"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/0635b7260cfa0b53b731d4b7cdc1ba4979d7859b3337cc88c44111cb8f9fbcd2.json",
+        "size": 943,
+        "mode": 33188,
+        "sha256": "72695642f68ce11db660eb5f1f23e072b3c63143b8e8963a9f149d8ad04d32f3"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit-detcore::tests_misc",
+          "package_id": "path+file:///src/detcore#hermit-detcore@0.2.0",
+          "binary_name": "tests_misc",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/tests_misc-a4d0d37b2fb894aa",
+            "size": 255525984,
+            "mode": 33261,
+            "sha256": "1e4a52e9c05469126e5321ece6243c5cb092b90de92130bef406b541d1e6f203"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/syscaller",
+          "size": 4631888,
+          "mode": 33261,
+          "sha256": "536ba6102e1351e080b495f815cb275870a47296a6bdd03d7ce660fad0679e65"
+        }
+      ]
+    },
+    "296cadcb0e34c664d373676f02895207ad17afbdb414c8a070b5fd0f4fd23454": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "sabre_examples"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/296cadcb0e34c664d373676f02895207ad17afbdb414c8a070b5fd0f4fd23454.json",
+        "size": 2428,
+        "mode": 33188,
+        "sha256": "5155aeecb2b11f113106ef664a6ca10839d5f0d62f2d7ebd7e080b990aae9c3b"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::sabre_examples",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "sabre_examples",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/sabre_examples-6cde26df35085e96",
+            "size": 13455384,
+            "mode": 33261,
+            "sha256": "09c5d50c7248377aa3182aa869802534cfe31eadbfa6875cbd1e0530e732714a"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "3e69a4706d704da57eca385e24e13d6755b8dd7352749ea0cad38d919b00f55a": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "aio_nr_determinism",
+        "--test",
+        "arch_status_determinism",
+        "--test",
+        "chaos_sched_yield_progress",
+        "--test",
+        "chaos_stress_pmu_detection",
+        "--test",
+        "child_time_rpc",
+        "--test",
+        "chown_virtual_root_identity",
+        "--test",
+        "clock_determinism",
+        "--test",
+        "clock_discipline_determinism",
+        "--test",
+        "container_init_deadline",
+        "--test",
+        "cpufreq_avg_determinism",
+        "--test",
+        "epoll_determinism",
+        "--test",
+        "epoll_pwait_zero_timeout_progress",
+        "--test",
+        "file_nr_determinism",
+        "--test",
+        "fp_reduction_determinism",
+        "--test",
+        "futex2_refusal",
+        "--test",
+        "hashseed_determinism",
+        "--test",
+        "inode_nr_determinism",
+        "--test",
+        "kernel_keyring",
+        "--test",
+        "key_users_determinism",
+        "--test",
+        "mmap_determinism",
+        "--test",
+        "node_vmstat_determinism",
+        "--test",
+        "numa_maps_determinism",
+        "--test",
+        "perf_event_refusal",
+        "--test",
+        "pidfd_creation",
+        "--test",
+        "process_isolation_refusals",
+        "--test",
+        "proc_fdinfo_determinism",
+        "--test",
+        "proc_locks_determinism",
+        "--test",
+        "procfs_determinism",
+        "--test",
+        "procfs_positioned_determinism",
+        "--test",
+        "pty_nr_determinism",
+        "--test",
+        "python_stdlib",
+        "--test",
+        "robust_futex_owner_death",
+        "--test",
+        "run_evidence",
+        "--test",
+        "self_sched_determinism",
+        "--test",
+        "self_schedstat_determinism",
+        "--test",
+        "signal_determinism",
+        "--test",
+        "smaps_determinism",
+        "--test",
+        "smaps_rollup_determinism",
+        "--test",
+        "softnet_stat_determinism",
+        "--test",
+        "sockstat_determinism",
+        "--test",
+        "swaps_determinism",
+        "--test",
+        "thp_stats_determinism",
+        "--test",
+        "verification_report_cli",
+        "--test",
+        "verification_report_consumers",
+        "--test",
+        "writev_determinism",
+        "--test",
+        "zero_copy_pipe_fallback"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/3e69a4706d704da57eca385e24e13d6755b8dd7352749ea0cad38d919b00f55a.json",
+        "size": 15506,
+        "mode": 33188,
+        "sha256": "956208f4107a55d2f5eb55a9f84142ad7ebf0184ff255ec266b705f0943483c8"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::aio_nr_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "aio_nr_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/aio_nr_determinism-100e0f9f29745292",
+            "size": 8315240,
+            "mode": 33261,
+            "sha256": "4692852ceaa14568c6ac03e3ddc528944ba9f4abc5c4187990402e5b61a8874c"
+          }
+        },
+        {
+          "binary_id": "hermit::arch_status_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "arch_status_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/arch_status_determinism-3d28ab2b8fdde8de",
+            "size": 8349672,
+            "mode": 33261,
+            "sha256": "60b09c5d4fb57fbae3df51454c283295f8ccf0e5f6c5ec1a037c7ed0a23569ff"
+          }
+        },
+        {
+          "binary_id": "hermit::chaos_sched_yield_progress",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "chaos_sched_yield_progress",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/chaos_sched_yield_progress-e0894ca771aa7646",
+            "size": 8429400,
+            "mode": 33261,
+            "sha256": "f2dd205723cfb47fcb546fe13e5ea49b7f768e9a8f6287211805343a8137468f"
+          }
+        },
+        {
+          "binary_id": "hermit::chaos_stress_pmu_detection",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "chaos_stress_pmu_detection",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/chaos_stress_pmu_detection-62dbdf9d6044d61b",
+            "size": 7565768,
+            "mode": 33261,
+            "sha256": "ae5666eba6c1bbf2b1e89bab08be0cdc8c05d52cdf7e3a1756f25b7552f41d85"
+          }
+        },
+        {
+          "binary_id": "hermit::child_time_rpc",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "child_time_rpc",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/child_time_rpc-7b039ade0ba66e98",
+            "size": 122651480,
+            "mode": 33261,
+            "sha256": "25ad3f3a5c102686ade06ed5806b62074d5da2ab6189d40d1e6f6cbdd07b5e33"
+          }
+        },
+        {
+          "binary_id": "hermit::chown_virtual_root_identity",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "chown_virtual_root_identity",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/chown_virtual_root_identity-2764b5553246afa7",
+            "size": 8397576,
+            "mode": 33261,
+            "sha256": "4cbfcdc984ecd3ae854eaba504564f8ccf768314a566eeac02c788bafaf588d5"
+          }
+        },
+        {
+          "binary_id": "hermit::clock_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "clock_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/clock_determinism-8cde3d80dd152887",
+            "size": 8423248,
+            "mode": 33261,
+            "sha256": "29e0436bfe9328d9f3bd2d0503cd752908072cc807501356b8512280d4ed216b"
+          }
+        },
+        {
+          "binary_id": "hermit::clock_discipline_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "clock_discipline_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/clock_discipline_determinism-ce4f7cdf7e4104a0",
+            "size": 10942616,
+            "mode": 33261,
+            "sha256": "f4a6e897b3bb4f2b4145824b21c7e20d2e89278d1b6b57289b2f54f5254b70a4"
+          }
+        },
+        {
+          "binary_id": "hermit::container_init_deadline",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "container_init_deadline",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/container_init_deadline-ab2dd4f945143961",
+            "size": 8660232,
+            "mode": 33261,
+            "sha256": "ac480abeea3db5a6a464cc57b02add54facd244dcb4c060ba2113f8e9bed5f07"
+          }
+        },
+        {
+          "binary_id": "hermit::cpufreq_avg_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "cpufreq_avg_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/cpufreq_avg_determinism-3a81f85a3bca9e97",
+            "size": 8324224,
+            "mode": 33261,
+            "sha256": "d9c69dd26c04441b5f563983f58862851b7d1f5f737b25c870bcf7461f43a1cd"
+          }
+        },
+        {
+          "binary_id": "hermit::epoll_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "epoll_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/epoll_determinism-7e931426b1080325",
+            "size": 9324432,
+            "mode": 33261,
+            "sha256": "7036b90c4c76c2d5575ca39efb2a6725245d3eee6e9f03bb507a76c22e13c435"
+          }
+        },
+        {
+          "binary_id": "hermit::epoll_pwait_zero_timeout_progress",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "epoll_pwait_zero_timeout_progress",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/epoll_pwait_zero_timeout_progress-823d0bacd941990b",
+            "size": 8377784,
+            "mode": 33261,
+            "sha256": "6919108d080ae0bd75382a9e72ce3b73066988adc70736ed06c3bf32dd02f0cb"
+          }
+        },
+        {
+          "binary_id": "hermit::file_nr_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "file_nr_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/file_nr_determinism-ad99c80871384a5e",
+            "size": 8318168,
+            "mode": 33261,
+            "sha256": "9db35e2d3e0eb4eee2b457fc0dde3e4b963df367e5b6c04cdc98fc359147085e"
+          }
+        },
+        {
+          "binary_id": "hermit::fp_reduction_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "fp_reduction_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/fp_reduction_determinism-68ab6a1509075afb",
+            "size": 8898152,
+            "mode": 33261,
+            "sha256": "6e9fed06b6490c178b201a9db692a239e5e53feef3d999dc78e584362706090b"
+          }
+        },
+        {
+          "binary_id": "hermit::futex2_refusal",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "futex2_refusal",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/futex2_refusal-34ef27128e0ddd14",
+            "size": 8347560,
+            "mode": 33261,
+            "sha256": "8e6351fff5c19c4b6a1a5670b169801c9ff897a46ef5ebcecb75f120f1ccc444"
+          }
+        },
+        {
+          "binary_id": "hermit::hashseed_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "hashseed_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hashseed_determinism-72d8c180adc8ccd9",
+            "size": 8690648,
+            "mode": 33261,
+            "sha256": "8fe410912c64fdae73cc102861342fb589d2eb43fdc4fc1a987a4e9cf6acff61"
+          }
+        },
+        {
+          "binary_id": "hermit::inode_nr_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "inode_nr_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/inode_nr_determinism-2aa95d2b96198f65",
+            "size": 8320104,
+            "mode": 33261,
+            "sha256": "b7f9650c94b452bcfec2be85d21c9db840f209a4a25c6ec3829b5659b6921946"
+          }
+        },
+        {
+          "binary_id": "hermit::kernel_keyring",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "kernel_keyring",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/kernel_keyring-e9ac4f725d02f744",
+            "size": 8369304,
+            "mode": 33261,
+            "sha256": "af99b947420874cf50421161eb48dbdc75460a47dce12dafd621702aca3e412b"
+          }
+        },
+        {
+          "binary_id": "hermit::key_users_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "key_users_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/key_users_determinism-56702ec5ec1648ea",
+            "size": 8635504,
+            "mode": 33261,
+            "sha256": "8065189a5bb073fbc530d7de96b014683648612a6a0457f9971eae99d4485239"
+          }
+        },
+        {
+          "binary_id": "hermit::mmap_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "mmap_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/mmap_determinism-928c736110a7636a",
+            "size": 8255336,
+            "mode": 33261,
+            "sha256": "0f14655533c38264cc2ddaeb1221b30a989a4111e16cb6431745b8cef0c461c5"
+          }
+        },
+        {
+          "binary_id": "hermit::node_vmstat_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "node_vmstat_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/node_vmstat_determinism-3c466c1f6956b8b6",
+            "size": 8351032,
+            "mode": 33261,
+            "sha256": "07c84f9dc39e04a9de2d57b8ff92aafa2b95f090b4e9d773dee058abcb099b2f"
+          }
+        },
+        {
+          "binary_id": "hermit::numa_maps_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "numa_maps_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/numa_maps_determinism-10a6d062a3d64fa3",
+            "size": 8436848,
+            "mode": 33261,
+            "sha256": "324ed3b90f0849800bdd252a57d19403a2832c14be4268de594c9e22e2269c64"
+          }
+        },
+        {
+          "binary_id": "hermit::perf_event_refusal",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "perf_event_refusal",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/perf_event_refusal-b1d7621d16fa26e6",
+            "size": 8329304,
+            "mode": 33261,
+            "sha256": "adf5c2790c2517ab3002a00cbcb7989f293602e3c45b02e83b2c255e1d5c98a0"
+          }
+        },
+        {
+          "binary_id": "hermit::pidfd_creation",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "pidfd_creation",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/pidfd_creation-4328626ee91d8c62",
+            "size": 8352064,
+            "mode": 33261,
+            "sha256": "c6373d2e3419f5462c1c15d565404db59eb36f468ff3cd4c43bafbbb9c3ceeee"
+          }
+        },
+        {
+          "binary_id": "hermit::proc_fdinfo_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "proc_fdinfo_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/proc_fdinfo_determinism-47f6b94f3f7020ed",
+            "size": 8297208,
+            "mode": 33261,
+            "sha256": "36778c6d82ff41ae73bb8cbdc8c332bc83a4581d867fd420750d09ec6f342ac9"
+          }
+        },
+        {
+          "binary_id": "hermit::proc_locks_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "proc_locks_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/proc_locks_determinism-eac2441306b6762b",
+            "size": 11275952,
+            "mode": 33261,
+            "sha256": "1874aadfd3c9f803fb3297683ef48a662cb35d6d0dd53eff95217259f27e3a48"
+          }
+        },
+        {
+          "binary_id": "hermit::process_isolation_refusals",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "process_isolation_refusals",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/process_isolation_refusals-87c63b58bf838d8e",
+            "size": 8344672,
+            "mode": 33261,
+            "sha256": "51ee5b6b86fbb301c443897981ba99863e6746cb142f2bce3863d26c0a682410"
+          }
+        },
+        {
+          "binary_id": "hermit::procfs_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "procfs_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/procfs_determinism-bba8b7d482a54fe0",
+            "size": 350201888,
+            "mode": 33261,
+            "sha256": "58cfe88a62434e1134adb4db5ddfbe6436f3b14b25afad1ae99e91459eac9bdc"
+          }
+        },
+        {
+          "binary_id": "hermit::procfs_positioned_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "procfs_positioned_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/procfs_positioned_determinism-5d2640ada84e2411",
+            "size": 8288536,
+            "mode": 33261,
+            "sha256": "a8fa169fc2397083131d20ec835af8a85e277fb2ae2cc74bcb201f935d16baed"
+          }
+        },
+        {
+          "binary_id": "hermit::pty_nr_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "pty_nr_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/pty_nr_determinism-d2e5d89d4d605329",
+            "size": 8347360,
+            "mode": 33261,
+            "sha256": "086e3f6be2d8484054b8062f0373ac53131b33e9b9b433e0833c42d1f4148cff"
+          }
+        },
+        {
+          "binary_id": "hermit::python_stdlib",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "python_stdlib",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/python_stdlib-c3e409312194c7a5",
+            "size": 8434128,
+            "mode": 33261,
+            "sha256": "f56080f8e227e0c00b25a352995f7e7d32158d55f16d0aaa8e4b9fc8749b1e52"
+          }
+        },
+        {
+          "binary_id": "hermit::robust_futex_owner_death",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "robust_futex_owner_death",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/robust_futex_owner_death-61b283f0f7a09a84",
+            "size": 10996304,
+            "mode": 33261,
+            "sha256": "285f63c9cb971e878ebfe6c10d5e1f796d26eb61a5f67fb5d3d565d942243d88"
+          }
+        },
+        {
+          "binary_id": "hermit::run_evidence",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "run_evidence",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/run_evidence-a3fe76ebc9e9af08",
+            "size": 308231488,
+            "mode": 33261,
+            "sha256": "3fd59da7efaccaf28bcd11b383c9117719b16fb4ab123a65cd94e9736ad1c7f8"
+          }
+        },
+        {
+          "binary_id": "hermit::self_sched_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "self_sched_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/self_sched_determinism-47cad9719ff01e34",
+            "size": 8447056,
+            "mode": 33261,
+            "sha256": "16f357d7f4aedd85ec99f1baba875c297d5f49ae533fe8e62615ee3b31994012"
+          }
+        },
+        {
+          "binary_id": "hermit::self_schedstat_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "self_schedstat_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/self_schedstat_determinism-dce37df0d3523545",
+            "size": 8379008,
+            "mode": 33261,
+            "sha256": "0356f14200cc1629dccbbaf35e57de557c791783e733db9051f800ef91793613"
+          }
+        },
+        {
+          "binary_id": "hermit::signal_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "signal_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/signal_determinism-c56012f8720fc790",
+            "size": 299621072,
+            "mode": 33261,
+            "sha256": "63606dd95d93ad055ee85daa53afbf28f24ebe015d9917dc95b2bedfe67bfd14"
+          }
+        },
+        {
+          "binary_id": "hermit::smaps_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "smaps_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/smaps_determinism-d18d4972fdc4aad0",
+            "size": 8479688,
+            "mode": 33261,
+            "sha256": "c38edbfe89cab3e6fb113099a5937d205b0dc19f27d5f1e3d650868b92b6080f"
+          }
+        },
+        {
+          "binary_id": "hermit::smaps_rollup_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "smaps_rollup_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/smaps_rollup_determinism-6b43dfd374779b3f",
+            "size": 8410416,
+            "mode": 33261,
+            "sha256": "c29d44b8a6412422dee6b9aa0da919458bb46b2276e5190a3be5cc304f4fc47a"
+          }
+        },
+        {
+          "binary_id": "hermit::sockstat_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "sockstat_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/sockstat_determinism-82f1920d255df4f9",
+            "size": 8470960,
+            "mode": 33261,
+            "sha256": "2d5f8aadc4011c12242775433753c73a2dd818acee6ea5708447f7ca6fd67fc5"
+          }
+        },
+        {
+          "binary_id": "hermit::softnet_stat_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "softnet_stat_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/softnet_stat_determinism-b4beab4eee6a73f3",
+            "size": 8326584,
+            "mode": 33261,
+            "sha256": "3fe0803b8f9bfa8c1ecbbaa4baf2cf9ecb9957efda73f7bd0556d4dc1805d51c"
+          }
+        },
+        {
+          "binary_id": "hermit::swaps_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "swaps_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/swaps_determinism-dac60e1490c9833b",
+            "size": 8339072,
+            "mode": 33261,
+            "sha256": "a17591aa8819035b9a89bfab8d126005d6b29890fc5b420be43957e9f148edeb"
+          }
+        },
+        {
+          "binary_id": "hermit::thp_stats_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "thp_stats_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/thp_stats_determinism-574be4acd7abd5f5",
+            "size": 8323432,
+            "mode": 33261,
+            "sha256": "6ef97d52175e1b17082b8ca77c5fc955801d4ac8081ad2c4d9a2074b34f6f6bf"
+          }
+        },
+        {
+          "binary_id": "hermit::verification_report_cli",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "verification_report_cli",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/verification_report_cli-9e4aeef656cbf5e9",
+            "size": 299548704,
+            "mode": 33261,
+            "sha256": "38815609d7e16868a56688e4d80ffde3e6b6c5ed25d9621b9e0c0afce5fc28b2"
+          }
+        },
+        {
+          "binary_id": "hermit::verification_report_consumers",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "verification_report_consumers",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/verification_report_consumers-3ec1a555052aef57",
+            "size": 11024048,
+            "mode": 33261,
+            "sha256": "3fe9cc036c02b7643b82e1c02661f1de5f79c5bfdcd73f502e8e4c9790b1a1f7"
+          }
+        },
+        {
+          "binary_id": "hermit::writev_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "writev_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/writev_determinism-844d83ef36f97697",
+            "size": 14530216,
+            "mode": 33261,
+            "sha256": "3088e37571e41e962d3cb05ac0bd72d4d131110ac7a9190f52abdfa250b87576"
+          }
+        },
+        {
+          "binary_id": "hermit::zero_copy_pipe_fallback",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "zero_copy_pipe_fallback",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/zero_copy_pipe_fallback-7eabd335f44930cb",
+            "size": 8356816,
+            "mode": 33261,
+            "sha256": "1a2cec022c653fb6c1f94c8aaf1630c7c1f48b3a1b73a638f0cb566ef484deb0"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "4046e7748a242aceadd0bc6f1fb4151914edd2d52de846ca8eb2272b490b797a": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "command_strict_verify"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/4046e7748a242aceadd0bc6f1fb4151914edd2d52de846ca8eb2272b490b797a.json",
+        "size": 2456,
+        "mode": 33188,
+        "sha256": "ec8e389e6bc3a0fb7ba27700ac17ad968e557442575067e30c0c408f58d2c16e"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::command_strict_verify",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "command_strict_verify",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/command_strict_verify-c78b8556182a32bb",
+            "size": 10566520,
+            "mode": 33261,
+            "sha256": "1a208510355dee07878e0f68b6d3cd2f059731133e8648a63ff4f09861946c38"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "471ba0120abfe5e28b4d81d2d6b3e0beeb93b6e627bebc5292c5d08b51c787e0": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "epoll_determinism",
+        "--test",
+        "rcx_canonicalization"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/471ba0120abfe5e28b4d81d2d6b3e0beeb93b6e627bebc5292c5d08b51c787e0.json",
+        "size": 2726,
+        "mode": 33188,
+        "sha256": "4cb1d244d1eff647946d5fe6b55cee37788ea1561b680322e100e9084071e05e"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::epoll_determinism",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "epoll_determinism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/epoll_determinism-7e931426b1080325",
+            "size": 9324432,
+            "mode": 33261,
+            "sha256": "7036b90c4c76c2d5575ca39efb2a6725245d3eee6e9f03bb507a76c22e13c435"
+          }
+        },
+        {
+          "binary_id": "hermit::rcx_canonicalization",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "rcx_canonicalization",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/rcx_canonicalization-a39bf10a4fa58888",
+            "size": 7894712,
+            "mode": 33261,
+            "sha256": "929db0bfb96dfdb36724f9900387b0cd30c13bea4244052d1f4f50e53a69448f"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "4bcbfd77e7dc279abaaf5caba7865f65f5a085853e16a31fb81713dada7dda8b": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "rr_suite"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/4bcbfd77e7dc279abaaf5caba7865f65f5a085853e16a31fb81713dada7dda8b.json",
+        "size": 2404,
+        "mode": 33188,
+        "sha256": "b6177a1111cdbbcfd15542a41cde26a1dc0d39c66458c26ec945c7c2ceb267ee"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::rr_suite",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "rr_suite",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/rr_suite-e4e83101522cd8a0",
+            "size": 10740328,
+            "mode": 33261,
+            "sha256": "3771afc5f0a303592f5078d030a3c0fb8ab31481d454ed1f43ceec83f524fc8b"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "4c96ccb8c17b9c3565f3d817b112499630b1004ddda75660f1ebd377ab20f25a": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "app_strict_verify"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/4c96ccb8c17b9c3565f3d817b112499630b1004ddda75660f1ebd377ab20f25a.json",
+        "size": 2440,
+        "mode": 33188,
+        "sha256": "5c47a7e41e45618b3c975927f30df448429d0543f16e1f78bb1161ac562571ef"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::app_strict_verify",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "app_strict_verify",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/app_strict_verify-947160337d7fa526",
+            "size": 13686432,
+            "mode": 33261,
+            "sha256": "7574c45ed7a2b4fe12ae57754a1c1b771bb6074cc44ac687a2afdb1374d9f332"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "4cf7dc2f1329b678063b10dc9e9021f5f519e3d175509ce3e58b9dde467f9f50": {
+      "build_args": [
+        "--workspace",
+        "--exclude",
+        "hermit-detcore",
+        "--exclude",
+        "hermit",
+        "--exclude",
+        "hermetic_infra_hermit_flaky-tests"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/4cf7dc2f1329b678063b10dc9e9021f5f519e3d175509ce3e58b9dde467f9f50.json",
+        "size": 11633,
+        "mode": 33188,
+        "sha256": "10e38680f179e5bf0151e564682a92b76fa7e4550fc7a2d4f280d327f8a321f8"
+      },
+      "binaries": [
+        {
+          "binary_id": "detcore-dbt",
+          "package_id": "path+file:///src/detcore-dbt#0.2.0",
+          "binary_name": "detcore_dbt",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/detcore_dbt-031983e0c0bdee97",
+            "size": 153013368,
+            "mode": 33261,
+            "sha256": "b530299a4628390de1785eb2fcb06e9a23030b7dd905f4e38ffc6d3518894aad"
+          }
+        },
+        {
+          "binary_id": "detcore-model",
+          "package_id": "path+file:///src/detcore-model#0.2.0",
+          "binary_name": "detcore_model",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/detcore_model-2e441646067dc7a6",
+            "size": 45364312,
+            "mode": 33261,
+            "sha256": "88a2f4adb129f6fc771e99bca1b82cd671045667c0cd661828c2d50efc755b9c"
+          }
+        },
+        {
+          "binary_id": "detcore-sabre",
+          "package_id": "path+file:///src/detcore-sabre#0.2.0",
+          "binary_name": "detcore_sabre",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/detcore_sabre-d32f280dde9a14d3",
+            "size": 163237104,
+            "mode": 33261,
+            "sha256": "bf50df15681ea1281bf21358bfd27dcc9aeb09594a4f7e69f6e526be2250c1dc"
+          }
+        },
+        {
+          "binary_id": "detcore-testutils",
+          "package_id": "path+file:///src/detcore/tests/testutils#detcore-testutils@0.2.0",
+          "binary_name": "detcore_testutils",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/detcore_testutils-8e9c5ba2bc706037",
+            "size": 218334280,
+            "mode": 33261,
+            "sha256": "c66481efbc54627355ce9b1eea0f1fcab5110b211b0bf48387283bdb16876571"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/chaos_cas_sequence_bin",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "chaos_cas_sequence_bin",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/chaos_cas_sequence_bin-c30f649665e2871e",
+            "size": 7208360,
+            "mode": 33261,
+            "sha256": "c726d12ac2fbe8a2ba436b13587cd975e73581fe1a2498794383f31ebb81987b"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/chaos_hello_chaos",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "chaos_hello_chaos",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/chaos_hello_chaos-f09781f30d46795e",
+            "size": 7208256,
+            "mode": 33261,
+            "sha256": "0eb736a6b16571f98833a4cd82b2e4b97d2132b6e8e69f6190a36a82dbbcf735"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/chaos_keyvalue_bin",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "chaos_keyvalue_bin",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/chaos_keyvalue_bin-fd54f8fb1a39c6ff",
+            "size": 7208256,
+            "mode": 33261,
+            "sha256": "7766b80788b71ca73121407ae2a0ba78f0964d33d610a885f89c57baf7287d4b"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/nanosleep_threads_nocrash_rust",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "nanosleep_threads_nocrash_rust",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/nanosleep_threads_nocrash_rust-dacf7f4d3bdb9ce0",
+            "size": 7208608,
+            "mode": 33261,
+            "sha256": "88c8a0a88a73cf3e8c4ac6a7dc15fa6fe20593ac495bf4f025ce69b9e7d53046"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/network_bind_full_rs",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "network_bind_full_rs",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/network_bind_full_rs-68ecf80b24bf223d",
+            "size": 7208384,
+            "mode": 33261,
+            "sha256": "f7078a7bb1bba0e4feae696620184fb4b5ee143dd660e804254f9f315810eac2"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/network_bind_rs",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "network_bind_rs",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/network_bind_rs-ae89ddb4698a4f49",
+            "size": 7208248,
+            "mode": 33261,
+            "sha256": "212ec7e8e6d891d811207ba60aeb0a1bea2d1bab40c8ddd128fd04d9e9cf0108"
+          }
+        },
+        {
+          "binary_id": "hermetic_infra_hermit_tests::bin/standalone_stacktrace_events",
+          "package_id": "path+file:///src/tests#hermetic_infra_hermit_tests@0.2.0",
+          "binary_name": "standalone_stacktrace_events",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/standalone_stacktrace_events-735dee6697d07ef8",
+            "size": 7208544,
+            "mode": 33261,
+            "sha256": "0deef8cc283295c1ab43abb07f349ca9b65baa0bec7341d17b169d27c42ecb94"
+          }
+        },
+        {
+          "binary_id": "hermit-install",
+          "package_id": "path+file:///src/hermit-install#0.2.0",
+          "binary_name": "hermit_install",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_install-cfdc41d6a0de37d2",
+            "size": 7208184,
+            "mode": 33261,
+            "sha256": "c350db9c35fa88f1008fbe0025097e69bb3fea983c53e217b6ea791bd3ec6f46"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "hermit_manifest_plan",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_manifest_plan-b95b8ba257b65038",
+            "size": 140475512,
+            "mode": 33261,
+            "sha256": "2066b26dc64479ca9253ddc0d126d2cd02f49ebcd7d0c9394432b8ed425a7ba6"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/generate-test-footprints",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "generate-test-footprints",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/generate_test_footprints-24e8f50254e608ce",
+            "size": 103183760,
+            "mode": 33261,
+            "sha256": "457ed18710a84b5d0aa692837d745d76df802fd01785ecfa2ce9c1a8050ba9c4"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/generate-validation-dag",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "generate-validation-dag",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/generate_validation_dag-1e2ae25630c46009",
+            "size": 7208528,
+            "mode": 33261,
+            "sha256": "c3c8596ba69f6825948050f1102b04878810e481a3fa75a83a4b7198f9648924"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/hermit-manifest-plan",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "hermit-manifest-plan",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_manifest_plan-aeba2f2d22ada1c7",
+            "size": 112413904,
+            "mode": 33261,
+            "sha256": "ed9de707959e1dbbd8f418905bf394246053fb614e42b422508042f1bae3e91f"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/manifest-metadata",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "manifest-metadata",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/manifest_metadata-66a801f418a37896",
+            "size": 7208368,
+            "mode": 33261,
+            "sha256": "a50d02cb8ba69b3e5b40a4c2107ac8d4301b04cefbf4db7f2881ea5c5a9434eb"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/nextest-cpu-wrapper",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "nextest-cpu-wrapper",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/nextest_cpu_wrapper-cfd4bdebb672aca5",
+            "size": 7208936,
+            "mode": 33261,
+            "sha256": "0920402444908078148cba85bc30345b4b8d16131a21889273813b4b0c762862"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/strict-green-authority",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "strict-green-authority",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/strict_green_authority-b6cb8d38b99fcd6e",
+            "size": 96332488,
+            "mode": 33261,
+            "sha256": "3847c01bdb2d77872bc2e8608ae6125cdc2ad852c64fa845fb64423e26cec93f"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::bin/test-harness",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "test-harness",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/test_harness-2af3f7dc1bb971b1",
+            "size": 116828816,
+            "mode": 33261,
+            "sha256": "696a037c98196033be0184723d107e16687d761040ca1feb2c9945c8465175e2"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::cli_help",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "cli_help",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/cli_help-5a854f30a3e04ae4",
+            "size": 8052336,
+            "mode": 33261,
+            "sha256": "87afe75c16fb41587488a22fdbceb1482ea94ab66c8123097fabaf1acc0c4508"
+          }
+        },
+        {
+          "binary_id": "hermit-manifest-plan::plan_refuses_unknown_test_id",
+          "package_id": "path+file:///src/ci/manifest-plan#hermit-manifest-plan@0.2.0",
+          "binary_name": "plan_refuses_unknown_test_id",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/plan_refuses_unknown_test_id-9b26614ba073553f",
+            "size": 10284456,
+            "mode": 33261,
+            "sha256": "26c5a13f42b9f56438193ebbfa21b524a5ec9b660c2d68e54d38dc3101f0998e"
+          }
+        },
+        {
+          "binary_id": "hermit-resources",
+          "package_id": "path+file:///src/hermit-resources#0.2.0",
+          "binary_name": "hermit_resources",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_resources-cf7c9e382f289c25",
+            "size": 7450136,
+            "mode": 33261,
+            "sha256": "73b7bced15cbd1d372c71a9df4718c469e954bd9a9e424f1375ff6bc3f15763f"
+          }
+        },
+        {
+          "binary_id": "hermit-test-workdir",
+          "package_id": "path+file:///src/common/test-workdir#hermit-test-workdir@0.2.0",
+          "binary_name": "hermit_test_workdir",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_test_workdir-eff9a62eee6c0089",
+            "size": 7571912,
+            "mode": 33261,
+            "sha256": "51f59282dcddceea6ac97f5acf80042caf8be296b79b78f72618d3f3870ca24a"
+          }
+        },
+        {
+          "binary_id": "hermit-test-workdir::bin/workdir-control",
+          "package_id": "path+file:///src/common/test-workdir#hermit-test-workdir@0.2.0",
+          "binary_name": "workdir-control",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/workdir_control-c79b01385c86352b",
+            "size": 7208320,
+            "mode": 33261,
+            "sha256": "69e3842799f5f81d96f4dca0057e1bb3b30f1fd72e6b418a4728fef4fff4d283"
+          }
+        },
+        {
+          "binary_id": "hermit-verify::bin/hermit-verify",
+          "package_id": "path+file:///src/hermit-verify#0.2.0",
+          "binary_name": "hermit-verify",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_verify-3f429d1ec63ee40f",
+            "size": 123988456,
+            "mode": 33261,
+            "sha256": "61c9aa8db6f8ebc7899c3fc10edcb6ce3b79e3bc69964b7e133267e2cf307d52"
+          }
+        },
+        {
+          "binary_id": "hermit-verify::cli",
+          "package_id": "path+file:///src/hermit-verify#0.2.0",
+          "binary_name": "cli",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/cli-d5e12e00615e3e72",
+            "size": 7771848,
+            "mode": 33261,
+            "sha256": "843a8b6bb2e18a5541c2ffd8aff7e1b0f2531783787289410f1c8dea3e379912"
+          }
+        },
+        {
+          "binary_id": "test-allocator",
+          "package_id": "path+file:///src/common/test-allocator#0.2.0",
+          "binary_name": "test_allocator",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/test_allocator-4c4206cb56116cbc",
+            "size": 7855952,
+            "mode": 33261,
+            "sha256": "f63a5ec941d4b0550b81d647295a37f9354fe881220527aa6e9849669d2cd130"
+          }
+        },
+        {
+          "binary_id": "test-allocator::bin/test_bin",
+          "package_id": "path+file:///src/common/test-allocator#0.2.0",
+          "binary_name": "test_bin",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/test_bin-d842f40345a00e4c",
+            "size": 7287536,
+            "mode": 33261,
+            "sha256": "27a8de627528b3bc48b49a8bcd4011ff9f0a45426dfdda252d8feeed6869d266"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_sabre.rlib",
+          "size": 76290882,
+          "mode": 33188,
+          "sha256": "57c0e826226a696f21a0d0481b6796e9396443f402ee1cdb0b011160b7fde83c"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_sabre.so",
+          "size": 161632160,
+          "mode": 33261,
+          "sha256": "b6144c93c96e95a7dbc8aed7c6f34c30970aea16b6a306acf43c33be9bdca718"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-afba58a427044da1.rlib",
+          "size": 10046632,
+          "mode": 33188,
+          "sha256": "ac6ce6473f000879d3e42f23977f22f33e7a4f1b7a3fe1c05634ebb97bb4da70"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-afba58a427044da1.so",
+          "size": 49888232,
+          "mode": 33261,
+          "sha256": "ef4eca948920375e7852d0b7509efebfc06f02c5bc52ad6677c5dbbd15282b9b"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-e481968a4493a8a9.rlib",
+          "size": 10060854,
+          "mode": 33188,
+          "sha256": "8fc466e80b01989726d8b4dfa58e91cddd5bb472b0ee56591f4eb11c8294b51e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-e481968a4493a8a9.so",
+          "size": 54254984,
+          "mode": 33261,
+          "sha256": "7e457841cc24144596815f3590638c4b6b68a31c4bc8fc9cfe345114b7cad3df"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-8cc2a8d9cac3f09d.rlib",
+          "size": 934170,
+          "mode": 33188,
+          "sha256": "e1463277e7e5beb0ee3566a8ecd578220809806398cff62610cdaa6c84a6c04b"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-8cc2a8d9cac3f09d.so",
+          "size": 50626240,
+          "mode": 33261,
+          "sha256": "87796fdd0eaa3fd706d7c7a88d9cd1ca9aefe0d4f541cbece2e4f75f5297d7c4"
+        },
+        {
+          "path": "/src/target/debug/generate-test-footprints",
+          "size": 98193360,
+          "mode": 33261,
+          "sha256": "12aa7d773a08520b455e9177596c30d2891483dbf5ce8e3cc9dc0be5af6e699a"
+        },
+        {
+          "path": "/src/target/debug/generate-validation-dag",
+          "size": 97887072,
+          "mode": 33261,
+          "sha256": "7208ef81916e6515a16c0e1d0e70a3da29c739f74b7357cd747a32c13867bc11"
+        },
+        {
+          "path": "/src/target/debug/hermit-manifest-plan",
+          "size": 97992056,
+          "mode": 33261,
+          "sha256": "fe04f44f6e96ad4c9b5cbfd51a560c7c2c17e3d1c34569cb1b8623d9145bc77e"
+        },
+        {
+          "path": "/src/target/debug/hermit-verify",
+          "size": 125918464,
+          "mode": 33261,
+          "sha256": "68a19a6971f7da407c56f17fb2bd7c6da44513d016e14ffe84ad25843b90ef43"
+        },
+        {
+          "path": "/src/target/debug/manifest-metadata",
+          "size": 96368048,
+          "mode": 33261,
+          "sha256": "c5026946db4f72ad2eefaf93f7ce83d86d15a3a043c7a29d4880062fa51bc7d6"
+        },
+        {
+          "path": "/src/target/debug/nextest-cpu-wrapper",
+          "size": 95262608,
+          "mode": 33261,
+          "sha256": "6cdf0ee4dec2ed31b7e8a64ff9c9b63b3abd83fd8868c476e2b331351998e340"
+        },
+        {
+          "path": "/src/target/debug/strict-green-authority",
+          "size": 95016504,
+          "mode": 33261,
+          "sha256": "a80c530144842bdaa15a2d9a665659caccc9b99c91bc9d9aa1565379886591f2"
+        },
+        {
+          "path": "/src/target/debug/test-harness",
+          "size": 107984912,
+          "mode": 33261,
+          "sha256": "7820c70bd86e6e912efc505529c3905ce287a24f5d5fa2730172391469cebd44"
+        }
+      ]
+    },
+    "7128de1b196c9940c6c29f4437cf22759949728441a638156e53393ab653f22c": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "arbitrary_binaries"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/7128de1b196c9940c6c29f4437cf22759949728441a638156e53393ab653f22c.json",
+        "size": 2444,
+        "mode": 33188,
+        "sha256": "a1d9f2e00076933ca17f742231834106efa24613972c3ea4b528d456549f78d3"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::arbitrary_binaries",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "arbitrary_binaries",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/arbitrary_binaries-5bb1e29cdb631824",
+            "size": 8090320,
+            "mode": 33261,
+            "sha256": "c3b73516b41ff9bfafedcdb49140e5cf1b3f52e494e1daabe2fb54d34d7c8f99"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "89e1c3589d3d35dccd6d9fd114507419767d3d8e1c719f5bc8427cd35f01b22a": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "cli"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/89e1c3589d3d35dccd6d9fd114507419767d3d8e1c719f5bc8427cd35f01b22a.json",
+        "size": 2384,
+        "mode": 33188,
+        "sha256": "cacdf8a8f698a079da31f8b8f0d0c7d7db195945eb6062e2a576886c496b4817"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::cli",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "cli",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/cli-500938aae101cf8c",
+            "size": 304667728,
+            "mode": 33261,
+            "sha256": "f973078f2e41b5550cf44d61d812abb9a4ff860fe7493f6934be2e3611fb61b6"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "9a0a1081f109f890f392a6ebe8ee633ecb9b04bd8f677638e17138eec1a450c8": {
+      "build_args": [
+        "-p",
+        "hermit-detcore",
+        "--lib",
+        "--bins"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/9a0a1081f109f890f392a6ebe8ee633ecb9b04bd8f677638e17138eec1a450c8.json",
+        "size": 1070,
+        "mode": 33188,
+        "sha256": "635e50b970c5246a5742bc4c6477e4b13d2f4044cd46a6d32cc519c2a06b4192"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit-detcore",
+          "package_id": "path+file:///src/detcore#hermit-detcore@0.2.0",
+          "binary_name": "detcore",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/detcore-db748d9e7b24d0f7",
+            "size": 162253144,
+            "mode": 33261,
+            "sha256": "da2a188ed478dbd15232ad4dd8ae420ed7a76432283abd9e15f992c92951f65d"
+          }
+        },
+        {
+          "binary_id": "hermit-detcore::bin/syscaller",
+          "package_id": "path+file:///src/detcore#hermit-detcore@0.2.0",
+          "binary_name": "syscaller",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/syscaller-5df3d5bf2de6c786",
+            "size": 7208088,
+            "mode": 33261,
+            "sha256": "8221c6213d46b328c09e97c7c4eb0531aa06b4760480d954ffd9c1743ac90028"
+          }
+        }
+      ],
+      "runtime_files": []
+    },
+    "b2bfbb20750d8841639225543ef11f4a67c9b70bf0ca6cac1be962d75e3c45e7": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--lib",
+        "--bins"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/b2bfbb20750d8841639225543ef11f4a67c9b70bf0ca6cac1be962d75e3c45e7.json",
+        "size": 2953,
+        "mode": 33188,
+        "sha256": "967a26fca6d82149a19184f7835aea57ad6508e307cda17c3bf57d357b2b1440"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "hermit",
+          "kind": "lib",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit-a792dab5152216dc",
+            "size": 359764016,
+            "mode": 33261,
+            "sha256": "0e30181b3d550cb6424ec1ca236698d0df4bc644723a163debb7e32a674a61cd"
+          }
+        },
+        {
+          "binary_id": "hermit::bin/hermit",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "hermit",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit-1322a24680801299",
+            "size": 412645592,
+            "mode": 33261,
+            "sha256": "41c0db01ebda2a4b47e5102f14cb3de87221fa1f2d24bed6954e98f9c22cc0dd"
+          }
+        },
+        {
+          "binary_id": "hermit::bin/hermit-dap",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "hermit-dap",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_dap-013e61ed699cb36b",
+            "size": 9373944,
+            "mode": 33261,
+            "sha256": "9aa21917d3f3c0e3873f8cccc49542135456ca673c2a5b5ddd2eb119cf545d41"
+          }
+        },
+        {
+          "binary_id": "hermit::bin/verification-report",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "verification-report",
+          "kind": "bin",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/verification_report-da8f04844916d655",
+            "size": 198505000,
+            "mode": 33261,
+            "sha256": "93f71ee6464672949243580c965d98a4f1d978872c20330ec28050931fa9af5a"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        }
+      ]
+    },
+    "d507c72de3714b8d04117ebf17a8785568162eba8ec2d4715604f9940037ff81": {
+      "build_args": [
+        "-p",
+        "hermit-detcore",
+        "--test",
+        "tests_parallelism"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/d507c72de3714b8d04117ebf17a8785568162eba8ec2d4715604f9940037ff81.json",
+        "size": 971,
+        "mode": 33188,
+        "sha256": "e30364f7face16d2692c535ed339c04a80de99979580fede62401429759d1511"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit-detcore::tests_parallelism",
+          "package_id": "path+file:///src/detcore#hermit-detcore@0.2.0",
+          "binary_name": "tests_parallelism",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/tests_parallelism-b097683988205d32",
+            "size": 220789264,
+            "mode": 33261,
+            "sha256": "225ee2c5bce74a7950947a792eb06421b9d7fbc5e36f1899271d591d9aef6da6"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/syscaller",
+          "size": 4631888,
+          "mode": 33261,
+          "sha256": "536ba6102e1351e080b495f815cb275870a47296a6bdd03d7ce660fad0679e65"
+        }
+      ]
+    },
+    "e6313151daddab52c9f633140435a70ffc0159db812f23f882e4756019a81db1": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "liteinst_advanced"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/e6313151daddab52c9f633140435a70ffc0159db812f23f882e4756019a81db1.json",
+        "size": 2440,
+        "mode": 33188,
+        "sha256": "521942004073baf08945785b1ff10bc9cee5e7ebd75a62c253dc7011b621c43e"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::liteinst_advanced",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "liteinst_advanced",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/liteinst_advanced-804fdd1d82727877",
+            "size": 132037664,
+            "mode": 33261,
+            "sha256": "055469be5a1bd538c920939b47052caa94e9557238416f45e2374c2c260bf183"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    },
+    "eea3b0a098452bd73f604a8f5fcf4d80636888eae062559f4c8ed5bdcbe8d0a3": {
+      "build_args": [
+        "-p",
+        "hermit",
+        "--features",
+        "third-party-backends",
+        "--test",
+        "hermit_modes"
+      ],
+      "metadata": {
+        "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/eea3b0a098452bd73f604a8f5fcf4d80636888eae062559f4c8ed5bdcbe8d0a3.json",
+        "size": 2420,
+        "mode": 33188,
+        "sha256": "84e5a99fb3f1bdc66cbec55a1d39ffba575971455d9d4e27d9a2b028eec4c336"
+      },
+      "binaries": [
+        {
+          "binary_id": "hermit::hermit_modes",
+          "package_id": "path+file:///src/hermit-cli#hermit@0.2.0",
+          "binary_name": "hermit_modes",
+          "kind": "test",
+          "build_platform": "target",
+          "executable": {
+            "path": "/src/target/debug/deps/hermit_modes-1c57ead3e324978e",
+            "size": 301853056,
+            "mode": 33261,
+            "sha256": "b5c689e36f8ebd55a48796d8cc9c8a04a80e0c9a630d942934a21388bde1a9f3"
+          }
+        }
+      ],
+      "runtime_files": [
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.rlib",
+          "size": 64197046,
+          "mode": 33188,
+          "sha256": "c31f3935cc33c18f6af24631f68ecc44e0f205642483880086f5d9d35a7630cf"
+        },
+        {
+          "path": "/src/target/debug/deps/libdetcore_dbt.so",
+          "size": 161689744,
+          "mode": 33261,
+          "sha256": "0ed2a1d4c3240218dd463ad9663585eccf6ab0eee667fefa547704d0973b2052"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.rlib",
+          "size": 305643334,
+          "mode": 33188,
+          "sha256": "aeacf93af23de82a667feeb24a801e7febb0101ce730d8ded8762c41c19b4d09"
+        },
+        {
+          "path": "/src/target/debug/deps/libhermit.so",
+          "size": 325016688,
+          "mode": 33261,
+          "sha256": "f6b1c62722d33a1bbb7f8be85456d3c74421636a2d1b17e4133f5916dbf02a7c"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.rlib",
+          "size": 10053526,
+          "mode": 33188,
+          "sha256": "7b71a9ae5d0bded2e5dbfa8d2f7bc243de0e48434ae7b951060c855042b80003"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_dbt-0b0c13ac5384000e.so",
+          "size": 54247520,
+          "mode": 33261,
+          "sha256": "6d2ec44284c5313d796322a8f281657237ee4d60642ae4966dca71d3167fbd87"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.rlib",
+          "size": 79434474,
+          "mode": 33188,
+          "sha256": "437391c42147d347aca4eeb4af1cda098933925326a541312a59861d4da7bd1e"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_liteinst-0bbd67b3ed4d9d59.so",
+          "size": 131474104,
+          "mode": 33261,
+          "sha256": "3230492e979d8fb25fd85953ce37c12e3c87ffc13c3eece85705324ff6054c38"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.rlib",
+          "size": 935124,
+          "mode": 33188,
+          "sha256": "4d9e583f9bfc6676944590c888de5cf8410ea48e5dd77854f330d3e15016d2e9"
+        },
+        {
+          "path": "/src/target/debug/deps/libreverie_preload-1cd28bc4caa27bad.so",
+          "size": 50623136,
+          "mode": 33261,
+          "sha256": "9041cf7a5605e0d6ff3566cbe405f9c0418a07ff20ec14015e327e22e7253722"
+        },
+        {
+          "path": "/src/target/debug/hermit",
+          "size": 399847664,
+          "mode": 33261,
+          "sha256": "80372bfaafb459190e63a89d49f1247e3419e905af99ab0294a33e316868eb92"
+        },
+        {
+          "path": "/src/target/debug/hermit-dap",
+          "size": 7110976,
+          "mode": 33261,
+          "sha256": "bba3da1175b36a41b7c3b0f2a8c1c7640d6bfd1c16b0f61fa546c2d7e16eefb4"
+        },
+        {
+          "path": "/src/target/debug/verification-report",
+          "size": 298010784,
+          "mode": 33261,
+          "sha256": "969fdf6d8b7b4075c31c9546476eee664be440de78745272f7bd77b6959bdac0"
+        }
+      ]
+    }
+  },
+  "guests": [
+    {
+      "path": "/src/target/debug/rustbin_bind_connect_race",
+      "size": 8269408,
+      "mode": 33261,
+      "sha256": "d90b0443231158fb6a4752c8f68d93433a12e2207a4c2cf36e227d61c74f221e"
+    },
+    {
+      "path": "/src/target/debug/rustbin_clock_gettime",
+      "size": 7085456,
+      "mode": 33261,
+      "sha256": "4fbfae44e61abd84026c783e6278941c94c33e1740aead2056e406b5be358794"
+    },
+    {
+      "path": "/src/target/debug/rustbin_clock_total_order",
+      "size": 7415920,
+      "mode": 33261,
+      "sha256": "bde4430fa69a7e70248f9b682c5d78a90925b4466865938e7f3c8412b78ef63f"
+    },
+    {
+      "path": "/src/target/debug/rustbin_exit_group",
+      "size": 4855744,
+      "mode": 33261,
+      "sha256": "a6f716dcf413f486212f31a274de533f2f979be5f755e1fd4f12d047bb72b3a0"
+    },
+    {
+      "path": "/src/target/debug/rustbin_futex_and_print",
+      "size": 4889744,
+      "mode": 33261,
+      "sha256": "2058a95027ac8dda750e867d976dcba86cddb7e92f0ba441f2548f1b58dd6c2e"
+    },
+    {
+      "path": "/src/target/debug/rustbin_futex_timeout",
+      "size": 7039608,
+      "mode": 33261,
+      "sha256": "ca6224d6e5773131d128650aa8e65fd151e3cd6132d275af8f8e4b96975d9abd"
+    },
+    {
+      "path": "/src/target/debug/rustbin_futex_wait_child",
+      "size": 4872616,
+      "mode": 33261,
+      "sha256": "dd36806bdbcab3148f19cf106c0deb6507519d92b06dfe303bb407eefd2d8c3e"
+    },
+    {
+      "path": "/src/target/debug/rustbin_futex_wake_some",
+      "size": 7341728,
+      "mode": 33261,
+      "sha256": "22a9b7eca6da64af9a7e19e8eb4e50a663e3d72ff3b4b533294375a7a38bfa07"
+    },
+    {
+      "path": "/src/target/debug/rustbin_interrogate_tty",
+      "size": 7170272,
+      "mode": 33261,
+      "sha256": "b1c5d40dde013d3b5753c70adc6769d491dbddf09aea1d19e4fd3784b026a6f7"
+    },
+    {
+      "path": "/src/target/debug/rustbin_nanosleep",
+      "size": 4542304,
+      "mode": 33261,
+      "sha256": "4b1d46abfaa39e5272bc4f1c95c48b008d3d44954bfcb5cc1100c81790da2f15"
+    },
+    {
+      "path": "/src/target/debug/rustbin_network_hello_world",
+      "size": 8471704,
+      "mode": 33261,
+      "sha256": "0b617a1b196875dd4e51b004f87bdfd88b2745ee66d5125950350354c6ad26bf"
+    },
+    {
+      "path": "/src/target/debug/rustbin_pipe_basics",
+      "size": 7373624,
+      "mode": 33261,
+      "sha256": "2b099fe3ca2d10bf3ab6a47a483f929d8a2b4ea22b0df69c332f61974350abf6"
+    },
+    {
+      "path": "/src/target/debug/rustbin_poll",
+      "size": 9551536,
+      "mode": 33261,
+      "sha256": "5e50bcbb2a0a9cea4d28941d9d4d89d3b5149403dd4005c5664420a59bbc9d21"
+    },
+    {
+      "path": "/src/target/debug/rustbin_poll_spin",
+      "size": 7406552,
+      "mode": 33261,
+      "sha256": "950b4ad4947750ec02d1154357c78fd35aade61b9249490a8f674ec1e000b957"
+    },
+    {
+      "path": "/src/target/debug/rustbin_print_clock_nanosleep_monotonic_abs_race",
+      "size": 4971872,
+      "mode": 33261,
+      "sha256": "9f14c679051e074520166b4ed8185ca491909d9ce5f2fa78a8088378d3335b7d"
+    },
+    {
+      "path": "/src/target/debug/rustbin_print_clock_nanosleep_monotonic_race",
+      "size": 4968552,
+      "mode": 33261,
+      "sha256": "256c99e84b93f8d44beeb54183c92cdf5ebcc229891d5d566ee38f56645776df"
+    },
+    {
+      "path": "/src/target/debug/rustbin_print_clock_nanosleep_realtime_abs_race",
+      "size": 4971200,
+      "mode": 33261,
+      "sha256": "38f3c1c899230249b869d6e78b54a3ab52c889101b5217eeb74016d71ed5b68d"
+    },
+    {
+      "path": "/src/target/debug/rustbin_print_nanosleep_race",
+      "size": 4951808,
+      "mode": 33261,
+      "sha256": "2bf07fa4be0a2db677ce4ad8b504d171b4ef1476881223fc952347ec1ff78115"
+    },
+    {
+      "path": "/src/target/debug/rustbin_sched_yield",
+      "size": 4861240,
+      "mode": 33261,
+      "sha256": "9d8a096d04da4d289ad445e809f2d5960fc742f9aafd16bd1033e61ad0e8df51"
+    },
+    {
+      "path": "/src/target/debug/rustbin_socketpair",
+      "size": 7088496,
+      "mode": 33261,
+      "sha256": "b1c8e3b501e6142d677f0bc3926307887bcd4cc52a07e05dc8a2789384123549"
+    },
+    {
+      "path": "/src/target/debug/rustbin_thread_random",
+      "size": 5179144,
+      "mode": 33261,
+      "sha256": "21b3265b75eb1b8ff0e6f4af091bdea7367034d1be159ba8f90b8db714cc7200"
+    }
+  ],
+  "cpu_wrapper": {
+    "metadata": {
+      "path": "/src/target/ci/nextest-binaries/generation-36692-1789602673458279752/cpu-wrapper.jsonl",
+      "size": 83952,
+      "mode": 33188,
+      "sha256": "3106f029f5403dc9fa06a490b845c0e0df8921c908b44cd4b6a1f48afc28c03d"
+    },
+    "executable": {
+      "path": "/src/target/debug/nextest-cpu-wrapper",
+      "size": 95262608,
+      "mode": 33261,
+      "sha256": "6cdf0ee4dec2ed31b7e8a64ff9c9b63b3abd83fd8868c476e2b331351998e340"
+    }
+  }
+}

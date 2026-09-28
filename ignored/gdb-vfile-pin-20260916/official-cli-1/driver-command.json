@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "with-proxy",
+    "./scripts/validate.rs",
+    "full",
+    "--allow-local-off-the-record-run",
+    "--selected",
+    "test.cli",
+    "-j",
+    "1",
+    "--no-label-pr",
+    "--verbose",
+    "--run-timeout",
+    "11400"
+  ],
+  "cwd": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916",
+  "node_wall_sum": 9600,
+  "whole_run_seconds": 11400,
+  "bootstrap_scope_seconds": 13200,
+  "actual_driver_policy": "ordinary authenticated shared dagrun scope,90%-MemAvailable cap, original per-node budgets; no bootstrap CPU/tasks inheritance claim",
+  "canonical_validation_receipt": false
+}

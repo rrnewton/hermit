@@ -1,0 +1,18 @@
+{
+  "sha256": "d079649b74ab74668a334c5739a911ce63b0bcd3ff34e0b8433232e943f8170e",
+  "bytes": 1112,
+  "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/HANDOFF.md",
+  "same_inode_mtime": true,
+  "ctime_changed_by_rename": true,
+  "status": {
+    "argv": [
+      "git",
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all"
+    ],
+    "exit": 0,
+    "stdout": "?? HANDOFF.md\n",
+    "stderr": ""
+  }
+}

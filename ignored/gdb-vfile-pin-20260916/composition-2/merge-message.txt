@@ -1,0 +1,12 @@
+Compose current main with the verified Reverie pin
+
+[hermit2, degraded-unresolved, gpt-6-astra, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Bring already-landed current-main E2E qualification and pressure-test changes into the Reverie protocol pin branch without changing its twelve-file pin patch. All eleven incoming files are byte-identical to main fe410817. The existing CLI source, exact twelve-node closure, image, selectors, assertions and limits are unchanged. The native build-budget carry still uses identical recipe inputs and unchanged numerical bounds; it is not a new timing measurement.
+
+The prior pin head 932f7130 passed all twelve official selected nodes and all 78 CLI tests, including the replay-stage SIGKILL classification regression. The unchanged 113-identity inventory has 34 skipped matches and one existing ignored case. That result remains bound to 932f7130: this later composition has not run another guest selection and does not claim a full-main receipt. Normal commit hooks run on this composition.
+
+Upstream protocol repair: https://github.com/rrnewton/reverie/pull/559
+Task: vision-ci-signal-is-trustworthy-end-to-end

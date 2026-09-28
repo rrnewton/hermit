@@ -1,0 +1,6 @@
+{
+  "pid": 1360898,
+  "start": "175880662",
+  "cgroup": "/sys/fs/cgroup/user.slice/user-212630.slice/user@212630.service/app.slice/hermit-gdb-vfile-pin-update-1-20260916.scope",
+  "inode": 38024424
+}

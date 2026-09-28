@@ -1,0 +1,64 @@
+{
+  "utc": "2026-09-16T23:09:01.995980+00:00",
+  "actual_exit": 2,
+  "cgroup_absent": true,
+  "original_pid_generation_absent": true,
+  "exact_updater_delta": {
+    "Cargo.lock": {
+      "old_sha256": "a63dfeba0309571d628186eee273aa9561cd1d75dc9758f93a77908bc6f5f42b",
+      "new_sha256": "c68351cb54743131c8182c0e7a7d2a245c18862f7d4a19fa27579be29509905f",
+      "occurrences": 34
+    },
+    "ci/configure-build-jobs.sh": {
+      "old_sha256": "8873074202cc95bf1292130d879cdd648f464868468558c3d859f8066f87f5a3",
+      "new_sha256": "ff9460a1424f36f37ce0f62af2d3832a1a6ee7ce910a035491a560ae8cde9721",
+      "occurrences": 2
+    },
+    "detcore-dbt/Cargo.toml": {
+      "old_sha256": "0609911c244d5c2c54602fb3547809a6bf18b6b5e4f1ffe806e191044414512f",
+      "new_sha256": "a271dfe56f907979373f37b5aa0e4e1add5bf41aed01003412e9f0c04d7223b8",
+      "occurrences": 2
+    },
+    "detcore-model/Cargo.toml": {
+      "old_sha256": "db4a1232af7e31817477d31ef64316395fc608966a2b8a3076a34598165f6b60",
+      "new_sha256": "9904a8939559c64486142650504a817bb9a8b6fa935bd38c9a54282f21858665",
+      "occurrences": 1
+    },
+    "detcore-sabre/Cargo.toml": {
+      "old_sha256": "de7a13fac51ddadcf8abf61695ac7cedc5bdaf5aaf99108aa53a4a09719267e1",
+      "new_sha256": "0aa7bc7d86904ec5324f4737a9a03f218a816ef82b2585313971c8a795a34678",
+      "occurrences": 5
+    },
+    "detcore/Cargo.toml": {
+      "old_sha256": "d8f6a595ce0cd9159da8ad8a8c0f34a67d8beeff54dd5bc6b546ef659259f7c2",
+      "new_sha256": "018a78631a7480d5d3385b377acdfe780f8e0d559ec91fb86f2428b186d377e1",
+      "occurrences": 2
+    },
+    "detcore/tests/testutils/Cargo.toml": {
+      "old_sha256": "5c088caedc28b8ed7e074d93c0a40246349be8904e90d8a73316c5c5fd332f9d",
+      "new_sha256": "a28d25a48b920d7d76bf8f1bf87c700642e0a917bdf7f0314034fcd4d8c3c26b",
+      "occurrences": 2
+    },
+    "hermit-cli/Cargo.toml": {
+      "old_sha256": "dc3b614017abda826f61c11d17dc8db68423bb2d020c6df9f1a2d8fc0c61f448",
+      "new_sha256": "97a5563b76e4bad30774e866c92137d7d3cf6ed4d718779ee0409b1a91759a01",
+      "occurrences": 6
+    },
+    "hermit-install/Cargo.toml": {
+      "old_sha256": "226d3796ef6a0f04309eb34475d8d9b5c49d2a61711888e6dd61d31b640946ce",
+      "new_sha256": "490649bbc5238b01dfa23c4f1e585f90206e6c86ed52b59e2e45ed4438069a73",
+      "occurrences": 1
+    },
+    "liteinst-runtime-build/Cargo.lock": {
+      "old_sha256": "e55bbc626f68f38e159794336693b041e1e6e16b42e26088f5138800e3f02155",
+      "new_sha256": "bad5be55e95b10f3bdfe47e9ceb781bfd5060b8585dce8cbf91b743807009f3c",
+      "occurrences": 18
+    },
+    "liteinst-runtime-build/runtime/Cargo.toml": {
+      "old_sha256": "c874750b813d062aa6cc903596ab93d0cf8607136c1a3225a59eafd76c11d359",
+      "new_sha256": "3cd7f86635b48b59e4ef4e085d1f7e31b7c3331951d0f58bb6679233995ba133",
+      "occurrences": 1
+    }
+  },
+  "selected_pin": "d87a03a312421d34dee81dae71aa395b40231e63"
+}

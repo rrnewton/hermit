@@ -1,0 +1,3 @@
+who-am-i: fields: team, agent, model, machine, role
+who-am-i: DEGRADED: identity resolver returned UNRESOLVED
+who-am-i: NEXT: run with --diagnostics to see the missing or conflicting signals. If --pid was supplied, pass a live agent PID or omit --pid to inspect the caller.

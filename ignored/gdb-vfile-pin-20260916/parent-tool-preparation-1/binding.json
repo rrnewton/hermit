@@ -1,0 +1,25 @@
+{
+  "pid": 3640282,
+  "generation": 176005213,
+  "cgroup": "/sys/fs/cgroup/user.slice/user-212630.slice/user@212630.service/app.slice/hermit-gdb-vfile-pin-parent-prep-1-20260916.scope",
+  "inode": 38061410,
+  "resources_before": {
+    "memory.max": "8589934592\n",
+    "memory.peak": "217202688\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0\n",
+    "memory.swap.max": "0\n",
+    "pids.max": "1024\n",
+    "pids.peak": "24\n",
+    "pids.events": "max 0\n",
+    "cpu.max": "400000 100000\n",
+    "cpu.stat": "usage_usec 646580\nuser_usec 241413\nsystem_usec 405167\nnice_usec 0\nnr_periods 4\nnr_throttled 0\nthrottled_usec 0\nnr_bursts 0\nburst_usec 0\n"
+  },
+  "parent_tool": "/home/newton/work/dev-hermit/ci-hub/ci-hub",
+  "environment_updates": {
+    "XDG_CACHE_HOME": "/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache",
+    "CARGO_HOME": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo",
+    "CARGO_HTTP_CAINFO": "/etc/pki/tls/certs/fb_certs.pem",
+    "CARGO_BUILD_JOBS": "4"
+  },
+  "borrowed_live_cache": false
+}

@@ -1,0 +1,54 @@
+Typed front door for dev-hermit validation, GH Actions, and runner operations
+
+Usage: ci-hub <COMMAND>
+
+START HERE
+  Begin with fleet-wide truth and ownership before narrowing the question.
+  quickstart              Print the opinionated five-step agent workflow
+  health                  Combine current-main, open-PR, and ownership diagnostics
+  active-work             Reconcile tasks, owners, and live ORC agents
+
+READ-ONLY STATUS AND HISTORY
+  Inspect current and retained state without changing product source, labels, or queues.
+  main-health             Query current main-branch GitHub workflow health
+  pr-status               Pull fresh open-PR GitHub status [alias: fresh]
+  runner-health           Summarize self-hosted runners and recent workflows
+  load-probe              Measure current CPU and memory pressure
+  validate-status         List recent runs, the Hermit commit timeline, or one SHA/PR
+  signal-crosscheck       Reconcile every retained CI signal for one Hermit SHA
+  local-history           List recent local validation runs [default: 10]
+  newest-green            Find the newest ledger-qualified green commit [default: --branch main]
+  first-bad               Find a retained PASS -> FAIL transition for a cell or gate
+  hosted-status           Check the registered exact-head GH Actions result
+  receipt-digest          Recompute a HistoryRow's canonical exact-row digest
+  history                 Query the retained GitHub Actions timeline
+  green-time              Estimate carried-forward green/red time and densification gaps
+  verify-landing          Verify a PR replay SHA or commit SHA on a fetched target
+
+VALIDATION ACTIONS
+  Start, stop, admit, or persist validation work.
+  validate-run            Launch detached validation through ci-hub admission
+  validate-stop           Stop detached validate-* user units and verify termination
+  correct-owner-watch-handles
+                          Correct proven pre-service owner-watch refusals (dry-run by default)
+  validate-lock           6 validation slots; benchmarks reserve every slot (GRANT/QUEUE/REFUSE)
+  ledger                  Read or update canonical validate-ledger views
+  refresh-history         Ingest fresh GitHub and local history into the local store
+
+LANDING AND COORDINATION ACTIONS
+  Mutate landing, review, GitHub, batch, or scheduled operational state.
+  tick                    Run due scheduled operational-health gates
+  land-lock               Acquire, renew, inspect, or release the fleet landing mutex
+  apply-local-label       Reconcile the derived label with exact-head validation truth
+  publish-commit-status   Publish a qualifying local receipt on its exact commit
+  review-attest           Verify an exact-head review comment and reconcile cache labels
+  ci-mode                 Inspect or change constrained GH Actions admission mode
+  batch                   Inspect or edit the named current GH Actions batch
+  ci-timeout              Cancel hosted runs starved waiting to start; reroute to local
+
+Run `ci-hub <COMMAND> --help` for exhaustive flags and `ci-hub quickstart` for
+the short operational workflow.
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

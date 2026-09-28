@@ -1,0 +1,86 @@
+[
+  {
+    "path": "Cargo.lock",
+    "old_occurrences": 34,
+    "new_occurrences": 34,
+    "sha256": "c68351cb54743131c8182c0e7a7d2a245c18862f7d4a19fa27579be29509905f",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "ci/configure-build-jobs.sh",
+    "old_occurrences": 2,
+    "new_occurrences": 2,
+    "sha256": "be954a4a4a9b5355b3445b257a6f51388c25d4061149226144b0083d40ec91b0",
+    "only_sha_substitution": false
+  },
+  {
+    "path": "ci/run-with-reverie-dbt-budget.sh",
+    "old_occurrences": 1,
+    "new_occurrences": 1,
+    "sha256": "3f8df4e6f308c8cc44c1f27feee69a7313a185afb6cb31834b5c92366a529a87",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "detcore-dbt/Cargo.toml",
+    "old_occurrences": 2,
+    "new_occurrences": 2,
+    "sha256": "a271dfe56f907979373f37b5aa0e4e1add5bf41aed01003412e9f0c04d7223b8",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "detcore-model/Cargo.toml",
+    "old_occurrences": 1,
+    "new_occurrences": 1,
+    "sha256": "9904a8939559c64486142650504a817bb9a8b6fa935bd38c9a54282f21858665",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "detcore-sabre/Cargo.toml",
+    "old_occurrences": 5,
+    "new_occurrences": 5,
+    "sha256": "0aa7bc7d86904ec5324f4737a9a03f218a816ef82b2585313971c8a795a34678",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "detcore/Cargo.toml",
+    "old_occurrences": 2,
+    "new_occurrences": 2,
+    "sha256": "018a78631a7480d5d3385b377acdfe780f8e0d559ec91fb86f2428b186d377e1",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "detcore/tests/testutils/Cargo.toml",
+    "old_occurrences": 2,
+    "new_occurrences": 2,
+    "sha256": "a28d25a48b920d7d76bf8f1bf87c700642e0a917bdf7f0314034fcd4d8c3c26b",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "hermit-cli/Cargo.toml",
+    "old_occurrences": 6,
+    "new_occurrences": 6,
+    "sha256": "97a5563b76e4bad30774e866c92137d7d3cf6ed4d718779ee0409b1a91759a01",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "hermit-install/Cargo.toml",
+    "old_occurrences": 1,
+    "new_occurrences": 1,
+    "sha256": "490649bbc5238b01dfa23c4f1e585f90206e6c86ed52b59e2e45ed4438069a73",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "liteinst-runtime-build/Cargo.lock",
+    "old_occurrences": 18,
+    "new_occurrences": 18,
+    "sha256": "bad5be55e95b10f3bdfe47e9ceb781bfd5060b8585dce8cbf91b743807009f3c",
+    "only_sha_substitution": true
+  },
+  {
+    "path": "liteinst-runtime-build/runtime/Cargo.toml",
+    "old_occurrences": 1,
+    "new_occurrences": 1,
+    "sha256": "3cd7f86635b48b59e4ef4e085d1f7e31b7c3331951d0f58bb6679233995ba133",
+    "only_sha_substitution": true
+  }
+]

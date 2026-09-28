@@ -1,0 +1,44 @@
+{
+  "output": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1",
+  "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916",
+  "base": null,
+  "head": null,
+  "tree": null,
+  "source_binding": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1-controller/FROZEN-RUN-SOURCE.json",
+  "host_cache": "/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache",
+  "driver_arguments": [
+    "full",
+    "--allow-local-off-the-record-run",
+    "--selected",
+    "test.cli",
+    "-j",
+    "1",
+    "--no-label-pr",
+    "--verbose",
+    "--run-timeout",
+    "11400"
+  ],
+  "run_id": null,
+  "bootstrap_unit": null,
+  "observer_unit": null,
+  "observer_seconds": 13080,
+  "expected_nodes": [
+    "build.e2e_artifact_in_pinned_root",
+    "build.liteinst_runtime_release_in_pinned_root",
+    "build.runtime_release_in_pinned_root",
+    "build.rust_scripts",
+    "build.rust_scripts_in_pinned_root",
+    "build.workspace_in_pinned_root",
+    "gate.manifest",
+    "pre.reverie_pin",
+    "pre.submodules",
+    "setup.manifest_plan",
+    "setup.pinned_root_fetch",
+    "test.cli"
+  ],
+  "expected_tests": {
+    "test.cli": 78
+  },
+  "node_wall_sum": 9600,
+  "actual_policy": "ordinary authenticated sibling Dagrun aggregate with90%-MemAvailable bound; bootstrap4CPU/8GiB/1024 does not constrain sibling; all product node budgets unchanged"
+}

@@ -1,0 +1,100 @@
+Scope: scanned 18 tracked Cargo.toml and 3 tracked Cargo.lock files; 10 files contain 46 Reverie revision entries.
+Scope exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included.
+Pin read from checkout HEAD 4e7c0636ff105f333d81fa6560069a267e8d60a8.
+    Updating crates.io index
+    Updating git repository `https://github.com/rrnewton/reverie.git`
+    Updating git repository `https://github.com/rrnewton/liteinst2`
+     Locking 17 packages to highest compatible versions
+    Removing nostd-print v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding nostd-print v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-core v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-core v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-dbt v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-dbt v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-kvm v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-kvm v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-liteinst v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-liteinst v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-preload v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-preload v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-process v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-process v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-ptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-ptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-rpc v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-rpc v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-rpc-macros v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-rpc-macros v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-rpc-transport v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-rpc-transport v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-sabre v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-sabre v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-sabre-macros v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-sabre-macros v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-sabre-stats v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-sabre-stats v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing safeptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding safeptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+note: pass `--verbose` to see 65 unchanged dependencies behind latest
+    Updating git repository `https://github.com/rrnewton/reverie.git`
+    Updating crates.io index
+    Updating git repository `https://github.com/rrnewton/liteinst2`
+     Locking 9 packages to highest Rust 1.100.0-nightly compatible versions
+    Removing reverie-core v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-core v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-liteinst v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-liteinst v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-memory v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-preload v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-preload v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-process v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-process v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-ptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-ptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-rpc-transport v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-rpc-transport v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding reverie-syscalls v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+    Removing safeptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e#a158914e)
+      Adding safeptrace v0.2.0 (https://github.com/rrnewton/reverie.git?rev=d87a03a312421d34dee81dae71aa395b40231e63#d87a03a3)
+note: pass `--verbose` to see 36 unchanged dependencies behind latest
+======================================================================
+REVERIE PIN LINT: CHECKER ERROR - BLOCKED
+======================================================================
+
+======================================================================
+REVERIE PIN: DBT BUILD-BUDGET CALIBRATION DECISION REQUIRED
+======================================================================
+Cargo metadata and every derived CI site now name d87a03a312421d34dee81dae71aa395b40231e63.
+ci/run-with-reverie-dbt-budget.sh still names a158914eceeca02a9ab4c7dd4e9916926d5e5c1e, and this tool will not
+change it for you: that line asserts a MEASURED build clamp and
+threshold still apply, which is a judgement, not a lookup.
+
+Decide whether the budget carries. It governs one quantity: the elapsed
+time reverie-dbt/build.rs reports for a DynamoRIO content-key miss,
+hashed over {reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs,
+$CMAKE, $CMAKE_GENERATOR}. In a Reverie checkout:
+
+  git -C <reverie> diff a158914eceeca02a9ab4c7dd4e9916926d5e5c1e:reverie-dbt/build.rs \
+      d87a03a312421d34dee81dae71aa395b40231e63:reverie-dbt/build.rs
+  git -C <reverie> rev-parse a158914eceeca02a9ab4c7dd4e9916926d5e5c1e:reverie-dbt/vendor/dynamorio \
+      d87a03a312421d34dee81dae71aa395b40231e63:reverie-dbt/vendor/dynamorio
+
+Changed bytes do NOT by themselves mean recalibration: judge whether the
+diff can affect build TIME. A pure rename cannot. Note the DBI->DBT
+rename also MOVED these paths, so a query at an older revision can
+return nothing rather than a difference -- absent is not unchanged.
+
+If it carries: set expected_pin=d87a03a312421d34dee81dae71aa395b40231e63 in ci/run-with-reverie-dbt-budget.sh and
+append a `CARRY TO` block to ci/configure-build-jobs.sh stating the
+evidence. If it does not: recalibrate and record the measurement.
+Then re-run this checker; it will report the tree policy-compliant.
+
+Nothing above needs redoing -- the Cargo sites and the derived CI sites
+are already written.
+

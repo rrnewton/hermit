@@ -1,0 +1,120 @@
+{
+  "created_ns": 1789603595813001469,
+  "files": [
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/00-FULL.log",
+      "bytes": 436821,
+      "sha256": "ba6ddb9159110f30aac192ec384acf41e6bc80997b833a3526e2895818246719"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/01-launcher-result.json",
+      "bytes": 219,
+      "sha256": "1d72e18f8a9f8c8ccb34224d5265229e618ed6c34ff1568b3445e441dada2eb4"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/02-test.cli.log",
+      "bytes": 9980,
+      "sha256": "702f1c6a4ce300795ee3ec58b47ea9eb48e29e10065755b53d3717dd9c74713c"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/03-journal.jsonl",
+      "bytes": 20407,
+      "sha256": "ba24fe05755a203c3feb0d7a0e92da0fc534f4529e19da329d7fc67d02b090bd"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/04-binding.json",
+      "bytes": 2602,
+      "sha256": "57a587d9e63bcafe22a30292a8e4703c592b4fb35c342895044dd42150451a88"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/05-result.json",
+      "bytes": 776,
+      "sha256": "aad3fb18d72e5d470a3996ab453dde618ba3961806ad86dded63b6e9d6ddcb88"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/06-observations.jsonl",
+      "bytes": 5334747,
+      "sha256": "7b6e7f3f26a576824032829a5debea34372f6d6de099ec4051d0726b203eaa6a"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/07-.dagrun-test-counts-108548-0-108548:11:1789603068578473387:test.cli.json.cpu.json",
+      "bytes": 35155,
+      "sha256": "c05e3cba04a86052b6420ffb6027f912cb5b415d8142ee24bef5e623454b090c"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/08-current.json",
+      "bytes": 103737,
+      "sha256": "ab37b42ec6d21e305820d6e9f2cb69724f5d135b70808f940d69cc3678e0e422"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/09-89e1c3589d3d35dccd6d9fd114507419767d3d8e1c719f5bc8427cd35f01b22a.json",
+      "bytes": 2384,
+      "sha256": "cacdf8a8f698a079da31f8b8f0d0c7d7db195945eb6062e2a576886c496b4817"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/10-89e1c3589d3d35dccd6d9fd114507419767d3d8e1c719f5bc8427cd35f01b22a.tests.json",
+      "bytes": 14397,
+      "sha256": "443735941fd1c36995ab37a55a01e9c69b801ff141edd7b0a7721b8887f4ac06"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/REPORT.md",
+      "bytes": 6426,
+      "sha256": "f596d51723c1a300b299608272c2727e98b345c286eb5a2d3287afb74e27fa11"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/handoff-restored.json",
+      "bytes": 456,
+      "sha256": "19bf66a03b4b4eb47ed85606f119f0f5337364eb2d2d5e8906645383cc424325"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/node-end-events.json",
+      "bytes": 5591,
+      "sha256": "8e8a214d5d2836c103c9643fd3f1d2f3066b9b5b4b4e2c2d7c7da0b4d1c83c42"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/observer-exit-readback-limit.json",
+      "bytes": 637,
+      "sha256": "63cffb1643d9b74447c76021021c5699d1caa299b16b1a4d63ab062ca8bdbade"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/prepared-cli-selection.json",
+      "bytes": 5162,
+      "sha256": "6fab2160d87a17b090637cabf0544b01efda0d9675aaf0739de3d92178a89f44"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/prepared-executable-readback.json",
+      "bytes": 5021,
+      "sha256": "a6468eb451e4d3961e8042d63439da0baa1f4d00f36918a35897cba4a5767275"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/readback-helper-failure-1.json",
+      "bytes": 387,
+      "sha256": "e870553a58dba15d143a32d6f9ae57714fc0a0af91a00ddb5083544f25880272"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/resources.json",
+      "bytes": 24983,
+      "sha256": "14f41eb12527cfb0327050f7b10bb236a87fa80217439d92cd683172c1324f30"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/retained-files.json",
+      "bytes": 5325,
+      "sha256": "1a207b79ce93303645577e54c3733941cc5247783fdd00c69e5e9994c3e5c2de"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/source-after.json",
+      "bytes": 275210,
+      "sha256": "626e52d03a9fc87ba91fa92fa437641a9130a6d68d0b3a854b23c564342466e6"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/terminal.json",
+      "bytes": 3509,
+      "sha256": "bc1cafb9219146cc6f16c8b01e46b0040d2eda6d35c6dd8106d66e988d368ed8"
+    },
+    {
+      "path": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/official-cli-1/final-evidence/test-result-readback.json",
+      "bytes": 21724,
+      "sha256": "03f371375e8f8aa7885c22cc30b218e34358ccba873acdf2d66538f5dfd51729"
+    }
+  ]
+}

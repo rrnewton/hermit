@@ -1,0 +1,18 @@
+from pathlib import Path
+import subprocess,json,os,hashlib,time,sys
+E=Path(__file__).resolve().parent;S=E.parents[2];os.chdir(S);main="59cbd3c64d8f304b2c477a153b0239fca7a8572a";prior="7c4df11ca6ae4b92196d04297e6a650d7e10915e"
+env={**os.environ,"CARGO_HOME":str(S/"ignored/gdb-vfile-pin-20260916/cargo"),"CARGO_TARGET_DIR":str(S/"target"),"CARGO_BUILD_JOBS":"4","XDG_CACHE_HOME":"/home/newton/work/dev-hermit/ignored/ci-hub/run1828-fix-forward-20260916/gdb-vfile-pin-official-1/host-cache","CARGO_HTTP_CAINFO":"/etc/pki/tls/certs/fb_certs.pem"}
+def call(name,argv):
+ t=time.monotonic();q=subprocess.run(argv,env=env,capture_output=True);(E/(name+".stdout")).write_bytes(q.stdout);(E/(name+".stderr")).write_bytes(q.stderr);(E/(name+".json")).write_text(json.dumps({"argv":argv,"actual_exit":q.returncode,"seconds":time.monotonic()-t},indent=2)+"\n");print(name,q.returncode,flush=True);return q
+assert subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()==prior
+assert not subprocess.check_output(["git","status","--porcelain","--untracked-files=no"])
+q=call("merge-stage",["git","merge","--no-ff","--no-commit",main]);assert q.returncode==0
+pin_patch=subprocess.check_output(["git","diff","--cached","--binary","--full-index",main]);assert hashlib.sha256(pin_patch).hexdigest()=="6e9338d0f661ec1db8a399b494509ab6e9b08a125b601f93937482f6715a88da"
+expected=json.loads((E/"INCOMING-READBACK.json").read_text())["paths"];assert sorted(subprocess.check_output(["git","diff","--cached","--name-only",prior],text=True).splitlines())==sorted(expected)
+for name in expected:assert subprocess.check_output(["git","show",":"+name])==subprocess.check_output(["git","show",main+":"+name])
+q=call("who-am-i",["/home/newton/work/dev-hermit/ci-hub/bin/who-am-i","--tag","--role","impl"]);assert q.returncode==0;tag=q.stdout.decode().strip();assert tag.startswith("[") and tag.endswith("]")
+message="Compose landed robust clocks with the Reverie pin\n\n"+tag+"\n\nPlain Language Summary and Project Impact\n\nBring the already-landed robust owner-clock repair into the GDB protocol pin candidate before its official CLI qualification. The five incoming source/count files are byte-identical to reviewed main59cbd3c6, whose selected679 Detcore and158 integration tests passed. Preserve the twelve-file d87a Reverie pin patch exactly and keep all existing test identities, selectors, node limits and comparison policies.\n\nThe pin separately passed the normal policy, locked workspace check, default workspace Clippy and format checks. This append-only composition has not yet run the planned official78-case CLI selection; no combined guest result or full-main receipt is claimed.\n\nTask: vision-ci-signal-is-trustworthy-end-to-end\n"
+(E/"merge-message.txt").write_text(message);q=call("merge-commit",["git","commit","-F",str(E/"merge-message.txt")]);assert q.returncode==0
+h=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip();tree=subprocess.check_output(["git","rev-parse","HEAD^{tree}"],text=True).strip();assert subprocess.check_output(["git","show","-s","--format=%P",h],text=True).strip().split()==[prior,main]
+patch=subprocess.check_output(["git","diff","--binary","--full-index",main,h]);assert patch==pin_patch;assert not subprocess.check_output(["git","status","--porcelain","--untracked-files=no"])
+(E/"composed-pin.patch").write_bytes(patch);(E/"COMPOSED.json").write_text(json.dumps({"head":h,"tree":tree,"main":main,"prior_pin_head":prior,"pin_patch_sha256":hashlib.sha256(patch).hexdigest(),"incoming_five_blobs_exact":True,"tracked_clean":True,"actual_tag":tag},indent=2)+"\n");print(h,tree,flush=True)

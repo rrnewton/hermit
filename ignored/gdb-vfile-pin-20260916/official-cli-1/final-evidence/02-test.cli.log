@@ -1,0 +1,112 @@
+dns github.com: refused (gaierror)
+dns crates.io: refused (gaierror)
+dns static.crates.io: refused (gaierror)
+assert-no-network: route-table: no route (0 non-loopback routes, 0 non-loopback interfaces)
+assert-no-network: dns github.com: refused
+assert-no-network: dns crates.io: refused
+assert-no-network: dns static.crates.io: refused
+assert-no-network: tcp 1.1.1.1:443: refused
+assert-no-network: tcp 8.8.8.8:53: refused
+assert-no-network: OK -- no route, no DNS, no raw TCP. This environment is isolated.
+assert-build-dependencies: OK -- 18/18 executable build dependencies are present.
+assert-build-dependencies: OK -- 4/4 native libraries and development headers are present.
+assert-build-dependencies: OK -- 87/87 absolute guest paths are executable files.
+Pin read from checkout HEAD 932f7130ea3c77dcdb2547b6834f46f08bf593f0.
+Scope: 21 tracked Cargo metadata file(s) PLUS tracked submodule gitlinks; 5 git dependency/ies pinned. Untracked, generated and vendored copies are EXCLUDED by design.
+  OK    https://github.com/facebookexperimental/rust-shed  4 entries @ 84a82026bc1d
+  FLOAT https://github.com/facebookexperimental/rust-shed  tracked by branch=main -- KNOWN EXCEPTION: branch=main since before 2026-08-24; the manifests are autocargo-generated from Meta's internal Buck targets, so pinning it is an owner decision rather than a hand edit. Only the lockfile records what was built (84a82026 at time of writing). Filed separately.
+  OK    https://github.com/rr-debugger/rr  1 entry @ 39e5c18e7e43
+  OK    https://github.com/rrnewton/agent-utils  1 entry @ 2781b1054efc
+  OK    https://github.com/rrnewton/liteinst2  2 entries @ 95ee5e6917fa
+  OK    https://github.com/rrnewton/reverie  46 entries @ d87a03a31242
+check-git-pin-uniformity.rs: OK -- every REVISION-PINNED git dependency is pinned at exactly one revision
+  ⚠️ 1 dependency/ies are NOT PINNED AT ALL and were excluded from that statement, by approved exception: https://github.com/facebookexperimental/rust-shed
+  A BRANCH IS NOT A PIN -- it moves under you. Uniformity cannot be asserted over a dependency that names one.
+run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:d87a03a312421d34dee81dae71aa395b40231e63,source:inherited-launch-cargo-build-jobs,raw-build-jobs:1,effective-cpus-source:child-nproc,effective-cpus:1,reverie-max-jobs:16,effective-native-jobs:1,effective-job-seconds:1050,max-elapsed-seconds:1050,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463}
+info: experimental features enabled: wrapper-scripts
+info: experimental features enabled: wrapper-scripts
+────────────
+ Nextest run ID 685ef5b9-dafe-4265-abaf-1ea71182614c with nextest profile: default
+    Starting 78 tests across 1 binary (35 tests skipped)
+        PASS [   0.284s] hermit::cli a_fault_aimed_at_no_existing_site_fires_nowhere
+        PASS [   0.139s] hermit::cli a_guest_cannot_escape_the_deterministic_pipe_capacity_pin
+        PASS [   0.403s] hermit::cli a_guest_exiting_a_reserved_status_is_not_reported_as_hermit
+        PASS [   0.715s] hermit::cli a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure
+        PASS [   0.613s] hermit::cli a_signal_killed_container_reports_a_signal_death_not_a_refusal
+        PASS [   2.561s] hermit::cli a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out
+        PASS [   0.164s] hermit::cli backend_stats_are_debug_gated_and_absent_from_the_info_envelope
+        PASS [   0.503s] hermit::cli container_child_exit_is_distinguishable_from_an_ordinary_cli_error
+        PASS [   0.559s] hermit::cli dbt_verify_retains_captures_under_the_names_the_harness_scans_for
+        PASS [   0.405s] hermit::cli dbt_verify_without_json_rejects_io_buffer_content_divergence
+        PASS [   0.617s] hermit::cli diagnostics_survive_a_nonblocking_stderr_under_back_pressure
+        PASS [  28.540s] hermit::cli every_record_container_site_classifies_a_child_fault_by_name
+        PASS [   0.011s] hermit::cli global_position_rejects_unknown_backends
+        PASS [   0.005s] hermit::cli guest_env_difference_accepts_the_forced_pair_plus_the_explicit_value
+        PASS [   0.005s] hermit::cli guest_env_difference_rejects_a_dropped_explicit_variable
+        PASS [   0.005s] hermit::cli guest_env_difference_rejects_a_leaked_host_variable
+        PASS [   0.004s] hermit::cli guest_env_difference_rejects_the_pre_parity_fix_output
+        PASS [   0.008s] hermit::cli hermit_dap_forwards_remote_settings_to_gdb
+        PASS [   0.006s] hermit::cli hermit_dap_help_describes_managed_replay
+        PASS [   0.006s] hermit::cli hermit_dap_rejects_replay_options_without_replay
+        PASS [   0.006s] hermit::cli hermit_dap_reports_a_missing_gdb_path
+        PASS [   0.010s] hermit::cli incompatible_run_modes_fail_during_argument_parsing
+        PASS [   0.155s] hermit::cli inherited_container_output_does_not_expose_capture_offset
+        PASS [   0.006s] hermit::cli kvm_pinned_root_arguments_are_exact_and_fail_closed
+        PASS [   0.007s] hermit::cli liteinst_runtime_cache_requires_the_current_revision
+        PASS [   0.012s] hermit::cli log_file_that_cannot_be_opened_is_refused_by_path
+        PASS [   0.066s] hermit::cli log_file_under_tmp_lands_on_the_host
+        PASS [   0.052s] hermit::cli namespace_only_applies_a_fresh_private_tmpfs_workdir
+        PASS [   0.024s] hermit::cli namespace_only_applies_minimal_and_explicit_environment
+        PASS [   0.027s] hermit::cli namespace_only_preserves_default_host_environment
+        PASS [   0.024s] hermit::cli namespace_only_propagates_guest_exit_status
+        PASS [   0.023s] hermit::cli namespace_only_rejects_every_explicit_backend
+        PASS [   0.012s] hermit::cli namespace_only_rejects_global_position_backend
+        PASS [   0.033s] hermit::cli namespace_only_reports_invalid_process_settings
+        PASS [   0.006s] hermit::cli no_container_site_is_unreachable_by_the_fault_injector
+        PASS [   0.281s] hermit::cli no_namespace_fork_children_have_deterministic_distinct_rng_streams
+        PASS [   0.203s] hermit::cli no_namespace_preserves_affinity_for_run_and_verify
+        PASS [   0.058s] hermit::cli no_namespace_rejects_container_only_options
+        PASS [   0.033s] hermit::cli no_namespace_runs_without_container_setup
+        PASS [   0.005s] hermit::cli pinned_root_arguments_cover_split_guest_commands
+        PASS [   1.680s] hermit::cli record_classifies_a_container_child_failure_the_same_way_run_does
+        PASS [   0.558s] hermit::cli record_classifies_a_gdbserver_replay_stage_container_child_failure
+        PASS [   0.358s] hermit::cli record_classifies_a_replay_stage_container_child_failure
+        PASS [   0.012s] hermit::cli record_list_json_reports_an_empty_inventory
+        PASS [   0.017s] hermit::cli record_list_rejects_a_non_directory_inventory
+        PASS [   0.301s] hermit::cli record_reports_an_unsupported_syscall_as_a_refusal_not_an_internal_failure
+        PASS [   0.083s] hermit::cli run_dbt_executes_integrated_backend
+        PASS [   0.087s] hermit::cli run_dbt_forwards_detcore_info_logs
+        PASS [   0.438s] hermit::cli run_dbt_rejects_unfollowed_execveat
+        PASS [   0.080s] hermit::cli run_dbt_uses_the_normalized_backend_config
+        PASS [   0.087s] hermit::cli run_dbt_uses_the_requested_guest_environment
+        PASS [   0.414s] hermit::cli run_dbt_verifies_application_mmap
+        PASS [   0.523s] hermit::cli run_dbt_verifies_process_wait_lifecycle
+        PASS [   1.539s] hermit::cli run_dbt_virtualizes_process_identities
+        PASS [   0.016s] hermit::cli run_liteinst_rejects_a_non_runtime_override_before_activation_claim
+        PASS [   0.088s] hermit::cli run_liteinst_rejects_an_inert_dso_before_activation_claim
+        PASS [   3.473s] hermit::cli run_liteinst_verifies_detcore_backend
+        PASS [   0.337s] hermit::cli run_ptrace_fails_closed_by_default_on_unsupported_syscall
+        PASS [   0.332s] hermit::cli run_ptrace_virtual_clock_across_execve_is_deterministic
+        PASS [   0.146s] hermit::cli run_ptrace_virtual_clock_advances_across_execve
+        PASS [   0.020s] hermit::cli run_rejects_a_missing_bind_source_before_mounting
+        PASS [   0.018s] hermit::cli run_rejects_invalid_configuration_without_panicking
+        PASS [   0.042s] hermit::cli run_rejects_invalid_programs_with_actionable_errors
+        PASS [   0.009s] hermit::cli run_rejects_unknown_backends_during_argument_parsing
+        PASS [   0.018s] hermit::cli run_reports_denied_ptrace_and_seccomp_capabilities
+        PASS [   0.049s] hermit::cli run_strict_flag_is_accepted_and_runs
+        PASS [  11.038s] hermit::cli run_timeout_fallback_fires_when_the_unwind_does_not_finish
+        PASS [   2.039s] hermit::cli run_timeout_fires_by_name_and_unwinds_the_container
+        PASS [   0.073s] hermit::cli run_timeout_leaves_a_guest_that_finishes_in_time_alone
+        PASS [   0.027s] hermit::cli run_timeout_refuses_backends_where_it_cannot_bound_the_run
+        PASS [   0.023s] hermit::cli sabre_backend_validation_honors_command_scope
+        PASS [   0.005s] hermit::cli sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp
+        PASS [   0.006s] hermit::cli sabre_rpc_socket_is_hidden_from_proc_environ
+        PASS [   0.606s] hermit::cli sigint_instakill_reports_a_signal_death_not_a_policy_refusal
+        PASS [   0.292s] hermit::cli skid_overshoot_and_guest_failure_have_different_exit_codes
+        PASS [   2.560s] hermit::cli the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each
+        PASS [   0.006s] hermit::cli the_stderr_diagnostic_deadline_fits_inside_the_unwind_grace
+        PASS [   0.011s] hermit::cli verify_verbose_requires_verify
+────────────
+     Summary [  64.011s] 78 tests run: 78 passed, 35 skipped
+running 78 tests
+test result: ok. 78 passed; 0 failed; 0 ignored; 35 filtered out

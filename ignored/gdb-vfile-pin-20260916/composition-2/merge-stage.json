@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "git",
+    "merge",
+    "--no-ff",
+    "--no-commit",
+    "fe41081742652fce09fc22f20469df10fa09ddaa"
+  ],
+  "actual_exit": 0,
+  "seconds": 0.39236709801480174
+}

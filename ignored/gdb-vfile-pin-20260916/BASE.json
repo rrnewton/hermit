@@ -1,0 +1,11 @@
+{
+  "head": "4e7c0636ff105f333d81fa6560069a267e8d60a8",
+  "tree": "43ab581c87f698cf33f3d1854001d071e8e10e5d",
+  "branch": "dev-hermit/gdb-vfile-pin-20260916",
+  "submodules": " 2781b1054efc3a9c561dbed35584a6fca1ed8676 agent-utils (v0.11.0-650-g2781b10)\n 39e5c18e7e43236b7ca0fb1eb647fe9c93e3934e third-party/rr (5.9.0-163-g39e5c18e)\n",
+  "status": "?? HANDOFF.md\n",
+  "slot": "dev-hermit-gdb-vfile-pin-20260916",
+  "generation": 1,
+  "owner_pid": 2162531,
+  "owner_start": 166139008
+}

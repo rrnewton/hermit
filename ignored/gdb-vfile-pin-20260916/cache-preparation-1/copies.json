@@ -1,0 +1,78 @@
+[
+  {
+    "label": "debug",
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/hermetic/split/target/debug",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug",
+    "argv": [
+      "cp",
+      "--reflink=auto",
+      "-a",
+      "--no-preserve=ownership",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/hermetic/split/target/debug/.",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/debug"
+    ],
+    "actual_copy_exit": 0,
+    "seconds": 170.9366261579562,
+    "files": 73099,
+    "logical_bytes": 41728338659,
+    "source_before_after_equal": true,
+    "no_shared_file_inodes": true
+  },
+  {
+    "label": "release",
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/hermetic/split/target/release",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/release",
+    "argv": [
+      "cp",
+      "--reflink=auto",
+      "-a",
+      "--no-preserve=ownership",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-replay-diagnostic-20260916/ignored/hermetic/split/target/release/.",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/target/release"
+    ],
+    "actual_copy_exit": 0,
+    "seconds": 8.946176135912538,
+    "files": 3754,
+    "logical_bytes": 2001456935,
+    "source_before_after_equal": true,
+    "no_shared_file_inodes": true
+  },
+  {
+    "label": "registry",
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/registry",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo/registry",
+    "argv": [
+      "cp",
+      "--reflink=auto",
+      "-a",
+      "--no-preserve=ownership",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/registry/.",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo/registry"
+    ],
+    "actual_copy_exit": 0,
+    "seconds": 14.811832116916776,
+    "files": 18125,
+    "logical_bytes": 705260829,
+    "source_before_after_equal": true,
+    "no_shared_file_inodes": true
+  },
+  {
+    "label": "git",
+    "source": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/git",
+    "destination": "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo/git",
+    "argv": [
+      "cp",
+      "--reflink=auto",
+      "-a",
+      "--no-preserve=ownership",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/gdb-vfile-pin-20260916/cargo/git/.",
+      "/home/newton/work/dev-hermit/worktrees/slots/dev-hermit-gdb-vfile-pin-20260916/ignored/hermetic/split/cargo/git"
+    ],
+    "actual_copy_exit": 0,
+    "seconds": 21.15428527398035,
+    "files": 27902,
+    "logical_bytes": 1110359727,
+    "source_before_after_equal": true,
+    "no_shared_file_inodes": true
+  }
+]

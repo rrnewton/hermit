@@ -1,0 +1,14 @@
+{
+  "observed_ns": 1789604160502780916,
+  "argv": [
+    "with-proxy",
+    "git",
+    "ls-remote",
+    "origin",
+    "refs/heads/main",
+    "refs/heads/dev-hermit/gdb-vfile-pin-20260916"
+  ],
+  "actual_exit": 0,
+  "stdout": "fe41081742652fce09fc22f20469df10fa09ddaa\trefs/heads/main\n",
+  "stderr": ""
+}

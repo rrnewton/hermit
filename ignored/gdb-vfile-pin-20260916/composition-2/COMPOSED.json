@@ -1,0 +1,12 @@
+{
+  "head": "e208b86786ea7d8d7c7eb81e9783c8af04165c7f",
+  "tree": "34e78fd6b7b2d8d2125b73ff98fc820c4c4ffb37",
+  "main": "fe41081742652fce09fc22f20469df10fa09ddaa",
+  "tested_prior_pin_head": "932f7130ea3c77dcdb2547b6834f46f08bf593f0",
+  "pin_patch_sha256": "6e9338d0f661ec1db8a399b494509ab6e9b08a125b601f93937482f6715a88da",
+  "incoming_eleven_files_exact": true,
+  "tracked_clean": true,
+  "handoff_unchanged": true,
+  "actual_tag": "[hermit2, degraded-unresolved, gpt-6-astra, devbig014, role=impl]",
+  "guest_result_scope": "78 PASS at prior932; no new guest run at composed head"
+}

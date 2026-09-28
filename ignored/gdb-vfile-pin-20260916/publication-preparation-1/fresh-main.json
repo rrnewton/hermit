@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "with-proxy",
+    "git",
+    "ls-remote",
+    "origin",
+    "refs/heads/main"
+  ],
+  "observed_ns": 1789603653471222154,
+  "actual_exit": 0,
+  "stdout": "fe41081742652fce09fc22f20469df10fa09ddaa\trefs/heads/main\n",
+  "stderr": ""
+}

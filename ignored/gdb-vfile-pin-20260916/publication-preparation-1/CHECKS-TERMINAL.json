@@ -1,0 +1,76 @@
+{
+  "actual_checks": {
+    "actual_exit": 0,
+    "seconds": 41.936844057170674,
+    "source_equal": true,
+    "commands": [
+      {
+        "name": "default-warnings",
+        "argv": [
+          "./scripts/check-default-build-warnings.sh"
+        ],
+        "actual_exit": 0,
+        "seconds": 38.87971352506429
+      },
+      {
+        "name": "fmt",
+        "argv": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "actual_exit": 0,
+        "seconds": 2.6522254990413785
+      },
+      {
+        "name": "shell-syntax",
+        "argv": [
+          "bash",
+          "-n",
+          "ci/configure-build-jobs.sh",
+          "ci/run-with-reverie-dbt-budget.sh"
+        ],
+        "actual_exit": 0,
+        "seconds": 0.0031304180156439543
+      },
+      {
+        "name": "whitespace",
+        "argv": [
+          "git",
+          "diff",
+          "--check",
+          "fe41081742652fce09fc22f20469df10fa09ddaa",
+          "HEAD"
+        ],
+        "actual_exit": 0,
+        "seconds": 0.040676534874364734
+      }
+    ]
+  },
+  "source_entry_count": 1713,
+  "source_before_after_equal": true,
+  "identity": {
+    "pid": 3928381,
+    "start": "176302716",
+    "cgroup": "/sys/fs/cgroup/user.slice/user-212630.slice/user@212630.service/app.slice/hermit-gdb-vfile-pin-publish-checks1-20260917.scope",
+    "inode": 38145320
+  },
+  "same_generation_live": false,
+  "cgroup_exists": false,
+  "unit_query_actual_exit": 0,
+  "unit_stdout": "LoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\nControlGroup=\n",
+  "unit_stderr": "",
+  "resources": {
+    "memory.max": "8589934592\n",
+    "memory.swap.max": "0\n",
+    "memory.peak": "3914579968\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\nsock_throttled 0\n",
+    "pids.max": "1024\n",
+    "pids.peak": "49\n",
+    "pids.events": "max 0\n",
+    "cpu.max": "400000 100000\n",
+    "cpu.stat": "usage_usec 153145216\nuser_usec 129273584\nsystem_usec 23871631\nnice_usec 0\nnr_periods 424\nnr_throttled 140\nthrottled_usec 6489732\nnr_bursts 0\nburst_usec 0\n"
+  }
+}
