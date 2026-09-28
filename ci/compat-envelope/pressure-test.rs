@@ -1716,7 +1716,11 @@ fn outcome_evidence(outcome: &StepOutcome) -> RunnerEvidence {
 }
 
 fn retained_outcome_evidence(outcome: &RetainedOutcome) -> Result<RunnerEvidence, String> {
-    if outcome.oom_kills < 0 || outcome.oomed != (outcome.oom_kills > 0) {
+    // The scheduler sets `oomed` when any memory.events OOM counter (`oom`,
+    // `oom_kill` or `oom_group_kill`) is positive, but `oom_kills` counts only
+    // `oom_kill`. An OOM whose victim was not killed in the step's own cgroup
+    // is therefore `oomed` with zero kills; a kill without `oomed` is not.
+    if outcome.oom_kills < 0 || (outcome.oom_kills > 0 && !outcome.oomed) {
         return Err(format!(
             "typed scheduler outcome {} disagrees about oomed={} and oom_kills={}",
             outcome.tag, outcome.oomed, outcome.oom_kills
@@ -5295,6 +5299,26 @@ fn load_runner_evidence(
         let timeout_column = column("timed_out")?;
         let cpu_timeout_column = column("cpu_timed_out")?;
         let oom_column = column("oom_kills")?;
+        // A runner that writes `memory_events_oom_group_kill` also classifies
+        // OOM on every memory.events OOM counter, as retained_outcome_evidence
+        // describes. Older runners classified on `oom_kills` alone, and their
+        // files keep that meaning. A blank counter was never read and is not
+        // evidence of an OOM.
+        let memory_event_columns = if headers
+            .iter()
+            .any(|candidate| candidate == "memory_events_oom_group_kill")
+        {
+            [
+                "memory_events_oom",
+                "memory_events_oom_kill",
+                "memory_events_oom_group_kill",
+            ]
+            .into_iter()
+            .map(|name| column(name).map(|index| (name, index)))
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         for (row_index, record) in reader.records().enumerate() {
             let fields = record
                 .map_err(|e| format!("{}:{} is invalid CSV: {e}", path.display(), row_index + 2))?;
@@ -5345,11 +5369,26 @@ fn load_runner_evidence(
                         row_index + 2
                     )
                 })?;
+            let mut memory_events_oom = false;
+            for &(name, index) in &memory_event_columns {
+                let value = fields.get(index).unwrap_or("");
+                if value.is_empty() {
+                    continue;
+                }
+                let count = value.parse::<u64>().map_err(|e| {
+                    format!(
+                        "{}:{} has invalid {name}: {e}",
+                        path.display(),
+                        row_index + 2
+                    )
+                })?;
+                memory_events_oom |= count > 0;
+            }
             let row = evidence.entry(step.to_string()).or_default();
             row.seen = true;
             row.ok |= ok;
             row.timed_out |= timed_out;
-            row.oom |= oom_kills > 0;
+            row.oom |= oom_kills > 0 || memory_events_oom;
         }
     }
     if evidence.is_empty() {
@@ -5383,7 +5422,9 @@ fn is_proven_timeout_attempt(runner: RunnerEvidence, harness_status: Option<i32>
 fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
     // The per-step row is already selected by exact source SHA and exact DAG
     // step name. The numeric marker proves that this cell began before its
-    // cgroup reported an OOM kill; without both records, absence of terminal
+    // cgroup reported an OOM event (a positive memory.events `oom`, `oom_kill`
+    // or `oom_group_kill` counter, which need not have killed anything; see
+    // retained_outcome_evidence); without both records, absence of terminal
     // artifacts is not evidence of a guest OOM.
     runner.seen
         && !runner.ok
@@ -8343,11 +8384,35 @@ fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
             refuse(&format!("malformed {field}"), &wrong)?;
         }
     }
-    for (oomed, kills) in [(false, -1), (false, 1), (true, 0)] {
+    for (oomed, kills) in [(false, -1), (true, -1), (false, 1)] {
         let mut bad = document.clone();
         bad["outcomes"][0]["oomed"] = json!(oomed);
         bad["outcomes"][0]["oom_kills"] = json!(kills);
         refuse("contradictory OOM count", &bad)?;
+    }
+    // A memory.events `oom` or `oom_group_kill` without a local `oom_kill` is
+    // a real scheduler outcome, and it must read as an OOM rather than refuse.
+    let mut unkilled_oom = document.clone();
+    unkilled_oom["outcomes"][0]["oomed"] = json!(true);
+    unkilled_oom["outcomes"][0]["oom_kills"] = json!(0);
+    fs::write(
+        &path,
+        serde_json::to_vec(&unkilled_oom).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let unkilled =
+        load_retained_runner_evidence(&results)?.ok_or("OOM-without-kill evidence disappeared")?;
+    let tag = unkilled_oom["outcomes"][0]["tag"]
+        .as_str()
+        .ok_or("typed termination fixture lost its tag")?;
+    if unkilled.len() != 1
+        || !unkilled
+            .get(tag)
+            .is_some_and(|row| row.seen && !row.ok && row.oom && !row.timed_out)
+    {
+        return Err(format!(
+            "typed termination reader lost an OOM without a local kill: {unkilled:?}"
+        ));
     }
     for field in ["oomed", "timed_out", "cpu_timed_out"] {
         let mut bad = document.clone();
@@ -12683,7 +12748,72 @@ fn self_test(root: &Path) -> Result<(), String> {
          other,cell.foreign-oom,false,false,false,9\n",
     )
     .map_err(|e| format!("cannot write self-test runner profile: {e}"))?;
+    const MEMORY_EVENTS_HEADER: &str = "git_sha,step,ok,timed_out,cpu_timed_out,oom_kills,\
+         memory_events_oom,memory_events_oom_kill,memory_events_oom_group_kill\n";
+    fs::write(
+        profile_dir.join("step_profiles_fixture_events.csv"),
+        format!(
+            "{MEMORY_EVENTS_HEADER}\
+             abc,cell.boundary-oom,false,false,false,0,1,0,0\n\
+             abc,cell.group-oom,false,false,false,0,0,0,1\n\
+             abc,cell.unread-events,false,false,false,0,,,\n\
+             abc,cell.events-pass,true,false,false,0,0,0,0\n"
+        ),
+    )
+    .map_err(|e| format!("cannot write self-test memory-events profile: {e}"))?;
+    fs::write(
+        profile_dir.join("step_profiles_fixture_legacy_events.csv"),
+        "git_sha,step,ok,timed_out,cpu_timed_out,oom_kills,memory_events_oom,memory_events_oom_kill\n\
+         abc,cell.legacy-events,false,false,false,0,1,0\n",
+    )
+    .map_err(|e| format!("cannot write self-test legacy memory-events profile: {e}"))?;
     let retained = load_runner_evidence(&scratch, "abc")?;
+    let failed_oom = |row: &RunnerEvidence| row.seen && !row.ok && row.oom && !row.timed_out;
+    if !retained.get("cell.boundary-oom").is_some_and(failed_oom)
+        || !retained.get("cell.group-oom").is_some_and(failed_oom)
+        || !retained
+            .get("cell.unread-events")
+            .is_some_and(|row| row.seen && !row.ok && !row.oom)
+        || !retained
+            .get("cell.events-pass")
+            .is_some_and(|row| row.seen && row.ok && !row.oom)
+        || !retained
+            .get("cell.legacy-events")
+            .is_some_and(|row| row.seen && !row.ok && !row.oom)
+    {
+        return Err(format!(
+            "retained runner evidence did not classify memory.events OOM counters like its runner: {retained:?}"
+        ));
+    }
+    for (label, csv, expected) in [
+        (
+            "an invalid memory.events counter",
+            format!("{MEMORY_EVENTS_HEADER}abc,cell.bad-events,false,false,false,0,x,0,0\n"),
+            "has invalid memory_events_oom:",
+        ),
+        (
+            "a memory.events header without memory_events_oom",
+            "git_sha,step,ok,timed_out,cpu_timed_out,oom_kills,memory_events_oom_kill,memory_events_oom_group_kill\n\
+             abc,cell.bad-events,false,false,false,0,0,1\n"
+                .to_string(),
+            "has no `memory_events_oom` column",
+        ),
+    ] {
+        let bad_root = scratch.join("runner-profile-bad-memory-events");
+        let bad_dir = bad_root.join("runner-profile");
+        fs::create_dir_all(&bad_dir)
+            .map_err(|e| format!("cannot create self-test bad profile directory: {e}"))?;
+        fs::write(bad_dir.join("step_profiles_bad.csv"), csv)
+            .map_err(|e| format!("cannot write self-test bad profile: {e}"))?;
+        match load_runner_evidence(&bad_root, "abc") {
+            Err(error) if error.contains(expected) => {}
+            other => {
+                return Err(format!(
+                    "retained runner evidence did not refuse {label} with {expected:?}: {other:?}"
+                ))
+            }
+        }
+    }
     if !retained
         .get("cell.pass")
         .is_some_and(|row| row.seen && row.ok)
