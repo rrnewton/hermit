@@ -209,7 +209,7 @@ pub(crate) enum DirentFormat {
 
 impl DirentFormat {
     /// Offset of `d_name` within a record.
-    fn name_offset(self) -> usize {
+    pub(crate) fn name_offset(self) -> usize {
         match self {
             // d_ino (8), d_off (8), d_reclen (2), d_type (1)
             Self::Dirent64 => 19,
@@ -227,6 +227,14 @@ impl DirentFormat {
             Self::Legacy => 2,
         };
         (self.name_offset() + name_len + trailer + 7) & !7
+    }
+
+    /// Offset of `d_type` within a record of `reclen` bytes.
+    pub(crate) fn type_offset(self, reclen: usize) -> usize {
+        match self {
+            Self::Dirent64 => 18,
+            Self::Legacy => reclen - 1,
+        }
     }
 
     /// The bytes at the start of a record that Linux writes for a name of
@@ -311,10 +319,7 @@ impl DirentFormat {
         record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
         let name_offset = self.name_offset();
         record[name_offset..name_offset + entry.name.len()].copy_from_slice(&entry.name);
-        match self {
-            Self::Dirent64 => record[18] = entry.ty,
-            Self::Legacy => record[reclen - 1] = entry.ty,
-        }
+        record[self.type_offset(reclen)] = entry.ty;
     }
 }
 
