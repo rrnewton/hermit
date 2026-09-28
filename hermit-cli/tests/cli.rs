@@ -72,6 +72,7 @@ static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KVM_GETTIMEOFDAY_EFAULT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -651,6 +652,32 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "KVM exact-child wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn kvm_gettimeofday_efault_guest() -> &'static Path {
+    KVM_GETTIMEOFDAY_EFAULT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-gettimeofday-efault");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create KVM gettimeofday EFAULT guest directory");
+        let guest = build_root.join("kvm_gettimeofday_efault");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/kvm_gettimeofday_efault.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile KVM gettimeofday EFAULT guest");
+        assert!(
+            output.status.success(),
+            "KVM gettimeofday EFAULT guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -2953,6 +2980,54 @@ fn run_kvm_executes_dynamic_guest() {
         "kvm must not fall through to the ptrace backend:\n{}",
         stderr(&output),
     );
+}
+
+#[test]
+fn run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let program = kvm_gettimeofday_efault_guest()
+        .to_str()
+        .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--",
+        program,
+        "invalid-tv",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "invalid-tv: EFAULT\n");
+}
+
+#[test]
+fn run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+
+    let program = kvm_gettimeofday_efault_guest()
+        .to_str()
+        .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "kvm",
+        "--strict",
+        "--",
+        program,
+        "faulting-tz",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "faulting-tz: EFAULT tv=0.000000\n");
 }
 
 /// ⚠️ A GUEST THAT MUTATES hermit's OWN stderr MUST NOT MAKE `--verify` REPORT
