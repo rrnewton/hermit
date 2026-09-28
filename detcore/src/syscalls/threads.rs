@@ -532,6 +532,64 @@ fn terminal_child_wait_spec(
     }
 }
 
+// Serial KVM represents terminal events only, including the terminal subset
+// of WUNTRACED. Keep unsupported and unknown low-int bits on the backend's
+// prevalidation path; they must not select or consume a logical child.
+pub(super) fn wait4_uses_terminal_selector(options: WaitPidFlag, serial_kvm: bool) -> bool {
+    if serial_kvm {
+        options.bits() & !(libc::WNOHANG | libc::WUNTRACED) == 0
+    } else {
+        !options.intersects(
+            WaitPidFlag::WUNTRACED
+                | WaitPidFlag::WCONTINUED
+                | WaitPidFlag::__WCLONE
+                | WaitPidFlag::__WALL,
+        )
+    }
+}
+
+pub(super) async fn complete_selected_kvm_wait4<G, T>(
+    guest: &mut G,
+    call: syscalls::Wait4,
+    child: DetPid,
+) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // Backend waitability precedes the child's final owner-hook CPU prefix.
+    // Retain this exact grant and birth-owned identity through that publication
+    // and copyout; no new scheduler turn or user-memory identity read occurs.
+    if !guest
+        .thread_state()
+        .wait_for_child_cpu_publication(child)
+        .await
+    {
+        return Err(Error::Tool(anyhow::anyhow!(
+            "serial KVM wait4 selected child has no owned final CPU publication"
+        )));
+    }
+    let result = guest.inject(call.with_pid(child.as_raw())).await;
+    match result {
+        Ok(pid) if pid == i64::from(child.as_raw()) => {}
+        // The supported KVM wait4 selects/consumes before either status or
+        // rusage copyout. EFAULT therefore consumed this exact child too.
+        Err(Errno::EFAULT) => {}
+        unexpected => {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "serial KVM wait4 selected-child invariant failed: {unexpected:?} for {child}"
+            )));
+        }
+    }
+    guest.thread_state_mut().reap_child_process_cpu_time(child);
+    if !consume_child_wait(guest, child).await {
+        return Err(Error::Tool(anyhow::anyhow!(
+            "serial KVM wait4 selected child was not logically consumed"
+        )));
+    }
+    result.map_err(Error::from)
+}
+
 fn child_wait_can_retry_after_stale(spec: ChildWaitSpec) -> bool {
     !matches!(spec.selector, ChildWaitSelector::Exact(_))
 }
@@ -1576,6 +1634,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Wait4,
     ) -> Result<i64, Error> {
+        let serial_kvm = guest.config().backend_is_kvm && guest.config().sequentialize_threads;
+        let mut kvm_consumed = false;
         let dettid = guest.thread_state().dettid;
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
@@ -1586,12 +1646,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // process clones also remain legacy until backends distinguish
         // PTRACE_EVENT_CLONE from CLONE_THREAD. The common matcher already
         // carries those filters so activation does not require another model.
-        let selector = if call.options().intersects(
-            WaitPidFlag::WUNTRACED
-                | WaitPidFlag::WCONTINUED
-                | WaitPidFlag::__WCLONE
-                | WaitPidFlag::__WALL,
-        ) {
+        let selector = if !wait4_uses_terminal_selector(call.options(), serial_kvm) {
+            None
+        } else if call.pid() == libc::pid_t::MIN {
+            // Linux validates options before INT_MIN, then returns ESRCH
+            // without looking up children or touching either output. The
+            // serial KVM branch above already validated its supported subset.
+            // Other backends retain native option validation and errno order.
+            if serial_kvm {
+                return Err(Errno::ESRCH.into());
+            }
             None
         } else {
             match call.pid() {
@@ -1635,17 +1699,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let _ = await_exact_child_physical_exit(guest, child).await;
                     let exact_call = call.with_pid(child.as_raw());
                     loop {
-                        match guest.inject_with_retry(exact_call).await {
+                        let result = if serial_kvm {
+                            complete_selected_kvm_wait4(guest, exact_call, child).await
+                        } else {
+                            guest
+                                .inject_with_retry(exact_call)
+                                .await
+                                .map_err(Error::from)
+                        };
+                        kvm_consumed = serial_kvm && matches!(result, Ok(value) if value > 0);
+                        match result {
                             Ok(value) if value != 0 => break 'select_child value,
                             Ok(_) => yield_once().await,
-                            Err(Errno::ECHILD) => {
+                            Err(Error::Errno(Errno::ECHILD)) => {
                                 let _ = consume_child_wait(guest, child).await;
                                 if child_wait_can_retry_after_stale(spec) {
                                     continue 'select_child;
                                 }
                                 return Err(Errno::ECHILD.into());
                             }
-                            Err(errno) => return Err(errno.into()),
+                            Err(error) => return Err(error),
                         }
                     }
                 }
@@ -1688,9 +1761,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if let Some(child) = ready {
                         let _ = await_exact_child_physical_exit(guest, child).await;
-                        match guest.inject_with_retry(call.with_pid(child.as_raw())).await {
+                        let result = if serial_kvm {
+                            complete_selected_kvm_wait4(guest, call, child).await
+                        } else {
+                            guest
+                                .inject_with_retry(call.with_pid(child.as_raw()))
+                                .await
+                                .map_err(Error::from)
+                        };
+                        kvm_consumed = serial_kvm && matches!(result, Ok(value) if value > 0);
+                        match result {
                             Ok(value) => break Ok(value),
-                            Err(Errno::ECHILD) => {
+                            Err(Error::Errno(Errno::ECHILD)) => {
                                 let _ = consume_child_wait(guest, child).await;
                                 if child_wait_can_retry_after_stale(spec) {
                                     let (next_ready, _) = ready_child_wait(guest, spec).await;
@@ -1709,11 +1791,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 }
                                 break Err(Errno::ECHILD.into());
                             }
-                            Err(errno) => break Err(errno.into()),
+                            Err(error) => break Err(error),
                         }
                     }
                     if !has_child {
                         break Err(Errno::ECHILD.into());
+                    }
+                    if serial_kvm {
+                        // A broad backend poll can become consuming while the
+                        // owner callback is still publishing logical/CPU state.
+                        // Only a selected exact identity may cross that boundary.
+                        if let Some(disposition) = pending_signal {
+                            break interrupted_child_wait_result(guest, call, disposition).await;
+                        }
+                        continue;
                     }
                     match guest.inject(poll_call).await {
                         Ok(value) => {
@@ -1737,7 +1828,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // so it is not routed through the record/replay subtool.
             retry_nonblocking_syscall(guest, call, rsrc, None).await?
         };
-        let consumed_termination = if value <= 0 {
+        let consumed_termination = if kvm_consumed || value <= 0 {
             false
         } else if let Some(status) = call.wstatus() {
             wait_status_is_termination(guest.memory().read_value(status)?)

@@ -7924,3 +7924,13 @@ fn run_kvm_waitid_sibling_worker_child_all_success() {
 fn run_kvm_waitid_sibling_worker_child_all_efault() {
     kvm_waitid_copyout::run_sibling("worker-child", "all", "efault");
 }
+
+#[test]
+fn run_kvm_wait4_fault_consumption_preserves_waitid_and_children_cpu() {
+    kvm_waitid_copyout::run_wait4_fault();
+}
+
+#[test]
+fn run_kvm_wait4_int_min_preserves_errno_and_arenas() {
+    kvm_waitid_copyout::run_wait4_int_min();
+}
