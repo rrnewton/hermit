@@ -71,6 +71,7 @@ const ERROR_CASES: &[&str] = &[
     "interrupted-protected-info",
     "interrupted-writable-info",
     "restarted-writable-info",
+    "ignored-sibling-sigurg",
 ];
 
 fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u64) {
@@ -83,6 +84,8 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
     let mut names = BTreeSet::new();
     let mut checks = 0;
     let mut summaries = 0;
+    let mut ignored_child = None;
+    let mut ignored_checks = 0;
     for (index, row) in rows.iter().enumerate() {
         match row["type"].as_str().expect("observation type") {
             "case" => {
@@ -100,6 +103,45 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                 }
                 assert!(row["rc"].is_i64());
                 assert!(row["errno"].is_i64());
+                if name == "ignored-sibling-sigurg" {
+                    assert!(ignored_child.replace(row["id"].as_u64().unwrap()).is_none());
+                    for (key, expected) in [
+                        ("which", 1),
+                        ("rc", -1),
+                        ("errno", libc::EFAULT),
+                        ("alarms", 1),
+                        ("info_mode", 2),
+                        ("info_offset", 64),
+                        ("usage_protection", 3),
+                        ("null_usage", 1),
+                        ("signal", libc::SIGURG),
+                        ("wait_calls", 1),
+                        ("send_calls", 1),
+                        ("send_rc", 0),
+                        ("send_errno", 0),
+                        ("pre_returned", 0),
+                        ("release_seen", 1),
+                        ("release_rc", 1),
+                        ("release_errno", 0),
+                        ("ack_rc", 1),
+                        ("ack_errno", 0),
+                        ("sender_failure", 0),
+                    ] {
+                        assert_eq!(row[key].as_i64(), Some(i64::from(expected)), "{key}");
+                    }
+                    assert_eq!(row["options"], "0x4");
+                    assert_eq!(row["signal_default"], true);
+                    for key in ["id", "tgid", "waiter_tid", "sender_tid"] {
+                        assert!(row[key].as_i64().unwrap() > 0, "{key}");
+                    }
+                    assert_ne!(row["waiter_tid"], row["sender_tid"]);
+                    assert_eq!(row["tgid"], row["waiter_tid"]);
+                    assert!(row["release_fd"].as_i64().unwrap() >= 0);
+                    assert_eq!(row["pre_info"], row["info_before"]);
+                    assert_eq!(row["pre_aux"], row["aux_before"]);
+                    assert_eq!(row["info_after"], row["info_before"]);
+                    assert_eq!(row["aux_after"], row["aux_before"]);
+                }
                 if matches!(
                     name,
                     "interrupted-writable-info" | "restarted-writable-info"
@@ -140,6 +182,18 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                 let arena = row["arena"].as_str().expect("full guarded follow-up arena");
                 assert_eq!(arena.len(), 320);
                 assert!(arena.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                if row["name"] == "ignored-child-ECHILD" {
+                    ignored_checks += 1;
+                    assert_eq!(row["pid"].as_u64(), ignored_child);
+                    assert_eq!(row["rc"], -1);
+                    assert_eq!(row["errno"], libc::ECHILD);
+                    assert_eq!(row["options"], "0x5");
+                    let mut expected = "a5".repeat(160).into_bytes();
+                    for offset in [0, 4, 8, 16, 20, 24] {
+                        expected[2 * (16 + offset)..2 * (20 + offset)].fill(b'0');
+                    }
+                    assert_eq!(arena.as_bytes(), expected.as_slice());
+                }
             }
             "retained" => {
                 assert_eq!(row["rc"], 0);
@@ -168,12 +222,174 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
         "actual child peeks and reap checks must execute"
     );
     assert_eq!(summaries, 1);
+    assert_eq!(ignored_checks, usize::from(mode == "errors"));
+}
+
+// Full INFO records can span lines (scheduler commits do). Retain their
+// boundaries; do not treat a bare SIGURG substring as a signal grant.
+fn info_records(text: &str) -> Vec<String> {
+    assert!(text.ends_with('\n'), "complete retained INFO log");
+    let header = regex::Regex::new(r"^\S+\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+\S+: (.*)$").unwrap();
+    let mut records = Vec::new();
+    let mut current: Option<(bool, String)> = None;
+    for line in text.lines() {
+        if let Some(capture) = header.captures(line) {
+            if let Some((true, message)) = current.take() {
+                records.push(message.trim_end_matches('\n').to_owned());
+            }
+            current = Some((&capture[1] == "INFO", capture[2].to_owned()));
+        } else if let Some((_, message)) = current.as_mut() {
+            message.push('\n');
+            message.push_str(line);
+        }
+    }
+    if let Some((true, message)) = current {
+        records.push(message.trim_end_matches('\n').to_owned());
+    }
+    assert!(!records.is_empty());
+    records
+}
+
+fn assert_ignored_signal_trace(log: &[u8], stdout: &[u8]) {
+    let rows: Vec<serde_json::Value> = std::str::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let selected: Vec<_> = rows
+        .iter()
+        .filter(|row| row["name"] == "ignored-sibling-sigurg")
+        .collect();
+    assert_eq!(selected.len(), 1);
+    let row = selected[0];
+    let waiter = row["waiter_tid"].as_u64().unwrap();
+    let sender = row["sender_tid"].as_u64().unwrap();
+    let child = row["id"].as_u64().unwrap();
+    let tgid = row["tgid"].as_u64().unwrap();
+    let fd = row["release_fd"].as_u64().unwrap();
+    assert!(waiter > 0 && sender > 0 && child > 0 && tgid > 0 && waiter != sender);
+    let records = info_records(std::str::from_utf8(log).expect("complete UTF-8 INFO log"));
+    let entry = regex::Regex::new(
+        r"^DETLOG \[syscall\]\[detcore, dtid (\d+)\] inbound syscall: (.+) = \?$",
+    )
+    .unwrap();
+    let finish = regex::Regex::new(
+        r"^DETLOG \[syscall\]\[detcore, dtid (\d+)\] finish syscall #(\d+): (.+) = (.+)$",
+    )
+    .unwrap();
+    let mut entries = Vec::new();
+    let mut results = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let Some((message, metadata)) = record.rsplit_once(" DETLOG_RECORD=") else {
+            continue;
+        };
+        if let Some(capture) = entry.captures(message) {
+            let value: serde_json::Value = serde_json::from_str(metadata).unwrap();
+            assert_eq!(value["schema"], 1);
+            assert_eq!(value["event"]["kind"], "syscall");
+            entries.push((
+                index,
+                capture[1].parse::<u64>().unwrap(),
+                capture[2].to_owned(),
+            ));
+        } else if let Some(capture) = finish.captures(message) {
+            let value: serde_json::Value = serde_json::from_str(metadata).unwrap();
+            assert_eq!(value["schema"], 1);
+            assert_eq!(value["event"]["kind"], "syscall_result");
+            assert_eq!(
+                value["event"]["finished_syscall_number"].as_u64(),
+                Some(capture[2].parse::<u64>().unwrap())
+            );
+            results.push((
+                index,
+                capture[1].parse::<u64>().unwrap(),
+                capture[3].to_owned(),
+                capture[4].to_owned(),
+            ));
+        }
+    }
+    let pair = |tid: u64, pattern: &str, result: &str| {
+        let expression = regex::Regex::new(pattern).unwrap();
+        let starts: Vec<_> = entries
+            .iter()
+            .filter(|(_, actual, call)| *actual == tid && expression.is_match(call))
+            .collect();
+        assert_eq!(starts.len(), 1, "one exact syscall entry: {pattern}");
+        let (begin, _, call) = starts[0];
+        let ends: Vec<_> = results
+            .iter()
+            .filter(|(_, actual, actual_call, _)| *actual == tid && actual_call == call)
+            .collect();
+        assert_eq!(ends.len(), 1, "one exact syscall result: {call}");
+        assert_eq!(ends[0].3, result);
+        assert!(*begin < ends[0].0);
+        (*begin, ends[0].0)
+    };
+    let wait = pair(
+        waiter,
+        &format!(r"^waitid\(1, {child}, 0x[0-9a-f]+, 4, NULL\)$"),
+        "Err(Errno(EFAULT))",
+    );
+    let send = pair(
+        sender,
+        &format!(r"^tgkill\({tgid}, {waiter}, 23\)$"),
+        "Ok(0)",
+    );
+    let release = pair(
+        sender,
+        &format!(r"^write\({fd}, 0x[0-9a-f]+, 1\)$"),
+        "Ok(1)",
+    );
+    let gone = pair(
+        waiter,
+        &format!(r"^waitid\(1, {child}, 0x[0-9a-f]+, 5, NULL\)$"),
+        "Err(Errno(ECHILD))",
+    );
+    let park = regex::Regex::new(&format!(r"^\[scheduler\] NONCOMMIT turn \d+, parking dettid {waiter} for child ChildWaitSpec \{{ selector: Exact\(DetPid\({child}\)\), owner: None, exit_class: Sigchld \}}$")).unwrap();
+    // This single-resource Debug spelling is bound to SigWrapper's actual
+    // derive and scheduler formatter. Until a released run emits it, the
+    // proposal makes no claim to have observed this particular event.
+    let grant = regex::Regex::new(&format!(r"(?s)^\[sched-step5\] >>>>>>>\n\n COMMIT turn (\d+), dettid {waiter} using resources \{{WaitidSignals\(\[SigWrapper\(23\)\]\): W\}}, on previously committed [^\n]+$")).unwrap();
+    let mut grants = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let Some((message, metadata)) = record.rsplit_once(" DETLOG_RECORD=") else {
+            continue;
+        };
+        if let Some(capture) = grant.captures(message) {
+            let value: serde_json::Value = serde_json::from_str(metadata).unwrap();
+            assert_eq!(value["schema"], 1);
+            assert_eq!(value["event"]["kind"], "scheduler_commit");
+            assert_eq!(
+                value["event"]["scheduler_turn"].as_u64(),
+                Some(capture[1].parse::<u64>().unwrap())
+            );
+            grants.push(index);
+        }
+    }
+    assert_eq!(grants.len(), 1, "one actual ignored-signal grant");
+    let granted = grants[0];
+    assert!(wait.0 < send.0 && send.0 < granted && send.1 < release.0);
+    assert!(granted < release.0 && release.0 < wait.1 && wait.1 < gone.0);
+    assert!(
+        records
+            .iter()
+            .enumerate()
+            .any(|(n, message)| wait.0 < n && n < send.0 && park.is_match(message)),
+        "actual initial park before sibling send"
+    );
+    assert!(
+        records
+            .iter()
+            .enumerate()
+            .any(|(n, message)| granted < n && n < release.0 && park.is_match(message)),
+        "actual re-park before child release"
+    );
 }
 
 pub(super) fn run(mode: &str) {
     let (expected, children) = match mode {
         "terminal" => (TERMINAL_CASES, 23),
-        "errors" => (ERROR_CASES, 4),
+        "errors" => (ERROR_CASES, 5),
         _ => panic!("unknown waitid fixture mode"),
     };
     let _lock = super::hermit_run_guard();
@@ -212,6 +428,7 @@ pub(super) fn run(mode: &str) {
                 "-Werror",
                 "-fno-pie",
                 "-no-pie",
+                "-pthread",
             ])
             .arg(&fixture)
             .arg("-o")
@@ -317,7 +534,11 @@ pub(super) fn run(mode: &str) {
             })
             .collect();
         assert_eq!(paths.len(), 1, "one retained full log per actual guest");
-        assert!(!bounded_read(&paths[0], 64 * MIB).is_empty());
+        let full_log = bounded_read(&paths[0], 64 * MIB);
+        assert!(!full_log.is_empty());
+        if mode == "errors" {
+            assert_ignored_signal_trace(&full_log, &stdout);
+        }
     }
     assert!(
         Instant::now() < deadline,
