@@ -9053,7 +9053,7 @@ backends_disabled:
                 let host = dir.display().to_string();
                 let guest = vec![
                     format!("{host}/fixtures/program"),
-                    format!("{host}/home/.rc"),
+                    format!("{host}/home/test/.rc"),
                     format!("{host}/xdg-config"),
                     // Embedded and look-alike paths are not rewritten.
                     format!("--input={host}/fixtures/data"),
@@ -9091,7 +9091,7 @@ backends_disabled:
                 reference.guest_argv,
                 vec![
                     "/tmp/e2e/fixtures/program".to_string(),
-                    "/tmp/e2e/home/.rc".to_string(),
+                    "/tmp/e2e/home/test/.rc".to_string(),
                     "/tmp/e2e/xdg-config".to_string(),
                     format!("--input={reference_dir}/fixtures/data"),
                     format!("{reference_dir}/fixtures-extra"),
