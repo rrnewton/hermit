@@ -26,10 +26,12 @@
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
-//! The pre-fold numbers are embedded, not recomputed: they were measured at the
-//! last commit that declared backend-parity-c,
-//! e8007f971a72c5fd92fcf3e17e41f38811c3cac3, and a later change that moves a
-//! count has to change this file and say why.
+//! The pre-fold numbers are embedded, not recomputed: they were measured at
+//! e8007f971a72c5fd92fcf3e17e41f38811c3cac3. The fold's parent on main is
+//! 3f66a249b30fada86b81e722b8e5439ac0789f8e, the last commit that declared
+//! backend-parity-c; the plan, the cell table and both manifests are
+//! byte-identical at the two commits. A later change that moves a count has to
+//! change this file and say why.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -43,7 +45,7 @@ use serde_yaml::Value;
 
 const RETIRED_BUCKET: &str = "backend-parity-c";
 const SUCCESSOR_BUCKET: &str = "c-programs";
-const LAST_LIVE_COMMIT: &str = "e8007f971a72c5fd92fcf3e17e41f38811c3cac3";
+const LAST_LIVE_COMMIT: &str = "3f66a249b30fada86b81e722b8e5439ac0789f8e";
 const FOLDED_TESTS: usize = 104;
 
 /// Every successor that is not the plain prefix rename, and why. c-programs
