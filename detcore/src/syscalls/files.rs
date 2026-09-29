@@ -60,6 +60,7 @@ use crate::resources::Resources;
 use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
+use crate::syscalls::threads::sigchld_eligibility_is_tracked;
 use crate::tool_global::*;
 use crate::tool_local::CapturedDetFdInstallError;
 use crate::tool_local::Detcore;
@@ -4397,13 +4398,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Fail closed unless Detcore models this descriptor as a pidfd. This also
         // yields a deterministic EBADF for an unknown/closed descriptor.
-        let is_pidfd = guest
-            .thread_state()
-            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
+        let (is_pidfd, target) = guest.thread_state().with_detfd(pidfd, |detfd| {
+            (matches!(detfd.ty(), FdType::Pidfd), detfd.pidfd_target())
+        })?;
         if !is_pidfd {
             return Err(Errno::EBADF.into());
         }
-        Ok(self.record_or_replay(guest, call).await?)
+        let signal = match call {
+            Syscall::Other(_, args) => args.arg1 as i32,
+            _ => 0,
+        };
+        let value = self.record_or_replay(guest, call).await?;
+        if signal == libc::SIGCHLD
+            && let Some(target) = target
+            && target != guest.thread_state().dettid
+            && sigchld_eligibility_is_tracked(guest)
+        {
+            // Queued on the target process's shared queue in this turn, so a gated
+            // wait there may count it (see `eligible_pending_signals`;
+            // https://github.com/rrnewton/hermit/issues/3146).
+            sigchld_eligibility(
+                guest,
+                SigchldEligibilityRequest::Mark {
+                    thread: target,
+                    process: Some(target),
+                },
+            )
+            .await;
+        }
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
