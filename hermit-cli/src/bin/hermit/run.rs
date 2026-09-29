@@ -2500,6 +2500,17 @@ fn strict_help_describes_compatibility_and_opt_outs() {
 }
 
 #[test]
+fn only_instrumented_ptrace_family_runs_depend_on_host_perf() {
+    let default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    assert!(default.arms_reverie_ptrace_pmu_timer());
+    let namespace_only = RunOpts::parse_from(["fakehermit", "--namespace-only", "fakeprog"]);
+    assert_eq!(namespace_only.selected_backend(), Backend::Ptrace);
+    assert!(!namespace_only.arms_reverie_ptrace_pmu_timer());
+    let kvm = RunOpts::parse_from(["fakehermit", "--backend=kvm", "fakeprog"]);
+    assert!(!kvm.arms_reverie_ptrace_pmu_timer());
+}
+
+#[test]
 fn display_runopts_without_perf_support() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
     ro.validate_args_with_perf_support(false).unwrap();
@@ -3308,13 +3319,25 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let perf_supported = match self.selected_backend() {
-            Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
-                reverie_ptrace::is_perf_supported()
-            }
-            Backend::Dbt | Backend::Sabre | Backend::Kvm => true,
-        };
+        let perf_supported =
+            !self.arms_reverie_ptrace_pmu_timer() || reverie_ptrace::is_perf_supported();
         self.validate_args_with_perf_support(perf_supported)
+    }
+
+    /// Whether this run would arm Reverie ptrace's PMU timer for
+    /// `--max-timeslice`, and so depends on host `perf_event_open` support.
+    ///
+    /// `--namespace-only` execs the guest directly without any instrumentation
+    /// backend (see `run_with_namespace_only`), so it never arms that timer even
+    /// though `selected_backend()` still reports the ptrace default. Probing perf
+    /// for it would print a `--max-timeslice` downgrade warning about a timer the
+    /// run never uses.
+    fn arms_reverie_ptrace_pmu_timer(&self) -> bool {
+        !self.namespace_only
+            && match self.selected_backend() {
+                Backend::Ptrace | Backend::Liteinst | Backend::E9patch => true,
+                Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
+            }
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
