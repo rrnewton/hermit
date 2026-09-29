@@ -18551,7 +18551,16 @@ fn self_test() -> Result<(), String> {
     // disabled same-backend row for that identical coordinate must remain
     // excluded. Calling the readers/folders directly cannot prove that the
     // front-door eligibility sets and write-back path agree.
-    let command_tracked: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
+    //
+    // The pinned corpus predates the backend-parity-c fold
+    // (https://github.com/rrnewton/hermit/issues/3301, slice S6), so the raw
+    // fixture cells.json still names every folded cell by its retired id.
+    // Select cells from the history exactly as both commands read it
+    // (`load_existing`, which resolves retired ids through retired-ids.json):
+    // the raw document would compare a live id with a retired one.
+    let command_history: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
+    let command_tracked =
+        load_existing(&result_command_root)?.ok_or("front-door fixture ledger has no history")?;
     let command_parity_id = command_tracked
         .cells
         .iter()
@@ -18623,6 +18632,89 @@ fn self_test() -> Result<(), String> {
         )))
     };
 
+    // The parity retirement fixture below needs an existing, applicable KVM
+    // cell for `c-programs/readdir-order-identity`. The pinned corpus records
+    // that cell under its pre-fold id `backend-parity-c/readdir-order-identity`
+    // (https://github.com/rrnewton/hermit/issues/3301), so the cell must be
+    // found through retired-ids.json: the raw history must hold only the
+    // retired id, and the history as the commands read it must hold the live
+    // id with the retired cell's status and every one of its observations.
+    let import_parity_id = CellId {
+        lane: "portable".into(),
+        category: "c-programs".into(),
+        test: "c-programs/readdir-order-identity".into(),
+        mode: "verify".into(),
+        backend: "kvm".into(),
+    };
+    let retired_import_parity_id = CellId {
+        category: "backend-parity-c".into(),
+        test: "backend-parity-c/readdir-order-identity".into(),
+        ..import_parity_id.clone()
+    };
+    if retired_ids().successor(&retired_import_parity_id.test)
+        != Some(import_parity_id.test.as_str())
+        || resolve_cell_id(&retired_import_parity_id) != import_parity_id
+    {
+        return Err(format!(
+            "retired-ids.json must map {} to {}",
+            retired_import_parity_id.test, import_parity_id.test
+        ));
+    }
+    let raw_import_parity = command_history
+        .cells
+        .iter()
+        .find(|cell| cell.id == retired_import_parity_id)
+        .filter(|cell| cell.status != CellStatus::NotApplicable && !cell.observations.is_empty());
+    let resolved_import_parity = command_tracked
+        .cells
+        .iter()
+        .find(|cell| cell.id == import_parity_id && cell.status != CellStatus::NotApplicable);
+    let pre_fold_observations = match (raw_import_parity, resolved_import_parity) {
+        (Some(raw), Some(resolved))
+            if resolved.status == raw.status
+                && resolved.observations == raw.observations
+                && !command_history
+                    .cells
+                    .iter()
+                    .any(|cell| cell.id == import_parity_id)
+                && !command_tracked
+                    .cells
+                    .iter()
+                    .any(|cell| cell.id.category == retired_import_parity_id.category) =>
+        {
+            raw.observations.clone()
+        }
+        _ => {
+            return Err(format!(
+                "parity retirement fixture requires the existing applicable KVM cell: the pre-fold history must hold {} (applicable, observed) and not {}, and the history as read must resolve it to {} with every observation (raw retired cell present: {}, resolved live cell present: {})",
+                retired_import_parity_id.test,
+                import_parity_id.test,
+                import_parity_id.test,
+                raw_import_parity.is_some(),
+                resolved_import_parity.is_some(),
+            ));
+        }
+    };
+    // After a public command writes the history back, no cell may still carry
+    // a retired id and the live cell must keep every pre-fold observation: a
+    // front door that re-keyed only the rows it imported, or wrote the raw
+    // pre-fold document back, would split one test across two cells.
+    let joined_pre_fold_history = |cells: &TrackedCells| {
+        cells
+            .cells
+            .iter()
+            .all(|cell| resolve_cell_id(&cell.id) == cell.id)
+            && cells
+                .cells
+                .iter()
+                .find(|cell| cell.id == import_parity_id)
+                .is_some_and(|cell| {
+                    pre_fold_observations
+                        .iter()
+                        .all(|observation| cell.observations.contains(observation))
+                })
+    };
+
     let parity_observed = run_result_command("observe-results", None)?;
     if !parity_observed.status.success()
         || !front_door_admitted_only_parity(&read_json(&fixture_ledger.join(LEDGER_CELLS))?)
@@ -18632,6 +18724,12 @@ fn self_test() -> Result<(), String> {
             "observe-results front door did not admit only the typed disabled parity row: stdout={:?} stderr={:?}",
             String::from_utf8_lossy(&parity_observed.stdout),
             String::from_utf8_lossy(&parity_observed.stderr)
+        ));
+    }
+    if !joined_pre_fold_history(&read_json(&fixture_ledger.join(LEDGER_CELLS))?) {
+        return Err(format!(
+            "observe-results front door did not join the pre-fold history onto live ids: a retired id survived the write-back or {} lost a pre-fold observation",
+            import_parity_id.test
         ));
     }
     restore_generated()?;
@@ -18647,25 +18745,19 @@ fn self_test() -> Result<(), String> {
             String::from_utf8_lossy(&parity_imported.stderr)
         ));
     }
+    if !joined_pre_fold_history(&read_json(&fixture_ledger.join(LEDGER_CELLS))?) {
+        return Err(format!(
+            "import-results front door did not join the pre-fold history onto live ids: a retired id survived the write-back or {} lost a pre-fold observation",
+            import_parity_id.test
+        ));
+    }
     restore_generated()?;
 
     // Parity and ordinary repeatability share a cell, not a comparison. These
     // controls use both actual readers and the public importer/observer in the
     // owned fixture clone, with authentic typed fixture report bytes/hashes.
-    let import_parity_id = CellId {
-        lane: "portable".into(),
-        category: "c-programs".into(),
-        test: "c-programs/readdir-order-identity".into(),
-        mode: "verify".into(),
-        backend: "kvm".into(),
-    };
-    if !command_tracked
-        .cells
-        .iter()
-        .any(|cell| cell.id == import_parity_id && cell.status != CellStatus::NotApplicable)
-    {
-        return Err("parity retirement fixture requires the existing applicable KVM cell".into());
-    }
+    // `import_parity_id` and its retired-id precondition are established
+    // above, before the front-door commands run.
 
     // The combined writer must bind each parity receipt to its current result
     // digest before treating another outer attempt as independent evidence.
