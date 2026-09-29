@@ -746,7 +746,7 @@ const LAST_LIVE_HOSTED_PARITY_SELECTOR: &str = r########"export PATH="$PWD/ci/ru
 
 /// The retired backend-parity-c id of every live id the fold renamed.
 fn folded_ids() -> BTreeMap<String, String> {
-    let root = crate::validation_dag::repo_root().unwrap();
+    let root = crate::git_environment::checkout_root();
     let retired = crate::retired_ids::RetiredIds::load(&root).unwrap();
     let retirement = retired.retirement("backend-parity-c").unwrap();
     assert_eq!(
@@ -919,7 +919,7 @@ fn restore_pre_exclusion_ownership(cfg: &mut DagConfig, generated: &DagConfig) {
 // the live graph through retired-ids.json with the selector bytes that the last
 // pre-fold generator emitted.
 fn generated_plan_populations_preserve_command_policy() {
-    let root = crate::validation_dag::repo_root().unwrap();
+    let root = crate::git_environment::checkout_root();
     let generated = crate::validation_dag::generate(&root).unwrap();
     assert_eq!(
         crate::validation_dag::canonical_text(&generated),
@@ -1714,7 +1714,7 @@ fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
 /// export.
 #[test]
 fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
-    let root = crate::validation_dag::repo_root().unwrap();
+    let root = crate::git_environment::checkout_root();
     let generated = crate::validation_dag::generate(&root).unwrap();
     // Slice S6 of https://github.com/rrnewton/hermit/issues/3301 then folded
     // the two parity selectors into the c-programs pair, which selects no

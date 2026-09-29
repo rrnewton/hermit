@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Exercise the actual dispatcher against independent Git fixture repositories.
 set -euo pipefail
+# Git exports its repository-location variables to hooks and `git rebase
+# --exec` steps, and they override `git -C`. Every repository below is named
+# explicitly, so run without them; otherwise a scratch `git init` rewrites the
+# caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
 SOURCE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 scratch=$(mktemp -d /tmp/hermit-rust-script-ownership.XXXXXXXX)

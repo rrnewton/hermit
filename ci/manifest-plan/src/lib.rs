@@ -6,6 +6,7 @@ pub mod ci_selection;
 pub mod cli_help;
 pub mod cpu_evidence;
 pub mod environmental_block;
+mod git_environment;
 pub mod host_capability;
 pub mod ledger;
 #[path = "../../../hermit-cli/src/logdiff_report.rs"]

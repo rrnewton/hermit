@@ -219,8 +219,14 @@ fn file_identity(path: &Path, executable: bool) -> Result<FileIdentity, String> 
     })
 }
 
+/// Run git in `root` itself.
+///
+/// The preparation identity must describe the checkout this tool was pointed
+/// at. An inherited `GIT_DIR` would make these reads describe the caller's
+/// repository instead, and the scratch fixtures that exercise this function
+/// would write into it (https://github.com/rrnewton/hermit/issues/3362).
 fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let result = Command::new("git")
+    let result = crate::git_environment::git_command()
         .args(args)
         .current_dir(root)
         .output()
@@ -2260,7 +2266,7 @@ mod tests {
             .find(|candidate| candidate.join(".git").exists())
             .expect("locating the repository root by .git")
             .to_path_buf();
-        let output = Command::new("git")
+        let output = crate::git_environment::git_command()
             .arg("-C")
             .arg(&candidate)
             .args(["rev-parse", "--show-toplevel"])
@@ -2280,7 +2286,7 @@ mod tests {
     }
 
     fn is_ignored(root: &Path, relative: &str) -> bool {
-        Command::new("git")
+        crate::git_environment::git_command()
             .arg("-C")
             .arg(root)
             .args(["check-ignore", "-q", relative])
@@ -2341,5 +2347,323 @@ mod tests {
             "a stray summary in the repository root is ignored, so a leak there \
              would no longer be visible to source accounting"
         );
+    }
+
+    /// The git repository-location variables this regression exports into a
+    /// child test run. Listed here rather than borrowed from the code under
+    /// test, so that shrinking the production list cannot also shrink the test.
+    const INHERITED_LOCATION_VARIABLES: [&str; 8] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ];
+
+    /// Git for this regression's own bookkeeping: never steered by the
+    /// environment the test itself was started in.
+    fn bookkeeping_command(directory: &Path) -> Command {
+        let mut command = Command::new("git");
+        for name in INHERITED_LOCATION_VARIABLES {
+            command.env_remove(name);
+        }
+        command.current_dir(directory);
+        command
+    }
+
+    fn bookkeeping_git(directory: &Path, args: &[&str]) -> Vec<u8> {
+        let output = bookkeeping_command(directory)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .expect("running bookkeeping git");
+        assert!(
+            output.status.success(),
+            "bookkeeping git {args:?} in {} failed: {}",
+            directory.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// A disposable repository standing in for the one `git rebase --exec` or a
+    /// hook would name. It has a linked worktree because that is the incident's
+    /// shape: `GIT_DIR` naming `.git/worktrees/<name>`, a directory not called
+    /// `.git`, is what made `git init` record `core.bare = true` in the shared
+    /// configuration and break every work-tree command in the main checkout.
+    struct Throwaway {
+        root: PathBuf,
+        main: PathBuf,
+        linked: PathBuf,
+        linked_git_dir: PathBuf,
+    }
+
+    impl Throwaway {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "hermit-git-location-throwaway-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let main = root.join("main");
+            let linked = root.join("linked");
+            fs::create_dir_all(&main).unwrap();
+            bookkeeping_git(&main, &["init", "-q"]);
+            fs::write(main.join("tracked"), "throwaway\n").unwrap();
+            bookkeeping_git(&main, &["add", "tracked"]);
+            bookkeeping_git(&main, &["commit", "-qm", "throwaway"]);
+            bookkeeping_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                ],
+            );
+            let linked_git_dir = PathBuf::from(
+                String::from_utf8(bookkeeping_git(
+                    &linked,
+                    &["rev-parse", "--absolute-git-dir"],
+                ))
+                .unwrap()
+                .trim(),
+            );
+            assert_ne!(
+                linked_git_dir.file_name().unwrap(),
+                ".git",
+                "the throwaway must reproduce a GIT_DIR that is not named .git"
+            );
+            Self {
+                root,
+                main,
+                linked,
+                linked_git_dir,
+            }
+        }
+
+        /// HEAD, every ref, both indexes and the configuration, byte for byte,
+        /// plus git's own reading of core.bare and of each HEAD.
+        fn snapshot(&self) -> BTreeMap<String, Vec<u8>> {
+            let mut state = BTreeMap::new();
+            let common = self.main.join(".git");
+            let mut files = vec![
+                common.join("HEAD"),
+                common.join("config"),
+                common.join("index"),
+                common.join("packed-refs"),
+                self.linked_git_dir.join("HEAD"),
+                self.linked_git_dir.join("index"),
+                self.linked_git_dir.join("config.worktree"),
+                self.linked.join(".git"),
+            ];
+            let mut pending = vec![common.join("refs")];
+            while let Some(directory) = pending.pop() {
+                for entry in fs::read_dir(&directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+            for file in files {
+                let key = file.strip_prefix(&self.root).unwrap().display().to_string();
+                match fs::read(&file) {
+                    Ok(bytes) => state.insert(key, bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        state.insert(key, b"<absent>".to_vec())
+                    }
+                    Err(error) => panic!("reading {}: {error}", file.display()),
+                };
+            }
+            // Absent, false and true must all stay distinguishable, so this
+            // records the exit status as well as the value.
+            let bare = bookkeeping_command(&self.main)
+                .args(["config", "--get", "core.bare"])
+                .output()
+                .unwrap();
+            state.insert(
+                "git config --get core.bare".into(),
+                format!(
+                    "{:?} {}",
+                    bare.status.code(),
+                    String::from_utf8_lossy(&bare.stdout)
+                )
+                .into_bytes(),
+            );
+            for (label, directory) in [("main", &self.main), ("linked", &self.linked)] {
+                state.insert(
+                    format!("{label}: git rev-parse HEAD"),
+                    bookkeeping_git(directory, &["rev-parse", "HEAD"]),
+                );
+            }
+            state.insert(
+                "git for-each-ref".into(),
+                bookkeeping_git(&self.main, &["for-each-ref"]),
+            );
+            state
+        }
+    }
+
+    impl Drop for Throwaway {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3362: this module's
+    /// scratch-repository tests, and the helpers that ask git about this
+    /// checkout, must not act on a repository named by an inherited Git
+    /// location variable.
+    ///
+    /// `git rebase --exec` exports `GIT_DIR` to the commands it runs, and hooks
+    /// get `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`. On hermit main
+    /// 6be37a833d a `cargo test -p hermit-manifest-plan --lib` run under
+    /// `rebase --exec` committed six "fixture" commits onto a real worktree
+    /// and set `core.bare = true` in the shared hermit configuration for five
+    /// minutes.
+    ///
+    /// Each case re-runs the representative tests in a child process of this
+    /// test binary with one variable, or the `GIT_WORK_TREE` and
+    /// `GIT_INDEX_FILE` pair that hooks get together, pointing into a
+    /// throwaway repository. It then requires both that the child passed and
+    /// that the throwaway is byte-identical afterwards. The environment goes
+    /// to the child only; this process never exports it, so concurrently
+    /// running tests are unaffected.
+    #[test]
+    fn scratch_repository_tests_ignore_inherited_git_location_variables() {
+        const CHILD_TESTS: [&str; 3] = [
+            "nextest_binaries::tests::changed_tracked_and_untracked_sources_change_the_identity",
+            "nextest_binaries::tests::a_disposable_run_summary_is_not_source_but_a_stray_one_still_is",
+            "nextest_binaries::tests::the_repository_really_ignores_the_disposable_directory",
+        ];
+        // An unrelated repository, used only to prove that each variable
+        // really reaches git in the child's environment. Without this control
+        // a misspelled variable would make every case pass vacuously.
+        let probe = Throwaway::new();
+        type CaseValue = fn(&Throwaway) -> PathBuf;
+        let variables: [(&str, CaseValue, &[&str]); 3] = [
+            (
+                "GIT_DIR",
+                |throwaway| throwaway.linked_git_dir.clone(),
+                &["rev-parse", "--absolute-git-dir"],
+            ),
+            (
+                "GIT_WORK_TREE",
+                |throwaway| throwaway.linked.clone(),
+                &["rev-parse", "--show-toplevel"],
+            ),
+            (
+                "GIT_INDEX_FILE",
+                |throwaway| throwaway.linked_git_dir.join("index"),
+                &["rev-parse", "--git-path", "index"],
+            ),
+        ];
+        // Each variable alone, then the pair that hooks get together.
+        let cases: [&[&str]; 4] = [
+            &["GIT_DIR"],
+            &["GIT_WORK_TREE"],
+            &["GIT_INDEX_FILE"],
+            &["GIT_WORK_TREE", "GIT_INDEX_FILE"],
+        ];
+        // Every case runs before anything is asserted, so a failure names
+        // each variable that still leaks rather than only the first. Each case
+        // gets its own throwaway, so one case's damage cannot hide another's.
+        let mut failures = Vec::new();
+        for names in cases {
+            let throwaway = Throwaway::new();
+            let mut inherited = Vec::new();
+            for name in names {
+                let (_, value, control) = variables
+                    .iter()
+                    .find(|(variable, _, _)| variable == name)
+                    .expect("every case names a listed variable");
+                let value = value(&throwaway);
+                let live = bookkeeping_command(&probe.main)
+                    .env(name, &value)
+                    .args(*control)
+                    .output()
+                    .unwrap();
+                let answer = PathBuf::from(String::from_utf8_lossy(&live.stdout).trim());
+                assert_eq!(
+                    answer.canonicalize().ok(),
+                    value.canonicalize().ok(),
+                    "control: {name} did not steer an unisolated git; stderr: {}",
+                    String::from_utf8_lossy(&live.stderr)
+                );
+                inherited.push((*name, value));
+            }
+            let described = inherited
+                .iter()
+                .map(|(name, value)| format!("{name}={}", value.display()))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let before = throwaway.snapshot();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            for other in INHERITED_LOCATION_VARIABLES {
+                child.env_remove(other);
+            }
+            let output = child
+                .envs(inherited.iter().map(|(name, value)| (*name, value)))
+                .args(["--exact", "--test-threads=1"])
+                .args(CHILD_TESTS)
+                .output()
+                .expect("re-running this test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let after = throwaway.snapshot();
+            let show = |bytes: Option<&Vec<u8>>| match bytes {
+                None => "<missing>".to_string(),
+                Some(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(text) => format!("{text:?}"),
+                    Err(_) => format!("{} bytes sha256 {:x}", bytes.len(), Sha256::digest(bytes)),
+                },
+            };
+            let changed: Vec<_> = before
+                .keys()
+                .chain(after.keys())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|key| before.get(*key) != after.get(*key))
+                .map(|key| {
+                    format!(
+                        "  {key}: {} -> {}",
+                        show(before.get(key)),
+                        show(after.get(key))
+                    )
+                })
+                .collect();
+            if !changed.is_empty() {
+                failures.push(format!(
+                    "with {described} the scratch-repository tests wrote into the named \
+                     repository:\n{}",
+                    changed.join("\n")
+                ));
+            }
+            if !(output.status.success()
+                && stdout.contains(&format!(
+                    "test result: ok. {} passed; 0 failed",
+                    CHILD_TESTS.len()
+                )))
+            {
+                failures.push(format!(
+                    "with {described} the representative tests did not all run and \
+                     pass:\n{stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     }
 }

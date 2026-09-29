@@ -1314,6 +1314,19 @@ fn make_gcc_build_is_l1_deterministic_under_strict() {
 // ---------------------------------------------------------------------------
 // Git subprocess/pipe/pack-negotiation coverage.
 
+/// Git's repository-location variables. Each overrides the directory git was
+/// pointed at, so the git fixture below runs without them.
+const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
 /// Build a tiny two-commit Git repository with a fixed identity and fixed
 /// author/committer dates so the fixture is byte-reproducible across hosts and
 /// independent of host `git` config and wall-clock time. Returns the path to
@@ -1332,6 +1345,14 @@ fn build_git_fixture(git: &Path, dir: &Path) -> PathBuf {
     // same regardless of who runs the test.
     let git_command = |args: &[&str]| -> Command {
         let mut command = Command::new(git);
+        // Git exports its repository-location variables to hooks and `git
+        // rebase --exec` steps, and they override the working directory. An
+        // inherited GIT_DIR would point this fixture's `git init` and commits
+        // at the caller's repository
+        // (https://github.com/rrnewton/hermit/issues/3362).
+        for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+            command.env_remove(name);
+        }
         command
             .current_dir(&src)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1405,10 +1426,14 @@ fn git_clone_file_protocol_is_l1_deterministic_under_strict() {
         // never mask nondeterminism and no path is embedded in the comparison.
         let dest = dir.join(format!("dest{run}"));
         let _ = fs::remove_dir_all(&dest);
+        // The guest inherits the host environment, so the clone and the HEAD
+        // lookup drop the same location variables as the fixture.
         let script = format!(
-            "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            "unset {location}; \
+             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
              '{git}' clone -q 'file://{src}' '{dest}' && \
              '{git}' -C '{dest}' rev-parse HEAD",
+            location = GIT_REPOSITORY_LOCATION_VARIABLES.join(" "),
             git = git.display(),
             src = src.display(),
             dest = dest.display(),

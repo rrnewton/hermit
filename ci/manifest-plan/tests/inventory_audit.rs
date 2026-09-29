@@ -28,8 +28,30 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Git exports these to hooks and `git rebase --exec` steps, and they override
+/// the working directory. Every command below names the checkout by its
+/// working directory and the index by `GIT_INDEX_FILE`, so run without the
+/// inherited ones (https://github.com/rrnewton/hermit/issues/3362).
+const REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+fn without_location_variables(mut command: Command) -> Command {
+    for name in REPOSITORY_LOCATION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn run_audit(root: &Path, index: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_test-harness"))
+    without_location_variables(Command::new(env!("CARGO_BIN_EXE_test-harness")))
         .arg("audit-inventory")
         .current_dir(root)
         .env("GIT_INDEX_FILE", index)
@@ -40,7 +62,7 @@ fn run_audit(root: &Path, index: &Path) -> Output {
 #[test]
 fn audit_inventory_refuses_an_unregistered_test_file() {
     let root = repo_root();
-    let git_index = Command::new("git")
+    let git_index = without_location_variables(Command::new("git"))
         .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
         .current_dir(&root)
         .output()
@@ -71,7 +93,7 @@ fn audit_inventory_refuses_an_unregistered_test_file() {
         String::from_utf8_lossy(&control.stderr)
     );
 
-    let update = Command::new("git")
+    let update = without_location_variables(Command::new("git"))
         .args([
             "update-index",
             "--add",

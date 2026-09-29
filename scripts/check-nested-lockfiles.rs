@@ -234,17 +234,56 @@ mod tests {
 
     use super::*;
 
+    /// Remove git's repository-location variables from `command`. Git exports
+    /// them to hooks and `git rebase --exec` steps, and each overrides the
+    /// working directory, so an inherited `GIT_DIR` would send a fixture's
+    /// `git init` and commit into the caller's repository
+    /// (https://github.com/rrnewton/hermit/issues/3362). The production
+    /// scripts these tests run on a fixture call git from the fixture root, so
+    /// they drop the same variables.
+    fn without_repository_location(command: &mut Command) -> &mut Command {
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    }
+
+    /// A git command for a scratch fixture.
+    fn fixture_git() -> Command {
+        let mut command = Command::new("git");
+        without_repository_location(&mut command);
+        command
+    }
+
     fn split_validate_dry_run(args: &[&str]) -> std::process::Output {
-        let root = git_root().unwrap_or_else(|_| {
-            Path::new(file!())
-                .canonicalize()
-                .expect("checker source path")
-                .parent()
-                .and_then(Path::parent)
-                .expect("checker lives under the repository scripts directory")
-                .to_owned()
-        });
-        Command::new(root.join("ci/hermetic/run-split-validate.sh"))
+        // `git_root` is the production lookup and follows an inherited
+        // GIT_DIR, which would name the test's working directory instead.
+        let root = fixture_git()
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+            .unwrap_or_else(|| {
+                Path::new(file!())
+                    .canonicalize()
+                    .expect("checker source path")
+                    .parent()
+                    .and_then(Path::parent)
+                    .expect("checker lives under the repository scripts directory")
+                    .to_owned()
+            });
+        let mut command = Command::new(root.join("ci/hermetic/run-split-validate.sh"));
+        without_repository_location(&mut command)
             .args(args)
             .arg("--dry-run")
             .current_dir(root)
@@ -566,19 +605,19 @@ esac
 "#,
         );
 
-        let init = Command::new("git")
+        let init = fixture_git()
             .args(["init", "-q"])
             .current_dir(&root)
             .status()
             .expect("initialize fixture repository");
         assert!(init.success());
-        let add = Command::new("git")
+        let add = fixture_git()
             .args(["add", "fixture.rs"])
             .current_dir(&root)
             .status()
             .expect("stage rust-script fixture");
         assert!(add.success());
-        let commit = Command::new("git")
+        let commit = fixture_git()
             .args([
                 "-c",
                 "user.name=fixture",
@@ -609,7 +648,7 @@ esac
         )
         .expect("join fixture PATH");
         let mut command = Command::new(fixture.root.join("ci/hermetic/run-split-validate.sh"));
-        command
+        without_repository_location(&mut command)
             .args(["--out", "phase-output", "--shards", "unit"])
             .current_dir(&fixture.root)
             .env("PATH", path)
@@ -708,7 +747,8 @@ esac
                     .chain(env::split_paths(&env::var_os("PATH").unwrap())),
             )
             .unwrap();
-            let output = Command::new(fixture.root.join("ci/prepare-rust-scripts.sh"))
+            let mut producer = Command::new(fixture.root.join("ci/prepare-rust-scripts.sh"));
+            let output = without_repository_location(&mut producer)
                 .current_dir(&fixture.root)
                 .env("PATH", path)
                 .env(

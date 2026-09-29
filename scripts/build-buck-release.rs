@@ -7605,6 +7605,38 @@ mod tests {
 
     use super::*;
 
+    /// A git command for a test fixture. Git exports its repository-location
+    /// variables to hooks and `git rebase --exec` steps, and each overrides
+    /// the directory git was pointed at, so an inherited `GIT_DIR` would send
+    /// a fixture's `git init` and commit into the caller's repository
+    /// (https://github.com/rrnewton/hermit/issues/3362). The first call also
+    /// forgets them for the rest of the test process, so this tool's own
+    /// `git` helper, which the tests then run on the fixture, resolves the
+    /// fixture by directory too.
+    fn fixture_git() -> Command {
+        const LOCATION: [&str; 8] = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ];
+        static FORGET: std::sync::Once = std::sync::Once::new();
+        FORGET.call_once(|| {
+            for name in LOCATION {
+                env::remove_var(name);
+            }
+        });
+        let mut command = Command::new("git");
+        for name in LOCATION {
+            command.env_remove(name);
+        }
+        command
+    }
+
     fn fixture_root(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "build-buck-release-{label}-{}",
@@ -8507,17 +8539,17 @@ mod tests {
         .unwrap();
         fs::write(root.join("reverie/pin"), b"fixture\n").unwrap();
         checked_output(
-            Command::new("git").current_dir(&root).args(["init", "-q"]),
+            fixture_git().current_dir(&root).args(["init", "-q"]),
             "git init",
         )
         .unwrap();
         checked_output(
-            Command::new("git").current_dir(&root).args(["add", "."]),
+            fixture_git().current_dir(&root).args(["add", "."]),
             "git add fixture",
         )
         .unwrap();
         checked_output(
-            Command::new("git").current_dir(&root).args([
+            fixture_git().current_dir(&root).args([
                 "-c",
                 "user.name=test",
                 "-c",
@@ -9454,10 +9486,10 @@ esac
             "compile fixture Buck release ELF",
         )
         .unwrap();
-        checked_output(Command::new("git").current_dir(&root).arg("init"), "init fixture Git repository").unwrap();
-        checked_output(Command::new("git").current_dir(&root).args(["add", "ci", "candidate-hermit", "candidate.c"]), "stage fixture repository").unwrap();
+        checked_output(fixture_git().current_dir(&root).arg("init"), "init fixture Git repository").unwrap();
+        checked_output(fixture_git().current_dir(&root).args(["add", "ci", "candidate-hermit", "candidate.c"]), "stage fixture repository").unwrap();
         checked_output(
-            Command::new("git").current_dir(&root).args([
+            fixture_git().current_dir(&root).args([
                 "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
                 "commit", "-m", "fixture",
             ]),
@@ -10439,20 +10471,18 @@ esac
         let root = fixture_root("git-untracked");
         fs::create_dir(&root).unwrap();
         checked_output(
-            Command::new("git").current_dir(&root).args(["init", "-q"]),
+            fixture_git().current_dir(&root).args(["init", "-q"]),
             "git init",
         )
         .unwrap();
         fs::write(root.join(".gitignore"), "ignored\n").unwrap();
         checked_output(
-            Command::new("git")
-                .current_dir(&root)
-                .args(["add", ".gitignore"]),
+            fixture_git().current_dir(&root).args(["add", ".gitignore"]),
             "git add",
         )
         .unwrap();
         checked_output(
-            Command::new("git").current_dir(&root).args([
+            fixture_git().current_dir(&root).args([
                 "-c",
                 "user.name=test",
                 "-c",

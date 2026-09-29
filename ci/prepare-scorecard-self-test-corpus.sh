@@ -16,6 +16,12 @@
 # commit's tree and the two pinned blobs, and prints the directory on stdout only
 # after every object has been verified locally without lazy fetching.
 set -euo pipefail
+# Git exports its repository-location variables to hooks and `git rebase
+# --exec` steps, and they override `git -C`. Every repository below is named
+# explicitly, so run without them; otherwise a scratch `git init` rewrites the
+# caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
 if [ "$#" -ne 1 ] || [ ! -d "$1" ]; then
     echo "usage: $0 PARENT_DIR (an existing directory)" >&2

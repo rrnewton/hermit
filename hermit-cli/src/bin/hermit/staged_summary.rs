@@ -1014,8 +1014,29 @@ mod tests {
 
     #[test]
     fn summary_staging_stays_outside_prepared_source_enumeration() {
+        /// Git exports its repository-location variables to hooks and `git
+        /// rebase --exec` steps, and they override the working directory.
+        /// An inherited GIT_DIR would point this fixture's `git init` at the
+        /// caller's repository
+        /// (https://github.com/rrnewton/hermit/issues/3362).
+        fn fixture_git() -> std::process::Command {
+            let mut command = std::process::Command::new("git");
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_PREFIX",
+            ] {
+                command.env_remove(name);
+            }
+            command
+        }
         fn source_files(root: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
-            let output = std::process::Command::new("git")
+            let output = fixture_git()
                 .args([
                     "ls-files",
                     "--cached",
@@ -1066,7 +1087,7 @@ mod tests {
         }
         let fixture = Fixture::new();
         let root = fixture.directory.path();
-        let init = std::process::Command::new("git")
+        let init = fixture_git()
             .args(["init", "--quiet"])
             .current_dir(root)
             .output()

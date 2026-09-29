@@ -704,7 +704,7 @@ fn primary_checkout_for_self_test(root: &Path) -> Result<PathBuf, String> {
         });
     }
 
-    let configured_worktree = Command::new("git")
+    let configured_worktree = git_command()
         .current_dir(root)
         .args(["config", "--path", "--get", "core.worktree"])
         .output()
@@ -745,8 +745,34 @@ fn primary_checkout_for_self_test(root: &Path) -> Result<PathBuf, String> {
     })
 }
 
+/// A `git` that finds its repository from the directory it is run in.
+///
+/// Every git command here names its checkout explicitly: the checkout holding
+/// this script, or a fixture. Git exports its repository-location variables to
+/// hooks and `git rebase --exec` steps, and each overrides the working
+/// directory. Inherited, they would point the primary-checkout guard at
+/// another repository and make the bisect's `checkout --detach --force` move
+/// that repository's HEAD and index; the unit tests' fixture `init` and commits
+/// would write there too (https://github.com/rrnewton/hermit/issues/3362).
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = git_command()
         .current_dir(root)
         .args(args)
         .output()
@@ -1627,7 +1653,7 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) -> String {
-            let output = Command::new("git")
+            let output = git_command()
                 .current_dir(&self.root)
                 .args(args)
                 .output()

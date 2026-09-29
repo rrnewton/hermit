@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+# Git exports its repository-location variables to hooks and `git rebase
+# --exec` steps, and they override `git -C`. Every repository below is named
+# explicitly, so run without them; otherwise a scratch `git init` rewrites the
+# caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
 readonly LEVELDB_REPOSITORY="https://github.com/google/leveldb.git"
 readonly LEVELDB_REVISION="7ee830d02b623e8ffe0b95d59a74db1e58da04c5"

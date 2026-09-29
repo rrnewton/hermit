@@ -7,6 +7,7 @@
 
 """Exercise the actual wrapper's cache mounts without starting a container."""
 
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,24 @@ import unittest
 
 
 WRAPPER = Path(__file__).with_name("run-in-pinned-root.sh")
+
+# Git exports these to hooks and to every `git rebase --exec` step, and they
+# take precedence over `git -C`. Every command below names its repository
+# explicitly, so it runs without them; otherwise a scratch `git init` rewrites
+# the caller's core.bare and a scratch commit moves the caller's HEAD
+# (https://github.com/rrnewton/hermit/issues/3362). GIT_CONFIG_COUNT and its
+# companions carry this host's proxy rewrites and are kept.
+REPOSITORY_LOCATION_VARIABLES = frozenset((
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+    "GIT_PREFIX",
+))
+
+
+def repository_neutral_env():
+    """This process's environment without Git's repository-location variables."""
+    return {name: value for name, value in os.environ.items()
+            if name not in REPOSITORY_LOCATION_VARIABLES}
 
 
 class CargoCacheMounts(unittest.TestCase):
@@ -56,7 +75,7 @@ class CargoCacheMounts(unittest.TestCase):
         fake.chmod(0o755)
 
     def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output", proc_locks_runtime=None, calibration=False):
-        env = os.environ.copy()
+        env = repository_neutral_env()
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
         forwarded = ["--nextest-calibration"] if calibration else []
@@ -359,7 +378,7 @@ class CargoCacheMounts(unittest.TestCase):
     def test_relocates_real_nested_submodule_configs_without_changing_host_metadata(self):
         git_bin = shutil.which("git")
         self.assertIsNotNone(git_bin)
-        git_env = os.environ.copy()
+        git_env = repository_neutral_env()
         git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                        GIT_OPTIONAL_LOCKS="0")
 
@@ -456,7 +475,7 @@ class CargoCacheMounts(unittest.TestCase):
     def test_relocates_nested_linked_worktrees_with_external_common_metadata(self):
         git_bin = shutil.which("git")
         self.assertIsNotNone(git_bin)
-        git_env = os.environ.copy()
+        git_env = repository_neutral_env()
         git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                        GIT_OPTIONAL_LOCKS="0")
 
@@ -558,7 +577,7 @@ class CargoCacheMounts(unittest.TestCase):
     def test_relocates_gitfile_roots_and_common_metadata_without_global_git_overrides(self):
         git_bin = shutil.which("git")
         self.assertIsNotNone(git_bin)
-        git_env = os.environ.copy()
+        git_env = repository_neutral_env()
         git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                        GIT_OPTIONAL_LOCKS="0")
 
@@ -677,6 +696,157 @@ class CargoCacheMounts(unittest.TestCase):
                     self.assertEqual((git(repo, "rev-parse", "HEAD"),
                                       git(repo, "ls-files", "--stage", "-z"),
                                       git(repo, "show", "HEAD:payload")), identities[str(repo)])
+
+
+
+# The git repository-location variables the regression below exports into a
+# child run. Listed separately from the helpers under test so that shrinking
+# their list cannot also shrink this one.
+INHERITED_LOCATION_VARIABLES = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
+
+
+class InheritedGitLocation(unittest.TestCase):
+    """https://github.com/rrnewton/hermit/issues/3362: the scratch-repository
+    tests above must not act on a repository named by an inherited Git
+    location variable.
+
+    `git rebase --exec` exports GIT_DIR to the commands it runs, and hooks get
+    GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE. On hermit main 6be37a833d a
+    `cargo test -p hermit-manifest-plan --lib` run under `rebase --exec` ran
+    this script, whose fixtures then committed "fixture" commits adding
+    `payload` onto a real worktree, and set `core.bare = true` in the shared
+    hermit configuration.
+
+    Each case re-runs the scratch-repository tests in a child process with one
+    variable, or the GIT_WORK_TREE and GIT_INDEX_FILE pair that hooks get
+    together, pointing into a throwaway repository. It then requires both that
+    the child passed and that the throwaway is byte-identical afterwards. The
+    variables go to the child only.
+    """
+
+    CHILD_TESTS = (
+        "CargoCacheMounts.test_relocates_real_nested_submodule_configs_without_changing_host_metadata",
+        "CargoCacheMounts.test_relocates_nested_linked_worktrees_with_external_common_metadata",
+        "CargoCacheMounts.test_relocates_gitfile_roots_and_common_metadata_without_global_git_overrides",
+    )
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory(prefix="hermit-git-location-throwaway-")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.git_bin = shutil.which("git")
+        self.assertIsNotNone(self.git_bin)
+
+    def bookkeeping_env(self):
+        env = {k: v for k, v in os.environ.items() if k not in INHERITED_LOCATION_VARIABLES}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        return env
+
+    def bookkeeping_git(self, directory, *args, check=True):
+        result = subprocess.run(
+            [self.git_bin, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+             "-C", str(directory), *args],
+            env=self.bookkeeping_env(), capture_output=True, timeout=10,
+        )
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return result
+
+    def throwaway(self, name):
+        """A repository with a linked worktree: GIT_DIR naming
+        `.git/worktrees/<name>`, a directory not called `.git`, is what made
+        `git init` record core.bare = true in the shared configuration."""
+        main = self.root / name / "main"
+        linked = self.root / name / "linked"
+        main.mkdir(parents=True)
+        self.bookkeeping_git(main, "init", "-q")
+        (main / "tracked").write_text("throwaway\n")
+        self.bookkeeping_git(main, "add", "tracked")
+        self.bookkeeping_git(main, "commit", "-qm", "throwaway")
+        self.bookkeeping_git(main, "worktree", "add", "-q", "--detach", str(linked))
+        linked_git_dir = Path(self.bookkeeping_git(
+            linked, "rev-parse", "--absolute-git-dir").stdout.decode().strip())
+        self.assertNotEqual(linked_git_dir.name, ".git")
+        return main, linked, linked_git_dir
+
+    def snapshot(self, main, linked, linked_git_dir):
+        common = main / ".git"
+        files = [common / "HEAD", common / "config", common / "index", common / "packed-refs",
+                 linked_git_dir / "HEAD", linked_git_dir / "index",
+                 linked_git_dir / "config.worktree", linked / ".git"]
+        files += sorted(path for path in (common / "refs").rglob("*") if path.is_file())
+        state = {str(path): path.read_bytes() if path.exists() else b"<absent>" for path in files}
+        bare = self.bookkeeping_git(main, "config", "--get", "core.bare", check=False)
+        state["git config --get core.bare"] = (bare.returncode, bare.stdout)
+        for directory in (main, linked):
+            state[f"{directory}: git rev-parse HEAD"] = self.bookkeeping_git(
+                directory, "rev-parse", "HEAD").stdout
+        state["git for-each-ref"] = self.bookkeeping_git(main, "for-each-ref").stdout
+        return state
+
+    def test_scratch_repository_tests_ignore_inherited_git_location_variables(self):
+        # An unrelated repository, used only to prove that each variable really
+        # reaches git in the child's environment. Without it a misspelled
+        # variable would make every case pass vacuously.
+        probe = self.root / "probe"
+        probe.mkdir()
+        self.bookkeeping_git(probe, "init", "-q")
+        controls = {"GIT_DIR": ("rev-parse", "--absolute-git-dir"),
+                    "GIT_WORK_TREE": ("rev-parse", "--show-toplevel"),
+                    "GIT_INDEX_FILE": ("rev-parse", "--git-path", "index")}
+        cases = []
+        # Each variable alone, then the pair that hooks get together.
+        for names in (("GIT_DIR",), ("GIT_WORK_TREE",), ("GIT_INDEX_FILE",),
+                      ("GIT_WORK_TREE", "GIT_INDEX_FILE")):
+            main, linked, linked_git_dir = self.throwaway("+".join(names))
+            values = {"GIT_DIR": linked_git_dir, "GIT_WORK_TREE": linked,
+                      "GIT_INDEX_FILE": linked_git_dir / "index"}
+            inherited = {name: values[name] for name in names}
+            for name, value in inherited.items():
+                live = subprocess.run([self.git_bin, "-C", str(probe), *controls[name]],
+                                      env={**self.bookkeeping_env(), name: str(value)},
+                                      capture_output=True, timeout=10)
+                self.assertEqual(Path(live.stdout.decode().strip()).resolve(), value.resolve(),
+                                 f"control: {name} did not steer an unisolated git: {live.stderr!r}")
+            described = " ".join(f"{name}={value}" for name, value in inherited.items())
+            before = self.snapshot(main, linked, linked_git_dir)
+            # The cases run concurrently: each has its own throwaway.
+            child = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), *self.CHILD_TESTS],
+                env={**self.bookkeeping_env(),
+                     **{name: str(value) for name, value in inherited.items()}},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.addCleanup(lambda child=child: child.poll() is None and child.kill())
+            cases.append((described, (main, linked, linked_git_dir), before, child))
+        # Every case is judged before anything is asserted, so a failure names
+        # each variable that still leaks rather than only the first.
+        failures = []
+        for described, repository, before, child in cases:
+            stdout, stderr = child.communicate(timeout=300)
+            after = self.snapshot(*repository)
+
+            def show(data):
+                if isinstance(data, bytes) and b"\0" in data:
+                    return f"<{len(data)} bytes sha256 {hashlib.sha256(data).hexdigest()}>"
+                return repr(data)
+
+            changed = [f"  {key}: {show(before.get(key))} -> {show(after.get(key))}"
+                       for key in sorted(set(before) | set(after)) if before.get(key) != after.get(key)]
+            if changed:
+                failures.append(f"with {described} the scratch-repository tests wrote "
+                                "into the named repository:\n" + "\n".join(changed))
+            report = stderr.decode()
+            if not (child.returncode == 0 and f"Ran {len(self.CHILD_TESTS)} tests" in report
+                    and report.rstrip().endswith("OK")):
+                failures.append(f"with {described} the scratch-repository tests did not all "
+                                f"run and pass:\n{stdout.decode()}{report}")
+        if failures:
+            self.fail("\n\n".join(failures))
 
 
 class PinnedGuestPathContract(unittest.TestCase):

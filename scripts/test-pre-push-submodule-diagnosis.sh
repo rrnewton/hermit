@@ -15,6 +15,12 @@
 # ⚠️ BOTH DIRECTIONS. A hook that always blamed the submodule would pass the
 # first case and hide every real compile failure, which is worse than the bug.
 set -uo pipefail
+# Git exports its repository-location variables to hooks and `git rebase
+# --exec` steps, and they override `git -C`. Every repository below is named
+# explicitly, so run without them; otherwise a scratch `git init` rewrites the
+# caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
 HOOK=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/.githooks/pre-push
 [[ -f $HOOK ]] || { echo "FAIL: hook not found at $HOOK" >&2; exit 1; }

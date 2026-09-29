@@ -2,19 +2,38 @@
 
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / ".github/scripts/publish-compatibility-site.py"
 PINS = ROOT / ".github/compatibility-site-releases.json"
+REPOSITORY_LOCATION_VARIABLES = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
 
 
 class NightlyRegistryTests(unittest.TestCase):
+    def setUp(self):
+        # Git exports its repository-location variables to hooks and `git
+        # rebase --exec` steps, and they override `git -C` and the working
+        # directory. Every repository these tests touch is named explicitly;
+        # with them inherited, the fixture's `git init` would rewrite the
+        # caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+        scrubbed = mock.patch.dict(os.environ)
+        scrubbed.start()
+        self.addCleanup(scrubbed.stop)
+        for name in REPOSITORY_LOCATION_VARIABLES:
+            os.environ.pop(name, None)
+
     def test_previous_publication_cannot_be_dropped_or_rewritten(self):
         baseline = json.loads(PINS.read_bytes())
         added = copy.deepcopy(baseline["releases"][-1])

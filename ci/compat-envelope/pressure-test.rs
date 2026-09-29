@@ -1044,9 +1044,40 @@ fn validate_generated_checkout_path(
     Ok(observed_identity)
 }
 
+/// Variables that redirect git away from the directory it was pointed at.
+const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// A git command for the generated fresh checkout, which this tool creates and
+/// names by path.
+///
+/// Git exports its repository-location variables to hooks and `git rebase
+/// --exec` steps, and they override `git -C`. Under an inherited `GIT_DIR`
+/// naming the source repository, `git -C <fresh> checkout --detach <sha>` ran
+/// against the source: it detached the source's HEAD, rewrote its index and
+/// left the `--no-checkout` clone empty, and the HEAD check below read the
+/// source and passed. Under an inherited `GIT_WORK_TREE` naming an existing
+/// directory, the clone refuses to start
+/// (https://github.com/rrnewton/hermit/issues/3362).
+fn fresh_checkout_git() -> Command {
+    let mut command = Command::new("git");
+    for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn clone_local_without_hardlinks(source: &Path, destination: &Path) -> Result<(), String> {
     command_ok(
-        Command::new("git")
+        fresh_checkout_git()
             .args(LOCAL_CLONE_ARGS)
             .arg(source)
             .arg(destination),
@@ -1103,7 +1134,7 @@ impl FreshCheckout {
             .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
             checkout.marker_written = true;
             command_ok(
-                Command::new("git")
+                fresh_checkout_git()
                     .args([
                         "-C",
                         &checkout.path.to_string_lossy(),
@@ -1113,14 +1144,15 @@ impl FreshCheckout {
                     .arg(sha),
                 "check out exact pressure-test commit",
             )?;
-            let observed = git_output(&checkout.path, &["rev-parse", "HEAD"])?;
+            let observed =
+                git_output_from(fresh_checkout_git(), &checkout.path, &["rev-parse", "HEAD"])?;
             if observed != sha {
                 return Err(format!(
                     "fresh pressure-test checkout resolved to {observed}, expected {sha}"
                 ));
             }
             command_ok(
-                Command::new("git").args([
+                fresh_checkout_git().args([
                     "-C",
                     &checkout.path.to_string_lossy(),
                     "submodule",
@@ -2214,6 +2246,16 @@ fn run() -> Result<(), String> {
             if args.next().is_some() {
                 return Err("self-test accepts no options".into());
             }
+            // The self-test builds scratch repositories and names every one by
+            // directory. Git exports its repository-location variables to
+            // hooks and `git rebase --exec` steps, and they override the
+            // working directory, so inherited ones would point the fixtures'
+            // `git init` and commits at the caller's repository
+            // (https://github.com/rrnewton/hermit/issues/3362). This process
+            // runs only the self-test, and no other thread exists yet.
+            for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+                env::remove_var(name);
+            }
             self_test(&root)?;
         }
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
@@ -2820,7 +2862,11 @@ fn worktree_dirty(root: &Path) -> Result<bool, String> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    git_output_from(Command::new("git"), root, args)
+}
+
+fn git_output_from(mut command: Command, root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = command
         .args(args)
         .current_dir(root)
         .output()
@@ -9352,6 +9398,128 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// Prove that the generated checkout never follows an inherited repository
+/// location back to its source.
+///
+/// Git exports `GIT_DIR` to `git rebase --exec` steps, and `GIT_DIR`,
+/// `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks. With `GIT_DIR` naming the
+/// source, the checkout step detached the source's HEAD and rewrote its index
+/// before a later check noticed the empty checkout. With `GIT_WORK_TREE`
+/// naming the source, the clone refused to start
+/// (https://github.com/rrnewton/hermit/issues/3362). The source's state is
+/// compared before any preparation error is reported, so a run that both
+/// damages the source and fails names the damage. The self-test process runs
+/// no other thread, so it may set and clear the variables here.
+fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
+    let git_dir = source.join(".git");
+    let git_dir_text = git_dir.to_string_lossy().into_owned();
+    let source_text = source.to_string_lossy().into_owned();
+    let index_text = git_dir.join("index").to_string_lossy().into_owned();
+    let cases: [&[(&str, &str)]; 2] = [
+        &[("GIT_DIR", &git_dir_text)],
+        &[
+            ("GIT_WORK_TREE", &source_text),
+            ("GIT_INDEX_FILE", &index_text),
+        ],
+    ];
+    for inherited in cases {
+        let names = inherited
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let before = repository_location_state(&git_dir)?;
+        for (name, value) in inherited {
+            env::set_var(name, value);
+        }
+        let prepared = FreshCheckout::prepare(source, sha);
+        for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+            env::remove_var(name);
+        }
+        let after = repository_location_state(&git_dir)?;
+        let changed = before
+            .keys()
+            .chain(after.keys())
+            .find(|path| before.get(*path) != after.get(*path));
+        let fresh = match (prepared, changed) {
+            (Ok(fresh), None) => fresh,
+            (Ok(fresh), Some(changed)) => {
+                let cleanup = match fresh.cleanup() {
+                    Ok(()) => String::new(),
+                    Err(error) => format!("; generated-checkout cleanup also failed: {error}"),
+                };
+                return Err(format!(
+                    "generated checkout under an inherited {names} changed its source's {}{cleanup}",
+                    changed.display()
+                ));
+            }
+            (Err(error), Some(changed)) => {
+                return Err(format!(
+                    "generated checkout under an inherited {names} changed its source's {} and then failed: {error}",
+                    changed.display()
+                ));
+            }
+            (Err(error), None) => {
+                return Err(format!(
+                    "generated checkout failed under an inherited {names}: {error}"
+                ));
+            }
+        };
+        let observed = git_output(&fresh.path, &["rev-parse", "HEAD"]);
+        let cleanup = fresh.cleanup();
+        let observed = observed?;
+        if observed != sha {
+            return Err(format!(
+                "generated checkout under an inherited {names} resolved to {observed}, expected {sha}"
+            ));
+        }
+        cleanup?;
+        if worktree_dirty(source)? {
+            return Err(format!(
+                "generated checkout under an inherited {names} left its source dirty"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The bytes of a repository's HEAD, index, config, packed refs and loose refs,
+/// keyed by path. An absent file maps to `None`.
+fn repository_location_state(git_dir: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>, String> {
+    let mut paths = vec![
+        git_dir.join("HEAD"),
+        git_dir.join("index"),
+        git_dir.join("config"),
+        git_dir.join("packed-refs"),
+    ];
+    let mut pending = vec![git_dir.join("refs")];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory)
+            .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect {}: {e}", entry.path().display()))?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else {
+                paths.push(entry.path());
+            }
+        }
+    }
+    let mut state = BTreeMap::new();
+    for path in paths {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
+        state.insert(path, bytes);
+    }
+    Ok(state)
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -10187,6 +10355,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if worktree_dirty(&clone_source)? {
         return Err("generated-checkout cleanup left its source fixture dirty".into());
     }
+    inherited_location_fresh_checkout_self_test(&clone_source, &clone_sha)?;
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
@@ -14011,7 +14180,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }

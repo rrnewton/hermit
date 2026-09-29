@@ -3579,10 +3579,12 @@ fn run() -> Result<(), String> {
         }
         "self-test" => {
             no_more(&mut args)?;
+            forget_inherited_repository_location();
             self_test()?;
         }
         "self-test-and-check" => {
             no_more(&mut args)?;
+            forget_inherited_repository_location();
             self_test()?;
             let derived = check_tracked_with_lock(&root)?;
             println!("{}", tracked_current_summary(&derived));
@@ -14055,6 +14057,49 @@ fn snapshot_child_wait_diagnostic(pid: u32) -> String {
         .map(|wchan| wchan.trim().to_owned())
         .unwrap_or_else(|error| format!("unavailable: {error}"));
     format!("state={state}; wchan={wchan}")
+}
+
+/// Git's repository-location variables. Each one overrides the directory git
+/// was pointed at, including `git -C` and the working directory.
+const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// Forget Git's repository-location variables for the rest of this process.
+///
+/// The self-test and the unit tests build scratch repositories and ledgers,
+/// name each one by directory, and then run this tool's own git helpers on
+/// them. Git exports these variables to hooks and `git rebase --exec` steps,
+/// so inherited ones would point the fixtures' `git init`, commits and ledger
+/// writes at the caller's repository
+/// (https://github.com/rrnewton/hermit/issues/3362).
+fn forget_inherited_repository_location() {
+    static FORGET: std::sync::Once = std::sync::Once::new();
+    FORGET.call_once(|| {
+        for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+            env::remove_var(name);
+        }
+    });
+}
+
+/// A git command for a test fixture: it forgets the inherited location
+/// variables before the fixture exists, so the tool's own helpers that later
+/// run on the fixture resolve it by directory too.
+#[cfg(test)]
+fn fixture_git() -> Command {
+    forget_inherited_repository_location();
+    let mut command = Command::new("git");
+    for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
 }
 
 fn self_test() -> Result<(), String> {
@@ -25176,11 +25221,7 @@ mod baseline_resolution_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .unwrap();
+            let out = fixture_git().args(args).current_dir(root).output().unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",
@@ -25286,7 +25327,7 @@ mod baseline_resolution_tests {
         assert!(reason.contains("NOT REACHABLE"), "{reason}");
         // The revision is a real, resolvable object. Being resolvable is
         // exactly why returning it would be believed.
-        let exists = Command::new("git")
+        let exists = fixture_git()
             .args(["cat-file", "-e", &format!("{orphan}^{{commit}}")])
             .current_dir(dir.path())
             .status()
@@ -25472,7 +25513,7 @@ mod catalogue_ledger_tests {
     }
 
     fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = fixture_git()
             .arg("-c")
             .arg("core.hooksPath=/dev/null")
             .args(args)
@@ -25755,7 +25796,7 @@ mod catalogue_ledger_tests {
             ledger,
             &["config", "remote.origin.partialclonefilter", "blob:none"],
         );
-        let routed = Command::new("git")
+        let routed = fixture_git()
             .args(["remote", "get-url", "origin"])
             .current_dir(ledger)
             .output()
@@ -25775,7 +25816,7 @@ mod catalogue_ledger_tests {
             load_self_test_corpus(root, &corpus).is_err(),
             "missing promised objects must not fetch"
         );
-        let still_missing = Command::new("git")
+        let still_missing = fixture_git()
             .args(["cat-file", "-e", &blob])
             .env("GIT_NO_LAZY_FETCH", "1")
             .current_dir(ledger)
@@ -25787,7 +25828,7 @@ mod catalogue_ledger_tests {
         );
         // Positive opponent: the previous unguarded command really would fetch
         // this exact blob from the local promisor and return the original data.
-        let fetched = Command::new("git")
+        let fetched = fixture_git()
             .args([
                 "-c",
                 "maintenance.auto=false",
@@ -25926,7 +25967,7 @@ mod catalogue_ledger_tests {
                 TEST_LEDGER_REPOSITORY,
             ],
         );
-        let routed = Command::new("git")
+        let routed = fixture_git()
             .args(["remote", "get-url", "origin"])
             .current_dir(&ledger)
             .output()
@@ -26065,7 +26106,7 @@ mod catalogue_ledger_tests {
             serde_json::to_value(refreshed.cells[1].measurement).unwrap(),
             serde_json::to_value(default_measurement()).unwrap()
         );
-        let retained = Command::new("git")
+        let retained = fixture_git()
             .args(["show", &format!("{retained_commit}:{LEDGER_CELLS}")])
             .current_dir(&ledger)
             .output()
@@ -26119,7 +26160,7 @@ mod post_verdict_transaction_tests {
     use super::*;
 
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = fixture_git()
             .arg("-C")
             .arg(root)
             .args(args)
@@ -26265,7 +26306,7 @@ mod post_verdict_transaction_tests {
                 "unmerged" => {
                     let blob = git(root, &["rev-parse", "HEAD:ordinary"]);
                     git(root, &["update-index", "--force-remove", "ordinary"]);
-                    let mut child = Command::new("git")
+                    let mut child = fixture_git()
                         .args(["update-index", "--index-info"])
                         .current_dir(root)
                         .stdin(Stdio::piped())
@@ -26285,11 +26326,7 @@ mod post_verdict_transaction_tests {
                 _ => unreachable!(),
             }
             let old_clean = |args: &[&str]| {
-                let status = Command::new("git")
-                    .args(args)
-                    .current_dir(root)
-                    .status()
-                    .unwrap();
+                let status = fixture_git().args(args).current_dir(root).status().unwrap();
                 assert!(matches!(status.code(), Some(0 | 1)));
                 status.success()
             };
@@ -26746,7 +26783,7 @@ mod post_verdict_transaction_tests {
                 .unwrap()
                 .is_empty()
         );
-        let retained = Command::new("git")
+        let retained = fixture_git()
             .args(["show", &format!("{archived_commit}:{LEDGER_CELLS}")])
             .current_dir(&fixture.ledger)
             .output()

@@ -46,7 +46,38 @@ fn checked_output(command: &mut Command) -> String {
         .to_owned()
 }
 
+/// Remove Git's repository-location variables from this test process.
+///
+/// Git exports them to hooks and `git rebase --exec` steps, and they override
+/// the working directory. These tests name every repository by directory,
+/// including through the in-process `build_support` calls and the fixture
+/// `cargo build`, so an inherited `GIT_DIR` would point the fixture's
+/// `git init` and commits at the caller's repository
+/// (https://github.com/rrnewton/hermit/issues/3362).
+fn without_inherited_repository_location() {
+    static REMOVE: std::sync::Once = std::sync::Once::new();
+    REMOVE.call_once(|| {
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            // SAFETY: every test in this binary calls this through
+            // `initialized_repo` before it spawns a process, and `Once`
+            // holds every other caller until the removal finishes, so no
+            // thread reads the environment while it changes.
+            unsafe { std::env::remove_var(name) };
+        }
+    });
+}
+
 fn initialized_repo() -> TempDir {
+    without_inherited_repository_location();
     let repo = tempfile::tempdir().expect("failed to create temporary repository");
     git(repo.path(), &["init", "--quiet"]);
     fs::write(repo.path().join("tracked.txt"), "clean\n").expect("failed to write fixture");

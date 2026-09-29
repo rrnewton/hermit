@@ -2986,7 +2986,7 @@ sys.exit(37)
 
     #[test]
     fn full_generator_refuses_static_artifact_mutations() {
-        let root = repo_root().unwrap();
+        let root = crate::git_environment::checkout_root();
         let generated = canonical_text(&generate(&root).unwrap());
         let committed = include_str!("../../dag/validate.json");
         assert_eq!(committed, generated);
@@ -3095,7 +3095,7 @@ sys.exit(37)
 
     #[test]
     fn new_plans_never_request_a_ptrace_parity_reference() {
-        let root = repo_root().unwrap();
+        let root = crate::git_environment::checkout_root();
         let dag = generate(&root).unwrap();
         assert_eq!(
             dag.steps
@@ -3459,7 +3459,7 @@ sys.exit(37)
                 })
                 .collect::<Vec<(String, String, i64, i64)>>(),
         );
-        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         for result in expected_for_label(HOSTED_PORTABLE_LABEL, &cells) {
             result_manifest_owner(&selected.steps, result).unwrap();
         }
@@ -3645,7 +3645,7 @@ sys.exit(37)
     #[test]
     fn c_programs_nodes_refuse_an_empty_selection() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_invariants(&committed, &cells).unwrap();
         let c_programs = committed
             .steps
@@ -3711,7 +3711,7 @@ sys.exit(37)
     #[test]
     fn profile_producers_retain_distinct_measured_cpu_limits() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_invariants(&committed, &cells).unwrap();
         for (tag, wrong_cpu) in [
             ("quick-super-build.rust_scripts", 900),
@@ -3947,7 +3947,7 @@ sys.exit(37)
     #[test]
     fn result_classification_and_failure_families_retain_their_pre_cutover_policy() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_invariants(&committed, &cells).unwrap();
 
         let mut changed_family = committed.clone();
@@ -4232,7 +4232,7 @@ sys.exit(37)
         assert_eq!(before_normalize, after_normalize);
         assert!(normalized.effective_result_manifests().is_empty());
 
-        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let mut reattached = committed.clone();
         let before = reattached
             .steps

@@ -1024,7 +1024,7 @@ mod tests {
             f
         }
         fn command(&self, args: &[&str]) -> String {
-            let out = Command::new("git")
+            let out = crate::scratch_git()
                 .args([
                     "-c",
                     "user.name=Fixture",
@@ -1424,7 +1424,7 @@ for entry in Path('/proc/self/fd').iterdir():
         )
         .unwrap();
         assert!(
-            Command::new("git")
+            crate::scratch_git()
                 .args(["merge-base", "--is-ancestor", &later, &target])
                 .current_dir(&f.0)
                 .status()

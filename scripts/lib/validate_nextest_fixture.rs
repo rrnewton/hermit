@@ -4,7 +4,6 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
 
 use super::super::DagConfig;
@@ -25,8 +24,10 @@ use super::super::validate_test_results;
 use super::super::write_ledger;
 use super::*;
 
+/// Reads the checkout this file belongs to, which is named by directory. An
+/// inherited repository-location variable would redirect the read.
 fn git_text(source: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = crate::scratch_git()
         .args(args)
         .current_dir(source)
         .output()

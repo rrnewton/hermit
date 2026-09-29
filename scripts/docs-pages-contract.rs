@@ -869,7 +869,26 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
     #[test]
     fn publisher_passes_black_box_publication_and_history_cases() {
         let root = repository_root();
-        let output = Command::new("python3")
+        let mut python = Command::new("python3");
+        // The fixture builds scratch repositories by directory and runs the
+        // publisher on them. Git exports its repository-location variables to
+        // hooks and `git rebase --exec` steps, and each overrides the
+        // directory git was pointed at, so an inherited `GIT_DIR` would send
+        // the fixture's `git init`, commits and clone into the caller's
+        // repository (https://github.com/rrnewton/hermit/issues/3362).
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            python.env_remove(name);
+        }
+        let output = python
             .args([
                 "-c",
                 BLACK_BOX_FIXTURE,

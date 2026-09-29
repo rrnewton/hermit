@@ -6,8 +6,31 @@ fn run(binary: &str, arguments: &[&str]) -> Output {
     run_from(binary, arguments, None)
 }
 
+/// Git exports these to hooks and `git rebase --exec` steps, and they override
+/// the working directory. An inherited `GIT_DIR` would put the deliberately
+/// non-repository directory below inside a repository
+/// (https://github.com/rrnewton/hermit/issues/3362).
+const REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+fn located_by_directory(program: &str) -> Command {
+    let mut command = Command::new(program);
+    for name in REPOSITORY_LOCATION_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn run_from(binary: &str, arguments: &[&str], current_dir: Option<&Path>) -> Output {
-    let mut command = Command::new(binary);
+    let mut command = located_by_directory(binary);
     command.args(arguments);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
@@ -52,7 +75,7 @@ fn non_repository_dir(label: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&directory).expect("create non-repository working directory");
     std::fs::write(directory.join(".git"), "deliberately not a Git directory\n")
         .expect("create an explicit non-repository boundary");
-    let git_probe = Command::new("git")
+    let git_probe = located_by_directory("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&directory)
         .output()
@@ -239,7 +262,7 @@ fn subcommand_help_precedes_environment_validation_and_output_creation() {
     let non_repo = non_repository_dir("side-effect-free-help");
     let result_root = non_repo.join("must-not-exist");
     let counts = non_repo.join("counts-must-not-exist.json");
-    let output = Command::new(env!("CARGO_BIN_EXE_test-harness"))
+    let output = located_by_directory(env!("CARGO_BIN_EXE_test-harness"))
         .args(["run", "-h"])
         .current_dir(&non_repo)
         .env("E2E_RESULT_ROOT", &result_root)

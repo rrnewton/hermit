@@ -1782,7 +1782,7 @@ fn assert_submodule_fixture_source(
     // A prepared original-root driver must describe this clone's source and AU
     // API. Compare actual tracked bytes and Git executable/symlink modes after
     // the existing development overlay; do not equate a cache name with source.
-    let tracked = Command::new("git")
+    let tracked = scratch_git()
         .args(["ls-files", "--stage", "-z"])
         .current_dir(root)
         .output()
@@ -1829,14 +1829,14 @@ fn assert_submodule_fixture_source(
         }
     }
     let original_au = root.join("agent-utils");
-    let original_pin = Command::new("git")
+    let original_pin = scratch_git()
         .args(["rev-parse", "--verify", "HEAD^{commit}"])
         .current_dir(&original_au)
         .output()
         .map_err(|error| {
             format!("submodule service result: cannot inspect original AU pin: {error}")
         })?;
-    let original_status = Command::new("git")
+    let original_status = scratch_git()
         .args([
             "status",
             "--porcelain=v1",
@@ -1935,7 +1935,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             return Err("submodule service result: private ledger must be an empty regular file".into());
         }
         let mut command = Command::new("timeout");
-        command
+        // The child validate finds this fixture checkout from its working
+        // directory, so it must not inherit a caller's repository location.
+        without_repository_location(&mut command)
             .args(["--signal=TERM", "300"])
             .arg(
                 prepared_source_root
@@ -2024,7 +2026,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     // branch history. Keep transport copying (--no-local), so the disposable
     // repositories remain independent of the source's object store.
     checked_command(
-        Command::new("git")
+        scratch_git()
             .args([
                 "clone", "--quiet", "--no-local", "--no-recurse-submodules",
                 "--depth", "1", "--single-branch", "--no-tags",
@@ -2043,13 +2045,13 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         })?;
     }
     checked_command(
-        Command::new("git")
+        scratch_git()
             .args(["add", "--"])
             .args(SUBMODULE_SERVICE_FIXTURE_SOURCES)
             .current_dir(&checkout),
         "stage the fixture sources",
     )?;
-    let staged = Command::new("git")
+    let staged = scratch_git()
         .args(["diff", "--cached", "--quiet"])
         .current_dir(&checkout)
         .status()
@@ -2058,7 +2060,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         })?;
     if !staged.success() {
         checked_command(
-            Command::new("git")
+            scratch_git()
                 .args([
                     "-c",
                     "user.name=validate fixture",
@@ -2095,7 +2097,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     }
 
     checked_command(
-        Command::new("git")
+        scratch_git()
             .args([
                 "clone", "--quiet", "--no-local",
                 "--depth", "1", "--single-branch", "--no-tags",
@@ -2104,7 +2106,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .arg(checkout.join("agent-utils")),
         "populate only agent-utils",
     )?;
-    let expected_agent_utils = Command::new("git")
+    let expected_agent_utils = scratch_git()
         .args(["ls-tree", "HEAD", "agent-utils"])
         .current_dir(&checkout)
         .output()
@@ -2117,7 +2119,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         .ok_or("submodule service result: agent-utils gitlink is absent")?
         .to_string();
     checked_command(
-        Command::new("git")
+        scratch_git()
             .args(["checkout", "--quiet", &expected_agent_utils])
             .current_dir(checkout.join("agent-utils")),
         "checkout the recorded agent-utils pin",
@@ -4681,7 +4683,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
     std::fs::create_dir_all(&source)
         .map_err(|error| format!("checkout attribution: cannot create fixture: {error}"))?;
     let git = |repo: &Path, args: &[&str]| -> Result<(), String> {
-        let status = Command::new("git")
+        let status = scratch_git()
             .current_dir(repo)
             .args(args)
             .status()
@@ -7158,6 +7160,38 @@ fn sh(cmd: &str, args: &[&str]) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Remove git's repository-location variables from a command that runs in a
+/// self-test or unit-test scratch repository.
+///
+/// Git exports these variables to hooks and `git rebase --exec` steps, and
+/// they override both `git -C` and the working directory. Every scratch
+/// repository is named by directory, so an inherited `GIT_DIR` would point a
+/// fixture's `git init` and commits at the caller's repository
+/// (https://github.com/rrnewton/hermit/issues/3362). A child that finds its
+/// fixture from its working directory drops them for the same reason.
+fn without_repository_location(command: &mut Command) -> &mut Command {
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// A git command for a self-test or unit-test scratch repository.
+fn scratch_git() -> Command {
+    let mut command = Command::new("git");
+    without_repository_location(&mut command);
+    command
 }
 
 fn git_sha() -> String {
@@ -19399,9 +19433,7 @@ fn tool_root_split_bracket() -> Result<(), String> {
     let checkout = root.join("checkout");
     let log = root.join("validate.log");
     let git = |dir: &Path, args: &[&str]| -> Result<(), String> {
-        let status = Command::new("git")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
+        let status = scratch_git()
             .args(["-C", dir.to_str().ok_or("tool-root split: non-UTF-8 path")?])
             .args(args)
             .status()
@@ -25004,7 +25036,7 @@ mod fused_privileged_build_tests {
         std::fs::write(root.path().join("guest-names.json"), serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap()).unwrap();
         std::fs::write(root.path().join(".gitignore"), "/target/\n/custom-cargo-target/\n/cargo-calls\n").unwrap();
         for args in [vec!["init", "-q"], vec!["add", "."], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]] {
-            let output = Command::new("git").args(args).current_dir(root.path()).output().unwrap();
+            let output = scratch_git().args(args).current_dir(root.path()).output().unwrap();
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         }
         let bin = root.path().join("bin");
@@ -25811,7 +25843,7 @@ mod submodule_service_tests {
         }
 
         fn git(root: &Path, args: &[&str]) -> String {
-            let output = Command::new("git")
+            let output = scratch_git()
                 .args([
                     "-c",
                     "user.name=validate fixture",
@@ -26076,7 +26108,7 @@ mod refusal_detail_tests {
             ],
         ] {
             assert!(
-                Command::new("git")
+                scratch_git()
                     .args(args)
                     .current_dir(&root)
                     .status()
@@ -26511,7 +26543,7 @@ with (root/'calls.jsonl').open('a') as out:
     }
 
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = scratch_git()
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(root)

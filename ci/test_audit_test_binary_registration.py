@@ -6,6 +6,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import json
 import os
 import shutil
@@ -13,10 +14,25 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("audit-test-binary-registration.py")
+REPOSITORY_LOCATION_VARIABLES = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
 
 
 class RegistrationAuditTest(unittest.TestCase):
     def setUp(self) -> None:
+        # Git exports its repository-location variables to hooks and `git
+        # rebase --exec` steps, and they override `git -C` and the working
+        # directory. Every repository these tests touch is named explicitly;
+        # with them inherited, the fixture's `git init` would rewrite the
+        # caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+        scrubbed = mock.patch.dict(os.environ)
+        scrubbed.start()
+        self.addCleanup(scrubbed.stop)
+        for name in REPOSITORY_LOCATION_VARIABLES:
+            os.environ.pop(name, None)
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         (self.root / "hermit-cli/tests/common").mkdir(parents=True)

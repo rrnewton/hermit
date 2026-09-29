@@ -170,6 +170,13 @@ check_submodules() (
 
 self_test() {
     local root self git_bin agent_seed rr_seed nested_seed leaf_seed super agent_sha rr_sha output
+    # Git exports its repository-location variables to hooks and `git rebase
+    # --exec` steps, and they override `git -C`. Every fixture below is named
+    # explicitly, so run without them; otherwise a scratch `git init` rewrites
+    # the caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+    # The verifier runs under test are children, so they inherit this too.
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
     root=$(mktemp -d)
     self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
     git_bin=$(command -v git)

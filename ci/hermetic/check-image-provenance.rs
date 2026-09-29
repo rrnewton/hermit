@@ -865,9 +865,26 @@ mod tests {
             vec!["add", "."],
             vec!["commit", "-q", "-m", "unrelated rebased head"],
         ] {
+            let mut git = Command::new("git");
+            // Git exports its repository-location variables to hooks and `git
+            // rebase --exec` steps, and they override the working directory.
+            // Inherited, they would point this fixture's `git init`, `git
+            // config` and commit at the caller's repository
+            // (https://github.com/rrnewton/hermit/issues/3362).
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_PREFIX",
+            ] {
+                git.env_remove(name);
+            }
             assert!(
-                Command::new("git")
-                    .args(args)
+                git.args(args)
                     .current_dir(fixture.path())
                     .status()
                     .unwrap()

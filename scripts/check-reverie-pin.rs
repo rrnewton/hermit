@@ -2616,6 +2616,30 @@ mod tests {
 
     use super::*;
 
+    /// A raw `git` for fixture setup and for the deliberately unisolated
+    /// brackets below. It keeps every other inherited setting, but never lets
+    /// an inherited repository-location variable steer it away from the
+    /// fixture it names: a `git rebase --exec` step or a hook exports
+    /// `GIT_DIR`, which overrides `-C`, and `git clone` writes into it
+    /// (https://github.com/rrnewton/hermit/issues/3362). A bracket that needs
+    /// `GIT_DIR` sets it explicitly after this.
+    fn fixture_git() -> Command {
+        let mut command = Command::new("git");
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    }
+
     #[test]
     fn extracts_rev_key_not_reverie_prefix() {
         let line = r#"reverie = { git = "https://github.com/rrnewton/reverie.git", rev = "0123456789abcdef0123456789abcdef01234567" }"#;
@@ -3043,7 +3067,7 @@ mod tests {
         );
         let victim_git_dir = root.join(".git");
         let vulnerable = under_git_env(|| {
-            Command::new("git")
+            fixture_git()
                 .env("GIT_DIR", &victim_git_dir)
                 .arg("-C")
                 .arg(&cache)
@@ -3064,7 +3088,7 @@ mod tests {
             String::from_utf8_lossy(&vulnerable.stderr)
         );
         let imported = under_git_env(|| {
-            Command::new("git")
+            fixture_git()
                 .arg("--git-dir")
                 .arg(&victim_git_dir)
                 .args(["rev-parse", "refs/heads/main"])
@@ -3080,14 +3104,14 @@ mod tests {
         // Restore only the disposable fixture, then run the same fetch after
         // applying the production environment isolation. The foreign ref must
         // land in the cache and the product main must remain unchanged.
-        assert!(under_git_env(|| Command::new("git")
+        assert!(under_git_env(|| fixture_git()
             .arg("--git-dir")
             .arg(&victim_git_dir)
             .args(["update-ref", "refs/heads/main", &victim_main])
             .status()
             .expect("restore fixture main")
             .success()));
-        assert!(under_git_env(|| Command::new("git")
+        assert!(under_git_env(|| fixture_git()
             .arg("--git-dir")
             .arg(&victim_git_dir)
             .args(["config", "core.bare", "false"])
@@ -3604,7 +3628,7 @@ mod tests {
         };
         let floor = head();
         let checkout = temp_path("admitted-checkout");
-        let cloned = Command::new("git")
+        let cloned = fixture_git()
             .args(["clone", "--quiet"])
             .arg(&origin)
             .arg(&checkout)
@@ -5047,7 +5071,7 @@ mod tests {
         // point of the assertion. It still takes the ENVIRONMENT guard -- that
         // is a different mechanism and does not affect what this test measures.
         let unguarded = under_git_env(|| {
-            Command::new("git")
+            fixture_git()
                 .arg("-C")
                 .arg(&source)
                 .args(["merge-base", "--is-ancestor", &off, &b])

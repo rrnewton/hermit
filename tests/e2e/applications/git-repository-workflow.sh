@@ -26,6 +26,14 @@ case ${1:-} in
         rm -rf -- "$work"
         mkdir -p -- "$repo" "$work/home" "$work/xdg"
 
+        # Git exports its repository-location variables to hooks and `git
+        # rebase --exec` steps, and they override `git -C`. The corpus
+        # repository is named explicitly, so run without them; otherwise its
+        # `git init` and commits land in the caller's repository
+        # (https://github.com/rrnewton/hermit/issues/3362).
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+            GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+
         # Keep the transaction independent of developer and system Git config.
         export HOME="$work/home"
         export XDG_CONFIG_HOME="$work/xdg"
