@@ -1308,9 +1308,15 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         .map(|index| index as u64 + 1)
         .expect("proc mount must be present in captured identity order");
 
+    // The subject is mount identity, not preemption: the guest is a single
+    // sequential reader of mountinfo and fdinfo. Request no PMU timeslice
+    // explicitly. Unlike `hermit run`, the library API does not downgrade the
+    // default timeslice when perf_event_open is unavailable, so leaving the
+    // default would make this test depend on the host having a usable PMU.
     let config = hermit::DetConfig {
         mountinfo_mount_ids: captured_mount_ids,
         mountinfo_mount_ids_captured: true,
+        max_timeslice: None,
         ..Default::default()
     };
     let mut command = ReverieCommand::new(&controller_program);
