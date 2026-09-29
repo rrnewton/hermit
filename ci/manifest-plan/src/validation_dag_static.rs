@@ -318,7 +318,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (runner::tests::a_chaos_timeout_leads_the_reason_and_is_not_counted_as_a_pass
     // and runner::tests::a_chaos_timeout_keeps_an_earlier_seeds_failure_reason)
     // retain all 721 prior identities.
-    ("test.regular_crates", 723),
+    // Deleting the E2E runner's ptrace-golden normalization producer
+    // (https://github.com/rrnewton/hermit/issues/3301) deletes its one test,
+    // runner::tests::ptrace_golden_normalization_is_bounded_and_accounts_a_timeout,
+    // and retains the other 722 prior identities (`cargo nextest list
+    // --profile ci` over this node's whole selection measured 722 against 723;
+    // no other selected crate gains or loses a test).
+    ("test.regular_crates", 722),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -340,7 +346,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_bridge_is_not_installed_by_a_process_that_is_pid_1) retain all 754
     // prior identities (`cargo nextest list --profile ci` measured 758;
     // https://github.com/rrnewton/hermit/issues/3354).
-    ("test.hermit_unit", 758),
+    // Keeping only the golden run-1 log after a matched verify
+    // (https://github.com/rrnewton/hermit/issues/3301) adds five bin/hermit
+    // retention tests (verify::tests::
+    // requested_logs_survive_a_match_that_did_not_compare_them,
+    // requested_logs_survive_a_refused_comparison,
+    // an_overridden_match_keeps_both_logs_in_the_failure_directory;
+    // tests::dbt_backend_divergence_overrides_a_log_match_for_retention;
+    // run::tests::skid_overshoot_overrides_a_log_match_for_retention) and
+    // retains all 758 prior identities (`cargo nextest list --profile ci`
+    // measured 763).
+    ("test.hermit_unit", 763),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -392,7 +408,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The PMU-subject skid-overshoot case moves to privileged-test.pmu_cli_cases.
     // The nonleader-exec exit-only variant retains all 87 prior selected CLI
     // identities; its four PMU-subject siblings run in privileged-test.pmu_cli_cases.
-    ("test.cli", 88),
+    // The real-ptrace golden-log retention test
+    // ptrace_keep_logs_retains_only_the_golden_log_after_a_match
+    // (https://github.com/rrnewton/hermit/issues/3301) retains all 88 prior
+    // selected identities (`cargo nextest list --profile ci` measured 89). It
+    // needs no PMU: without perf counters the run continues with
+    // --max-timeslice=disabled.
+    ("test.cli", 89),
     ("test.liteinst_strict", 25),
     ("test.sabre_examples", 6),
     ("test.hermit_modes", 21),
@@ -410,7 +432,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     ("privileged-test.cli_kvm", 36),
-    ("test.cli_on_host", 88),
+    // The host node carries the identical selection.
+    ("test.cli_on_host", 89),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -424,11 +447,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 848),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
-    ("test.hermit_unit_on_host", 758),
+    // The host node carries the identical selection.
+    ("test.hermit_unit_on_host", 763),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 723),
+    ("test.regular_crates_on_host", 722),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
