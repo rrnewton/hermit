@@ -273,10 +273,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // default_virtual_epoch_tracks_invocation_start_and_is_reported and
     // explicit_virtual_epoch_reproduces_identical_observed_time.
     // The read-only proc chroot identity test retains all 170 prior identities.
-    // The two inode_device_identity_determinism tests
+    // The three inode_device_identity_determinism tests
     // (https://github.com/rrnewton/hermit/issues/2897) retain all 171 prior
-    // identities (`cargo nextest list` measured 173).
-    ("test.hermit_integration", 173),
+    // identities (`cargo nextest list` measured 174).
+    ("test.hermit_integration", 174),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -306,8 +306,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host node carries the identical selection: 816 (see test.detcore_unit).
     ("test.detcore_unit_on_host", 816),
     // Host variants select the same proc regressions and retain prior identities.
-    // The two inode_device_identity_determinism tests retain all 171 prior identities.
-    ("test.hermit_integration_on_host", 173),
+    // The three inode_device_identity_determinism tests retain all 171 prior identities.
+    ("test.hermit_integration_on_host", 174),
     ("test.hermit_unit_on_host", 757),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),

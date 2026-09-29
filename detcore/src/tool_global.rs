@@ -140,6 +140,15 @@ pub(crate) async fn yield_once() {
 /// because the maps device column is not always the file's `st_dev`; see
 /// [`InodePool::resolve_mapping`] and [`InodePool::add_inode`] for how the two
 /// are paired in either order.
+///
+/// Known limitation: Linux reissues anonymous device numbers (tmpfs, procfs,
+/// btrfs subvolumes) lowest-free, so a filesystem unmounted and another mounted
+/// during one run may receive the old one's `st_dev` in one run and a fresh
+/// one in the other, depending on concurrent host mount activity; in the first
+/// case the new filesystem's inodes alias the old one's identities. The guest
+/// cannot mount in the default configuration (`mount -t tmpfs` and
+/// `unshare -Urm` are refused), so this is not reachable today. If guest mounts
+/// are ever allowed, retire a device's entries and slot on unmount.
 #[derive(Debug)]
 struct InodePool {
     /// `stat`-side identities: `(st_dev, st_ino)` as `stat`, `fstat`,
@@ -267,6 +276,20 @@ impl InodePool {
     // an executable and its ELF interpreter at execve without anyone calling
     // `stat`) is ADOPTED here instead of minting a second inode for the same
     // file, so maps and `stat` agree whichever the guest reads first.
+    //
+    // Residual, adoption side: ANY stat device may adopt a provisional inode
+    // with the same host inode number. A paired device is only preferred
+    // among several candidates; none is refused, even when the maps device is
+    // already paired with a different stat device. So a file created during
+    // the run on another filesystem, whose host inode number differs between
+    // runs, can adopt, say, the executable's provisional inode in the run
+    // where its number happens to equal the executable's. Refusing instead is
+    // wrong on btrfs: one maps device names files of every subvolume of that
+    // filesystem, each with its own `st_dev` (on the development host maps
+    // device 00:2f names files with `st_dev` 0:30 under /data and 0:32 under
+    // /tmp), so a refusal would split a mapped file from its `stat` identity
+    // after the first subvolume paired. See also the residual at
+    // [`InodePool::resolve_mapping`].
     fn add_inode(&mut self, raw: RawFileId, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         if let Some(dino) = self.inodes.get(&raw) {
             return (*dino, self.info(*dino).mtime);
@@ -382,13 +405,19 @@ impl InodePool {
     /// Residual: steps 3 and 4 match across devices by inode number alone, so
     /// an unrelated file on another device with the same host inode number
     /// can be taken for the mapped file when no paired-device candidate
-    /// exists. Files on pipefs, sockfs, procfs and the internal shmem mount
-    /// draw inode numbers from a host-global counter that differs between
-    /// runs, so such a collision can differ between runs. On the development
-    /// host those numbers are near 3.9e9 while root-filesystem inode numbers
-    /// are 1e5 to 5e7. The pool keyed every lookup by the bare inode number
-    /// before https://github.com/rrnewton/hermit/issues/2897, which had this
-    /// exposure everywhere.
+    /// exists (step 3), or can adopt a provisional inode (step 4, see
+    /// [`InodePool::add_inode`]). Files on pipefs, sockfs, procfs and the
+    /// internal shmem mount draw inode numbers from a host-global counter
+    /// (`get_next_ino`) that differs between runs, and files created during
+    /// the run get whatever number their filesystem hands out, so such a
+    /// collision can happen in one run and not the other. On a long-running
+    /// host that counter is far above typical root-filesystem inode numbers
+    /// (near 3.9e9 against 1e5 to 5e7 on the development host), but on a
+    /// freshly booted machine, such as a hosted CI runner, it is small and
+    /// overlaps them, so the exposure there is larger. The pool keyed every
+    /// lookup by the bare inode number before
+    /// https://github.com/rrnewton/hermit/issues/2897, which had this exposure
+    /// everywhere.
     fn resolve_mapping(&mut self, raw: RawFileId, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         if let Some(dino) = self.mapping_inodes.get(&raw) {
             return (*dino, self.info(*dino).mtime);
@@ -2655,6 +2684,16 @@ impl GlobalState {
 
     async fn recv_touch_file(&self, from: Tid, ino: RawFileId) {
         let _sched = self.lock_rpc_scheduler(false).await;
+        if ino == INHERITED_STDIO_TOUCH_ID {
+            // Deliberately after taking the scheduler lock, so a write to
+            // stdio costs the same RPC it always did; only the inode pool is
+            // skipped.
+            trace!(
+                "[dtid {}] write to inherited stdio: no inode to touch",
+                from
+            );
+            return;
+        }
         let mtime = if self.cfg.virtualize_time {
             self.global_time.lock().unwrap().as_nanos()
         } else {
@@ -3810,8 +3849,31 @@ where
     }
 }
 
+/// Placeholder identity that writes through an inherited stdio descriptor
+/// (resource `ContainerStdin`/`ContainerStdout`/`ContainerStderr`) pass to
+/// [`touch_file`] instead of that descriptor's cached host identity. The global
+/// scheduler recognizes it and leaves the inode pool alone.
+///
+/// Those descriptors carry a placeholder stat, the TRACER's own fd-0 `fstat`
+/// (`setup_stdio`), which depends only on how hermit was invoked. Touching it
+/// minted a deterministic inode on the device holding hermit's stdin and, with
+/// one inode counter per device
+/// (https://github.com/rrnewton/hermit/issues/2897), shifted every later inode
+/// on that device; a new device also took a slot and shifted every later
+/// device. Guest-visible inode numbers then depended on where the caller's
+/// stdin came from, which `--verify` cannot see because both of its runs share
+/// one tracer. `fstat` of those descriptors already reports
+/// `deterministic_stdio_inode` and the epoch mtime without consulting the pool,
+/// so nothing reads the mtime such a touch recorded.
+///
+/// The device value is not a Linux `dev_t` (the kernel's is 32 bits), and
+/// differs from the pipefs/sockfs probe-failure sentinels in `namespace.rs`.
+pub(crate) const INHERITED_STDIO_TOUCH_ID: RawFileId = RawFileId::new(RawDevice::MAX - 2, 0);
+
 /// Update the modification time for a file, using its inode.
 /// This will set the mtime to a coherent global-time value.
+///
+/// Callers pass [`INHERITED_STDIO_TOUCH_ID`] for inherited stdio.
 pub async fn touch_file<G, T>(guest: &mut G, inode: RawFileId)
 where
     G: Guest<Detcore<T>>,

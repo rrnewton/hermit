@@ -303,6 +303,19 @@ fn pipe_capacity_failure(
     Some(PipeCapacityFailure { created_fds, error })
 }
 
+/// The identity whose virtual mtime a successful write through `detfd` bumps:
+/// the descriptor's cached host identity, or [`INHERITED_STDIO_TOUCH_ID`] for
+/// an inherited stdio descriptor, whose cached stat is only the tracer's own
+/// fd-0 `fstat` and must not reach the inode pool.
+fn write_touch_identity(detfd: &DetFd) -> Option<RawFileId> {
+    match detfd.resource() {
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr,
+        )) => Some(INHERITED_STDIO_TOUCH_ID),
+        _ => detfd.stat().map(|stat| stat.host_file_id()),
+    }
+}
+
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
     fd_type: FdType,
@@ -1972,12 +1985,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let in_type = guest
             .thread_state()
             .with_detfd(call.in_fd(), |detfd| detfd.ty())?;
-        let (out_type, out_resource, out_inode) =
+        let (out_type, out_resource, out_inode, out_touch) =
             guest.thread_state().with_detfd(call.out_fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.resource(),
                     detfd.stat().map(|stat| stat.host_file_id()),
+                    write_touch_identity(detfd),
                 )
             })?;
 
@@ -2005,8 +2019,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
         // `out_inode` is the fd's cached HOST inode, so it must be
-        // determinized before naming a resource. It is deliberately left raw
-        // for the `touch_file` call below, which takes the host `RawFileId`.
+        // determinized before naming a resource. The `touch_file` call below
+        // takes `out_touch` instead, the raw identity from
+        // `write_touch_identity`.
         let out_resource = match out_resource {
             Some(resource) => Some(resource),
             None => match out_inode {
@@ -2027,7 +2042,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
             .map_err(Error::from);
         if guest.config().virtualize_metadata && matches!(&result, Ok(copied) if *copied > 0) {
-            let inode = out_inode.expect("virtualized metadata requires stat data for sendfile");
+            let inode = out_touch.expect("virtualized metadata requires stat data for sendfile");
             touch_file(guest, inode).await;
         }
         resource_release_all(guest).await;
@@ -2052,7 +2067,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             logically_nonblocking,
             open_file_id,
             resource,
-            raw_ino,
+            touch_id,
         ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (
                 detfd.ty(),
@@ -2060,13 +2075,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.is_nonblocking(),
                 detfd.open_file_id(),
                 detfd.resource(),
-                detfd.stat().map(|x| x.host_file_id()),
+                write_touch_identity(detfd),
             )
         })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
             let r =
-                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+                touch_id.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
             touch_file(guest, r).await;
         }
 
@@ -2159,12 +2174,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             });
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.resource(),
-                detfd.stat().map(|stat| stat.host_file_id()),
-            )
-        })?;
+        let (resource, raw_ino, touch_id) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.resource(),
+                    detfd.stat().map(|stat| stat.host_file_id()),
+                    write_touch_identity(detfd),
+                )
+            })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -2241,7 +2258,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
-            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            let inode = touch_id.expect("virtualized metadata requires stat data for tracked fds");
             touch_file(guest, inode).await;
         }
 
@@ -2273,7 +2290,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             logically_nonblocking,
             open_file_id,
             resource,
-            raw_ino,
+            touch_id,
         ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (
                 detfd.ty(),
@@ -2281,7 +2298,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.is_nonblocking(),
                 detfd.open_file_id(),
                 detfd.resource(),
-                detfd.stat().map(|x| x.host_file_id()),
+                write_touch_identity(detfd),
             )
         })?;
 
@@ -2313,7 +2330,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
             let inode =
-                raw_ino.expect("virtualized metadata requires stat data for every tracked fd");
+                touch_id.expect("virtualized metadata requires stat data for every tracked fd");
             touch_file(guest, inode).await;
         }
 
@@ -2605,12 +2622,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.resource(),
-                detfd.stat().map(|stat| stat.host_file_id()),
-            )
-        })?;
+        let (resource, raw_ino, touch_id) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.resource(),
+                    detfd.stat().map(|stat| stat.host_file_id()),
+                    write_touch_identity(detfd),
+                )
+            })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -2635,7 +2654,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await;
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
-            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            let inode = touch_id.expect("virtualized metadata requires stat data for tracked fds");
             touch_file(guest, inode).await;
         }
 
@@ -2668,12 +2687,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.resource(),
-                detfd.stat().map(|stat| stat.host_file_id()),
-            )
-        })?;
+        let (resource, raw_ino, touch_id) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.resource(),
+                    detfd.stat().map(|stat| stat.host_file_id()),
+                    write_touch_identity(detfd),
+                )
+            })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -2698,7 +2719,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await;
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
-            let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
+            let inode = touch_id.expect("virtualized metadata requires stat data for tracked fds");
             touch_file(guest, inode).await;
         }
 
