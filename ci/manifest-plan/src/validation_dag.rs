@@ -3063,18 +3063,14 @@ sys.exit(37)
             )
             .is_err()
         );
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../hermetic/run-in-pinned-root-cache-test.py");
-        let output = std::process::Command::new("python3")
-            .arg(script)
-            .output()
-            .expect("run the actual wrapper with the recorded Podman fixture");
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        // The wrapper's own cache and run-state behaviour is exercised by
+        // ci/hermetic/run-in-pinned-root-cache-test.py, which runs the actual
+        // wrapper against the recorded Podman fixture. That suite runs in the
+        // Makefile's `lint-checks` recipe (DAG node check.lint_checks), not
+        // here: it needs about 38 CPU-seconds, and a regular nextest case may
+        // use at most 22 (DEFAULT_TEST_CPU_TIMEOUT_SECONDS), so inside this
+        // test it was killed on every run
+        // (https://github.com/rrnewton/hermit/issues/3379).
     }
 
     fn exact(test: &str) -> DagManifest {
