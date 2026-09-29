@@ -1572,7 +1572,8 @@ fn run_nested_scope_probe() -> Result<String, String> {
 fn nested_scope_self_test() -> Result<String, String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
-    let output = Command::new("timeout")
+    let mut command = Command::new("timeout");
+    command
         .arg("--kill-after=5s")
         .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
         .arg(exe).arg("--self-test")
@@ -1582,7 +1583,22 @@ fn nested_scope_self_test() -> Result<String, String> {
         .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_SCOPE_UNIT")
         .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
-        .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
+        .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC");
+    // Exercise the real CPU-placement path whenever this host can enforce it,
+    // independent of how the self-test itself was launched: request this
+    // process's CPUs minus one and require the nested step to end up inside.
+    let placement_request = safe_ci_scope::self_test_placement_request();
+    match &placement_request {
+        Ok((allowed, excluded)) => command
+            .env(safe_ci_scope::CPU_PLACEMENT_ALLOWED_ENV, allowed)
+            .env(safe_ci_scope::CPU_PLACEMENT_EXCLUDED_ENV, excluded)
+            .env(safe_ci_scope::CPU_PLACEMENT_SOURCE_ENV, "self-test"),
+        Err(_) => command
+            .env_remove(safe_ci_scope::CPU_PLACEMENT_ALLOWED_ENV)
+            .env_remove(safe_ci_scope::CPU_PLACEMENT_EXCLUDED_ENV)
+            .env_remove(safe_ci_scope::CPU_PLACEMENT_SOURCE_ENV),
+    };
+    let output = command
         .output()
         .map_err(|error| format!("cannot launch bounded nested scope self-test: {error}"))?;
     if !output.status.success() {
@@ -1610,7 +1626,102 @@ fn nested_scope_self_test() -> Result<String, String> {
             ));
         }
     }
-    Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
+    // CPU placement (https://github.com/rrnewton/hermit/issues/3265) is never a
+    // gate for a validation, so a host that cannot enforce a cpuset still
+    // passes, and says so. Where a probe unit showed that it can, the outer
+    // scope must apply the requested list and the nested step below it must be
+    // inside it; anything else means the cpuset does not reach the cells.
+    // The outer line is on this child's stderr, but the scheduler relays its
+    // steps' output (the nested line) to its own stdout, so read both.
+    let combined = format!("{stderr}\n{stdout}");
+    let placement = match &placement_request {
+        Ok(_) => nested_scope_placement_evidence(&combined, true)?,
+        Err(reason) => format!(
+            "{}; CPU placement not exercised: {reason}",
+            nested_scope_placement_evidence(&combined, false)?
+        ),
+    };
+    Ok(format!("safe-ci scope: real outer -> step child -> nested boxed step passed{placement}"))
+}
+
+/// Inert two-sided bracket for [`nested_scope_placement_evidence`].
+fn nested_scope_placement_bracket() -> Result<String, String> {
+    let outer = "safe-ci nested self-test outer: CPU placement APPLIED: AllowedCPUs=1-3 on x.scope";
+    // The nested line arrives relayed by the scheduler, prefixed with the step tag.
+    let within = "[safe_ci_scope_self_test.outer_child] \
+                  safe-ci nested self-test inner: CPU placement inherited: Cpus_allowed_list=1-3 \
+                  (inherited from the owning invocation; this process's CPUs are within the allowed set).";
+    let outside = "safe-ci nested self-test inner: CPU placement inherited: Cpus_allowed_list=0-3 \
+                   (inherited from the owning invocation; NOT within the allowed set: ...).";
+    let not_applied = "safe-ci nested self-test outer: WARNING: CPU placement NOT APPLIED: \
+                       `systemctl --user set-property --runtime x.scope AllowedCPUs=1-3` exited 1: ...";
+    for required in [false, true] {
+        match nested_scope_placement_evidence(&format!("{outer}\n{within}\n"), required) {
+            Ok(line) if line.contains("APPLIED to the scope") => {}
+            other => {
+                return Err(format!(
+                    "an applied and inherited placement was not accepted (required={required}): {other:?}"
+                ));
+            }
+        }
+        if nested_scope_placement_evidence(&format!("{outer}\n{outside}\n"), required).is_ok() {
+            return Err(format!("an applied placement the nested step escaped was accepted (required={required})"));
+        }
+        if nested_scope_placement_evidence(&format!("{outer}\n"), required).is_ok() {
+            return Err(format!(
+                "an applied placement with no nested observation was accepted (required={required})"
+            ));
+        }
+    }
+    match nested_scope_placement_evidence(&format!("{not_applied}\n{within}\n"), false) {
+        Ok(line) if !line.contains("APPLIED to the scope") => {}
+        other => return Err(format!("an unrequested, unapplied placement was not left as a non-gate: {other:?}")),
+    }
+    for stderr in [format!("{not_applied}\n{within}\n"), String::new()] {
+        if nested_scope_placement_evidence(&stderr, true).is_ok() {
+            return Err(format!("a required placement the outer scope did not apply was accepted: {stderr:?}"));
+        }
+    }
+    Ok("nested scope CPU placement: APPLIED requires the nested step inside it; a required placement must be APPLIED; an unrequested one is not a gate".into())
+}
+
+/// Read the nested self-test's CPU-placement lines back from its combined
+/// stdout and stderr; see the caller.
+/// `required`: the self-test requested a placement on a host shown to enforce
+/// cpusets, so anything short of APPLIED-and-inherited is a failure.
+fn nested_scope_placement_evidence(output: &str, required: bool) -> Result<String, String> {
+    const OUTER_APPLIED: &str = "safe-ci nested self-test outer: CPU placement APPLIED";
+    const INNER: &str = "safe-ci nested self-test inner: CPU placement inherited: ";
+    const WITHIN: &str = "this process's CPUs are within the allowed set";
+    let inner = output.lines().find(|line| line.contains(INNER));
+    if output.contains(OUTER_APPLIED) {
+        return match inner {
+            Some(line) if line.contains(WITHIN) => Ok(format!(
+                "; CPU placement APPLIED to the scope and inherited by the nested step ({})",
+                line.trim()
+            )),
+            Some(line) => Err(format!(
+                "the outer scope reported CPU placement APPLIED but the nested step is outside it: {line}"
+            )),
+            None => Err(format!(
+                "the outer scope reported CPU placement APPLIED but the nested step reported no inherited \
+                 placement; placement lines seen: {:?}",
+                output.lines().filter(|line| line.contains("CPU placement")).collect::<Vec<_>>()
+            )),
+        };
+    }
+    if required {
+        let outer = output
+            .lines()
+            .find(|line| line.contains("safe-ci nested self-test outer: ") && line.contains("CPU placement"))
+            .unwrap_or("no outer CPU placement line");
+        return Err(format!(
+            "the self-test requested a CPU placement on a host whose user manager enforces AllowedCPUs=, \
+             but the outer scope did not apply it: {}",
+            outer.trim()
+        ));
+    }
+    Ok(String::new())
 }
 
 /// The literal flag that enables Hermit's strict execution mode.
@@ -3537,6 +3648,7 @@ fn self_test() -> Result<(), String> {
     // inner/run/scope/wrapper bounds, then proves a nested signal cannot stop it.
     for line in [
         safe_ci_scope::self_test()?,
+        nested_scope_placement_bracket()?,
         nested_scope_self_test()?,
         retry_timeout_bound_bracket(&root)?,
         scheduler_accounting_bracket()?,
@@ -20246,6 +20358,12 @@ fn write_ledger_with_snapshot(
         record["admission_floor_evidence"] =
             serde_json::to_value(evidence).expect("typed admission evidence");
     }
+    // Where the cells were allowed to run, as launched and as observed on the
+    // dagrun scope (https://github.com/rrnewton/hermit/issues/3265). Evidence
+    // only: no budget, timeout, selection or verdict reads it.
+    if let Some(placement) = safe_ci_scope::cpu_placement_observation() {
+        record["cpu_placement"] = placement.to_json();
+    }
     let typed = match serde_json::from_value::<HistoryRow>(record.clone()) {
         Ok(typed) => typed,
         Err(error) => {
@@ -24258,6 +24376,12 @@ fn run(
                 .into(),
         );
     }
+
+    // Where the cells ran (https://github.com/rrnewton/hermit/issues/3265). Added
+    // after exit_code is final; completed_verdict reads nothing else.
+    detail.push(safe_ci_scope::cpu_placement_summary_line(
+        safe_ci_scope::cpu_placement_observation(),
+    ));
 
     let mut s = RunSummary::new(
         completed_verdict(exit_code),
