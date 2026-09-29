@@ -1414,6 +1414,110 @@ fn default_attempt() -> u64 {
     1
 }
 
+/// What a runner reason says about a verify attempt's declared stdout. Only
+/// the texts `check_expected_stdout` and `check_expected_stdout_contains` in
+/// ci/manifest-plan/src/runner.rs write are recognized, and only by rebuilding
+/// them with the runner's own formatters.
+#[derive(Debug, PartialEq, Eq)]
+enum ExpectedOutputClaim {
+    /// The named compared run's stdout is not the declared exact bytes.
+    Exact {
+        run: String,
+        observed_bytes: u64,
+        observed_sha256: String,
+        declared_bytes: u64,
+        declared_sha256: String,
+    },
+    /// The captured stdout, which equals both compared runs' stdout, omits
+    /// the declared text.
+    Contains {
+        captured_bytes: u64,
+        captured_sha256: String,
+        text: String,
+    },
+}
+
+/// Split `<bytes> bytes, sha256 <digest>)<rest>`.
+fn split_sized_digest(text: &str) -> Option<(u64, &str, &str)> {
+    let (bytes, rest) = text.split_once(" bytes, sha256 ")?;
+    let (digest, rest) = rest.split_once(')')?;
+    Some((bytes.parse().ok()?, digest, rest))
+}
+
+/// Invert Rust's `{:?}` rendering of a string, which is how the runner quotes
+/// a declared expected_stdout_contains text. The caller still requires the
+/// re-rendered reason to reproduce the original exactly, so a lenient decode
+/// here cannot admit a text the runner would not write.
+fn parse_debug_string(quoted: &str) -> Option<String> {
+    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    let mut text = String::new();
+    let mut chars = inner.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => return None,
+            '\\' => text.push(match chars.next()? {
+                't' => '\t',
+                'r' => '\r',
+                'n' => '\n',
+                '0' => '\0',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                'u' => {
+                    let (hex, rest) = chars.as_str().strip_prefix('{')?.split_once('}')?;
+                    let decoded = char::from_u32(u32::from_str_radix(hex, 16).ok()?)?;
+                    chars = rest.chars();
+                    decoded
+                }
+                _ => return None,
+            }),
+            other => text.push(other),
+        }
+    }
+    Some(text)
+}
+
+/// Recognize the runner's reason for a failed stdout expectation, or `None`
+/// for any other text.
+fn parse_expected_output_claim(reason: &str) -> Option<ExpectedOutputClaim> {
+    use hermit_manifest_plan::runner::expected_stdout_contains_mismatch_reason;
+    use hermit_manifest_plan::runner::expected_stdout_mismatch_reason;
+    if let Some(rest) = reason.strip_prefix("verify stdout (") {
+        let (captured_bytes, captured_sha256, rest) = split_sized_digest(rest)?;
+        let quoted =
+            rest.strip_prefix(" does not contain the declared expected_stdout_contains text ")?;
+        let text = parse_debug_string(quoted)?;
+        (expected_stdout_contains_mismatch_reason(captured_bytes, captured_sha256, &text) == reason)
+            .then(|| ExpectedOutputClaim::Contains {
+                captured_bytes,
+                captured_sha256: captured_sha256.into(),
+                text,
+            })
+    } else {
+        let (run, rest) = reason
+            .strip_prefix("verify ")?
+            .split_once(" run stdout (")?;
+        let (observed_bytes, observed_sha256, rest) = split_sized_digest(rest)?;
+        let rest = rest.strip_prefix(" differs from the declared expected_stdout (")?;
+        let (declared_bytes, declared_sha256, rest) = split_sized_digest(rest)?;
+        (rest.is_empty()
+            && expected_stdout_mismatch_reason(
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            ) == reason)
+            .then(|| ExpectedOutputClaim::Exact {
+                run: run.into(),
+                observed_bytes,
+                observed_sha256: observed_sha256.into(),
+                declared_bytes,
+                declared_sha256: declared_sha256.into(),
+            })
+    }
+}
+
 impl ResultRow {
     fn retry_fixture(&self) -> Result<Option<RetryFixture>, String> {
         let Some(artifact_dir) = self.artifact_dir.as_deref() else {
@@ -2056,6 +2160,124 @@ impl ResultRow {
         }
     }
 
+    /// Read a matched verify attempt that the runner FAILed, with no timeout
+    /// and no error kind, as the runner's red for a failed stdout expectation.
+    ///
+    /// `check_expected_stdout` and `check_expected_stdout_contains` in
+    /// ci/manifest-plan/src/runner.rs fail a matched verify attempt whose two
+    /// runs agree on other bytes than the cell declares, and record why only
+    /// in the attempt's reason. `Ok(None)`: the reason is not one of those
+    /// texts. `Ok(Some)`: it is, and the matched report and the captured
+    /// stdout bear it out, so the attempt is that red and the returned text
+    /// says so. `Err`: the reason claims such a failure that its evidence
+    /// contradicts, which is malformed evidence.
+    fn expected_output_failure(
+        &self,
+        index: usize,
+        attempt: &JsonValue,
+        report: &canonical_verdict::VerificationReport,
+    ) -> Result<Option<String>, String> {
+        let Some(reason) = attempt.get("reason").and_then(JsonValue::as_str) else {
+            return Ok(None);
+        };
+        let Some(claim) = parse_expected_output_claim(reason) else {
+            return Ok(None);
+        };
+        let contradiction = |why: String| {
+            format!(
+                "attempt {} reason claims a failed stdout expectation that contradicts its evidence: {why}",
+                index + 1
+            )
+        };
+        if self.mode != "verify" {
+            return Err(contradiction(format!(
+                "only a verify cell declares expected stdout, and this is a {} cell",
+                self.mode
+            )));
+        }
+        let (bytes, digest) = match &claim {
+            ExpectedOutputClaim::Exact {
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            } => {
+                if !is_sha256(observed_sha256) || !is_sha256(declared_sha256) {
+                    return Err(contradiction("a stdout digest is not SHA-256".into()));
+                }
+                // The runner names the first run whose stdout differs, and
+                // both runs of a matched report print the same bytes.
+                if run != "first" {
+                    return Err(contradiction(format!(
+                        "it names the {run} run, but the first run of a matched pair printed the same bytes"
+                    )));
+                }
+                if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
+                    return Err(contradiction(
+                        "the declared stdout is the observed stdout".into(),
+                    ));
+                }
+                (*observed_bytes, observed_sha256.as_str())
+            }
+            ExpectedOutputClaim::Contains {
+                captured_bytes,
+                captured_sha256,
+                text,
+            } => {
+                if !is_sha256(captured_sha256) {
+                    return Err(contradiction("the stdout digest is not SHA-256".into()));
+                }
+                if text.is_empty() {
+                    return Err(contradiction(
+                        "the runner finds an empty declared text in any stdout".into(),
+                    ));
+                }
+                (*captured_bytes, captured_sha256.as_str())
+            }
+        };
+        let outputs = report.compared_outputs.as_ref().ok_or_else(|| {
+            contradiction("the matched report records no compared outputs".into())
+        })?;
+        for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
+            if output.stdout_bytes != bytes || output.stdout_sha256 != digest {
+                return Err(contradiction(format!(
+                    "the report's {run} run printed {} bytes with sha256 {}, not the stdout the reason names",
+                    output.stdout_bytes, output.stdout_sha256
+                )));
+            }
+        }
+        // The runner records a capture it cannot read as UTF-8 text as empty,
+        // so an empty capture of nonempty output is absent, not other bytes.
+        match attempt.get("stdout") {
+            None | Some(JsonValue::Null) => {}
+            Some(JsonValue::String(stdout)) if stdout.is_empty() && bytes > 0 => {}
+            Some(JsonValue::String(stdout)) => {
+                if stdout.len() as u64 != bytes
+                    || format!("{:x}", Sha256::digest(stdout.as_bytes())) != digest
+                {
+                    return Err(contradiction(
+                        "the captured stdout is not the stdout the reason names".into(),
+                    ));
+                }
+                if let ExpectedOutputClaim::Contains { text, .. } = &claim {
+                    if stdout.contains(text.as_str()) {
+                        return Err(contradiction(
+                            "the captured stdout contains the declared text".into(),
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(contradiction("the captured stdout is not text".into()));
+            }
+        }
+        Ok(Some(format!(
+            "attempt {} failed its declared expected output: {reason}",
+            index + 1
+        )))
+    }
+
     /// A declared row's match counts only if it ends exactly as declared, and
     /// an undeclared row's only if it ends as `undeclared_match_ends_cleanly`
     /// requires.
@@ -2478,30 +2700,39 @@ impl ResultRow {
                                     ));
                                 }
                                 // A completed failure keeps its red: a declared
-                                // cell that ended differently, or an undeclared
-                                // verify or replay that exited nonzero, is the
+                                // cell that ended differently, an undeclared
+                                // verify or replay that exited nonzero, or a
+                                // verify whose agreeing runs printed other
+                                // stdout than the cell declares, is the
                                 // runner's crash-error, exactly the attempts
                                 // the series writer projects as a failed match.
                                 // The runner writes a FAIL without a timeout or
-                                // error kind only for that disposition, so one
-                                // that ended as its row allows is a
-                                // contradiction. Other non-passing attempts
-                                // keep the result already established, such as
-                                // a timeout.
+                                // error kind only for those, so one that ended
+                                // as its row allows and names no failed stdout
+                                // expectation is a contradiction, as is a
+                                // failed expectation its evidence refutes.
+                                // Other non-passing attempts keep the result
+                                // already established, such as a timeout.
                                 if attempt.get("outcome").and_then(JsonValue::as_str)
                                     == Some("FAIL")
                                     && attempt.get("timed_out").and_then(JsonValue::as_bool)
                                         == Some(false)
                                     && attempt.get("error_kind").is_none_or(JsonValue::is_null)
                                 {
-                                    if self
-                                        .require_matched_disposition(index, attempt, &report)
-                                        .is_ok()
-                                    {
-                                        return Err(format!(
-                                            "attempt {} is a FAIL whose matched report ends as its row allows",
-                                            index + 1
-                                        ));
+                                    match self.expected_output_failure(index, attempt, &report)? {
+                                        Some(failure) => {
+                                            unavailable.get_or_insert(failure);
+                                        }
+                                        None if self
+                                            .require_matched_disposition(index, attempt, &report)
+                                            .is_ok() =>
+                                        {
+                                            return Err(format!(
+                                                "attempt {} is a FAIL whose matched report ends as its row allows",
+                                                index + 1
+                                            ));
+                                        }
+                                        None => {}
                                     }
                                     retained_crash = true;
                                     no_verdict_result.get_or_insert(ObservedResult::CrashError);
@@ -28646,6 +28877,70 @@ mod post_verdict_transaction_tests {
                 Err(error) => assert!(error.contains(expected_error), "{label}: {error}"),
                 other => panic!("{label}: the contradiction was retained: {other:?}"),
             }
+        }
+    }
+
+    /// The reader recognizes exactly the texts the runner's formatters write,
+    /// whatever the declared text contains, and nothing else: an escape
+    /// `{:?}` would not produce, trailing text, or a malformed size is not a
+    /// runner reason.
+    #[test]
+    fn only_the_runners_stdout_expectation_reasons_are_recognized() {
+        use hermit_manifest_plan::runner::expected_stdout_contains_mismatch_reason;
+        use hermit_manifest_plan::runner::expected_stdout_mismatch_reason;
+        let digest = "a".repeat(64);
+        for text in [
+            "ok",
+            "tab\tnewline\nreturn\r",
+            "quote\" apostrophe' backslash\\ nul\0",
+            "combining e\u{301} delete\u{7f} bell\u{7}",
+            "caf\u{e9} \u{1f600}",
+            ") does not contain the declared expected_stdout_contains text \"x\"",
+        ] {
+            let reason = expected_stdout_contains_mismatch_reason(9, &digest, text);
+            assert_eq!(
+                parse_expected_output_claim(&reason),
+                Some(ExpectedOutputClaim::Contains {
+                    captured_bytes: 9,
+                    captured_sha256: digest.clone(),
+                    text: text.into(),
+                }),
+                "{reason}"
+            );
+            assert_eq!(parse_expected_output_claim(&format!("{reason} ")), None);
+        }
+        let exact = expected_stdout_mismatch_reason("first", 959, &digest, 958, &"b".repeat(64));
+        assert_eq!(
+            parse_expected_output_claim(&exact),
+            Some(ExpectedOutputClaim::Exact {
+                run: "first".into(),
+                observed_bytes: 959,
+                observed_sha256: digest.clone(),
+                declared_bytes: 958,
+                declared_sha256: "b".repeat(64),
+            })
+        );
+        let not_written = [
+            format!("{exact})"),
+            exact.replace("959 bytes", "+959 bytes"),
+            exact.replace("959 bytes", "-1 bytes"),
+            exact.replacen("verify ", "Verify ", 1),
+            format!(
+                "verify stdout (9 bytes, sha256 {digest}) does not contain the declared expected_stdout_contains text \"\\x41\""
+            ),
+            format!(
+                "verify stdout (9 bytes, sha256 {digest}) does not contain the declared expected_stdout_contains text \"\\u{{41}}\""
+            ),
+            format!(
+                "verify stdout (9 bytes, sha256 {digest}) does not contain the declared expected_stdout_contains text \"a\"b\""
+            ),
+            format!(
+                "verify stdout (9 bytes, sha256 {digest}) does not contain the declared expected_stdout_contains text unquoted"
+            ),
+            "the guest printed something unexpected".into(),
+        ];
+        for reason in not_written {
+            assert_eq!(parse_expected_output_claim(&reason), None, "{reason}");
         }
     }
 
