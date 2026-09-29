@@ -30,6 +30,7 @@ use reverie::syscalls::FcntlCmd::*;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
@@ -744,6 +745,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(total)
     }
     /// Inject an extra fstat to retrieve file metadata.
+    ///
+    /// The kernel needs a writable `struct stat` in the guest. It is staged
+    /// first in the guest stack scratch, which on the ptrace backend lies just
+    /// below the red zone under the guest's stack pointer and costs nothing
+    /// when the stack has room. That memory is not guaranteed to be writable:
+    /// the guest may run with its stack pointer just above a guard page (a
+    /// thread, fiber or alternate signal stack), or within a few hundred bytes
+    /// of the lowest page of the main-thread stack, which a tracer's write does
+    /// not grow. The fault then belongs to Detcore's bookkeeping, not to the
+    /// guest, so the same fstat is repeated with its buffer in a transient
+    /// private page that is unmapped before the guest resumes
+    /// (<https://github.com/rrnewton/hermit/issues/3328>).
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -753,10 +766,94 @@ impl<T: RecordOrReplay> Detcore<T> {
             "Injecting additional fstat to retrieve file metadata on fd {}.",
             raw_fd
         );
+        let copied = match self.inject_fstat_on_stack(guest, raw_fd).await {
+            Err(Errno::EFAULT) => {
+                info!(
+                    "Guest stack scratch cannot hold the fstat buffer for fd {}; \
+                     using a transient page instead.",
+                    raw_fd
+                );
+                self.inject_fstat_in_transient_page(guest, raw_fd).await?
+            }
+            result => result?,
+        };
+        trace!("extra fstat returned inode {}", copied.st_ino);
+        Ok(copied)
+    }
+
+    /// The fast path of [`Self::inject_fstat`]: the buffer lives in the guest
+    /// stack scratch. Returns `EFAULT` when that scratch is not writable.
+    async fn inject_fstat_on_stack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<libc::stat, Errno> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
-        stack.commit()?;
+        // Keep the guard until the buffer is no longer used. Backends whose
+        // scratch is a Tool-owned arena (DBT, SaBRe) free it when the guard
+        // drops, so dropping it before the injected fstat would let the kernel
+        // write into freed memory.
+        let _stack_guard = stack.commit()?;
+        let copied = Self::inject_fstat_into(guest, raw_fd, statptr).await?;
+        // clear stack memory used for fstat allocation
+        guest
+            .memory()
+            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
+        Ok(copied)
+    }
 
+    /// The fallback of [`Self::inject_fstat`]: the buffer lives in a private
+    /// anonymous page mapped for this call only. The guest never learns its
+    /// address, and it is unmapped before the guest resumes, so the guest's
+    /// address space is the same as before the call.
+    async fn inject_fstat_in_transient_page<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<libc::stat, Errno> {
+        let len = std::mem::size_of::<libc::stat>();
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await?;
+        let page = usize::try_from(mapped)
+            .ok()
+            .and_then(AddrMut::<libc::stat>::from_raw)
+            .unwrap_or_else(|| panic!("transient fstat page mmap returned {mapped}"));
+        let copied = Self::inject_fstat_into(guest, raw_fd, StatPtr(page)).await;
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(page.cast::<libc::c_void>().into()))
+                    .with_len(len),
+            ))
+            .await
+        {
+            // Not expected: the page was mapped by this call and its address
+            // never reached the guest. The metadata is still valid, so a
+            // leftover page is no reason to fail the guest's syscall.
+            warn!(
+                "[detcore] could not unmap the transient fstat page for fd {}: {}",
+                raw_fd, errno
+            );
+        }
+        copied
+    }
+
+    /// Inject `fstat(raw_fd, statptr)` and read back what the kernel wrote.
+    async fn inject_fstat_into<G: Guest<Self>>(
+        guest: &mut G,
+        raw_fd: RawFd,
+        statptr: StatPtr<'_>,
+    ) -> Result<libc::stat, Errno> {
         // NOTE: Must retry the injection here. This could get interrupted and
         // we don't want to rerun the entire syscall handler twice.
         guest
@@ -766,14 +863,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_stat(Some(statptr)),
             ))
             .await?;
-
-        let copied = statptr.read(&guest.memory())?;
-        // clear stack memory used for fstat allocation
-        guest
-            .memory()
-            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
-        trace!("extra fstat returned inode {}", copied.st_ino);
-        Ok(copied)
+        statptr.read(&guest.memory())
     }
 
     // helper function to track a new file descriptor.
@@ -785,7 +875,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         ty: FdType,
     ) -> Result<(), Errno> {
         let stat = if guest.config().virtualize_metadata {
-            Some(self.inject_fstat(guest, fd).await?.into())
+            match self.inject_fstat(guest, fd).await {
+                Ok(stat) => Some(stat.into()),
+                Err(errno) => {
+                    // `fd` is already open in the guest, but Detcore cannot
+                    // model it: with metadata virtualization on, a descriptor
+                    // without its stat is an invariant violation. The caller
+                    // reports this error as the syscall's result, so close
+                    // the descriptor rather than leave an untracked one open
+                    // behind that error. Not retried on EINTR: Linux releases
+                    // the descriptor even then, and a retry could close a
+                    // reused number.
+                    if let Err(close_errno) = guest.inject(syscalls::Close::new().with_fd(fd)).await
+                    {
+                        warn!(
+                            "[detcore] could not close fd {} after failing to record its \
+                             metadata ({}): {}",
+                            fd, errno, close_errno
+                        );
+                    }
+                    return Err(errno);
+                }
+            }
         } else {
             None
         };
