@@ -17,8 +17,11 @@ use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::VerificationReport;
 use regex::Regex;
 
+use super::kvm_cancellation::assert_compared;
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
+use super::kvm_cancellation::compared_info_stream;
+use super::kvm_cancellation::without_verification;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -96,6 +99,71 @@ fn assert_lifecycle(log: &str, expected_status: i32) {
     );
     // The process Tool hook is silent; the component controls check its exact
     // count. Global cleanup is an independently visible end-to-end boundary.
+}
+
+/// The anchors of [`assert_lifecycle`] that are INFO records verify compares,
+/// checked on run 1's golden log. The matched verdict carries each of them to
+/// run 2, whose log is deleted; `assert_compared` in `kvm_cancellation.rs`
+/// gives the argument. The exit hooks (DEBUG), deregistrations (TRACE) and
+/// cleanup (DEBUG) are checked again on the plain traced run.
+fn assert_compared_lifecycle(log: &str, expected_status: i32) {
+    let compared = compared_info_stream(log, "run 1");
+    let lines: Vec<_> = compared.lines().collect();
+    let signal = Regex::new(r"\[dtid (\d+)\] handling inbound signal \(#0\) SIGALRM").unwrap();
+    let deliveries: Vec<_> = signal.captures_iter(&compared).collect();
+    assert_eq!(deliveries.len(), 1, "one compared process alarm delivery");
+    let receiver = deliveries[0][1].to_owned();
+    // `info!` at detcore/src/lib.rs:1420: compared, so run 2 delivered the
+    // one alarm, and only it, to the same task.
+    assert_eq!(
+        assert_compared(log, &compared, "handling inbound signal"),
+        1
+    );
+    assert_eq!(
+        assert_compared(
+            log,
+            &compared,
+            &format!("[dtid {receiver}] handling inbound signal (#0) SIGALRM")
+        ),
+        1
+    );
+    let exit = Regex::new(&format!(
+        r"\[detcore, dtid (\d+)\] inbound syscall: exit_group\({expected_status}\)"
+    ))
+    .unwrap();
+    let exits: Vec<_> = exit.captures_iter(&compared).collect();
+    assert_eq!(exits.len(), 1, "one compared group-exit issuer");
+    let issuer = exits[0][1].to_owned();
+    assert_ne!(receiver, issuer, "the sibling must issue group exit");
+    // `detlog!` at detcore/src/lib.rs:1887, which logs at INFO
+    // (detcore/src/detlog.rs:144): compared, so run 2's sibling issued the
+    // same group exit.
+    assert_eq!(
+        assert_compared(
+            log,
+            &compared,
+            &format!("[detcore, dtid {issuer}] inbound syscall: exit_group({expected_status})")
+        ),
+        1
+    );
+    // `info!` at detcore/src/scheduler.rs:4924; the anchor is on the second
+    // line of that one INFO record. Compared, so run 2 granted the same exit.
+    let commit_anchor = format!("dettid {issuer} using resources {{Exit {{ group: true");
+    assert_eq!(assert_compared(log, &compared, &commit_anchor), 1);
+    let delivered = lines.iter().position(|line| signal.is_match(line)).unwrap();
+    let requested = lines.iter().position(|line| exit.is_match(line)).unwrap();
+    let committed = lines
+        .iter()
+        .position(|line| line.contains(" COMMIT turn ") && line.contains(&commit_anchor))
+        .expect("compared winning group-exit commit");
+    // All three are compared INFO records, so run 2 has them in this order.
+    assert!(delivered < requested && requested < committed);
+    // `info!` at detcore/src/tool_global.rs:518: compared, so run 2 destroyed
+    // the global state exactly once.
+    assert_eq!(
+        assert_compared(log, &compared, "detcore shut down, destroying global state"),
+        1
+    );
 }
 
 pub(super) fn run() {
@@ -242,19 +310,58 @@ pub(super) fn run() {
             assert_eq!(operand.stderr_bytes, 0);
             assert_eq!(operand.stderr_sha256, Digest::new(b"").to_string());
         }
-        for prefix in ["run1_log_", "run2_log_"] {
-            let matches: Vec<_> = fs::read_dir(&logs)
+        let retained = |prefix: &str| -> Vec<_> {
+            fs::read_dir(&logs)
                 .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(prefix))
-                .collect();
-            assert_eq!(matches.len(), 1, "one retained log per actual guest");
-            let log =
-                String::from_utf8(bounded_read(&matches[0], 64 * MIB)).expect("complete trace");
-            assert_lifecycle(&log, expected_status);
-        }
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(prefix)
+                })
+                .collect()
+        };
+        // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+        // run 2's log, which matched it, is deleted.
+        let golden = retained("run1_log_");
+        assert_eq!(
+            golden.len(),
+            1,
+            "one retained golden log of the matched guest"
+        );
+        let log = String::from_utf8(bounded_read(&golden[0], 64 * MIB)).expect("complete trace");
+        assert_lifecycle(&log, expected_status);
+        assert_compared_lifecycle(&log, expected_status);
+        assert!(
+            retained("run2_log_").is_empty(),
+            "a matched verification must not retain run 2's log"
+        );
+
+        // A second whole execution for the DEBUG and TRACE records verify does
+        // not compare: the same command without its verification options,
+        // tracing to stderr at the same level.
+        let plain = directory.join("plain");
+        let mut command = super::hermit_command(&without_verification(&args));
+        command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+        let status = bounded_command_with_timeout(&mut command, &plain, Duration::from_secs(57));
+        assert_eq!(
+            status.code(),
+            Some(expected_status),
+            "plain traced run's exact winning exit status for mode {mode}"
+        );
+        assert_eq!(
+            bounded_read(&plain.join("stdout"), 64 * MIB),
+            expected.as_bytes()
+        );
+        let log = String::from_utf8(bounded_read(&plain.join("stderr"), 16 * MIB))
+            .expect("complete plain trace");
+        assert_lifecycle(&log, expected_status);
         completed += 1;
-        eprintln!("KVM signal retirement mode {mode}: two positive guests and full INFO match");
+        eprintln!(
+            "KVM signal retirement mode {mode}: two positive verified guests with a full INFO \
+             match, and a plain traced guest"
+        );
     }
     assert_eq!(completed, 2);
 }

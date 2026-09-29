@@ -211,6 +211,83 @@ pub(super) fn bounded_command_with_timeout(
     status
 }
 
+/// The INFO records a `BitwiseInfoV1` verification compares for one log, each
+/// followed by a newline. The product's own renderer selects and canonicalizes
+/// them, so this selection cannot drift from the comparison's.
+pub(super) fn compared_info_stream(log: &str, label: &str) -> String {
+    let mut rendered = Vec::new();
+    detcore::logdiff::write_bitwise_info_v1_bytes(log.as_bytes(), label, &mut rendered)
+        .unwrap_or_else(|error| panic!("render {label}'s compared INFO records: {error}"));
+    String::from_utf8(rendered).expect("rendered INFO records are UTF-8")
+}
+
+/// Asserts that `anchor` occurs in run 1's `log` and that every occurrence is
+/// in one of the INFO records verify compared, `compared` (from
+/// [`compared_info_stream`]). Returns the number of occurrences.
+///
+/// Why this also checks run 2, whose log a matched verification deletes:
+/// `require_canonical_match` admits only a `BitwiseInfoV1` match that compared
+/// a nonempty INFO stream from each run (both counts above zero,
+/// `hermit-cli/src/canonical_verdict.rs:660`). That comparison
+/// (`hermit-cli/src/bin/hermit/verify.rs:1376-1392`) selects each log's INFO
+/// records (`filter_infos`, `detcore/src/logdiff.rs:2133-2134`),
+/// canonicalizes them (`messages_for_comparison`, `logdiff.rs:2182-2183`),
+/// and reports a difference unless the two streams are equally long and equal
+/// record for record (`diff_vecs`, `logdiff.rs:1372-1377` and `1417-1446`).
+/// Only then is the verdict `Matched` (`verify.rs:1406-1407` and
+/// `1549-1551`). `write_bitwise_info_v1_bytes` (`logdiff.rs:558-585`) makes
+/// the same selection and canonicalization. So an anchor that occurs only in
+/// run 1's compared records occurs in run 2's compared records as often and
+/// in the same INFO order. That says nothing about the TRACE and DEBUG records
+/// verify does not compare; each test's plain traced run checks those.
+pub(super) fn assert_compared(log: &str, compared: &str, anchor: &str) -> usize {
+    let occurrences = log.matches(anchor).count();
+    assert!(occurrences > 0, "missing {anchor:?}");
+    assert_eq!(
+        compared.matches(anchor).count(),
+        occurrences,
+        "{anchor:?} occurs outside the INFO records verify compares"
+    );
+    occurrences
+}
+
+/// `args` without exactly its verification options: `--verify`,
+/// `--verify-strict`, `--verify-allow=...`, `--keep-logs`, and `--verify-json`
+/// and `--verify-log-dir` with their values. Every other option and the guest
+/// command after `--` are kept in order.
+///
+/// None of the removed options changes the traced execution; they select the
+/// second run, the comparison and log retention. Without `--log-file`, the
+/// plain run logs to stderr at the same `--log` level, through the same
+/// `RUST_LOG` filter (`env_filter` in `hermit-cli/src/bin/hermit/tracing.rs`).
+pub(super) fn without_verification<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let guest = args
+        .iter()
+        .position(|arg| *arg == "--")
+        .expect("a guest command after --");
+    assert!(args[..guest].contains(&"--verify"), "a verified command");
+    let mut plain = Vec::with_capacity(args.len());
+    let mut options = args[..guest].iter().copied();
+    while let Some(arg) = options.next() {
+        match arg {
+            "--verify" | "--verify-strict" | "--keep-logs" => {}
+            "--verify-json" | "--verify-log-dir" => {
+                options.next().expect("the verification option's value");
+            }
+            _ if arg.starts_with("--verify-allow=") => {}
+            _ => {
+                assert!(
+                    !arg.starts_with("--verify") && !arg.starts_with("--keep-logs"),
+                    "unhandled verification option {arg}"
+                );
+                plain.push(arg);
+            }
+        }
+    }
+    plain.extend_from_slice(&args[guest..]);
+    plain
+}
+
 fn line_after(lines: &[&str], start: usize, needle: &str) -> usize {
     start
         + lines[start..]
@@ -454,6 +531,77 @@ fn assert_mechanism(log: &str, loops: usize, timestamp_rip: u64) {
     }));
 }
 
+/// The anchors of [`assert_mechanism`] that are INFO records verify compares,
+/// checked on run 1's golden log. The matched verdict carries each of them to
+/// run 2, whose log is deleted; [`assert_compared`] gives the argument. The
+/// TRACE and DEBUG anchors are checked again on the plain traced run.
+fn assert_compared_mechanism(log: &str, loops: usize) {
+    let compared = compared_info_stream(log, "run 1");
+    let lines: Vec<_> = compared.lines().collect();
+    let leader_re =
+        Regex::new(r"\[detcore, dtid (\d+)\] inbound syscall: exit_group\(17\)").unwrap();
+    let leader = leader_re
+        .captures(&compared)
+        .expect("compared leader exit request")[1]
+        .to_owned();
+    let worker_re = Regex::new(r"\[dtid (\d+)\] inbound rdtsc,").unwrap();
+    let worker = worker_re
+        .captures(&compared)
+        .expect("compared worker timestamp")[1]
+        .to_owned();
+    assert_ne!(leader, worker);
+    let (winner, canceled) = if loops == 64 {
+        (&worker, &leader)
+    } else {
+        (&leader, &worker)
+    };
+    // `detlog!` at detcore/src/lib.rs:1887, which logs at INFO
+    // (detcore/src/detlog.rs:144): compared, so run 2 made the same request.
+    assert_compared(
+        log,
+        &compared,
+        &format!("[detcore, dtid {leader}] inbound syscall: exit_group(17)"),
+    );
+    // `info!` at detcore/src/lib.rs:1360: compared, so run 2's worker executed
+    // the same number of timestamp instructions.
+    let callbacks = assert_compared(log, &compared, &format!("[dtid {worker}] inbound rdtsc,"));
+    // `info!` at detcore/src/scheduler.rs:4924; the anchor is on the second
+    // line of that one INFO record. Compared, so run 2 granted the same Exit.
+    let commit_anchor = format!("dettid {winner} using resources {{Exit {{ group: true");
+    assert_compared(log, &compared, &commit_anchor);
+    let commit = lines
+        .iter()
+        .position(|line| line.contains(&commit_anchor))
+        .expect("compared winning Exit commit");
+    // `info!` at detcore/src/scheduler.rs:2314: compared, so run 2 removed the
+    // canceled task after the same grant.
+    let kill_anchor =
+        format!("logically_kill: Scheduler removing all knowledge of [det]tid {canceled} ");
+    assert_compared(log, &compared, &kill_anchor);
+    let killed = line_after(&lines, commit + 1, &kill_anchor);
+    // `info!` at detcore/src/tool_global.rs:518: compared, so run 2 destroyed
+    // the global state exactly once, after the removal.
+    let destroy = "detcore shut down, destroying global state";
+    assert_eq!(assert_compared(log, &compared, destroy), 1);
+    line_after(&lines, killed + 1, destroy);
+    let late_exit = format!("[detcore, dtid {worker}] inbound syscall: exit_group(95)");
+    if loops != 512 {
+        assert_eq!(callbacks, loops, "all fixed-loop instructions executed");
+        // `detlog!` at detcore/src/lib.rs:1887, INFO: compared, so run 2's
+        // worker also requested its exit before the grant.
+        assert_compared(log, &compared, &late_exit);
+        assert!(lines[..commit].iter().any(|line| line.contains(&late_exit)));
+        return;
+    }
+    assert!(
+        callbacks < loops,
+        "worker canceled before completing its loop"
+    );
+    // The same INFO record kind, absent from run 1's compared records and so
+    // from run 2's.
+    assert!(!compared.contains("inbound syscall: exit_group(95)"));
+}
+
 pub(super) fn run(loops: usize, expected: i32) {
     let _lock = super::hermit_run_guard();
     fs::OpenOptions::new()
@@ -613,8 +761,8 @@ pub(super) fn run(loops: usize, expected: i32) {
         assert_eq!(operand.stdout_sha256, EMPTY_SHA256);
         assert_eq!(operand.stderr_sha256, EMPTY_SHA256);
     }
-    for prefix in ["run1_log_", "run2_log_"] {
-        let matches: Vec<_> = fs::read_dir(&logs)
+    let retained = |prefix: &str| -> Vec<_> {
+        fs::read_dir(&logs)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
@@ -623,14 +771,38 @@ pub(super) fn run(loops: usize, expected: i32) {
                     .to_string_lossy()
                     .starts_with(prefix)
             })
-            .collect();
-        assert_eq!(
-            matches.len(),
-            1,
-            "exactly one retained log for each real run"
-        );
-        let log =
-            String::from_utf8(bounded_read(&matches[0], 16 * MIB)).expect("complete UTF-8 trace");
-        assert_mechanism(&log, loops, timestamp);
-    }
+            .collect()
+    };
+    // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+    // run 2's log, which matched it, is deleted.
+    let golden = retained("run1_log_");
+    assert_eq!(
+        golden.len(),
+        1,
+        "exactly one retained golden log of the matched run"
+    );
+    let log = String::from_utf8(bounded_read(&golden[0], 16 * MIB)).expect("complete UTF-8 trace");
+    assert_mechanism(&log, loops, timestamp);
+    assert_compared_mechanism(&log, loops);
+    assert!(
+        retained("run2_log_").is_empty(),
+        "a matched verification must not retain run 2's log"
+    );
+
+    // A second whole execution for the TRACE and DEBUG records verify does not
+    // compare: the same command without its verification options, tracing to
+    // stderr at the same level.
+    let plain = root.join("plain");
+    let mut command = super::hermit_command(&without_verification(&args));
+    command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
+    let status = bounded_command(&mut command, &plain);
+    assert_eq!(
+        status.code(),
+        Some(expected),
+        "plain traced run's actual guest status"
+    );
+    assert!(bounded_read(&plain.join("stdout"), 64 * MIB).is_empty());
+    let log = String::from_utf8(bounded_read(&plain.join("stderr"), 16 * MIB))
+        .expect("complete UTF-8 plain trace");
+    assert_mechanism(&log, loops, timestamp);
 }
