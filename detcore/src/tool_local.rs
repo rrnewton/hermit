@@ -54,6 +54,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::stat::*;
+use crate::syscalls::InheritedStdio;
 use crate::types::*;
 
 /// The detcore tool and its per-process state.
@@ -88,6 +89,11 @@ pub struct FileMetadata {
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
+    /// Host identities of the objects hermit handed the root process as fds
+    /// 0 to 2. Recorded once and copied unchanged into every descendant's
+    /// table, whatever the descendant later does with its own fds 0 to 2.
+    #[serde(default)]
+    pub(crate) inherited_stdio: InheritedStdio,
 }
 
 /// A descriptor identity held across an awaited syscall.
@@ -472,6 +478,7 @@ impl FileMetadata {
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
             file_handles: HashMap::new(),
+            inherited_stdio: InheritedStdio::default(),
         }
     }
 
@@ -564,6 +571,7 @@ impl FileMetadata {
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             file_handles: self.file_handles.clone(),
+            inherited_stdio: self.inherited_stdio,
         }
     }
 
@@ -577,6 +585,7 @@ impl FileMetadata {
                 .iter()
                 .filter_map(|(&fd, detfd)| (!detfd.is_cloexec()).then_some((fd, detfd.clone())))
                 .collect(),
+            inherited_stdio: self.inherited_stdio,
         }
     }
 
@@ -647,24 +656,32 @@ impl FileMetadata {
     ///
     /// Each descriptor caches the host identity of the guest's own fd 0, 1 or
     /// 2 (see [`inherited_stdio_stat`]); it used to cache the tracer's fd-0
-    /// `fstat` for all three. The maps and fd-link sanitizers match stdio
-    /// objects by these identities. The inode pool never sees them: every
-    /// descriptor carrying one of these resources reports a fixed stdio inode
-    /// (`deterministic_stdio_inode_for_resource`), and a write through one
-    /// touches `INHERITED_STDIO_TOUCH_ID` instead.
+    /// `fstat` for all three. The same identities are recorded, by stream, in
+    /// [`FileMetadata::inherited_stdio`], which every route that can reach a
+    /// stdio object matches on the full `(st_dev, st_ino)` pair. A descriptor
+    /// carrying one of these resources reports a fixed stdio inode without
+    /// consulting the inode pool (see [`InheritedStdio`]), and a write through
+    /// one touches `INHERITED_STDIO_TOUCH_ID` instead.
     fn setup_stdio(mut self, pid: Pid, owner: DetTid) -> Self {
+        let mut streams = [None; 3];
+        let mut mapped = [None; 3];
         for (fd, device) in [
             (libc::STDIN_FILENO, Device::ContainerStdin),
             (libc::STDOUT_FILENO, Device::ContainerStdout),
             (libc::STDERR_FILENO, Device::ContainerStderr),
         ] {
+            let stat = inherited_stdio_stat(pid, fd);
+            streams[fd as usize] = stat.as_ref().map(DetStat::host_file_id);
+            mapped[fd as usize] = stat
+                .as_ref()
+                .and_then(|stat| inherited_stdio_mapped_identity(pid, fd, stat));
             let detfd = DetFd::new(
                 fd,
                 OFlag::empty(),
                 FdType::Regular,
                 self.allocate_open_file_id(owner, FdType::Regular),
             )
-            .with_stat(inherited_stdio_stat(pid, fd))
+            .with_stat(stat)
             .with_resource(ResourceID::Device(device));
             // These descriptors existed before Detcore began observing the
             // guest, so they may already carry flock state that we cannot
@@ -672,8 +689,30 @@ impl FileMetadata {
             detfd.mark_flock_mode_unobserved();
             self.add_detfd(detfd);
         }
+        self.inherited_stdio = InheritedStdio::new(streams).with_mapped(mapped);
 
         self
+    }
+
+    /// Record the host identities of fds 0 to 2 as discovered in this process
+    /// (the in-guest backend's counterpart of [`Self::setup_stdio`]).
+    ///
+    /// Learns no maps identities: this runs inside the guest process, and
+    /// mapping an object there to learn one would change the guest's address
+    /// space. A mapped stdio object is then recognized in `/proc/<pid>/maps`
+    /// only through its `stat` identity or a paired device (see
+    /// [`InheritedStdio::inode_of_mapping`] and
+    /// https://github.com/rrnewton/hermit/issues/3355).
+    fn record_discovered_stdio(&mut self) {
+        let mut streams = [None; 3];
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            streams[fd as usize] = self
+                .file_handles
+                .get(&fd)
+                .and_then(DetFd::stat)
+                .map(|stat| stat.host_file_id());
+        }
+        self.inherited_stdio = InheritedStdio::new(streams);
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -849,6 +888,62 @@ fn inherited_stdio_stat(pid: Pid, fd: RawFd) -> Option<DetStat> {
         .or_else(|_| stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }))
         .ok()
         .map(DetStat::from)
+}
+
+/// The identity `/proc/<pid>/maps` headers give a mapping of inherited
+/// descriptor `fd` of process `pid`, whose host `stat` is `stat`, when that is
+/// a regular file.
+///
+/// A header names the mapped inode by its superblock's device, which is not
+/// always the file's `st_dev`: btrfs reports one device there for every
+/// subvolume (on the development host, maps device 00:2f for files whose
+/// `st_dev` is 0:30 under /data and 0:32 under /tmp), and overlayfs maps the
+/// real layer file. Learnt once, by reopening the object read-only through the
+/// guest's descriptor, mapping one page of it in THIS process and reading this
+/// process's own maps line for the mapping; the guest's address space is not
+/// touched and the page is never accessed. `None` for any other kind of
+/// object (opening a FIFO or a device through its link can block or act on
+/// the device), or when the object cannot be reopened for reading or mapped.
+fn inherited_stdio_mapped_identity(pid: Pid, fd: RawFd, stat: &DetStat) -> Option<RawFileId> {
+    use std::os::fd::AsRawFd as _;
+
+    if stat.mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    let file = std::fs::File::open(format!("/proc/{}/fd/{}", pid.as_raw(), fd)).ok()?;
+    let reopened = stat::fstat(&file).ok()?;
+    if RawFileId::new(reopened.st_dev, reopened.st_ino) != stat.host_file_id() {
+        return None;
+    }
+    // SAFETY: a new private read-only mapping at an address the kernel
+    // chooses, so it replaces nothing; it is never accessed and is unmapped
+    // below. Mapping past the end of a short or empty file is allowed.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            1,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return None;
+    }
+    // The kernel prints a mapping's start as at least eight hex digits.
+    let start = format!("{:08x}-", addr as usize);
+    let identity = std::fs::read_to_string("/proc/self/maps")
+        .ok()
+        .and_then(|maps| {
+            maps.lines()
+                .find(|line| line.starts_with(&start))
+                .and_then(crate::procfs::mapping_header_identity)
+        });
+    // SAFETY: `addr` is the one-page mapping made above, which nothing else
+    // refers to.
+    unsafe { libc::munmap(addr, 1) };
+    identity.map(|(dev, ino)| RawFileId::new(dev, ino))
 }
 
 fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
@@ -1080,6 +1175,73 @@ mod file_metadata_tests {
         );
     }
 
+    /// A regular file handed over as stdio learns the identity a maps header
+    /// shows for a mapping of it, which on btrfs names another device than
+    /// its `st_dev`; a pipe and a character device learn none.
+    #[test]
+    fn a_regular_stdio_file_learns_the_identity_its_maps_header_shows() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let pid = nix::unistd::getpid();
+        let mut file = tempfile::NamedTempFile::new().expect("a temporary file");
+        file.write_all(b"stdio contents\n").expect("write the file");
+        let stat = DetStat::from(stat::fstat(file.as_file()).expect("fstat the file"));
+        let learnt = inherited_stdio_mapped_identity(pid, file.as_file().as_raw_fd(), &stat)
+            .expect("a regular file learns a maps identity");
+
+        // What this process's maps header shows for its own mapping of the file.
+        // SAFETY: a new private read-only mapping at an address the kernel
+        // chooses; it is never accessed and is unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                1,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED, "map the file");
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
+        // SAFETY: `addr` is the one-page mapping made above.
+        unsafe { libc::munmap(addr, 1) };
+        let header = maps
+            .lines()
+            .find(|line| {
+                line.split('-')
+                    .next()
+                    .and_then(|start| usize::from_str_radix(start, 16).ok())
+                    == Some(addr as usize)
+            })
+            .expect("a maps header for the mapping");
+        let fields: Vec<&str> = header.split_whitespace().collect();
+        let (major, minor) = fields[3].split_once(':').expect("a device column");
+        let shown = RawFileId::new(
+            libc::makedev(
+                u32::from_str_radix(major, 16).unwrap(),
+                u32::from_str_radix(minor, 16).unwrap(),
+            ),
+            fields[4].parse().unwrap(),
+        );
+        assert_eq!(learnt, shown, "{header}");
+        assert_eq!(learnt.ino, stat.inode);
+
+        let (read, _write) = nix::unistd::pipe().expect("a pipe");
+        let pipe = DetStat::from(stat::fstat(&read).expect("fstat the pipe"));
+        assert_eq!(
+            inherited_stdio_mapped_identity(pid, read.as_raw_fd(), &pipe),
+            None
+        );
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let null_stat = DetStat::from(stat::fstat(&null).expect("fstat /dev/null"));
+        assert_eq!(
+            inherited_stdio_mapped_identity(pid, null.as_raw_fd(), &null_stat),
+            None
+        );
+    }
+
     #[test]
     fn discovered_stdio_uses_container_wide_resources() {
         let owner = DetTid::from_raw(9);
@@ -1097,27 +1259,33 @@ mod file_metadata_tests {
         );
 
         // Observe real metadata transitions without closing the test process's
-        // stdio. Inherited resources keep their slot identities, and an alias
-        // above fd 2 reports its stream's fixed inode rather than reaching the
-        // inode pool with the inherited object's host identity.
-        use crate::syscalls::deterministic_stdio_inode_for_resource;
+        // stdio. The stream, and so the fixed inode, is decided by the
+        // resource: every duplicate of stdout, whatever its number, reports
+        // stdout's inode, and an ordinary file that replaced fd 0, 1 or 2
+        // reports none.
+        use crate::syscalls::inherited_stdio_stream;
 
+        metadata.record_discovered_stdio();
         let inherited_stat = metadata
             .with_detfd(libc::STDOUT_FILENO, |detfd| detfd.stat().unwrap())
             .unwrap();
+        let recorded = InheritedStdio::new([None, Some(inherited_stat.host_file_id()), None]);
+        assert_eq!(metadata.inherited_stdio, recorded);
+        let fixed_inode = |metadata: &mut FileMetadata, fd: RawFd| {
+            metadata
+                .with_detfd(fd, |detfd| {
+                    inherited_stdio_stream(detfd.resource()).map(|stream| {
+                        recorded.inode_of_stream(stream, detfd.stat().map(|s| s.host_file_id()))
+                    })
+                })
+                .unwrap()
+        };
         metadata.dup_fd(1, 7, OFlag::empty()).unwrap();
         assert_eq!(
             metadata.with_detfd(7, |detfd| detfd.resource()).unwrap(),
             Some(ResourceID::Device(Device::ContainerStdout))
         );
-        assert_eq!(
-            metadata
-                .with_detfd(7, |detfd| {
-                    deterministic_stdio_inode_for_resource(7, detfd.resource())
-                })
-                .unwrap(),
-            Some(DetInode::mint(1001))
-        );
+        assert_eq!(fixed_inode(&mut metadata, 7), Some(DetInode::mint(1001)));
         for fd in 0..=2 {
             metadata.remove_fd(fd);
             let mut ordinary = inherited_stat;
@@ -1127,14 +1295,7 @@ mod file_metadata_tests {
                 .unwrap();
             metadata.dup_fd(fd, 8, OFlag::empty()).unwrap();
             for ordinary_fd in [fd, 8] {
-                assert_eq!(
-                    metadata
-                        .with_detfd(ordinary_fd, |detfd| {
-                            deterministic_stdio_inode_for_resource(ordinary_fd, detfd.resource())
-                        })
-                        .unwrap(),
-                    None
-                );
+                assert_eq!(fixed_inode(&mut metadata, ordinary_fd), None);
             }
             assert_eq!(
                 metadata
@@ -1146,20 +1307,21 @@ mod file_metadata_tests {
             );
             metadata.dup_fd(7, fd, OFlag::empty()).unwrap();
             assert_eq!(
-                metadata
-                    .with_detfd(fd, |detfd| {
-                        deterministic_stdio_inode_for_resource(fd, detfd.resource())
-                    })
-                    .unwrap(),
-                Some(DetInode::mint(1000 + fd as u64)),
-                "inherited streams retain the existing numeric-slot outcome"
+                fixed_inode(&mut metadata, fd),
+                Some(DetInode::mint(1001)),
+                "a duplicate of stdout reports stdout's inode whatever its number"
             );
         }
+        // Replacing the process's own fds 0 to 2 does not change what
+        // hermit's stdio is, and every descendant table inherits the record.
+        assert_eq!(metadata.inherited_stdio, recorded);
         metadata.dup_fd(7, 9, OFlag::O_CLOEXEC).unwrap();
         let child = metadata.fork_for(DetTid::from_raw(10));
         let after_exec = child.for_exec(DetTid::from_raw(10));
         assert!(!after_exec.file_handles.contains_key(&9));
         assert!(after_exec.file_handles.contains_key(&7));
+        assert_eq!(child.inherited_stdio, recorded);
+        assert_eq!(after_exec.inherited_stdio, recorded);
     }
 
     #[test]
@@ -2173,6 +2335,7 @@ impl<T> ThreadState<T> {
                     .discover_fd_from_current_process(pid, fd)
                     .expect("SaBRe guest stdio must be open");
             }
+            metadata.record_discovered_stdio();
             metadata
         } else {
             FileMetadata::new(pid).setup_stdio(pid.into(), pid)
@@ -2516,6 +2679,12 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
+    }
+
+    /// The host identities of the objects hermit handed the guest as its
+    /// stdio. See [`InheritedStdio`].
+    pub(crate) fn inherited_stdio(&self) -> InheritedStdio {
+        self.metadata().inherited_stdio
     }
 
     /// Whether this task owns a socket that attempted a loopback connection.

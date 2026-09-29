@@ -25,10 +25,8 @@ use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 
-use super::deterministic_stdio_inode;
-use super::deterministic_stdio_inode_for_resource;
+use super::files::StatRoute;
 use crate::record_or_replay::RecordOrReplay;
-use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
 use crate::types::DetInode;
 use crate::types::RawDevice;
@@ -128,17 +126,31 @@ fn decimal_fd(component: &OsStr) -> Option<i32> {
         .then(|| value.parse().ok())?
 }
 
-/// Returns the optional numeric proc subject and the descriptor number.
+/// Returns the optional numeric proc subject and the descriptor number, for
+/// /dev/fd/N, /proc/<self|thread-self|pid>/fd/N and
+/// /proc/<self|pid>/task/<tid>/fd/N. The subject is the process whose table
+/// holds the descriptor; a task directory names a thread of that process.
 fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
+    let proc_subject = |subject: &OsStr| -> Option<Option<u32>> {
+        match subject.to_str()? {
+            "self" | "thread-self" => Some(None),
+            _ => Some(Some(decimal_u32(subject)?)),
+        }
+    };
     let parts = normalized_absolute_parts(path)?;
     match parts.as_slice() {
         [dev, fd_dir, fd] if *dev == "dev" && *fd_dir == "fd" => Some((None, decimal_fd(fd)?)),
         [proc, subject, fd_dir, fd] if *proc == "proc" && *fd_dir == "fd" => {
-            let subject = match subject.to_str()? {
-                "self" | "thread-self" => None,
-                _ => Some(decimal_u32(subject)?),
-            };
-            Some((subject, decimal_fd(fd)?))
+            Some((proc_subject(subject)?, decimal_fd(fd)?))
+        }
+        [proc, subject, task, tid, fd_dir, fd]
+            if *proc == "proc"
+                && *task == "task"
+                && *fd_dir == "fd"
+                && *subject != "thread-self" =>
+        {
+            decimal_u32(tid)?;
+            Some((proc_subject(subject)?, decimal_fd(fd)?))
         }
         _ => None,
     }
@@ -152,16 +164,16 @@ fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
 /// Lexical, like [`proc_fd_target`]: a relative spelling, or a directory
 /// symlink other than these, is not recognized.
 pub(super) fn descriptor_link_target(path: &Path) -> Option<(Option<u32>, i32)> {
-    if let [dev, stream] = normalized_absolute_parts(path)?.as_slice() {
-        if *dev == "dev" {
-            let fd = match stream.to_str()? {
-                "stdin" => libc::STDIN_FILENO,
-                "stdout" => libc::STDOUT_FILENO,
-                "stderr" => libc::STDERR_FILENO,
-                _ => return None,
-            };
-            return Some((None, fd));
-        }
+    if let [dev, stream] = normalized_absolute_parts(path)?.as_slice()
+        && *dev == "dev"
+    {
+        let fd = match stream.to_str()? {
+            "stdin" => libc::STDIN_FILENO,
+            "stdout" => libc::STDOUT_FILENO,
+            "stderr" => libc::STDERR_FILENO,
+            _ => return None,
+        };
+        return Some((None, fd));
     }
     proc_fd_target(path)
 }
@@ -206,24 +218,6 @@ fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> 
         return Some(AnonymousProcFdIdentity { kind, raw_inode });
     }
     None
-}
-
-/// Match a raw identity against cached current-process inherited-stdio identities.
-/// Callers exclude ordinary replacement objects before filling this array.
-///
-/// Iterating in fd order deliberately matches the last-insert-wins behavior of
-/// the maps sanitizer's `stdio_by_raw_inode` table when stdio descriptors alias.
-fn deterministic_stdio_inode_for_raw(
-    raw_inode: RawInode,
-    stdio_raw_inodes: &[Option<RawInode>; 3],
-) -> Option<DetInode> {
-    let mut matched = None;
-    for (fd, cached) in stdio_raw_inodes.iter().enumerate() {
-        if *cached == Some(raw_inode) {
-            matched = deterministic_stdio_inode(fd as i32);
-        }
-    }
-    matched
 }
 
 /// Host device of every pipe (`kind == "pipe"`) or every socket.
@@ -283,25 +277,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(identity) = anonymous_proc_fd_identity(raw_target) else {
             return Ok(None);
         };
-        let mut stdio_raw_inodes = [None; 3];
-        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
-            stdio_raw_inodes[fd as usize] = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| {
-                    deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                    detfd.stat().map(|stat| stat.inode)
-                })
-                .ok()
-                .flatten();
-        }
-        let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
-            Some(inode) => inode,
-            None => {
-                let raw =
-                    RawFileId::new(anonymous_object_device(identity.kind), identity.raw_inode);
-                determinize_inode(guest, raw).await.0
-            }
-        };
+        // A link names only the inode number; every pipe is on pipefs and
+        // every socket on sockfs, so the device completes the identity. One
+        // of hermit's stdio objects matches on the full pair and reports its
+        // fixed inode without consulting the pool (`StatRoute`).
+        let raw = RawFileId::new(anonymous_object_device(identity.kind), identity.raw_inode);
+        let inode = self
+            .reported_inode(guest, StatRoute::ForeignDescriptorLink, raw)
+            .await
+            .0;
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
         guest.memory().write_exact(buffer.cast(), &target)?;
@@ -366,21 +350,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 libc::S_IFSOCK => "socket",
                 _ => return Ok(result),
             };
-            let inode_override = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| {
-                    deterministic_stdio_inode_for_resource(fd, detfd.resource())
-                })
-                .ok()
-                .flatten();
-            let inode = match inode_override {
-                Some(inode) => inode,
-                None => {
-                    determinize_inode(guest, RawFileId::new(stat.st_dev, stat.st_ino))
-                        .await
-                        .0
-                }
-            };
+            // The same identity `fstat` of the descriptor reports.
+            let route = self.descriptor_route(guest, fd);
+            let inode = self
+                .reported_inode(guest, route, RawFileId::new(stat.st_dev, stat.st_ino))
+                .await
+                .0;
             format!("{kind}:[{inode}]").into_bytes()
         } else {
             return Ok(result);
@@ -634,6 +609,9 @@ mod tests {
             ("/proc/123/fd/7", (Some(123), 7)),
             ("/proc/self/fd/../fd/9", (None, 9)),
             ("/dev/fd/3", (None, 3)),
+            ("/proc/self/task/123/fd/1", (None, 1)),
+            ("/proc/123/task/124/fd/2", (Some(123), 2)),
+            ("/proc/123/task/123/fd/0", (Some(123), 0)),
         ] {
             assert_eq!(proc_fd_target(Path::new(path)), Some(expected), "{path}");
         }
@@ -649,6 +627,8 @@ mod tests {
             ("/proc/self/fd/1", Some((None, 1))),
             ("/proc/thread-self/fd/0", Some((None, 0))),
             ("/proc/123/fd/2", Some((Some(123), 2))),
+            ("/proc/self/task/7/fd/1", Some((None, 1))),
+            ("/proc/123/task/7/fd/1", Some((Some(123), 1))),
             ("/dev/stdio", None),
             ("/dev/null", None),
             ("/dev/stdout/x", None),
@@ -673,6 +653,14 @@ mod tests {
             host_self_proc_fd_alias(Path::new("/proc/self/fd/7"), 123),
             None
         );
+        assert_eq!(
+            host_self_proc_fd_alias(Path::new("/proc/123/task/124/fd/7"), 123),
+            Some(PathBuf::from("/proc/self/fd/7"))
+        );
+        assert_eq!(
+            host_self_proc_fd_alias(Path::new("/proc/124/task/124/fd/7"), 123),
+            None
+        );
     }
 
     #[test]
@@ -684,6 +672,11 @@ mod tests {
             "/proc/not-a-pid/fd/1",
             "/dev/fd/-1",
             "proc/self/fd/1",
+            "/proc/self/task/fd/1",
+            "/proc/self/task/x/fd/1",
+            "/proc/self/tasks/7/fd/1",
+            "/proc/thread-self/task/7/fd/1",
+            "/proc/self/task/7/fdinfo/1",
         ] {
             assert_eq!(proc_fd_target(Path::new(path)), None, "{path}");
         }
@@ -738,20 +731,43 @@ mod tests {
         );
     }
 
+    /// A `pipe:[N]` or `socket:[N]` link names a stdio object only when the
+    /// object is a pipe or socket with inode N: the link's identity is
+    /// completed with the pipefs or sockfs device, and matched on the full
+    /// pair, so a socket whose inode number equals a stdio pipe's (both come
+    /// from one host-wide counter) and a file with that inode number are
+    /// other objects.
     #[test]
-    fn stdio_identity_requires_a_raw_inode_match_and_preserves_alias_precedence() {
-        let stdio = [Some(11), Some(22), Some(33)];
+    fn an_anonymous_link_names_a_stdio_object_on_its_device_and_inode() {
+        let (read, _write) = nix::unistd::pipe().unwrap();
+        let pipe = nix::sys::stat::fstat(&read).unwrap();
+        assert_eq!(anonymous_object_device("pipe"), pipe.st_dev);
+        let socket = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            deterministic_stdio_inode_for_raw(22, &stdio),
+            anonymous_object_device("socket"),
+            nix::sys::stat::fstat(&socket).unwrap().st_dev
+        );
+        assert_ne!(
+            anonymous_object_device("pipe"),
+            anonymous_object_device("socket")
+        );
+
+        let stdout_pipe = RawFileId::new(pipe.st_dev, pipe.st_ino);
+        let file = RawFileId::new(0x30, pipe.st_ino);
+        let stdio = super::super::InheritedStdio::new([Some(file), Some(stdout_pipe), None]);
+        let link = |kind: &str, ino| RawFileId::new(anonymous_object_device(kind), ino);
+        assert_eq!(
+            stdio.inode_of_object(link("pipe", pipe.st_ino)),
             Some(DetInode::mint(1001))
         );
-        assert_eq!(deterministic_stdio_inode_for_raw(44, &stdio), None);
-
-        let aliased = [None, Some(55), Some(55)];
-        assert_eq!(
-            deterministic_stdio_inode_for_raw(55, &aliased),
-            Some(DetInode::mint(1002))
-        );
+        assert_eq!(stdio.inode_of_object(link("socket", pipe.st_ino)), None);
+        assert_eq!(stdio.inode_of_object(link("pipe", pipe.st_ino + 1)), None);
     }
 
     #[test]

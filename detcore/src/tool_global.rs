@@ -92,6 +92,8 @@ use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::scheduler::sched_loop;
 use crate::scheduler::sched_loop_external;
+use crate::syscalls::InheritedStdio;
+use crate::syscalls::deterministic_stdio_inode;
 use crate::tool_local::Detcore;
 use crate::tool_local::ExecFdBlockingOverrides;
 use crate::tool_local::RobustListWake;
@@ -312,6 +314,12 @@ impl InodePool {
     /// deliberately mapped to a deterministic one. The value is minted from
     /// the device's monotonic counter, never derived from the host inode's
     /// bits. The caller records the identity it was minted for.
+    ///
+    /// The first device's slot is 0, so its values are the bare counter. The
+    /// counter skips the fixed stdio inodes 1000 to 1002 there, which belong
+    /// to hermit's stdio objects (see [`crate::syscalls::InheritedStdio`]):
+    /// the 1000th file determinized on that device must not share an identity
+    /// with stdin.
     fn mint(&mut self, dev: RawDevice, mtime: LogicalTime) -> DetInode {
         let next_device_slot = &mut self.next_device_slot;
         let device = self.devices.entry(dev).or_insert_with(|| {
@@ -319,6 +327,9 @@ impl InodePool {
             *next_device_slot += 1;
             DeviceInodeCounter { slot, next: 1 }
         });
+        while device.slot == 0 && is_fixed_stdio_inode(device.next) {
+            device.next += 1;
+        }
         assert!(
             device.next < (1 << DEVICE_SLOT_SHIFT),
             "more than 2^{DEVICE_SLOT_SHIFT} inodes determinized on one device"
@@ -455,6 +466,49 @@ impl InodePool {
         (dino, self.info(dino).mtime)
     }
 
+    /// [`InodePool::resolve_mapping`] for a header read by a process whose
+    /// inherited stdio objects are `stdio`: a header that names one of them
+    /// reports its fixed inode, as `fstat` of the stream and `stat` of the
+    /// object's path do.
+    ///
+    /// A header names a stdio object when its `(device, inode)` pair is the
+    /// object's `stat` identity or the maps identity learnt for it at startup,
+    /// or, when none was learnt, its device is one the pool has seen paired
+    /// with the object's device and the inode numbers are equal (see
+    /// [`InheritedStdio::inode_of_mapping`]). Such a header does not consult
+    /// the pool further, as a descriptor derived from the stream does not. A
+    /// header that does not match first is resolved as usual, and the result
+    /// is still replaced when the inode it resolved to has a stdio object's
+    /// `stat` identity (the pairing was learnt by this resolution).
+    ///
+    /// Residual: when no maps identity was learnt (the in-guest backend, or an
+    /// object that could not be mapped at startup), a stdio object on btrfs
+    /// or overlayfs mapped before any file on its devices has paired them,
+    /// and whose path nobody has `stat`ed, resolves to a provisional inode
+    /// under the maps device rather than its fixed inode.
+    fn resolve_mapping_with_stdio(
+        &mut self,
+        raw: RawFileId,
+        stdio: InheritedStdio,
+        mtime: LogicalTime,
+    ) -> (DetInode, LogicalTime) {
+        let paired_devices = &self.paired_devices;
+        if let Some(fixed) = stdio.inode_of_mapping(raw, |maps_dev, stat_dev| {
+            paired_devices.contains(&(maps_dev, stat_dev))
+        }) {
+            return (fixed, mtime);
+        }
+        let (dino, mtime) = self.resolve_mapping(raw, mtime);
+        match self
+            .info(dino)
+            .stat
+            .and_then(|stat| stdio.inode_of_object(stat))
+        {
+            Some(fixed) => (fixed, mtime),
+            None => (dino, mtime),
+        }
+    }
+
     // remove a det inode
     fn remove_inode(&mut self, det_inode: DetInode) {
         if let Some(info) = self.detinodes_info.remove(&det_inode) {
@@ -473,6 +527,13 @@ impl InodePool {
             }
         }
     }
+}
+
+/// Whether `value` is one of the fixed stdio inodes, which the pool never
+/// mints.
+fn is_fixed_stdio_inode(value: RawInode) -> bool {
+    (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+        .any(|stream| deterministic_stdio_inode(stream) == Some(DetInode::mint(value)))
 }
 
 fn remove_from_index(
@@ -1682,11 +1743,11 @@ impl GlobalTool for GlobalState {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
             GlobalRequest::DeterminizeInode(ino) => {
-                R::DeterminizeInode(self.recv_determinize_inode(from, ino, false).await)
+                R::DeterminizeInode(self.recv_determinize_inode(from, ino, None).await)
             }
-            GlobalRequest::DeterminizeMappingInode(ino) => {
-                R::DeterminizeMappingInode(self.recv_determinize_inode(from, ino, true).await)
-            }
+            GlobalRequest::DeterminizeMappingInode(ino, stdio) => R::DeterminizeMappingInode(
+                self.recv_determinize_inode(from, ino, Some(stdio)).await,
+            ),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
             GlobalRequest::DeterminizeDevice(dev) => {
@@ -2603,11 +2664,13 @@ impl GlobalState {
         sched.wake_futex_waiters_after_exit(&wakes)
     }
 
+    /// `mapping_stdio` is `Some` for the identity a `/proc/<pid>/maps` header
+    /// names, carrying the reading process's inherited stdio objects.
     async fn recv_determinize_inode(
         &self,
         from: Tid,
         ino: RawFileId,
-        from_mapping: bool,
+        mapping_stdio: Option<InheritedStdio>,
     ) -> (DetInode, LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
         // Here we establish a policy that when we first see a file its mtime is epoch.
@@ -2618,10 +2681,11 @@ impl GlobalState {
             .expect("epoch cannot be represented in a timestamp with nanosecond precision")
             as u64;
         let mut pool = self.inodes.lock().unwrap();
-        let (dino, ns) = if from_mapping {
-            pool.resolve_mapping(ino, LogicalTime::from_nanos(nanos))
-        } else {
-            pool.add_inode(ino, LogicalTime::from_nanos(nanos))
+        let (dino, ns) = match mapping_stdio {
+            Some(stdio) => {
+                pool.resolve_mapping_with_stdio(ino, stdio, LogicalTime::from_nanos(nanos))
+            }
+            None => pool.add_inode(ino, LogicalTime::from_nanos(nanos)),
         };
         drop(pool);
         trace!(
@@ -3068,8 +3132,10 @@ pub enum GlobalRequest {
 
     /// Translate the identity a `/proc/<pid>/maps` header names, whose device
     /// column may differ from the file's `st_dev` (see
-    /// `InodePool::resolve_mapping`).
-    DeterminizeMappingInode(RawFileId),
+    /// `InodePool::resolve_mapping`), for a process whose inherited stdio
+    /// objects are the second field (see
+    /// `InodePool::resolve_mapping_with_stdio`).
+    DeterminizeMappingInode(RawFileId, InheritedStdio),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -3770,12 +3836,19 @@ where
 /// `/proc/<pid>/maps` header names. The maps device column is not always the
 /// file's `st_dev` (btrfs reports the superblock device there), so a pair not
 /// seen exactly resolves to an existing inode with the same host inode number.
-pub async fn determinize_mapping_inode<G, T>(guest: &mut G, inode: RawFileId) -> DetInode
+/// A header naming one of the process's inherited stdio objects `stdio`
+/// reports that object's fixed inode.
+pub async fn determinize_mapping_inode<G, T>(
+    guest: &mut G,
+    inode: RawFileId,
+    stdio: InheritedStdio,
+) -> DetInode
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeMappingInode(inode)).await;
+    let resp =
+        send_and_update_time(guest, GlobalRequest::DeterminizeMappingInode(inode, stdio)).await;
     match resp.1 {
         GlobalResponse::DeterminizeMappingInode(x) => x.0,
         _ => unreachable!(),
@@ -4592,6 +4665,7 @@ mod tests {
     use crate::scheduler::SchedResponse;
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
+    use crate::syscalls::InheritedStdio;
     use crate::tool_local::ExecFdBlockingOverrides;
     use crate::types::DetInode;
     use crate::types::DetPid;
@@ -7332,6 +7406,124 @@ mod tests {
         assert_eq!(
             pool.resolve_mapping(RawFileId::new(0x30, 5_000), t).0,
             first_minted
+        );
+    }
+
+    /// The first device's inodes are the bare counter, so the pool must skip
+    /// the fixed stdio inodes 1000 to 1002 there: the 1000th file on the root
+    /// filesystem is not stdin. Other devices carry their slot in the high
+    /// bits and cannot collide.
+    #[test]
+    fn the_first_device_never_mints_a_fixed_stdio_inode() {
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        for ino in 1..=999 {
+            assert_eq!(
+                pool.add_inode(RawFileId::new(0x21, 50_000 + ino), t).0,
+                DetInode::mint(ino)
+            );
+        }
+        assert_eq!(
+            pool.add_inode(RawFileId::new(0x21, 60_000), t).0,
+            DetInode::mint(1003),
+            "1000 to 1002 are the fixed stdio inodes"
+        );
+        // A provisional inode minted for a maps header skips them too.
+        assert_eq!(
+            pool.resolve_mapping(RawFileId::new(0x21, 60_001), t).0,
+            DetInode::mint(1004)
+        );
+
+        let mut other = super::InodePool::new();
+        other.add_inode(RawFileId::new(0x21, 1), t);
+        for ino in 1..=999 {
+            other.add_inode(RawFileId::new(0x9e, ino), t);
+        }
+        assert_eq!(
+            other.add_inode(RawFileId::new(0x9e, 1_000), t).0,
+            DetInode::mint((1 << super::DEVICE_SLOT_SHIFT) | 1_000),
+            "a later device's counter is not reserved"
+        );
+        assert!((1_000..=1_002).all(|reserved| {
+            !pool.detinodes_info.contains_key(&DetInode::mint(reserved))
+                && !other.detinodes_info.contains_key(&DetInode::mint(reserved))
+        }));
+    }
+
+    /// A maps header names a stdio object only through the object's own
+    /// `(device, inode)` pair or a device paired with it, and then reports
+    /// the object's fixed inode without consulting the pool.
+    #[test]
+    fn a_maps_header_naming_a_stdio_object_reports_its_fixed_inode() {
+        let t = LogicalTime::from_nanos(0);
+        let dev_null = RawFileId::new(0x5, 3);
+        let output = RawFileId::new(0x21, 7_917_682);
+        let stdio = InheritedStdio::new([Some(dev_null), Some(output), Some(output)]);
+
+        let mut pool = super::InodePool::new();
+        assert_eq!(
+            pool.resolve_mapping_with_stdio(output, stdio, t).0,
+            DetInode::mint(1001)
+        );
+        assert!(
+            pool.detinodes_info.is_empty() && pool.mapping_inodes.is_empty(),
+            "a header naming a stdio object must not consult the pool"
+        );
+
+        // The third file of a fresh tmpfs is inode 3, as /dev/null is. It is
+        // a different object, and maps must agree with its `stat`.
+        let tmpfs_third = RawFileId::new(0x9e, 3);
+        let (mapped, _) = pool.resolve_mapping_with_stdio(tmpfs_third, stdio, t);
+        assert!(mapped.as_raw() > 1_002 || mapped.as_raw() < 1_000);
+        assert_eq!(pool.add_inode(tmpfs_third, t).0, mapped);
+
+        // btrfs: the header names the output file under maps device 0x20.
+        // Once a stat of the file's path has put it in the pool, the header
+        // resolves to that entry, pairs the devices, and reports the fixed
+        // inode; a later header on the paired device needs no resolution.
+        let maps_output = RawFileId::new(0x20, output.ino);
+        pool.add_inode(output, t);
+        assert_eq!(
+            pool.resolve_mapping_with_stdio(maps_output, stdio, t).0,
+            DetInode::mint(1001)
+        );
+        assert!(pool.paired_devices.contains(&(0x20, 0x21)));
+        let mut paired = super::InodePool::new();
+        let (libc, _) = paired.add_inode(RawFileId::new(0x21, 43_905_055), t);
+        assert_eq!(
+            paired
+                .resolve_mapping(RawFileId::new(0x20, 43_905_055), t)
+                .0,
+            libc
+        );
+        let minted_before = paired.detinodes_info.len();
+        assert_eq!(
+            paired.resolve_mapping_with_stdio(maps_output, stdio, t).0,
+            DetInode::mint(1001)
+        );
+        assert_eq!(paired.detinodes_info.len(), minted_before);
+
+        // The same inode number on a maps device NOT paired with the output
+        // file's device is another file.
+        let unpaired = RawFileId::new(0x31, output.ino);
+        assert_ne!(
+            paired.resolve_mapping_with_stdio(unpaired, stdio, t).0,
+            DetInode::mint(1001)
+        );
+
+        // With the maps identity learnt at startup, a header naming the
+        // output file under maps device 0x20 reports its fixed inode on a
+        // fresh pool, before anything has paired the devices, and consults
+        // the pool no more than a header matching the `stat` identity does.
+        let learnt = stdio.with_mapped([None, Some(maps_output), Some(maps_output)]);
+        let mut fresh = super::InodePool::new();
+        assert_eq!(
+            fresh.resolve_mapping_with_stdio(maps_output, learnt, t).0,
+            DetInode::mint(1001)
+        );
+        assert!(
+            fresh.detinodes_info.is_empty() && fresh.mapping_inodes.is_empty(),
+            "a header naming a stdio object by its learnt maps identity must not consult the pool"
         );
     }
 
