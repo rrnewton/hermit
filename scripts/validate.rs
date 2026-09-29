@@ -4233,6 +4233,7 @@ cleared-caps refusal names {} starved step(s)",
         for tag in [
             "privileged-e2e.manifest_applications",
             "privileged-e2e.manifest_c_programs",
+            "privileged-e2e.manifest_system_utils",
         ] {
             let deps = deps_of(tag)
                 .ok_or_else(|| format!("full-plan bracket: pinned-root cell {tag} disappeared"))?;
@@ -9696,7 +9697,7 @@ fn expand_strict_compat_alias(
     Ok(())
 }
 
-const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 12] = [
+const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 13] = [
     ("build.rust_scripts", "build.rust_scripts"),
     ("check.reverie_pin", "pre.reverie_pin"),
     ("build.privileged_tests", "privileged-only-build.privileged_tests"),
@@ -9716,6 +9717,10 @@ const PRIVILEGED_PUBLIC_TAGS: [(&str, &str); 12] = [
     (
         "e2e.manifest_c_programs",
         "privileged-only-e2e.manifest_c_programs",
+    ),
+    (
+        "e2e.manifest_system_utils",
+        "privileged-only-e2e.manifest_system_utils",
     ),
     ("test.cli_kvm", "privileged-only-test.cli_kvm"),
 ];
@@ -14704,8 +14709,12 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
             .collect::<Vec<_>>();
         // 33 until backend-parity-c was folded into c-programs, which removed
         // e2e.manifest_backend_parity_c and its _on_host variant
-        // (https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(steps.len(), 31);
+        // (https://github.com/rrnewton/hermit/issues/3301). 34 since
+        // system-utils/sysfs-sanitized-prefixes moved to the privileged lane,
+        // which added privileged-e2e.manifest_system_utils,
+        // privileged-only-e2e.manifest_system_utils and its _on_host variant
+        // (https://github.com/rrnewton/hermit/actions/runs/36485831200).
+        assert_eq!(steps.len(), 34);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -26980,8 +26989,12 @@ mod raw_census_publication_tests {
             .collect::<Vec<_>>();
         // 33 until backend-parity-c was folded into c-programs, which removed
         // e2e.manifest_backend_parity_c and its _on_host variant
-        // (https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(publishers.len(), 31);
+        // (https://github.com/rrnewton/hermit/issues/3301). 34 since
+        // system-utils/sysfs-sanitized-prefixes moved to the privileged lane,
+        // which added privileged-e2e.manifest_system_utils,
+        // privileged-only-e2e.manifest_system_utils and its _on_host variant
+        // (https://github.com/rrnewton/hermit/actions/runs/36485831200).
+        assert_eq!(publishers.len(), 34);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(
