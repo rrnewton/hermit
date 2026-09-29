@@ -363,7 +363,7 @@ Examples:
   # Check one committed green cell 100 times under the same boxed limits.
   # The DAG admits at most four manifest guests at once.
   ./ci/compat-envelope/pressure-test.rs run \
-    --test backend-parity-c/fork-exec-pipeline \
+    --test c-programs/fork-exec-pipeline \
     --mode verify --backend ptrace --green \
     --repetitions 100 --cell-timeout 600
 

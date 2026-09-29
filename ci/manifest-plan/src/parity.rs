@@ -2691,10 +2691,16 @@ mod tests {
         let manifests = ManifestSet::load(&root).unwrap();
         let matrix = ParityMatrix::derive(&manifests).unwrap();
         let selection = ParitySelection::load(&root, &matrix).unwrap();
+        // The rule names the tests folded from the retired backend-parity-c
+        // bucket, which retired-ids.json records; they now live in c-programs.
+        let folded = crate::retired_ids::RetiredIds::load(&root)
+            .unwrap()
+            .successors_of("backend-parity-c")
+            .unwrap();
         let reference_selected: BTreeSet<String> = manifests
             .select(&Selection {
                 population: Some(Population::Required),
-                category: Some("backend-parity-c".to_string()),
+                category: Some("c-programs".to_string()),
                 mode: Some(PARITY_MODE.to_string()),
                 backend: Some(PARITY_REFERENCE_BACKEND.to_string()),
                 ..Selection::default()
@@ -2702,6 +2708,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|cell| cell.id.test)
+            .filter(|test| folded.contains(test))
             .collect();
         assert!(!reference_selected.is_empty());
         let derived: BTreeSet<ParityCellId> = matrix
@@ -2712,7 +2719,12 @@ mod tests {
             .map(|(id, _)| id.clone())
             .collect();
         assert_eq!(selection.cells, derived);
-        assert!(selection.rule.contains("backend-parity-c"));
+        assert!(selection.rule.contains("retired backend-parity-c bucket"));
+        assert!(
+            selection
+                .rule
+                .contains(crate::retired_ids::RETIRED_IDS_FILE)
+        );
     }
 
     #[test]

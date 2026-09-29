@@ -1,5 +1,11 @@
 //! Exact command bytes for the two backend-parity-c manifest selectors.
 //!
+//! Those selectors no longer exist in a generated plan: slice S6 of
+//! <https://github.com/rrnewton/hermit/issues/3301> folded the backend-parity-c
+//! bucket into c-programs and removed `e2e.manifest_backend_parity_c` and its
+//! `_on_host` twin. Their tags, commands and category below are the spellings
+//! of retained plans, which a reader must still match byte for byte.
+//!
 //! The generator emits only the ordinary spellings: since
 //! <https://github.com/rrnewton/hermit/issues/3301> no newly constructed plan
 //! asks the harness for a ptrace reference run, and the generator's invariants

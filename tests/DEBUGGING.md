@@ -1,8 +1,13 @@
 # applications
 
-# backend-parity-c
+# bin-c
 
-## backend-parity-c/hardware-trap-identity
+# c-programs
+
+## c-programs/hardware-trap-identity
+
+Recorded as `backend-parity-c/hardware-trap-identity` before that bucket was
+folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).
 
 ### 2026-08-27T05:27:07-07:00 — portable / verify / dbt — ERROR
 
@@ -36,18 +41,21 @@
   cell name does not identify the failing subsystem.
 - Ruled out / next: this is not the SaBRe TLS ordering defect and not KVM's
   wrong guest-visible signal result. The pre-fix polling mechanism was shared
-  with `backend-parity-c/signal-waitstatus-identity/verify@dbt`, which is also
+  with `c-programs/signal-waitstatus-identity/verify@dbt`, which is also
   now 3 of 3 `ERROR/no_result`. Determine why DBT does not complete both runs
   after the child-lifecycle repair; do not restore host polling and do not call
   either cell resolved until a terminal canonical comparison exists.
 
-## backend-parity-c/signal-waitstatus-identity
+## c-programs/signal-waitstatus-identity
+
+Recorded as `backend-parity-c/signal-waitstatus-identity` before that bucket
+was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).
 
 ### 2026-08-27T05:27:07-07:00 — portable / verify / dbt — ERROR
 
 - Hermit and command: the same main SHA, complete E2E artifact, unrelaxed
   comparator, 15-second timeout, and one-worker runner as
-  `backend-parity-c/hardware-trap-identity` above.
+  `c-programs/hardware-trap-identity` above.
 - Evidence: three result rows and artifact directories under
   `<dev-hermit>/ignored/hermit-132-postfix-6172478e-retry4-results/`, with
   result-row SHA-256 values
@@ -64,10 +72,6 @@
 - Ruled out / next: ptrace was the positive control for the old comparison at
   336/336 canonical INFO records. Re-measure DBT only after its run completes;
   until then this cell is uncheckable rather than matching or diverging.
-
-# bin-c
-
-# c-programs
 
 ## c-programs/writev-determinism
 

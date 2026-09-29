@@ -63,9 +63,8 @@ const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
 const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
-const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 12] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 8),
-    ("e2e.manifest_backend_parity_c", "manifest_guest", 8, 8),
     ("e2e.manifest_bin_c", "manifest_guest", 1, 8),
     ("e2e.manifest_c_programs", "manifest_guest", 8, 8),
     ("e2e.manifest_chaos_c", "manifest_guest", 1, 8),
@@ -171,13 +170,13 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 272,
-        selected_steps: 273,
+        direct_steps: 271,
+        selected_steps: 272,
     },
     Profile {
         label: "portable",
-        direct_steps: 261,
-        selected_steps: 262,
+        direct_steps: 260,
+        selected_steps: 261,
     },
     Profile {
         label: "quick",
@@ -196,8 +195,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 252,
-        selected_steps: 252,
+        direct_steps: 251,
+        selected_steps: 251,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1237,9 +1236,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 108 {
+    if expected.len() != 106 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 108",
+            "structured result producer registry has {} entries, expected 106",
             expected.len()
         ));
     }
@@ -1374,7 +1373,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [69, 33, 2, 2, 2] {
+    if actual_group_counts != [69, 31, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1576,6 +1575,62 @@ fn assert_dagrun_preparation_placement(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Manifest buckets whose `test-harness run` selector omits `--allow-empty`.
+///
+/// A node for one of these buckets that selects no cells fails with "filters
+/// selected no cells" instead of passing having executed nothing. c-programs
+/// joined when the backend-parity-c bucket was folded into it
+/// (<https://github.com/rrnewton/hermit/issues/3301>): the fold moved 279
+/// selected cells (276 portable, 3 privileged) onto its nodes, and a bucket
+/// that large must not be able to report green on an empty selection. The
+/// generator, the manifest DAG audit in `test-harness validate`, and the
+/// validation driver's raw-publisher check all read this one list.
+pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs"];
+
+/// The selector flags a manifest node for `category` passes after
+/// `--lane <lane> --category <category>`.
+pub fn manifest_selector_flags(category: &str) -> &'static str {
+    if FAIL_CLOSED_MANIFEST_BUCKETS.contains(&category) {
+        "--ci-only --prebuilt"
+    } else {
+        "--ci-only --allow-empty --prebuilt"
+    }
+}
+
+/// Every node of a [`FAIL_CLOSED_MANIFEST_BUCKETS`] bucket runs its exact
+/// selector without `--allow-empty`, and every such bucket still has a node.
+fn assert_fail_closed_manifest_selectors(cfg: &DagConfig) -> Result<(), String> {
+    let mut covered = BTreeSet::new();
+    for step in &cfg.steps {
+        let Some(manifest) = step.manifest.as_ref() else {
+            continue;
+        };
+        if !FAIL_CLOSED_MANIFEST_BUCKETS.contains(&manifest.category.as_str()) {
+            continue;
+        }
+        let selector = format!(
+            "target/debug/test-harness run --lane {} --category {} {}",
+            manifest.lane,
+            manifest.category,
+            manifest_selector_flags(&manifest.category)
+        );
+        if step.cmd.contains("--allow-empty") || step.cmd.matches(selector.as_str()).count() != 1 {
+            return Err(format!(
+                "{} must fail closed on an empty selection: it must run `{selector}` exactly once and never pass --allow-empty",
+                step.tag()
+            ));
+        }
+        covered.insert(manifest.category.as_str());
+    }
+    if let Some(bucket) = FAIL_CLOSED_MANIFEST_BUCKETS
+        .iter()
+        .find(|bucket| !covered.contains(**bucket))
+    {
+        return Err(format!("fail-closed manifest bucket {bucket} has no node"));
+    }
+    Ok(())
+}
+
 fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
     let ordinary = cfg
         .steps
@@ -1686,10 +1741,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
+    assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1608 {
+    if cfg.steps.len() != 1606 {
         return Err(format!(
-            "superset has {} steps, expected 1608",
+            "superset has {} steps, expected 1606",
             cfg.steps.len()
         ));
     }
@@ -2043,7 +2099,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 "privileged-only-build.privileged_tests_on_host",
                 "privileged-only-cpuid.faulting_on_host",
                 "privileged-only-e2e.manifest_applications_on_host",
-                "privileged-only-e2e.manifest_backend_parity_c_on_host",
+                "privileged-only-e2e.manifest_c_programs_on_host",
                 "privileged-only-pmu.preemption_on_host",
                 "privileged-only-test.cli_kvm_on_host",
                 "privileged-only-test.pmu_buck_chaos_cases_on_host",
@@ -2073,10 +2129,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 ("privileged-only-test.pmu_buck_chaos_cases_on_host", 7200),
                 ("privileged-build.manifest_guests_on_host", 7200),
                 ("privileged-only-e2e.manifest_applications_on_host", 7200),
-                (
-                    "privileged-only-e2e.manifest_backend_parity_c_on_host",
-                    7200,
-                ),
+                ("privileged-only-e2e.manifest_c_programs_on_host", 7200),
                 ("privileged-only-test.cli_kvm_on_host", 7200),
             ]
             .into_iter()
@@ -2921,22 +2974,32 @@ sys.exit(37)
             Vec::<String>::new(),
             "https://github.com/rrnewton/hermit/issues/3301 removed the ptrace reference run from every generated step"
         );
-        // The two former parity selectors keep their population, width and
-        // resources; only the reference flag is gone.
-        let selectors = [
+        // The former parity selectors were folded into the c-programs pair
+        // (slice S6 of https://github.com/rrnewton/hermit/issues/3301). That
+        // pair keeps its width and resources, carries no reference flag, and
+        // fails closed on an empty selection.
+        for retired in [
             "e2e.manifest_backend_parity_c",
             "e2e.manifest_backend_parity_c_on_host",
-        ];
+        ] {
+            assert!(
+                dag.steps.iter().all(|step| step.tag() != retired),
+                "{retired} must stay folded into c-programs"
+            );
+        }
+        let selectors = ["e2e.manifest_c_programs", "e2e.manifest_c_programs_on_host"];
         for tag in selectors {
             let step = dag.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert!(step.cmd.contains(
-                "--category backend-parity-c --ci-only --allow-empty --prebuilt --results"
-            ));
+            assert!(
+                step.cmd
+                    .contains("--category c-programs --ci-only --prebuilt --results")
+            );
+            assert!(!step.cmd.contains("--allow-empty"));
             assert_eq!(step.jobs_flag.as_deref(), Some("--jobs"));
             assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             let selector = step.manifest.as_ref().unwrap();
             assert_eq!(selector.lane, "portable");
-            assert_eq!(selector.category, "backend-parity-c");
+            assert_eq!(selector.category, "c-programs");
             assert_eq!(selector.test, None);
             assert_eq!(selector.mode, None);
             assert_eq!(selector.backend, None);
@@ -2973,12 +3036,11 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        assert_eq!(selected.steps.len(), 252);
+        assert_eq!(selected.steps.len(), 251);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
             "e2e.manifest_applications_on_host",
-            "e2e.manifest_backend_parity_c_on_host",
             "e2e.manifest_bin_c_on_host",
             "e2e.manifest_c_programs_on_host",
             "e2e.manifest_chaos_c_on_host",
@@ -3037,7 +3099,10 @@ sys.exit(37)
             .map(str::to_string)
             .into_iter()
             .collect::<BTreeSet<_>>();
-        assert_eq!(expected.len(), 16);
+        // 15 since e2e.manifest_backend_parity_c_on_host was folded into
+        // e2e.manifest_c_programs_on_host (slice S6 of
+        // https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(expected.len(), 15);
         assert!(expected.is_disjoint(&new_variants));
         expected.extend(new_variants);
         assert_eq!(
@@ -3127,7 +3192,7 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            error.contains("hosted-portable label has 251 direct steps"),
+            error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
     }
@@ -3229,15 +3294,84 @@ sys.exit(37)
         let local = committed
             .steps
             .iter()
-            .find(|step| step.tag() == "e2e.manifest_backend_parity_c")
+            .find(|step| step.tag() == "e2e.manifest_c_programs")
             .unwrap();
         let hosted = committed
             .steps
             .iter()
-            .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
+            .find(|step| step.tag() == "e2e.manifest_c_programs_on_host")
             .unwrap();
-        assert_eq!(local.timeout, 600);
+        // 900 s covers the 104 folded backend-parity-c tests (slice S6 of
+        // https://github.com/rrnewton/hermit/issues/3301); the two buckets
+        // measured 128.62 s and 75.76 s of wall time in one run.
+        assert_eq!(local.timeout, 900);
         assert_eq!(hosted.timeout, local.timeout);
+    }
+
+    #[test]
+    fn c_programs_nodes_refuse_an_empty_selection() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        assert_invariants(&committed, &cells).unwrap();
+        let c_programs = committed
+            .steps
+            .iter()
+            .filter(|step| {
+                step.manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.category == "c-programs")
+            })
+            .map(|step| step.tag())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            c_programs,
+            [
+                "e2e.manifest_c_programs",
+                "privileged-e2e.manifest_c_programs",
+                "privileged-only-e2e.manifest_c_programs",
+                "e2e.manifest_c_programs_on_host",
+                "privileged-only-e2e.manifest_c_programs_on_host",
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(
+            manifest_selector_flags("c-programs"),
+            "--ci-only --prebuilt"
+        );
+        assert_eq!(
+            manifest_selector_flags("bin-c"),
+            "--ci-only --allow-empty --prebuilt"
+        );
+        for tag in &c_programs {
+            let mut planted = committed.clone();
+            let step = planted
+                .steps
+                .iter_mut()
+                .find(|step| &step.tag() == tag)
+                .unwrap();
+            assert!(!step.cmd.contains("--allow-empty"), "{tag}");
+            assert_eq!(step.cmd.matches("--ci-only --prebuilt").count(), 1);
+            step.cmd = step
+                .cmd
+                .replace("--ci-only --prebuilt", "--ci-only --allow-empty --prebuilt");
+            let error = assert_fail_closed_manifest_selectors(&planted).unwrap_err();
+            assert!(
+                error.starts_with(&format!(
+                    "{tag} must fail closed on an empty selection: it must run `target/debug/test-harness run --lane "
+                )) && error.ends_with("--category c-programs --ci-only --prebuilt` exactly once and never pass --allow-empty"),
+                "{error}"
+            );
+        }
+        let mut dropped = committed.clone();
+        dropped.steps.retain(|step| {
+            step.manifest
+                .as_ref()
+                .is_none_or(|manifest| manifest.category != "c-programs")
+        });
+        assert_eq!(
+            assert_fail_closed_manifest_selectors(&dropped).unwrap_err(),
+            "fail-closed manifest bucket c-programs has no node"
+        );
     }
 
     #[test]

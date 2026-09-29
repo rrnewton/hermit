@@ -49,6 +49,7 @@ use hermit_manifest_plan::logdiff_report::LogDiffRecords;
 use hermit_manifest_plan::logdiff_report::LogDiffReport;
 use hermit_manifest_plan::logdiff_report::LogDiffVerdict;
 use hermit_manifest_plan::logdiff_report::RecordEnvelopePolicy;
+use hermit_manifest_plan::retired_ids::RetiredIds;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
@@ -1537,13 +1538,14 @@ impl ResultRow {
             None if self.mode == "naked" => "native".to_string(),
             None => return None,
         };
-        Some(CellId {
+        // A retained row recorded under a retired test id joins its successor.
+        Some(resolve_cell_id(&CellId {
             lane: self.lane.clone(),
             category: self.category.clone(),
             test: self.test.clone(),
             mode: self.mode.clone(),
             backend,
-        })
+        }))
     }
 
     fn require_literal_invocation(&self) -> Result<(), String> {
@@ -3355,6 +3357,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let root = repo_root()?;
+    init_retired_ids(&root)?;
     let _ledger_identity_scope = CommandLedgerIdentityScope::enter();
     if matches!(
         command.as_str(),
@@ -3861,7 +3864,7 @@ fn retain_selected_custom_results(
                 .filter(|event| {
                     event.producer == SeriesProducer::Validate
                         && event.run_id == row.run_id
-                        && event.cell() == key
+                        && series_row_cell(event) == key.as_str()
                         && event.series.tree == row.hermit_sha
                         && event.series.run_index <= row.attempt
                         && series_last_run_index(event).is_some_and(|last| row.attempt <= last)
@@ -3955,7 +3958,7 @@ fn reconcile_declared_guest_exits(
             for event in series.iter().filter(|event| {
                 event.producer == SeriesProducer::Validate
                     && event.run_id == row.run_id
-                    && event.cell() == key
+                    && series_row_cell(event) == key.as_str()
                     && event.series.tree == row.hermit_sha
                     && event.series.run_index <= row.attempt
                     && series_last_run_index(event).is_some_and(|last| row.attempt <= last)
@@ -4470,7 +4473,7 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
 This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. \
 A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
-At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification: since https://github.com/rrnewton/hermit/issues/3301 no committed selector runs a ptrace reference, and parity no longer decides a validation outcome. The counts below come from strict ptrace-vs-candidate reports recorded before that change. No command produces a new one, `--probe-disabled` included: it now runs only the disabled cell's own backend verification. The counts are therefore not refreshed until a new parity producer lands. Eligibility does not mean every cell was selected or measured.\n\n\
+At the latest recorded Hermit source depth, any divergence outranks a match. The cells formerly in `backend-parity-c` run under the portable and hosted-portable `c-programs` nodes, which perform ordinary same-backend verification: since https://github.com/rrnewton/hermit/issues/3301 no committed selector runs a ptrace reference, and parity no longer decides a validation outcome. The counts below come from strict ptrace-vs-candidate reports recorded before that change. No command produces a new one, `--probe-disabled` included: it now runs only the disabled cell's own backend verification. The counts are therefore not refreshed until a new parity producer lands. Eligibility does not mean every cell was selected or measured.\n\n\
 | Candidate backend | Ptrace cells selected by full | Not-applicable candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
@@ -4647,7 +4650,10 @@ fn tracked_from(
                 existing.schema
             ));
         }
-        for cell in existing.cells {
+        // History recorded under a retired test id carries forward to its
+        // successor rather than reading as a deleted cell plus a new one.
+        for mut cell in existing.cells {
+            cell.id = resolve_cell_id(&cell.id);
             if previous.insert(cell.id.clone(), cell).is_some() {
                 return Err("tracked cell file contains a duplicate identity".into());
             }
@@ -4906,7 +4912,9 @@ fn load_catalogue(root: &Path) -> Result<Option<TrackedCells>, String> {
     }
     let bytes =
         fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    decode_catalogue(&bytes).map(Some)
+    let mut catalogue = decode_catalogue(&bytes)?;
+    resolve_retired_history(&mut catalogue)?;
+    Ok(Some(catalogue))
 }
 
 /// Each command invocation verifies a ledger checkout's Git identity once.
@@ -5028,7 +5036,8 @@ fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
 
 fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     let path = ledger_root(root, false)?.join(LEDGER_CELLS);
-    let cells = read_json(&path).map_err(|error| format!("history unavailable: {error}"))?;
+    let mut cells = read_json(&path).map_err(|error| format!("history unavailable: {error}"))?;
+    resolve_retired_history(&mut cells)?;
     validate_observation_identity_namespace(&cells)?;
     validate_attempt_bindings(&cells, None)?;
     Ok(Some(cells))
@@ -5164,6 +5173,8 @@ fn load_self_test_corpus(
 /// Retired cells remain in the ledger's existing Git history, never an
 /// uncommitted projection that a later writer could overwrite.
 fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Result<(), String> {
+    // A renamed cell is a join, not a retirement: re-key it before comparing.
+    resolve_retired_history(history)?;
     let catalogue = load_catalogue(root)?.ok_or("the source catalogue is unavailable")?;
     let current_ids = catalogue
         .cells
@@ -6138,7 +6149,7 @@ fn apply_pressure_summary(
         // Keyed on (cell, repetition, attempt): repeats of one cell and retries
         // within one repetition are both real observations, while two rows
         // claiming the same attempt would double-count.
-        if !seen.insert((row.cell.clone(), row.repetition, row.attempt)) {
+        if !seen.insert((resolve_cell_id(&row.cell), row.repetition, row.attempt)) {
             skipped.push((
                 display_id(&row.cell),
                 format!(
@@ -6178,7 +6189,8 @@ fn apply_pressure_summary(
             skipped.push((display_id(&row.cell), row.evidence_errors.join("; ")));
             continue;
         }
-        let Some(index) = positions.get(&row.cell).copied() else {
+        // A retained summary recorded under a retired test id joins its successor.
+        let Some(index) = positions.get(&resolve_cell_id(&row.cell)).copied() else {
             skipped.push((
                 display_id(&row.cell),
                 "not a cell in the tracked manifest".to_string(),
@@ -9175,7 +9187,7 @@ fn typed_event_digest(row: &SeriesRow) -> Result<String, String> {
 fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) -> bool {
     row.producer == SeriesProducer::Validate
         && row.schema == SeriesSchema::V3
-        && row.cell() == series_cell_key(&binding.cell)
+        && series_row_cell(row) == series_cell_key(&binding.cell)
         && row.series.tree == binding.hermit_sha
         && row.run_id == binding.run_id
         && row.series.run_index <= binding.attempt
@@ -10206,10 +10218,11 @@ fn source_direct_evidence_key(
     if row.validate_for_projection().is_err() {
         return Ok(None);
     }
+    let row_cell = series_row_cell(row);
     let matches = tracked
         .cells
         .iter()
-        .filter(|cell| series_cell_key(&cell.id) == row.cell())
+        .filter(|cell| series_cell_key(&cell.id) == row_cell)
         .collect::<Vec<_>>();
     if matches.len() != 1 {
         return Ok(None);
@@ -10219,7 +10232,7 @@ fn source_direct_evidence_key(
         return Ok(None);
     };
     let base = DirectEvidenceBase {
-        cell: row.cell().to_string(),
+        cell: row_cell.into_owned(),
         identity: series_observation_identity(row)?,
         provenance: series_provenance(row.producer),
         hermit_sha: row.series.tree.clone(),
@@ -10301,11 +10314,12 @@ fn current_comparison_representation(
         if row.producer != SeriesProducer::Validate || row.schema != SeriesSchema::V3 {
             continue;
         }
+        let row_cell = series_row_cell(row);
         let matches = bound
             .iter()
             .filter(|(base, _)| {
                 base.provenance == ObservationProvenance::Validate
-                    && base.cell == row.cell()
+                    && base.cell == row_cell
                     && base.hermit_sha == row.series.tree
                     && base.run_id == row.run_id
             })
@@ -10990,7 +11004,7 @@ fn apply_series_rows_inner(
             skipped.push(format!("{label}: {why}"));
             continue;
         }
-        let Some(indices) = cell_indices.get(row.cell()) else {
+        let Some(indices) = cell_indices.get(series_row_cell(row).as_ref()) else {
             skipped.push(format!(
                 "{label}: no exact test/mode/backend match in the tracked manifest"
             ));
@@ -12852,9 +12866,11 @@ fn read_current_pressure_evidence(
         };
 
         for row in &summary.rows {
+            // A summary recorded under a retired test id counts for its successor.
+            let cell = resolve_cell_id(&row.cell);
             if let Some(problem) = &summary_problem {
                 uncheckable
-                    .entry(row.cell.clone())
+                    .entry(cell)
                     .or_default()
                     .push(problem.clone());
                 continue;
@@ -12868,11 +12884,11 @@ fn read_current_pressure_evidence(
             };
             match checked_current_pressure_result(tracked, one, &current_tree) {
                 Ok(result) => {
-                    results.entry(row.cell.clone()).or_default().push(result);
+                    results.entry(cell).or_default().push(result);
                 }
                 Err(error) => {
                     uncheckable
-                        .entry(row.cell.clone())
+                        .entry(cell)
                         .or_default()
                         .push(format!("{}: {error}", path.display()));
                 }
@@ -13364,6 +13380,155 @@ fn require_sha256(label: &str, value: &str) -> Result<(), String> {
 /// wrong one silently matches nothing at all.
 fn series_cell_key(id: &CellId) -> String {
     format!("{}/{}/{}", id.test, id.mode, id.backend)
+}
+
+/// Retired E2E test ids and their live successors, read from
+/// `tests/e2e/manifests/inventory/retired-ids.json`.
+///
+/// History is keyed by test id and is never rewritten: series rows, retained
+/// result rows, pressure summaries and ledger documents recorded before a
+/// bucket fold still name the retired id. Every join between that history and
+/// the current catalogue therefore resolves the history side through this map,
+/// so a row recorded as `backend-parity-c/x` and a row recorded as
+/// `c-programs/x` land on one cell
+/// (<https://github.com/rrnewton/hermit/issues/3301>). A command loads the map
+/// from its own checkout before doing anything else; the fallback to this
+/// source file's checkout exists for the unit tests, which call helpers
+/// directly.
+static RETIRED_IDS: std::sync::OnceLock<RetiredIds> = std::sync::OnceLock::new();
+
+fn init_retired_ids(root: &Path) -> Result<(), String> {
+    let loaded = RetiredIds::load(root)?;
+    if *RETIRED_IDS.get_or_init(|| loaded.clone()) != loaded {
+        return Err("the retired-id map changed within one command".into());
+    }
+    Ok(())
+}
+
+fn retired_ids() -> &'static RetiredIds {
+    RETIRED_IDS.get_or_init(|| {
+        manifest_tool_root()
+            .and_then(RetiredIds::load)
+            .unwrap_or_else(|error| {
+                panic!("history joins require the retired-id map: {error}")
+            })
+    })
+}
+
+/// `id` with a retired test id replaced by its live successor. An id that was
+/// never retired, or whose category is not the retired bucket, is returned
+/// unchanged.
+fn resolve_cell_id(id: &CellId) -> CellId {
+    let successor = retired_ids()
+        .retirements
+        .iter()
+        .filter(|retirement| retirement.retired_bucket == id.category)
+        .find_map(|retirement| {
+            retirement
+                .ids
+                .get(&id.test)
+                .map(|test| (retirement.successor_bucket.clone(), test.clone()))
+        });
+    match successor {
+        Some((category, test)) => CellId {
+            lane: id.lane.clone(),
+            category,
+            test,
+            mode: id.mode.clone(),
+            backend: id.backend.clone(),
+        },
+        None => id.clone(),
+    }
+}
+
+/// A series-store key (`bucket/name/mode/backend`, see [`series_cell_key`])
+/// with a retired test id replaced by its successor.
+fn resolve_series_cell(key: &str) -> std::borrow::Cow<'_, str> {
+    let test_end = key
+        .find('/')
+        .and_then(|bucket| key[bucket + 1..].find('/').map(|name| bucket + 1 + name));
+    if let Some(end) = test_end {
+        let (test, rest) = key.split_at(end);
+        if let Some(successor) = retired_ids().successor(test) {
+            return std::borrow::Cow::Owned(format!("{successor}{rest}"));
+        }
+    }
+    std::borrow::Cow::Borrowed(key)
+}
+
+/// The cell a series row belongs to now, as a series-store key.
+fn series_row_cell(row: &SeriesRow) -> std::borrow::Cow<'_, str> {
+    resolve_series_cell(row.cell())
+}
+
+/// Re-key a history document recorded under retired test ids onto their
+/// successors: the cells, the comparison-attempt bindings and the retired
+/// comparison receipts. The series rows those bindings name keep their
+/// recorded ids; every binding-to-event match goes through
+/// [`series_row_cell`], so a re-keyed binding still verifies against its
+/// original immutable event.
+///
+/// A document holding both a retired id and its successor is refused rather
+/// than merged: no writer produces one, because every writer reads history
+/// through this function first.
+fn resolve_retired_history(history: &mut TrackedCells) -> Result<(), String> {
+    let mut renamed = false;
+    for cell in &mut history.cells {
+        let resolved = resolve_cell_id(&cell.id);
+        if resolved != cell.id {
+            cell.id = resolved;
+            renamed = true;
+        }
+    }
+    if renamed {
+        let mut seen = BTreeSet::new();
+        if let Some(cell) = history.cells.iter().find(|cell| !seen.insert(&cell.id)) {
+            return Err(format!(
+                "history records {} under both a retired id and its successor; refusing to guess how to merge them",
+                display_id(&cell.id)
+            ));
+        }
+        history.cells.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    let Some(envelope) = history
+        .projection
+        .as_mut()
+        .and_then(|projection| projection.comparison_attempt_bindings_v1.as_mut())
+    else {
+        return Ok(());
+    };
+    let mut rekeyed = false;
+    let mut resolve = |cell: &mut CellId| {
+        let resolved = resolve_cell_id(cell);
+        if resolved != *cell {
+            *cell = resolved;
+            rekeyed = true;
+        }
+    };
+    envelope
+        .bindings
+        .iter_mut()
+        .for_each(|binding| resolve(&mut binding.cell));
+    envelope
+        .retired_canonical_comparisons
+        .iter_mut()
+        .for_each(|receipt| resolve(&mut receipt.cell));
+    envelope
+        .retired_backend_parity_comparisons
+        .iter_mut()
+        .for_each(|receipt| resolve(&mut receipt.cell));
+    if rekeyed {
+        // The stored order is canonical over the recorded keys; restore it
+        // over the resolved ones so the ordering checks still hold.
+        envelope.bindings.sort_by_key(binding_key);
+        envelope
+            .retired_canonical_comparisons
+            .sort_by_key(retired_comparison_key);
+        envelope
+            .retired_backend_parity_comparisons
+            .sort_by_key(retired_parity_key);
+    }
+    Ok(())
 }
 
 fn display_id(id: &CellId) -> String {
@@ -14401,11 +14566,7 @@ fn self_test() -> Result<(), String> {
         backend: backend.into(),
     };
     let custom_ids = BTreeSet::from([
-        custom(
-            "backend-parity-c",
-            "backend-parity-c/environment-and-workdir",
-            "ptrace",
-        ),
+        custom("c-programs", "c-programs/environment-and-workdir", "ptrace"),
         custom("system-utils", "system-utils/clock-determinism", "liteinst"),
         custom("system-utils", "system-utils/clock-determinism", "ptrace"),
     ]);
@@ -15326,13 +15487,23 @@ fn self_test() -> Result<(), String> {
     }
     let matching_markdown = render_backend_parity_section(&matching_parity);
     let plan = hermit_manifest_plan::validation_dag::generate(&repo_root()?)?;
+    // The backend-parity-c selectors were folded into the c-programs ones
+    // (https://github.com/rrnewton/hermit/issues/3301, slice S6).
+    if plan.steps.iter().any(|step| {
+        matches!(
+            step.tag().as_str(),
+            "e2e.manifest_backend_parity_c" | "e2e.manifest_backend_parity_c_on_host"
+        )
+    }) {
+        return Err("a retired backend-parity-c selector is still constructed".into());
+    }
     let selectors = plan
         .steps
         .iter()
         .filter(|step| {
             matches!(
                 step.tag().as_str(),
-                "e2e.manifest_backend_parity_c" | "e2e.manifest_backend_parity_c_on_host"
+                "e2e.manifest_c_programs" | "e2e.manifest_c_programs_on_host"
             )
         })
         .collect::<Vec<_>>();
@@ -15348,11 +15519,11 @@ fn self_test() -> Result<(), String> {
         .any(|step| step.cmd.contains("--parity-reference"))
     {
         return Err(
-            "a constructed backend-parity-c selector passes --parity-reference, which https://github.com/rrnewton/hermit/issues/3301 removed"
+            "a constructed c-programs selector passes --parity-reference, which https://github.com/rrnewton/hermit/issues/3301 removed"
                 .into(),
         );
     }
-    if !matching_markdown.contains("currently perform ordinary same-backend verification") {
+    if !matching_markdown.contains("which perform ordinary same-backend verification") {
         return Err(
             "scorecard execution description is stale against the constructed selectors".into(),
         );
@@ -18452,8 +18623,8 @@ fn self_test() -> Result<(), String> {
     // owned fixture clone, with authentic typed fixture report bytes/hashes.
     let import_parity_id = CellId {
         lane: "portable".into(),
-        category: "backend-parity-c".into(),
-        test: "backend-parity-c/readdir-order-identity".into(),
+        category: "c-programs".into(),
+        test: "c-programs/readdir-order-identity".into(),
         mode: "verify".into(),
         backend: "kvm".into(),
     };
@@ -26840,8 +27011,7 @@ mod post_verdict_transaction_tests {
         assert_eq!(
             selected.iter().map(display_id).collect::<BTreeSet<_>>(),
             BTreeSet::from([
-                "portable/backend-parity-c/backend-parity-c/environment-and-workdir/custom@ptrace"
-                    .into(),
+                "portable/c-programs/c-programs/environment-and-workdir/custom@ptrace".into(),
                 "portable/system-utils/system-utils/clock-determinism/custom@liteinst".into(),
                 "portable/system-utils/system-utils/clock-determinism/custom@ptrace".into(),
             ])
@@ -28520,15 +28690,19 @@ mod attempt_binding_tests {
     use super::*;
 
     fn fixture() -> (TrackedCells, Vec<SeriesRow>) {
-        let head = "a".repeat(40);
-        let tree = "b".repeat(40);
-        let id = CellId {
+        fixture_for(CellId {
             lane: "portable".into(),
             category: "fixture".into(),
             test: "fixture/retry".into(),
             mode: "verify".into(),
             backend: "ptrace".into(),
-        };
+        })
+    }
+
+    /// Two bound determinism-failure attempts of one run, recorded under `id`.
+    pub(super) fn fixture_for(id: CellId) -> (TrackedCells, Vec<SeriesRow>) {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
         let receipts = ["c".repeat(64), "d".repeat(64)].iter().map(|digest| serde_json::json!({
             "hermit_sha":head,"hermit_commits":2,"hermit_first_parent":2,"run_id":"old-run",
             "evidence_sha256":digest,"result":"determinism-failure","left_info_messages":[17],"right_info_messages":[17]
@@ -29030,6 +29204,171 @@ mod attempt_binding_tests {
                 .unwrap()
                 .contains("verification_report")
         );
+    }
+}
+
+/// History recorded under a retired test id joins the live successor's
+/// history (https://github.com/rrnewton/hermit/issues/3301, slice S6).
+#[cfg(test)]
+mod retired_id_join_tests {
+    use super::*;
+
+    fn cell(category: &str, test: &str) -> CellId {
+        CellId {
+            lane: "portable".into(),
+            category: category.into(),
+            test: test.into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        }
+    }
+
+    fn retired() -> CellId {
+        cell("backend-parity-c", "backend-parity-c/pidfd-open-self")
+    }
+
+    /// Not a plain prefix rename: `c-programs/pidfd-open-self` already existed.
+    fn successor() -> CellId {
+        cell("c-programs", "c-programs/pidfd-open-self-pair")
+    }
+
+    #[test]
+    fn resolves_retired_ids_and_series_keys_only_through_the_map() {
+        assert_eq!(resolve_cell_id(&retired()), successor());
+        assert_eq!(resolve_cell_id(&successor()), successor());
+        let plain = cell("backend-parity-c", "backend-parity-c/epoll-readiness");
+        assert_eq!(
+            resolve_cell_id(&plain),
+            cell("c-programs", "c-programs/epoll-readiness")
+        );
+        // A retired name under a different category is not that retired id.
+        let foreign = cell("c-programs", "backend-parity-c/pidfd-open-self");
+        assert_eq!(resolve_cell_id(&foreign), foreign);
+        assert_eq!(
+            resolve_series_cell("backend-parity-c/pidfd-open-self/verify/kvm"),
+            "c-programs/pidfd-open-self-pair/verify/kvm"
+        );
+        assert!(matches!(
+            resolve_series_cell("c-programs/pidfd-open-self/verify/kvm"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            resolve_series_cell("backend-parity-c/not-a-retired-id/verify/kvm"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(resolve_series_cell("malformed"), "malformed");
+    }
+
+    #[test]
+    fn a_retired_id_row_and_a_successor_row_land_on_one_cell() {
+        let (recorded, old_events) = super::attempt_binding_tests::fixture_for(retired());
+        assert!(
+            old_events
+                .iter()
+                .all(|row| row.cell() == "backend-parity-c/pidfd-open-self/verify/ptrace")
+        );
+        let mut tracked = recorded.clone();
+        resolve_retired_history(&mut tracked).unwrap();
+        assert_eq!(tracked.cells.len(), 1);
+        assert_eq!(tracked.cells[0].id, successor());
+        assert_eq!(tracked.cells[0].observations, recorded.cells[0].observations);
+        let bindings = &comparison_attempt_bindings(&tracked).unwrap().bindings;
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|binding| binding.cell == successor()));
+        // The immutable events keep their recorded key, and their typed
+        // digests still verify against the re-keyed bindings.
+        let attempts = validate_attempt_bindings(&tracked, Some(&old_events)).unwrap();
+        let represented = direct_representation(&tracked, &old_events, &attempts).unwrap();
+        assert_eq!(represented.represented_event_ids.len(), 2);
+        // Resolution is idempotent.
+        let mut again = tracked.clone();
+        resolve_retired_history(&mut again).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&again).unwrap(),
+            serde_json::to_vec(&tracked).unwrap()
+        );
+
+        // A series projection over a row recorded under the successor id and
+        // a later row still recorded under the retired id puts both on the
+        // one live cell, beside the bound retained attempts.
+        let (_, new_events) = super::attempt_binding_tests::fixture_for(successor());
+        let mut fresh = new_events[0].clone();
+        fresh.event_id = "successor-1".into();
+        fresh.run_id = "successor-run".into();
+        assert_eq!(fresh.cell(), "c-programs/pidfd-open-self-pair/verify/ptrace");
+        let mut late = old_events[0].clone();
+        late.event_id = "retired-late-1".into();
+        late.run_id = "retired-late-run".into();
+        let mut joined = tracked.clone();
+        apply_series_rows(
+            Path::new("/absent-host-results"),
+            &mut joined,
+            &[fresh, late],
+            Some("series"),
+        )
+        .unwrap();
+        assert_eq!(joined.cells.len(), 1);
+        assert_eq!(joined.cells[0].id, successor());
+        for event in ["successor-1", "retired-late-1"] {
+            assert!(
+                joined.cells[0]
+                    .observations
+                    .iter()
+                    .any(|observation| observation.event_ids.contains(event)),
+                "{event} did not join the successor cell"
+            );
+        }
+        assert!(
+            joined.cells[0]
+                .observations
+                .iter()
+                .any(|observation| observation.canonical_comparisons.len() == 2)
+        );
+    }
+
+    #[test]
+    fn unresolved_retired_bindings_do_not_verify() {
+        // Every reader resolves the document first; one that skipped it would
+        // compare an old-id binding with a resolved event key and must refuse
+        // rather than silently drop the evidence.
+        let (recorded, old_events) = super::attempt_binding_tests::fixture_for(retired());
+        assert!(validate_attempt_bindings(&recorded, Some(&old_events)).is_err());
+    }
+
+    #[test]
+    fn a_document_holding_both_ids_is_refused() {
+        let (mut both, _) = super::attempt_binding_tests::fixture_for(retired());
+        let mut duplicate = both.cells[0].clone();
+        duplicate.id = successor();
+        both.cells.push(duplicate);
+        let error = resolve_retired_history(&mut both).unwrap_err();
+        assert!(
+            error.contains("under both a retired id and its successor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn carrying_forward_a_retired_id_is_not_a_cell_removal() {
+        let (recorded, _) = super::attempt_binding_tests::fixture_for(retired());
+        let derived = Derived {
+            population: BTreeSet::from([successor()]),
+            applicable: BTreeSet::from([successor()]),
+            ci_disabled_reasons: BTreeMap::new(),
+            not_applicable_reasons: BTreeMap::new(),
+            selected: BTreeSet::from([successor()]),
+            green: BTreeSet::new(),
+            selected_custom: BTreeSet::new(),
+        };
+        let carried = tracked_from(&derived, Some(recorded.clone()), None, false).unwrap();
+        assert_eq!(carried.cells.len(), 1);
+        assert_eq!(carried.cells[0].id, successor());
+        assert_eq!(carried.cells[0].observations, recorded.cells[0].observations);
+        // Without the map entry the same document would be a removal.
+        let mut unmapped = recorded;
+        unmapped.cells[0].id = cell("backend-parity-c", "backend-parity-c/never-retired");
+        let error = tracked_from(&derived, Some(unmapped), None, false).unwrap_err();
+        assert!(error.contains("refusing to delete 1 tracked cell"), "{error}");
     }
 }
 

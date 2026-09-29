@@ -5,10 +5,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Shared mutation harness for the backend-parity identity-fixture family.
+"""Shared mutation harness for the identity-fixture family in tests/c.
 
-The family of backend-parity identity fixtures (rlimit_identity.c,
-sched_getaffinity_identity.c, getcpu_identity.c, ...) all make the same claim:
+This harness moved here from tests/backend-parity/parity_mutation.py, with its
+fixtures, when the backend-parity-c manifest bucket was folded into c-programs
+(https://github.com/rrnewton/hermit/issues/3301, slice S6).
+
+The family of identity fixtures (rlimit_identity_probe.c,
+sched_getaffinity_identity_probe.c, ioctl_fionread.c, ...) all make the same claim:
 "every backend observes the same value the golden ptrace reference does." That
 claim is only worth anything if the fixture would actually FAIL when a backend
 gets the value wrong. Historically each fixture hand-rolled its own
@@ -55,6 +59,11 @@ Two run modes:
 
 Adding a family member is one registry entry below: source path + field names.
 No bespoke verification code travels with the fixture.
+
+The family is exactly the set of tests/c sources that include parity_probe.h.
+The harness refuses to run if that set and the registry differ, so a fixture
+that adopts the seam cannot go unexamined and a registry entry cannot point at
+a file that left the family. Every run prints the fixtures it examined.
 """
 
 from __future__ import annotations
@@ -71,7 +80,11 @@ import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-FIXTURES_DIR = SCRIPT_DIR / "fixtures"
+# The fixtures live beside the harness, in tests/c.
+FIXTURES_DIR = SCRIPT_DIR
+REPOSITORY_ROOT = SCRIPT_DIR.parent.parent
+# The shared contract header every family member includes.
+PROBE_HEADER = "parity_probe.h"
 
 # The golden reference backend. "Parity" is defined against this.
 GOLDEN_BACKEND = "ptrace"
@@ -91,7 +104,7 @@ class HarnessError(Exception):
 class FixtureSpec:
     """A single family member. Supplies ONLY its syscall and its divergence.
 
-    source: fixture .c source path (relative to fixtures/ unless absolute).
+    source: fixture .c source path (relative to tests/c unless absolute).
     fields: the mutable field name(s) it threads through the parity_mutate_*()
             seam. Each is proven load-bearing independently.
     cflags: extra compile flags (e.g. ("-pthread",)); -D_GNU_SOURCE is always
@@ -107,15 +120,21 @@ class FixtureSpec:
         return candidate if candidate.is_absolute() else FIXTURES_DIR / candidate
 
 
-# The family registry. Every backend-parity identity fixture lives here with its
-# field(s); nothing else. A new member is one line.
+# The family registry. Every identity fixture that includes parity_probe.h lives
+# here with its field(s); nothing else. A new member is one line.
+#
+# rlimit_identity_probe.c and sched_getaffinity_identity_probe.c are the
+# harness-only members that lived in tests/backend-parity/fixtures as
+# rlimit_identity.c and sched_getaffinity_identity.c. They took a _probe suffix
+# on the move because tests/c/rlimit_identity.c and
+# tests/c/sched_getaffinity_identity.c are different, larger manifest programs.
 FIXTURES: dict[str, FixtureSpec] = {
     "rlimit_identity": FixtureSpec(
-        source="rlimit_identity.c",
+        source="rlimit_identity_probe.c",
         fields=("nofile",),
     ),
     "sched_getaffinity_identity": FixtureSpec(
-        source="sched_getaffinity_identity.c",
+        source="sched_getaffinity_identity_probe.c",
         fields=("affinity_count",),
     ),
     "ioctl_fionread": FixtureSpec(
@@ -272,6 +291,47 @@ class Observation:
 # ---------------------------------------------------------------------------
 # Compilation
 # ---------------------------------------------------------------------------
+
+
+_PROBE_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"parity_probe\.h"', re.M)
+
+
+def family_sources(directory: Path) -> set[Path]:
+    """Every C source in `directory` that includes the shared probe header."""
+    return {
+        source.resolve()
+        for source in sorted(directory.glob("*.c"))
+        if _PROBE_INCLUDE_RE.search(source.read_text(encoding="utf-8"))
+    }
+
+
+def check_family_registry(
+    fixtures: dict[str, FixtureSpec], directory: Path = FIXTURES_DIR
+) -> None:
+    """Refuse unless the registry is exactly the family found on disk.
+
+    A source that includes parity_probe.h but is not registered would never be
+    examined; a registered source that is missing or no longer includes the
+    header would be examined against a contract it does not carry. Either way
+    the guard would report success about files it did not check.
+    """
+    if not (directory / PROBE_HEADER).is_file():
+        raise HarnessError(f"shared probe header missing: {directory / PROBE_HEADER}")
+    registered = {spec.source_path().resolve() for spec in fixtures.values()}
+    discovered = family_sources(directory)
+    missing = sorted(str(path) for path in registered if not path.is_file())
+    unregistered = sorted(str(path) for path in discovered - registered)
+    outside = sorted(
+        str(path) for path in registered - discovered if path.is_file()
+    )
+    if missing or unregistered or outside:
+        raise HarnessError(
+            "fixture registry does not match the parity_probe.h family in "
+            f"{directory}: missing={missing} unregistered={unregistered} "
+            f"not-including-{PROBE_HEADER}={outside}"
+        )
+    if not registered:
+        raise HarnessError(f"fixture registry is empty; nothing in {directory} to examine")
 
 
 def compile_fixture(spec: FixtureSpec, output: Path) -> Path:
@@ -926,7 +986,7 @@ def run_self_test_mode() -> int:
     positives = len(expectations) - negatives
     print()
     print(
-        f"parity-mutation self-test: {len(expectations)} bracket case(s) "
+        f"fixture-mutation self-test: {len(expectations)} bracket case(s) "
         f"({negatives} planted negative(s) that MUST fail, "
         f"{positives} positive control(s) that MUST pass); "
         f"{len(mismatches)} mismatch(es)"
@@ -946,18 +1006,23 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         return run_self_test_mode()
 
+    check_family_registry(FIXTURES)
     selected = args.fixtures or list(FIXTURES)
     unknown = [name for name in selected if name not in FIXTURES]
     if unknown:
         raise HarnessError(f"unknown fixture(s): {unknown}; known: {sorted(FIXTURES)}")
+    if not selected:
+        raise HarnessError("no fixture selected; a run that examines nothing is not a pass")
 
     candidates = tuple(args.backends) if args.backends else DEFAULT_CANDIDATES
 
     report = Report()
-    workdir = Path(tempfile.mkdtemp(prefix="parity-mutation-"))
+    workdir = Path(tempfile.mkdtemp(prefix="fixture-mutation-"))
+    examined: list[Path] = []
     try:
         for name in selected:
             spec = FIXTURES[name]
+            examined.append(spec.source_path())
             check_declared_fields(report, name, spec)
             binary = compile_fixture(spec, workdir / name)
             run_native(report, name, binary, spec)
@@ -984,13 +1049,16 @@ def main(argv: list[str]) -> int:
             shutil.rmtree(workdir, ignore_errors=True)
 
     print()
+    print(f"fixture-mutation: examined {len(examined)} fixture(s):")
+    for source in examined:
+        print(f"  examined: {source.relative_to(REPOSITORY_ROOT)}")
     print(
-        f"parity-mutation: {report.checks} checks, "
+        f"fixture-mutation: {report.checks} checks, "
         f"{len(report.failures)} failed, {len(report.skips)} skipped"
     )
     # A green must carry what it verified. Print the achieved strictness per
     # cell, not just a count of passes.
-    print(f"parity-mutation strictness: {report.tier_summary()}")
+    print(f"fixture-mutation strictness: {report.tier_summary()}")
     for label, achieved in sorted(report.tiers.items()):
         print(f"  tier: {label} -> {tier_label(achieved)}")
     for skipped in report.skips:
@@ -1004,5 +1072,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
     except HarnessError as error:
-        print(f"parity-mutation: {error}", file=sys.stderr)
+        print(f"fixture-mutation: {error}", file=sys.stderr)
         sys.exit(2)

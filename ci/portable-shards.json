@@ -35,7 +35,7 @@
     "lint.rustfmt"
   ],
   "build_debug_nodes": [
-    "e2e.audit_compile_backend_parity_c",
+    "e2e.audit_compile_c_programs",
     "setup.nextest",
     "build.workspace",
     "build.manifest_guests"
@@ -50,7 +50,6 @@
   ],
   "e2e_nodes": [
     "e2e.manifest_applications_on_host",
-    "e2e.manifest_backend_parity_c_on_host",
     "e2e.manifest_bin_c_on_host",
     "e2e.manifest_c_programs_on_host",
     "e2e.manifest_chaos_c_on_host",

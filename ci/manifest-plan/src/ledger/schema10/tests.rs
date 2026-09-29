@@ -27,6 +27,10 @@ fn retain_fixture(name: &str, row: &HistoryRow, plan: &[u8], cells: &[u8], tests
     }
 }
 
+// A cell of a plan retained from before the backend-parity-c bucket was
+// folded into c-programs (https://github.com/rrnewton/hermit/issues/3301,
+// slice S6): the reader must keep verifying such plans with their original
+// identities and selector, so this fixture deliberately keeps the retired ones.
 fn identity() -> CellIdentity {
     CellIdentity {
         lane: "portable".into(),
@@ -729,9 +733,154 @@ fn exact_rng_population(cells: &[CellIdentity], count: usize) -> bool {
 /// These are retained bytes rather than a derivation from the reader's constants.
 const PRE_RELEASE_ENV_PARITY_COMMAND: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra '\'' %q'\'' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
 
+/// The two backend-parity-c selector commands exactly as ci/dag/validate.json
+/// emitted them at e8007f971a72c5fd92fcf3e17e41f38811c3cac3, the last Hermit
+/// commit whose manifests declared that bucket. Slice S6 of
+/// <https://github.com/rrnewton/hermit/issues/3301> folded the bucket into
+/// c-programs, so no generator emits these any more. Plans published with them
+/// must keep reading, and these retained bytes, rather than a derivation from
+/// the reader's constants, are what prove it.
+const LAST_LIVE_PORTABLE_PARITY_SELECTOR: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_EPOCH --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env HERMIT_VALIDATE_BUCK_DOTSLASH --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra '\'' %q'\'' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
+const LAST_LIVE_HOSTED_PARITY_SELECTOR: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
+
+/// The retired backend-parity-c id of every live id the fold renamed.
+fn folded_ids() -> BTreeMap<String, String> {
+    let root = crate::validation_dag::repo_root().unwrap();
+    let retired = crate::retired_ids::RetiredIds::load(&root).unwrap();
+    let retirement = retired.retirement("backend-parity-c").unwrap();
+    assert_eq!(
+        retirement.last_live_commit,
+        "e8007f971a72c5fd92fcf3e17e41f38811c3cac3"
+    );
+    retirement
+        .ids
+        .iter()
+        .map(|(old, new)| (new.clone(), old.clone()))
+        .collect()
+}
+
+/// The expected plan as a plan published before the fold carried it: every
+/// folded cell restored to its retired backend-parity-c identity.
+fn pre_fold_expected_json(expected_json: &str) -> String {
+    let folded = folded_ids();
+    let mut expected: Value = serde_json::from_str(expected_json).unwrap();
+    let mut restored = 0;
+    for cell in expected["cells"].as_array_mut().unwrap() {
+        if let Some(old) = folded.get(cell["test"].as_str().unwrap()) {
+            assert_eq!(cell["category"], "c-programs");
+            cell["category"] = "backend-parity-c".into();
+            cell["test"] = old.as_str().into();
+            restored += 1;
+        }
+    }
+    assert_eq!(restored, 279, "276 portable and 3 privileged folded cells");
+    serde_json::to_string(&expected).unwrap()
+}
+
+/// `live` as a plan published before the fold selected it: every folded cell
+/// restored to its retired identity, the portable folded cells owned again by
+/// their own selector step `tag` running the retained `command`, and each
+/// privileged c-programs step, which owned only folded cells, renamed back in
+/// place.
+fn pre_fold_dag(live: &DagConfig, tag: &str, command: &str) -> DagConfig {
+    use dagrun::model::ResultManifest;
+    let folded = folded_ids();
+    let mut cfg = live.clone();
+    let mut restored_steps = Vec::new();
+    let mut renamed_tags = BTreeMap::new();
+    for step in &mut cfg.steps {
+        let live_tag = step.tag();
+        let selects_c_programs = step
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.category == "c-programs");
+        let Some(manifests) = step.result_manifests.as_mut() else {
+            continue;
+        };
+        let mut restored = Vec::new();
+        for item in manifests.iter_mut() {
+            if let ResultManifest::ManifestCell(cell) = item {
+                if let Some(old) = cell.test.as_ref().and_then(|test| folded.get(test)) {
+                    cell.category = "backend-parity-c".into();
+                    cell.test = Some(old.clone());
+                    restored.push(cell.clone());
+                }
+            }
+        }
+        if restored.is_empty() || !selects_c_programs {
+            continue;
+        }
+        let retired_tag = live_tag.replace("c_programs", "backend_parity_c");
+        let owns_only_folded = manifests.iter().all(|item| match item {
+            ResultManifest::ManifestCell(cell) => cell.category == "backend-parity-c",
+            ResultManifest::StructuredTestResults(_) => true,
+        });
+        if owns_only_folded {
+            assert!(live_tag.starts_with("privileged"), "{live_tag}");
+            for item in manifests.iter_mut() {
+                if let ResultManifest::StructuredTestResults(producer) = item {
+                    producer.owner = retired_tag.clone();
+                }
+            }
+            step.job = step.job.replace("c_programs", "backend_parity_c");
+            renamed_tags.insert(live_tag.clone(), retired_tag.clone());
+            step.manifest.as_mut().unwrap().category = "backend-parity-c".into();
+            if step.fail_fast_family.is_some() {
+                step.fail_fast_family = Some(retired_tag);
+            }
+            continue;
+        }
+        assert_eq!(retired_tag, tag);
+        let mut producer = manifests
+            .iter()
+            .find_map(|item| match item {
+                ResultManifest::StructuredTestResults(producer) => Some(producer.clone()),
+                ResultManifest::ManifestCell(_) => None,
+            })
+            .unwrap();
+        producer.owner = tag.to_owned();
+        manifests.retain(|item| {
+            !matches!(item, ResultManifest::ManifestCell(cell) if cell.category == "backend-parity-c")
+        });
+        let mut retired = step.clone();
+        retired.job = tag.split_once('.').unwrap().1.to_owned();
+        retired.cmd = command.to_owned();
+        retired.manifest.as_mut().unwrap().category = "backend-parity-c".into();
+        retired.result_manifests = Some(
+            restored
+                .into_iter()
+                .map(ResultManifest::ManifestCell)
+                .chain([ResultManifest::StructuredTestResults(producer)])
+                .collect(),
+        );
+        if retired.fail_fast_family.is_some() {
+            retired.fail_fast_family = Some(tag.to_owned());
+        }
+        restored_steps.push(retired);
+    }
+    assert_eq!(restored_steps.len(), 1, "{tag}");
+    // A renamed privileged step keeps its dependents: they named the retired
+    // tag before the fold.
+    for step in &mut cfg.steps {
+        for dep in &mut step.deps {
+            if let Some(retired) = renamed_tags.get(dep.as_str()) {
+                *dep = retired.clone();
+            }
+        }
+    }
+    cfg.steps.extend(restored_steps);
+    cfg
+}
+
 // Use the real generated graph and label selection, including the pinned-root
 // wrapper additions. The small report fixture above intentionally remains a
 // synthetic single-cell input; it does not cover generated command bytes.
+//
+// Since the backend-parity-c bucket was folded into c-programs (slice S6 of
+// https://github.com/rrnewton/hermit/issues/3301), the live graph selects no
+// parity relation, and a published plan from before the fold is rebuilt from
+// the live graph through retired-ids.json with the selector bytes that the last
+// pre-fold generator emitted.
 fn generated_plan_populations_preserve_command_policy() {
     let root = crate::validation_dag::repo_root().unwrap();
     let generated = crate::validation_dag::generate(&root).unwrap();
@@ -767,16 +916,73 @@ fn generated_plan_populations_preserve_command_policy() {
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
     assert!(!exact_rng_population(&missing, 859));
-    for (label, tag, cell_count) in [
-        ("full", "e2e.manifest_backend_parity_c", 859),
+    let pre_fold_json = pre_fold_expected_json(&expected_json);
+    let pre_fold_cells = crate::validation_dag::expected_cells_from_json(&pre_fold_json)
+        .unwrap()
+        .iter()
+        .map(exact_identity)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .unwrap();
+    assert_eq!(pre_fold_cells.len(), 859);
+    for (label, tag, retained_command, cell_count) in [
+        (
+            "full",
+            "e2e.manifest_backend_parity_c",
+            LAST_LIVE_PORTABLE_PARITY_SELECTOR,
+            859,
+        ),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
+            LAST_LIVE_HOSTED_PARITY_SELECTOR,
             855,
         ),
     ] {
-        let selected = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
-        let expected_selected = expected_cells
+        let live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
+        let live_selected = expected_cells
+            .iter()
+            .filter(|cell| label == "full" || cell.lane == "portable")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(live_selected.len(), cell_count);
+        assert!(exact_rng_population(&live_selected, cell_count));
+        // The live plan reads with every cell and no parity relation, and a
+        // reference flag planted on its c-programs selector is refused.
+        let live_plan = ConstructedValidationPlanV10 {
+            schema: 1,
+            run_id: format!("generated-{label}-live"),
+            hermit_sha: "a".repeat(40),
+            path: ValidatePath::Full,
+            compatibility_selected: true,
+            dag_json: dag_to_json(&live),
+            expected_e2e_plan_json: expected_json.clone(),
+        };
+        assert_eq!(live_plan.planned_cells().unwrap(), live_selected);
+        assert_eq!(
+            live_plan.planned_backend_parity_relations().unwrap(),
+            Vec::new()
+        );
+        let live_tag = tag.replace("backend_parity_c", "c_programs");
+        let mut planted = live.clone();
+        let step = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == live_tag)
+            .unwrap();
+        assert_eq!(step.cmd.matches("--prebuilt --results").count(), 1);
+        step.cmd = step.cmd.replace(
+            "--prebuilt --results",
+            "--prebuilt --parity-reference ptrace --results",
+        );
+        let mut planted_plan = live_plan.clone();
+        planted_plan.dag_json = dag_to_json(&planted);
+        assert_eq!(
+            planted_plan.planned_cells().unwrap_err(),
+            format!("{live_tag} has unrecognized backend parity policy")
+        );
+
+        let selected = pre_fold_dag(&live, tag, retained_command);
+        let expected_selected = pre_fold_cells
             .iter()
             .filter(|cell| label == "full" || cell.lane == "portable")
             .cloned()
@@ -807,9 +1013,19 @@ fn generated_plan_populations_preserve_command_policy() {
                 path: ValidatePath::Full,
                 compatibility_selected: true,
                 dag_json: dag_to_json(&cfg),
-                expected_e2e_plan_json: expected_json.clone(),
+                expected_e2e_plan_json: pre_fold_json.clone(),
             };
             assert_eq!(plan.planned_cells().unwrap(), expected_selected);
+            if !active {
+                // The retained last-live bytes are the ordinary spelling.
+                assert_eq!(
+                    cfg.steps
+                        .iter()
+                        .filter(|step| step.cmd == retained_command)
+                        .count(),
+                    1
+                );
+            }
             let expected_relations = expected_selected
                 .iter()
                 .filter(|cell| {
@@ -1401,30 +1617,34 @@ fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
 fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
     let root = crate::validation_dag::repo_root().unwrap();
     let generated = crate::validation_dag::generate(&root).unwrap();
-    for tag in [
-        "e2e.manifest_backend_parity_c",
-        "e2e.manifest_backend_parity_c_on_host",
+    // Slice S6 of https://github.com/rrnewton/hermit/issues/3301 then folded
+    // the two parity selectors into the c-programs pair, which selects no
+    // parity relation.
+    for (retired, live) in [
+        ("e2e.manifest_backend_parity_c", "e2e.manifest_c_programs"),
+        (
+            "e2e.manifest_backend_parity_c_on_host",
+            "e2e.manifest_c_programs_on_host",
+        ),
     ] {
+        assert!(generated.steps.iter().all(|step| step.tag() != retired));
         let step = generated
             .steps
             .iter()
-            .find(|step| step.tag() == tag)
+            .find(|step| step.tag() == live)
             .unwrap();
-        assert!(!step.cmd.contains("--parity-reference"), "{tag}");
+        assert!(!step.cmd.contains("--parity-reference"), "{live}");
         assert!(
             !crate::backend_parity_policy::selects_ptrace_parity(step).unwrap(),
-            "{tag}"
+            "{live}"
         );
     }
-    // Today's hosted command is the last parity spelling minus exactly the
-    // removed flag, so a plan carrying that spelling is a pre-change plan.
-    let hosted = generated
-        .steps
-        .iter()
-        .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
-        .unwrap();
+    // The last hosted command a generator emitted is the last parity spelling
+    // minus exactly the removed flag, so a plan carrying that spelling is a
+    // pre-change plan. The last portable command is the reader's ordinary
+    // spelling under today's pinned-root wrapper.
     assert_eq!(
-        hosted.cmd,
+        LAST_LIVE_HOSTED_PARITY_SELECTOR,
         crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND
     );
     assert_eq!(
@@ -1433,7 +1653,15 @@ fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
             "",
             1
         ),
-        hosted.cmd
+        LAST_LIVE_HOSTED_PARITY_SELECTOR
+    );
+    assert_eq!(
+        crate::validation_dag::refresh_pinned_root_environment(
+            "e2e.manifest_backend_parity_c",
+            crate::backend_parity_policy::PORTABLE_ORDINARY_COMMAND
+        )
+        .unwrap(),
+        LAST_LIVE_PORTABLE_PARITY_SELECTOR
     );
     let relation = vec![BackendParityRelation::ptrace(identity())];
 

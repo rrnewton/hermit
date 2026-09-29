@@ -7,6 +7,12 @@
 
 """Classify what each backend-parity C fixture EMITS, and how blind that is.
 
+The fixture family is the programs that the backend-parity-c manifest bucket
+used to register. That bucket was folded into c-programs
+(https://github.com/rrnewton/hermit/issues/3301, slice S6): its fixtures now
+live in tests/c and its tests carry c-programs ids, so the family is read from
+tests/e2e/manifests/inventory/retired-ids.json rather than from a directory.
+
 Why this exists as a committed tool rather than a one-off command: the emission
 census for this fixture family has been re-derived by hand at least three times
 and produced three different, irreconcilable denominators (46/73, 24/46/3,
@@ -43,7 +49,10 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent.parent
-FIXTURE_DIR = REPO / "tests" / "backend-parity" / "fixtures"
+FIXTURE_DIR = REPO / "tests" / "c"
+MANIFEST = REPO / "tests" / "e2e" / "manifests" / "c-programs.yaml"
+RETIRED_IDS = REPO / "tests" / "e2e" / "manifests" / "inventory" / "retired-ids.json"
+FAMILY_BUCKET = "backend-parity-c"
 
 # A key whose value is a count of checks that passed, not an observation.
 TALLY_KEYS = {"ok", "checks", "count", "n"}
@@ -112,9 +121,11 @@ def main():
                     help="classify a different checkout of the fixtures (for A/B against another rev)")
     ap.add_argument("--virtualize-cpuid", action="store_true",
                     help="drop --no-virtualize-cpuid (the portable lane sets it; cpuid_probe needs it off)")
-    ap.add_argument("--population", choices=("dir", "bucket"), default="dir",
-                    help="'dir' = every *.c under fixtures/; 'bucket' = every program "
-                         "the backend-parity-c manifest registers")
+    ap.add_argument("--population", choices=("family", "dir", "bucket"), default="family",
+                    help="'family' = every program of a c-programs test that replaced a "
+                         "backend-parity-c test (retired-ids.json); 'dir' = every *.c under "
+                         "--fixture-dir (default tests/c); 'bucket' = every program the "
+                         "c-programs manifest registers")
     args = ap.parse_args()
 
     global FIXTURE_DIR
@@ -131,23 +142,35 @@ def main():
     # fixture is wrong: numa_node_identity defines _GNU_SOURCE itself and is
     # declared with no cflags, so forcing the flag makes it fail -Werror on a
     # redefinition that the real harness never triggers.
-    manifest = yaml.safe_load(
-        (REPO / "tests/e2e/manifests/backend-parity-c.yaml").read_text()
-    )
+    manifest = yaml.safe_load(MANIFEST.read_text())
     cflags_by_program = {}
+    program_by_id = {}
     for test in manifest["test"]:
         program = test.get("program")
         if not program:
             continue
         cflags_by_program[program] = test.get("build", {}).get("cflags", [])
+        program_by_id[test["id"]] = program
 
-    if args.population == "bucket":
-        fixtures = [REPO / m for m in sorted(cflags_by_program)]
+    if args.population == "dir":
+        fixtures = sorted(FIXTURE_DIR.glob("*.c"))
+    else:
+        if args.population == "family":
+            retired = json.loads(RETIRED_IDS.read_text())
+            family = [r for r in retired["retirements"] if r["retired_bucket"] == FAMILY_BUCKET]
+            if len(family) != 1:
+                sys.exit(f"{RETIRED_IDS} has no single retirement of {FAMILY_BUCKET}")
+            successors = sorted(family[0]["ids"].values())
+            unknown = [i for i in successors if i not in program_by_id]
+            if unknown:
+                sys.exit(f"retired-id successors with no program in {MANIFEST}: {unknown}")
+            programs = sorted({program_by_id[i] for i in successors})
+        else:
+            programs = sorted(cflags_by_program)
+        fixtures = [REPO / m for m in programs]
         missing = [f for f in fixtures if not f.exists()]
         if missing:
             sys.exit(f"manifest references missing programs: {missing}")
-    else:
-        fixtures = sorted(FIXTURE_DIR.glob("*.c"))
     env = dict(os.environ, LC_ALL="C", TZ="UTC")
 
     rows = []

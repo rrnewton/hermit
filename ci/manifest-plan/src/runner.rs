@@ -5922,7 +5922,7 @@ mod tests {
             .unwrap()
             .select(&Selection {
                 population: Some(Population::Required),
-                test: Some("backend-parity-c/readdir-order-identity".into()),
+                test: Some("c-programs/readdir-order-identity".into()),
                 mode: Some("verify".into()),
                 backend: Some("ptrace".into()),
                 ..Selection::default()
@@ -9626,16 +9626,23 @@ exit "$(cat "$PWD/exit-status")"
     fn selected_portable_parity_candidates_preserve_identical_guest_arguments() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
+        // The tests folded from the retired backend-parity-c bucket into
+        // c-programs (https://github.com/rrnewton/hermit/issues/3301, slice S6).
+        let folded = crate::retired_ids::RetiredIds::load(&root)
+            .unwrap()
+            .successors_of("backend-parity-c")
+            .unwrap();
         let cells = manifests
             .select(&Selection {
                 lane: Some("portable".into()),
-                category: Some("backend-parity-c".into()),
+                category: Some("c-programs".into()),
                 population: Some(Population::Required),
                 ..Selection::default()
             })
             .unwrap();
         let candidates = cells
             .iter()
+            .filter(|cell| folded.contains(&cell.id.test))
             .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
             .collect::<Vec<_>>();
         // Pin the selected population and per-backend split, and check every
@@ -9651,9 +9658,12 @@ exit "$(cat "$PWD/exit-status")"
             by_backend,
             BTreeMap::from([("kvm", 75), ("liteinst", 97), ("sabre", 1)])
         );
-        assert!(candidates.iter().any(|cell| cell.id.test
-            == "backend-parity-c/readdir-order-identity"
-            && cell.id.backend.as_deref() == Some("kvm")));
+        assert!(
+            candidates
+                .iter()
+                .any(|cell| cell.id.test == "c-programs/readdir-order-identity"
+                    && cell.id.backend.as_deref() == Some("kvm"))
+        );
         for cell in candidates {
             let mode = &cell.test.modes["verify"];
             let candidate = cell.id.backend.as_deref().unwrap();
@@ -9668,7 +9678,7 @@ exit "$(cat "$PWD/exit-status")"
                 "{}",
                 cell.id.test
             );
-            if cell.id.test == "backend-parity-c/readdir-order-identity" {
+            if cell.id.test == "c-programs/readdir-order-identity" {
                 assert_eq!(mode.guest_args[candidate], ["--require-small-determinized"]);
                 assert_eq!(mode.guest_args["ptrace"], ["--require-small-determinized"]);
             }

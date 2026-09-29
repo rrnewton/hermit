@@ -58,7 +58,6 @@
       ],
       "nodes": [
         "e2e.manifest_applications_on_host",
-        "e2e.manifest_backend_parity_c_on_host",
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
@@ -82,7 +81,6 @@
       "packages": ["hermit-install"],
       "nodes": [
         "e2e.manifest_applications_on_host",
-        "e2e.manifest_backend_parity_c_on_host",
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
@@ -117,7 +115,6 @@
       "packages": ["hermetic_infra_hermit_tests"],
       "nodes": [
         "e2e.manifest_applications_on_host",
-        "e2e.manifest_backend_parity_c_on_host",
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",
@@ -145,7 +142,7 @@
     {
       "_why": "The DBT plugin has a backend-private release/parity harness and DBT cells.",
       "packages": ["detcore-dbt"],
-      "nodes": ["e2e.manifest_backend_parity_c_on_host", "test.dbt_parity"],
+      "nodes": ["e2e.manifest_c_programs_on_host", "test.dbt_parity"],
       "e2e_backends": ["dbt"]
     },
     {
@@ -168,9 +165,20 @@
   ],
   "path_footprints": [
     {
-      "_why": "Backend-parity fixtures and driver contract suites are outside Cargo targets.",
+      "_why": "Backend-parity driver contract suites are outside Cargo targets.",
       "paths": ["tests/backend-parity/**"],
-      "nodes": ["check.backend_parity_mutation", "check.backend_parity_suites", "e2e.manifest_backend_parity_c_on_host", "test.dbt_parity"],
+      "nodes": ["check.backend_parity_suites", "test.dbt_parity"],
+      "e2e_backends": ["dbt"]
+    },
+    {
+      "_why": "The identity-fixture mutation guard and the fixtures it plants into moved to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",
+      "paths": ["tests/c/**"],
+      "nodes": ["check.backend_parity_mutation"]
+    },
+    {
+      "_why": "run_matrix.py, which test.dbt_parity drives, compiles these three fixtures. They moved from tests/backend-parity/fixtures, where the tests/backend-parity/** rule covered them, to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",
+      "paths": ["tests/c/cpuid_probe.c", "tests/c/pid_probe.c", "tests/c/pthread_lifecycle.c"],
+      "nodes": ["test.dbt_parity"],
       "e2e_backends": ["dbt"]
     },
     {
@@ -196,7 +204,6 @@
       ],
       "nodes": [
         "e2e.manifest_applications_on_host",
-        "e2e.manifest_backend_parity_c_on_host",
         "e2e.manifest_bin_c_on_host",
         "e2e.manifest_c_programs_on_host",
         "e2e.manifest_chaos_c_on_host",

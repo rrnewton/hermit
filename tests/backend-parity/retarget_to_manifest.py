@@ -24,7 +24,9 @@ This tool mechanizes the coverage migration for those PRs. For each source PR it
   2. writes the fixture into the working tree (so the manifest ``program`` path
      exists for the lint) if it is not already present;
   3. appends a symmetric ``[[test]]`` block to
-     ``tests/e2e/manifests/backend-parity-c.yaml`` -- ptrace established first,
+     ``tests/e2e/manifests/c-programs.yaml`` (it targeted the backend-parity-c
+     bucket until that bucket was folded into c-programs,
+     https://github.com/rrnewton/hermit/issues/3301) -- ptrace established first,
      every backend x mode cell declared, DBT/KVM enabled only where the source
      row's ``--verify`` (L2) witness actually passed, everything else disabled
      with a concrete reason carried over from the matrix row;
@@ -75,13 +77,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-MANIFEST = REPO_ROOT / "tests/e2e/manifests/backend-parity-c.yaml"
+MANIFEST = REPO_ROOT / "tests/e2e/manifests/c-programs.yaml"
 INVENTORY = REPO_ROOT / "tests/e2e/manifests/inventory/test-files.json"
-BUCKET = "backend-parity-c"
+BUCKET = "c-programs"
 
 # Every generated mode-cell is born `ci = false`, because a cell that has never
 # been executed cannot be claimed as coverage. What must NOT be silent is *why*.
-# ci/manifest-plan rejects a backend-parity-c cell that sets `ci = false` without
+# ci/manifest-plan rejects a manifest cell that sets `ci = false` without
 # a reason, so the birth default carries this one until somebody measures the
 # cell and replaces it (or enables the cell and deletes it).
 BIRTH_CI_DISABLED_REASON = (
@@ -304,12 +306,12 @@ def inventory_entry(program: str) -> dict:
         "path": program,
         "disposition": "manifest-test",
         "runner": (
-            "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml "
+            "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml "
             "(explicit mode selection; ci=false)"
         ),
         "why": (
             f"{program} is owned by target/debug/test-harness via "
-            "tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; "
+            "tests/e2e/manifests/c-programs.yaml (explicit mode selection; "
             "ci=false): Direct C guest is centrally discoverable with ptrace "
             "verification enabled for explicit runs; it remains outside blocking "
             "CI until its standalone build and output contract are calibrated"
@@ -405,8 +407,8 @@ def plans_from_pr(pr: int) -> tuple:
         if program is None:
             # Fixture already in-tree on main (some rows reuse an existing guest).
             for candidate in (
-                f"tests/backend-parity/fixtures/{row.name}.c",
                 f"tests/c/{row.name}.c",
+                f"tests/backend-parity/fixtures/{row.name}.c",
             ):
                 if (REPO_ROOT / candidate).exists():
                     program = candidate

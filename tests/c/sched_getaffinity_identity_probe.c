@@ -16,7 +16,7 @@
  * population count is threaded through the shared mutation seam.
  *
  * This is the "second fixture" for the shared harness: it reuses parity_probe.h
- * and registers in parity_mutation.py with its field name. It contains zero
+ * and registers in fixture_mutation.py with its field name. It contains zero
  * bespoke both-direction verification -- the harness supplies all of it.
  */
 

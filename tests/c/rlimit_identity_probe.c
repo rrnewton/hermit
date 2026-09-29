@@ -14,7 +14,7 @@
  * is a deterministic guest property -- independent of the host's real ulimit --
  * so the ptrace, DBT, and KVM backends must all observe the same value. The
  * observed value is threaded through the shared mutation seam so
- * parity_mutation.py can prove the round-trip is load-bearing.
+ * fixture_mutation.py can prove the round-trip is load-bearing.
  *
  * This fixture carries NO bespoke pass/fail logic: it uses only the shared
  * contract in parity_probe.h. Adding a family member means supplying its syscall

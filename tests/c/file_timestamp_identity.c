@@ -9,10 +9,11 @@
 /*
  * Contract: timestamps on files the GUEST creates are deterministic.
  *
- * This surface looks covered and is not. `backend-parity-c/statx-metadata` and
- * `backend-parity-c/utimensat-determinism` both exist, and both are ci=false in
- * all five modes, so neither has ever run. 84 of the 85 cells in that bucket are
- * in the same state. A coverage check by cell NAME says this is guarded; a
+ * This surface looks covered and is not. `c-programs/statx-metadata` and
+ * `c-programs/utimensat-determinism` (formerly in the backend-parity-c bucket)
+ * both exist, and both are ci=false in all five modes, so neither has ever run.
+ * When this was written, 84 of the 85 cells in that bucket were in the same
+ * state. A coverage check by cell NAME says this is guarded; a
  * coverage check by ci=true mode says it is not.
  *
  * Why it matters: every file a guest writes gets an mtime, and that mtime comes

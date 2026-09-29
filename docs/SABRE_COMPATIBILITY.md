@@ -140,9 +140,14 @@ The 110 newly enabled cells are grouped as follows:
 | --- | ---: |
 | `c-programs` | 100 |
 | `determinism-stress-c` | 7 |
-| `backend-parity-c` | 1 |
+| `backend-parity-c` (since folded into `c-programs`) | 1 |
 | `bin-c` | 1 |
 | `chaos-c` verify mode | 1 |
+
+The `backend-parity-c` bucket was later folded into `c-programs`
+(https://github.com/rrnewton/hermit/issues/3301); this document names its
+tests by their `c-programs/<name>` ids, and
+`tests/e2e/manifests/inventory/retired-ids.json` maps the old ids.
 
 The exact allowlist is available with:
 
@@ -160,7 +165,7 @@ some fork and signal probes pass while other probes in those categories do not.
 The root-process identity increment starts the SaBRe tracee before creating its
 blocking ptrace-supervisor worker. Linux assigns the guest namespace PID 3,
 matching ptrace, instead of assigning 3 to the worker and 4 to the guest. This
-gives `backend-parity-c/pid-probe` and `debugger-c/debuggee` SaBRe `Stripped`
+gives `c-programs/pid-probe` (then `backend-parity-c/pid-probe`) and `debugger-c/debuggee` SaBRe `Stripped`
 matches with byte-identical ptrace output under the portable profile. It does
 not establish L2 or claim parity for child/thread identities, whose backend
 task topologies still differ.
@@ -191,7 +196,7 @@ but stay disabled because their guest output is still backend-specific:
 
 | Cell | Disposition | Evidence |
 | --- | --- | --- |
-| `backend-parity-c/pid-probe` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
+| `c-programs/pid-probe` | Fixed and promoted | Root PID alignment makes ptrace and SaBRe output byte-identical. |
 | `c-programs/dbt-pid-virtualization` | Blocked | Child allocation and vfork/exec behavior still expose different backend task topologies. |
 | `c-programs/print-memaddrs` | Blocked | SaBRe relocation changes the stack, brk heap, and large-allocation addresses. |
 | `c-programs/proc-fdinfo` | Blocked | Loader-visible regular-file opens shift the virtual inode: ptrace reports 3 and SaBRe reports 1. |
@@ -274,7 +279,7 @@ stdout content alone: both glibc TLS guards vary while the later read of
 `AT_RANDOM` matches.
 
 This is not the pthread exit/join mechanism behind
-`backend-parity-c/pthread-lifecycle/verify@sabre` and
+`c-programs/pthread-lifecycle/verify@sabre` and
 `chaos-c/lock-granularity/verify@sabre`. Those cells first differ in a scheduler
 COMMIT's virtual time by exact multiples of the 5,000 ns futex charge, around
 different `pthread_join` futex sequences. This cell has one guest thread, no
@@ -321,9 +326,9 @@ The following 27 candidates fail SaBRe's `Stripped` comparison or its timeout
 and remain disabled:
 
 ```text
-backend-parity-c/cpuid-probe
 bin-c/robust-futex-test
 c-programs/clone
+c-programs/cpuid-probe
 c-programs/dbt-unsupported-syscall
 c-programs/fp-reduction-nondeterminism
 c-programs/hello-nostdlib

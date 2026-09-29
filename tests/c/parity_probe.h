@@ -34,7 +34,7 @@
  *   - parity_mutate_*(field, v): the observation seam the mutation harness
  *                                drives (see below).
  *
- * The mutation seam. `tests/backend-parity/parity_mutation.py` proves a fixture
+ * The mutation seam. `tests/c/fixture_mutation.py` proves a fixture
  * is non-vacuous by planting a divergence: it runs the fixture once clean and
  * once with HERMIT_PARITY_MUTATE naming one of the fixture's fields. A fixture
  * observes every syscall result it reports through parity_mutate_*(field, v),
@@ -47,7 +47,7 @@
  * "does the test fail if the mechanism does not run?" question, applied
  * mechanically to every family member.
  *
- * _GNU_SOURCE is supplied by the compile flags (both parity_mutation.py and
+ * _GNU_SOURCE is supplied by the compile flags (both fixture_mutation.py and
  * target/debug/test-harness compile with -D_GNU_SOURCE); do not define it here.
  */
 

@@ -435,7 +435,10 @@ class Fixtures:
 
         local = SCRIPT_DIR / "fixtures"
         sources: dict[str, tuple[Path, tuple[str, ...]]] = {
-            "pthread_lifecycle": (local / "pthread_lifecycle.c", ("-pthread",)),
+            "pthread_lifecycle": (
+                REPOSITORY / "tests/c/pthread_lifecycle.c",
+                ("-pthread",),
+            ),
             "process_wait_lifecycle": (
                 REPOSITORY / "tests/c/dbt_wait_lifecycle.c",
                 ("-D_GNU_SOURCE",),
@@ -473,7 +476,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/mmap_determinism.c",
                 (),
             ),
-            "cpuid_probe": (local / "cpuid_probe.c", ()),
+            "cpuid_probe": (REPOSITORY / "tests/c/cpuid_probe.c", ()),
             "clock_determinism": (
                 REPOSITORY / "tests/c/clock_determinism.c",
                 ("-D_GNU_SOURCE",),
@@ -482,7 +485,7 @@ class Fixtures:
                 REPOSITORY / "tests/c/random_sources.c",
                 ("-D_GNU_SOURCE", "-pthread"),
             ),
-            "pid_probe": (local / "pid_probe.c", ()),
+            "pid_probe": (REPOSITORY / "tests/c/pid_probe.c", ()),
             "scheduler_policy_queries": (
                 REPOSITORY / "tests/c/scheduler_policy_queries.c",
                 (),

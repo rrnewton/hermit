@@ -1106,6 +1106,8 @@ fn main() {
     // (test-harness.rs, `ScheduledWorkerCapacity::new(args.jobs.unwrap_or(1))`) --
     // `e2e.manifest_system_utils` pins `--jobs 1` explicitly, and only
     // `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` use `--jobs 8`.
+    // (Since slice S6 of https://github.com/rrnewton/hermit/issues/3301 folded the
+    // first into the second, only `e2e.manifest_c_programs` remains, at 8 slots.)
     //
     // This driver defaulted to 8. An id expands to up to 3 cells (median 1, max 3),
     // so for a multi-cell id the probe was running its cells CONCURRENTLY while the

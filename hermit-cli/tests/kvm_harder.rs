@@ -91,7 +91,7 @@ fn assert_ptrace_kvm_parity(name: &str, source: &str, extra_args: &[&str], expec
 fn kvm_matches_ptrace_for_pthread_lifecycle() {
     assert_ptrace_kvm_parity(
         "pthread_lifecycle",
-        "tests/backend-parity/fixtures/pthread_lifecycle.c",
+        "tests/c/pthread_lifecycle.c",
         &["-pthread"],
         "threads=4 total=10\n",
     );

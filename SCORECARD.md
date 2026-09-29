@@ -46,9 +46,8 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | Manifest category | Verify | Replay | Chaos | Selected by full | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
-| `backend-parity-c` | 103 / 104 | 0 / 104 | 0 / 104 | 103 | 312 |
 | `bin-c` | 1 / 2 | 0 / 2 | 0 / 2 | 1 | 6 |
-| `c-programs` | 162 / 166 | 1 / 166 | 3 / 166 | 166 | 498 |
+| `c-programs` | 265 / 270 | 1 / 270 | 3 / 270 | 269 | 810 |
 | `chaos-c` | 1 / 1 | 0 / 1 | 1 / 1 | 2 | 3 |
 | `data-handling` | 6 / 6 | 0 / 6 | 0 / 6 | 6 | 18 |
 | `debugger-c` | 1 / 1 | 0 / 1 | 0 / 1 | 1 | 3 |
@@ -67,7 +66,7 @@ These rows are part of the selected regression denominator even though they are 
 
 | Lane | Category | Test | Mode | Backend |
 | --- | --- | --- | --- | --- |
-| `portable` | `backend-parity-c` | `backend-parity-c/environment-and-workdir` | `custom` | `ptrace` |
+| `portable` | `c-programs` | `c-programs/environment-and-workdir` | `custom` | `ptrace` |
 | `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `liteinst` |
 | `portable` | `system-utils` | `system-utils/clock-determinism` | `custom` | `ptrace` |
 

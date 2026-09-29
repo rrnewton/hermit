@@ -199,8 +199,10 @@ The centralized manifests use an explicit build barrier before execution:
    missing or invalid producer output. Direct standalone use of
    `run-with-hermit-e2e-artifact.sh` still accepts that verified pointer
    override, and the standalone test harness still supports `HERMIT_BIN`.
-4. `e2e.audit_compile_backend_parity_c` compiles every C guest that bucket
-   declares, `ci=false` cells included. Nothing else in the DAG ever builds a
+4. `e2e.audit_compile_c_programs` compiles every C guest the c-programs bucket
+   declares, `ci=false` cells included (it compiled only the backend-parity-c
+   guests until that bucket was folded into c-programs,
+   https://github.com/rrnewton/hermit/issues/3301). Nothing else in the DAG ever builds a
    disabled cell, so without this node a disabled fixture rots invisibly — it
    never reaches `-Werror`, and "the file is in the repo" quietly stops meaning
    "the file builds". It fails closed: zero guests compiled, or a filter that
@@ -340,10 +342,11 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 - `resource_caps` gates *scarce* resources. The `portable` label keeps only
   `{"manifest_guest": 8}`. Ordinary manifest buckets use disjoint cell trees
-  and request one slot after the shared build barrier. The two high-width
-  buckets, `backend-parity-c` and `c-programs`, request all eight slots and pass
-  `--jobs 8`, so they do not overlap another manifest bucket while retaining
-  the measured worker width. Legacy Hermit guest gates and direct strict
+  and request one slot after the shared build barrier. The high-width
+  `c-programs` bucket, which absorbed the former `backend-parity-c` bucket
+  (https://github.com/rrnewton/hermit/issues/3301), requests all eight slots
+  and passes `--jobs 8`, so it does not overlap another manifest bucket while
+  retaining the measured worker width. Legacy Hermit guest gates and direct strict
   compatibility probes have no shared scarce-resource demand; they may overlap
   when dependencies, the outer scheduler width, and memory allow.
   The `privileged` label declares no resource cap: `/dev/kvm` supports concurrent

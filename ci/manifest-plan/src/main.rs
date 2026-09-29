@@ -351,6 +351,7 @@ fn main() {
 
     let inventory = load_test_inventory(&repo_root);
     validate_test_inventory(&repo_root, &inventory, &seen_programs);
+    validate_retired_ids(&repo_root, &documents, &seen_ids);
     validate_front_door(&repo_root, &documents, &inventory);
     validate_ci_reason_baseline(&repo_root, &documents);
 
@@ -690,6 +691,19 @@ fn inventory_string<'a>(entry: &'a JsonValue, key: &str, location: &str) -> &'a 
         .and_then(JsonValue::as_str)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| die(format!("{location}: `{key}` must be a non-empty string")))
+}
+
+/// Every retired test id must resolve to exactly one live id and no retired id
+/// may come back: history readers join old-id and new-id rows through this map.
+fn validate_retired_ids(repo_root: &Path, documents: &[Value], seen_ids: &BTreeSet<String>) {
+    let buckets = documents
+        .iter()
+        .filter_map(|document| document.get("bucket").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    hermit_manifest_plan::retired_ids::RetiredIds::load(repo_root)
+        .and_then(|map| map.check_live(seen_ids, &buckets))
+        .unwrap_or_else(|error| die(error));
 }
 
 /// Require the inventory to be an exact partition of the test tree.
@@ -1850,7 +1864,7 @@ mod tests {
             host_requirement_pairs(&documents).unwrap(),
             vec![(
                 "cpuid-faulting".to_string(),
-                "backend-parity-c/cpuid-probe".to_string()
+                "c-programs/cpuid-probe".to_string()
             )]
         );
     }

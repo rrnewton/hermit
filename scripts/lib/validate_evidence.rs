@@ -476,7 +476,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let args = parse_argv(&[
             "--requalify-cell".into(),
-            "backend-parity-c/pid-probe".into(),
+            "c-programs/pid-probe".into(),
             "verify".into(),
             "liteinst".into(),
             "--no-label-pr".into(),
@@ -490,8 +490,8 @@ mod tests {
 
         let requested = DagManifest {
             lane: "portable".into(),
-            category: "backend-parity-c".into(),
-            test: Some("backend-parity-c/pid-probe".into()),
+            category: "c-programs".into(),
+            test: Some("c-programs/pid-probe".into()),
             mode: Some("verify".into()),
             backend: Some("liteinst".into()),
         };
@@ -575,11 +575,17 @@ mod tests {
             )
             .err()
             .expect("a new plan that selects backend parity must be refused");
-        // The owner node's whole declared population is what a planted
-        // reference flag would compare: liteinst 97, KVM 75 and SaBRe 1.
+        // Before backend-parity-c was folded into c-programs, the owner node was
+        // e2e.manifest_backend_parity_c, whose retained parity spelling the plan
+        // reader still recognizes, so the planted flag was read as 173 relations
+        // (liteinst 97, KVM 75 and SaBRe 1) and refused by count. The owner is
+        // now e2e.manifest_c_programs, which never had a parity spelling, so the
+        // same planted flag is refused earlier, as an unrecognized policy, and
+        // nothing is published either way
+        // (https://github.com/rrnewton/hermit/issues/3301).
         assert_eq!(
             refusal,
-            "newly constructed plan selects 173 backend parity relation(s); backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
+            "e2e.manifest_c_programs has unrecognized backend parity policy"
         );
         assert!(
             !planted_scratch
