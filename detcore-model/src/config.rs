@@ -180,6 +180,16 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_parked_write_signal_interruption: bool,
 
+    /// The backend runs the guest as real host threads whose signal state the kernel
+    /// owns and reports in `/proc`, and resumes a Tool's restart errno through the
+    /// kernel's own signal-delivery and syscall-restart path. Blocking waits then
+    /// decide signal interruption from the guest's real mask and dispositions
+    /// (https://github.com/rrnewton/hermit/issues/3146). Off by default: only the
+    /// backends measured to honor that contract opt in.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_supports_blocked_wait_signal_interruption: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
     /// The execution backend virtualizes capability bounding-set and ambient-capability state.
@@ -1478,6 +1488,7 @@ mod tests {
         assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(config.backend_supports_parked_write_signal_interruption);
+        assert!(!config.backend_supports_blocked_wait_signal_interruption);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
     }

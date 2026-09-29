@@ -136,7 +136,7 @@ async fn selected_cleanup(daemon_first: bool) {
             },
         );
         sched.priorities.insert(waiter, DEFAULT_PRIORITY);
-        sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+        sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
         waiter_response = sched.next_turns[&waiter].resp.clone();
     }
     let (chosen, request, response) = state.sched.lock().unwrap().select_test_turn().unwrap();
