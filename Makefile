@@ -33,11 +33,10 @@ endif
 # immediately saturating every hardware thread. Override on smaller shared hosts.
 THIRD_PARTY_BUILD_JOBS ?= 64
 
-# Hermit debug binary used by the per-backend parity targets below. Override to
-# point the matrix at a prebuilt binary and skip the build step, e.g.
+# Hermit binary that validate-kvm and validate-dbt below hand to test-harness as
+# HERMIT_BIN. Override to run those cells against a prebuilt binary, e.g.
 #   make validate-kvm HERMIT_DEBUG_BIN=/path/to/hermit
 HERMIT_DEBUG_BIN ?= target/debug/hermit
-RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
@@ -237,8 +236,8 @@ help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@printf '\nPer-backend validate targets run ONLY one backend'"'"'s compatibility\n'
 	@printf 'corpus, for a tight per-backend iteration loop. Runtimes are approximate:\n'
-	@printf '  validate-kvm       KVM parity corpus     (needs /dev/kvm)            ~5-15 min\n'
-	@printf '  validate-dbt       DBT parity corpus     (third-party-backends)      ~5-15 min\n'
+	@printf '  validate-kvm       KVM manifest cells    (needs /dev/kvm)            not yet timed\n'
+	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
@@ -336,23 +335,26 @@ check-submodules: checkout-all ## Initialize if needed, then verify (build path)
 # Each target runs ONLY its backend's compatibility corpus so a backend lane
 # agent can iterate tightly without paying for the full cross-backend suite.
 # They wrap the pre-existing mechanisms rather than adding new ones:
-#   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
-#     scoped to one backend with `run_matrix.py --backend <backend>`. The
-#     validation DAG no longer runs this matrix: since slice S13 of
-#     https://github.com/rrnewton/hermit/issues/3301 its DBT cases are DBT
-#     verify cells of the c-programs and system-utils manifests.
+#   * KVM and DBT (real Detcore backends) -> the E2E manifest runner,
+#     `test-harness run --backend <backend>`, which runs that backend's
+#     required cells in every manifest. It runs no ptrace cell, so its parity
+#     post-pass has no reference to compare against; `test-harness parity
+#     compare` measures parity from a run that retained both sides' logs.
 #   * SaBRe / LiteInst / e9patch          -> the Rust driver's focused
 #     `--<backend>-compat-only` profiles, which self-build the release binary
 #     and any backend artifacts.
 # ---------------------------------------------------------------------------
 
-validate-kvm: check-submodules ## Run ONLY the KVM backend parity corpus (needs /dev/kvm)
+validate-kvm: check-submodules ## Run ONLY the KVM cells of the E2E manifests (needs /dev/kvm)
+	@test -r /dev/kvm && test -w /dev/kvm || { echo 'validate-kvm: /dev/kvm is not readable and writable, so no KVM cell can run here' >&2; exit 1; }
 	cargo build -p hermit
-	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend kvm --probe-gaps --require-backend
+	cargo build -p hermit-manifest-plan --bin test-harness
+	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend kvm
 
-validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-party-backends feature)
+validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (third-party-backends feature)
 	cargo build -p hermit --features third-party-backends
-	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
+	cargo build -p hermit-manifest-plan --bin test-harness
+	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend dbt
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./scripts/validate.rs --sabre-compat-only
