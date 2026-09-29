@@ -254,7 +254,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The five PMU-subject ptrace_completion::tests::real_random_ cases move
     // to privileged-test.pmu_ptrace_completion_cases, and the namespace-only
     // perf-probe control is added: 757 - 5 + 1 = 753.
-    ("test.hermit_unit", 753),
+    // The nosuid,nodev image-root regression
+    // (container::tests::image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem)
+    // retains all 753 prior identities (`cargo nextest list --profile ci`
+    // measured 754; https://github.com/rrnewton/hermit/issues/3334).
+    ("test.hermit_unit", 754),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -313,7 +317,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_unit_on_host", 810),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
-    ("test.hermit_unit_on_host", 753),
+    ("test.hermit_unit_on_host", 754),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.

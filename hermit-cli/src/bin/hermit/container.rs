@@ -486,11 +486,15 @@ pub(super) fn image_container(
     // it onto itself and remount it read-only so a guest cannot poison later
     // runs or mutate run one underneath `--verify` run two. A fresh writable
     // /tmp is mounted separately for ordinary scratch files.
-    container.mount(Mount::bind(rootfs, rootfs));
-    container.mount(
-        Mount::new(rootfs)
-            .flags(MountFlags::MS_BIND | MountFlags::MS_REMOUNT | MountFlags::MS_RDONLY),
-    );
+    //
+    // Use Reverie's read-only bind rather than a hand-written
+    // `MS_BIND | MS_REMOUNT | MS_RDONLY`. When the cache lives on a filesystem
+    // mounted `nosuid`, `nodev` or `noexec` outside this user namespace, the
+    // kernel locks those flags on the copied mount and refuses (EPERM) any
+    // remount that omits them. Reverie restates the source's locked flags in
+    // its read-only remount; the hand-written remount did not, so every image
+    // run failed at spawn under such a cache.
+    container.mount(Mount::bind(rootfs, rootfs).readonly());
     container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
 
     // Mount the deterministic /proc into the target root. The materializer
@@ -1177,6 +1181,64 @@ mod tests {
             .unwrap()
             .expect("image container should retry its denied proc mount read-only");
         readonly_proc::assert_readonly_proc(&mounts, &status, 1);
+    }
+
+    /// The image cache can live on a filesystem mounted `nosuid,nodev` outside
+    /// Hermit's user namespace (a hardened `/tmp`, a CI sandbox's scratch
+    /// tmpfs). The kernel locks those flags on the mount copied into Hermit's
+    /// namespace, so the read-only remount of the image root must restate them.
+    /// A remount that asks only for `MS_RDONLY` fails with EPERM and the image
+    /// container never starts. This builds that filesystem in an outer user
+    /// namespace, so the result does not depend on how the host mounted its
+    /// temporary directory, and checks that the image root comes up read-only
+    /// with both locked flags still present.
+    #[test]
+    fn image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem() {
+        fn root_mount_flags() -> Result<(bool, bool, bool), String> {
+            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            // SAFETY: the path is a valid NUL-terminated string and `stat` is a
+            // correctly sized out-parameter that is read only on success.
+            let rc = unsafe { libc::statvfs(c"/".as_ptr(), stat.as_mut_ptr()) };
+            if rc != 0 {
+                return Err(format!("statvfs /: {}", io::Error::last_os_error()));
+            }
+            // SAFETY: statvfs returned 0, so it initialized `stat`.
+            let flags = unsafe { stat.assume_init() }.f_flag;
+            Ok((
+                flags & libc::ST_RDONLY != 0,
+                flags & libc::ST_NOSUID != 0,
+                flags & libc::ST_NODEV != 0,
+            ))
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().to_owned();
+        let flags = Container::new()
+            .map_root()
+            .mount(Mount::tmpfs(&base_path).flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV))
+            .run(move || -> Result<(bool, bool, bool), String> {
+                let rootfs = base_path.join("rootfs");
+                let tmpfs = base_path.join("scratch");
+                for directory in ["proc", "tmp", "dev/pts"] {
+                    fs::create_dir_all(rootfs.join(directory)).map_err(|e| e.to_string())?;
+                }
+                for node in crate::image::DEV_BIND_TARGETS {
+                    File::create(rootfs.join("dev").join(node)).map_err(|e| e.to_string())?;
+                }
+                fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
+                let (mut container, _identity) = image_container(&rootfs, &tmpfs, false, true)
+                    .map_err(|error| error.to_string())?;
+                container
+                    .run(root_mount_flags)
+                    .map_err(|error| format!("{error:?}"))?
+            })
+            .expect("run the outer namespace holding the nosuid,nodev filesystem")
+            .expect("an image root on a nosuid,nodev filesystem must mount read-only");
+        assert_eq!(
+            flags,
+            (true, true, true),
+            "image root (read-only, nosuid, nodev) flags inside the container"
+        );
     }
 
     /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for
