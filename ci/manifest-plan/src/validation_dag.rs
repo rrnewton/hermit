@@ -378,16 +378,20 @@ struct Profile {
 // full, portable and hosted-portable then replaced 189 compat.<program> nodes
 // with one e2e.manifest_compat bucket (its hosted twin for hosted-portable):
 // 274/275, 261/262 and 255/255 before.
+// full, portable and hosted-portable then gained check.e9patch_corpus when the
+// e9patch corpus left tests/backend-parity (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 86/87, 73/74 and
+// 67/67 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 86,
-        selected_steps: 87,
+        direct_steps: 87,
+        selected_steps: 88,
     },
     Profile {
         label: "portable",
-        direct_steps: 73,
-        selected_steps: 74,
+        direct_steps: 74,
+        selected_steps: 75,
     },
     Profile {
         label: "quick",
@@ -406,8 +410,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 67,
-        selected_steps: 67,
+        direct_steps: 68,
+        selected_steps: 68,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -2269,10 +2273,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // check.script_unit_tests took the rust-script unit tests out of
     // check.lint_checks. 1240 since the 189 compat.<program> nodes and their
     // 189 hosted twins became e2e.manifest_compat and its hosted twin
-    // (2026-10-01).
-    if cfg.steps.len() != 1240 {
+    // (2026-10-01). +1 for check.e9patch_corpus when the e9patch corpus
+    // left tests/backend-parity (also slice S13).
+    if cfg.steps.len() != 1241 {
         return Err(format!(
-            "superset has {} steps, expected 1240",
+            "superset has {} steps, expected 1241",
             cfg.steps.len()
         ));
     }
@@ -3844,6 +3849,9 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 68 since check.e9patch_corpus was added when the e9patch corpus
+        // left tests/backend-parity (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301);
         // 67 since the 189 per-program compat.<label>_on_host nodes were
         // folded into the one bucket e2e.manifest_compat_on_host (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448: 255 - 189 + 1);
@@ -3854,9 +3862,8 @@ sys.exit(37)
         // 256 since selftest.scorecard_commands split from selftest.scorecard;
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
-        // test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 67);
+        // test.dbt_parity_on_host was retired (slice S13); 251 before.
+        assert_eq!(selected.steps.len(), 68);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -4042,6 +4049,10 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
+            // 67 = the 68 hosted-portable direct steps since
+            // check.e9patch_corpus was added in slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301, minus the one
+            // planted loss;
             // 66 = the 67 hosted-portable direct steps since the 189
             // compat.<label>_on_host nodes became e2e.manifest_compat_on_host
             // (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
@@ -4053,7 +4064,7 @@ sys.exit(37)
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 66 direct steps"),
+            error.contains("hosted-portable label has 67 direct steps"),
             "{error}"
         );
     }
