@@ -17,8 +17,7 @@ with `--backend dbt --strict`; its 28 cases now run as DBT verify cells of
 `tests/e2e/manifests/c-programs.yaml` and `tests/e2e/manifests/system-utils.yaml`,
 with exact `expected_stdout` goldens or `expected_stdout_contains` markers.
 `run_matrix.py` stays for the `make validate-kvm` and `make validate-dbt`
-targets, the nightly Buck shadow comparison in `scripts/build-buck-release.rs`,
-and the driver-side suites below.
+targets and the driver-side suites below.
 
 ## Current ratchet
 
