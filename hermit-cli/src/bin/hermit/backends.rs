@@ -1013,9 +1013,10 @@ pub(super) fn run_dbt(
 
     // The capture names are READ BY THE HARNESS, so they are not a local choice.
     //
-    // `ci/compat-envelope/pressure-test.rs` and `ci/manifest-plan/src/runner.rs`
-    // both scan a retained verify-log directory with
-    // `name.starts_with("run1_log_")` / `("run2_log_")`. This call used to pass
+    // `ci/compat-envelope/pressure-test.rs` scans a retained verify-log
+    // directory with `name.starts_with("run1_log_")` / `("run2_log_")`, and the
+    // parity post-pass in `ci/manifest-plan/src/parity.rs` reads the
+    // `run1_log_` golden. This call used to pass
     // "dbt-run1"/"dbt-run2", which `temp_log_files_in` turns into the prefixes
     // `dbt-run1_log_` / `dbt-run2_log_` -- and those do not start with
     // `run1_log_`. `run.rs` passes "run1"/"run2" for every other backend.
@@ -1243,6 +1244,11 @@ pub(super) fn run_dbt(
             keep_logs: keep_logs
                 || branch_clock_diverged
                 || summary_comparison.requires_log_retention(),
+            // The same divergence also overrides a log match: the verdict
+            // becomes a divergence after this comparison, so both logs are
+            // retained rather than the single golden log `--keep-logs` keeps
+            // after a match.
+            match_overridden: branch_clock_diverged || summary_comparison.requires_log_retention(),
             failed_log_retention: (!keep_logs)
                 .then(super::verify::default_failed_verify_log_retention),
             // Each log holds `DbtEvidence::all_records()`, so every
@@ -1783,6 +1789,7 @@ mod tests {
                     diagnostic_full_trace: false,
                     compare_io_buffers: true,
                     keep_logs: false,
+                    match_overridden: false,
                     failed_log_retention: None,
                     record_envelope: RecordEnvelope::all_records_v1(),
                     virtualize_time: true,

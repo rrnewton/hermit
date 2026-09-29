@@ -1822,15 +1822,22 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
             report["compared_log_messages"]["left"], report["compared_log_messages"]["right"],
             "{report}"
         );
-        for side in ["run1_log_", "run2_log_"] {
-            let captures = fs::read_dir(&logs)
+        // After a match `--keep-logs` retains only run 1's log, the golden
+        // log; run 2's log, which matched it, is deleted.
+        let captures = |side: &str| {
+            fs::read_dir(&logs)
                 .unwrap()
                 .map(Result::unwrap)
                 .filter(|entry| entry.file_name().to_string_lossy().starts_with(side))
-                .collect::<Vec<_>>();
-            assert_eq!(captures.len(), 1);
-            assert!(captures[0].metadata().unwrap().len() > 0);
-        }
+                .collect::<Vec<_>>()
+        };
+        let golden = captures("run1_log_");
+        assert_eq!(golden.len(), 1);
+        assert!(golden[0].metadata().unwrap().len() > 0);
+        assert!(
+            captures("run2_log_").is_empty(),
+            "verify {attempt}: a matched verification must not retain run 2's log"
+        );
     };
     // Each command performs the original strict two-run comparison. Reusing
     // either a physical-run directory or a sibling's directory makes O_EXCL
@@ -1853,11 +1860,14 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
 
 /// DBT's retained verify captures must carry the names THE HARNESS SCANS FOR.
 ///
-/// This is not a style assertion. `ci/compat-envelope/pressure-test.rs` and
-/// `ci/manifest-plan/src/runner.rs` both locate the pair with
-/// `name.starts_with("run1_log_")` / `("run2_log_")`, and a terminal verify
-/// result whose directory does not yield exactly one of each is recorded
-/// `infrastructure-error` regardless of the verdict it actually reached.
+/// This is not a style assertion. `ci/compat-envelope/pressure-test.rs` locates
+/// the retained logs with `name.starts_with("run1_log_")` / `("run2_log_")`,
+/// and the parity post-pass reads the `run1_log_` golden. A matched verify
+/// result must yield exactly one nonempty `run1_log_` capture and no
+/// `run2_log_` capture, because `--keep-logs` keeps only the golden log after a
+/// match; a diverged result must yield exactly one of each. A terminal result
+/// whose directory does not fit its verdict is recorded `infrastructure-error`
+/// regardless of the verdict it actually reached.
 ///
 /// DBT used to pass "dbt-run1"/"dbt-run2" to `temp_log_files_in`, producing
 /// `dbt-run1_log_*`, which does not start with `run1_log_`. Measured 2026-08-27
@@ -1871,7 +1881,10 @@ fn run_dbt_verifies_fresh_physical_workdirs() {
 /// Nothing else in the tree ever referenced the `dbt-` spelling, so it was
 /// undefended: the mismatch could return by editing one string with no test
 /// failing. This asserts BOTH directions -- the scanned names are present, and
-/// the old spelling is absent -- so a revert is visible.
+/// the old spelling is absent -- so a revert is visible. Run 2's name is only
+/// retained after a divergence, so
+/// `dbt_verify_without_json_rejects_io_buffer_content_divergence` pins it on a
+/// deterministic divergence.
 #[test]
 fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
     if dbt_unavailable("dbt_verify_retains_captures_under_the_names_the_harness_scans_for") {
@@ -1882,6 +1895,7 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
         .expect("failed to create DBT verify-log naming test directory");
     let log_dir = root.path().join("verify-logs");
     fs::create_dir(&log_dir).expect("failed to create DBT verification log directory");
+    let verdict_path = root.path().join("verdict.json");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
@@ -1893,26 +1907,38 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
             "--keep-logs",
             "--verify-log-dir",
         ])
-        .arg(&log_dir);
+        .arg(&log_dir)
+        .arg("--verify-json")
+        .arg(&verdict_path);
     append_hermit_args_using_outer_mount(
         &mut command,
         &["--", "/bin/echo", "dbt-verify-log-naming"],
     );
     let output = command.output().expect("failed to run DBT verification");
 
-    // DELIBERATELY NOT asserting the verdict. The subject here is the NAME the
-    // captures are retained under, and `--keep-logs` retains them whether the
-    // two runs matched or not. An earlier version of this test also required
-    // success and was flaky within three runs: DBT verification of /bin/echo
-    // diverged on one of them ("Log differences found between run 1 and run 2"),
-    // which failed the test for a reason that has nothing to do with the naming
-    // it exists to pin. Coupling a property to an unrelated verdict is how a
-    // test starts getting re-run until it passes.
+    // DELIBERATELY NOT REQUIRING a particular verdict. The subject here is the
+    // NAME the captures are retained under. An earlier version of this test
+    // required success and was flaky within three runs: DBT verification of
+    // /bin/echo diverged on one of them ("Log differences found between run 1
+    // and run 2"), which failed the test for a reason that has nothing to do
+    // with the naming it exists to pin. Coupling a property to an unrelated
+    // verdict is how a test starts getting re-run until it passes. The verdict
+    // only selects which captures `--keep-logs` must have retained.
     let stderr_text = strip_ansi_sgr(&stderr(&output));
     assert!(
-        stderr_text.contains("Verification logs retained") || output.status.success(),
-        "DBT verification neither succeeded nor reported retained logs, so this test cannot \
-         observe the capture names at all:\n{stderr_text}"
+        stderr_text.contains("Verification logs retained"),
+        "DBT verification did not report retained logs, so this test cannot observe the \
+         capture names at all:\n{stderr_text}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verdict_path).expect("DBT verification did not write its --verify-json report"),
+    )
+    .expect("DBT verification report should be JSON");
+    let matched = report["verdict"] == "matched";
+    assert_eq!(
+        output.status.success(),
+        matched,
+        "process status disagrees with the recorded verdict: {report}"
     );
 
     let names = |prefix: &str| -> Vec<String> {
@@ -1923,26 +1949,46 @@ fn dbt_verify_retains_captures_under_the_names_the_harness_scans_for() {
             .filter(|name| name.starts_with(prefix))
             .collect()
     };
-
-    // The harness predicate, applied verbatim: exactly one of each, both nonempty.
-    for prefix in ["run1_log_", "run2_log_"] {
-        let matched = names(prefix);
-        assert_eq!(
-            matched.len(),
-            1,
-            "DBT verification must retain exactly one {prefix} capture for the harness to find; \
-             directory held {:?}",
-            fs::read_dir(&log_dir)
-                .map(|entries| entries
+    let directory_listing = || {
+        fs::read_dir(&log_dir)
+            .map(|entries| {
+                entries
                     .filter_map(Result::ok)
                     .map(|e| e.file_name())
-                    .collect::<Vec<_>>())
-                .unwrap_or_default()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    // The harness predicate, applied verbatim: a match retains exactly one
+    // nonempty golden capture and no second capture; anything else retains
+    // exactly one nonempty capture of each side.
+    let retained: &[&str] = if matched {
+        &["run1_log_"]
+    } else {
+        &["run1_log_", "run2_log_"]
+    };
+    for prefix in retained {
+        let found = names(prefix);
+        assert_eq!(
+            found.len(),
+            1,
+            "DBT verification ({}) must retain exactly one {prefix} capture for the harness to \
+             find; directory held {:?}",
+            report["verdict"],
+            directory_listing()
         );
-        let size = fs::metadata(log_dir.join(&matched[0]))
+        let size = fs::metadata(log_dir.join(&found[0]))
             .expect("failed to stat a retained capture")
             .len();
-        assert!(size > 0, "retained capture {} is empty", matched[0]);
+        assert!(size > 0, "retained capture {} is empty", found[0]);
+    }
+    if matched {
+        assert!(
+            names("run2_log_").is_empty(),
+            "a matched DBT verification must not retain run 2's log; directory held {:?}",
+            directory_listing()
+        );
     }
 
     // And the spelling that hid them must not come back.
@@ -2034,6 +2080,43 @@ fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
             stderr.contains(marker),
             "DBT's no-JSON verification failure did not name {marker:?}; it must fail on the \
              syscall output-buffer evidence itself:\n{stderr}"
+        );
+    }
+
+    // A divergence keeps both logs under `--keep-logs`, each under the name the
+    // harness scans for. This deterministic divergence is what pins run 2's
+    // name: after a match only run 1's golden log is retained.
+    let captures = |prefix: &str| -> Vec<PathBuf> {
+        fs::read_dir(&log_dir)
+            .expect("failed to read the retained DBT verify-log directory")
+            .map(|entry| entry.expect("failed to read a retained log entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect()
+    };
+    for prefix in ["run1_log_", "run2_log_"] {
+        let found = captures(prefix);
+        assert_eq!(
+            found.len(),
+            1,
+            "a diverged DBT verification must retain exactly one {prefix} capture: {found:?}"
+        );
+        let size = fs::metadata(&found[0])
+            .expect("failed to stat a retained DBT capture")
+            .len();
+        assert!(
+            size > 0,
+            "retained DBT capture {} is empty",
+            found[0].display()
+        );
+    }
+    for stale in ["dbt-run1_log_", "dbt-run2_log_"] {
+        assert!(
+            captures(stale).is_empty(),
+            "DBT retained a {stale} capture instead of the name the harness scans for"
         );
     }
 }
@@ -2863,11 +2946,32 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
             report["verified"] == true,
             "process status disagrees with terminal verdict: {report}"
         );
-        let retained_logs = fs::read_dir(&logs)
+        let mut retained_logs = fs::read_dir(&logs)
             .expect("failed to read retained DBT log-env verification logs")
             .map(|entry| entry.expect("failed to read retained log entry").path())
             .collect::<Vec<_>>();
-        assert_eq!(retained_logs.len(), 2, "unexpected logs: {retained_logs:?}");
+        retained_logs.sort();
+        // `--keep-logs` keeps only run 1's golden log after a match, and both
+        // logs after a divergence.
+        let expected_sides: &[&str] = if report["verdict"] == "matched" {
+            &["run1_log_"]
+        } else {
+            &["run1_log_", "run2_log_"]
+        };
+        assert_eq!(
+            retained_logs.len(),
+            expected_sides.len(),
+            "unexpected logs for verdict {}: {retained_logs:?}",
+            report["verdict"]
+        );
+        for (log, side) in retained_logs.iter().zip(expected_sides) {
+            assert!(
+                log.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(side)),
+                "expected a {side} capture, found {log:?}"
+            );
+        }
         for log in retained_logs {
             let contents = fs::read_to_string(&log).expect("failed to read retained DBT log");
             assert!(contents.contains("INFO detcore"), "empty INFO log: {log:?}");
@@ -6195,6 +6299,122 @@ fn skid_overshoot_and_guest_failure_have_different_exit_codes() {
         overshoot_code,
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "an understood infrastructure failure should use the policy-refusal status"
+    );
+}
+
+/// Retained entries of a verify-log directory whose names start with `prefix`.
+fn retained_captures(log_dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut captures = fs::read_dir(log_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", log_dir.display()))
+        .map(|entry| entry.expect("failed to read a retained log entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    captures.sort();
+    captures
+}
+
+/// `--keep-logs` keeps ONLY the first run's log after a matched verification.
+///
+/// Owner rule, https://github.com/rrnewton/hermit/issues/3301: after the two
+/// runs are checked to match for determinism, only one log needs to be kept.
+/// The first run's log is kept as the golden log, and `--keep-logs` deletes the
+/// second run's log, which compared equal to it. This
+/// drives the real ptrace backend with the exact retention flags the E2E runner
+/// emits, `--keep-logs --verify-log-dir <dir>`, so the directory checked here
+/// has the shape the pressure-test gate and the parity post-pass read.
+#[test]
+fn ptrace_keep_logs_retains_only_the_golden_log_after_a_match() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the golden-log test directory");
+    let log_dir = root.path().join("verify-logs");
+    fs::create_dir(&log_dir).expect("failed to create the verify-log directory");
+    let verdict_path = root.path().join("verdict.json");
+    let stdout_path = root.path().join("stdout");
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--keep-logs",
+        "--verify-log-dir",
+        log_dir
+            .to_str()
+            .expect("verify-log directory should be UTF-8"),
+        "--verify-json",
+        verdict_path.to_str().expect("verdict path should be UTF-8"),
+        "--",
+        "/bin/echo",
+        "golden-log",
+    ];
+    let mut child = hermit_command(&args)
+        .stdout(fs::File::create(&stdout_path).expect("failed to create the stdout capture"))
+        .stderr(Stdio::piped())
+        // Own process group, so `wait_bounded` can reach namespace descendants.
+        .process_group(0)
+        .spawn()
+        .expect("failed to spawn the ptrace verification");
+    let status = wait_bounded(
+        &mut child,
+        "ptrace_keep_logs_retains_only_the_golden_log_after_a_match",
+    );
+    let stderr = strip_ansi_sgr(&drain_bounded(child.stderr.take()));
+    assert!(
+        status.success(),
+        "ptrace verification failed ({status}):\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&stdout_path).expect("failed to read the guest stdout"),
+        "golden-log\n"
+    );
+
+    let report = VerificationReport::from_current_json_value(
+        serde_json::from_slice(&fs::read(&verdict_path).expect("failed to read the verdict"))
+            .expect("the verdict should be JSON"),
+    )
+    .expect("the verdict should be a current verification report");
+    assert_eq!(report.verdict, Verdict::Matched, "{stderr}");
+    assert!(report.verified && report.bitwise_parity, "{stderr}");
+    let compared = report
+        .compared_log_messages
+        .expect("a canonical verification must report its compared INFO messages");
+    assert!(
+        compared.left > 0 && compared.left == compared.right,
+        "the golden log must come from a nonempty compared log population: {compared:?}"
+    );
+
+    // Exactly one nonempty golden log, and it is the only retained file.
+    let golden = retained_captures(&log_dir, "run1_log_");
+    assert_eq!(golden.len(), 1, "expected one golden log: {golden:?}");
+    let size = fs::metadata(&golden[0])
+        .expect("failed to stat the golden log")
+        .len();
+    assert!(size > 0, "the golden log {} is empty", golden[0].display());
+    let duplicates = retained_captures(&log_dir, "run2_log_");
+    assert!(
+        duplicates.is_empty(),
+        "a matched verification must delete run 2's log: {duplicates:?}"
+    );
+    let everything = retained_captures(&log_dir, "");
+    assert_eq!(
+        everything, golden,
+        "the golden log must be the only retained file"
+    );
+    // The retained path printed for the user names that same file, and no
+    // second log is reported as retained.
+    assert!(
+        stderr.contains(&format!("::   run 1: {}", golden[0].display())),
+        "the retained golden path was not reported:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("::   run 2:"),
+        "a deleted run 2 log was reported as retained:\n{stderr}"
     );
 }
 
