@@ -12225,8 +12225,7 @@ fn verify_results(
 ) -> Result<(), String> {
     let derived = derive(root)?;
     let head = git_head(root)?;
-    let (expected, omitted) =
-        select_verified_cells(&derived.selected, lanes, excluded_backends)?;
+    let (expected, omitted) = select_verified_cells(&derived.selected, lanes, excluded_backends)?;
     let candidates = read_result_candidates(result_root, &head)?;
     let admitted = verify_candidate_set(&expected, candidates)?;
     if admitted != expected.len() {
@@ -12258,7 +12257,11 @@ fn verify_results(
     if !excluded_backends.is_empty() {
         println!(
             "Omitted by --exclude-backend {}: {omitted} selected cells were not required and are not counted as passed.",
-            excluded_backends.iter().cloned().collect::<Vec<_>>().join(",")
+            excluded_backends
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
         );
     }
     println!("Result directory: {}", result_root.display());
@@ -17097,6 +17100,21 @@ fn self_test() -> Result<(), String> {
         cell.observations.clear();
         cell.last_tested = None;
     }
+    // The pinned corpus predates the catalogue, so the catalogue may have
+    // retired cells since. The 2026-09-28 lane move of
+    // system-utils/sysfs-sanitized-prefixes did this. A real ledger drops a
+    // retired cell once and publishes that document, so this baseline
+    // (observations cleared) holds only the current catalogue's cells. The
+    // refusal to retire unpublished history is asserted on its own control
+    // below, independent of the live catalogue.
+    let baseline_catalogue: BTreeSet<CellId> = fixture_cells
+        .cells
+        .iter()
+        .map(|cell| cell.id.clone())
+        .collect();
+    combined_baseline_cells
+        .cells
+        .retain(|cell| baseline_catalogue.contains(&cell.id));
     combined_baseline_cells.projection = None;
     refresh_measurement(&mut combined_baseline_cells);
     let combined_derived = derive(&result_command_root)?;
@@ -17215,6 +17233,40 @@ fn self_test() -> Result<(), String> {
             "bare snapshot filename did not produce the expected direct evidence: status={} stderr={:?}",
             bare_output.status,
             String::from_utf8_lossy(&bare_output.stderr)
+        ));
+    }
+    restore_combined_baseline()?;
+
+    // An unpublished ledger document that still holds a cell the catalogue
+    // has retired is refused unchanged. A writer must not retire history
+    // that exists only in an uncommitted projection. This control does not
+    // depend on whether the live catalogue has retired anything.
+    let mut unpublished_retiring = combined_baseline_cells.clone();
+    let mut retired_cell = unpublished_retiring
+        .cells
+        .first()
+        .cloned()
+        .ok_or("combined transaction baseline has no cells")?;
+    retired_cell.id.test = "system-utils/scorecard-self-test-retired-cell".into();
+    unpublished_retiring.cells.push(retired_cell);
+    let unpublished_retiring = generated_files(&combined_derived, &unpublished_retiring)?;
+    fs::write(
+        fixture_ledger.join(LEDGER_CELLS),
+        &unpublished_retiring.cells,
+    )
+    .map_err(|error| error.to_string())?;
+    let unpublished_output = run_snapshot_command(&empty_snapshot_path, &empty_snapshot_sha)?;
+    if unpublished_output.status.code() != Some(2)
+        || !String::from_utf8_lossy(&unpublished_output.stderr).contains(
+            "catalogue reconciliation refuses to retire uncommitted history; publish the exact existing detailed document first",
+        )
+        || fs::read(fixture_ledger.join(LEDGER_CELLS)).map_err(|error| error.to_string())?
+            != unpublished_retiring.cells
+    {
+        return Err(format!(
+            "unpublished retiring history was not refused unchanged: status={} stderr={:?}",
+            unpublished_output.status,
+            String::from_utf8_lossy(&unpublished_output.stderr)
         ));
     }
     restore_combined_baseline()?;
@@ -30082,8 +30134,8 @@ mod verify_results_exclusion_tests {
     #[test]
     fn an_exclusion_that_matches_nothing_or_everything_is_refused() {
         let selected = BTreeSet::from([cell("portable", "a", "ptrace")]);
-        let stale = select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["kvm"]))
-            .unwrap_err();
+        let stale =
+            select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["kvm"])).unwrap_err();
         assert_eq!(
             stale,
             "--exclude-backend kvm matches no selected cell in the named lanes"
