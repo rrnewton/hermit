@@ -12,8 +12,19 @@ set -euo pipefail
 # dd bs=1 across a pipe is the coreutils-native version of the same surface:
 # every byte is its own read()/write() pair, so a backend that coalesces or
 # splits transfers differently produces a different syscall stream while the
-# byte total still matches. Small by design -- 4096 bytes is ~8k syscalls and
-# no meaningful compute.
+# byte total still matches. Small by design, with no meaningful compute.
+#
+# The payload is 512 bytes. Every partial-transfer path still runs hundreds of
+# times: 1-byte reads and writes on the pipe and the file, the 0-byte EOF read,
+# and the short final block of the bs=7 copy. At 4096 bytes the run made 22,637
+# syscalls and cost 18-20 CPU seconds under a debug Hermit, which went over the
+# 22-second CPU budget on the hosted runner
+# (https://github.com/rrnewton/hermit/issues/3337). At 512 bytes it makes 4,711
+# syscalls, with the same syscall types, result classes and Hermit coverage.
+# The size must be a multiple of 16, the length of one pattern repeat. One
+# incidental change: `wc -c <file` reads a regular file only when its size is a
+# multiple of the 4096-byte page, and otherwise takes the size from fstat, so
+# the two large whole-file reads by wc are gone at 512 bytes.
 #
 # dd's own stats line is suppressed with status=none: it reports a virtual-time
 # derived rate, which the time-focused entries already cover, and leaving it in
@@ -24,12 +35,13 @@ case ${1:-} in
         work="${E2E_TMPDIR:-/tmp}/dd-partial"
         rm -rf "$work"; mkdir -p "$work"
         src="$work/src.bin"
-        # Deterministic, compressible-but-not-uniform 4096-byte payload.
-        awk 'BEGIN { for (i = 0; i < 256; i++) printf "0123456789abcdef" }' >"$src"
+        size=512
+        # Deterministic, compressible-but-not-uniform payload.
+        awk -v n=$((size / 16)) 'BEGIN { for (i = 0; i < n; i++) printf "0123456789abcdef" }' >"$src"
         src_size=$(wc -c <"$src" | tr -d '[:space:]')
         printf 'SRC %s\n' "$src_size"
-        if [ "$src_size" -ne 4096 ]; then
-            echo "source size mismatch: got $src_size, want 4096" >&2
+        if [ "$src_size" -ne "$size" ]; then
+            echo "source size mismatch: got $src_size, want $size" >&2
             exit 1
         fi
 
@@ -37,8 +49,8 @@ case ${1:-} in
         # every transfer is partial.
         piped=$(cat "$src" | dd bs=1 status=none | wc -c | tr -d '[:space:]')
         printf 'PIPED %s\n' "$piped"
-        if [ "$piped" -ne 4096 ]; then
-            echo "pipe transfer mismatch: got $piped, want 4096" >&2
+        if [ "$piped" -ne "$size" ]; then
+            echo "pipe transfer mismatch: got $piped, want $size" >&2
             exit 1
         fi
 
@@ -53,7 +65,7 @@ case ${1:-} in
         fi
         printf 'COPIED %s\n' "$copied"
         printf 'IDENTICAL %s\n' "$identical"
-        if [ "$copied" -ne 4096 ] || [ "$identical" != yes ]; then
+        if [ "$copied" -ne "$size" ] || [ "$identical" != yes ]; then
             echo "file transfer mismatch: copied=$copied identical=$identical" >&2
             exit 1
         fi

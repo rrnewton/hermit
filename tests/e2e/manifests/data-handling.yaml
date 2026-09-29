@@ -305,6 +305,18 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
+  # Power/weight 2026-09-28 @ Hermit ad21724d5f64, ptrace verify, devbig014
+  # (https://github.com/rrnewton/hermit/issues/3337): payload 4096 -> 512 bytes.
+  # Debug Hermit, the build the E2E artifact ships: median CPU 18.59s -> 4.76s
+  # (3.9x) over 5 runs each. Release Hermit: 4.39s -> 1.14s (3.8x). Syscalls per
+  # run 22,637 -> 4,711. Sets are the same: 49 syscall types, 60 syscall result
+  # classes, 5 io-buffer classes, 27 Hermit event classes. The 1-byte pipe and
+  # file transfers, the 0-byte EOF read and the 7-byte blocks with a 5-byte
+  # final block all remain. One incidental change: wc -c no longer reads the
+  # whole file, because 512 is not a page multiple. Hermit coverage for
+  # dd-4096 vs dd-512 has no lost lines or regions (9137/12824 -> 9138/12826).
+  # The 22s CPU and 58s wall bounds and their 60-sample calibration predate
+  # the shrink and are left unchanged.
   - id: data-handling/dd-partial-transfers
     description: 'Byte-at-a-time dd across a pipe and a file: partial transfers in a real coreutil'
     lane: portable
