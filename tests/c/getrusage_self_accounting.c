@@ -89,7 +89,7 @@ int main(void) {
     // (2) getrusage and times report the same advancing logical CPU clock.
     if (rc == 0 && usage_matches_times(&ru, &before, &after, ticks_per_second)) ok++;
     // (3) A runaway value would indicate that host time leaked into the guest.
-    // Exact determinism is checked by the backend-parity double execution.
+    // Exact determinism is checked by the manifest verify cell's two runs.
     if (rc == 0 && ru.ru_utime.tv_sec < 60) ok++;
     // (4) Determinized: minor page-fault count is zeroed (native counts them).
     if (ru.ru_minflt == 0) ok++;
