@@ -2722,6 +2722,15 @@ mod tests {
             );
         }
 
+        // Only INT_MIN is refused: every other pid, including the nearest
+        // process-group selector, must still reach the wait.
+        for pid in [libc::pid_t::MIN + 1, -2, 0, 1, libc::pid_t::MAX] {
+            assert_eq!(
+                validate_wait4_arguments(pid, WaitPidFlag::empty()),
+                Ok(()),
+                "pid {pid}"
+            );
+        }
         assert_eq!(
             validate_wait4_arguments(libc::pid_t::MIN, WaitPidFlag::empty()),
             Err(Errno::ESRCH)
