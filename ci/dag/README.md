@@ -155,12 +155,21 @@ The current relationships are:
 - **Deliberately different:** hosted selected runs are off the record. They do
   not write a local validation receipt, ledger row, scorecard, or pull-request
   label.
-- **Deliberately different:** `check.lint_checks` and
-  `check.check_outcome_consumers` load their pinned authority from the private
-  parent repository. The repository-scoped hosted token cannot read that other
-  repository, and no cross-repository read secret is configured, so those two
-  checks remain visible as red diagnostics. They run unchanged locally, and
-  their hosted job does not prevent the remaining selected steps from running.
+- **Deliberately different:** hosted runs `check.lint_checks_on_host`, not
+  `check.lint_checks`. A GitHub-hosted checkout has no dev-hermit parent, so the
+  accept arm of the canonical adapter contract in
+  `scripts/test_validate_stop_paths.py` (which needs the parent's
+  `ci-hub/ledger/validate_rows.py`) cannot run there. In run
+  [36532203200](https://github.com/rrnewton/hermit/actions/runs/36532203200)
+  every other lint checker passed and that one case turned the node into NO
+  RESULT (exit 75). The hosted twin, derived by
+  `materialize_hosted_lint_checks` from the local node, passes
+  `--hosted-out-of-scope canonical-adapter-accept-arm`. `ci/lint-checks-node.sh`
+  then names the case `NOT-EVALUATED-ON-HOSTED` in the job output and in the
+  step summary instead of counting it as a pass; any other unevaluable case, or
+  a failure, keeps its NO RESULT or FAIL exit. The local `check.lint_checks`
+  (labels `full` and `portable`) runs without the flag and still evaluates the
+  arm.
 - **Unknown:** none after the current command and assignment audit. A future
   difference remains a defect until it is either removed or explained here.
 

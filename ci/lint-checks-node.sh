@@ -47,6 +47,133 @@ _node_lib="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/node-run-classifi
 # shellcheck source=ci/node-run-classification.sh
 . "$_node_lib"
 
+# ---- Cases the hosted-portable lane may declare out of scope ----------------
+#
+# ⚠️ A CLOSED SET OF ONE, KEYED BY AN ID, NOT A PATTERN THE CALLER SUPPLIES.
+# The accept arm of the canonical adapter contract in
+# scripts/test_validate_stop_paths.py exercises the REAL ledger adapter,
+# ci-hub/ledger/validate_rows.py, which lives in the dev-hermit PARENT
+# repository. A GitHub-hosted checkout has no parent, so that one arm cannot be
+# evaluated there and the whole target reports a no_result. Measured on hosted
+# run https://github.com/rrnewton/hermit/actions/runs/36532203200 at main
+# 6be37a833df8: every other checker in the target passed, and the node exited
+# 75, which made the hosted checks job exit 75.
+#
+# The hosted-portable DAG node alone passes --hosted-out-of-scope with this id.
+# The local check.lint_checks node never does, so local validation inside the
+# parent still EVALUATES the arm, and outside the parent still reports 75.
+#
+# A declared case is NOT a pass. When it is the only unevaluable case, the node
+# prints a NOT-EVALUATED-ON-HOSTED line for it, appends the same statement to
+# the GitHub job summary, and exits 0 for the checkers that did run. Any other
+# unevaluable case still makes the node exit 75, and a real failure still
+# outranks everything (classify_run decides that before any of this runs).
+hosted_out_of_scope_prefix() {
+    # Echoes the exact column-0 marker prefix the producer emits for case $1;
+    # returns 1 for an id outside the closed set.
+    case "$1" in
+        canonical-adapter-accept-arm)
+            printf '%s\n' "${NO_RESULT_MARKER} canonical adapter contract, accept arm: "
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+classify_declared_no_result() {
+    # $1 = the declared case's marker prefix, $2 = the target's combined output.
+    # Echoes "declared" only when the output carries at least one column-0 marker
+    # and EVERY column-0 marker begins with that prefix; otherwise "undeclared".
+    # The column-0 test is the same anchor classify_run applies.
+    local prefix="$1" out="$2"
+    awk -v marker="$NO_RESULT_MARKER" -v prefix="$prefix" '
+        index($0, marker) == 1 {
+            total++
+            if (index($0, prefix) == 1) declared++
+        }
+        END {
+            if (total > 0 && declared == total) print "declared"
+            else print "undeclared"
+        }' "$out"
+}
+
+report_not_evaluated_on_hosted() {
+    # $1 = declared case id, $2 = the target's combined output. Prints one
+    # NOT-EVALUATED-ON-HOSTED line per declared marker on stderr and appends the
+    # same lines to $GITHUB_STEP_SUMMARY. Returns 1 when the summary cannot be
+    # written, or when this runs under GitHub Actions with no summary file: the
+    # caller then reports NO RESULT, because a declaration nobody can see in the
+    # summary is not the declaration the hosted lane makes.
+    local id="$1" out="$2" reasons
+    reasons="$(grep "^${NO_RESULT_MARKER}" "$out" | sed "s/^${NO_RESULT_MARKER} //")"
+    {
+        echo "lint-checks: every checker that could run PASSED. The case below was NOT EVALUATED:"
+        echo "  the hosted-portable lane declares it out of scope, and it is not counted as a pass."
+        echo "  Local validation evaluates it in node check.lint_checks, from a checkout nested"
+        echo "  under the dev-hermit parent repository."
+        printf '%s\n' "$reasons" | sed "s/^/NOT-EVALUATED-ON-HOSTED: ${id}: /"
+    } >&2
+    if [ -z "${GITHUB_STEP_SUMMARY:-}" ]; then
+        if [ "${GITHUB_ACTIONS:-}" = true ]; then
+            echo 'lint-checks: GITHUB_ACTIONS is true but GITHUB_STEP_SUMMARY is unset; the job summary cannot name the case' >&2
+            return 1
+        fi
+        return 0
+    fi
+    {
+        echo
+        echo "### lint-checks: 1 case NOT EVALUATED on hosted (not counted as a pass)"
+        echo
+        echo "The hosted-portable lane declares \`${id}\` out of scope. Every other checker in"
+        echo "\`make lint-checks\` ran and passed. Local validation evaluates this case in node"
+        echo "\`check.lint_checks\`, from a checkout nested under the dev-hermit parent repository."
+        echo
+        printf '%s\n' "$reasons" | sed "s/^/- NOT-EVALUATED-ON-HOSTED: ${id}: /"
+    } >> "$GITHUB_STEP_SUMMARY" || {
+        echo "lint-checks: cannot append to GITHUB_STEP_SUMMARY (${GITHUB_STEP_SUMMARY})" >&2
+        return 1
+    }
+}
+
+finish_node() {
+    # $1 = make's exit code, $2 = the target's combined output, $3 = the declared
+    # hosted out-of-scope id, or empty. Sets node_exit; prints the report.
+    local make_rc="$1" out="$2" declared_id="$3" verdict prefix
+    verdict="$(classify_run "$make_rc" "$out")"
+    case "$verdict" in
+        fail*)
+            node_exit="${verdict#fail }"
+            return 0
+            ;;
+        pass)
+            node_exit=0
+            return 0
+            ;;
+    esac
+    if [ -n "$declared_id" ]; then
+        if ! prefix="$(hosted_out_of_scope_prefix "$declared_id")"; then
+            echo "lint-checks: unknown hosted out-of-scope case '${declared_id}'" >&2
+            node_exit=2
+            return 0
+        fi
+        if [ "$(classify_declared_no_result "$prefix" "$out")" = declared ]; then
+            if report_not_evaluated_on_hosted "$declared_id" "$out"; then
+                node_exit=0
+                return 0
+            fi
+            echo 'lint-checks: the out-of-scope declaration could not be made visible; reporting NO RESULT' >&2
+        else
+            echo "lint-checks: only '${declared_id}' is declared out of scope, and another case could not be evaluated" >&2
+        fi
+    fi
+    echo "lint-checks: NO RESULT -- the target PASSED, and at least one case could not be" >&2
+    echo '  evaluated from this checkout. Every checker ran; the unevaluable cases are' >&2
+    echo '  listed above, each on a line beginning with the marker below.' >&2
+    grep "^${NO_RESULT_MARKER}" "$out" | sed 's/^/    /' >&2
+    node_exit=75
+}
+
 
 self_test() {
     local got failures=0
@@ -124,7 +251,171 @@ PARTIAL: every evaluable assertion passed"
 make: *** [lint-checks] Error 1"
     check_run 'a failure outranks it whatever the code' 'fail 75' 75 \
         "NO-RESULT-CASE: something unevaluable"
-    rm -f "$tmp"
+
+    # ---- the hosted out-of-scope declaration ---------------------------------
+    #
+    # Each case FAILS if the declaration widens: an undeclared marker must keep
+    # the node at 75, a failure must keep its code, and a declared case must be
+    # named as NOT EVALUATED rather than disappear into a silent 0.
+    local id='canonical-adapter-accept-arm' prefix summary errs
+    summary="$(mktemp)" || return 1
+    errs="$(mktemp)" || return 1
+    if prefix="$(hosted_out_of_scope_prefix "$id")"; then
+        if [ "$prefix" != 'NO-RESULT-CASE: canonical adapter contract, accept arm: ' ]; then
+            echo "FAIL: declared prefix drifted from the producer's marker: '${prefix}'" >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "FAIL: '${id}' is not in the closed set" >&2
+        failures=$((failures + 1))
+        prefix='unreachable'
+    fi
+    # The producer must still emit the exact text the prefix matches. Drift
+    # there fails safe (the hosted node returns to 75), but it should be loud here.
+    local producer
+    producer="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/scripts/test_validate_stop_paths.py"
+    if ! grep -qF 'unevaluated.append(f"canonical adapter contract, accept arm: {exc}")' "$producer" \
+        || ! grep -qF 'f"{NO_RESULT_MARKER} {item}"' "$producer"; then
+        echo "FAIL: ${producer} no longer emits the declared case's marker text" >&2
+        failures=$((failures + 1))
+    fi
+    if hosted_out_of_scope_prefix 'canonical-adapter' >/dev/null \
+        || hosted_out_of_scope_prefix '' >/dev/null; then
+        echo 'FAIL: an id outside the closed set was accepted' >&2
+        failures=$((failures + 1))
+    fi
+    check_declared() {
+        local name="$1" want="$2" body="$3"
+        printf '%s\n' "$body" > "$tmp"
+        got="$(classify_declared_no_result "$prefix" "$tmp")"
+        if [ "$got" != "$want" ]; then
+            echo "FAIL: ${name}: expected '${want}', got '${got}'" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    check_declared 'only the declared case' 'declared' \
+        "NO-RESULT-CASE: canonical adapter contract, accept arm: no parent adapter
+PARTIAL: every evaluable assertion passed"
+    check_declared 'declared plus another case' 'undeclared' \
+        "NO-RESULT-CASE: canonical adapter contract, accept arm: no parent adapter
+NO-RESULT-CASE: check-status authority unreachable"
+    check_declared 'another case alone' 'undeclared' \
+        "NO-RESULT-CASE: check-status authority unreachable"
+    check_declared 'the refuse arm is not the accept arm' 'undeclared' \
+        "NO-RESULT-CASE: canonical adapter contract, refuse arm: no parent adapter"
+    check_declared 'a quoted declared prefix does not cover a real marker' 'undeclared' \
+        "  NO-RESULT-CASE: canonical adapter contract, accept arm: quoted
+NO-RESULT-CASE: check-status authority unreachable"
+    check_declared 'an undeclared marker quoting the declared one mid-line' 'undeclared' \
+        "NO-RESULT-CASE: wrapper saw NO-RESULT-CASE: canonical adapter contract, accept arm: x"
+    check_declared 'no marker at all' 'undeclared' 'lint-checks: everything passed'
+
+    check_finish() {
+        local name="$1" want_exit="$2" want_lines="$3" rc="$4" declared="$5" body="$6"
+        printf '%s\n' "$body" > "$tmp"
+        : > "$summary"
+        node_exit=''
+        GITHUB_STEP_SUMMARY="$summary" finish_node "$rc" "$tmp" "$declared" 2> "$errs"
+        local lines
+        lines="$(grep -c '^NOT-EVALUATED-ON-HOSTED: ' "$errs" || true)"
+        lines="${lines}/$(grep -c '^- NOT-EVALUATED-ON-HOSTED: ' "$summary" || true)"
+        if [ "$node_exit" != "$want_exit" ] || [ "$lines" != "$want_lines" ]; then
+            echo "FAIL: ${name}: expected exit ${want_exit} with ${want_lines} output/summary lines, got exit ${node_exit} with ${lines}" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    local declared_only='NO-RESULT-CASE: canonical adapter contract, accept arm: no parent adapter'
+    check_finish 'declared case alone is named, not silently passed' 0 '1/1' 0 "$id" "$declared_only"
+    if ! grep -q "^NOT-EVALUATED-ON-HOSTED: ${id}: canonical adapter contract, accept arm: no parent adapter\$" "$errs" \
+        || ! grep -q 'not counted as a pass' "$errs" \
+        || ! grep -q 'NOT EVALUATED on hosted (not counted as a pass)' "$summary"; then
+        echo 'FAIL: the declared case is not named as not evaluated and not a pass' >&2
+        failures=$((failures + 1))
+    fi
+    check_finish 'without the declaration it stays a no_result' 75 '0/0' 0 '' "$declared_only"
+    check_finish 'an undeclared case stays a no_result' 75 '0/0' 0 "$id" \
+        "${declared_only}
+NO-RESULT-CASE: check-status authority unreachable"
+    check_finish 'a failure outranks the declaration' 2 '0/0' 2 "$id" "$declared_only"
+    check_finish 'a clean run needs no declaration' 0 '0/0' 0 "$id" 'lint-checks: everything passed'
+    # ⚠️ A SUMMARY NOBODY CAN WRITE IS NOT A DECLARATION. An unwritable summary
+    # path, or GitHub Actions without one, must fall back to 75.
+    printf '%s\n' "$declared_only" > "$tmp"
+    node_exit=''
+    GITHUB_STEP_SUMMARY="${summary}.missing-dir/summary" finish_node 0 "$tmp" "$id" 2> "$errs"
+    if [ "$node_exit" != 75 ]; then
+        echo "FAIL: an unwritable job summary must report 75, got ${node_exit}" >&2
+        failures=$((failures + 1))
+    fi
+    node_exit=''
+    GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY='' finish_node 0 "$tmp" "$id" 2> "$errs"
+    if [ "$node_exit" != 75 ]; then
+        echo "FAIL: GitHub Actions without a job summary must report 75, got ${node_exit}" >&2
+        failures=$((failures + 1))
+    fi
+
+    # ---- end to end through the real entry point -----------------------------
+    #
+    # The cases above call finish_node directly. These run this script itself,
+    # with stub `git` and `make` first on PATH, so argument parsing, the make
+    # argv and the exit status are covered as the DAG node runs them.
+    local stubs self out want_args
+    self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+    stubs="$(mktemp -d)" || return 1
+    out="${stubs}/out"
+    cat > "${stubs}/git" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = submodule ] && [ "${2:-}" = status ]; then
+    echo ' abc123 agent-utils'
+    exit 0
+fi
+echo "unexpected git invocation: $*" >&2
+exit 2
+STUB
+    cat > "${stubs}/make" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$STUB_MAKE_ARGS"
+printf '%s\n' "$STUB_MAKE_OUTPUT"
+exit "$STUB_MAKE_RC"
+STUB
+    chmod +x "${stubs}/git" "${stubs}/make"
+    run_entry() {
+        local name="$1" want_exit="$2" want_lines="$3" make_rc="$4" make_output="$5"
+        shift 5
+        local rc lines
+        : > "$summary"
+        env -u VALIDATE_REVERIE_PIN_BASE_REF -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES \
+            -u GITHUB_ACTIONS PATH="${stubs}:${PATH}" GITHUB_STEP_SUMMARY="$summary" \
+            STUB_MAKE_ARGS="${stubs}/args" STUB_MAKE_OUTPUT="$make_output" \
+            STUB_MAKE_RC="$make_rc" "$self" "$@" > "$out" 2>&1 && rc=0 || rc=$?
+        lines="$(grep -c '^NOT-EVALUATED-ON-HOSTED: ' "$out" || true)"
+        lines="${lines}/$(grep -c '^- NOT-EVALUATED-ON-HOSTED: ' "$summary" || true)"
+        if [ "$rc" != "$want_exit" ] || [ "$lines" != "$want_lines" ]; then
+            echo "FAIL: entry point: ${name}: expected exit ${want_exit} with ${want_lines} output/summary lines, got exit ${rc} with ${lines}" >&2
+            sed 's/^/    /' "$out" >&2
+            failures=$((failures + 1))
+        fi
+    }
+    local declared_flag=(--hosted-out-of-scope "$id")
+    local floor='0123456789abcdef0123456789abcdef01234567'
+    run_entry 'hosted declaration names the case and exits 0' 0 '1/1' 0 "$declared_only" "${declared_flag[@]}"
+    run_entry 'the local command still reports 75' 75 '0/0' 0 "$declared_only"
+    run_entry 'hosted declaration never hides a failure' 1 '0/0' 1 "$declared_only" "${declared_flag[@]}"
+    run_entry 'hosted declaration never hides another case' 75 '0/0' 0 \
+        "${declared_only}
+NO-RESULT-CASE: check-status authority unreachable" "${declared_flag[@]}"
+    run_entry 'hosted declaration composes with the admitted pin floor' 0 '1/1' 0 "$declared_only" \
+        "${declared_flag[@]}" --reverie-pin-base-ref "$floor"
+    want_args="lint-checks VALIDATE_REVERIE_PIN_BASE_REF=${floor}"
+    if [ "$(cat "${stubs}/args")" != "$want_args" ]; then
+        echo "FAIL: entry point: make argv was '$(cat "${stubs}/args")', expected '${want_args}'" >&2
+        failures=$((failures + 1))
+    fi
+    run_entry 'an unknown case id is a usage error' 2 '0/0' 0 "$declared_only" --hosted-out-of-scope other
+    run_entry 'a repeated declaration is a usage error' 2 '0/0' 0 "$declared_only" \
+        "${declared_flag[@]}" "${declared_flag[@]}"
+    rm -rf "$stubs"
+    rm -f "$tmp" "$summary" "$errs"
 
     if [ "$failures" -ne 0 ]; then
         echo "lint-checks-node --self-test: ${failures} case(s) failed" >&2
@@ -132,7 +423,8 @@ make: *** [lint-checks] Error 1"
     fi
     echo 'PASS: lint-checks-node classifies uninitialized as no_result, drift/conflict as failure,'
     echo '      a quoted marker as pass, a column-0 marker as no_result, and never lets a marker'
-    echo '      outrank a real failure'
+    echo '      outrank a real failure; the hosted declaration covers only its one case, names it'
+    echo '      NOT EVALUATED in the output and job summary, and falls back to 75 when it cannot'
 }
 
 if [ "${1:-}" = '--self-test' ]; then
@@ -144,16 +436,38 @@ if [ "${1:-}" = '--self-test' ]; then
     exit $?
 fi
 
-# This parameter carries only a SHA already selected by the driver. It neither
-# grants admission nor changes the ordinary standalone checker policy.
+# --reverie-pin-base-ref carries only a SHA already selected by the driver. It
+# neither grants admission nor changes the ordinary standalone checker policy.
+# --hosted-out-of-scope names one case from the closed set above; only the
+# hosted-portable DAG node passes it. Each option may appear at most once, and
+# neither has an environment-variable form.
+usage() {
+    echo 'usage: ci/lint-checks-node.sh [--hosted-out-of-scope canonical-adapter-accept-arm] [--reverie-pin-base-ref FULL_SHA]' >&2
+    exit 2
+}
 pin_args=()
-if [ "$#" -ne 0 ]; then
-    if [ "$#" -ne 2 ] || [ "$1" != '--reverie-pin-base-ref' ] || ! [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
-        echo 'usage: ci/lint-checks-node.sh [--reverie-pin-base-ref FULL_SHA]' >&2
-        exit 2
-    fi
-    pin_args=("VALIDATE_REVERIE_PIN_BASE_REF=$2")
-fi
+declared_out_of_scope=''
+while [ "$#" -ne 0 ]; do
+    case "$1" in
+        --reverie-pin-base-ref)
+            if [ "$#" -lt 2 ] || [ "${#pin_args[@]}" -ne 0 ] || ! [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
+                usage
+            fi
+            pin_args=("VALIDATE_REVERIE_PIN_BASE_REF=$2")
+            shift 2
+            ;;
+        --hosted-out-of-scope)
+            if [ "$#" -lt 2 ] || [ -n "$declared_out_of_scope" ] || ! hosted_out_of_scope_prefix "$2" >/dev/null; then
+                usage
+            fi
+            declared_out_of_scope="$2"
+            shift 2
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
 if [[ ${VALIDATE_REVERIE_PIN_BASE_REF+x} || ${MAKEFLAGS:-}${MFLAGS:-}${MAKEOVERRIDES:-} == *VALIDATE_REVERIE_PIN_BASE_REF* ]]; then
     echo 'lint-checks-node: an ambient admission floor is not authority' >&2
     exit 2
@@ -222,17 +536,6 @@ if [ "$tee_rc" -ne 0 ]; then
         make_rc=$tee_rc
     fi
 fi
-verdict="$(classify_run "$make_rc" "$node_out")"
-case "$verdict" in
-    fail*)
-        exit "${verdict#fail }"
-        ;;
-    no_result)
-        echo "lint-checks: NO RESULT -- the target PASSED, and at least one case could not be" >&2
-        echo '  evaluated from this checkout. Every checker ran; the unevaluable cases are' >&2
-        echo '  listed above, each on a line beginning with the marker below.' >&2
-        grep "^${NO_RESULT_MARKER}" "$node_out" | sed 's/^/    /' >&2
-        exit 75
-        ;;
-esac
-exit 0
+node_exit=''
+finish_node "$make_rc" "$node_out" "$declared_out_of_scope"
+exit "$node_exit"
