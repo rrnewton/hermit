@@ -10,7 +10,9 @@
  * The --root-only mode of random_sources.c as its own manifest program.
  *
  * Root-only output is the random stream drawn by the root thread alone:
- * getrandom(2), /dev/urandom, /dev/random and the vDSO getrandom leg. It
+ * getrandom(2) through the raw syscall, /dev/urandom, /dev/random and the
+ * vDSO getrandom leg. The raw syscall keeps the golden independent of the C
+ * library: glibc 2.41 and later derive getrandom(3) bytes in userspace. It
  * leaves out the per-thread samples, so it is the part of the guest's output
  * that must be byte-identical across backends, not only across two runs on
  * one backend. A manifest program belongs to exactly one test, and

@@ -45,6 +45,10 @@ static ssize_t raw_getrandom(void* buffer, size_t length, unsigned long flags) {
   return syscall(SYS_getrandom, buffer, length, flags);
 }
 
+static int fill_raw_getrandom(uint8_t buffer[BYTES]) {
+  return raw_getrandom(buffer, BYTES, 0) == BYTES ? 0 : -1;
+}
+
 static int check_getrandom_flags(void) {
   /*
    * Check Linux syscall semantics directly. glibc 2.42 may satisfy getrandom
@@ -327,8 +331,20 @@ int main(int argc, char** argv) {
     return 9;
   }
 
+  /*
+   * Root-only output is one exact golden shared by every backend, so it
+   * samples getrandom(2) itself. glibc 2.41 and later answer getrandom(3)
+   * from a userspace ChaCha20 state that one syscall keys, so libc sampling
+   * prints different bytes for the same Hermit random stream depending on
+   * which glibc linked the program: the host's glibc 2.34 wrapper passes the
+   * syscall's bytes through, and the pinned root's glibc 2.42 does not. The
+   * full mode keeps libc sampling, and the vDSO leg above still covers
+   * __vdso_getrandom in both modes.
+   */
+  int (*fill_sample_getrandom)(uint8_t[BYTES]) =
+      root_only ? fill_raw_getrandom : fill_getrandom;
   for (int sample = 0; sample < SAMPLES; sample++) {
-    if (fill_getrandom(getrandom_samples[sample]) != 0 ||
+    if (fill_sample_getrandom(getrandom_samples[sample]) != 0 ||
         fill_device("/dev/urandom", urandom_samples[sample]) != 0 ||
         fill_device("/dev/random", random_samples[sample]) != 0) {
       return 2;
