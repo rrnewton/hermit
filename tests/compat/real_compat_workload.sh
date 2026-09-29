@@ -222,6 +222,125 @@ function test_published_localhost_port {
     printf 'localhost-port self-test: PASS\n'
 }
 
+# The git workload builds its scratch repository with `git -C "$WORK_DIR/repo"`.
+# Git exports GIT_DIR to `git rebase --exec` steps and GIT_DIR, GIT_WORK_TREE
+# and GIT_INDEX_FILE to hooks, and each one overrides `git -C`. Before the
+# workload removed them, a run under an inherited GIT_DIR exited 0 while its
+# `git init` set core.bare = true and its user.* settings in the repository
+# GIT_DIR named, and its commit moved that repository's HEAD
+# (https://github.com/rrnewton/hermit/issues/3362). This runs the workload
+# natively under each variable, aimed at a fresh throwaway repository, and
+# requires the workload to pass with the output of an unaffected run and every
+# file under the throwaway's metadata to stay byte-identical. The throwaways
+# are created beneath TMPDIR (default /tmp) and removed on exit.
+function test_git_workload_ignores_inherited_location {
+    (
+        # The self-test's own bookkeeping must not follow the caller either.
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+            GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+        # Plain assignments: this subshell already scopes them, and the EXIT
+        # trap below must still see $root.
+        failures=0
+        assignments=()
+
+        self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+        if [[ -x /usr/local/bin/git.meta.real ]]; then
+            git_bin=/usr/local/bin/git.meta.real
+        else
+            git_bin=/usr/bin/git
+        fi
+        root=$(mktemp -d "${TMPDIR:-/tmp}/real-compat-git-location.XXXXXXXX")
+        trap 'rm -rf "$root"' EXIT
+        mkdir -p "$root/home"
+        # Bookkeeping git, isolated from the host's global and system config.
+        # The workload under test isolates itself the same way.
+        tgit() { HOME="$root/home" GIT_CONFIG_NOSYSTEM=1 "$git_bin" "$@"; }
+
+        # A repository with one commit and a linked worktree, the shape of an
+        # agent slot whose `git rebase --exec` step exports the linked gitdir.
+        make_throwaway() {
+            local dir=$1
+            mkdir -p "$dir/main"
+            tgit -C "$dir/main" init -q
+            printf 'tracked\n' >"$dir/main/tracked"
+            tgit -C "$dir/main" add tracked
+            tgit -C "$dir/main" -c user.name=Throwaway \
+                -c user.email=throwaway@example.invalid -c commit.gpgsign=false \
+                commit -q -m tracked
+            tgit -C "$dir/main" worktree add -q --detach "$dir/linked"
+        }
+        # Every file of the metadata, objects included, plus core.bare spelled
+        # out so a failure names it.
+        snapshot() {
+            local dir=$1
+            (cd "$dir" && find main/.git linked/.git -type f -print0 |
+                LC_ALL=C sort -z | xargs -0 sha256sum)
+            printf 'core.bare=%s\n' "$(tgit -C "$dir/main" config --get core.bare)"
+        }
+        fail() {
+            printf 'git-location self-test: %s\n' "$1" >&2
+            failures=$((failures + 1))
+        }
+
+        # Control: each variable really steers an unisolated `git -C`. The
+        # probe repository is empty, so none of these answers can be its own.
+        make_throwaway "$root/control"
+        mkdir -p "$root/probe"
+        tgit -C "$root/probe" init -q
+        head=$(tgit -C "$root/control/main" rev-parse HEAD)
+        gitdir="$root/control/main/.git/worktrees/linked"
+        if [[ $(GIT_DIR=$gitdir tgit -C "$root/probe" rev-parse HEAD 2>&1) != "$head" ]]; then
+            fail 'control: GIT_DIR did not redirect git -C to the throwaway'
+        fi
+        if [[ $(GIT_WORK_TREE=$root/control/linked tgit -C "$root/probe" \
+            rev-parse --show-toplevel 2>&1) != "$(cd "$root/control/linked" && pwd -P)" ]]; then
+            fail 'control: GIT_WORK_TREE did not redirect git -C to the throwaway'
+        fi
+        if [[ $(GIT_INDEX_FILE=$gitdir/index tgit -C "$root/probe" ls-files 2>&1) != tracked ]]; then
+            fail 'control: GIT_INDEX_FILE did not redirect git -C to the throwaway'
+        fi
+
+        status=0
+        bash "$self" git >"$root/baseline.out" 2>"$root/baseline.err" || status=$?
+        if ((status != 0)) || [[ $(<"$root/baseline.out") != 'git:compat commit:'* ]]; then
+            fail "baseline workload exited $status with output: $(<"$root/baseline.out") $(<"$root/baseline.err")"
+        fi
+
+        for name in GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_WORK_TREE+GIT_INDEX_FILE; do
+            make_throwaway "$root/$name"
+            gitdir="$root/$name/main/.git/worktrees/linked"
+            case $name in
+                GIT_DIR) assignments=("GIT_DIR=$gitdir") ;;
+                GIT_WORK_TREE) assignments=("GIT_WORK_TREE=$root/$name/linked") ;;
+                GIT_INDEX_FILE) assignments=("GIT_INDEX_FILE=$gitdir/index") ;;
+                GIT_WORK_TREE+GIT_INDEX_FILE)
+                    assignments=("GIT_WORK_TREE=$root/$name/linked" "GIT_INDEX_FILE=$gitdir/index")
+                    ;;
+            esac
+            snapshot "$root/$name" >"$root/$name.before"
+            status=0
+            env "${assignments[@]}" bash "$self" git >"$root/$name.out" 2>"$root/$name.err" ||
+                status=$?
+            snapshot "$root/$name" >"$root/$name.after"
+            if ((status != 0)); then
+                fail "$name: workload exited $status: $(<"$root/$name.err")"
+            elif ! cmp -s "$root/baseline.out" "$root/$name.out"; then
+                fail "$name: workload printed '$(<"$root/$name.out")', expected '$(<"$root/baseline.out")'"
+            fi
+            if ! cmp -s "$root/$name.before" "$root/$name.after"; then
+                fail "$name: the throwaway repository changed:
+$(diff "$root/$name.before" "$root/$name.after" || true)"
+            fi
+        done
+
+        if ((failures != 0)); then
+            printf 'git-location self-test: FAIL (%s)\n' "$failures" >&2
+            exit 1
+        fi
+        printf 'git-location self-test: PASS\n'
+    )
+}
+
 function fetch_localhost_payload {
     (
         local client=$1
@@ -303,6 +422,9 @@ function fetch_localhost_payload {
 case "$PROGRAM" in
     --self-test-localhost-port)
         test_published_localhost_port
+        ;;
+    --self-test-git-location)
+        test_git_workload_ignores_inherited_location
         ;;
     gzip-roundtrip)
         prepare_archive_fixture
@@ -513,6 +635,16 @@ EOF
             readonly GIT=/usr/bin/git
         fi
         mkdir -p "$WORK_DIR/home" "$WORK_DIR/repo"
+        # Git exports its repository-location variables to hooks and `git
+        # rebase --exec` steps, and they override `git -C`. Validation nodes
+        # run this workload without --base-env=minimal, so the guest can
+        # inherit them. The scratch repository is named explicitly, so run
+        # without them; otherwise its `git init` sets core.bare = true in the
+        # caller's repository and its commit moves the caller's HEAD
+        # (https://github.com/rrnewton/hermit/issues/3362). Unsetting them here
+        # leaves every other workload's environment unchanged.
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+            GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
         export HOME="$WORK_DIR/home"
         export GIT_CONFIG_NOSYSTEM=1
         "$GIT" -C "$WORK_DIR/repo" init -q

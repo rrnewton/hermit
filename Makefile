@@ -184,6 +184,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	python3 ./scripts/test_check_outcome_adapter_authority.py
 	./scripts/test-authority-obtained-once.sh
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
+	bash ./tests/compat/real_compat_workload.sh --self-test-git-location
 	python3 ./scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
