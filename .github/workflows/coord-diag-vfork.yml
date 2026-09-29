@@ -1,0 +1,75 @@
+name: coord-diag vfork SIGTRAP (scratch)
+
+# SCRATCH DIAGNOSTIC ONLY. Never merge. Runs detcore tests_misc
+# vfork::vfork_parent_resumes_after_child_exec on a GitHub-hosted runner with
+# full tracing, to find the ptrace stop that produced
+# "unexpected ptrace terminal stop: Signal(SIGTRAP)".
+
+on:
+  push:
+    branches: ['coord-diag/vfork-sigtrap-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: -C link-arg=-llzma
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize dagrun submodule
+        run: git submodule update --init agent-utils
+      - name: Host facts
+        run: |
+          uname -a
+          cat /proc/version
+          nproc
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 -o -w 'cpuid_fault' /proc/cpuinfo || echo "no cpuid_fault flag"
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+          ls -l /bin/cat; file -L /bin/cat
+          ldd --version | head -1
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libunwind-dev liblzma-dev libelf-dev pkg-config clang zlib1g-dev
+      - name: Build tests_misc
+        run: cargo test -p hermit-detcore --test tests_misc --no-run
+      - name: Run vfork test with tracing (direct, 3x)
+        run: |
+          set +e
+          bin=$(ls -t target/debug/deps/tests_misc-* | grep -v '\.d$' | head -1)
+          echo "binary: $bin"
+          for i in 1 2 3; do
+            DETCORE_TEST_RUST_LOG=trace RUST_BACKTRACE=1 timeout 120 "$bin" --exact vfork::vfork_parent_resumes_after_child_exec --test-threads 1 --nocapture > "vf-$i.log" 2>&1
+            echo "run $i rc=$?"
+          done
+          for i in 1 2 3; do
+            echo "=================== run $i (ANSI stripped, last 400 lines) ==================="
+            sed 's/\x1b\[[0-9;]*m//g' "vf-$i.log" | tail -400 | cut -c1-600
+          done
+      - name: Run vfork test inside the hosted user namespace (like run-hosted-node.sh)
+        run: |
+          set +e
+          bin=$(ls -t target/debug/deps/tests_misc-* | grep -v '\.d$' | head -1)
+          for i in 1 2; do
+            DETCORE_TEST_RUST_LOG=trace RUST_BACKTRACE=1 timeout 120 unshare --user --map-root-user --uts --net --mount "$bin" --exact vfork::vfork_parent_resumes_after_child_exec --test-threads 1 --nocapture > "vfu-$i.log" 2>&1
+            echo "userns run $i rc=$?"
+          done
+          sed 's/\x1b\[[0-9;]*m//g' vfu-1.log | tail -400 | cut -c1-600
+      - name: Upload full logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coord-diag-vfork-logs
+          path: vf*.log
+          retention-days: 7
