@@ -4277,8 +4277,18 @@ fn record_cell(
 }
 
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, CellRunFailure> {
+    run_cell_in(context, cell, cell_artifact_dir(context, cell))
+}
+
+/// Run `cell` with `dir` as its cell directory. Only [`run_cell`] and the
+/// equal-inputs acceptance test choose a directory other than the cell's own.
+fn run_cell_in(
+    context: &RunContext,
+    cell: &SelectedCell,
+    dir: PathBuf,
+) -> Result<CellResult, CellRunFailure> {
     record_cell(context, cell, |progress| {
-        run_cell_inner(context, cell, progress)
+        run_cell_inner(context, cell, dir, progress)
     })
 }
 
@@ -4311,13 +4321,13 @@ fn acquire_proc_locks_lease(
 fn run_cell_inner(
     context: &RunContext,
     cell: &SelectedCell,
+    dir: PathBuf,
     progress: &mut CellRunProgress,
 ) -> Result<CellResult, String> {
     let CellRunProgress {
         observations,
         attempts,
     } = progress;
-    let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let timeouts = cell_timeouts(context, cell)?;
     let preparation_deadline =
@@ -9132,6 +9142,233 @@ backends_disabled:
         assert!(!equalizes_guest_inputs("naked", "ptrace"));
         assert!(equalizes_guest_inputs("verify", "ptrace"));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    // The acceptance test of slice S8 of
+    // https://github.com/rrnewton/hermit/issues/3301, one test per id
+    // measured in
+    // https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696,
+    // each paired with the candidate whose cell directory its second ptrace
+    // run is given. In that measurement ptrace given each of these
+    // candidates' unequalized inputs diverged from ptrace given its own
+    // (control C1: record 14 for five pairs, record 93 for epoll with the
+    // sabre directory). Whether an unequalized pair diverges depends on its
+    // host path lengths, which here include the test process id: with the
+    // equalization disabled, five of these pairs diverged in this layout
+    // (records 14, 105 and 107) and epoll with the sabre directory matched by
+    // coincidence. So each test also requires the parity record to say the
+    // inputs were equalized, which no unequalized pair can.
+
+    #[test]
+    fn ptrace_given_kvm_inputs_matches_its_own_on_add_key_enosys() {
+        ptrace_given_equalized_inputs_matches_ptrace("c-programs/add-key-enosys", "kvm");
+    }
+
+    #[test]
+    fn ptrace_given_sabre_inputs_matches_its_own_on_bpf_enosys() {
+        ptrace_given_equalized_inputs_matches_ptrace("c-programs/bpf-enosys", "sabre");
+    }
+
+    #[test]
+    fn ptrace_given_liteinst_inputs_matches_its_own_on_adjtimex_deterministic() {
+        ptrace_given_equalized_inputs_matches_ptrace(
+            "c-programs/adjtimex-deterministic",
+            "liteinst",
+        );
+    }
+
+    #[test]
+    fn ptrace_given_kvm_inputs_matches_its_own_on_ioctl_fioclex() {
+        ptrace_given_equalized_inputs_matches_ptrace("c-programs/ioctl-fioclex", "kvm");
+    }
+
+    #[test]
+    fn ptrace_given_liteinst_inputs_matches_its_own_on_mmap_determinism() {
+        ptrace_given_equalized_inputs_matches_ptrace("c-programs/mmap-determinism", "liteinst");
+    }
+
+    #[test]
+    fn ptrace_given_sabre_inputs_matches_its_own_on_epoll_determinism() {
+        ptrace_given_equalized_inputs_matches_ptrace("c-programs/epoll-determinism", "sabre");
+    }
+
+    /// The Hermit the acceptance test runs: `HERMIT_BIN`, else the verified
+    /// artifact that validate publishes before `test.regular_crates`
+    /// (`target/ci/hermit-e2e-artifact.path`), else `target/debug/hermit`.
+    /// Without one the test fails, because a pass that ran no guest would
+    /// measure nothing.
+    fn acceptance_hermit(root: &Path) -> PathBuf {
+        if let Some(bin) = std::env::var_os("HERMIT_BIN") {
+            return PathBuf::from(bin);
+        }
+        let pointer = root.join("target/ci/hermit-e2e-artifact.path");
+        if pointer.is_file() {
+            let output = Command::new(root.join("ci/verify-hermit-e2e-artifact.sh"))
+                .arg(&pointer)
+                .output()
+                .expect("run ci/verify-hermit-e2e-artifact.sh");
+            assert!(
+                output.status.success(),
+                "{} names no verified Hermit artifact:\n{}",
+                pointer.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return PathBuf::from(String::from_utf8(output.stdout).unwrap().trim()).join("hermit");
+        }
+        let debug = root.join("target/debug/hermit");
+        assert!(
+            debug.is_file(),
+            "the equal-inputs acceptance test runs a real Hermit: set HERMIT_BIN, publish \
+             {} (validate's build.e2e_artifact does), or build {}",
+            pointer.display(),
+            debug.display()
+        );
+        debug
+    }
+
+    /// Ptrace given `candidate`'s cell inputs through the equalization matches
+    /// ptrace given its own on `test`, so a parity comparison of the two earns
+    /// full credit with equal inputs. It runs the id's real ptrace verify cell
+    /// twice, once in its own cell directory and once in the candidate's, and
+    /// hands both rows to the parity post-pass with the second relabelled as
+    /// the candidate. The runner shape follows the environment, so validate's
+    /// `HERMIT_E2E_EMPTY_WORKDIR=/test` runs the hermetic shape. One id per
+    /// test keeps each inside the per-test Nextest CPU bound (22 CPU-s): with
+    /// the debug Hermit that validate publishes, hashing that binary three
+    /// times per cell costs more CPU than the guest runs do.
+    fn ptrace_given_equalized_inputs_matches_ptrace(test: &str, candidate: &str) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = root.canonicalize().unwrap();
+        let hermit_bin = acceptance_hermit(&root);
+        let scratch = root.join(format!(
+            "target/equalized-input-acceptance-{}-{}",
+            std::process::id(),
+            test.replace('/', "-")
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        let isolated_workdir = std::env::var_os(ISOLATED_WORKDIR_ENV).map(|value| {
+            assert_eq!(value, HERMETIC_TEST_WORKDIR, "{ISOLATED_WORKDIR_ENV}");
+            PathBuf::from(HERMETIC_TEST_WORKDIR)
+        });
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: hermit_bin.clone(),
+            result_root: scratch.join("results"),
+            build_root: scratch.join("build"),
+            run_id: "equalized-inputs".into(),
+            machine_shortname: "acceptance".into(),
+            kernel_version: command_text("uname", &["-r"]).unwrap(),
+            host_capabilities: probe_host_capabilities(),
+            attempt: 1,
+            run_index: None,
+            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now).unwrap(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            binary_build_sha: probe_binary_build_sha(&hermit_bin),
+            prebuilt: false,
+            keep_logs: true,
+            parity_retained: BTreeSet::new(),
+            run_verify_strict: command_help_contains(
+                &hermit_bin,
+                &["run", "--help"],
+                "--verify-strict",
+            )
+            .unwrap(),
+            record_verify_strict: false,
+            timeout_multipliers: crate::timeouts::timeout_multipliers_from_env().unwrap(),
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir,
+        };
+        let manifests = ManifestSet::load(&root).unwrap();
+        let [cell] = manifests
+            .select(&Selection {
+                population: Some(Population::Enabled),
+                test: Some(test.into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                ..Selection::default()
+            })
+            .unwrap()
+            .try_into()
+            .unwrap_or_else(|cells: Vec<_>| panic!("{test}: {} ptrace verify cells", cells.len()));
+        let own = run_cell(&context, &cell)
+            .unwrap_or_else(|failure| panic!("{test} in its own directory: {}", failure.reason));
+        let candidate_id = CellId {
+            backend: Some(candidate.into()),
+            ..cell.id.clone()
+        };
+        let candidate_dir = cell_artifact_path(
+            &context.result_root,
+            &context.run_id,
+            &candidate_id,
+            context.attempt,
+        );
+        let mut given =
+            run_cell_in(&context, &cell, candidate_dir.clone()).unwrap_or_else(|failure| {
+                panic!("{test} in the {candidate} directory: {}", failure.reason)
+            });
+        for (row, dir) in [
+            (&own, cell_artifact_dir(&context, &cell)),
+            (&given, candidate_dir),
+        ] {
+            assert_eq!(row.outcome, "PASS", "{test}: {row:?}");
+            // The inputs came from that cell's directory.
+            assert_eq!(row.artifact_dir, dir.to_string_lossy(), "{test}");
+            assert_eq!(
+                row.env.get("E2E_FIXTURE_DIR"),
+                Some(&format!("{}/fixtures", dir.display())),
+                "{test}"
+            );
+        }
+        given.backend = Some(candidate.into());
+
+        let scope = BTreeSet::from([crate::parity::ParityCellId {
+            test_id: test.into(),
+            backend: crate::parity::ParityBackend::parse(candidate).unwrap(),
+        }]);
+        let artifacts = scratch.join("parity");
+        fs::create_dir_all(&artifacts).unwrap();
+        let report = crate::parity::post_pass(
+            &crate::parity::PostPassConfig::new(
+                &artifacts,
+                &hermit_bin,
+                &context.run_id,
+                &context.source_sha,
+            ),
+            &scope,
+            &[own, given],
+        )
+        .unwrap();
+        assert_eq!(report.log_diff_runs, 1, "{test}");
+        let [record] = report.records.as_slice() else {
+            panic!("{test}: {} parity records", report.records.len());
+        };
+        record.validate().unwrap();
+        assert_eq!(
+            record.verdict,
+            crate::parity::ParityVerdict::Matched,
+            "{record:?}"
+        );
+        assert!(record.inputs_equalized, "{record:?}");
+        assert_eq!(record.credit, Some(1.0), "{record:?}");
+        assert_eq!(record.unequalized_credit, None, "{record:?}");
+        // A match of two near-empty logs would prove nothing. The measurement
+        // above recorded 115 to 173 records for these ids.
+        assert!(
+            record.left_len.is_some_and(|len| len >= 100)
+                && record.left_len == record.right_len
+                && record.matched_prefix == record.left_len,
+            "{record:?}"
+        );
+        assert!(
+            report.summary_line().contains(
+                "mean credit 1.0000 over 1 measured with equal inputs; \
+                 none measured with unequal inputs"
+            ),
+            "{}",
+            report.summary_line()
+        );
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
