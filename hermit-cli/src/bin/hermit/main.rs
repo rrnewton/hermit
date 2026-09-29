@@ -1457,6 +1457,46 @@ mod tests {
         );
     }
 
+    /// The DBT backend observes a counted-branch or statistics divergence
+    /// before the log comparison, so its logs can match while the published
+    /// verdict is a divergence. `--keep-logs` keeps a single golden log after a
+    /// match, so the DBT arm must mark such a match overridden with exactly the
+    /// predicates that later turn the verdict into a divergence
+    /// (`finalize_dbt_verification` for the clock, `DbtSummaryComparison::apply`
+    /// for the statistics). Otherwise run 2's log of a divergent run would be
+    /// deleted. DBT cannot execute in unit tests, so the wiring is pinned here
+    /// and `verify::tests::an_overridden_match_keeps_both_logs_in_the_failure_directory`
+    /// proves what an overridden match retains.
+    #[test]
+    fn dbt_backend_divergence_overrides_a_log_match_for_retention() {
+        let source = include_str!("backends.rs");
+        let start = source
+            .find("= compare_two_runs(")
+            .expect("DBT arm must compare two runs");
+        let options = source[start..]
+            .find("ComparisonOptions {")
+            .map(|offset| &source[start + offset..])
+            .expect("DBT comparison must build ComparisonOptions");
+        let block = &options[..options.find("\n        },").expect("options block end")];
+        let normalized = block.split_whitespace().collect::<Vec<_>>().join(" ");
+        let backend_divergence =
+            "branch_clock_diverged || summary_comparison.requires_log_retention(),";
+        for field in [
+            format!("keep_logs: keep_logs || {backend_divergence}"),
+            format!("match_overridden: {backend_divergence}"),
+        ] {
+            assert_eq!(
+                normalized.matches(&field).count(),
+                1,
+                "the DBT comparison must state `{field}` exactly once"
+            );
+        }
+        assert!(
+            source.contains("let branch_clock_diverged = !branch_clock_comparison.matched();"),
+            "the retention predicate must be the same clock comparison the verdict uses"
+        );
+    }
+
     /// `--namespace-only` appears on the list of paths that bypass `verify()`,
     /// but it is NOT reachable with a verdict artifact: clap rejects
     /// `--verify` together with `--namespace-only`, and `--verify-json`
