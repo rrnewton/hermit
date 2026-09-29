@@ -6643,9 +6643,9 @@ mod tests {
     /// A scratch e2e result root, removed when the test that made it ends,
     /// unless that test is panicking: a failing test's directory is kept to
     /// debug.
-    struct LedgerRoot(PathBuf);
+    struct ResultRoot(PathBuf);
 
-    impl std::ops::Deref for LedgerRoot {
+    impl std::ops::Deref for ResultRoot {
         type Target = Path;
 
         fn deref(&self) -> &Path {
@@ -6653,7 +6653,7 @@ mod tests {
         }
     }
 
-    impl Drop for LedgerRoot {
+    impl Drop for ResultRoot {
         fn drop(&mut self) {
             if !std::thread::panicking() {
                 let _ = fs::remove_dir_all(&self.0);
@@ -6661,20 +6661,20 @@ mod tests {
         }
     }
 
-    fn ledger_root(label: &str) -> LedgerRoot {
+    fn result_root(label: &str) -> ResultRoot {
         let dir = std::env::temp_dir().join(format!(
-            "hermit-parity-ledger-{}-{label}",
+            "hermit-parity-results-{}-{label}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        LedgerRoot(dir)
+        ResultRoot(dir)
     }
 
-    /// The scratch roots of the ledger tests do not outlive them.
+    /// The scratch result roots of the ledger-row tests do not outlive them.
     #[test]
-    fn a_ledger_root_is_removed_when_its_test_ends() {
-        let root = ledger_root("removed");
+    fn a_result_root_is_removed_when_its_test_ends() {
+        let root = result_root("removed");
         let path = root.to_path_buf();
         write_node(
             &root.join("portable/manifest_c_programs"),
@@ -6701,7 +6701,7 @@ mod tests {
     /// keeps the two it wrote. None vanishes from the denominator.
     #[test]
     fn a_failed_status_owes_record_missing_rows_for_its_unrecorded_scope() {
-        let root = ledger_root("failed");
+        let root = result_root("failed");
         let scope = five_cells();
         let written = [
             ledger_diverged("c-programs/a", ParityBackend::Kvm, 3),
@@ -6780,7 +6780,7 @@ mod tests {
     /// A complete status must account for exactly its cells.
     #[test]
     fn a_complete_status_with_a_count_mismatch_is_refused() {
-        let root = ledger_root("count");
+        let root = result_root("count");
         let scope = five_cells();
         let node = root.join("portable/manifest_c_programs");
         let records = [ledger_diverged("c-programs/a", ParityBackend::Kvm, 3)];
@@ -6849,7 +6849,7 @@ mod tests {
     /// cells are missing, and is refused without one.
     #[test]
     fn a_schema_one_status_is_accepted_by_its_count() {
-        let root = ledger_root("schema-one");
+        let root = result_root("schema-one");
         let node = root.join("privileged/manifest_c_programs");
         let records = [
             ledger_diverged("c-programs/cpuid", ParityBackend::Kvm, 2),
@@ -6903,7 +6903,7 @@ mod tests {
     /// `record-missing` row with `post_pass_state` `absent`.
     #[test]
     fn an_absent_status_owes_its_expected_cells() {
-        let root = ledger_root("absent");
+        let root = result_root("absent");
         fs::create_dir_all(root.join("portable/manifest_system_utils")).unwrap();
         let expected = parse_expected_scope(
             r#"{"portable/manifest_c_programs": ["c-programs/a@kvm", "c-programs/a@dbt"]}"#,
@@ -6938,7 +6938,7 @@ mod tests {
     /// the status's state; a narrower post-pass scope cannot drop it.
     #[test]
     fn a_cell_the_expected_scope_owes_but_the_status_omits_is_record_missing() {
-        let root = ledger_root("gap");
+        let root = result_root("gap");
         let node = root.join("portable/manifest_c_programs");
         let scope = five_cells();
         let expected = scope.iter().cloned().collect::<BTreeSet<_>>();
@@ -7052,7 +7052,7 @@ mod tests {
     /// the refusal and the refused bytes.
     #[test]
     fn a_refused_node_owes_record_missing_rows_for_its_expected_cells() {
-        let root = ledger_root("refused");
+        let root = result_root("refused");
         // A records file with no status beside it: refused.
         let refused_node = root.join("portable/manifest_c_programs");
         write_node(
@@ -7229,7 +7229,7 @@ mod tests {
     /// reader orders runs by that instant, so it cannot be guessed.
     #[test]
     fn a_ledger_row_with_a_malformed_emitted_at_is_refused() {
-        let root = ledger_root("emitted-at");
+        let root = result_root("emitted-at");
         let node = root.join("portable/manifest_c_programs");
         let scope = [parity_cell("c-programs/a", ParityBackend::Kvm)];
         write_node(
@@ -7271,7 +7271,7 @@ mod tests {
     }
 
     fn append_rows(label: &str) -> Vec<ParityLedgerSource> {
-        let root = ledger_root(&format!("{label}-rows"));
+        let root = result_root(&format!("{label}-rows"));
         let node = root.join("portable/manifest_c_programs");
         let scope = [
             parity_cell("c-programs/a", ParityBackend::Kvm),
@@ -7305,7 +7305,7 @@ mod tests {
     /// on its command line, and the writer's own words end the line.
     #[test]
     fn appended_rows_reach_the_writer_with_the_runs_identity() {
-        let root = ledger_root("append-ok");
+        let root = result_root("append-ok");
         let rows = append_rows("append-ok");
         let capture = root.join("captured.json");
         let series = fake_series(
@@ -7356,7 +7356,7 @@ mod tests {
     /// writer are each named, and the rows are left where they are.
     #[test]
     fn a_writer_that_cannot_append_is_named_and_leaves_the_rows() {
-        let root = ledger_root("append-refused");
+        let root = result_root("append-refused");
         let rows = append_rows("append-refused");
         let left = format!(
             "; 2 rows left in {} (diverged 1, record-missing 1)",
@@ -7398,7 +7398,7 @@ mod tests {
     /// a straggler left holding its output after it exited.
     #[test]
     fn a_hanging_writer_is_killed_at_its_bound() {
-        let root = ledger_root("append-hang");
+        let root = result_root("append-hang");
         let rows = append_rows("append-hang");
         let bounds = AppendBounds {
             probe: Duration::from_millis(300),
@@ -7459,7 +7459,7 @@ mod tests {
     /// canonical encoding, and a record of another run.
     #[test]
     fn an_invalid_record_refuses_the_node() {
-        let root = ledger_root("invalid");
+        let root = result_root("invalid");
         let node = root.join("portable/manifest_c_programs");
         let scope = [parity_cell("c-programs/a", ParityBackend::Kvm)];
         let status = ledger_status(PostPassState::Complete, Some(&scope), 1, None);
@@ -7667,7 +7667,7 @@ mod tests {
     /// identity; a disagreement is refused, not reconciled.
     #[test]
     fn a_ledger_row_that_disagrees_with_its_record_is_refused() {
-        let root = ledger_root("envelope");
+        let root = result_root("envelope");
         let node = root.join("portable/manifest_c_programs");
         let scope = five_cells();
         write_node(
