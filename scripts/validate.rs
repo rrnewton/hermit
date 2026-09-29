@@ -4714,7 +4714,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
     // refusal predicate and cannot become receipt-eligible.
     std::fs::write(source.join("tracked.txt"), b"dirty source\n")
         .map_err(|error| format!("cannot dirty source fixture: {error}"))?;
-    let dirty_source = worktree_dirty_at(&source);
+    let dirty_source = worktree_dirty_at(scratch_git, &source);
     if !dirty_source || !dirty_worktree_requires_refusal(false, dirty_source, false) {
         return Err("checkout attribution: a genuinely dirty in-place source did not refuse".into());
     }
@@ -4747,7 +4747,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         .map_err(|error| format!("checkout attribution: cannot create validate root: {error}"))?;
     std::fs::rename(&source, &disposable)
         .map_err(|error| format!("checkout attribution: cannot materialize fixture: {error}"))?;
-    if tree_dirty_at(&disposable)
+    if tree_dirty_at(scratch_git, &disposable)
         || !is_disposable_validate_checkout(&disposable, Some(&parent))
     {
         return Err("checkout attribution: disposable fixture was not clean and recognized".into());
@@ -4800,7 +4800,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
     let disposable_attribution = source_attribution(
         commit,
         false,
-        tree_dirty_at(&disposable),
+        tree_dirty_at(scratch_git, &disposable),
         admitted.disposable,
     );
     if disposable_attribution
@@ -7162,15 +7162,21 @@ fn sh(cmd: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Remove git's repository-location variables from a command that runs in a
-/// self-test or unit-test scratch repository.
+/// Remove git's repository-location variables from a command that must act on
+/// a repository named by its path: a self-test or unit-test scratch
+/// repository, or a checkout validate names explicitly (for example an
+/// explicit tool root and its canonical state root).
 ///
 /// Git exports these variables to hooks and `git rebase --exec` steps, and
-/// they override both `git -C` and the working directory. Every scratch
-/// repository is named by directory, so an inherited `GIT_DIR` would point a
-/// fixture's `git init` and commits at the caller's repository
-/// (https://github.com/rrnewton/hermit/issues/3362). A child that finds its
-/// fixture from its working directory drops them for the same reason.
+/// they override both `git -C` and the working directory. An inherited
+/// `GIT_DIR` would point a fixture's `git init` and commits at the caller's
+/// repository (https://github.com/rrnewton/hermit/issues/3362), and an
+/// inherited `GIT_INDEX_FILE` makes a status read of a named checkout compare
+/// it against the caller's index. A child that finds its fixture from its
+/// working directory drops them for the same reason.
+///
+/// Reads of the tree validate is running in ([`caller_git`]) keep them: there
+/// the caller's repository is the one being validated.
 fn without_repository_location(command: &mut Command) -> &mut Command {
     for name in [
         "GIT_DIR",
@@ -7192,6 +7198,12 @@ fn scratch_git() -> Command {
     let mut command = Command::new("git");
     without_repository_location(&mut command);
     command
+}
+
+/// A git command for the tree validate is running in. It keeps any inherited
+/// repository-location variables, because that is the caller's repository.
+fn caller_git() -> Command {
+    Command::new("git")
 }
 
 fn git_sha() -> String {
@@ -7351,11 +7363,15 @@ fn line_is_self_output(line: &str) -> bool {
 /// status column is significant and a global trim silently shifts the first
 /// line's columns (see [`path_readings`]).
 fn foreign_porcelain(args: &[&str]) -> Vec<String> {
-    foreign_porcelain_at(Path::new("."), args)
+    foreign_porcelain_at(caller_git, Path::new("."), args)
 }
 
-fn foreign_porcelain_at(root: &Path, args: &[&str]) -> Vec<String> {
-    let Ok(out) = Command::new("git").current_dir(root).args(args).output() else {
+/// [`foreign_porcelain`] for the repository `git` resolves from `root`.
+/// Production passes [`caller_git`]; a self-test fixture named by path passes
+/// [`scratch_git`], so the caller's `GIT_DIR` or `GIT_INDEX_FILE` cannot stand
+/// in for the fixture.
+fn foreign_porcelain_at(git: fn() -> Command, root: &Path, args: &[&str]) -> Vec<String> {
+    let Ok(out) = git().current_dir(root).args(args).output() else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -7371,24 +7387,25 @@ fn foreign_porcelain_at(root: &Path, args: &[&str]) -> Vec<String> {
 
 /// True when the tree differs from HEAD in any way validate did not itself cause.
 fn tree_dirty() -> bool {
-    tree_dirty_at(Path::new("."))
+    tree_dirty_at(caller_git, Path::new("."))
 }
 
-fn tree_dirty_at(root: &Path) -> bool {
-    !foreign_porcelain_at(root, &["status", "--porcelain"]).is_empty()
+fn tree_dirty_at(git: fn() -> Command, root: &Path) -> bool {
+    !foreign_porcelain_at(git, root, &["status", "--porcelain"]).is_empty()
 }
 
 /// True when the WORKING TREE proper carries changes `git add` would capture.
 /// This drives the hard gate, because staging or committing is the caller's
 /// escape from it.
 fn worktree_dirty() -> bool {
-    worktree_dirty_at(Path::new("."))
+    worktree_dirty_at(caller_git, Path::new("."))
 }
 
-fn worktree_dirty_at(root: &Path) -> bool {
-    let unstaged = !foreign_porcelain_at(root, &["diff", "--name-only"]).is_empty();
+fn worktree_dirty_at(git: fn() -> Command, root: &Path) -> bool {
+    let unstaged = !foreign_porcelain_at(git, root, &["diff", "--name-only"]).is_empty();
     unstaged
-        || !foreign_porcelain_at(root, &["ls-files", "--others", "--exclude-standard"]).is_empty()
+        || !foreign_porcelain_at(git, root, &["ls-files", "--others", "--exclude-standard"])
+            .is_empty()
 }
 
 /// Whether this checkout is one of ci-hub's disposable validate worktrees.
@@ -8259,11 +8276,11 @@ fn configured_tool_selection(
     let state_root = parent.ok_or_else(|| {
         format!("explicit {TOOL_ROOT_ENV} has no canonical {PARENT_ENV} to bind to")
     })?;
+    // Both roots are named by path, so none of the caller's repository-location
+    // variables may redirect these reads. An inherited GIT_INDEX_FILE alone
+    // would compare the tool root against the caller's index.
     let git = |root: &Path, args: &[&str]| -> Result<String, String> {
-        let output = Command::new("git")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
+        let output = without_repository_location(&mut Command::new("git"))
             .args(["--no-optional-locks", "-C"])
             .arg(root)
             .args(args)
@@ -27290,5 +27307,210 @@ mod raw_census_publication_tests {
                 .remove("raw_result_input_census_v1");
             assert_eq!(row, original);
         }
+    }
+}
+
+/// Git exports `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks and
+/// `git rebase --exec` steps (https://github.com/rrnewton/hermit/issues/3362).
+/// The self-test brackets below read repositories they name by path, so an
+/// inherited location must neither redirect those reads nor touch the
+/// repository it names. Validate's own reads of the tree it runs in are the
+/// opposite case: they must keep following the caller.
+#[cfg(test)]
+mod inherited_repository_location_tests {
+    use super::*;
+
+    const CHILD: &str = "HERMIT_VALIDATE_INHERITED_LOCATION_TEST_CHILD";
+    const COMPLETED: &str = "inherited-location child completed";
+
+    /// A throwaway repository with a linked worktree and a dirty tracked file,
+    /// standing in for the repository whose hook launched validate.
+    struct Throwaway {
+        root: tempfile::TempDir,
+        main: PathBuf,
+        linked: PathBuf,
+        linked_git_dir: PathBuf,
+    }
+
+    fn throwaway() -> Throwaway {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let status = scratch_git().current_dir(dir).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?} exited {status}");
+        };
+        git(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("tracked.txt"), "committed\n").unwrap();
+        git(&main, &["add", "tracked.txt"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "user.name=fixture",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(linked.join("tracked.txt"), "hook-time edit\n").unwrap();
+        std::fs::write(linked.join("untracked.txt"), "hook-time file\n").unwrap();
+        let linked_git_dir = main.join(".git/worktrees/linked");
+        assert!(linked_git_dir.join("index").is_file());
+        Throwaway {
+            root,
+            main,
+            linked,
+            linked_git_dir,
+        }
+    }
+
+    /// Every file under the throwaway with its bytes and inode. A lock-and-
+    /// rename rewrite of an index with identical bytes still changes the inode.
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, u64)> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, u64)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    walk(root, &path, out);
+                } else if metadata.is_file() {
+                    out.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        (std::fs::read(&path).unwrap(), metadata.ino()),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// The inherited-location shapes: a `rebase --exec` step (GIT_DIR only), a
+    /// lone GIT_INDEX_FILE, and a hook's GIT_WORK_TREE plus GIT_INDEX_FILE,
+    /// with and without GIT_DIR.
+    const SHAPES: [&[&str]; 4] = [
+        &["GIT_DIR"],
+        &["GIT_INDEX_FILE"],
+        &["GIT_WORK_TREE", "GIT_INDEX_FILE"],
+        &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"],
+    ];
+
+    fn location(shape: &[&'static str], fixture: &Throwaway) -> Vec<(&'static str, PathBuf)> {
+        shape
+            .iter()
+            .map(|&name| {
+                let value = match name {
+                    "GIT_DIR" => fixture.linked_git_dir.clone(),
+                    "GIT_WORK_TREE" => fixture.linked.clone(),
+                    "GIT_INDEX_FILE" => fixture.linked_git_dir.join("index"),
+                    _ => unreachable!("{name}"),
+                };
+                (name, value)
+            })
+            .collect()
+    }
+
+    fn run_child(test: &str, cwd: &Path, location: &[(&str, PathBuf)]) -> String {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        without_repository_location(&mut command)
+            .args(["--exact", test, "--nocapture"])
+            .current_dir(cwd)
+            .env(CHILD, "1");
+        for (name, value) in location {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{location:?}\n{stdout}{stderr}"
+        );
+        assert!(stdout.contains(COMPLETED), "{location:?}\n{stdout}{stderr}");
+        assert!(stdout.contains("1 passed; 0 failed;"), "{stdout}{stderr}");
+        stdout
+    }
+
+    /// Runs one bracket in a child process under every inherited shape and
+    /// requires it to pass with the named repository left byte- and
+    /// inode-identical.
+    fn bracket_ignores_inherited_location(test: &str) {
+        for shape in SHAPES {
+            let fixture = throwaway();
+            let before = snapshot(fixture.root.path());
+            run_child(test, &test_source_root(), &location(shape, &fixture));
+            assert!(
+                snapshot(fixture.root.path()) == before,
+                "{shape:?}: the inherited repository changed"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_attribution_bracket_ignores_an_inherited_repository() {
+        if std::env::var_os(CHILD).is_some() {
+            checkout_attribution_bracket().unwrap();
+            println!("{COMPLETED}");
+            return;
+        }
+        bracket_ignores_inherited_location(
+            "inherited_repository_location_tests::checkout_attribution_bracket_ignores_an_inherited_repository",
+        );
+    }
+
+    #[test]
+    fn tool_root_split_bracket_ignores_an_inherited_repository() {
+        if std::env::var_os(CHILD).is_some() {
+            tool_root_split_bracket().unwrap();
+            println!("{COMPLETED}");
+            return;
+        }
+        bracket_ignores_inherited_location(
+            "inherited_repository_location_tests::tool_root_split_bracket_ignores_an_inherited_repository",
+        );
+    }
+
+    /// The production dirtiness reads keep the caller's repository: run from a
+    /// clean checkout with a hook's GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE
+    /// aimed at a dirty one, they report the dirty one. The same child reads
+    /// the clean checkout through the fixture path and sees it clean.
+    #[test]
+    fn production_dirty_reads_follow_the_caller() {
+        if std::env::var_os(CHILD).is_some() {
+            let clean = std::env::current_dir().unwrap();
+            assert!(tree_dirty(), "tree_dirty() stopped following the caller");
+            assert!(
+                worktree_dirty(),
+                "worktree_dirty() stopped following the caller"
+            );
+            assert!(!tree_dirty_at(scratch_git, &clean));
+            assert!(!worktree_dirty_at(scratch_git, &clean));
+            println!("{COMPLETED}");
+            return;
+        }
+        let clean = throwaway();
+        let dirty = throwaway();
+        run_child(
+            "inherited_repository_location_tests::production_dirty_reads_follow_the_caller",
+            &clean.main,
+            &location(SHAPES[3], &dirty),
+        );
     }
 }
