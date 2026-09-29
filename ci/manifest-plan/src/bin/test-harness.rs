@@ -4316,12 +4316,12 @@ sys.exit(1 if failed else 0)
                 }
             }
         }
-        // Two portable manifest nodes currently select zero cells on their own.
-        // They remain assigned exactly once, but share the integration shard so
-        // the hosted validator cannot mistake a standalone zero-test run for a
-        // pass.
-        assert_eq!(physical_rows, 25);
-        assert_eq!(resolved.len(), 25);
+        // No manifest node belongs in a test shard while it selects portable
+        // cells: only the e2e jobs pack the parity-v1 archive the reducer reads.
+        // shared-futex-c and util-c left the integration shard once
+        // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell.
+        assert_eq!(physical_rows, 23);
+        assert_eq!(resolved.len(), 23);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
