@@ -471,7 +471,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // parity_export:
     //   export_prints_one_row_per_owed_cell_and_passes_real_records_through,
     //   export_refuses_an_inconsistent_node_and_prints_no_rows.
-    ("test.regular_crates", 814),
+    // Deleting the E2E runner's ptrace-golden normalization producer
+    // (https://github.com/rrnewton/hermit/issues/3301) deletes its one test,
+    // runner::tests::ptrace_golden_normalization_is_bounded_and_accounts_a_timeout,
+    // and retains the other 813 prior identities (`cargo nextest list
+    // --profile ci` over this node's whole selection measured the -1 when the
+    // change was written, not on this base; no other selected crate gains or
+    // loses a test).
+    ("test.regular_crates", 813),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -550,7 +557,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // backend_stats::tests::baseline_ptrace_snapshot_is_explicit, because
     // ptrace now reports real dispatch counters instead of "metrics=none".
     // The other 789 identities are retained.
-    ("test.hermit_unit", 791),
+    // Keeping only the golden run-1 log after a matched verify
+    // (https://github.com/rrnewton/hermit/issues/3301) adds five bin/hermit
+    // retention tests (verify::tests::
+    // requested_logs_survive_a_match_that_did_not_compare_them,
+    // requested_logs_survive_a_refused_comparison,
+    // an_overridden_match_keeps_both_logs_in_the_failure_directory;
+    // tests::dbt_backend_divergence_overrides_a_log_match_for_retention;
+    // run::tests::skid_overshoot_overrides_a_log_match_for_retention) and
+    // retains all 791 prior identities (`cargo nextest list --profile ci`
+    // measured the +5 when the change was written, not on this base).
+    ("test.hermit_unit", 796),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -692,7 +709,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7
     // (https://github.com/rrnewton/hermit/pull/3545) retains all 117 prior
     // selected CLI identities.
-    ("test.cli", 118),
+    // The real-ptrace golden-log retention test
+    // ptrace_keep_logs_retains_only_the_golden_log_after_a_match
+    // (https://github.com/rrnewton/hermit/issues/3301) retains all 118 prior
+    // selected identities (`cargo nextest list --profile ci` measured the +1
+    // when the change was written, not on this base). It needs no PMU:
+    // without perf counters the run continues with --max-timeslice=disabled.
+    ("test.cli", 119),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -730,7 +753,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3545 as test.cli (added three,
     // two, four, three and one at a time); all 105, 108, 110, 114 and 117
     // prior identities retained at each step.
-    ("test.cli_on_host", 118),
+    // The host node carries the identical selection.
+    ("test.cli_on_host", 119),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),
@@ -772,7 +796,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3547).
     // The host twin carries the same dispatch-record change (+2, -1;
     // https://github.com/rrnewton/hermit/pull/3522).
-    ("test.hermit_unit_on_host", 791),
+    // The host node carries the identical selection.
+    ("test.hermit_unit_on_host", 796),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -793,7 +818,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The selection includes the S12 parity tests above: 31 identities
     // added and one removed, whose test S12 rewrote under a new name, so 783
     // of its 784 prior identities are retained.
-    ("test.regular_crates_on_host", 814),
+    ("test.regular_crates_on_host", 813),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

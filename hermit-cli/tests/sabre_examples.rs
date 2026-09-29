@@ -592,8 +592,8 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
         "SaBRe verification report was not canonical bitwise INFO parity: {report}",
     );
 
-    let retained_log = |prefix: &str| {
-        let mut matches = std::fs::read_dir(&retained_logs)
+    let retained = |prefix: &str| {
+        std::fs::read_dir(&retained_logs)
             .expect("failed to read retained SaBRe verification log directory")
             .map(|entry| {
                 entry
@@ -601,21 +601,24 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
                     .path()
             })
             .filter(|path| {
-                path.is_file()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(prefix))
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
             })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            matches.len(),
-            1,
-            "SaBRe strict verification must retain exactly one {prefix} file: {matches:?}",
-        );
-        matches.pop().unwrap()
+            .collect::<Vec<_>>()
     };
-    let logs = [retained_log("run1_log_"), retained_log("run2_log_")];
+    // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+    // run 2's log, which matched it, is deleted.
+    let logs = retained("run1_log_");
+    assert!(
+        logs.len() == 1 && logs[0].is_file(),
+        "SaBRe strict verification must retain exactly one run1_log_ file: {logs:?}",
+    );
+    let duplicates = retained("run2_log_");
+    assert!(
+        duplicates.is_empty(),
+        "a matched SaBRe verification must not retain run 2's log: {duplicates:?}",
+    );
 
     const SCHEDULER_EMPTY: &str =
         " INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.";

@@ -2033,12 +2033,6 @@ pub struct CellRunSpec {
     attempt: String,
     #[serde(skip)]
     fixed_workdir_source: PathBuf,
-    /// Normalize the retained ptrace log into `normalized-ptrace-golden.log`.
-    /// Only `E2E_KEEP_VERIFY_LOGS=1` asks for this; logs retained for the
-    /// parity post-pass alone are never normalized, so parity retention adds
-    /// no process to the cell and cannot change its outcome.
-    #[serde(skip)]
-    normalize_ptrace_golden: bool,
 }
 
 /// The existing pressure-test result vocabulary for one executed cell.
@@ -2175,8 +2169,10 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process group and any required retained-log
-    /// normalization process.
+    /// CPU consumed by the launched process group. Rows written before the
+    /// ptrace golden-log normalization was removed
+    /// (<https://github.com/rrnewton/hermit/issues/3301>) also include that
+    /// normalization process for `E2E_KEEP_VERIFY_LOGS=1` ptrace verify cells.
     ///
     /// Completed commands use `wait4`; a CPU timeout retains the last live
     /// process-group observation when that is larger. It is not inferred from
@@ -2613,13 +2609,15 @@ pub struct RunContext {
     /// See [`CellResult::binary_build_sha`].
     pub binary_build_sha: Option<String>,
     pub prebuilt: bool,
-    /// `E2E_KEEP_VERIFY_LOGS=1`: retain every verify cell's logs and normalize
-    /// each ptrace golden, as before.
+    /// `E2E_KEEP_VERIFY_LOGS=1`: retain every verify cell's logs through
+    /// `hermit run --keep-logs`, which keeps one golden log (run 1's) after a
+    /// match and both logs after a divergence. Retention adds no process to
+    /// the cell and cannot change its outcome.
     pub keep_logs: bool,
     /// `(test, backend)` verify cells whose logs are retained for the parity
     /// post-pass even without `keep_logs`. This is the selection closure of
-    /// [`crate::parity::retention_closure`]: retention only, so it neither
-    /// normalizes a ptrace golden nor adds any other process to the cell.
+    /// [`crate::parity::retention_closure`]: retention only, the same
+    /// `--keep-logs` retention as `keep_logs`, adding no process to the cell.
     pub parity_retained: BTreeSet<(String, String)>,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
@@ -3382,7 +3380,6 @@ pub fn build_spec(
         },
         attempt: attempt.into(),
         fixed_workdir_source,
-        normalize_ptrace_golden: context.keep_logs,
     })
 }
 
@@ -3666,33 +3663,7 @@ fn execute_spec_until(
             timeout,
         ));
     }
-    let execution_ordinal = observations.len() as u64 + 1;
     let output = execute_process(request, (deadline, remaining_cpu_usec), observations)?;
-    let mut accounted_cpu_usage_usec = Some(output.cpu_usage_usec);
-    let mut normalization_error = None;
-    if output.timeout.is_none()
-        && spec.normalize_ptrace_golden
-        && spec.id.mode == "verify"
-        && spec.id.backend.as_deref() == Some("ptrace")
-    {
-        if let Some(directory) = &spec.verification_log_dir {
-            let normalized = normalize_ptrace_golden(
-                &spec.argv[0],
-                directory,
-                &spec.cwd,
-                deadline,
-                remaining_cpu_usec.map(|budget| budget.saturating_sub(output.cpu_usage_usec)),
-                (cpu_timeout_seconds, wall_timeout_seconds),
-                (
-                    observations,
-                    InvocationRole::PtraceNormalization { execution_ordinal },
-                ),
-            );
-            accounted_cpu_usage_usec =
-                checked_add_cpu_usage(accounted_cpu_usage_usec, normalized.cpu_usage_usec);
-            normalization_error = normalized.result.err();
-        }
-    }
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut outcome = if output.timeout.is_some() || !output.status.success() {
@@ -4089,11 +4060,6 @@ fn execute_spec_until(
         error_kind = Some(timeout.error_kind().into());
         reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
     }
-    if let Some(error) = normalization_error {
-        outcome = "ERROR".into();
-        error_kind = Some("incomplete-verification-evidence".into());
-        reason = Some(error);
-    }
     Ok(AttemptResult {
         index: index.into(),
         outcome,
@@ -4102,7 +4068,7 @@ fn execute_spec_until(
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
         timed_out: output.timeout.is_some(),
         duration_ms: started.elapsed().as_millis(),
-        cpu_usage_usec: accounted_cpu_usage_usec,
+        cpu_usage_usec: Some(output.cpu_usage_usec),
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -4124,96 +4090,6 @@ fn execute_spec_until(
         sabre_path_evidence_sha256,
         reason,
     })
-}
-
-/// Preserve process accounting even when post-processing cannot produce its
-/// semantic result. An `Err` must not erase CPU already consumed by a child.
-struct AccountedStep<T> {
-    result: Result<T, String>,
-    cpu_usage_usec: Option<u64>,
-}
-
-fn normalize_ptrace_golden(
-    hermit: &str,
-    directory: &Path,
-    cwd: &Path,
-    deadline: Instant,
-    remaining_cpu_usec: Option<u64>,
-    timeout_seconds: (u64, u64),
-    record: (&mut Vec<InvocationCpuObservation>, InvocationRole),
-) -> AccountedStep<()> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return AccountedStep {
-                result: Err(format!("cannot read {}: {error}", directory.display())),
-                cpu_usage_usec: Some(0),
-            };
-        }
-    };
-    let mut run1 = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(|name| name.starts_with("run1_log_"))
-        })
-        .collect::<Vec<_>>();
-    run1.sort();
-    let normalized = directory.join("normalized-ptrace-golden.log");
-    let status_path = directory.join("normalized-ptrace-golden.status");
-    if run1.len() != 1 || !run1[0].metadata().is_ok_and(|metadata| metadata.len() > 0) {
-        let result = fs::write(&normalized, b"")
-            .and_then(|()| fs::write(status_path, b"2\n"))
-            .map_err(|error| error.to_string());
-        return AccountedStep {
-            result,
-            cpu_usage_usec: Some(0),
-        };
-    }
-    let stderr = directory.join("normalized-ptrace-golden.stderr");
-    let args = vec!["log-diff".into(), run1[0].to_string_lossy().into_owned()];
-    let output = match execute_process(
-        ProcessRequest::new(
-            record.1,
-            cwd,
-            hermit,
-            &args,
-            &BTreeMap::new(),
-            &normalized,
-            &stderr,
-        ),
-        (deadline, remaining_cpu_usec),
-        record.0,
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            return AccountedStep {
-                result: Err(format!("cannot normalize {}: {error}", run1[0].display())),
-                cpu_usage_usec: None,
-            };
-        }
-    };
-    let cpu_usage_usec = Some(output.cpu_usage_usec);
-    let status = output.status.code().unwrap_or(1);
-    let result = (|| {
-        if !output.status.success() {
-            fs::write(&normalized, b"").map_err(|error| error.to_string())?;
-        }
-        fs::write(&status_path, format!("{status}\n")).map_err(|error| error.to_string())?;
-        if let Some(timeout) = output.timeout {
-            return Err(format!(
-                "ptrace golden normalization {}",
-                timeout.reason(timeout_seconds.0, timeout_seconds.1)
-            ));
-        }
-        Ok(())
-    })();
-    AccountedStep {
-        result,
-        cpu_usage_usec,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8487,7 +8363,6 @@ mod tests {
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
 
         // This is the exact boundary reached when the aggregate execution
@@ -9218,7 +9093,6 @@ mod tests {
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
-            normalize_ptrace_golden: false,
         }
     }
 
@@ -9806,47 +9680,6 @@ int main(int argc, char **argv) {
         assert_eq!(checked_add_cpu_usage(Some(2), None), None);
         assert_eq!(checked_add_cpu_usage(None, Some(3)), None);
         assert_eq!(checked_add_cpu_usage(Some(u64::MAX), Some(1)), None);
-    }
-
-    #[test]
-    fn ptrace_golden_normalization_is_bounded_and_accounts_a_timeout() {
-        let root = std::env::temp_dir().join(format!(
-            "hermit-runner-normalization-budget-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("run1_log_fixture.log"), b"retained log\n").unwrap();
-        let program = root.join("hermit");
-        fs::write(&program, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let normalized = normalize_ptrace_golden(
-            program.to_str().unwrap(),
-            &root,
-            &root,
-            Instant::now() + Duration::from_secs(5),
-            Some(200_000),
-            (1, 5),
-            (
-                &mut Vec::new(),
-                InvocationRole::PtraceNormalization {
-                    execution_ordinal: 1,
-                },
-            ),
-        );
-        let error = normalized
-            .result
-            .expect_err("normalization must obey the shared CPU budget");
-        assert!(error.contains("CPU"), "{error}");
-        assert!(
-            normalized
-                .cpu_usage_usec
-                .is_some_and(|usage| usage >= 100_000),
-            "timed-out normalization must retain its measured CPU: {:?}",
-            normalized.cpu_usage_usec
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12678,7 +12511,6 @@ exit "$(cat "$PWD/exit-status")"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -12727,7 +12559,6 @@ exit "$(cat "$PWD/exit-status")"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -13161,7 +12992,6 @@ exit "$(cat "$PWD/exit-status")"
             comparator,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -13712,7 +13542,6 @@ cp "{}" "$verdict"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -14350,7 +14179,6 @@ cp "{}" "$verdict"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
-            normalize_ptrace_golden: false,
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
