@@ -3177,7 +3177,7 @@ sys.exit(37)
     fn hosted_portable_omits_the_excluded_backends_everywhere_and_locally_keeps_them() {
         assert_eq!(HOSTED_PORTABLE_EXCLUDED_BACKENDS, ["kvm"]);
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let excluded = |cell: &DagManifest| hosted_portable_excludes(cell);
         let portable = expected_for_label("portable", &cells);
         let hosted = expected_for_label(HOSTED_PORTABLE_LABEL, &cells);
