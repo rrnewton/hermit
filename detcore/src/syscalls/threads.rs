@@ -643,6 +643,93 @@ where
     Ok(None)
 }
 
+/// The one-bit kernel sigset for `raw_signal` (1-based), or 0 when out of range.
+pub(crate) fn kernel_sigset_bit(raw_signal: i32) -> KernelSigset {
+    if (1..=KernelSigset::BITS as i32).contains(&raw_signal) {
+        1_u64 << (raw_signal as u32 - 1)
+    } else {
+        0
+    }
+}
+
+/// One thread's signal state as the kernel reports it in
+/// `/proc/<pid>/task/<tid>/status`.
+///
+/// The kernel is the authority for a guest thread's mask, dispositions, and
+/// pending signals on backends that run the guest as real host threads. Reading
+/// the state has no effect on the guest, unlike a probe syscall around which a
+/// signal can be dequeued and held by the backend
+/// (https://github.com/rrnewton/hermit/issues/3146).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KernelSignalState {
+    /// Signals pending for the thread or its whole thread group (`SigPnd | ShdPnd`).
+    pub(crate) pending: KernelSigset,
+    /// The thread's current signal mask (`SigBlk`).
+    pub(crate) blocked: KernelSigset,
+    /// Signals whose disposition is `SIG_IGN` (`SigIgn`).
+    pub(crate) ignored: KernelSigset,
+    /// Signals with a handler installed (`SigCgt`).
+    pub(crate) caught: KernelSigset,
+}
+
+impl KernelSignalState {
+    /// Parse the five signal lines of a `/proc/<pid>/task/<tid>/status` file.
+    pub(crate) fn parse(status: &str) -> Option<Self> {
+        let mut thread_pending = None;
+        let mut shared_pending = None;
+        let mut state = KernelSignalState::default();
+        let mut blocked = None;
+        let mut ignored = None;
+        let mut caught = None;
+        for line in status.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let slot = match key {
+                "SigPnd" => &mut thread_pending,
+                "ShdPnd" => &mut shared_pending,
+                "SigBlk" => &mut blocked,
+                "SigIgn" => &mut ignored,
+                "SigCgt" => &mut caught,
+                _ => continue,
+            };
+            *slot = Some(KernelSigset::from_str_radix(value.trim(), 16).ok()?);
+        }
+        state.pending = thread_pending? | shared_pending?;
+        state.blocked = blocked?;
+        state.ignored = ignored?;
+        state.caught = caught?;
+        Some(state)
+    }
+
+    /// Signals whose delivery, while unblocked in `mask`, ends a blocking wait: a
+    /// caught signal runs its handler, and a `SIG_DFL` signal terminates, dumps
+    /// core, or stops the process. Ignored signals and the default-ignored
+    /// `SIGCHLD`, `SIGCONT`, `SIGURG`, and `SIGWINCH` do not, and neither does the
+    /// backend's own preemption signal.
+    pub(crate) fn interrupting(&self, mask: KernelSigset) -> KernelSigset {
+        let default_ignored = [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
+            .into_iter()
+            .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+        let default_action = !(self.ignored | self.caught);
+        (self.caught | (default_action & !default_ignored))
+            & !mask
+            & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32)
+    }
+
+    /// Pending signals that would end a blocking wait under the guest's `mask`.
+    pub(crate) fn pending_interrupting(&self, mask: KernelSigset) -> KernelSigset {
+        self.pending & self.interrupting(mask)
+    }
+}
+
+/// Read `tid`'s signal state from the kernel.
+pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalState, Errno> {
+    let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+    let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
+    KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
 pub(super) fn blocked_signal_mask() -> KernelSigset {
     // Preserve libc's definition of the blockable set (notably its reserved
     // NPTL signals) while converting the result to the kernel's one-word ABI.
@@ -1309,6 +1396,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     SchedValue::Value(num) => num,
                     SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
+                    SchedValue::Signaled => panic!("impossible, futex wake is never signaled"),
                 };
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
@@ -1347,21 +1435,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let maybe_timeout_lt = self
                         .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
                         .await?;
+                    // On a backend whose kernel reports the guest's signal state, the
+                    // wait names the signals that end it, so a blocked, ignored, or
+                    // default-ignored one leaves it parked until its wakeup or its
+                    // original deadline. One already pending is delivered first and
+                    // the wait then runs again
+                    // (https://github.com/rrnewton/hermit/issues/3146).
+                    let signal_interruption = guest
+                        .config()
+                        .backend_supports_blocked_wait_signal_interruption;
+                    let interrupting_signals = if signal_interruption {
+                        let state = read_kernel_signal_state(guest.pid(), guest.tid())
+                            .map_err(Error::Errno)?;
+                        if state.pending_interrupting(state.blocked) != 0 {
+                            trace!(
+                                "[detcore, dtid {}] futex wait restarts after pending signals {:#x}",
+                                &dettid,
+                                state.pending_interrupting(state.blocked)
+                            );
+                            return Err(Error::Errno(Errno::ERESTARTNOINTR));
+                        }
+                        Some(state.interrupting(state.blocked))
+                    } else {
+                        None
+                    };
                     let ans = futex_action(
                         guest,
-                        FutexAction::WaitRequest(maybe_timeout_lt),
+                        FutexAction::WaitRequest(maybe_timeout_lt, interrupting_signals),
                         &futexid,
                         init_val,
                         bitset,
                     )
                     .await;
-                    let res = if ans == Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)) {
-                        // The scheduler ended the wait for a signal, so the wait was
-                        // interrupted, not woken. Report it with the futex's restart
-                        // errno and let the kernel apply the guest's disposition on
-                        // resume, exactly as the polling mode does
-                        // (https://github.com/rrnewton/hermit/issues/3146).
-                        let errno = call.signal_interrupt_errno();
+                    let res = if signal_interruption && ans == Some(SchedValue::Signaled) {
+                        // The scheduler ended the wait for one of the signals named
+                        // above, so the wait was interrupted, not woken. Report the
+                        // futex's kernel restart errno and let the kernel apply the
+                        // guest's disposition on resume.
+                        let errno = call.kernel_restart_errno();
                         trace!(
                             "[detcore, dtid {}] futex wait interrupted by a signal: {:?}",
                             &dettid, errno
@@ -2626,7 +2737,7 @@ where
         {
             Some(SchedValue::Value(count)) => count,
             // A wake never carries a timeout, and a cancelled RPC wakes nobody.
-            Some(SchedValue::TimeOut) | None => 0,
+            Some(SchedValue::TimeOut) | Some(SchedValue::Signaled) | None => 0,
         };
         // Guest-level identities only: dettid, the modeled futex key, and a
         // count. No host pointers and no iteration order leak into this line,
@@ -2858,6 +2969,78 @@ mod tests {
             report.read_to_string(&mut aggregate).unwrap();
             assert_eq!(aggregate, if reported { "execveat\n" } else { "" });
         }
+    }
+
+    fn bits(signals: &[i32]) -> KernelSigset {
+        signals
+            .iter()
+            .fold(0, |set, &signal| set | kernel_sigset_bit(signal))
+    }
+
+    #[test]
+    fn kernel_signal_state_parses_proc_status() {
+        let status = "Name:\tguest\nSigQ:\t1/1024\nSigPnd:\t0000000000000200\n\
+                      ShdPnd:\t0000000000000400\nSigBlk:\t0000000000000800\n\
+                      SigIgn:\t0000000000001000\nSigCgt:\t0000000000000400\n";
+        assert_eq!(
+            KernelSignalState::parse(status),
+            Some(KernelSignalState {
+                pending: bits(&[libc::SIGUSR1, libc::SIGSEGV]),
+                blocked: bits(&[libc::SIGUSR2]),
+                ignored: bits(&[libc::SIGPIPE]),
+                caught: bits(&[libc::SIGSEGV]),
+            })
+        );
+        // Every line is required: a missing one is not an empty set.
+        assert_eq!(
+            KernelSignalState::parse("SigPnd:\t0\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\n"),
+            None
+        );
+        assert_eq!(
+            KernelSignalState::parse(
+                "SigPnd:\tzz\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\nSigCgt:\t0\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_unblocked_caught_or_fatal_signals_interrupt_a_wait() {
+        let state = KernelSignalState {
+            pending: bits(&[
+                libc::SIGUSR1,
+                libc::SIGUSR2,
+                libc::SIGPIPE,
+                libc::SIGTERM,
+                libc::SIGCHLD,
+                libc::SIGWINCH,
+                libc::SIGURG,
+                libc::SIGCONT,
+            ]),
+            blocked: bits(&[libc::SIGUSR2]),
+            ignored: bits(&[libc::SIGPIPE]),
+            caught: bits(&[libc::SIGUSR1, libc::SIGUSR2, libc::SIGWINCH]),
+        };
+        // Caught and unblocked (SIGUSR1, SIGWINCH) and default-fatal (SIGTERM) end the
+        // wait; blocked (SIGUSR2), ignored (SIGPIPE), and default-ignored ones do not.
+        assert_eq!(
+            state.pending_interrupting(state.blocked),
+            bits(&[libc::SIGUSR1, libc::SIGWINCH, libc::SIGTERM])
+        );
+        // The mask the guest had when the wait began decides, not the current one.
+        assert_eq!(
+            state.pending_interrupting(0),
+            bits(&[libc::SIGUSR1, libc::SIGUSR2, libc::SIGWINCH, libc::SIGTERM])
+        );
+        let interrupting = state.interrupting(state.blocked);
+        assert_ne!(interrupting & kernel_sigset_bit(libc::SIGKILL), 0);
+        assert_ne!(interrupting & kernel_sigset_bit(libc::SIGSTOP), 0);
+        assert_eq!(
+            interrupting & kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+            0
+        );
+        assert_eq!(kernel_sigset_bit(0), 0);
+        assert_eq!(kernel_sigset_bit(65), 0);
     }
 
     #[test]
