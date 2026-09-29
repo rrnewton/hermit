@@ -7614,12 +7614,19 @@ mod tests {
     /// `git` helper, which the tests then run on the fixture, resolves the
     /// fixture by directory too.
     ///
+    /// The removal is process-wide rather than per command because the tool's
+    /// helpers build their own `Command`s. Two tests depend on it: each fails
+    /// under an inherited `GIT_DIR` without the removal (measured 2026-09-29,
+    /// 2 of 54): nonignored_untracked_files_dirty_provenance
+    /// (`repository_dirty`) and release_candidate_version_probe_refuses_expected_layout_elf_decoy
+    /// (the tool's `git rev-parse HEAD:reverie`).
+    ///
     /// That happens at the first call, not before the first test. libtest
     /// runs tests on several threads, so under an inherited `GIT_DIR` a test
     /// that runs a helper which follows the caller's environment, without
     /// building a fixture first, sees the variables or not depending on
-    /// scheduling. Every fixture test is unaffected: it forgets them before
-    /// its fixture exists.
+    /// scheduling. Both tests above build their fixture first, so each makes
+    /// the call before its first helper runs.
     fn fixture_git() -> Command {
         const LOCATION: [&str; 8] = [
             "GIT_DIR",

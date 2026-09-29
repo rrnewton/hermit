@@ -14106,12 +14106,36 @@ fn without_variables<T>(names: &[&'static str], body: impl FnOnce() -> T) -> T {
 /// process, for the same reason as `without_inherited_repository_location`:
 /// the unit tests run this tool's own git helpers on their fixtures.
 ///
-/// This happens at the first `fixture_git` call, not before the first test.
-/// libtest runs tests on several threads, so under an inherited `GIT_DIR` a
-/// test that runs a helper which follows the caller's environment, without
-/// building a fixture first, sees the variables or not depending on
-/// scheduling. Every fixture test is unaffected: it forgets them before its
-/// fixture exists.
+/// The removal is process-wide rather than per command because those helpers
+/// build their own `Command`s, and a fixture cannot reach them. These tests
+/// depend on it: each fails under an inherited `GIT_DIR` without the removal
+/// (measured 2026-09-29, 18 of 61):
+///
+/// - baseline_resolution_tests: a_baseline_that_is_not_reachable_from_head_is_refused,
+///   a_matching_check_at_a_reachable_revision_is_a_regression
+/// - catalogue_ledger_tests: exact_archive_and_parent_lock_are_required_before_history_changes,
+///   self_test_corpus_requires_exact_committed_objects_and_identity,
+///   self_test_corpus_retains_the_complete_archived_input
+/// - post_verdict_transaction_tests: attempt_bindings_survive_normal_projection_and_current_ingestion,
+///   declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row,
+///   identical_current_rows_retain_one_binding_and_one_comparison,
+///   import_retires_bound_ordinary_comparison_without_losing_provenance,
+///   invalid_snapshot_refuses_before_history_work_but_after_publication_authority,
+///   observation_worktree_state_matches_existing_git_guards,
+///   observe_results_reconciles_declared_guest_exits_with_committed_series,
+///   projector_retires_bound_catalogue_cell_without_losing_provenance,
+///   projector_retires_failed_and_parity_catalogue_receipts_without_active_credit,
+///   retained_bindings_and_current_retry_events_reconcile_together,
+///   retained_retry_bindings_reconcile_all_historical_heads_together,
+///   selected_custom_attempts_publish_without_becoming_comparable_cells,
+///   two_head_writeback_preserves_attribution_and_refuses_unbound_or_moving_inputs
+///
+/// This happens at the first call, not before the first test. libtest runs
+/// tests on several threads, so a test that depends on the removal must make
+/// the call itself, before any helper runs: through `fixture_git`, or directly
+/// as self_test_corpus_retains_the_complete_archived_input does, since it reads
+/// the pinned ledger without building a fixture. Otherwise, under an inherited
+/// `GIT_DIR`, it sees the variables or not depending on scheduling.
 #[cfg(test)]
 fn forget_inherited_repository_location() {
     static FORGET: std::sync::Once = std::sync::Once::new();
@@ -25600,6 +25624,9 @@ mod catalogue_ledger_tests {
     #[test]
     fn self_test_corpus_retains_the_complete_archived_input() {
         let _fixture_lock = history_fixture_lock();
+        // No fixture_git call precedes the ledger reads, so forget the
+        // inherited location here rather than depend on another test.
+        forget_inherited_repository_location();
         let root = Path::new(file!())
             .parent()
             .unwrap()

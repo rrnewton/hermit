@@ -55,11 +55,22 @@ fn checked_output(command: &mut Command) -> String {
 /// `git init` and commits at the caller's repository
 /// (https://github.com/rrnewton/hermit/issues/3362).
 ///
-/// The removal is process-wide and happens once, at the first call. Every
-/// test in this binary makes that call first, through `initialized_repo`, so
-/// no test here runs git with the inherited variables, whatever order libtest
-/// schedules them in. A new test that runs git without `initialized_repo`
-/// would not have that guarantee.
+/// The removal is process-wide rather than per command because the
+/// in-process `build_support` calls and the fixture's build script build their
+/// own `Command`s. Every test here depends on it. Measured 2026-09-29 with the
+/// removal disabled, each test run alone under an inherited `GIT_DIR`: all
+/// four wrote into the caller's repository, and three failed:
+/// git_watch_paths_resolve_from_a_nested_crate (`git_watch_paths_in`),
+/// untracked_generated_output_does_not_taint_version (`git_short_sha_in`), and
+/// cargo_rebuilds_provenance_after_staging_a_tracked_edit (the fixture crate's
+/// `git_short_sha` and `git_watch_paths`, run by `cargo build`).
+/// tracked_worktree_and_index_changes_taint_version (`git_short_sha_in`) still
+/// passed, because its fixture and its reads followed the caller together.
+///
+/// It happens once, at the first call. Every test in this binary makes that
+/// call first, through `initialized_repo`, so no test here runs git with the
+/// inherited variables, whatever order libtest schedules them in. A new test
+/// that runs git without `initialized_repo` would not have that guarantee.
 fn without_inherited_repository_location() {
     static REMOVE: std::sync::Once = std::sync::Once::new();
     REMOVE.call_once(|| {
