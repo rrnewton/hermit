@@ -1291,8 +1291,8 @@ pub const PARITY_STEP_WALL_FLOOR: Duration = Duration::from_secs(600);
 pub const PARITY_STEP_EXIT_MARGIN: Duration = Duration::from_secs(60);
 
 const VERIFY_LOG_DIR_FLAG: &str = "--verify-log-dir";
-/// The first verification run's retained log: the same file the ptrace golden
-/// normalization reads.
+/// The first verification run's retained log: after a match, the only log
+/// `hermit run --keep-logs` keeps.
 const RETAINED_LOG_PREFIX: &str = "run1_log_";
 const STDERR_LIMIT_BYTES: usize = 16 * 1024;
 
@@ -1611,12 +1611,6 @@ pub enum ParityRejection {
     /// first-run log: [`UnavailableClass::LogNotRetained`] with the side's
     /// missing verdict.
     LogNotRetained(String),
-    /// The reference cell's row was valid but its normalized golden log was
-    /// not written: [`UnavailableClass::GoldenNotWritten`], verdict
-    /// `unavailable`. A candidate writes no golden, so a candidate refused
-    /// for this reason is [`UnavailableClass::NoResultRow`], verdict
-    /// `unavailable`, as for an invalid row.
-    GoldenNotWritten(String),
     /// Evidence other than a row, such as the harness summary, proves the
     /// cell host-inapplicable, so it left no log, like a `HOST-INAPPLICABLE`
     /// row: [`UnavailableClass::HostInapplicable`] with the side's missing
@@ -1630,7 +1624,6 @@ impl ParityRejection {
             Self::MissingRow(reason)
             | Self::InvalidRow(reason)
             | Self::LogNotRetained(reason)
-            | Self::GoldenNotWritten(reason)
             | Self::HostInapplicable(reason) => reason,
         }
     }
@@ -1647,13 +1640,7 @@ impl ParityRejection {
             (Self::MissingRow(_), _) => (missing, UnavailableClass::NoResultRow),
             (Self::LogNotRetained(_), _) => (missing, UnavailableClass::LogNotRetained),
             (Self::HostInapplicable(_), _) => (missing, UnavailableClass::HostInapplicable),
-            (Self::GoldenNotWritten(_), ParityOperand::Reference) => (
-                ParityVerdict::Unavailable,
-                UnavailableClass::GoldenNotWritten,
-            ),
-            (Self::InvalidRow(_), _) | (Self::GoldenNotWritten(_), ParityOperand::Candidate) => {
-                (ParityVerdict::Unavailable, UnavailableClass::NoResultRow)
-            }
+            (Self::InvalidRow(_), _) => (ParityVerdict::Unavailable, UnavailableClass::NoResultRow),
         }
     }
 }
@@ -3568,10 +3555,8 @@ pub enum UnavailableClass {
     /// The test id is not a plain relative path, so no golden can be
     /// written below it. No operand.
     InvalidTestId,
-    /// The reference's golden log or its sidecar could not be written, or
-    /// the caller refused the reference's row because its normalized golden
-    /// log was not written ([`ParityRejection::GoldenNotWritten`]). Operand
-    /// `reference`.
+    /// The reference's golden log or its sidecar could not be written.
+    /// Operand `reference`.
     GoldenNotWritten,
     /// The operands cannot be shown to share a `HERMIT_EPOCH`: operand the
     /// side that recorded none when exactly one did not, no operand when
@@ -6795,7 +6780,7 @@ mod tests {
     }
 
     /// `row` with its second run's log kept beside its first run's, as
-    /// `--keep-logs` keeps both for determinism debugging.
+    /// `--keep-logs` keeps both after a divergence.
     fn keep_second_run(row: CellResult, log: &str) -> CellResult {
         fs::write(log_dir(&row).join("run2_log_fixture.log"), log).unwrap();
         row
@@ -8480,26 +8465,23 @@ mod tests {
     /// A verify cell whose row the caller rejected is never compared. As the
     /// candidate or the reference, with or without rows, it takes the verdict
     /// and class the harness gives the same condition, with the caller's
-    /// reason: a missing or invalid row is `no-result-row`, logs the caller
-    /// requires and did not find are `log-not-retained`, and an unwritten
-    /// normalized golden is `golden-not-written` (`no-result-row` for a
-    /// candidate, which writes no golden). Each is unmeasured, in the floor
-    /// as 0, so a rejected reference keeps every candidate of its test in the
-    /// floor. Only a cell proven host-inapplicable, which left no log, has no
-    /// golden, and no rejection is `infrastructure-error`.
+    /// reason: a missing or invalid row is `no-result-row`, and logs the
+    /// caller requires and did not find are `log-not-retained`. Each is
+    /// unmeasured, in the floor as 0, so a rejected reference keeps every
+    /// candidate of its test in the floor. Only a cell proven
+    /// host-inapplicable, which left no log, has no golden, and no rejection
+    /// is `infrastructure-error`.
     /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>
     #[test]
     fn a_rejected_operand_takes_the_harness_class_with_the_callers_reason() {
         let fixture = Fixture::new("rejected");
         let candidates_rejected = [
-            "fx/c-golden",
             "fx/c-inapplicable",
             "fx/c-invalid",
             "fx/c-logs",
             "fx/c-missing",
         ];
         let references_rejected = [
-            "fx/r-golden",
             "fx/r-inapplicable",
             "fx/r-invalid",
             "fx/r-logs",
@@ -8529,11 +8511,6 @@ mod tests {
         let why = str::to_string;
         config.rejected = BTreeMap::from([
             rejected(
-                "fx/c-golden",
-                "kvm",
-                ParityRejection::GoldenNotWritten(why("golden c")),
-            ),
-            rejected(
                 "fx/c-inapplicable",
                 "kvm",
                 ParityRejection::HostInapplicable(why("inapplicable c")),
@@ -8552,11 +8529,6 @@ mod tests {
                 "fx/c-missing",
                 "kvm",
                 ParityRejection::MissingRow(why("missing c")),
-            ),
-            rejected(
-                "fx/r-golden",
-                "ptrace",
-                ParityRejection::GoldenNotWritten(why("golden r")),
             ),
             rejected(
                 "fx/r-inapplicable",
@@ -8627,14 +8599,6 @@ mod tests {
                 // A rejected candidate: the reference is good, so its golden
                 // is written and named for a later `parity compare`.
                 expect(
-                    "fx/c-golden@kvm",
-                    ParityVerdict::Unavailable,
-                    UnavailableClass::NoResultRow,
-                    candidate,
-                    "golden c",
-                    (true, false),
-                ),
-                expect(
                     "fx/c-inapplicable@kvm",
                     ParityVerdict::CandidateMissing,
                     UnavailableClass::HostInapplicable,
@@ -8669,14 +8633,6 @@ mod tests {
                 // A rejected reference names no golden. Its good candidate
                 // is named wherever the cell is unmeasured, and not where
                 // the reference left no golden at all.
-                expect(
-                    "fx/r-golden@kvm",
-                    ParityVerdict::Unavailable,
-                    UnavailableClass::GoldenNotWritten,
-                    reference,
-                    "golden r",
-                    (false, true),
-                ),
                 expect(
                     "fx/r-inapplicable@kvm",
                     ParityVerdict::ReferenceMissing,
