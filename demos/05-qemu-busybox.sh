@@ -203,12 +203,16 @@ if [[ $verify == 1 ]]; then
   # `bitwise_parity: false`, so scraping it cannot tell a stripped match from a
   # canonical one -- which is precisely how this demo used to certify L2.
   #
-  # These conjuncts mirror `verify_tier_from_json` in
-  # tests/backend-parity/run_matrix.py, the repository's enforcing definition of
-  # the `bitwise` tier. Keep the two in step. The counts are not redundant: an
-  # empty-vs-empty comparison reports "no difference" under the strictest
-  # possible spec, so without a positive count a run that produced no DETLOG at
-  # all would certify as parity.
+  # The repository's typed definition of this tier is
+  # VerificationReport::require_canonical_match in
+  # hermit-cli/src/canonical_verdict.rs, exposed as `verification-report
+  # canonical-match`. These conjuncts are the demo's own jq reading of the same
+  # report and are not a copy of that function's checks. (They were written to
+  # mirror `verify_tier_from_json` in the matrix driver deleted under
+  # https://github.com/rrnewton/hermit/issues/3301.) The counts are not
+  # redundant: an empty-vs-empty comparison reports "no difference" under the
+  # strictest possible spec, so without a positive count a run that produced no
+  # DETLOG at all would certify as parity.
   [[ -s $verify_json ]] || fail \
     "VERIFY=1 produced no typed verdict at $verify_json; inspect $stderr_log"
   if ! jq -e '

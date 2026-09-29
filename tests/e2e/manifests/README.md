@@ -51,12 +51,12 @@ include ptrace so the reference behavior is established before another backend
 ratchets it.
 
 `ci/matrix-symmetry-baseline.json` records the small amount of older policy
-debt: ptrace-less manifest rows and guest fixtures owned by a backend-specific
-or legacy backend-parity driver. `hermit-manifest-plan` requires that baseline
-to match exactly, so private corpora cannot grow. Migrating a baseline entry to
-a shared manifest is allowed, but the same change must remove it from the
-baseline. This makes the shared test identity the row axis; backend support or
-gaps remain cells of that one row rather than creating backend-private rows.
+debt: ptrace-less manifest rows and guest fixtures owned by a driver for one
+backend or for e9patch preprocessing. `hermit-manifest-plan` requires that
+baseline to match exactly, so private corpora cannot grow. Migrating a baseline
+entry to a shared manifest is allowed, but the same change must remove it from
+the baseline. This makes the shared test identity the row axis; backend support
+or gaps remain cells of that one row rather than creating backend-private rows.
 
 ## Schema contract
 
@@ -318,8 +318,11 @@ must be non-empty, keys must name backends in `backends_enabled`, and the
 table is rejected outside `verify` mode.
 
 These keys carry the DBT cases of the retired strict parity matrix
-(`tests/backend-parity/run_matrix.py --backend dbt --strict`, see
-https://github.com/rrnewton/hermit/issues/3301). The matrix compared the
+(`run_matrix.py --backend dbt --strict`). That driver was deleted with
+`tests/backend-parity/` under https://github.com/rrnewton/hermit/issues/3301;
+its last version is
+https://github.com/rrnewton/hermit/blob/82e24cc0e6fac0f7f9a8dac4b4b25d9ad8e3231d/tests/backend-parity/run_matrix.py.
+The matrix compared the
 stdout of three `--strict` runs with one attempt. A verify cell compares two
 runs, their stdout and their recorded event streams, and like every manifest
 cell a failed attempt is retried once; a passing retry passes the cell and the
