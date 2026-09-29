@@ -18551,7 +18551,15 @@ fn self_test() -> Result<(), String> {
     // disabled same-backend row for that identical coordinate must remain
     // excluded. Calling the readers/folders directly cannot prove that the
     // front-door eligibility sets and write-back path agree.
-    let command_tracked: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
+    //
+    // Read the fixture ledger the way every product reader does
+    // (`load_existing`, `load_catalogue`, `reconcile_history_catalogue`):
+    // through `resolve_retired_history`. The pinned self-test corpus predates
+    // the backend-parity-c fold, so it records the cells below under their
+    // retired `backend-parity-c/*` ids; a raw read would not find their
+    // `c-programs/*` successors at all.
+    let mut command_tracked: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
+    resolve_retired_history(&mut command_tracked)?;
     let command_parity_id = command_tracked
         .cells
         .iter()
