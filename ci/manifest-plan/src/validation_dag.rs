@@ -830,6 +830,86 @@ fn hosted_dbt_parity_case_exclusion_flags() -> String {
         .collect()
 }
 
+/// The local lint-checks node, which the `full` and `portable` profiles run.
+const LINT_CHECKS_TAG: &str = "check.lint_checks";
+
+/// The hosted-portable lint-checks node, derived from [`LINT_CHECKS_TAG`].
+const HOSTED_LINT_CHECKS_TAG: &str = "check.lint_checks_on_host";
+
+/// The one `make lint-checks` case the hosted-portable node declares out of
+/// scope.
+///
+/// The accept arm of the canonical adapter contract in
+/// `scripts/test_validate_stop_paths.py` drives the real ledger adapter,
+/// `ci-hub/ledger/validate_rows.py`, which exists only in the dev-hermit parent
+/// repository. A GitHub-hosted checkout has no parent, so every other checker
+/// in the target passes and the node still exits 75 (no result). Hosted run
+/// <https://github.com/rrnewton/hermit/actions/runs/36532203200> at main
+/// 6be37a833df8 measured exactly that, and the checks job exited 75.
+///
+/// Only [`HOSTED_LINT_CHECKS_TAG`] carries this argument. With it,
+/// `ci/lint-checks-node.sh` names the case NOT-EVALUATED-ON-HOSTED in the job
+/// output and the GitHub job summary, never as a pass, and exits 0 only when
+/// that case is the sole unevaluable one; any other unevaluable case still
+/// exits 75, and a failure still outranks both. [`LINT_CHECKS_TAG`] keeps the
+/// plain command, so local validation from a checkout nested under the parent
+/// evaluates the arm, and a checkout outside the parent still reports 75.
+const HOSTED_LINT_CHECKS_DECLARATION: &str = " --hosted-out-of-scope canonical-adapter-accept-arm";
+
+/// Split the hosted-portable lint-checks node from the local one.
+///
+/// ⚠️ THE HOSTED NODE IS NOT AN ADMITTED PIN COMMAND. [`admitted_pin_command`]
+/// binds the local node only. The dev-hermit parent's receipt reader
+/// (`ci-hub/qualifying_receipt.py`, `_ADMISSION_PIN_NODES`) accepts at most the
+/// three pin nodes it names, so binding a fourth node would make every admitted
+/// local receipt unqualifiable. Hosted runs are off the record and carry no
+/// admission floor, so the hosted node has none to bind.
+fn materialize_hosted_lint_checks(cfg: &mut DagConfig) -> Result<(), String> {
+    if cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == HOSTED_LINT_CHECKS_TAG)
+    {
+        return Err(format!(
+            "{HOSTED_LINT_CHECKS_TAG} is derived from {LINT_CHECKS_TAG} and must not be authored"
+        ));
+    }
+    let local = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == LINT_CHECKS_TAG)
+        .ok_or_else(|| format!("{LINT_CHECKS_TAG} is absent"))?;
+    if local.cmd != LINT_CHECKS_COMMAND {
+        return Err(format!(
+            "{LINT_CHECKS_TAG} lost its canonical command: {}",
+            local.cmd
+        ));
+    }
+    if !local
+        .labels
+        .iter()
+        .any(|label| label == HOSTED_PORTABLE_LABEL)
+    {
+        return Err(format!(
+            "{LINT_CHECKS_TAG} no longer declares the {HOSTED_PORTABLE_LABEL} label its hosted twin replaces"
+        ));
+    }
+    let mut hosted = local.clone();
+    local.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
+    hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
+    hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
+    hosted.fail_fast_family = Some(hosted.tag());
+    hosted.cmd.push_str(HOSTED_LINT_CHECKS_DECLARATION);
+    hosted.desc.push_str(
+        "; on hosted the parent-adapter accept arm is NOT EVALUATED (declared out of scope, not a pass)",
+    );
+    hosted.description.push_str(
+        " HOSTED TWIN: GitHub-hosted checkouts have no dev-hermit parent, so the accept arm of the canonical adapter contract in scripts/test_validate_stop_paths.py cannot run there. This node passes --hosted-out-of-scope canonical-adapter-accept-arm, and ci/lint-checks-node.sh names that case NOT-EVALUATED-ON-HOSTED in the job output and summary instead of counting it as a pass. Any other unevaluable case still exits 75. The local check.lint_checks node evaluates the arm.",
+    );
+    cfg.steps.push(hosted);
+    Ok(())
+}
+
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.retain(|step| {
         step.tag() != PINNED_ROOT_FETCH_TAG && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
@@ -1824,6 +1904,64 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
         .ok_or_else(|| "selected graph is empty".to_string())
 }
 
+/// Only the hosted-portable lint-checks node may declare a case out of scope,
+/// and it must otherwise be the local node unchanged.
+fn assert_hosted_lint_checks_declaration(cfg: &DagConfig) -> Result<(), String> {
+    let declaring = cfg
+        .steps
+        .iter()
+        .filter(|step| step.cmd.contains("--hosted-out-of-scope"))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if declaring != [HOSTED_LINT_CHECKS_TAG] {
+        return Err(format!(
+            "only {HOSTED_LINT_CHECKS_TAG} may pass --hosted-out-of-scope, found: {declaring:?}"
+        ));
+    }
+    let find = |tag: &str| {
+        cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("{tag} is absent"))
+    };
+    let local = find(LINT_CHECKS_TAG)?;
+    let hosted = find(HOSTED_LINT_CHECKS_TAG)?;
+    let hosted_command = format!("{LINT_CHECKS_COMMAND}{HOSTED_LINT_CHECKS_DECLARATION}");
+    if local.cmd != LINT_CHECKS_COMMAND
+        || hosted.cmd != hosted_command
+        || hosted.labels != [HOSTED_PORTABLE_LABEL]
+        || local
+            .labels
+            .iter()
+            .any(|label| label == HOSTED_PORTABLE_LABEL)
+        || !["full", "portable"]
+            .iter()
+            .all(|label| local.labels.iter().any(|actual| actual == label))
+    {
+        return Err(format!(
+            "{LINT_CHECKS_TAG} must keep `{LINT_CHECKS_COMMAND}` in full and portable, and {HOSTED_LINT_CHECKS_TAG} alone must run it with `{}` in {HOSTED_PORTABLE_LABEL}: local={:?} {:?}, hosted={:?} {:?}",
+            HOSTED_LINT_CHECKS_DECLARATION.trim(),
+            local.labels,
+            local.cmd,
+            hosted.labels,
+            hosted.cmd
+        ));
+    }
+    if hosted.deps != local.deps
+        || hosted.env != local.env
+        || hosted.timeout != local.timeout
+        || hosted.cpu_timeout != local.cpu_timeout
+        || format!("{:?}", hosted.hint) != format!("{:?}", local.hint)
+        || !matches!(&hosted.result_manifests, Some(results) if results.is_empty())
+        || !matches!(&local.result_manifests, Some(results) if results.is_empty())
+    {
+        return Err(format!(
+            "{HOSTED_LINT_CHECKS_TAG} must keep the dependencies, environment, bounds and hints of {LINT_CHECKS_TAG}"
+        ));
+    }
+    Ok(())
+}
+
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     // Backend parity is a scored comparison, not a gate
     // (https://github.com/rrnewton/hermit/issues/3301). No newly constructed
@@ -1847,9 +1985,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_manifest_gate_width_contract(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1609 {
+    assert_hosted_lint_checks_declaration(cfg)?;
+    if cfg.steps.len() != 1610 {
         return Err(format!(
-            "superset has {} steps, expected 1609",
+            "superset has {} steps, expected 1610",
             cfg.steps.len()
         ));
     }
@@ -2450,6 +2589,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_hosted_lint_checks(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -3475,6 +3615,122 @@ sys.exit(37)
     }
 
     #[test]
+    fn hosted_lint_checks_twin_declares_one_case_and_is_not_admission_bound() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        assert_hosted_lint_checks_declaration(&committed).unwrap();
+        let find = |cfg: &DagConfig, tag: &str| {
+            cfg.steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .clone()
+        };
+        let local = find(&committed, LINT_CHECKS_TAG);
+        let hosted = find(&committed, HOSTED_LINT_CHECKS_TAG);
+        assert_eq!(local.cmd, LINT_CHECKS_COMMAND);
+        assert_eq!(
+            hosted.cmd,
+            format!("{LINT_CHECKS_COMMAND} --hosted-out-of-scope canonical-adapter-accept-arm")
+        );
+        assert_eq!(local.labels, ["full", "portable"]);
+        assert_eq!(hosted.labels, [HOSTED_PORTABLE_LABEL]);
+
+        // The parent's receipt reader accepts only the three pin nodes it
+        // names (ci-hub/qualifying_receipt.py, _ADMISSION_PIN_NODES), so the
+        // hosted twin must never be bound; the local node still is.
+        let floor = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            admitted_pin_command(HOSTED_LINT_CHECKS_TAG, Some(floor)),
+            Ok(None)
+        );
+        assert_eq!(admitted_pin_command(HOSTED_LINT_CHECKS_TAG, None), Ok(None));
+        assert_eq!(
+            admitted_pin_command(LINT_CHECKS_TAG, Some(floor)),
+            Ok(Some(format!(
+                "{LINT_CHECKS_COMMAND} --reverie-pin-base-ref '{floor}'"
+            )))
+        );
+
+        // The twin is derived, never authored.
+        let mut authored = committed.clone();
+        let error = materialize_hosted_lint_checks(&mut authored).unwrap_err();
+        assert!(error.contains("must not be authored"), "{error}");
+
+        // Regenerating from the pre-split shape reproduces the committed pair.
+        let mut unsplit = committed.clone();
+        unsplit
+            .steps
+            .retain(|step| step.tag() != HOSTED_LINT_CHECKS_TAG);
+        unsplit
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == LINT_CHECKS_TAG)
+            .unwrap()
+            .labels = vec![
+            "full".into(),
+            HOSTED_PORTABLE_LABEL.into(),
+            "portable".into(),
+        ];
+        materialize_hosted_lint_checks(&mut unsplit).unwrap();
+        // dagrun::Step has neither PartialEq nor Serialize; compare the
+        // complete derived Debug rendering.
+        assert_eq!(
+            format!("{:?}", find(&unsplit, HOSTED_LINT_CHECKS_TAG)),
+            format!("{hosted:?}")
+        );
+        assert_eq!(
+            format!("{:?}", find(&unsplit, LINT_CHECKS_TAG)),
+            format!("{local:?}")
+        );
+        let mut unlabelled = unsplit.clone();
+        unlabelled
+            .steps
+            .retain(|step| step.tag() != HOSTED_LINT_CHECKS_TAG);
+        let error = materialize_hosted_lint_checks(&mut unlabelled).unwrap_err();
+        assert!(error.contains("no longer declares"), "{error}");
+
+        let mutate = |tag: &str, edit: &dyn Fn(&mut Step)| {
+            let mut cfg = committed.clone();
+            edit(cfg.steps.iter_mut().find(|step| step.tag() == tag).unwrap());
+            assert_invariants(&cfg, &cells).unwrap_err()
+        };
+        let declaration = " --hosted-out-of-scope canonical-adapter-accept-arm";
+        let error = mutate(LINT_CHECKS_TAG, &|step| step.cmd.push_str(declaration));
+        assert!(error.contains("may pass --hosted-out-of-scope"), "{error}");
+        let error = mutate("check.check_outcome_consumers", &|step| {
+            step.cmd.push_str(declaration)
+        });
+        assert!(error.contains("may pass --hosted-out-of-scope"), "{error}");
+        let error = mutate(HOSTED_LINT_CHECKS_TAG, &|step| {
+            step.cmd = LINT_CHECKS_COMMAND.into()
+        });
+        assert!(error.contains("may pass --hosted-out-of-scope"), "{error}");
+        let error = mutate(HOSTED_LINT_CHECKS_TAG, &|step| {
+            step.cmd.push_str(" --hosted-out-of-scope other-case")
+        });
+        assert!(error.contains("alone must run it with"), "{error}");
+        let error = mutate(LINT_CHECKS_TAG, &|step| {
+            step.labels.push(HOSTED_PORTABLE_LABEL.into())
+        });
+        assert!(error.contains("alone must run it with"), "{error}");
+        let error = mutate(LINT_CHECKS_TAG, &|step| {
+            step.labels.retain(|label| label != "full")
+        });
+        assert!(error.contains("alone must run it with"), "{error}");
+        let error = mutate(HOSTED_LINT_CHECKS_TAG, &|step| {
+            step.labels.push("portable".into())
+        });
+        assert!(error.contains("alone must run it with"), "{error}");
+        let error = mutate(HOSTED_LINT_CHECKS_TAG, &|step| step.timeout = 600);
+        assert!(error.contains("bounds and hints"), "{error}");
+        let error = mutate(HOSTED_LINT_CHECKS_TAG, &|step| {
+            step.deps.retain(|dep| dep != "pre.reverie_pin")
+        });
+        assert!(error.contains("bounds and hints"), "{error}");
+    }
+
+    #[test]
     fn hosted_selection_is_complete_and_excludes_local_pinned_root_steps() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
@@ -3548,6 +3804,17 @@ sys.exit(37)
         assert_eq!(expected.len(), 15);
         assert!(expected.is_disjoint(&new_variants));
         expected.extend(new_variants);
+        // Derived from check.lint_checks, which left hosted-portable, so the
+        // selected total stays 251. Hosted checkouts have no dev-hermit parent;
+        // this twin declares the parent-adapter accept arm out of scope
+        // (https://github.com/rrnewton/hermit/actions/runs/36532203200).
+        assert!(expected.insert(HOSTED_LINT_CHECKS_TAG.into()));
+        assert!(
+            !selected
+                .steps
+                .iter()
+                .any(|step| step.tag() == LINT_CHECKS_TAG)
+        );
         assert_eq!(
             selected
                 .steps
