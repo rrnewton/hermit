@@ -45,7 +45,7 @@ for required in \
     '"$ROOT_DIR/ci/delegate-hosted-cgroup.sh" "$$"' \
     'exec unshare --user --map-root-user --uts --net --mount' \
     'ip link set lo up' \
-    'mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp' \
+    'mount -t tmpfs -o mode=1777 tmpfs /tmp' \
     'export TMPDIR=/tmp'
 do
     if ! grep -Fq "$required" <<<"$hosted_runner_text"; then
