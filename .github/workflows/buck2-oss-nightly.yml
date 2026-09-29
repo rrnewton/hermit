@@ -83,6 +83,14 @@ jobs:
       - name: Enable unprivileged user namespaces
         timeout-minutes: 2
         shell: bash
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          ACTIONS_RUNTIME_TOKEN: ""
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
+          AWS_ACCESS_KEY_ID: ""
+          AWS_SECRET_ACCESS_KEY: ""
+          AWS_SESSION_TOKEN: ""
         run: |
           set -euo pipefail
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then

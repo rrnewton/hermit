@@ -65,6 +65,7 @@ use hermit_manifest_plan::environmental_block::EnvBlockObservation;
 use hermit_manifest_plan::environmental_block::environmental_block_observation;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::host_capability::HostCapability;
+use hermit_manifest_plan::parity;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
@@ -74,6 +75,8 @@ use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
+use hermit_manifest_plan::runner::ManifestSet;
+use hermit_manifest_plan::runner::run_epoch_from_env;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
 use hermit_manifest_plan::stress_series::SeriesPressureComparison;
@@ -324,6 +327,23 @@ Selection and bounded-batch options (run and plan):
   --kvm-guest-cap N        Separately cap KVM cells (default 4). This composes
                            with --manifest-guest-cap so non-KVM work need not be
                            throttled to the KVM-safe width.
+  --parity-select CELLS    Also measure these parity cells (comma-separated
+                           <test-id>@<backend>) after the series, besides the
+                           tests/e2e/parity-selection.yaml cells. A cell is
+                           reported when the series ran its ptrace or its
+                           candidate verify cell; the missing side is
+                           reference-missing or candidate-missing. A cell with
+                           neither side in the series is dropped with a warning.
+                           Adds no cell to the plan.
+
+Parity post-pass (run and summarize):
+  Once DIR/summary.json is written, the same post-pass as test-harness compares
+  each parity cell's candidate verify log with the ptrace verify log of the same
+  series (first repetition of each) and writes one line per cell to
+  DIR/parity.jsonl. A verify cell whose first repetition the summary refused
+  makes its parity cells unavailable, with the summary's reason. Every cell of
+  a series is launched with one HERMIT_EPOCH, recorded in run.json. The
+  post-pass never changes summary.json or the exit status.
 
 Examples:
   # Probe one cell with at most 600 seconds for its complete retry lifecycle.
@@ -584,6 +604,11 @@ struct CellSelection {
     kvm_guest_cap: Option<i64>,
     #[serde(default)]
     cells_file: Option<PathBuf>,
+    /// `--parity-select`: parity cells (`<test-id>@<backend>`) measured after
+    /// the series in addition to the committed selection, canonical and
+    /// sorted. They add no cell to the plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parity_select: Vec<String>,
     /// Exact cells retained in run.json are sufficient to revalidate an old
     /// run without depending on the continued existence of its source file.
     #[serde(skip)]
@@ -1437,6 +1462,14 @@ struct RunMetadata {
     cells_file_sha256: Option<String>,
     #[serde(default)]
     selected_population_sha256: Option<String>,
+    /// The one `HERMIT_EPOCH` every cell of this series was launched with, so
+    /// the ptrace and candidate operands of a parity comparison give their
+    /// guests the same clock. Absent from runs planned before it was pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hermit_epoch: Option<String>,
+    /// `--parity-select`, as retained for the post-pass and a re-summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parity_select: Vec<String>,
     cells: Vec<CellId>,
 }
 
@@ -2427,6 +2460,15 @@ fn result_options(
                     return Err("--kvm-guest-cap may be specified only once".into());
                 }
             }
+            "--parity-select" if allow_selection => {
+                let raw = args
+                    .next()
+                    .ok_or("--parity-select requires <test-id>@<backend>[,...]")?;
+                if !selection.parity_select.is_empty() {
+                    return Err("--parity-select may be specified only once".into());
+                }
+                selection.parity_select = parse_parity_select_option(root, &raw)?;
+            }
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
@@ -2467,6 +2509,22 @@ fn result_options(
     };
     let output = output.map(|path| absolute_from(root, path));
     Ok((results, output, selection))
+}
+
+/// Refuse an unmeasurable `--parity-select` before anything is planned, with
+/// the same parser as the harness's `E2E_PARITY_SELECT`, and return the cells
+/// in canonical order.
+fn parse_parity_select_option(root: &Path, raw: &str) -> Result<Vec<String>, String> {
+    let manifests = ManifestSet::load(root)
+        .map_err(|error| format!("--parity-select: cannot load the manifests: {error}"))?;
+    let matrix = parity::ParityMatrix::derive(&manifests)
+        .map_err(|error| format!("--parity-select: cannot derive the parity matrix: {error}"))?;
+    let cells = parity::parse_parity_select(raw, &matrix)
+        .map_err(|error| format!("--parity-select: {error}"))?;
+    if cells.is_empty() {
+        return Err("--parity-select requires at least one <test-id>@<backend>".into());
+    }
+    Ok(cells.iter().map(ToString::to_string).collect())
 }
 
 fn absolute_from(root: &Path, path: PathBuf) -> PathBuf {
@@ -3943,6 +4001,11 @@ fn write_plan_after_scorecard_check(
     selection: &CellSelection,
 ) -> Result<(RunMetadata, DagConfig), String> {
     let root = checked_scorecard.root;
+    // One epoch for the whole series. Each cell is a separate harness process
+    // that would otherwise sample host time, so the ptrace and candidate runs
+    // compared by the parity post-pass would give their guests different
+    // clocks. An inherited HERMIT_EPOCH is kept verbatim.
+    let hermit_epoch = run_epoch_from_env()?;
     let PressureCells {
         selected: cells,
         unavailable,
@@ -4220,8 +4283,8 @@ fn write_plan_after_scorecard_check(
                 "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
-             {run_index_env}={run_index} E2E_KEEP_VERIFY_LOGS=1 \
-             {harness} \
+             {run_index_env}={run_index} HERMIT_EPOCH={hermit_epoch} E2E_KEEP_VERIFY_LOGS=1 \
+             {post_pass_env}=0 {harness} \
              || status=$?; \
              if test -e {result_in_progress}; then mv -- {result_in_progress} {result_file} || status=$?; fi; \
              if test -e {junit_in_progress}; then mv -- {junit_in_progress} {junit} || status=$?; fi; \
@@ -4232,6 +4295,8 @@ fn write_plan_after_scorecard_check(
                 run_id = shell_quote(&evidence_run_id),
                 run_index_env = E2E_RUN_INDEX_ENV,
                 run_index = run_index,
+                hermit_epoch = shell_quote(&hermit_epoch),
+                post_pass_env = parity::PARITY_POST_PASS_ENV,
                 harness = harness,
                 result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
                 result_file = shell_quote(&result_file.to_string_lossy()),
@@ -4461,6 +4526,8 @@ fn write_plan_after_scorecard_check(
             .map(|path| path.to_string_lossy().into_owned()),
         cells_file_sha256,
         selected_population_sha256,
+        hermit_epoch: Some(hermit_epoch),
+        parity_select: selection.parity_select.clone(),
         cells: selected_cells,
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -4701,6 +4768,7 @@ fn validate_run_contract(
             .kvm_guest_cap_explicit
             .then_some(metadata.kvm_guest_cap),
         cells_file: None,
+        parity_select: metadata.parity_select.clone(),
         retained_cells_file_cells: metadata
             .cells_file
             .as_ref()
@@ -4938,6 +5006,20 @@ fn validate_run_contract(
         .collect();
     if dag_cells != expected_jobs {
         return Err("generated DAG cell identities do not match run metadata".into());
+    }
+    if let Some(epoch) = &metadata.hermit_epoch {
+        let pinned = format!(" HERMIT_EPOCH={} ", shell_quote(epoch));
+        if let Some(step) = dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .find(|step| !step.cmd.contains(&pinned))
+        {
+            return Err(format!(
+                "generated DAG cell {} was not launched with the series HERMIT_EPOCH {epoch}",
+                step.job
+            ));
+        }
     }
     Ok(expected)
 }
@@ -6626,6 +6708,13 @@ fn summarize(
     let mut attempted = 0usize;
     let mut passing = Vec::new();
     let mut rows = Vec::new();
+    // The verify histories of each cell's first repetition that this summary
+    // accepted: the operands of the parity post-pass, one harness history per
+    // cell. A first repetition it refused is handed over as its reason
+    // instead, so that side of a parity cell is unavailable, never measured
+    // and never reported missing.
+    let mut parity_rows: Vec<CellResult> = Vec::new();
+    let mut parity_rejected: BTreeMap<(String, String), String> = BTreeMap::new();
     for cell in &metadata.cells {
         for repetition in repetition_numbers(metadata.repetitions) {
             let slug = cell_run_slug(cell, repetition);
@@ -6983,6 +7072,21 @@ fn summarize(
             }
             if !evidence_errors.is_empty() {
                 result = "infrastructure-error";
+            }
+            if cell.mode == parity::PARITY_MODE && repetition.is_none_or(|number| number == 1) {
+                if row_valid && evidence_errors.is_empty() {
+                    parity_rows.extend(result_rows_for_history.iter().cloned());
+                } else {
+                    let why = if evidence_errors.is_empty() {
+                        format!("result {result} with no valid result row")
+                    } else {
+                        evidence_errors.join("; ")
+                    };
+                    parity_rejected.insert(
+                        (cell.test.clone(), cell.backend.clone()),
+                        format!("result row rejected by the series summary: {why}"),
+                    );
+                }
             }
             let retained_attempts = retained_attempt_count(
                 &result_rows_for_history,
@@ -7429,6 +7533,17 @@ fn summarize(
     fs::write(results.join("summary.json"), text)
         .map_err(|e| format!("cannot write summary.json: {e}"))?;
     println!("Summary: {}", results.join("summary.json").display());
+    // After summary.json and before the verdict below: the parity report can
+    // neither change the summary nor the exit status.
+    report_parity(
+        root,
+        results,
+        &metadata,
+        &parity_rows,
+        &parity_rejected,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    );
     if totals[6] > 0 {
         return Err(format!(
             "{} selected cell run(s) were sandbox-denied before the requested operation completed; retained stdout/stderr names the BPFJailer denial",
@@ -7455,6 +7570,133 @@ fn summarize(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a self-test to panic inside [`report_parity`], outside
+    /// [`parity::post_pass`] and its own panic guard.
+    static PANIC_IN_SERIES_PARITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run the parity post-pass over one completed series and write its summary
+/// line to `out`. It writes only `parity.jsonl`, `parity.status.json` and
+/// `parity/` in the result directory and returns nothing: an error, a panic,
+/// or an `out` or `err` that cannot be written is reported where it can be,
+/// and neither `summary.json` nor the exit status changes. A post-pass that
+/// refused or panicked before measuring leaves no earlier summary's records
+/// behind. `rejected` holds the verify cells whose first repetition the
+/// summary refused, with the reason; their parity cells are unavailable.
+fn report_parity(
+    root: &Path,
+    results: &Path,
+    metadata: &RunMetadata,
+    rows: &[CellResult],
+    rejected: &BTreeMap<(String, String), String>,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) {
+    let mut config = parity::PostPassConfig::new(
+        results,
+        &parity_hermit_bin(root, rows),
+        &metadata.run_id,
+        &metadata.hermit_sha,
+    );
+    config.jobs = usize::try_from(metadata.jobs).unwrap_or(1).max(1);
+    config.rejected = rejected.clone();
+    let mut warnings = Vec::new();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if PANIC_IN_SERIES_PARITY.with(|armed| armed.replace(false)) {
+            panic!("planted series post-pass panic");
+        }
+        pressure_parity(root, &config, metadata, rows, &mut warnings)
+    }));
+    for warning in &warnings {
+        let _ = writeln!(err, "pressure-test: {warning}");
+    }
+    match outcome {
+        Ok(Ok(Some(report))) => {
+            let _ = writeln!(out, "pressure-test: {}", report.summary_line());
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => {
+            let _ = writeln!(
+                err,
+                "pressure-test: parity post-pass failed (exit status unaffected): {error}"
+            );
+        }
+        Err(_) => {
+            let cleared = parity::clear_outputs(&config);
+            let _ = writeln!(
+                err,
+                "pressure-test: parity post-pass panicked (exit status unaffected)"
+            );
+            if let Err(error) = cleared {
+                let _ = writeln!(err, "pressure-test: {error}");
+            }
+        }
+    }
+}
+
+/// The same [`parity::post_pass`] that `test-harness run` calls, over the
+/// verify histories of the whole series that the summary accepted. Its scope
+/// comes from [`parity::resolve_scope`], the harness's rule: a cell of the
+/// committed selection or of `--parity-select` is reported when the series
+/// ran its ptrace or its candidate verify cell, and an explicit cell with
+/// neither side in the series is dropped with a warning. `None` when nothing
+/// is in scope. When nothing is measured, because the scope is empty or
+/// cannot be resolved, the previous outputs are removed first.
+fn pressure_parity(
+    root: &Path,
+    config: &parity::PostPassConfig,
+    metadata: &RunMetadata,
+    rows: &[CellResult],
+    warnings: &mut Vec<String>,
+) -> Result<Option<parity::PostPassReport>, String> {
+    let scope = match series_parity_scope(root, metadata) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return Err(match parity::clear_outputs(config) {
+                Ok(()) => error,
+                Err(cleared) => format!("{error}; {cleared}"),
+            });
+        }
+    };
+    warnings.extend(scope.warnings);
+    if scope.cells.is_empty() {
+        return parity::clear_outputs(config).map(|()| None);
+    }
+    parity::post_pass(config, &scope.cells, rows).map(Some)
+}
+
+/// [`parity::resolve_scope`] over the verify cells of one series and its
+/// `--parity-select` cells.
+fn series_parity_scope(
+    root: &Path,
+    metadata: &RunMetadata,
+) -> Result<parity::ResolvedScope, String> {
+    let manifests = ManifestSet::load(root)?;
+    let planned = metadata
+        .cells
+        .iter()
+        .filter(|cell| cell.mode == parity::PARITY_MODE)
+        .map(|cell| (cell.test.clone(), cell.backend.clone()))
+        .collect();
+    let explicit = metadata.parity_select.join(",");
+    parity::resolve_scope(root, &manifests, Some(&explicit), &planned)
+}
+
+/// The hermit whose `log-diff` compares the logs: the binary the verify cells
+/// ran (their argv[0]) while it still exists, then `HERMIT_BIN`, then the
+/// checkout's release build. It runs no guest.
+fn parity_hermit_bin(root: &Path, rows: &[CellResult]) -> PathBuf {
+    rows.iter()
+        .filter_map(|row| row.argv.first())
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute() && path.is_file())
+        .or_else(|| env::var_os("HERMIT_BIN").map(PathBuf::from))
+        .unwrap_or_else(|| root.join("target/release/hermit"))
 }
 
 fn sanitize(value: &str) -> String {
@@ -12130,6 +12372,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         cells_file: None,
         cells_file_sha256: None,
         selected_population_sha256: None,
+        hermit_epoch: None,
+        parity_select: Vec::new(),
         cells: vec![sample_a.clone()],
     };
     if current_result_policy(&sample_metadata, false)?
@@ -15141,6 +15385,771 @@ mod pressure_sample_tests {
             for (path, bytes) in saved_rows { fs::write(path, bytes).unwrap(); }
         }
 
+        cleanup.remove().unwrap();
+    }
+
+    fn checkout_root() -> PathBuf {
+        Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf()
+    }
+
+    /// A fresh result directory that is removed even if the test panics.
+    fn parity_self_test_results(label: &str) -> (PathBuf, SelfTestDirectory) {
+        let results = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&results).unwrap();
+        let cleanup = SelfTestDirectory::new(results.clone());
+        (results, cleanup)
+    }
+
+    /// Every file under `directory` except the parity outputs, by relative path.
+    fn files_outside_parity(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![directory.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(directory).unwrap().to_path_buf();
+                if relative == Path::new(parity::PARITY_JSONL)
+                    || relative == Path::new(parity::PARITY_STATUS_JSON)
+                    || relative == Path::new("parity")
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.insert(relative, fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    /// Retain `PROMOTION_REPETITIONS` diverged ptrace verify repetitions of
+    /// `selected`, each with its captures, golden and verification report, the
+    /// evidence a confirmed failure needs.
+    fn plant_diverged_verify_series(
+        results: &Path,
+        selected: &TrackedCell,
+        metadata: &RunMetadata,
+    ) -> BTreeMap<String, RunnerEvidence> {
+        let mut evidence = BTreeMap::new();
+        let mut inner = comparison_attempt("verify", 0);
+        inner.outcome = "FAIL".into();
+        inner.status = Some(1);
+        inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+        let mut report: JsonValue =
+            serde_json::from_str(inner.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        replace_report(&mut inner, report);
+        for repetition in 1..=PROMOTION_REPETITIONS {
+            let slug = cell_run_slug(&selected.id, Some(repetition));
+            let run_id = cell_evidence_run_id(
+                &selected.id,
+                Some(repetition),
+                metadata.run_id_prefix.as_deref(),
+            );
+            let cell_dir = results.join("cells").join(&slug);
+            fs::create_dir_all(&cell_dir).unwrap();
+            fs::write(cell_dir.join("harness-status"), "1\n").unwrap();
+            let artifact = results.join("runs").join(&run_id).join("attempt-1");
+            let logs = artifact.join("verify-logs/verify-1");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
+            fs::write(logs.join("run2_log_fixture.log"), "INFO second\n").unwrap();
+            fs::write(logs.join("normalized-ptrace-golden.log"), "INFO normalized\n").unwrap();
+            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
+            fs::write(
+                verification_report_path(&artifact),
+                inner.verification_report.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut row = history_row("verify", "FAIL", 1, vec![inner.clone()]);
+            row.run_id = run_id;
+            row.run_index = Some(repetition as u64);
+            row.hermit_sha = metadata.hermit_sha.clone();
+            row.test = selected.id.test.clone();
+            row.category = selected.id.category.clone();
+            row.lane = selected.id.lane.clone();
+            row.classification = if selected.is_applicable() {
+                "required"
+            } else {
+                "disabled"
+            }
+            .into();
+            row.result = Some(ObservedResult::DeterminismFailure);
+            row.failure_class = Some(FailureClass::ProductFailure);
+            row.argv = inner.argv.clone();
+            row.guest_argv = inner.guest_argv.clone();
+            row.env = inner.env.clone();
+            row.cwd = inner.cwd.clone();
+            row.shell_command = inner.shell_command.clone();
+            row.timeout_seconds = 57;
+            row.execution_cpu_timeout_seconds = Some(22);
+            row.execution_wall_timeout_seconds = Some(57);
+            row.artifact_dir = artifact.to_string_lossy().into_owned();
+            fs::write(
+                cell_dir.join("results.jsonl"),
+                format!("{}\n", serde_json::to_string(&row).unwrap()),
+            )
+            .unwrap();
+            evidence.insert(
+                format!("cell.{slug}"),
+                RunnerEvidence {
+                    seen: true,
+                    ok: false,
+                    ..RunnerEvidence::default()
+                },
+            );
+        }
+        evidence
+    }
+
+    /// One series samples one HERMIT_EPOCH and launches every cell with it, so
+    /// the ptrace reference and the candidate of a parity cell, which are
+    /// separate harness processes, start their guests on one clock. A retained
+    /// series with a cell on another clock is refused, and every pinned-root
+    /// wrapper in the validation DAG forwards the same variable.
+    #[test]
+    fn series_pins_one_hermit_epoch_for_every_cell_and_pinned_roots_forward_it() {
+        let root = checkout_root();
+        let checked = check_scorecard(&root).unwrap();
+        let available = pressure_cells(&root, &CellSelection::default()).unwrap();
+        let selected = available
+            .selected
+            .iter()
+            .find(|cell| cell.id.mode == "verify" && cell.id.backend == "ptrace")
+            .expect("fixture needs a selected ptrace verify cell");
+        let (results, cleanup) = parity_self_test_results("epoch");
+        let selection = CellSelection {
+            test: Some(selected.id.test.clone()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            repetitions: Some(3),
+            run_id_prefix: Some("epoch-pin".into()),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            ..CellSelection::default()
+        };
+        let (mut metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        let epoch = metadata
+            .hermit_epoch
+            .clone()
+            .expect("a planned series records its epoch");
+        if env::var_os("HERMIT_EPOCH").is_none() {
+            // Sampled from host time, in RFC 3339.
+            assert!(
+                epoch.len() >= 20 && epoch.as_bytes()[4] == b'-' && epoch.contains('T'),
+                "{epoch}"
+            );
+        }
+        let retained: RunMetadata =
+            serde_json::from_slice(&fs::read(results.join("run.json")).unwrap()).unwrap();
+        assert_eq!(retained.hermit_epoch.as_deref(), Some(epoch.as_str()));
+        let pinned = format!(" HERMIT_EPOCH={} ", shell_quote(&epoch));
+        let dag_text = fs::read_to_string(results.join("dag.json")).unwrap();
+        let dag = dag_from_json(&dag_text).unwrap();
+        let cells: Vec<_> = dag.steps.iter().filter(|step| step.group == "cell").collect();
+        assert_eq!(cells.len(), 3);
+        for step in &cells {
+            assert_eq!(step.cmd.matches("HERMIT_EPOCH=").count(), 1, "{}", step.cmd);
+            assert!(step.cmd.contains(&pinned), "{}", step.cmd);
+            assert!(step.cmd.contains(" E2E_KEEP_VERIFY_LOGS=1 "), "{}", step.cmd);
+            assert!(
+                step.cmd
+                    .contains(&format!(" {}=0 ", parity::PARITY_POST_PASS_ENV)),
+                "{}",
+                step.cmd
+            );
+        }
+        metadata.source_tree_dirty = false;
+        validate_run_contract(&root, &results, &metadata, false).unwrap();
+        let mut altered: JsonValue = serde_json::from_str(&dag_text).unwrap();
+        let step = altered["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| step["group"] == "cell")
+            .unwrap();
+        let other_clock = format!(" HERMIT_EPOCH={} ", shell_quote("2001-01-01T00:00:00+00:00"));
+        step["cmd"] = json!(step["cmd"].as_str().unwrap().replace(&pinned, &other_clock));
+        fs::write(results.join("dag.json"), serde_json::to_vec(&altered).unwrap()).unwrap();
+        let error = validate_run_contract(&root, &results, &metadata, false).unwrap_err();
+        assert!(
+            error.contains("was not launched with the series HERMIT_EPOCH"),
+            "{error}"
+        );
+        cleanup.remove().unwrap();
+
+        // Validation's hermetic wrapper forwards the variable when it is set.
+        let validate: JsonValue =
+            serde_json::from_slice(&fs::read(root.join("ci/dag/validate.json")).unwrap()).unwrap();
+        let headers: Vec<String> = validate["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|step| step["cmd"].as_str())
+            .filter(|cmd| cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "))
+            .map(|cmd| format!("{} ", cmd.split_once(" -- ").map_or(cmd, |(header, _)| header)))
+            .collect();
+        assert!(headers.len() > 100, "{} pinned-root commands", headers.len());
+        for header in headers {
+            assert_eq!(header.matches(" --env HERMIT_EPOCH ").count(), 1, "{header}");
+            // And the parity post-pass controls, so a pinned-root harness is
+            // activated and turned off as the caller asked.
+            for name in [parity::PARITY_SELECT_ENV, parity::PARITY_POST_PASS_ENV] {
+                assert_eq!(
+                    header.matches(&format!(" --env {name} ")).count(),
+                    1,
+                    "{header}"
+                );
+            }
+        }
+    }
+
+    /// The parity records of `path`, one per line.
+    fn read_parity_records(path: &Path) -> Vec<parity::ParityRecord> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The record of `cell` in `records`.
+    fn parity_record<'a>(
+        records: &'a [parity::ParityRecord],
+        cell: &parity::ParityCellId,
+    ) -> &'a parity::ParityRecord {
+        records
+            .iter()
+            .find(|record| record.test_id == cell.test_id && record.backend == cell.backend)
+            .unwrap_or_else(|| panic!("no parity line for {cell} in {records:?}"))
+    }
+
+    /// The series' parity post-pass is the harness's post-pass, with the
+    /// harness's scope rule. It runs after summary.json is written and changes
+    /// no file but its own. A selected cell whose ptrace verify cell the series
+    /// ran and whose candidate it did not is candidate-missing with null
+    /// credit; a selected cell with neither side in the series is dropped with
+    /// a warning. A post-pass that measures nothing, because its scope is empty
+    /// or cannot be resolved, leaves no records of an earlier summary behind. A
+    /// verify cell whose first repetition the summary refused makes its parity
+    /// cells unavailable, with the summary's reason.
+    #[test]
+    fn series_parity_post_pass_reports_missing_operands_and_leaves_the_summary_unchanged() {
+        let root = checkout_root();
+        let checked = check_scorecard(&root).unwrap();
+        let manifests = ManifestSet::load(&root).unwrap();
+        let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
+        let comparable = |cell: &parity::ParityCellId| {
+            cell.backend.inputs_not_equalizable().is_none()
+                && matrix
+                    .get(cell)
+                    .is_some_and(parity::ParityAvailability::applicable)
+        };
+        // A test the committed selection does not name, so a series of its
+        // ptrace verify cell alone has nothing in scope until a cell is
+        // selected explicitly.
+        let committed_tests: BTreeSet<String> = parity::ParitySelection::load(&root, &matrix)
+            .unwrap()
+            .cells
+            .into_iter()
+            .map(|cell| cell.test_id)
+            .collect();
+        let available = pressure_cells(&root, &CellSelection::default()).unwrap();
+        let (selected, failed_cell) = available
+            .selected
+            .iter()
+            .filter(|cell| cell.id.mode == "verify" && cell.id.backend == "ptrace")
+            .filter(|cell| !committed_tests.contains(&cell.id.test))
+            .find_map(|cell| {
+                parity::ParityBackend::ALL
+                    .into_iter()
+                    .map(|backend| parity::ParityCellId {
+                        test_id: cell.id.test.clone(),
+                        backend,
+                    })
+                    .find(|candidate| comparable(candidate))
+                    .map(|candidate| (cell, candidate))
+            })
+            .expect(
+                "fixture needs a red ptrace verify cell whose test has a comparable parity cell \
+                 and is not in the committed selection",
+            );
+        let missing_cell = matrix
+            .cells()
+            .map(|(cell, _)| cell)
+            .find(|cell| cell.test_id != selected.id.test && comparable(cell))
+            .cloned()
+            .expect("the matrix has a comparable parity cell of another test");
+        let (results, cleanup) = parity_self_test_results("parity");
+        let selection = CellSelection {
+            test: Some(selected.id.test.clone()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            repetitions: Some(PROMOTION_REPETITIONS),
+            run_id_prefix: Some("parity-post-pass".into()),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            ..CellSelection::default()
+        };
+        let (mut metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        assert!(metadata.parity_select.is_empty());
+        metadata.source_tree_dirty = false;
+        let write_metadata = |metadata: &RunMetadata| {
+            fs::write(
+                results.join("run.json"),
+                serde_json::to_vec(metadata).unwrap(),
+            )
+            .unwrap();
+        };
+        write_metadata(&metadata);
+        let evidence = plant_diverged_verify_series(&results, selected, &metadata);
+        let summary_path = results.join("summary.json");
+        let parity_path = results.join(parity::PARITY_JSONL);
+        let status_path = results.join(parity::PARITY_STATUS_JSON);
+        let first_repetition = results
+            .join("cells")
+            .join(cell_run_slug(&selected.id, Some(1)));
+
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        let without = fs::read(&summary_path).unwrap();
+        let mut untouched = files_outside_parity(&results);
+        untouched.remove(Path::new("run.json"));
+        let summary: JsonValue = serde_json::from_slice(&without).unwrap();
+        assert_eq!(
+            summary["repeated_cells"][0]["classification"],
+            "confirmed-failing"
+        );
+        // Nothing is in scope, so nothing is written.
+        assert!(!parity_path.exists());
+        assert!(!status_path.exists());
+        assert!(!results.join("parity").exists());
+
+        let explicit = vec![failed_cell.to_string(), missing_cell.to_string()];
+        metadata.parity_select = explicit.clone();
+        write_metadata(&metadata);
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        assert_eq!(
+            fs::read(&summary_path).unwrap(),
+            without,
+            "the parity post-pass changed summary.json"
+        );
+        let mut after = files_outside_parity(&results);
+        after.remove(Path::new("run.json"));
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            untouched.keys().collect::<Vec<_>>()
+        );
+        assert!(after == untouched, "the parity post-pass changed a series file");
+        let records = read_parity_records(&parity_path);
+        // The cell with neither side in the series has no line.
+        assert_eq!(records.len(), 1, "{records:?}");
+        let failed = parity_record(&records, &failed_cell);
+        assert_eq!(failed.verdict, parity::ParityVerdict::CandidateMissing);
+        assert!(
+            failed.reason.as_deref().is_some_and(|reason| reason.contains(&format!(
+                "the {} candidate verify cell of {} has no result row in this run",
+                failed_cell.backend, failed_cell.test_id
+            ))),
+            "{failed:?}"
+        );
+        for record in &records {
+            record.validate().unwrap();
+            assert_eq!((record.credit, record.unequalized_credit), (None, None));
+            assert!(!record.inputs_equalized);
+            assert_eq!(record.run_id, metadata.run_id);
+            assert_eq!(record.hermit_sha, metadata.hermit_sha);
+        }
+        let status: JsonValue = serde_json::from_slice(&fs::read(&status_path).unwrap()).unwrap();
+        assert_eq!(status["state"], "complete", "{status}");
+        // The dropped cell is named on stderr, and the summary line reaches
+        // stdout.
+        let rows: Vec<CellResult> = read_result_rows(&first_repetition.join("results.jsonl")).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        report_parity(
+            &root,
+            &results,
+            &metadata,
+            &rows,
+            &BTreeMap::new(),
+            &mut out,
+            &mut err,
+        );
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert!(out.starts_with("pressure-test: parity: 1 cell(s) -> "), "{out}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(
+            err.contains(&format!(
+                "pressure-test: explicitly selected parity cell {missing_cell} is not reported by this run"
+            )),
+            "{err}"
+        );
+
+        // A post-pass with nothing in scope leaves no earlier records behind.
+        metadata.parity_select.clear();
+        write_metadata(&metadata);
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        assert_eq!(fs::read(&summary_path).unwrap(), without);
+        assert!(!parity_path.exists());
+        assert!(!status_path.exists());
+
+        // A post-pass that fails is reported; the summary and the result stand,
+        // and no earlier records are left behind.
+        metadata.parity_select = explicit.clone();
+        write_metadata(&metadata);
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        assert_eq!(read_parity_records(&parity_path).len(), 1);
+        let mut refused = metadata.clone();
+        refused.parity_select = vec!["no-such-bucket/no-such-test@kvm".into()];
+        write_metadata(&refused);
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        assert_eq!(fs::read(&summary_path).unwrap(), without);
+        assert!(!parity_path.exists());
+        assert!(!status_path.exists());
+
+        // A first repetition the summary refused is never read: its parity
+        // cell is unavailable with the summary's reason, not missing.
+        metadata.parity_select = vec![failed_cell.to_string()];
+        write_metadata(&metadata);
+        let harness_status = first_repetition.join("harness-status");
+        fs::write(&harness_status, "x\n").unwrap();
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("produced no trustworthy result"), "{error}");
+        let records = read_parity_records(&parity_path);
+        assert_eq!(records.len(), 1, "{records:?}");
+        let refused = parity_record(&records, &failed_cell);
+        assert_eq!(refused.verdict, parity::ParityVerdict::Unavailable, "{refused:?}");
+        let reason = refused.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(&format!(
+                "the ptrace reference verify cell of {}: result row rejected by the series summary: ",
+                failed_cell.test_id
+            )) && reason.contains("contains nonnumeric harness exit `x`"),
+            "{refused:?}"
+        );
+        refused.validate().unwrap();
+        fs::write(&harness_status, "1\n").unwrap();
+        cleanup.remove().unwrap();
+    }
+
+    /// The series measures exactly the verify cells its summary accepted. A
+    /// sampled green series of one test's ptrace verify cell and a comparable
+    /// candidate is compared, through `summarize`, by the log-diff of the
+    /// binary the cells ran, as unequalized credit. A panic in the post-pass,
+    /// or an output that cannot be written, changes neither the summary nor
+    /// the result, and a panic leaves no earlier records behind. A cell whose
+    /// row is valid but whose retained evidence the summary refused is
+    /// unavailable with that reason and is not compared.
+    #[test]
+    fn series_parity_post_pass_measures_only_the_verify_cells_summarize_accepted() {
+        let root = checkout_root();
+        check_scorecard(&root).unwrap();
+        // A kvm candidate is fine on a host without KVM: no guest runs.
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let manifests = ManifestSet::load(&root).unwrap();
+        let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
+        let population = pressure_cells(
+            &root,
+            &CellSelection {
+                green: true,
+                mode: Some("verify".into()),
+                repetitions: Some(1),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<CellId> = population.selected.iter().map(|cell| cell.id.clone()).collect();
+        // The first seed whose two-cell sample is one test's ptrace verify
+        // cell and a comparable candidate.
+        let (seed, cell) = (0..1_000_000u64)
+            .find_map(|seed| {
+                let mut scored: Vec<(u64, &CellId)> =
+                    ids.iter().map(|id| (sample_score(id, seed), id)).collect();
+                scored.select_nth_unstable(1);
+                let (first, second) = (scored[0].1, scored[1].1);
+                if first.test != second.test {
+                    return None;
+                }
+                let candidate = [first, second]
+                    .into_iter()
+                    .find(|id| id.backend != parity::PARITY_REFERENCE_BACKEND)?;
+                if [first, second]
+                    .iter()
+                    .all(|id| id.backend != parity::PARITY_REFERENCE_BACKEND)
+                {
+                    return None;
+                }
+                let backend = parity::ParityBackend::ALL
+                    .into_iter()
+                    .find(|backend| backend.as_str() == candidate.backend)?;
+                let cell = parity::ParityCellId {
+                    test_id: candidate.test.clone(),
+                    backend,
+                };
+                (backend.inputs_not_equalizable().is_none()
+                    && matrix
+                        .get(&cell)
+                        .is_some_and(parity::ParityAvailability::applicable))
+                .then_some((seed, cell))
+            })
+            .expect("a seed samples one test's ptrace and comparable candidate verify cells");
+        let (results, cleanup) = parity_self_test_results("parity-green");
+        let selection = CellSelection {
+            green: true,
+            mode: Some("verify".into()),
+            repetitions: Some(1),
+            sample: Some(2),
+            seed: Some(seed),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            ..CellSelection::default()
+        };
+        let (mut metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        assert_eq!(metadata.cells.len(), 2, "{:?}", metadata.cells);
+        metadata.parity_select = vec![cell.to_string()];
+        metadata.source_tree_dirty = false;
+        fs::write(
+            results.join("run.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let epoch = metadata
+            .hermit_epoch
+            .clone()
+            .expect("a planned series records its epoch");
+
+        // The binary the cells ran compares the logs.
+        let tools = results.join("measured-tools");
+        fs::create_dir_all(&tools).unwrap();
+        let hermit = tools.join("hermit");
+        fs::copy(
+            root.join("ci/manifest-plan/tests/fixtures/fake-parity-log-diff.py"),
+            &hermit,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log_diff_calls = || {
+            fs::read_to_string(tools.join("log-diff-calls"))
+                .map_or(0, |calls| calls.lines().count())
+        };
+        let mut evidence = BTreeMap::new();
+        let mut rows = Vec::new();
+        let mut run2_logs = BTreeMap::new();
+        for id in &metadata.cells {
+            let reference = id.backend == parity::PARITY_REFERENCE_BACKEND;
+            let slug = cell_run_slug(id, Some(1));
+            let run_id = cell_evidence_run_id(id, Some(1), metadata.run_id_prefix.as_deref());
+            let cell_dir = results.join("cells").join(&slug);
+            fs::create_dir_all(&cell_dir).unwrap();
+            fs::write(cell_dir.join("harness-status"), "0\n").unwrap();
+            let artifact = results.join("runs").join(&run_id).join("attempt-1");
+            let logs = artifact.join("verify-logs/verify-1");
+            fs::create_dir_all(&logs).unwrap();
+            let log = format!(
+                "INFO detcore a\nINFO detcore b\nINFO detcore {}\n",
+                if reference { "c" } else { "x" }
+            );
+            fs::write(logs.join("run1_log_fixture.log"), &log).unwrap();
+            fs::write(logs.join("run2_log_fixture.log"), &log).unwrap();
+            run2_logs.insert(id.backend.clone(), logs.join("run2_log_fixture.log"));
+            if reference {
+                fs::write(logs.join("normalized-ptrace-golden.log"), &log).unwrap();
+                fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
+            }
+            let mut inner = comparison_attempt("verify", 0);
+            inner.argv = vec![
+                hermit.to_string_lossy().into_owned(),
+                "--verify-log-dir".into(),
+                logs.to_string_lossy().into_owned(),
+            ];
+            inner.env = BTreeMap::from([
+                ("HERMIT_EPOCH".into(), epoch.clone()),
+                ("LC_ALL".into(), "C".into()),
+            ]);
+            inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+            fs::write(
+                verification_report_path(&artifact),
+                inner.verification_report.as_ref().unwrap(),
+            )
+            .unwrap();
+            let mut row = history_row("verify", "PASS", 1, vec![inner.clone()]);
+            row.run_id = run_id;
+            row.run_index = Some(1);
+            row.hermit_sha = metadata.hermit_sha.clone();
+            row.test = id.test.clone();
+            row.category = id.category.clone();
+            row.lane = id.lane.clone();
+            row.backend = Some(id.backend.clone());
+            row.classification = "required".into();
+            row.argv = inner.argv.clone();
+            row.guest_argv = inner.guest_argv.clone();
+            row.env = inner.env.clone();
+            row.cwd = inner.cwd.clone();
+            row.shell_command = inner.shell_command.clone();
+            row.timeout_seconds = 57;
+            row.execution_cpu_timeout_seconds = Some(22);
+            row.execution_wall_timeout_seconds = Some(57);
+            row.artifact_dir = artifact.to_string_lossy().into_owned();
+            fs::write(
+                cell_dir.join("results.jsonl"),
+                format!("{}\n", serde_json::to_string(&row).unwrap()),
+            )
+            .unwrap();
+            rows.push(row);
+            evidence.insert(
+                format!("cell.{slug}"),
+                RunnerEvidence {
+                    seen: true,
+                    ok: true,
+                    ..RunnerEvidence::default()
+                },
+            );
+        }
+        let summary_path = results.join("summary.json");
+        let parity_path = results.join(parity::PARITY_JSONL);
+        let status_path = results.join(parity::PARITY_STATUS_JSON);
+
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        let summary = fs::read(&summary_path).unwrap();
+        let records = read_parity_records(&parity_path);
+        let measured = parity_record(&records, &cell);
+        assert_eq!(measured.verdict, parity::ParityVerdict::Diverged, "{measured:?}");
+        assert_eq!(measured.matched_prefix, Some(2));
+        assert_eq!(measured.credit, None);
+        assert!(
+            measured
+                .unequalized_credit
+                .is_some_and(|credit| credit > 0.0 && credit < 1.0),
+            "{measured:?}"
+        );
+        assert!(!measured.inputs_equalized);
+        assert_eq!(measured.run_id, metadata.run_id);
+        // Any other line is a committed cell of the same test whose candidate
+        // the sample did not run.
+        for record in &records {
+            record.validate().unwrap();
+            if record.backend != cell.backend {
+                assert_eq!(record.test_id, cell.test_id, "{record:?}");
+                assert_eq!(record.verdict, parity::ParityVerdict::CandidateMissing, "{record:?}");
+            }
+        }
+        let (golden, sidecar) = parity::golden_paths(&results, &cell.test_id).unwrap();
+        assert!(golden.is_file() && sidecar.is_file());
+        assert_eq!(log_diff_calls(), 1);
+
+        // A panic in the post-pass is reported and changes nothing else, and
+        // the records of the previous summary are gone.
+        PANIC_IN_SERIES_PARITY.with(|armed| armed.set(true));
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        assert!(!PANIC_IN_SERIES_PARITY.with(std::cell::Cell::get));
+        assert_eq!(fs::read(&summary_path).unwrap(), summary);
+        assert!(!parity_path.exists());
+        assert!(!status_path.exists());
+        assert_eq!(log_diff_calls(), 1);
+        PANIC_IN_SERIES_PARITY.with(|armed| armed.set(true));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        report_parity(
+            &root,
+            &results,
+            &metadata,
+            &rows,
+            &BTreeMap::new(),
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(out.is_empty());
+        assert!(
+            err.contains("pressure-test: parity post-pass panicked (exit status unaffected)"),
+            "{err}"
+        );
+
+        // Output that cannot be written is not the post-pass's problem.
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        report_parity(
+            &root,
+            &results,
+            &metadata,
+            &rows,
+            &BTreeMap::new(),
+            &mut Closed,
+            &mut Closed,
+        );
+        assert_eq!(log_diff_calls(), 2);
+        assert_eq!(
+            parity_record(&read_parity_records(&parity_path), &cell).verdict,
+            parity::ParityVerdict::Diverged
+        );
+
+        // A valid row whose retained evidence the summary refused is not
+        // compared: its cell is unavailable with the summary's reason.
+        fs::remove_file(&run2_logs[cell.backend.as_str()]).unwrap();
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("produced no trustworthy result"), "{error}");
+        let records = read_parity_records(&parity_path);
+        let refused = parity_record(&records, &cell);
+        assert_eq!(refused.verdict, parity::ParityVerdict::Unavailable, "{refused:?}");
+        let reason = refused.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(&format!(
+                "the {} candidate verify cell of {}: result row rejected by the series summary: ",
+                cell.backend, cell.test_id
+            )) && reason.contains(
+                "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
+            ),
+            "{refused:?}"
+        );
+        refused.validate().unwrap();
+        assert_eq!(log_diff_calls(), 2);
         cleanup.remove().unwrap();
     }
 

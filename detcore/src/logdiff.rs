@@ -1011,6 +1011,32 @@ fn matched_prefix_length(compared_left: &[String], compared_right: &[String]) ->
         .count()
 }
 
+/// The matched prefix to report, or None when the exact prefix scan cannot
+/// stand behind the comparator's verdict.
+///
+/// A match must have matched over the full length of both streams, and a
+/// divergence must leave at least one message unmatched. The exact comparator
+/// always satisfies this, because its verdict is the same message-by-message
+/// scan. The external `git diff -w` comparator does not: it compares rendered
+/// text, so one multi-line record on one side and the same lines as two records
+/// on the other match with unequal counts, messages that differ only in
+/// whitespace match although the exact scan stops at them, and a git error exit
+/// on identical streams reads as a divergence with nothing unmatched. Reporting
+/// any of these would claim a prefix nobody measured, so none is reported.
+fn matched_prefix_for_verdict(
+    diff_found: bool,
+    prefix: usize,
+    compared_left: usize,
+    compared_right: usize,
+) -> Option<usize> {
+    let consistent = if diff_found {
+        prefix < compared_left.max(compared_right)
+    } else {
+        prefix == compared_left && prefix == compared_right
+    };
+    consistent.then_some(prefix)
+}
+
 fn first_different_message_indices(
     left: &[LogMessage<'_>],
     compared_left: &[String],
@@ -1516,7 +1542,11 @@ pub struct LogDiffSummary {
     ///
     /// Equal to both compared counts when the streams match. When one stream is
     /// a strict prefix of the other it is the shorter length, because the extra
-    /// messages are the divergence. None only when the comparison was refused.
+    /// messages are the divergence. None when the comparison was refused, and
+    /// when the verdict came from the `git diff -w` comparator and the exact
+    /// prefix scan disagrees with it (a match over unequal counts, or a
+    /// divergence with nothing unmatched); see the private
+    /// `matched_prefix_for_verdict` in this module.
     ///
     /// This is not [`Self::first_divergent_record`] minus one: that field is a
     /// raw log-record index, which also counts records outside the compared
@@ -2206,15 +2236,15 @@ pub fn log_diff_summary_from_strs_with_filter(
             .then_some(first_different)
             .flatten()
             .and_then(|(left_index, right_index)| left_index.or(right_index)),
-        matched_prefix_messages: Some(if diff_found {
-            matched_prefix_length(&prepared_a, &prepared_b)
-        } else {
-            // No difference: the streams agree over their full length. The
-            // external `git diff -w` comparator may accept whitespace-only
-            // differences the exact prefix scan would not, so its verdict,
-            // not the scan, decides a match.
-            compared_a.len().max(compared_b.len())
-        }),
+        // The exact scan on both branches. The verdict still comes from the
+        // comparator, but a prefix is reported only where the scan agrees
+        // with it, so a `git diff -w` match over unequal counts reports none.
+        matched_prefix_messages: matched_prefix_for_verdict(
+            diff_found,
+            matched_prefix_length(&prepared_a, &prepared_b),
+            compared_a.len(),
+            compared_b.len(),
+        ),
         first_divergent_syscall: diff_found
             .then_some(first_divergent_syscall_candidate)
             .flatten(),
@@ -2786,6 +2816,66 @@ mod test {
         assert_eq!(empty.matched_prefix_messages, Some(0));
     }
 
+    /// The reported prefix is the exact scan's, and only where that scan
+    /// agrees with the verdict: a match covers both full streams, and a
+    /// divergence leaves something unmatched. Every other combination is
+    /// withheld rather than reported.
+    #[test]
+    fn a_matched_prefix_is_reported_only_where_the_exact_scan_agrees_with_the_verdict() {
+        // (diff_found, exact prefix, left, right) -> reported
+        for (case, diff_found, prefix, left, right, expected) in [
+            ("full match", false, 3, 3, 3, Some(3)),
+            ("empty match", false, 0, 0, 0, Some(0)),
+            ("divergence inside both", true, 2, 4, 4, Some(2)),
+            ("divergence at the first message", true, 0, 3, 3, Some(0)),
+            ("strict prefix", true, 2, 2, 5, Some(2)),
+            ("match over unequal counts", false, 2, 1, 2, None),
+            ("match of a strict prefix", false, 1, 1, 2, None),
+            ("match the exact scan stops inside", false, 1, 2, 2, None),
+            ("divergence with nothing unmatched", true, 3, 3, 3, None),
+            ("divergence of two empty streams", true, 0, 0, 0, None),
+        ] {
+            assert_eq!(
+                super::matched_prefix_for_verdict(diff_found, prefix, left, right),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// `git diff -w` compares rendered text, so one multi-line record on the
+    /// left and the same two lines as two records on the right MATCH with
+    /// compared counts 1 | 2. The old code reported a matched prefix of 2 for
+    /// that match, longer than the left stream. The exact comparator on the
+    /// same input is the control: it diverges at the first message.
+    #[test]
+    fn a_git_diff_match_over_unequal_counts_reports_no_matched_prefix() {
+        let left = "Apr 09 06:08:01.100  INFO detcore: a\nINFO detcore: b\n";
+        let right = format!("{}{}", record(1, "a"), record(2, "b"));
+
+        let git_opts = super::LogDiffOpts {
+            git_diff: true,
+            ..info_opts()
+        };
+        let git = super::log_diff_summary_from_strs(left, &right, &git_opts, &mut Vec::new())
+            .expect("comparing in-memory strings cannot fail on I/O");
+        assert_eq!((git.compared_left, git.compared_right), (1, 2));
+        assert!(
+            !git.diff_found,
+            "git diff -w must accept the split record (this test needs git on PATH)"
+        );
+        assert_eq!(
+            git.matched_prefix_messages, None,
+            "a match over 1 | 2 compared messages has no prefix covering both streams"
+        );
+
+        let exact = super::log_diff_summary_from_strs(left, &right, &info_opts(), &mut Vec::new())
+            .expect("comparing in-memory strings cannot fail on I/O");
+        assert_eq!((exact.compared_left, exact.compared_right), (1, 2));
+        assert!(exact.diff_found);
+        assert_eq!(exact.matched_prefix_messages, Some(0));
+    }
+
     /// An untagged line REFUSES the comparison instead of panicking, and the
     /// refusal names the line. A panic is the wrong failure mode for a tool
     /// people reach for when something is already broken, and the `--json`
@@ -3122,6 +3212,10 @@ mod test {
             assert!(
                 !summary.matched_with_evidence(),
                 "{label}: the evidence predicate must also refuse"
+            );
+            assert_eq!(
+                summary.matched_prefix_messages, None,
+                "{label}: a refused comparison measured no matched prefix"
             );
             let text = String::from_utf8(out).unwrap();
             assert!(

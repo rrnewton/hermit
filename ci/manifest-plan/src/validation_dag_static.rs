@@ -31,7 +31,8 @@ pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
 pub(super) const MANIFEST_GATE_INNER_JOBS: i64 = 2;
-const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their seven top-level audits run serially inside the shared aggregate budget: the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged."########;
+pub(super) const MANIFEST_GATE_CPU_SECONDS: i64 = 900;
+const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their seven top-level audits run serially inside the shared aggregate budget: the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged. CPU BOUND 2026-09-28: the ordinary and quick/super gates now carry 900 CPU seconds; the hosted-privileged variant keeps 600 with its 180-second wall. The audit work did not grow. At Hermit 81ca8822, b280bc48 and 1bd45c15 each audit's waited user+sys CPU agreed within 1% (scorecard 254.6-256.6, pressure 62.5-63.0, validate.rs 28.4-28.8 seconds), and across the 46 retained local validation profiles of this step from 2026-09-22 to 2026-09-28 user CPU stayed at or below 316.2 seconds while system CPU ranged from 32 to 374 seconds. The variable part is process creation. One complete gate at 81ca8822 runs 4011 git commands (scorecard 3182, validate.rs 509, pressure 204, DBT budget 65), and the local validation host resolves git to a telemetry wrapper that measured 51-85 ms of CPU per call against 5.1-5.2 ms for the git it wraps, spawning five further git processes and a detached logger for each call. On an unthrottled host the complete gate consumed 512.0 (b280bc48) and 535.7 (1bd45c15) CPU seconds with that wrapper first on PATH, and 305.5 and 300.7 with the wrapped git first. Three consecutive local runs on 2026-09-28 reached the old 600-second cap inside audits 5-7 with 340-374 seconds of system CPU. The largest observed user CPU, 316.2 seconds, times one plus the largest observed system/user ratio, 1.655, is 839.5 CPU seconds; 900 leaves 60.5 seconds above that product. It remains a runaway bound: a two-core spin is killed after 450 seconds, half of the unchanged 900-second wall."########;
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -225,13 +226,30 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The release-profile GlobalTime behind-baseline refusal test retains all
     // 623 prior identities.
     // The failed_match series-evidence test retains all 624 prior identities.
-    ("test.regular_crates", 625),
+    // The parity overhaul (d550979ad0, 71b5bca69b, b9ec113b5f, b280bc4807) adds
+    // 24 tests (15 parity, 3 logdiff_report, 2 runner, one each in schema10,
+    // validation_dag, test-harness and cli_help) and removes 9 ptrace
+    // parity-rerun tests: 625 + 24 - 9 = 640 in `cargo nextest list`.
+    // The parity review follow-ups add 5 tests (2 parity, 1 runner, 2 cli_help)
+    // and retain all 640 prior identities (`cargo nextest list` measured 645).
+    // Seven parity post-pass tests and the test-harness post-pass test retain
+    // all 645 prior identities (`cargo nextest list` measured 653).
+    // The post-pass review fixes add 10 tests (7 parity, 3 test-harness) and
+    // retain all 653 prior identities (`cargo nextest list` measured 663).
+    // The series parity post-pass adds one parity test (a rejected operand is
+    // unavailable) and retains all 663 prior identities (measured 664).
+    // e8007f971a7 adds relative_artifacts_and_hermit_paths_are_still_measured
+    // and ad21724d5f6 adds only_a_program_name_without_a_slash_is_left_for_path;
+    // both retain all 664 prior identities (`cargo nextest list` measured 666).
+    ("test.regular_crates", 666),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
     // retain all 750 prior identities in the prepared Nextest inventory.
-    ("test.hermit_unit", 753),
+    // Three logdiff_report schema-2 tests and the bin/hermit matched-prefix
+    // report test (d550979ad0) retain all 753 prior identities.
+    ("test.hermit_unit", 757),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -245,8 +263,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/stat gate retain all 800 prior identities (`cargo nextest list`
     // measured 802).
     // Five exec POSIX timer lifecycle tests retain all 802 prior identities.
-    // Thirty-three exec transfer, teardown and refusal controls retain all 807 IDs.
-    ("test.detcore_unit", 840),
+    // The logdiff matched-prefix test (d550979ad0) retains all 807 prior IDs.
+    // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
+    // Thirty-three exec transfer, teardown and refusal controls retain all 810 IDs.
+    ("test.detcore_unit", 843),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -282,14 +302,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 840),
+    ("test.detcore_unit_on_host", 843),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 171),
-    ("test.hermit_unit_on_host", 753),
+    ("test.hermit_unit_on_host", 757),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 625),
+    ("test.regular_crates_on_host", 666),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
@@ -687,7 +707,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 900,
-        cpu_timeout: 600,
+        cpu_timeout: MANIFEST_GATE_CPU_SECONDS,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
@@ -1480,7 +1500,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable manifest bucket: backend-parity-c"########,
         description: r########"WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: crate::backend_parity_policy::PORTABLE_PARITY_COMMAND,
+        cmd: crate::backend_parity_policy::PORTABLE_ORDINARY_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
@@ -5335,7 +5355,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Portable manifest bucket: backend-parity-c"########,
         description: r########"WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 49-64: three uncapped cgroup peaks were 2856333312, 3168403456, and 2857349120 bytes; three stricter 4-GiB-cap repetitions completed all 85 cells with peaks up to 3465289728 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves another 2.5 GiB of runaway headroom without reserving the former unmeasured 32 GiB."########,
         labels: &[r########"hosted-portable"########],
-        cmd: crate::backend_parity_policy::HOSTED_PARITY_COMMAND,
+        cmd: crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,

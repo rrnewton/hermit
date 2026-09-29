@@ -2941,6 +2941,12 @@
       "why": "tests/e2e/manifests/util-c.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `util-c` YAML file is policy for the `util-c` manifest bucket: it declares program identities, modes, backend partitions, and WHY reasons. It configures the common system and is not itself executable test input."
     },
     {
+      "disposition": "manifest-policy",
+      "path": "tests/e2e/parity-selection.yaml",
+      "runner": "ci/manifest-plan generate-parity-cells",
+      "why": "tests/e2e/parity-selection.yaml is owned by ci/manifest-plan generate-parity-cells: It names the cross-backend parity cells (a manifest test's verify mode on dbt, kvm, liteinst or sabre, compared with ptrace verify) that the parity report measures. The parity loader validates it against the bucket manifests and ci/compat-envelope/parity-cells.json is generated from it; it is policy, not executable test input, and it is kept outside tests/e2e/manifests because every YAML file there is parsed as a bucket manifest."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/e2e/performance/barrier-rounds.c",
       "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",

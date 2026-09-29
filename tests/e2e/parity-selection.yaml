@@ -1,0 +1,229 @@
+# Cross-backend parity selection: which parity cells the parity report
+# measures. See https://github.com/rrnewton/hermit/issues/3301.
+#
+# A parity cell compares one manifest test's verify run on a candidate backend
+# (dbt, kvm, liteinst or sabre) with the same test's verify run on ptrace, the
+# reference. Tests are sorted, and each test's backends are sorted.
+#
+# This file is deliberately NOT under tests/e2e/manifests: the manifest reader
+# parses every YAML file in that directory as a bucket manifest, and the parity
+# loader (ci/manifest-plan/src/parity.rs) refuses a selection placed there.
+#
+# The loader also refuses unknown or retired test ids, ptrace and unknown
+# backends, and any cell whose verify mode is not enabled on both ptrace and the
+# candidate. A listed cell that is enabled but not selected by full validation
+# is accepted; ci/compat-envelope/parity-cells.json marks it "selectable": false
+# with the reason, and it stays unmeasured until both verify cells are selected.
+#
+# After editing this file, regenerate the snapshot with:
+#   cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write
+schema: 1
+rule: >-
+  Every candidate-backend (dbt, kvm, liteinst, sabre) verify cell of a test in
+  the backend-parity-c manifest bucket whose ptrace verify cell is selected by
+  full validation, provided the candidate's verify cell is enabled. Candidate
+  cells that are enabled but not selected by full validation are included and
+  marked not selectable in ci/compat-envelope/parity-cells.json.
+cells:
+  - test: backend-parity-c/aio-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/append-pwrite
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/bind-getsockname
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/cachestat-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/child-subreaper-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/close-range-fds
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/copy-file-range-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/cpu-virtualization
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/cpuid-probe
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/cwd-roundtrip
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/dup-shared-offset
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/epoll-pwait2
+    backends: [liteinst]
+  - test: backend-parity-c/epoll-readiness
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/event-delivery-ordering
+    backends: [liteinst]
+  - test: backend-parity-c/eventfd-semantics
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/faccessat2-flags
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/fadvise-hints
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/fallocate-extents
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/fchmod-bits
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/fchmodat2-flags
+    backends: [liteinst]
+  - test: backend-parity-c/fcntl-owner
+    backends: [liteinst]
+  - test: backend-parity-c/fd-duplication
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/file-backed-mmap
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/file-io-roundtrip
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/flock-lifecycle
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/fork-exec-pipeline
+    backends: [kvm]
+  - test: backend-parity-c/fsync-durability
+    backends: [liteinst]
+  - test: backend-parity-c/ftruncate-sparse
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/getcpu-identity
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/getpriority-identity
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/getrusage-self-accounting
+    backends: [liteinst]
+  - test: backend-parity-c/hardware-trap-identity
+    backends: [dbt, liteinst]
+  - test: backend-parity-c/host-identity
+    backends: [dbt, liteinst]
+  - test: backend-parity-c/inline-syscall-sites
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/inotify-watch
+    backends: [liteinst]
+  - test: backend-parity-c/ioctl-fionread
+    backends: [liteinst]
+  - test: backend-parity-c/kcmp-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/linkat-flags
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/lseek-positioning
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/mce-kill-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/membarrier-query
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/memfd-create
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/mempolicy-default
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/mincore-residency
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/mixed-inline-and-libc-syscalls
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/mkdir-rmdir
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/mknod-special
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/mmap-layout-pointer-order
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/msync-writeback
+    backends: [liteinst]
+  - test: backend-parity-c/name-to-handle-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/no-new-privs-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/numa-node-identity
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/o-tmpfile-anon
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/openat-flags
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/openat2-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/path-file-ops
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/personality-domain
+    backends: [liteinst]
+  - test: backend-parity-c/pid-probe
+    backends: [kvm, liteinst, sabre]
+  - test: backend-parity-c/pidfd-open-self
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/pipe-capacity
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/pipe-capacity-pin
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/pipe-ipc
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/pipe2-flags
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/poll-readiness
+    backends: [liteinst]
+  - test: backend-parity-c/prctl-identity
+    backends: [dbt, liteinst]
+  - test: backend-parity-c/prctl-pdeathsig
+    backends: [liteinst]
+  - test: backend-parity-c/preadv2-flags
+    backends: [liteinst]
+  - test: backend-parity-c/pthread-lifecycle
+    backends: [kvm, liteinst, sabre]
+  - test: backend-parity-c/readdir-entries
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/readdir-order-identity
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/record-lock
+    backends: [liteinst]
+  - test: backend-parity-c/rename-ops
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/renameat2-flags
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/rlimit-identity
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/robust-list
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/sched-getaffinity-identity
+    backends: [dbt, kvm, liteinst]
+  - test: backend-parity-c/seccomp-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/sendfile-copy
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/set-tid-address
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/short-io-split-identity
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/shutdown-socketpair
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/signal-delivery-sequence
+    backends: [liteinst]
+  - test: backend-parity-c/signal-waitstatus-identity
+    backends: [dbt, liteinst]
+  - test: backend-parity-c/signalfd-create
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/socket-epoll-ordering
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/socket-options
+    backends: [liteinst]
+  - test: backend-parity-c/socketpair-flags
+    backends: [liteinst]
+  - test: backend-parity-c/sockname-unnamed
+    backends: [liteinst]
+  - test: backend-parity-c/stat-metadata-identity
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/statfs-free-determinism
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/static-nolibc-syscall-sites
+    backends: [kvm]
+  - test: backend-parity-c/statx-metadata
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/symlink-ops
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/sync-file-range
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/sysv-ipc-refusal
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/thp-disable
+    backends: [liteinst]
+  - test: backend-parity-c/umask-mode
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/uname-identity
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/utimensat-determinism
+    backends: [kvm, liteinst]
+  - test: backend-parity-c/vectored-file-io
+    backends: [liteinst]
+  - test: backend-parity-c/vectored-io
+    backends: [kvm, liteinst]

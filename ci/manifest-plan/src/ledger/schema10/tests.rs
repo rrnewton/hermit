@@ -943,22 +943,33 @@ fn generated_plan_populations_preserve_command_policy() {
                     "{label}/{active}/{mutation}"
                 );
             }
-            // Plans retained before the release-build names were forwarded
-            // must keep reading with the same cells and parity relations.
-            for (spelling, literal_jobs) in
-                [("pre-release-env", false), ("pre-release-env-jobs", true)]
-            {
+            // Plans retained before the parity post-pass names or the
+            // release-build names were forwarded must keep reading with the
+            // same cells and parity relations.
+            for (spelling, literal_jobs) in [
+                ("pre-epoch-env", false),
+                ("pre-release-env", false),
+                ("pre-release-env-jobs", true),
+            ] {
                 if label != "full" {
                     continue;
                 }
                 let mut previous = cfg.clone();
                 let step = &mut previous.steps[index];
-                assert_ne!(step.cmd, PRE_RELEASE_ENV_PARITY_COMMAND);
-                step.cmd = if active {
-                    PRE_RELEASE_ENV_PARITY_COMMAND.to_owned()
+                if spelling == "pre-epoch-env" {
+                    for name in crate::backend_parity_policy::PARITY_POST_PASS_ENV {
+                        let word = format!(" --env {name} ");
+                        assert_eq!(step.cmd.matches(&word).count(), 1, "{name}");
+                        step.cmd = step.cmd.replacen(&word, " ", 1);
+                    }
                 } else {
-                    PRE_RELEASE_ENV_PARITY_COMMAND.replacen("--parity-reference ptrace ", "", 1)
-                };
+                    assert_ne!(step.cmd, PRE_RELEASE_ENV_PARITY_COMMAND);
+                    step.cmd = if active {
+                        PRE_RELEASE_ENV_PARITY_COMMAND.to_owned()
+                    } else {
+                        PRE_RELEASE_ENV_PARITY_COMMAND.replacen("--parity-reference ptrace ", "", 1)
+                    };
+                }
                 if literal_jobs {
                     assert_eq!(step.cmd.matches(" --results ").count(), 1);
                     step.cmd = step.cmd.replace(" --results ", " --jobs 8 --results ");
@@ -1379,6 +1390,90 @@ fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
             );
         }
     }
+}
+
+/// https://github.com/rrnewton/hermit/issues/3301 removed `--parity-reference`
+/// from every newly generated plan. A plan retained before that change keeps
+/// verifying with the parity relations it was published with, both at the last
+/// parity spelling the generator emitted and as the preserved legacy producer
+/// export.
+#[test]
+fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
+    let root = crate::validation_dag::repo_root().unwrap();
+    let generated = crate::validation_dag::generate(&root).unwrap();
+    for tag in [
+        "e2e.manifest_backend_parity_c",
+        "e2e.manifest_backend_parity_c_on_host",
+    ] {
+        let step = generated
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .unwrap();
+        assert!(!step.cmd.contains("--parity-reference"), "{tag}");
+        assert!(
+            !crate::backend_parity_policy::selects_ptrace_parity(step).unwrap(),
+            "{tag}"
+        );
+    }
+    // Today's hosted command is the last parity spelling minus exactly the
+    // removed flag, so a plan carrying that spelling is a pre-change plan.
+    let hosted = generated
+        .steps
+        .iter()
+        .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
+        .unwrap();
+    assert_eq!(
+        hosted.cmd,
+        crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND
+    );
+    assert_eq!(
+        crate::backend_parity_policy::HOSTED_PARITY_COMMAND.replacen(
+            " --parity-reference ptrace",
+            "",
+            1
+        ),
+        hosted.cmd
+    );
+    let relation = vec![BackendParityRelation::ptrace(identity())];
+
+    let (row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let retained: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
+    assert_eq!(
+        retained.constructed_dag().unwrap().steps[0].cmd,
+        crate::backend_parity_policy::HOSTED_PARITY_COMMAND
+    );
+    assert_eq!(
+        retained.planned_backend_parity_relations().unwrap(),
+        relation
+    );
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert!(verified.full_backend_parity && verified.full_test_results);
+    assert_eq!(verified.cell_results.selected_backend_parity, relation);
+    assert!(verified.missing_backend_parity.is_empty());
+
+    // Exact bytes a producer exported before the change, in the older
+    // literal-worker-count spelling, read the same way.
+    let (row, plan, cells, tests) = legacy_fixture("reference-diverged");
+    let retained: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
+    assert!(
+        retained.constructed_dag().unwrap().steps[0]
+            .cmd
+            .contains("--prebuilt --parity-reference ptrace --jobs 8 --results")
+    );
+    assert_eq!(
+        retained.planned_backend_parity_relations().unwrap(),
+        relation
+    );
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified.cell_results.selected_backend_parity, relation);
 }
 
 #[test]

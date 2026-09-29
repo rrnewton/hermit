@@ -1476,11 +1476,16 @@ impl ResultRow {
             })
     }
 
-    /// Normal validation publishes `required` rows. A deliberately selected
-    /// disabled cell is admissible only when the row proves that it came from
-    /// the parity path, either with its report or the parity-specific no-result
-    /// disposition. This keeps `--probe-disabled` measurable without turning
-    /// arbitrary disabled runs into scorecard evidence.
+    /// Normal validation publishes `required` rows. A disabled row is
+    /// admissible only when it proves that it came from the parity path, either
+    /// with its report or the parity-specific no-result disposition, so an
+    /// arbitrary disabled run never becomes scorecard evidence.
+    ///
+    /// Since https://github.com/rrnewton/hermit/issues/3301 removed the ptrace
+    /// reference run, no current run writes either proof. This rule therefore
+    /// admits only rows retained from before that change. A `--probe-disabled`
+    /// run now performs only its own backend's verification, and its row is
+    /// refused here.
     fn is_ingestible_classification(&self) -> bool {
         self.classification == "required"
             || (self.classification == "disabled"
@@ -3372,10 +3377,16 @@ fn run() -> Result<(), String> {
         "show" => {
             no_more(&mut args)?;
             let derived = derive(&root)?;
-            print!("{}", render_scorecard(&derived));
-            if let Some(mut tracked) = load_existing(&root)? {
-                refresh_measurement(&mut tracked);
-                print!("{}", render_measurement_section(&tracked));
+            match load_existing(&root)? {
+                Some(mut tracked) => {
+                    refresh_measurement(&mut tracked);
+                    print!(
+                        "{}",
+                        with_regeneration_notice(render_scorecard(&derived), &tracked)
+                    );
+                    print!("{}", render_measurement_section(&tracked));
+                }
+                None => print!("{}", render_scorecard(&derived)),
             }
             print!("{}", render_evidence_coverage(&root)?);
         }
@@ -4457,11 +4468,10 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
 
     let mut out = "\n## Cross-backend parity\n\n\
 This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. \
-A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. The CLI can explicitly \
-select eligible not-applicable candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
+A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
-At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes perform ptrace-reference parity comparisons for eligible selected verify cells. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
-| Candidate backend | Ptrace cells selected by full | Not-applicable probe candidates | Measured match | Parity failure | Never measured |\n\
+At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes currently perform ordinary same-backend verification: since https://github.com/rrnewton/hermit/issues/3301 no committed selector runs a ptrace reference, and parity no longer decides a validation outcome. The counts below come from strict ptrace-vs-candidate reports recorded before that change. No command produces a new one, `--probe-disabled` included: it now runs only the disabled cell's own backend verification. The counts are therefore not refreshed until a new parity producer lands. Eligibility does not mean every cell was selected or measured.\n\n\
+| Candidate backend | Ptrace cells selected by full | Not-applicable candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
     for backend in ordered {
@@ -5720,11 +5730,12 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
         compare_file(&root.join(CELLS), &encoded_catalogue(&cells)?)?;
     } else {
         // Read the old checked-in generation until its exact archive is verified.
+        // The same bytes `generated_files` writes, notice included.
         compare_file(
             &root.join(SCORECARD),
             &format!(
                 "{}{}",
-                render_scorecard(&derived),
+                with_regeneration_notice(render_scorecard(&derived), &cells),
                 render_measurement_section(&cells)
             ),
         )?;
@@ -8499,12 +8510,134 @@ fn generated_files(derived: &Derived, tracked: &TrackedCells) -> Result<Generate
     Ok(GeneratedFiles {
         scorecard: format!(
             "{}{}",
-            render_scorecard(derived),
+            with_regeneration_notice(render_scorecard(derived), tracked),
             render_measurement_section(tracked)
         )
         .into_bytes(),
         cells: encoded_cells(tracked)?.into_bytes(),
     })
+}
+
+const SCORECARD_TITLE: &str = "# Compatibility scorecard\n\n";
+
+/// Most validate runs named individually in the regeneration notice; the rest
+/// are counted. A projection normally binds a handful of runs.
+const REGENERATION_NOTICE_RUNS: usize = 8;
+
+/// Put [`render_regeneration_notice`] directly under the title, where a reader
+/// of the ledger scorecard sees it first.
+fn with_regeneration_notice(scorecard: String, tracked: &TrackedCells) -> String {
+    let notice = render_regeneration_notice(tracked);
+    if notice.is_empty() {
+        return scorecard;
+    }
+    match scorecard.strip_prefix(SCORECARD_TITLE) {
+        Some(rest) => format!("{SCORECARD_TITLE}{notice}{rest}"),
+        None => format!("{notice}{scorecard}"),
+    }
+}
+
+/// The ledger scorecard's first paragraph: when it was last regenerated, from
+/// which ledger commit, and which validate run it came from.
+///
+/// Owner directive 2026-09-28: the scorecard carries a last-regenerated
+/// timestamp and the validate run it came from. Every value is read from the
+/// `projection` recorded in `scorecard/cells.json`, so rendering the same
+/// cells.json again reproduces these bytes exactly; nothing here reads the
+/// clock or the network.
+///
+/// "The validate run it came from" is the run whose comparison bindings were
+/// captured from the same series tree this projection read
+/// (`snapshot.tree == projection.source_tree`): the ledger publisher appends
+/// one validate run's rows and then regenerates, so that run is the one this
+/// regeneration published. Measured on ledger 7d28c1f: 1030 bindings from
+/// `validate-buck-validate-cargo-5ee668223a15-...` share the projection's
+/// series tree 81b15087; two older runs (1029 each, current) and one retained
+/// run (348) still supply other comparisons, and are listed separately.
+///
+/// The Hermit catalogue (`SCORECARD.md` in the Hermit tree) has no projection
+/// and renders no notice: it changes when the manifest changes, not when a
+/// validate run lands, so a timestamp there would not describe any run.
+fn render_regeneration_notice(tracked: &TrackedCells) -> String {
+    let Some(projection) = tracked.projection.as_ref() else {
+        return String::new();
+    };
+    let repository = projection
+        .source_repository
+        .as_deref()
+        .unwrap_or(projection.source.as_str());
+    let source = match projection.source_commit.as_deref() {
+        Some(commit) => format!("`{repository}` commit `{commit}`"),
+        None => format!("`{repository}` (commit not recorded)"),
+    };
+    let mut out = format!(
+        "Last regenerated **{}** from {source}, reading {} series row(s).",
+        projection.refreshed_at, projection.rows_read
+    );
+    let mut newest: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut others: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for binding in projection
+        .comparison_attempt_bindings_v1
+        .iter()
+        .flat_map(|bindings| bindings.bindings.iter())
+        .filter(|binding| binding.provenance == ObservationProvenance::Validate)
+    {
+        let in_snapshot = projection.source_tree.as_deref() == Some(binding.snapshot.tree.as_str());
+        if in_snapshot {
+            *newest.entry(binding.run_id.as_str()).or_default() += 1;
+        } else {
+            let kind = match binding.kind {
+                AttemptBindingKind::Current => "current",
+                AttemptBindingKind::Retained => "retained",
+            };
+            *others.entry((binding.run_id.as_str(), kind)).or_default() += 1;
+        }
+    }
+    let list = |runs: Vec<(String, usize)>| -> String {
+        let mut runs = runs;
+        runs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total = runs.len();
+        let mut named = runs
+            .into_iter()
+            .take(REGENERATION_NOTICE_RUNS)
+            .map(|(label, count)| format!("{label} ({count})"))
+            .collect::<Vec<_>>();
+        if total > REGENERATION_NOTICE_RUNS {
+            named.push(format!("and {} more", total - REGENERATION_NOTICE_RUNS));
+        }
+        named.join(", ")
+    };
+    if projection.source_tree.is_none() {
+        out.push_str(
+            " The projection does not record its series tree, so the validate run it came from \
+cannot be identified.",
+        );
+    } else if newest.is_empty() {
+        out.push_str(" No validate run's comparisons were captured from this series snapshot.");
+    } else {
+        out.push_str(&format!(
+            " Validate run published in this series snapshot, with its cell comparisons: {}.",
+            list(
+                newest
+                    .into_iter()
+                    .map(|(run, count)| (format!("`{run}`"), count))
+                    .collect()
+            )
+        ));
+    }
+    if !others.is_empty() {
+        out.push_str(&format!(
+            " Earlier validate runs still supplying comparisons: {}.",
+            list(
+                others
+                    .into_iter()
+                    .map(|((run, kind), count)| (format!("`{run}` {kind}"), count))
+                    .collect()
+            )
+        ));
+    }
+    out.push_str("\n\n");
+    out
 }
 
 fn write_observation_files(
@@ -13545,6 +13678,22 @@ fn recorded_shell_quote(value: &str) -> String {
 #[cfg(test)]
 static HISTORY_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serialize tests that share process-wide fixture state.
+///
+/// The lock guards no data: it only orders tests that change the environment
+/// (HistoryFixtureEnvironment) or the working directory (RestoreCwd), and both
+/// guards restore that state in `Drop`, including while a panic unwinds. A
+/// poisoned lock therefore means only that an earlier test failed, and that
+/// test already reports its own failure. Recovering the guard lets every later
+/// test report its own verdict instead of a PoisonError; run 36485831200 turned
+/// one missing-corpus failure into 15 failures this way.
+#[cfg(test)]
+fn history_fixture_lock() -> std::sync::MutexGuard<'static, ()> {
+    HISTORY_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct HistoryFixtureEnvironment {
     previous: [Option<std::ffi::OsString>; 2],
 }
@@ -15194,16 +15343,16 @@ fn self_test() -> Result<(), String> {
     {
         return Err("scorecard selector description differs from the two actual commands".into());
     }
-    let active = selectors
+    if selectors
         .iter()
-        .filter(|step| step.cmd.contains("--parity-reference ptrace"))
-        .count();
-    let expected = match active {
-        0 => "currently perform ordinary same-backend verification",
-        2 => "perform ptrace-reference parity comparisons",
-        _ => return Err("scorecard description requires both existing selectors to agree".into()),
-    };
-    if !matching_markdown.contains(expected) {
+        .any(|step| step.cmd.contains("--parity-reference"))
+    {
+        return Err(
+            "a constructed backend-parity-c selector passes --parity-reference, which https://github.com/rrnewton/hermit/issues/3301 removed"
+                .into(),
+        );
+    }
+    if !matching_markdown.contains("currently perform ordinary same-backend verification") {
         return Err(
             "scorecard execution description is stale against the constructed selectors".into(),
         );
@@ -24859,7 +25008,7 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn self_test_corpus_retains_the_complete_archived_input() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -24891,7 +25040,7 @@ mod catalogue_ledger_tests {
     fn self_test_corpus_requires_exact_committed_objects_and_identity() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -25224,7 +25373,7 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn exact_archive_and_parent_lock_are_required_before_history_changes() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -25926,7 +26075,7 @@ mod post_verdict_transaction_tests {
     }
 
     fn catalogue_retirement_fixture(include_parity: bool) {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         if include_parity {
             let measured = fixture.options.results_head.as_deref().unwrap();
@@ -26158,7 +26307,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn import_retires_bound_ordinary_comparison_without_losing_provenance() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let row = result_row(&fixture.options.expected_head);
         fs::write(
@@ -26317,7 +26466,7 @@ mod post_verdict_transaction_tests {
             );
             return;
         }
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let mut tracked = fixture.cells();
         let heads = [
@@ -26456,7 +26605,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn identical_current_rows_retain_one_binding_and_one_comparison() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let fixture = Fixture::new();
         let row = result_row(&fixture.options.expected_head);
         let raw = format!("{}\n", serde_json::to_string(&row).unwrap()).into_bytes();
@@ -26508,7 +26657,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn retained_bindings_and_current_retry_events_reconcile_together() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let retained = fixture.cells();
@@ -26611,7 +26760,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn attempt_bindings_survive_normal_projection_and_current_ingestion() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let first = comparison_attempt_bindings(&fixture.cells())
@@ -26679,7 +26828,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn selected_custom_attempts_publish_without_becoming_comparable_cells() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         fixture.publish().unwrap();
         let comparable = serde_json::to_value(fixture.cells().cells).unwrap();
@@ -27013,7 +27162,7 @@ mod post_verdict_transaction_tests {
     /// only the audit projected from the raw row publishes.
     #[test]
     fn declared_guest_exit_audit_publishes_only_when_bound_to_its_raw_row() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let reason = DECLARED_EXIT_REASON;
@@ -27255,7 +27404,7 @@ mod post_verdict_transaction_tests {
     /// event projected from that row is accepted.
     #[test]
     fn observe_results_reconciles_declared_guest_exits_with_committed_series() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let head = fixture.options.expected_head.clone();
         let (id, row) = declared_exit_row(&head);
@@ -27346,7 +27495,7 @@ mod post_verdict_transaction_tests {
     /// contradiction and aborts the fold rather than being kept as red.
     #[test]
     fn a_retained_failed_match_refuses_what_the_runner_cannot_write() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -27472,7 +27621,7 @@ mod post_verdict_transaction_tests {
     /// admits the sibling.
     #[test]
     fn a_matched_attempt_the_runner_failed_is_retained_red_beside_a_valid_sibling() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
@@ -27595,7 +27744,7 @@ mod post_verdict_transaction_tests {
     /// readers refuse it rather than retaining it.
     #[test]
     fn a_matched_attempt_counts_only_if_the_runner_passed_it() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, mut declared) = declared_exit_row(&measured);
@@ -27990,7 +28139,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn invalid_snapshot_refuses_before_history_work_but_after_publication_authority() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let ledger = directory.path().join("ledger");
@@ -28055,7 +28204,7 @@ mod post_verdict_transaction_tests {
 
     #[test]
     fn two_head_writeback_preserves_attribution_and_refuses_unbound_or_moving_inputs() {
-        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let _fixture_lock = history_fixture_lock();
         let mut fixture = Fixture::new();
         let measured = fixture.options.results_head.clone().unwrap();
         let invoker = fixture.options.expected_head.clone();
@@ -29653,5 +29802,185 @@ mod command_ledger_identity_scope_tests {
         fs::remove_dir(&ledger).unwrap();
         fs::rename(&held, &ledger).unwrap();
         assert!(verified(&ledger));
+    }
+}
+
+#[cfg(test)]
+mod regeneration_notice_tests {
+    use super::*;
+
+    const TREE: &str = "81b15087598ba3bfc3069a9b26f80d445ece03b8";
+    const OLDER_TREE: &str = "2222222222222222222222222222222222222222";
+
+    fn binding(
+        test: &str,
+        run_id: &str,
+        tree: &str,
+        kind: AttemptBindingKind,
+    ) -> ComparisonAttemptBinding {
+        ComparisonAttemptBinding {
+            cell: CellId {
+                lane: "portable".into(),
+                category: "c-programs".into(),
+                test: test.into(),
+                mode: "verify".into(),
+                backend: "ptrace".into(),
+            },
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: "5".repeat(40),
+            detcore_tree: "4".repeat(40),
+            run_id: run_id.into(),
+            evidence_sha256: "6".repeat(64),
+            attempt: 1,
+            result: ObservedResult::Pass,
+            kind,
+            producer_hermit_sha: "4".repeat(40),
+            input: AttemptBindingInput {
+                file_sha256: "a".repeat(64),
+                file_bytes: 1,
+                line: 1,
+                row_sha256: "b".repeat(64),
+            },
+            snapshot: AttemptBindingSnapshot {
+                repository: TEST_LEDGER_REPOSITORY.into(),
+                source: "series".into(),
+                commit: "6af85b80566730f212cf6c7a550d409cc27ae782".into(),
+                tree: tree.into(),
+                rows_sha256: "c".repeat(64),
+            },
+            events: Vec::new(),
+        }
+    }
+
+    fn tracked(source_tree: Option<&str>, bindings: Vec<ComparisonAttemptBinding>) -> TrackedCells {
+        TrackedCells {
+            schema: SCHEMA,
+            projection: Some(ObservationProjection {
+                source: "series".into(),
+                source_repository: Some(TEST_LEDGER_REPOSITORY.into()),
+                source_commit: Some("48faf973c125ed12ffa9beaa66e78e394ac06c7d".into()),
+                source_tree: source_tree.map(str::to_owned),
+                refreshed_at: "2026-09-28T09:16:36Z".into(),
+                rows_read: 96721,
+                pre_series_corpus: true,
+                comparison_attempt_bindings_v1: Some(ComparisonAttemptBindings {
+                    schema: 1,
+                    authority: ATTEMPT_BINDING_AUTHORITY.into(),
+                    bindings,
+                    retired_canonical_comparisons: Vec::new(),
+                    retired_backend_parity_comparisons: Vec::new(),
+                }),
+            }),
+            cells: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_notice_names_the_timestamp_ledger_commit_and_the_run_in_this_snapshot() {
+        // The live ledger 7d28c1f shape, reduced: the run appended in the
+        // projection's own series tree, an older current run, a retained run.
+        let cells = tracked(
+            Some(TREE),
+            vec![
+                binding(
+                    "c-programs/a",
+                    "run-newest",
+                    TREE,
+                    AttemptBindingKind::Current,
+                ),
+                binding(
+                    "c-programs/b",
+                    "run-newest",
+                    TREE,
+                    AttemptBindingKind::Current,
+                ),
+                binding(
+                    "c-programs/a",
+                    "run-older",
+                    OLDER_TREE,
+                    AttemptBindingKind::Current,
+                ),
+                binding(
+                    "c-programs/c",
+                    "run-retained",
+                    OLDER_TREE,
+                    AttemptBindingKind::Retained,
+                ),
+            ],
+        );
+        let notice = render_regeneration_notice(&cells);
+        assert_eq!(
+            notice,
+            "Last regenerated **2026-09-28T09:16:36Z** from \
+`https://github.com/rrnewton/hermit_test_ledger.git` commit \
+`48faf973c125ed12ffa9beaa66e78e394ac06c7d`, reading 96721 series row(s). \
+Validate run published in this series snapshot, with its cell comparisons: `run-newest` (2). \
+Earlier validate runs still supplying comparisons: `run-older` current (1), \
+`run-retained` retained (1).\n\n"
+        );
+        // Rendering the same cells.json twice is byte-identical: nothing reads
+        // the clock, so a re-render cannot manufacture a diff.
+        assert_eq!(render_regeneration_notice(&cells), notice);
+        // It sits directly under the title.
+        let placed = with_regeneration_notice(format!("{SCORECARD_TITLE}body\n"), &cells);
+        assert_eq!(placed, format!("{SCORECARD_TITLE}{notice}body\n"));
+    }
+
+    #[test]
+    fn the_notice_says_when_the_run_cannot_be_identified_instead_of_guessing() {
+        let bindings = vec![binding(
+            "c-programs/a",
+            "run-older",
+            OLDER_TREE,
+            AttemptBindingKind::Current,
+        )];
+        let unrecorded = render_regeneration_notice(&tracked(None, bindings.clone()));
+        assert!(
+            unrecorded.contains("does not record its series tree"),
+            "{unrecorded}"
+        );
+        assert!(
+            !unrecorded.contains("published in this series snapshot"),
+            "{unrecorded}"
+        );
+        let none_in_snapshot = render_regeneration_notice(&tracked(Some(TREE), bindings));
+        assert!(
+            none_in_snapshot
+                .contains("No validate run's comparisons were captured from this series snapshot."),
+            "{none_in_snapshot}"
+        );
+        assert!(
+            none_in_snapshot.contains("`run-older` current (1)"),
+            "{none_in_snapshot}"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_without_a_projection_renders_no_notice() {
+        let catalogue = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: Vec::new(),
+        };
+        assert_eq!(render_regeneration_notice(&catalogue), "");
+        let body = format!("{SCORECARD_TITLE}body\n");
+        assert_eq!(with_regeneration_notice(body.clone(), &catalogue), body);
+    }
+
+    #[test]
+    fn a_long_run_list_names_the_largest_runs_and_counts_the_rest() {
+        let mut bindings = Vec::new();
+        for index in 0..(REGENERATION_NOTICE_RUNS + 3) {
+            bindings.push(binding(
+                &format!("c-programs/t{index}"),
+                &format!("run-{index:02}"),
+                OLDER_TREE,
+                AttemptBindingKind::Current,
+            ));
+        }
+        let notice = render_regeneration_notice(&tracked(Some(TREE), bindings));
+        assert!(notice.contains("and 3 more."), "{notice}");
+        assert!(notice.contains("`run-00` current (1)"), "{notice}");
+        assert!(!notice.contains("`run-10`"), "{notice}");
     }
 }

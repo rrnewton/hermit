@@ -416,7 +416,7 @@ mod tests {
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
             ("build.rust_scripts".to_string(), 900, 7200, Some(6_442_450_944)),
             ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
-            ("gate.manifest".to_string(), 900, 600, Some(5_368_709_120)),
+            ("gate.manifest".to_string(), 900, 900, Some(5_368_709_120)),
         ];
         let check = |candidate: &[Step]| {
             let observed = candidate
@@ -444,6 +444,17 @@ mod tests {
         assert!(
             check(&lowered_gate).is_err(),
             "restoring the measured audit's inadequate 300-second CPU cap must fail"
+        );
+
+        let mut old_gate_cap = nodes.clone();
+        old_gate_cap
+            .iter_mut()
+            .find(|step| step.tag() == "gate.manifest")
+            .expect("gate.manifest exists")
+            .cpu_timeout = 600;
+        assert!(
+            check(&old_gate_cap).is_err(),
+            "restoring the 600-second CPU cap that killed three 2026-09-28 runs must fail"
         );
 
         let mut widened_neighbor = nodes;

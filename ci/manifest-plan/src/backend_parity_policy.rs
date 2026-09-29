@@ -1,4 +1,11 @@
-//! The two existing manifest selectors which request ptrace parity.
+//! Exact command bytes for the two backend-parity-c manifest selectors.
+//!
+//! The generator emits only the ordinary spellings: since
+//! <https://github.com/rrnewton/hermit/issues/3301> no newly constructed plan
+//! asks the harness for a ptrace reference run, and the generator's invariants
+//! refuse a step that does. The parity spellings stay here only so that
+//! schema-10 plans retained before that change keep reading with the cells and
+//! parity relations they were published with.
 //!
 //! The generator and retained-plan reader share exact command bytes; a reader
 //! never infers execution policy from a substring of an arbitrary shell command.
@@ -13,6 +20,39 @@ pub(crate) const HOSTED_ORDINARY_COMMAND: &str = r########"export PATH="$PWD/ci/
 /// Pinned-root names forwarded since the Buck release build joined validate.
 pub(crate) const RELEASE_BUILD_ENV: &str =
     " --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env HERMIT_VALIDATE_BUCK_DOTSLASH";
+
+/// Pinned-root names forwarded since the parity post-pass runs in every
+/// harness process (<https://github.com/rrnewton/hermit/issues/3301>): the one
+/// guest epoch pinned per run, and the post-pass's two activation variables.
+/// They were added together after the release-build names, so every older
+/// spelling lacks all three.
+pub(crate) const PARITY_POST_PASS_ENV: [&str; 3] = [
+    "HERMIT_EPOCH",
+    crate::parity::PARITY_POST_PASS_ENV,
+    crate::parity::PARITY_SELECT_ENV,
+];
+
+/// `command` without the [`PARITY_POST_PASS_ENV`] names: the spelling of a
+/// plan retained before they were forwarded. Each name must appear exactly
+/// once; the hosted command, which forwards nothing, must have none.
+pub(crate) fn without_parity_post_pass_env(tag: &str, command: &str) -> Result<String, String> {
+    let words = PARITY_POST_PASS_ENV.map(|name| format!(" --env {name} "));
+    if tag == "e2e.manifest_backend_parity_c_on_host"
+        && words.iter().all(|word| !command.contains(word.as_str()))
+    {
+        return Ok(command.to_owned());
+    }
+    let mut older = command.to_owned();
+    for (name, word) in PARITY_POST_PASS_ENV.iter().zip(&words) {
+        if older.matches(word.as_str()).count() != 1 {
+            return Err(format!(
+                "{tag} has no single {name} environment name to date"
+            ));
+        }
+        older = older.replacen(word.as_str(), " ", 1);
+    }
+    Ok(older)
+}
 
 pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
     let expected = match step.tag().as_str() {
@@ -54,13 +94,19 @@ pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
             step.tag()
         )),
     };
-    let previous_parity = pre_release_env(parity.clone())?;
-    let previous_ordinary = pre_release_env(ordinary.clone())?;
+    // Plans retained before the parity post-pass names were forwarded omit
+    // exactly those names from the current spelling, for the same reason.
+    let pre_epoch_parity = without_parity_post_pass_env(&step.tag(), &parity)?;
+    let pre_epoch_ordinary = without_parity_post_pass_env(&step.tag(), &ordinary)?;
+    let previous_parity = pre_release_env(pre_epoch_parity.clone())?;
+    let previous_ordinary = pre_release_env(pre_epoch_ordinary.clone())?;
     let legacy_parity = previous_parity.replacen(" --results ", " --jobs 8 --results ", 1);
     let legacy_ordinary = previous_ordinary.replacen(" --results ", " --jobs 8 --results ", 1);
     let selects_parity = match step.cmd.as_str() {
         command if command == parity => true,
         command if command == ordinary => false,
+        command if command == pre_epoch_parity => true,
+        command if command == pre_epoch_ordinary => false,
         command if command == previous_parity => true,
         command if command == previous_ordinary => false,
         // Schema-10 artifacts written before scheduler-owned width retain the

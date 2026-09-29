@@ -6244,11 +6244,6 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         } else {
             ""
         };
-        let parity = if manifest.lane == "portable" && manifest.category == "backend-parity-c" {
-            " --parity-reference ptrace"
-        } else {
-            ""
-        };
         let jobs = if manifest.category == "system-utils" {
             " --jobs 1"
         } else {
@@ -6257,7 +6252,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         (
             format!(
                 "./ci/run-with-hermit-e2e-artifact.sh {install}target/debug/test-harness run \
-            --lane {} --category {} --ci-only --allow-empty --prebuilt{parity}{jobs} \
+            --lane {} --category {} --ci-only --allow-empty --prebuilt{jobs} \
             --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
             --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
                 manifest.lane, manifest.category
@@ -13963,7 +13958,6 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     }
     let mut selection = Selection::default();
     let mut prebuilt = false;
-    let mut parity_reference = None;
     let mut seen = BTreeSet::new();
     let mut index = 2;
     while let Some(option) = argv.get(index) {
@@ -13977,7 +13971,7 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             "--prebuilt" => prebuilt = true,
             "--allow-empty" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--results"
-            | "--junit" | "--jobs" | "--parity-reference" => {
+            | "--junit" | "--jobs" => {
                 index += 1;
                 let value = argv
                     .get(index)
@@ -13988,7 +13982,6 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     "--test" => selection.test = Some(value.clone()),
                     "--mode" => selection.mode = Some(value.clone()),
                     "--backend" => selection.backend = Some(value.clone()),
-                    "--parity-reference" => parity_reference = Some(value.as_str()),
                     _ => {}
                 }
             }
@@ -14005,26 +13998,11 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             "retry bounds: {tag} must select a named lane with --ci-only"
         ));
     }
-    if let Some(reference) = parity_reference {
-        if reference != "ptrace" {
-            return Err(format!(
-                "retry bounds: {tag} --parity-reference currently requires ptrace"
-            ));
-        }
-        if selection.mode.as_deref().is_some_and(|mode| mode != "verify") {
-            return Err(format!(
-                "retry bounds: {tag} --parity-reference requires --mode verify when a mode is explicit"
-            ));
-        }
-        if selection.backend.as_deref() == Some(reference) {
-            return Err(format!(
-                "retry bounds: {tag} --parity-reference must differ from the explicit candidate --backend"
-            ));
-        }
-    }
-    // run_cell_inner shares one execution deadline and remaining CPU budget
-    // across candidate, reference, and comparison. Parity changes neither the
-    // selection nor the prebuilt/non-prebuilt timeout-window accounting.
+    // `--parity-reference` is deliberately unmodeled: backend parity no longer
+    // decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301),
+    // so a command that asks for a ptrace reference run falls through to the
+    // unmodeled-argument refusal above instead of gaining a second execution
+    // inside the same timeout window.
     Ok((selection, prebuilt))
 }
 
@@ -15178,50 +15156,109 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         cpu: 1.25,
         wall: 1.5,
     };
+    // Backend parity no longer decides a validation outcome
+    // (https://github.com/rrnewton/hermit/issues/3301). No committed manifest
+    // command asks the harness for a ptrace reference run, and a planted
+    // request is refused as an unmodeled argument, both on a bare command and
+    // on the committed backend-parity-c publishers.
+    if let Some(step) = committed
+        .steps
+        .iter()
+        .find(|step| step.cmd.contains("--parity-reference"))
+    {
+        return Err(format!(
+            "retry bounds: {} still passes --parity-reference",
+            step.tag()
+        ));
+    }
     let parity_command =
         "target/debug/test-harness run --ci-only --lane portable --category c-programs";
-    for filters in ["", " --mode verify --backend liteinst"] {
-        for prebuilt_flag in ["", " --prebuilt"] {
-            let command = format!("{parity_command}{filters}{prebuilt_flag}");
-            let (ordinary, ordinary_prebuilt) = manifest_command_policy("parity-control", &command)?;
-            let (parity, parity_prebuilt) = manifest_command_policy(
-                "parity-control",
-                &format!("{command} --parity-reference ptrace"),
-            )?;
-            let ordinary_cells = manifests.select(&ordinary)?;
-            let parity_cells = manifests.select(&parity)?;
-            if ordinary_cells.is_empty()
-                || ordinary_prebuilt != parity_prebuilt
-                || ordinary_cells.iter().map(|cell| &cell.id).collect::<Vec<_>>()
-                    != parity_cells.iter().map(|cell| &cell.id).collect::<Vec<_>>()
-            {
-                return Err("retry bounds: parity changed the selected cells or prebuilt policy".into());
+    let (control, _) = manifest_command_policy("parity-control", parity_command)?;
+    if manifests.select(&control)?.is_empty() {
+        return Err("retry bounds: the parity refusal control selects no cells".into());
+    }
+    let unmodeled = |tag: &str| {
+        format!("retry bounds: {tag} has an unmodeled harness argument \"--parity-reference\"")
+    };
+    for suffix in [
+        " --parity-reference ptrace",
+        " --parity-reference",
+        " --mode verify --backend liteinst --prebuilt --parity-reference ptrace",
+    ] {
+        match manifest_command_policy("parity-control", &format!("{parity_command}{suffix}")) {
+            Err(refusal) if refusal == unmodeled("parity-control") => {}
+            Err(refusal) => {
+                return Err(format!(
+                    "retry bounds: planted{suffix} was refused for the wrong reason: {refusal}"
+                ))
             }
-            let headroom = |selection: &Selection, prebuilt| {
-                require_manifest_selection_headroom(
-                    &manifests, "parity-control", quick.timeout, selection,
-                    representative_multipliers, prebuilt, attempts,
-                    MANIFEST_TERMINATION_GRACE_S as u64,
-                )
-            };
-            if headroom(&ordinary, ordinary_prebuilt)? != headroom(&parity, parity_prebuilt)? {
-                return Err("retry bounds: parity changed shared execution-window headroom".into());
+            Ok(_) => {
+                return Err(format!(
+                    "retry bounds: planted{suffix} was accepted as a manifest command"
+                ))
             }
         }
     }
+    // The missing-value and repeated-option refusals were bracketed through
+    // `--parity-reference` until it stopped being modeled. Keep both covered
+    // through options the policy still models, on the same accepted control.
     for (suffix, expected) in [
-        (" --parity-reference", "lacks a value for --parity-reference"),
-        (" --parity-reference ptrace --parity-reference ptrace", "supplies --parity-reference more than once"),
-        (" --parity-reference sabre", "currently requires ptrace"),
-        (" --parity-reference --prebuilt", "currently requires ptrace"),
-        (" --parity-reference ptrace --mode run", "requires --mode verify"),
-        (" --parity-reference ptrace --backend ptrace", "must differ from the explicit candidate"),
-        (" --parity-reference ptrace --unknown", "unmodeled harness argument"),
+        (" --mode", "retry bounds: parity-control lacks a value for --mode"),
+        (
+            " --backend kvm --backend kvm",
+            "retry bounds: parity-control supplies --backend more than once",
+        ),
+        (
+            " --lane privileged",
+            "retry bounds: parity-control supplies --lane more than once",
+        ),
     ] {
-        let refusal = manifest_command_policy("parity-control", &format!("{parity_command}{suffix}"))
-            .expect_err("invalid parity command must be refused");
-        if !refusal.contains(expected) {
-            return Err(format!("retry bounds: parity control failed for the wrong reason: {refusal}"));
+        match manifest_command_policy("parity-control", &format!("{parity_command}{suffix}")) {
+            Err(refusal) if refusal == expected => {}
+            Err(refusal) => {
+                return Err(format!(
+                    "retry bounds: planted{suffix} was refused for the wrong reason: {refusal}"
+                ))
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "retry bounds: planted{suffix} was accepted as a manifest command"
+                ))
+            }
+        }
+    }
+    for tag in [
+        "e2e.manifest_backend_parity_c",
+        "e2e.manifest_backend_parity_c_on_host",
+    ] {
+        let publisher = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: committed DAG lost {tag}"))?;
+        normal_raw_result_path(publisher, "parity-control")?;
+        let mut planted = publisher.clone();
+        if planted.cmd.matches("--prebuilt --results").count() != 1 {
+            return Err(format!(
+                "retry bounds: {tag} no longer has one --prebuilt --results boundary to plant into"
+            ));
+        }
+        planted.cmd = planted.cmd.replace(
+            "--prebuilt --results",
+            "--prebuilt --parity-reference ptrace --results",
+        );
+        match normal_raw_result_path(&planted, "parity-control") {
+            Err(refusal) if refusal == unmodeled(tag) => {}
+            Err(refusal) => {
+                return Err(format!(
+                    "retry bounds: planted parity on {tag} was refused for the wrong reason: {refusal}"
+                ))
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "retry bounds: planted parity on {tag} was accepted as a normal publisher"
+                ))
+            }
         }
     }
     for step in committed.steps.iter()
