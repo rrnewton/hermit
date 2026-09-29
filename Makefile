@@ -315,8 +315,10 @@ check-submodules: checkout-all ## Initialize if needed, then verify (build path)
 # agent can iterate tightly without paying for the full cross-backend suite.
 # They wrap the pre-existing mechanisms rather than adding new ones:
 #   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
-#     scoped to one backend with `run_matrix.py --backend <backend>`, exactly
-#     as the Rust validation driver's full backend-compatibility gate invokes it.
+#     scoped to one backend with `run_matrix.py --backend <backend>`. The
+#     validation DAG no longer runs this matrix: since slice S13 of
+#     https://github.com/rrnewton/hermit/issues/3301 its DBT cases are DBT
+#     verify cells of the c-programs and system-utils manifests.
 #   * SaBRe / LiteInst / e9patch          -> the Rust driver's focused
 #     `--<backend>-compat-only` profiles, which self-build the release binary
 #     and any backend artifacts.

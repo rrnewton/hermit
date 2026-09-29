@@ -675,10 +675,6 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
                 root.join("target/debug/generate-test-footprints"),
                 vec!["--check"],
             ),
-            (
-                root.join("tests/backend-parity/split_asymmetric_pr.py"),
-                vec!["--self-test"],
-            ),
             (root.join("tests/manifest-cli.rs"), vec!["self-test"]),
             // The DBT budget wrapper gates roughly twenty portable nodes and
             // fails CLOSED on a pin it is not calibrated for. Nothing else
@@ -4283,7 +4279,6 @@ sys.exit(1 if failed else 0)
             "test.ignored_syscall_regressions",
             "test.envelope_levels",
             "test.rr_suite_contract",
-            "test.dbt_parity",
             "test.sabre_examples",
             "test.liteinst_strict",
         ]
@@ -4321,9 +4316,11 @@ sys.exit(1 if failed else 0)
         // cells: only the e2e jobs pack the parity-v1 archive the reducer reads
         // (ci/check-shard-coverage.sh enforces that against the committed cell
         // plan). shared-futex-c and util-c left the integration shard once
-        // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell.
-        assert_eq!(physical_rows, 23);
-        assert_eq!(resolved.len(), 23);
+        // https://github.com/rrnewton/hermit/pull/3213 gave each a portable cell
+        // (25 to 23), and test.dbt_parity left the dbt-parity shard in slice
+        // S13 of https://github.com/rrnewton/hermit/issues/3301 (23 to 22).
+        assert_eq!(physical_rows, 22);
+        assert_eq!(resolved.len(), 22);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.

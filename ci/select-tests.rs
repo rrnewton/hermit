@@ -1083,7 +1083,9 @@ fn self_test() {
 
     let dbt = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into()]);
     check("dbt-only ⇒ selective", dbt.decision == Decision::Selective);
-    check("dbt-only runs dbt_parity", dbt.nodes.contains("test.dbt_parity_on_host"));
+    check("dbt-only runs the DBT runtime ABI check", dbt.nodes.contains("check.dbt_runtime_abi"));
+    check("dbt-only runs c-programs DBT cells", dbt.nodes.contains("e2e.manifest_c_programs_on_host"));
+    check("dbt-only runs system-utils DBT cells", dbt.nodes.contains("e2e.manifest_system_utils_on_host"));
     check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
     check("dbt-only pulls build.workspace (dep)", dbt.nodes.contains("build.workspace"));
     check(
@@ -1105,7 +1107,7 @@ fn self_test() {
 
     let mut removed = Dag { all_nodes: dag.all_nodes.clone(), deps: dag.deps.clone() };
     check("actual hosted DBT counterpart is present before removal",
-        removed.all_nodes.remove("test.dbt_parity_on_host"));
+        removed.all_nodes.remove("e2e.manifest_system_utils_on_host"));
     check("removed footprint counterpart forces full instead of dropping its coverage",
         select(&fp, &removed, &["detcore-dbt/src/lib.rs".into()]).decision == Decision::Full);
     let mut removed = Dag { all_nodes: dag.all_nodes.clone(), deps: dag.deps.clone() };

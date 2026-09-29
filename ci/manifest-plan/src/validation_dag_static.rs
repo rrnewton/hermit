@@ -32,7 +32,7 @@ pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
 pub(super) const RUST_SCRIPT_PRODUCER_QUICK_SUPER_CPU_SECONDS: i64 = 1200;
 pub(super) const MANIFEST_GATE_INNER_JOBS: i64 = 2;
 pub(super) const MANIFEST_GATE_CPU_SECONDS: i64 = 900;
-const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their seven top-level audits run serially inside the shared aggregate budget: the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged. CPU BOUND 2026-09-28: the ordinary and quick/super gates now carry 900 CPU seconds; the hosted-privileged variant keeps 600 with its 180-second wall. The audit work did not grow. At Hermit 81ca8822, b280bc48 and 1bd45c15 each audit's waited user+sys CPU agreed within 1% (scorecard 254.6-256.6, pressure 62.5-63.0, validate.rs 28.4-28.8 seconds), and across the 46 retained local validation profiles of this step from 2026-09-22 to 2026-09-28 user CPU stayed at or below 316.2 seconds while system CPU ranged from 32 to 374 seconds. The variable part is process creation. One complete gate at 81ca8822 runs 4011 git commands (scorecard 3182, validate.rs 509, pressure 204, DBT budget 65), and the local validation host resolves git to a telemetry wrapper that measured 51-85 ms of CPU per call against 5.1-5.2 ms for the git it wraps, spawning five further git processes and a detached logger for each call. On an unthrottled host the complete gate consumed 512.0 (b280bc48) and 535.7 (1bd45c15) CPU seconds with that wrapper first on PATH, and 305.5 and 300.7 with the wrapped git first. Three consecutive local runs on 2026-09-28 reached the old 600-second cap inside audits 5-7 with 340-374 seconds of system CPU. The largest observed user CPU, 316.2 seconds, times one plus the largest observed system/user ratio, 1.655, is 839.5 CPU seconds; 900 leaves 60.5 seconds above that product. It remains a runaway bound: a two-core spin is killed after 450 seconds, half of the unchanged 900-second wall."########;
+const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-25: RUN1902 admitted this gate to a one-core cgroup but inherited CARGO_BUILD_JOBS=4 from the outer validation environment. test-harness treated that unrelated value as the admitted width, launched two heavyweight metadata audits, and the scorecard's unchanged five-second snapshot command control was starved and killed after producing no output. The retained step profile recorded 0.9264 effective cores and 380.573 seconds throttled. Cold isolated controls at Hermit 22e9e0b5 and ecb3c9a5 passed with the original five-second boundary; concurrent one-core controls stretched the scorecard from 349.258/376.097 seconds to 553.087/531.102 seconds. preferred_inner_jobs=2 reserves the measured two-core width for each audit's internal Cargo and helper work, while jobs_env=CARGO_BUILD_JOBS carries a smaller admitted width into every child. The ordinary and quick/super variants set HERMIT_VALIDATE_AUDIT_JOBS=1 so their top-level audits run serially inside the shared aggregate budget (seven when measured; six since slice S13 of https://github.com/rrnewton/hermit/issues/3301 retired the tests/backend-parity/split_asymmetric_pr.py self-test): the exact concurrent scheduler path consumed 601.132 CPU seconds and was killed by the unchanged 600-second cap, while isolated scorecard and pressure controls consumed 327.344 and 70.699 CPU seconds. The separately bounded hosted-privileged variant retains its prior two-worker schedule. jobs_flag is explicitly empty so dagrun does not also append its default -j argument to test-harness. Commands, audit population, wall/CPU caps, and scorecard deadlines are unchanged. CPU BOUND 2026-09-28: the ordinary and quick/super gates now carry 900 CPU seconds; the hosted-privileged variant keeps 600 with its 180-second wall. The audit work did not grow. At Hermit 81ca8822, b280bc48 and 1bd45c15 each audit's waited user+sys CPU agreed within 1% (scorecard 254.6-256.6, pressure 62.5-63.0, validate.rs 28.4-28.8 seconds), and across the 46 retained local validation profiles of this step from 2026-09-22 to 2026-09-28 user CPU stayed at or below 316.2 seconds while system CPU ranged from 32 to 374 seconds. The variable part is process creation. One complete gate at 81ca8822 runs 4011 git commands (scorecard 3182, validate.rs 509, pressure 204, DBT budget 65), and the local validation host resolves git to a telemetry wrapper that measured 51-85 ms of CPU per call against 5.1-5.2 ms for the git it wraps, spawning five further git processes and a detached logger for each call. On an unthrottled host the complete gate consumed 512.0 (b280bc48) and 535.7 (1bd45c15) CPU seconds with that wrapper first on PATH, and 305.5 and 300.7 with the wrapped git first. Three consecutive local runs on 2026-09-28 reached the old 600-second cap inside audits 5-7 with 340-374 seconds of system CPU. The largest observed user CPU, 316.2 seconds, times one plus the largest observed system/user ratio, 1.655, is 839.5 CPU seconds; 900 leaves 60.5 seconds above that product. It remains a runaway bound: a two-core spin is killed after 450 seconds, half of the unchanged 900-second wall."########;
 
 /// The controlled writer a static validation step invokes.
 ///
@@ -43,16 +43,14 @@ const MANIFEST_GATE_DESCRIPTION: &str = r########"AUDIT WIDTH CONTRACT 2026-09-2
 pub(super) enum StructuredResultProducerKind {
     Nextest,
     TestHarness,
-    BackendParity,
     Envelope,
     Applications,
 }
 
 impl StructuredResultProducerKind {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 4] = [
         Self::Nextest,
         Self::TestHarness,
-        Self::BackendParity,
         Self::Envelope,
         Self::Applications,
     ];
@@ -61,7 +59,6 @@ impl StructuredResultProducerKind {
         match self {
             Self::Nextest => "run-nextest-counted.sh",
             Self::TestHarness => "target/debug/test-harness run",
-            Self::BackendParity => "tests/backend-parity/run_matrix.py",
             Self::Envelope => "write-structured-test-counts.sh",
             Self::Applications => "tests/e2e/lib/applications/run_all.sh",
         }
@@ -71,7 +68,6 @@ impl StructuredResultProducerKind {
         match self {
             Self::Nextest => NEXTEST_RESULT_PRODUCERS,
             Self::TestHarness => TEST_HARNESS_RESULT_PRODUCERS,
-            Self::BackendParity => BACKEND_PARITY_RESULT_PRODUCERS,
             Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
             Self::Applications => APPLICATION_RESULT_PRODUCERS,
         }
@@ -184,8 +180,6 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "quick.e2e_verify",
 ];
 
-pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] =
-    &["test.dbt_parity", "test.dbt_parity_on_host"];
 pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] =
     &["test.envelope_levels", "test.envelope_levels_on_host"];
 pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] =
@@ -375,10 +369,6 @@ pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredRes
         (
             TEST_HARNESS_RESULT_PRODUCERS,
             StructuredResultProducerKind::TestHarness,
-        ),
-        (
-            BACKEND_PARITY_RESULT_PRODUCERS,
-            StructuredResultProducerKind::BackendParity,
         ),
         (
             ENVELOPE_RESULT_PRODUCERS,
@@ -934,7 +924,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"check"########,
         job: r########"backend_parity_mutation"########,
         desc: r########"Identity fixtures in tests/c are non-vacuous (native mutation harness)"########,
-        description: r########"Proves every identity fixture in tests/c that includes parity_probe.h would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. The harness refuses to run unless its registry equals the set of tests/c sources that include parity_probe.h, and prints every fixture it examined. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. The fixtures and this harness moved from tests/backend-parity when the backend-parity-c bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the job id is kept so shard maps and history keep naming the same node. Real cross-backend parity (golden ptrace vs dbt/kvm) is covered by the c-programs manifest cells and the dbt_parity node against the same fixtures."########,
+        description: r########"Proves every identity fixture in tests/c that includes parity_probe.h would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. The harness refuses to run unless its registry equals the set of tests/c sources that include parity_probe.h, and prints every fixture it examined. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. The fixtures and this harness moved from tests/backend-parity when the backend-parity-c bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301); the job id is kept so shard maps and history keep naming the same node. Real cross-backend parity for those fixtures is carried by their c-programs verify cells, which e2e.manifest_c_programs and its _on_host twin select: c-programs/ioctl-fionread on ptrace and LiteInst, and c-programs/rlimit-identity and c-programs/sched-getaffinity-identity on ptrace, KVM and LiteInst. None of the three has a DBT cell. The retired test.dbt_parity matrix never compiled them either; its 28 cases now run as DBT verify cells in the c-programs and system-utils manifests (https://github.com/rrnewton/hermit/issues/3301, slice S13)."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -2844,42 +2834,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
-    },
-    StaticStepSpec {
-        group: r########"test"########,
-        job: r########"dbt_parity"########,
-        desc: r########"DynamoRIO DBT strict backend parity matrix"########,
-        description: r########"THE DEPENDENCY ON check.dbt_runtime_abi IS AN ORDERING FIX, NOT A DATA DEPENDENCY. This node does not consume anything the ABI check produces; it depends on it so the ABI check runs first and names a missing callback before eager-exit can cancel it. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 83660800 bytes; the larger 198864896-byte historical completed peak from its test.dbi_parity predecessor governs. The 512-MiB baseline rounds well above that floor and the 2-GiB hard cap preserves 1.5 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
-        labels: &[
-            r########"full"########,
-            r########"hosted-portable"########,
-            r########"portable"########,
-        ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/backend-parity/run_matrix.py --hermit target/ci/hermit-strict --backend dbt --strict --require-backend --no-parent-scorecard"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: None,
-        deps: &[
-            r########"build.runtime_release"########,
-            r########"check.dbt_runtime_abi"########,
-        ],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 180.0,
-            rss_baseline_bytes: Some(536870912),
-            hard_mem_max_bytes: Some(2147483648),
-            classification: StepClass::LatencyBound,
-            preferred_inner_jobs: None,
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 900,
-        cpu_timeout: 7200,
-        jobs_flag: None,
-        jobs_env: None,
     },
     StaticStepSpec {
         group: r########"test"########,

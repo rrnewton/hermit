@@ -71,7 +71,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_unit_on_host",
@@ -118,7 +117,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_unit_on_host",
@@ -165,7 +163,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_unit_on_host",
@@ -194,16 +191,17 @@
       "nodes": [
         "build.runtime_release",
         "build.workspace_on_host",
+        "check.dbt_runtime_abi",
         "doc.doctests_on_host",
         "doc.rustdoc_on_host",
         "e2e.manifest_c_programs_on_host",
+        "e2e.manifest_system_utils_on_host",
         "lint.clippy_on_host",
         "lint.rustfmt",
         "test.app_strict_verify_on_host",
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.hermit_integration_on_host",
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
@@ -246,7 +244,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_unit_on_host",
@@ -313,7 +310,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.detcore_misc_on_host",
         "test.detcore_parallel_on_host",
         "test.detcore_unit_on_host",
@@ -380,7 +376,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
         "test.hermit_modes_on_host",
@@ -424,7 +419,6 @@
         "test.arbitrary_binaries",
         "test.cli_on_host",
         "test.command_strict_verify",
-        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration",
         "test.hermit_modes_on_host",
@@ -469,7 +463,6 @@
         "test.arbitrary_binaries_on_host",
         "test.cli_on_host",
         "test.command_strict_verify_on_host",
-        "test.dbt_parity",
         "test.envelope_levels",
         "test.hermit_integration_on_host",
         "test.hermit_modes_on_host",
@@ -540,13 +533,9 @@
       ]
     },
     {
-      "_why": "Backend-parity driver contract suites are outside Cargo targets.",
-      "e2e_backends": [
-        "dbt"
-      ],
+      "_why": "Backend-parity driver contract suites are outside Cargo targets. No validation DAG node runs run_matrix.py since test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301, so only the suites node is selected.",
       "nodes": [
-        "check.backend_parity_suites",
-        "test.dbt_parity"
+        "check.backend_parity_suites"
       ],
       "paths": [
         "tests/backend-parity/**"
@@ -559,20 +548,6 @@
       ],
       "paths": [
         "tests/c/**"
-      ]
-    },
-    {
-      "_why": "run_matrix.py, which test.dbt_parity drives, compiles these three fixtures. They moved from tests/backend-parity/fixtures, where the tests/backend-parity/** rule covered them, to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",
-      "e2e_backends": [
-        "dbt"
-      ],
-      "nodes": [
-        "test.dbt_parity"
-      ],
-      "paths": [
-        "tests/c/cpuid_probe.c",
-        "tests/c/pid_probe.c",
-        "tests/c/pthread_lifecycle.c"
       ]
     },
     {

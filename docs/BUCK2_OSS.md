@@ -116,10 +116,16 @@ Completeness is not inferred from equal nonzero populations: before execution,
 the driver imports the official `run_matrix.py` catalog/expectation/reference
 policy and retains a source-hash-bound expected ledger. Every candidate runs on
 the host through safehermit's `systemd-run --user` service, which starts in the
-initial user namespace without CAP_SYS_ADMIN, so the per-run `/test` tmpfs that
-the pinned-root node `test.dbt_parity` requests cannot be mounted there. The
-matrix therefore takes its flags and environment from the official host twin
-`test.dbt_parity_on_host`. That twin runs each DBT command inside a rootless
+initial user namespace without CAP_SYS_ADMIN, so a per-run `/test` tmpfs
+cannot be mounted there. The matrix therefore runs with a reviewed host
+envelope that the driver owns: the strict flags `--backend dbt --strict
+--require-backend --no-parent-scorecard`, an empty environment, a 900 s wall and
+7200 s CPU budget, and a 512-MiB baseline and 2-GiB hard memory bound. These are
+the values the validation DAG's `test.dbt_parity_on_host` node carried until
+slice S13 of https://github.com/rrnewton/hermit/issues/3301 retired it; the
+matrix's 28 cases now run in authoritative validation as DBT verify cells of
+the c-programs and system-utils manifests, so `run_matrix.py` no longer runs in
+the validation DAG. The matrix runs each DBT command inside a rootless
 user+mount namespace whose `/tmp` is a per-command directory. The proxy must not
 start there: safehermit's disk bound needs host `sudo`, and its service would
 escape the namespace anyway, so the guest would silently run on the host `/tmp`.
@@ -133,13 +139,10 @@ must show the command directory as `/tmp`, `/tmp` as the working directory and
 is refused. Each DBT invocation retains that readback and a typed record of
 the stage (`private-tmp.json`); the retained audit requires both for every DBT
 run and neither for any other role, re-checks the readback against the record,
-and binds both hashes in the invocation manifest. The proxy refuses the twins
-unless the pinned node runs exactly the host payload with the same deadlines and
-differs in environment only by `HERMIT_E2E_EMPTY_WORKDIR=/test`, the host command
-is the reviewed strict invocation, the host node does not request `/test`, and no
-host variable collides with a candidate proxy binding.
-The pinned-root node itself is unchanged and still runs in authoritative
-validation. For the current strict DBT mode that independently requires
+and binds both hashes in the invocation manifest. The driver refuses an
+envelope that requests `HERMIT_E2E_EMPTY_WORKDIR` or whose environment collides
+with a candidate proxy binding.
+For the current strict DBT mode the matrix independently requires
 28 TSV rows (27 selected plus the documented `pthread_lifecycle` gap), 23
 ptrace references, 81 DBT candidate runs, two global probes, and therefore 106
 proxy invocations per candidate. Cargo and Buck must each match that exact

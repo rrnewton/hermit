@@ -4847,10 +4847,10 @@ struct MatrixExecutionEnvelope {
     cpu_timeout: i64,
     jobs_flag: Option<String>,
     jobs_env: Option<String>,
-    /// The official host twin's `run_matrix.py` flags, because this driver
-    /// launches every candidate on the host.
+    /// The reviewed `run_matrix.py` flags. This driver launches every
+    /// candidate on the host.
     matrix_flags: Vec<String>,
-    /// The official host twin's environment, for the same reason.
+    /// The reviewed host environment, for the same reason.
     environment: BTreeMap<String, String>,
 }
 
@@ -4858,10 +4858,6 @@ struct MatrixExecutionEnvelope {
 /// a safehermit candidate never has: `systemd-run --user` starts it in the
 /// initial user namespace, outside any namespace this driver could enter.
 const PINNED_ROOT_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
-const PINNED_ROOT_WORKDIR: &str = "/test";
-const HOST_DBT_MATRIX_PRELUDE: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
-const HOST_DBT_MATRIX_RUNNER: &str =
-    "python3 tests/backend-parity/run_matrix.py --hermit target/ci/hermit-strict ";
 const REVIEWED_DBT_MATRIX_FLAGS: [&str; 5] = [
     "--backend",
     "dbt",
@@ -4870,118 +4866,81 @@ const REVIEWED_DBT_MATRIX_FLAGS: [&str; 5] = [
     "--no-parent-scorecard",
 ];
 
-/// The host twin must run exactly the pinned twin's payload under the same
-/// envelope, and differ in environment only by the pinned-root `/test` request.
-/// Returns the host twin's matrix flags.
-fn require_host_dbt_matrix_counterpart(pinned: &Step, host: &Step) -> Result<Vec<String>, String> {
-    require_official_dbt_matrix_envelope(host)?;
-    let flags = host
-        .cmd
-        .strip_prefix(HOST_DBT_MATRIX_PRELUDE)
-        .and_then(|rest| rest.strip_prefix(HOST_DBT_MATRIX_RUNNER))
-        .map(|flags| flags.split(' ').map(str::to_owned).collect::<Vec<_>>())
-        .filter(|flags| flags == &REVIEWED_DBT_MATRIX_FLAGS)
-        .ok_or_else(|| {
-            "official test.dbt_parity_on_host no longer runs the reviewed strict DBT matrix command"
-                .to_owned()
-        })?;
-    if !pinned
-        .cmd
-        .ends_with(&format!(" bash {}", shell_words::quote(&host.cmd)))
-        || host.timeout != pinned.timeout
-        || host.cpu_timeout != pinned.cpu_timeout
-    {
-        return Err(
-            "official DBT matrix twins no longer share one payload, timeout and CPU timeout"
-                .to_owned(),
-        );
-    }
-    if host.env.contains_key(PINNED_ROOT_WORKDIR_ENV) {
-        return Err(format!(
-            "official test.dbt_parity_on_host requests {PINNED_ROOT_WORKDIR_ENV}, which a safehermit-bounded host candidate cannot satisfy"
-        ));
-    }
-    let mut pinned_expected = host.env.clone();
-    pinned_expected.insert(
-        PINNED_ROOT_WORKDIR_ENV.to_owned(),
-        PINNED_ROOT_WORKDIR.to_owned(),
-    );
-    if pinned.env != pinned_expected {
-        return Err(format!(
-            "official DBT matrix twin environments differ by more than the pinned-root {PINNED_ROOT_WORKDIR_ENV}={PINNED_ROOT_WORKDIR} request"
-        ));
-    }
-    Ok(flags)
-}
-
-fn require_official_dbt_matrix_envelope(step: &Step) -> Result<(), String> {
-    let hint = &step.hint;
-    if !hint.resources.is_empty()
-        || hint.est_duration_s != 180.0
-        || hint.rss_baseline_bytes != Some(512 * 1024 * 1024)
-        || hint.rss_baseline_inner_jobs.is_some()
-        || hint.hard_mem_max_bytes != Some(2_i64 * 1024 * 1024 * 1024)
-        || hint.classification != StepClass::LatencyBound
-        || hint.preferred_inner_jobs.is_some()
-        || hint.measured_effective_cores.is_some()
-        || hint.measured_cpu_utilization.is_some()
-        || !matches!(step.cmdtype, CmdType::Unknown)
-        || step.networkonly
-        || step.engine_only
-        || step.timeout != MATRIX_STEP_DEADLINE_SECONDS
-        || step.cpu_timeout != MATRIX_CPU_TIMEOUT_SECONDS
-        || step.jobs_flag.is_some()
-        || step.jobs_env.is_some()
-    {
-        Err(
-            "official test.dbt_parity resource envelope drifted from the reviewed 512-MiB baseline/2-GiB hard/latency/900-wall/7200-CPU/no-jobs contract"
-                .to_owned(),
-        )
-    } else {
-        Ok(())
-    }
-}
-
-fn official_dbt_matrix_envelope(root: &Path) -> Result<MatrixExecutionEnvelope, String> {
-    let generated = hermit_manifest_plan::validation_dag::generate(root)?;
-    dbt_matrix_envelope_from_steps(&generated.steps)
-}
-
-fn dbt_matrix_envelope_from_steps(steps: &[Step]) -> Result<MatrixExecutionEnvelope, String> {
-    let unique = |job: &str| {
-        let mut matches = steps
+/// The reviewed execution envelope for the shadow DBT matrix.
+///
+/// Until slice S13 of https://github.com/rrnewton/hermit/issues/3301 this was
+/// derived from the validation DAG's `test.dbt_parity` node and its
+/// `test.dbt_parity_on_host` twin, and refused any drift between them. Those
+/// nodes were retired: their 28 cases now run as DBT verify cells of the
+/// c-programs and system-utils manifests, and `run_matrix.py` stays only for
+/// this nightly Buck/Cargo comparison and the Makefile targets. The values are
+/// the ones that host twin carried when it was retired (commit 12371d6c): 180 s
+/// estimate, 512-MiB baseline and 2-GiB hard memory, latency-bound, 900 s wall
+/// and 7200 s CPU, no jobs flag, and an empty host environment.
+fn reviewed_dbt_matrix_envelope() -> MatrixExecutionEnvelope {
+    MatrixExecutionEnvelope {
+        cmdtype: CmdType::Unknown,
+        hint: ResourceHint {
+            est_duration_s: 180.0,
+            rss_baseline_bytes: Some(512 * 1024 * 1024),
+            hard_mem_max_bytes: Some(2_i64 * 1024 * 1024 * 1024),
+            classification: StepClass::LatencyBound,
+            ..ResourceHint::default()
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: MATRIX_STEP_DEADLINE_SECONDS,
+        cpu_timeout: MATRIX_CPU_TIMEOUT_SECONDS,
+        jobs_flag: None,
+        jobs_env: None,
+        matrix_flags: REVIEWED_DBT_MATRIX_FLAGS
             .iter()
-            .filter(|step| step.group == "test" && step.job == job);
-        let step = matches
-            .next()
-            .ok_or_else(|| format!("generated validation DAG lacks test.{job}"))?;
-        if matches.next().is_some() {
-            return Err(format!(
-                "generated validation DAG contains duplicate test.{job} nodes"
-            ));
-        }
-        Ok(step.clone())
-    };
-    let step = unique("dbt_parity")?;
-    let host = unique("dbt_parity_on_host")?;
-    require_official_dbt_matrix_envelope(&step)?;
-    let matrix_flags = require_host_dbt_matrix_counterpart(&step, &host)?;
-    Ok(MatrixExecutionEnvelope {
-        cmdtype: step.cmdtype,
-        hint: step.hint,
-        networkonly: step.networkonly,
-        engine_only: step.engine_only,
-        timeout: step.timeout,
-        cpu_timeout: step.cpu_timeout,
-        jobs_flag: step.jobs_flag,
-        jobs_env: step.jobs_env,
-        matrix_flags,
-        environment: host.env,
-    })
+            .map(|flag| (*flag).to_owned())
+            .collect(),
+        environment: BTreeMap::new(),
+    }
 }
 
-/// The official host twin's environment plus the proxy's own bindings; a
-/// collision would let the node silently redirect the candidate under test.
+/// The one scheduler step that runs a candidate's DBT matrix. Shared by the
+/// driver and its deadline test so the test exercises the step that launches.
+fn dbt_matrix_step(
+    envelope: &MatrixExecutionEnvelope,
+    candidate_label: &str,
+    description: &str,
+    cmd: String,
+    environment: BTreeMap<String, String>,
+) -> Step {
+    Step {
+        group: "buck_phase1".into(),
+        job: format!("{candidate_label}_dbt_matrix"),
+        desc: description.into(),
+        description: "Official DBT matrix under the repository cgroup process-tree supervisor"
+            .into(),
+        labels: Vec::new(),
+        cmd,
+        cmdtype: envelope.cmdtype,
+        manifest: None,
+        integration_test_binaries: None,
+        result_manifests: None,
+        deps: Vec::new(),
+        env: environment,
+        hint: envelope.hint.clone(),
+        networkonly: envelope.networkonly,
+        engine_only: envelope.engine_only,
+        timeout: envelope.timeout,
+        cpu_timeout: envelope.cpu_timeout,
+        jobs_flag: envelope.jobs_flag.clone(),
+        jobs_env: envelope.jobs_env.clone(),
+        skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
+        explains: Vec::new(),
+        fail_fast_family: None,
+    }
+}
+
+/// The reviewed host environment plus the proxy's own bindings; a collision
+/// would let the envelope silently redirect the candidate under test.
 fn matrix_step_environment(
     envelope: &MatrixExecutionEnvelope,
     safehermit: &Path,
@@ -5025,7 +4984,7 @@ fn matrix_step_environment(
     for (key, value) in proxy {
         if environment.insert(key.clone(), value).is_some() {
             return Err(format!(
-                "official host DBT matrix environment collides with proxy binding {key}"
+                "reviewed host DBT matrix environment collides with proxy binding {key}"
             ));
         }
     }
@@ -5078,33 +5037,13 @@ fn run_dbt_matrix(request: MatrixInvocation<'_>) -> Result<String, String> {
         &matrix_invocations,
         candidate_label,
     )?;
-    let step = Step {
-        group: "buck_phase1".into(),
-        job: format!("{candidate_label}_dbt_matrix"),
-        desc: description.into(),
-        description: "Official DBT matrix under the repository cgroup process-tree supervisor"
-            .into(),
-        labels: Vec::new(),
-        cmd: shell_command(&arguments),
-        cmdtype: envelope.cmdtype,
-        manifest: None,
-        integration_test_binaries: None,
-        result_manifests: None,
-        deps: Vec::new(),
-        env: environment,
-        hint: envelope.hint.clone(),
-        networkonly: envelope.networkonly,
-        engine_only: envelope.engine_only,
-        timeout: envelope.timeout,
-        cpu_timeout: envelope.cpu_timeout,
-        jobs_flag: envelope.jobs_flag.clone(),
-        jobs_env: envelope.jobs_env.clone(),
-        skip_reason: None,
-        write_domains: None,
-        write_domain_guarantee: None,
-        explains: Vec::new(),
-        fail_fast_family: None,
-    };
+    let step = dbt_matrix_step(
+        envelope,
+        candidate_label,
+        description,
+        shell_command(&arguments),
+        environment,
+    );
     let config = DagConfig {
         description: format!("{candidate_label} Buck phase-1 shadow DBT matrix"),
         steps: vec![step],
@@ -7461,7 +7400,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     unsafe {
         env::set_var("DAGRUN_LOG_DIR", &matrix_supervisor_logs);
     }
-    let matrix_envelope = official_dbt_matrix_envelope(&root)?;
+    let matrix_envelope = reviewed_dbt_matrix_envelope();
     publish_official_matrix_expected_ledger(&root, &evidence_dir)?;
     let cargo_matrix_output = evidence_dir.join("cargo-dbt-matrix.tsv");
     let cargo_matrix = run_dbt_matrix(MatrixInvocation {
@@ -8109,34 +8048,50 @@ mod tests {
     }
 
     #[test]
-    fn shadow_dbt_envelope_is_derived_from_exact_official_node() {
-        let root = Path::new(file!())
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf();
-        let generated = hermit_manifest_plan::validation_dag::generate(&root).unwrap();
-        let official = generated
-            .steps
-            .into_iter()
-            .find(|step| step.group == "test" && step.job == "dbt_parity")
-            .unwrap();
-        require_official_dbt_matrix_envelope(&official).unwrap();
-        let derived = official_dbt_matrix_envelope(&root).unwrap();
-        assert_eq!(derived.hint.rss_baseline_bytes, Some(512 * 1024 * 1024));
+    fn shadow_dbt_envelope_is_the_reviewed_host_contract() {
+        let envelope = reviewed_dbt_matrix_envelope();
+        assert!(envelope.hint.resources.is_empty());
+        assert_eq!(envelope.hint.est_duration_s, 180.0);
+        assert_eq!(envelope.hint.rss_baseline_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(envelope.hint.rss_baseline_inner_jobs, None);
         assert_eq!(
-            derived.hint.hard_mem_max_bytes,
+            envelope.hint.hard_mem_max_bytes,
             Some(2_i64 * 1024 * 1024 * 1024)
         );
-        assert_eq!(derived.hint.classification, StepClass::LatencyBound);
-        assert_eq!(derived.hint.preferred_inner_jobs, None);
-        assert!(matches!(derived.cmdtype, CmdType::Unknown));
-        assert_eq!(derived.timeout, 900);
-        assert_eq!(derived.cpu_timeout, 7_200);
-        assert_eq!(derived.jobs_flag, None);
-        assert_eq!(derived.jobs_env, None);
+        assert_eq!(envelope.hint.classification, StepClass::LatencyBound);
+        assert_eq!(envelope.hint.preferred_inner_jobs, None);
+        assert_eq!(envelope.hint.measured_effective_cores, None);
+        assert_eq!(envelope.hint.measured_cpu_utilization, None);
+        assert!(matches!(envelope.cmdtype, CmdType::Unknown));
+        assert!(!envelope.networkonly);
+        assert!(!envelope.engine_only);
+        assert_eq!(envelope.timeout, 900);
+        assert_eq!(envelope.cpu_timeout, 7_200);
+        assert_eq!(envelope.jobs_flag, None);
+        assert_eq!(envelope.jobs_env, None);
+        assert_eq!(
+            envelope.matrix_flags,
+            [
+                "--backend",
+                "dbt",
+                "--strict",
+                "--require-backend",
+                "--no-parent-scorecard"
+            ]
+        );
+        assert!(envelope.environment.is_empty());
+
+        let step = dbt_matrix_step(
+            &envelope,
+            "buck",
+            "deadline fixture",
+            "true".to_owned(),
+            BTreeMap::new(),
+        );
+        assert_eq!(step.timeout, envelope.timeout);
+        assert_eq!(step.cpu_timeout, envelope.cpu_timeout);
         let predicate_config = DagConfig {
-            steps: vec![official.clone()],
+            steps: vec![step.clone()],
             ..Default::default()
         };
         assert!(
@@ -8145,18 +8100,23 @@ mod tests {
         );
         assert_eq!(
             steps_violating_run_timeout(&predicate_config, MATRIX_STEP_DEADLINE_SECONDS),
-            vec![("test.dbt_parity".to_owned(), MATRIX_STEP_DEADLINE_SECONDS)]
+            vec![(
+                "buck_phase1.buck_dbt_matrix".to_owned(),
+                MATRIX_STEP_DEADLINE_SECONDS
+            )]
         );
         assert_eq!(
             steps_violating_run_timeout(&predicate_config, MATRIX_STEP_DEADLINE_SECONDS - 1),
-            vec![("test.dbt_parity".to_owned(), MATRIX_STEP_DEADLINE_SECONDS)]
+            vec![(
+                "buck_phase1.buck_dbt_matrix".to_owned(),
+                MATRIX_STEP_DEADLINE_SECONDS
+            )]
         );
 
         let marker_root = fixture_root("matrix-deadline-refusal");
         fs::create_dir(&marker_root).unwrap();
         let marker = marker_root.join("launched");
-        let mut refused_step = official.clone();
-        refused_step.deps.clear();
+        let mut refused_step = step;
         refused_step.cmd = format!("touch {}", shell_words::quote(&marker.to_string_lossy()));
         let refused_config = DagConfig {
             steps: vec![refused_step],
@@ -8181,124 +8141,6 @@ mod tests {
         );
         fs::remove_dir_all(marker_root).unwrap();
 
-        let mut widened = official.clone();
-        widened.hint.hard_mem_max_bytes = Some(16_i64 * 1024 * 1024 * 1024);
-        assert!(require_official_dbt_matrix_envelope(&widened).is_err());
-
-        // Candidates run on the host, so the matrix flags and environment come
-        // from the host twin; the pinned twin keeps its per-run /test request.
-        let steps = hermit_manifest_plan::validation_dag::generate(&root)
-            .unwrap()
-            .steps;
-        let host = steps
-            .iter()
-            .find(|step| step.group == "test" && step.job == "dbt_parity_on_host")
-            .unwrap()
-            .clone();
-        assert_eq!(
-            official
-                .env
-                .get(PINNED_ROOT_WORKDIR_ENV)
-                .map(String::as_str),
-            Some(PINNED_ROOT_WORKDIR)
-        );
-        assert_eq!(
-            require_host_dbt_matrix_counterpart(&official, &host).unwrap(),
-            REVIEWED_DBT_MATRIX_FLAGS
-        );
-        assert_eq!(derived.matrix_flags, REVIEWED_DBT_MATRIX_FLAGS);
-        assert_eq!(derived.environment, host.env);
-        assert!(!derived.environment.contains_key(PINNED_ROOT_WORKDIR_ENV));
-
-        let refused = |pinned: &Step, host: &Step| {
-            require_host_dbt_matrix_counterpart(pinned, host).unwrap_err()
-        };
-        let mut requesting = host.clone();
-        requesting.env.insert(
-            PINNED_ROOT_WORKDIR_ENV.to_owned(),
-            PINNED_ROOT_WORKDIR.to_owned(),
-        );
-        assert!(refused(&official, &requesting).contains("cannot satisfy"));
-        for (name, mutate) in [
-            ("dropped --strict", " --strict"),
-            ("dropped --require-backend", " --require-backend"),
-            (
-                "changed prelude",
-                "export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
-            ),
-        ] {
-            let mut drifted = host.clone();
-            drifted.cmd = drifted.cmd.replacen(mutate, "", 1);
-            assert_ne!(drifted.cmd, host.cmd, "{name}");
-            assert!(
-                refused(&official, &drifted).contains("reviewed strict DBT matrix command"),
-                "{name}"
-            );
-        }
-        let mut appended = host.clone();
-        appended.cmd.push_str(" --verify");
-        assert!(refused(&official, &appended).contains("reviewed strict DBT matrix command"));
-        let mut lengthened = host.clone();
-        lengthened.timeout += 1;
-        assert!(refused(&official, &lengthened).contains("resource envelope drifted"));
-        let mut cpu_lengthened = host.clone();
-        cpu_lengthened.cpu_timeout += 1;
-        assert!(refused(&official, &cpu_lengthened).contains("resource envelope drifted"));
-        let mut widened_host = host.clone();
-        widened_host.hint.hard_mem_max_bytes = Some(16_i64 * 1024 * 1024 * 1024);
-        assert!(refused(&official, &widened_host).contains("resource envelope drifted"));
-        let mut diverged_payload = official.clone();
-        diverged_payload.cmd = diverged_payload.cmd.replacen(" --strict", "", 1);
-        assert!(refused(&diverged_payload, &host).contains("share one payload"));
-        let mut extra_pinned_env = official.clone();
-        extra_pinned_env
-            .env
-            .insert("HERMIT_UNREVIEWED".to_owned(), "1".to_owned());
-        assert!(refused(&extra_pinned_env, &host).contains("environments differ"));
-        let mut extra_host_env = host.clone();
-        extra_host_env
-            .env
-            .insert("HERMIT_UNREVIEWED".to_owned(), "1".to_owned());
-        assert!(refused(&official, &extra_host_env).contains("environments differ"));
-        let mut other_workdir = official.clone();
-        other_workdir
-            .env
-            .insert(PINNED_ROOT_WORKDIR_ENV.to_owned(), "/tmp".to_owned());
-        assert!(refused(&other_workdir, &host).contains("environments differ"));
-        let mut no_workdir = official.clone();
-        no_workdir.env.remove(PINNED_ROOT_WORKDIR_ENV);
-        assert!(refused(&no_workdir, &host).contains("environments differ"));
-
-        let mut duplicated = steps.clone();
-        duplicated.push(host.clone());
-        assert!(
-            dbt_matrix_envelope_from_steps(&duplicated)
-                .err()
-                .unwrap()
-                .contains("duplicate test.dbt_parity_on_host")
-        );
-        let missing = steps
-            .iter()
-            .filter(|step| step.job != "dbt_parity_on_host")
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            dbt_matrix_envelope_from_steps(&missing)
-                .err()
-                .unwrap()
-                .contains("lacks test.dbt_parity_on_host")
-        );
-        let mut drifted_steps = steps.clone();
-        for step in &mut drifted_steps {
-            if step.job == "dbt_parity_on_host" {
-                step.env.insert(
-                    PINNED_ROOT_WORKDIR_ENV.to_owned(),
-                    PINNED_ROOT_WORKDIR.to_owned(),
-                );
-            }
-        }
-        assert!(dbt_matrix_envelope_from_steps(&drifted_steps).is_err());
-
         let bind = |envelope: &MatrixExecutionEnvelope| {
             matrix_step_environment(
                 envelope,
@@ -8309,8 +8151,8 @@ mod tests {
                 "buck",
             )
         };
-        let environment = bind(&derived).unwrap();
-        let mut expected = derived.environment.clone();
+        let environment = bind(&envelope).unwrap();
+        let mut expected = BTreeMap::new();
         for (key, value) in [
             (MATRIX_PROXY_ENV, "1"),
             ("HERMIT_BUCK_PHASE1_SAFEHERMIT", "/bounded/safehermit"),
@@ -8326,11 +8168,10 @@ mod tests {
             expected.insert(key.to_owned(), value.to_owned());
         }
         assert_eq!(environment, expected);
-        let mut pinned_request = derived.clone();
-        pinned_request.environment.insert(
-            PINNED_ROOT_WORKDIR_ENV.to_owned(),
-            PINNED_ROOT_WORKDIR.to_owned(),
-        );
+        let mut pinned_request = envelope.clone();
+        pinned_request
+            .environment
+            .insert(PINNED_ROOT_WORKDIR_ENV.to_owned(), "/test".to_owned());
         assert!(
             bind(&pinned_request)
                 .unwrap_err()
@@ -8341,7 +8182,7 @@ mod tests {
             "HERMIT_BUCK_PHASE1_CANDIDATE",
             "HERMIT_INSTALL_DIR",
         ] {
-            let mut redirecting = derived.clone();
+            let mut redirecting = envelope.clone();
             redirecting
                 .environment
                 .insert(key.to_owned(), "/elsewhere".to_owned());

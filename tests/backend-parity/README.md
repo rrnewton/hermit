@@ -11,6 +11,15 @@ generated TSV here. It does **not** touch the tracked
 publisher `compat-envelope/publish-scorecard.py`, whose exact invocation the
 runner prints at the end of the run.
 
+The validation DAG no longer runs this matrix. Until slice S13 of
+https://github.com/rrnewton/hermit/issues/3301 the `test.dbt_parity` node ran it
+with `--backend dbt --strict`; its 28 cases now run as DBT verify cells of
+`tests/e2e/manifests/c-programs.yaml` and `tests/e2e/manifests/system-utils.yaml`,
+with exact `expected_stdout` goldens or `expected_stdout_contains` markers.
+`run_matrix.py` stays for the `make validate-kvm` and `make validate-dbt`
+targets, the nightly Buck shadow comparison in `scripts/build-buck-release.rs`,
+and the driver-side suites below.
+
 ## Current ratchet
 
 The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the
@@ -431,39 +440,6 @@ HERMIT_E9TOOL=<path>/e9tool HERMIT_E9PATCH_BACKEND=<path>/e9patch \
 ```
 
 Use `--check` to validate the corpus contract without prerequisites.
-
-## Splitting asymmetric backlog PRs
-
-PRs that predate the shared-manifest symmetry guard may combine useful code
-with additions to this backend-private corpus. Do not hand-edit those patches.
-Plan a lossless split first:
-
-```bash
-tests/backend-parity/split_asymmetric_pr.py --pr <number>
-```
-
-The dry run assigns every changed path and hunk to code or deferred tests,
-replays both partitions, and requires their union to reproduce the source PR's
-Git tree exactly. It fails instead of guessing on mixed inventory edits,
-private-test deletions, unknown asymmetry shapes, or code replay conflicts.
-
-Publishing is a separate explicit operation:
-
-```bash
-tests/backend-parity/split_asymmetric_pr.py --pr <number> --publish \
-  --role-tag '[impl agent, MODEL]'
-```
-
-A mixed PR becomes a code-only draft against fresh `main` and a test-only draft
-against the source PR's original base. The latter is labeled
-`matrix-asymmetric-tests-deferred` and carries a required next-action checklist:
-promote through the shared ptrace front door, minimize then promote, or reject
-with evidence. The welded source closes only after both replacements exist. A
-test-only source stays open as the labeled deferred PR; the tool does not create
-an empty code PR.
-
-The open PR count can rise after a mixed split. That is intentional: one
-unlandable PR becomes landable code plus explicit, queryable test debt.
 
 ## Running
 

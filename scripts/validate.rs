@@ -451,7 +451,7 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     for tag in [
         "test.cli", "test.cli_on_host", "test.liteinst_strict",
         "test.liteinst_strict_on_host", "test.sabre_examples",
-        "test.sabre_examples_on_host", "test.dbt_parity", "test.dbt_parity_on_host",
+        "test.sabre_examples_on_host",
     ] {
         let Some(consumer) = cfg.steps.iter().find(|step| step.tag() == tag) else { continue; };
         direct_consumers += 1;
@@ -460,7 +460,11 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             return Err(format!("release-artifact bracket: {tag} bypasses the staged artifact"));
         }
     }
-    if direct_consumers < 4 {
+    // The full plan carries exactly 3 of these (test.cli,
+    // test.liteinst_strict, test.sabre_examples); the _on_host twins are
+    // hosted-portable only. It carried 4 until slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301 retired test.dbt_parity.
+    if direct_consumers < 3 {
         return Err(format!("release-artifact bracket: inspected only {direct_consumers} direct consumers"));
     }
     for selected in cfg.steps.iter().filter(|step| step.labels.iter().any(|label| label == "full")) {
@@ -508,7 +512,7 @@ mod artifact_plan_tests {
         for (tag, from, to) in [
             ("build.e2e_artifact", "cargo) hermit_payload=target/debug/hermit", "cargo) hermit_payload=target/ci/hermit-strict"),
             ("build.e2e_artifact", "buck) hermit_payload=target/ci/hermit-strict", "buck) hermit_payload=target/debug/hermit"),
-            ("test.dbt_parity", "target/ci/hermit-strict", "target/release/hermit"),
+            ("test.sabre_examples", "target/ci/hermit-strict", "target/release/hermit"),
             ("build.runtime_release", "target/ci/libdetcore_sabre.so", "target/ci/libdetcore_sabre-decoy.so"),
             ("build.runtime_release", "sabre_before", "sabre_decoy"),
             ("build.runtime_release", "rm -rf target/install_pkg/rsrcs/hermit-runtime", "true"),
@@ -5572,7 +5576,6 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         .collect::<BTreeSet<_>>();
     let expected_non_nextest = BTreeSet::from([
         "test.applications_e2e".to_string(),
-        "test.dbt_parity".to_string(),
         "test.envelope_levels".to_string(),
     ]);
     if non_nextest_test_nodes != expected_non_nextest {
@@ -5581,23 +5584,16 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
              {non_nextest_test_nodes:?}"
         ));
     }
-    for (relative, marker) in [
-        (
-            "tests/e2e/lib/applications/run_all.sh",
-            "write-structured-test-counts.sh",
-        ),
-        (
-            "tests/backend-parity/run_matrix.py",
-            "DAGRUN_TEST_COUNTS_PATH",
-        ),
-    ] {
-        let source = std::fs::read_to_string(root.join(relative))
-            .map_err(|error| format!("verbosity: cannot read {relative}: {error}"))?;
-        if !source.contains(marker) {
-            return Err(format!(
-                "verbosity: {relative} no longer publishes structured test counts"
-            ));
-        }
+    // One producer since slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301 retired test.dbt_parity,
+    // whose run_matrix.py was the other.
+    let relative = "tests/e2e/lib/applications/run_all.sh";
+    let source = std::fs::read_to_string(root.join(relative))
+        .map_err(|error| format!("verbosity: cannot read {relative}: {error}"))?;
+    if !source.contains("write-structured-test-counts.sh") {
+        return Err(format!(
+            "verbosity: {relative} no longer publishes structured test counts"
+        ));
     }
     let pinned_root_wrapper = std::fs::read_to_string(root.join("ci/hermetic/run-in-pinned-root.sh"))
         .map_err(|error| format!("verbosity: cannot read pinned-root wrapper: {error}"))?;
@@ -16173,100 +16169,22 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 "end-of-run summary: a nextest pass after an inner retry was not retained as one recovered retry: errors={inner_errors:?}, summary={inner_summary:?}"
             ));
         }
-        let dbt_log = "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
-[test.dbt_parity] PASS dbt/file_metadata: matched\n\
-[test.dbt_parity] FAIL dbt/random_sources: output differed\n\
-[test.dbt_parity] PASS dbt/: empty case\n\
-[test.dbt_parity] PASS ptrace/wrong_backend: matched\n\
-[test.dbt_parity] PASS dbt/missing_colon\n\
-[test.dbt_parity] XPASS dbt/known_gap: candidate\n\
-[test.other] FAIL dbt/other_node: ignored\n";
-        let dbt = dbt_parity_test_observations(dbt_log);
-        let expected_dbt = vec![
-            TestAttemptObservation {
-                node: DBT_PARITY_NODE.into(),
-                attempt: 1,
-                id: "backend-parity/file_metadata [dbt/strict]".into(),
-                passed: true,
-                inner_attempts: 1,
-            },
-            TestAttemptObservation {
-                node: DBT_PARITY_NODE.into(),
-                attempt: 1,
-                id: "backend-parity/random_sources [dbt/strict]".into(),
-                passed: false,
-                inner_attempts: 1,
-            },
-        ];
-        if dbt != expected_dbt {
-            return Err(format!(
-                "end-of-run summary: DBT parity PASS/FAIL rows or malformed-line refusal were \
-                 parsed incorrectly: {dbt:?}"
-            ));
-        }
-        let dbt_failed = test_id_summary(
-            dbt,
+        // A failed node that produced no individual result keeps its node-only
+        // fallback instead of gaining an invented test id. The retired
+        // test.dbt_parity log parser used to carry this case; it is a property
+        // of test_id_summary itself, so it stays asserted directly (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301).
+        let pre_result_death = test_id_summary(
+            Vec::new(),
             &[],
-            &BTreeSet::from([DBT_PARITY_NODE.to_string()]),
+            &BTreeSet::from(["fixture.died_before_results".to_string()]),
         );
-        if dbt_failed.failed.len() != 1
-            || dbt_failed.failed[0].id != "backend-parity/random_sources [dbt/strict]"
-            || !dbt_failed.failed_nodes_without_test_ids.is_empty()
+        if pre_result_death.failed_nodes_without_test_ids != ["fixture.died_before_results"]
+            || !pre_result_death.failed.is_empty()
         {
             return Err(format!(
-                "end-of-run summary: a DBT parity case failure did not replace its node-only \
-                 fallback with the stable test id: {dbt_failed:?}"
-            ));
-        }
-
-        let dbt_retry_log = "[test.dbt_parity] ▶ START first attempt\n\
-[test.dbt_parity] FAIL dbt/virtual_clock: first attempt failed\n\
-[test.dbt_parity] ▶ START second attempt\n\
-[test.dbt_parity] PASS dbt/virtual_clock: retry passed\n";
-        let dbt_retry = dbt_parity_test_observations(dbt_retry_log);
-        if dbt_retry.len() != 2
-            || dbt_retry[0].attempt != 1
-            || dbt_retry[0].passed
-            || dbt_retry[1].attempt != 2
-            || !dbt_retry[1].passed
-            || dbt_retry[0].id != dbt_retry[1].id
-        {
-            return Err(format!(
-                "end-of-run summary: DBT parity retry lost its per-attempt result: {dbt_retry:?}"
-            ));
-        }
-        let mut dbt_attempts = vec![
-            unreported_attempt(DBT_PARITY_NODE.into(), 1),
-            unreported_attempt(DBT_PARITY_NODE.into(), 2),
-        ];
-        dbt_attempts[0].retry_class = Some(RetryClass::AlwaysEligible);
-        dbt_attempts[0].retry_detail = Some("self-test retry".into());
-        let dbt_retry_summary = test_id_summary(dbt_retry, &dbt_attempts, &BTreeSet::new());
-        if dbt_retry_summary.recovered.len() != 1
-            || dbt_retry_summary.recovered[0].id
-                != "backend-parity/virtual_clock [dbt/strict]"
-            || dbt_retry_summary.recovered[0].retry_classes
-                != [RetryClass::AlwaysEligible]
-        {
-            return Err(format!(
-                "end-of-run summary: DBT parity fail-then-pass was not retained as recovered: \
-                 {dbt_retry_summary:?}"
-            ));
-        }
-
-        let dbt_pre_case_death = dbt_parity_test_observations(
-            "[test.dbt_parity] ▶ START DynamoRIO DBT strict backend parity matrix\n\
-[test.dbt_parity] ERROR: process died before the first case result\n",
-        );
-        let dbt_pre_case_summary = test_id_summary(
-            dbt_pre_case_death,
-            &[],
-            &BTreeSet::from([DBT_PARITY_NODE.to_string()]),
-        );
-        if dbt_pre_case_summary.failed_nodes_without_test_ids != [DBT_PARITY_NODE] {
-            return Err(format!(
-                "end-of-run summary: a DBT parity node that died before its first case gained an \
-                 invented test id: {dbt_pre_case_summary:?}"
+                "end-of-run summary: a node that died before its first result gained an \
+                 invented test id: {pre_result_death:?}"
             ));
         }
         let e2e_root = tmp.join("summary-e2e");
@@ -21078,63 +20996,6 @@ fn nextest_test_observations(
     (observations, errors)
 }
 
-const DBT_PARITY_NODE: &str = "test.dbt_parity";
-
-/// Parse one result emitted by the standalone DBT parity matrix.
-///
-/// `run_matrix.py` owns the stable case name `backend-parity/<case>`; the
-/// suffix records the backend and mode selected by the DAG node. Diagnostic,
-/// gap, blocked, and malformed lines are not individual test outcomes.
-fn dbt_parity_test_observation(rest: &str) -> Option<(bool, String)> {
-    let rest = rest.trim_start();
-    let (passed, result) = if let Some(result) = rest.strip_prefix("PASS ") {
-        (true, result)
-    } else {
-        (false, rest.strip_prefix("FAIL ")?)
-    };
-    let (identity, _detail) = result.split_once(':')?;
-    let case = identity.strip_prefix("dbt/")?;
-    if case.is_empty()
-        || !case
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-    {
-        return None;
-    }
-    Some((passed, format!("backend-parity/{case} [dbt/strict]")))
-}
-
-/// Recover DBT parity case results from the durable scheduler log.
-///
-/// Each scheduler START begins a new attempt. Keeping that boundary means a
-/// failed case that passes on retry remains visible as a recovered test id,
-/// while a node that dies before emitting any case result still has no invented
-/// id and remains in `failed_nodes_without_test_ids`.
-fn dbt_parity_test_observations(log: &str) -> Vec<TestAttemptObservation> {
-    let mut attempt = 0;
-    let mut seen: BTreeSet<(usize, String)> = BTreeSet::new();
-    let mut observations = Vec::new();
-    for line in log.lines() {
-        let Some(after_open) = line.strip_prefix('[') else { continue };
-        let Some((node, rest)) = after_open.split_once(']') else { continue };
-        if node != DBT_PARITY_NODE {
-            continue;
-        }
-        if rest.trim_start().starts_with("▶ START") {
-            attempt += 1;
-            continue;
-        }
-        let Some((passed, id)) = dbt_parity_test_observation(rest) else { continue };
-        let attempt = attempt.max(1);
-        if seen.insert((attempt, id.clone())) {
-            observations.push(TestAttemptObservation {
-                node: DBT_PARITY_NODE.to_string(), attempt, id, passed, inner_attempts: 1,
-            });
-        }
-    }
-    observations
-}
-
 fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, String> {
     e2e_test_observations_snapshot(&validate_cell_results::CapturedResults::capture(root))
 }
@@ -24252,16 +24113,6 @@ fn run(
         .collect::<BTreeSet<_>>();
     let (mut test_observations, mut test_summary_errors) =
         nextest_test_observations(&attempts, &nextest_nodes);
-    match read_log_since_settled(&log_path, 0) {
-        Some(log) => test_observations.extend(dbt_parity_test_observations(&log)),
-        None => {
-            test_summary_errors.push(
-                "individual DBT test ids could not be read from the durable log; failed DAG nodes \
-                 are listed separately below rather than mislabeled as test ids"
-                    .to_string(),
-            );
-        }
-    }
     match e2e_test_observations_snapshot(&raw_snapshot) {
         Ok(mut observations) => test_observations.append(&mut observations),
         Err(error) => test_summary_errors.push(format!(
@@ -24731,11 +24582,12 @@ mod committed_selection_preservation_tests {
                 );
             } else {
                 // 252 until backend-parity-c was folded into c-programs, which
-                // removed e2e.manifest_backend_parity_c_on_host
+                // removed e2e.manifest_backend_parity_c_on_host, and 251 until
+                // slice S13 retired test.dbt_parity_on_host
                 // (https://github.com/rrnewton/hermit/issues/3301).
                 assert!(
                     stdout.contains(
-                        "251 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "250 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -24853,7 +24705,7 @@ mod committed_selection_preservation_tests {
         let (committed, _, _) = load_committed_validation_dag(root).unwrap();
         let public = [
             "test.app_strict_verify", "test.applications_e2e", "test.arbitrary_binaries",
-            "test.command_strict_verify", "test.dbt_parity", "test.detcore_misc",
+            "test.command_strict_verify", "test.detcore_misc",
             "test.detcore_parallel", "test.detcore_unit", "test.envelope_levels",
             "test.hermit_integration", "test.hermit_unit", "test.ignored_syscall_regressions",
             "test.liteinst_strict", "test.regular_crates", "test.rr_suite_contract",
@@ -24866,7 +24718,9 @@ mod committed_selection_preservation_tests {
         assert_eq!(compat.len(), 189);
         expected.extend(compat);
         expected.insert("compatprep.fixtures_on_host".into());
-        assert_eq!(expected.len(), 206);
+        // 206 until test.dbt_parity_on_host was retired (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(expected.len(), 205);
         let requested = [public.join(","), STRICT_COMPAT_SELECTION_ALIAS.into()].join(",");
         for only in [false, true] {
             let mut argv = if only {

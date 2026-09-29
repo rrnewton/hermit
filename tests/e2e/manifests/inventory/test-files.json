@@ -26,12 +26,6 @@
     },
     {
       "disposition": "special-driver",
-      "path": "tests/backend-parity/classify_emission.py",
-      "runner": "backend-parity fixture emission census (manual; runs every fixture under hermit and caches full output)",
-      "why": "tests/backend-parity/classify_emission.py is owned by backend-parity fixture emission census (manual; runs every fixture under hermit and caches full output): Standalone census driver that runs every backend-parity C fixture under hermit, caches each fixture's complete stdout, stderr, and exit status to a file, and classifies the emission shape in Python so that no shell pipeline and no truncation can participate in the count. It exists because this census was re-derived by hand three times and produced three irreconcilable denominators, twice from method failures (a head -2 that truncated multi-line output, and a grep pipeline that classified the same input differently inside a loop). Fixtures must run under hermit rather than natively, because the refusal fixtures bail before their emit path when the syscall is allowed to succeed. It stays a manual driver rather than a manifest-plan program because it observes the fixture family as a whole rather than executing one program."
-    },
-    {
-      "disposition": "special-driver",
       "path": "tests/backend-parity/e9patch_corpus.py",
       "runner": "e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI)",
       "why": "tests/backend-parity/e9patch_corpus.py is owned by e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI): Standalone driver that compiles each freestanding corpus guest, rewrites it with e9tool, and enforces exit-status and stdout parity, golden and e9patch L2, full direct-AOT coverage with mapped==candidate, no SIGILL fallback with b0==0, and a guest-syscall DETLOG tail-match against golden ptrace. It needs e9tool and a hermit built --features e9patch, both absent in CI, so it is BLOCKED there like the KVM /dev/kvm gate rather than a manifest-plan program."
@@ -169,34 +163,10 @@
       "why": "tests/backend-parity/fixtures/mountinfo_device_identity.c is owned by hermit-cli/tests/kvm_harder.rs: The KVM integration suite compiles this focused guest and checks deterministic mountinfo device identities through its backend-specific execution contract; it is not a standalone manifest program."
     },
     {
-      "disposition": "support-data",
-      "path": "tests/backend-parity/measurements/README.md",
-      "runner": "maintainers of tests/e2e/manifests/c-programs.yaml",
-      "why": "tests/backend-parity/measurements/README.md is owned by maintainers of tests/e2e/manifests/c-programs.yaml: This note records the method and the traps behind the measured verify sweeps that justify each ci flag in the c-programs entries folded from the retired backend-parity-c bucket, so a later flip cites recorded evidence instead of re-deriving it. It is documentation consumed by humans; no runner reads it and the generic manifest must not treat it as guest input."
-    },
-    {
-      "disposition": "support-data",
-      "path": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv",
-      "runner": "maintainers of tests/e2e/manifests/c-programs.yaml",
-      "why": "tests/backend-parity/measurements/verify-sweep-6e1b59af0.tsv is owned by maintainers of tests/e2e/manifests/c-programs.yaml: This table is the recorded per-cell verify evidence, one row per declared test and backend pair with both sweep verdicts, that every ci = true flag in the c-programs entries folded from the retired backend-parity-c bucket rests on. It is inert recorded data read by reviewers rather than by any runner, and the generic manifest must not schedule it as an executable guest."
-    },
-    {
-      "disposition": "special-driver",
-      "path": "tests/backend-parity/retarget_to_manifest.py",
-      "runner": "backend-parity matrix.tsv -> schema-v3 manifest migration tool (manual)",
-      "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix.tsv -> schema-v3 manifest migration tool (manual): Standalone migration driver that reads a source PR's added matrix.tsv rows and fixture .c files and rewrites them into the shared schema-v3 manifest -- appending a symmetric test block to tests/e2e/manifests/c-programs.yaml (it targeted backend-parity-c.yaml until that bucket was folded into c-programs) (ptrace front-door first, every backend x mode cell declared, DBT/KVM enabled only where the row's --verify L2 witness passed) and reclassifying the fixture from guest-fixture to manifest-test. It lives beside and reuses the Python parity harness (run_matrix.py / e9patch_corpus.py) and is run manually to migrate legacy PRs, so it stays a driver rather than a manifest-plan program."
-    },
-    {
       "disposition": "special-driver",
       "path": "tests/backend-parity/run_matrix.py",
-      "runner": "portable and privileged backend-parity partitions",
-      "why": "tests/backend-parity/run_matrix.py is owned by portable and privileged backend-parity partitions: run_matrix.py expands its executable case catalog across backend-specific capability checks, build flags, and expected results, then writes live observations to the outer dev-hermit scorecard. It stays a driver because those cross-backend comparisons cannot be represented as one program observation."
-    },
-    {
-      "disposition": "special-driver",
-      "path": "tests/backend-parity/split_asymmetric_pr.py",
-      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in target/debug/test-harness validate)",
-      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in target/debug/test-harness validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
+      "runner": "make validate-kvm/validate-dbt and the nightly Buck shadow driver scripts/build-buck-release.rs",
+      "why": "tests/backend-parity/run_matrix.py is owned by make validate-kvm/validate-dbt and the nightly Buck shadow driver scripts/build-buck-release.rs: run_matrix.py expands its executable case catalog across backend-specific capability checks, build flags, and expected results, then writes live observations to the outer dev-hermit scorecard. It stays a driver because those cross-backend comparisons cannot be represented as one program observation. The validation DAG stopped running it when test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301; its 28 DBT cases are DBT verify cells of the c-programs and system-utils manifests."
     },
     {
       "disposition": "special-driver",

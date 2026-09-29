@@ -106,7 +106,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.command_strict_verify",
     "test.ignored_syscall_regressions",
     "test.rr_suite_contract",
-    "test.dbt_parity",
     "test.envelope_levels",
     "test.applications_e2e",
     "liteinst.strict",
@@ -167,16 +166,20 @@ struct Profile {
     selected_steps: usize,
 }
 
+// full, portable and hosted-portable each lost one step when test.dbt_parity
+// and its _on_host twin were retired (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 271/272, 260/261 and
+// 251/251 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 271,
-        selected_steps: 272,
+        direct_steps: 270,
+        selected_steps: 271,
     },
     Profile {
         label: "portable",
-        direct_steps: 260,
-        selected_steps: 261,
+        direct_steps: 259,
+        selected_steps: 260,
     },
     Profile {
         label: "quick",
@@ -195,8 +198,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 251,
-        selected_steps: 251,
+        direct_steps: 250,
+        selected_steps: 250,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -643,9 +646,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         })
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
-    if split.len() != 16 {
+    // 16 until test.dbt_parity was retired (slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301).
+    if split.len() != 15 {
         return Err(format!(
-            "hosted test split has {} roots, expected 16",
+            "hosted test split has {} roots, expected 15",
             split.len()
         ));
     }
@@ -679,9 +684,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    if split.len() != 213 {
+    // 213 until test.dbt_parity was retired (slice S13 of
+    // https://github.com/rrnewton/hermit/issues/3301).
+    if split.len() != 212 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 213",
+            "hosted test dependency closure has {} nodes, expected 212",
             split.len()
         ));
     }
@@ -1236,9 +1243,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 106 {
+    if expected.len() != 104 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 106",
+            "structured result producer registry has {} entries, expected 104",
             expected.len()
         ));
     }
@@ -1373,7 +1380,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [69, 31, 2, 2, 2] {
+    if actual_group_counts != [69, 31, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1743,9 +1750,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_manifest_gate_width_contract(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1606 {
+    // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
+    // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
+    if cfg.steps.len() != 1604 {
         return Err(format!(
-            "superset has {} steps, expected 1606",
+            "superset has {} steps, expected 1604",
             cfg.steps.len()
         ));
     }
@@ -3036,7 +3045,9 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        assert_eq!(selected.steps.len(), 251);
+        // 250 since test.dbt_parity_on_host was retired (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301); 251 before.
+        assert_eq!(selected.steps.len(), 250);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3059,7 +3070,6 @@ sys.exit(37)
             "applications_e2e",
             "arbitrary_binaries",
             "command_strict_verify",
-            "dbt_parity",
             "detcore_misc",
             "detcore_parallel",
             "detcore_unit",
@@ -3094,7 +3104,9 @@ sys.exit(37)
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
-        assert_eq!(new_variants.len(), 213);
+        // 212 since test.dbt_parity_on_host was retired with its pinned twin
+        // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(new_variants.len(), 212);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3192,7 +3204,10 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            error.contains("hosted-portable label has 250 direct steps"),
+            // 249 = the 250 hosted-portable direct steps since slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301, minus the one
+            // planted loss.
+            error.contains("hosted-portable label has 249 direct steps"),
             "{error}"
         );
     }
