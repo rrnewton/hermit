@@ -5446,6 +5446,8 @@ fn classify_result_from_typed_evidence(
         // the same bucket, so ordering between them is unobservable, and once
         // the timeout arm moved ahead of them they became neighbours with
         // identical blocks.
+        // `verification_logs_retained` is `RetainedVerificationLogs::complete_for`:
+        // only run 1's golden log after a match, and both logs after a divergence.
         || (mode == "verify"
             && matches!(verification_verdict, Some("matched" | "diverged"))
             && !verification_logs_retained)
@@ -6430,12 +6432,62 @@ fn verification_report_path(artifact_dir: &Path) -> PathBuf {
     artifact_dir.join("verify-1.json")
 }
 
+/// A divergent verify result must retain both runs' logs.
+///
+/// ⚠️ `scorecard.rs` matches THIS EXACT TEXT (`MISSING_RETAINED_VERIFY_LOGS`)
+/// to import a canonical DBT divergence whose logs are absent. Rewording it
+/// here alone silently turns that import into an ordinary refusal.
+const DIVERGED_VERIFY_LOGS_INCOMPLETE: &str =
+    "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log";
+
+/// A matched verify result must retain run 1's golden log and nothing else.
+const MATCHED_VERIFY_LOGS_NOT_GOLDEN_ONLY: &str =
+    "terminal matched verify result must retain exactly one nonempty run1 log and no run2 log";
+
+/// The run logs one verify attempt retained in `verify-logs/verify-1`.
+///
+/// `hermit run --keep-logs` keeps only run 1's log after a match: it is the
+/// deterministic golden copy, and run 2's log, a verified duplicate of it, is
+/// deleted (<https://github.com/rrnewton/hermit/issues/3301>). After a
+/// divergence it keeps both.
+#[derive(Debug, Default, PartialEq)]
+struct RetainedVerificationLogs {
+    run1: Option<String>,
+    run2: Option<String>,
+}
+
+impl RetainedVerificationLogs {
+    /// Whether these are exactly the captures a terminal `verdict` retains:
+    /// one nonempty run-1 log and no run-2 log after a match, one nonempty log
+    /// from each run after a divergence. No other verdict has a complete set.
+    fn complete_for(&self, verdict: Option<&str>) -> bool {
+        match verdict {
+            Some("matched") => self.run1.is_some() && self.run2.is_none(),
+            Some("diverged") => self.run1.is_some() && self.run2.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The retained capture paths, run 1's first.
+    fn paths(&self) -> Vec<String> {
+        self.run1.iter().chain(&self.run2).cloned().collect()
+    }
+}
+
+/// Read one verify attempt's retained run logs, refusing any capture that is
+/// empty, not a regular file, or duplicated.
+///
+/// A lone capture is refused too, except run 1's golden log under a `matched`
+/// `verdict`, which is exactly what `--keep-logs` retains after a match.
+/// Whether the set is complete for its verdict is the caller's check
+/// ([`RetainedVerificationLogs::complete_for`]).
 fn retained_verification_logs(
     cell: &CellId,
     artifact_dir: &Path,
-) -> Result<Vec<String>, String> {
+    verdict: Option<&str>,
+) -> Result<RetainedVerificationLogs, String> {
     if cell.mode != "verify" {
-        return Ok(Vec::new());
+        return Ok(RetainedVerificationLogs::default());
     }
     let directory = verification_report_path(artifact_dir)
         .parent()
@@ -6443,7 +6495,7 @@ fn retained_verification_logs(
         .join("verify-logs")
         .join("verify-1");
     if !directory.is_dir() {
-        return Ok(Vec::new());
+        return Ok(RetainedVerificationLogs::default());
     }
     let mut run1 = None;
     let mut run2 = None;
@@ -6493,67 +6545,14 @@ fn retained_verification_logs(
             ));
         }
     }
-    if run1.is_some() != run2.is_some() {
+    let golden_only = verdict == Some("matched") && run1.is_some() && run2.is_none();
+    if run1.is_some() != run2.is_some() && !golden_only {
         return Err(format!(
             "retained verify-log directory {} must contain exactly one nonempty run1 capture and one nonempty run2 capture",
             directory.display()
         ));
     }
-    Ok(run1.into_iter().chain(run2).collect())
-}
-
-fn normalized_ptrace_golden(
-    cell: &CellId,
-    artifact_dir: &Path,
-) -> Result<Option<String>, String> {
-    if cell.mode != "verify" || cell.backend != "ptrace" {
-        return Ok(None);
-    }
-    let directory = verification_report_path(artifact_dir)
-        .parent()
-        .expect("verification report has a parent")
-        .join("verify-logs")
-        .join("verify-1");
-    let status_path = directory.join("normalized-ptrace-golden.status");
-    let path = directory.join("normalized-ptrace-golden.log");
-    if !status_path.exists() && !path.exists() {
-        return Ok(None);
-    }
-    if !status_path.is_file() {
-        return Err(format!(
-            "ptrace golden-log output {} exists without its numeric status {}",
-            path.display(),
-            status_path.display()
-        ));
-    }
-    let status_text = fs::read_to_string(&status_path)
-        .map_err(|e| format!("cannot read {}: {e}", status_path.display()))?;
-    let status = status_text.trim().parse::<i32>().map_err(|_| {
-        format!(
-            "{} contains nonnumeric log-diff exit `{}`",
-            status_path.display(),
-            status_text.trim()
-        )
-    })?;
-    if status != 0 {
-        return Err(format!(
-            "ptrace golden-log normalization failed with exit {status}; see {}",
-            directory.display()
-        ));
-    }
-    if !path.is_file()
-        || path
-            .metadata()
-            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?
-            .len()
-            == 0
-    {
-        return Err(format!(
-            "ptrace golden-log normalization reported success without a nonempty {}",
-            path.display()
-        ));
-    }
-    Ok(Some(path.to_string_lossy().into_owned()))
+    Ok(RetainedVerificationLogs { run1, run2 })
 }
 
 fn read_verification_report(
@@ -7017,44 +7016,28 @@ fn summarize(
                 .and_then(|report| report.get("verdict"))
                 .and_then(JsonValue::as_str);
             let verification_logs = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match retained_verification_logs(cell, artifact_dir) {
-                    Ok(logs) => logs,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        Vec::new()
+                Some(artifact_dir) => {
+                    match retained_verification_logs(cell, artifact_dir, verification_verdict) {
+                        Ok(logs) => logs,
+                        Err(error) => {
+                            evidence_errors.push(error);
+                            RetainedVerificationLogs::default()
+                        }
                     }
-                },
-                None => Vec::new(),
+                }
+                None => RetainedVerificationLogs::default(),
             };
-            let normalized_ptrace_golden = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match normalized_ptrace_golden(cell, artifact_dir) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        None
+            let verification_logs_complete = verification_logs.complete_for(verification_verdict);
+            if cell.mode == "verify" && !verification_logs_complete {
+                match verification_verdict {
+                    Some("matched") => {
+                        evidence_errors.push(MATCHED_VERIFY_LOGS_NOT_GOLDEN_ONLY.into())
                     }
-                },
-                None => None,
-            };
-            if cell.mode == "verify"
-                && matches!(verification_verdict, Some("matched" | "diverged"))
-                && verification_logs.len() != 2
-            {
-                evidence_errors.push(
-                "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
-                    .into(),
-            );
-            }
-            if cell.mode == "verify"
-                && cell.backend == "ptrace"
-                && matches!(verification_verdict, Some("matched" | "diverged"))
-                && normalized_ptrace_golden.is_none()
-                && !evidence_errors
-                    .iter()
-                    .any(|error| error.contains("golden-log normalization"))
-            {
-                evidence_errors
-                    .push("terminal ptrace verify result has no normalized golden INFO log".into());
+                    Some("diverged") => {
+                        evidence_errors.push(DIVERGED_VERIFY_LOGS_INCOMPLETE.into())
+                    }
+                    _ => {}
+                }
             }
             if invocation.is_none() {
                 evidence_errors.push("selected result has no complete recorded invocation".into());
@@ -7067,7 +7050,7 @@ fn summarize(
                 reason.as_deref(),
                 &cell.mode,
                 verification_verdict,
-                verification_logs.len() == 2,
+                verification_logs_complete,
                 evidence_errors.is_empty(),
             );
             // Current rows take their functional result from the framework.
@@ -7240,10 +7223,12 @@ fn summarize(
                                 verification_report_path(&earlier_artifact_dir).display()
                             )
                         })?;
-                        let earlier_verification_logs =
-                            retained_verification_logs(cell, &earlier_artifact_dir)?;
-                        let earlier_normalized_ptrace_golden =
-                            crate::normalized_ptrace_golden(cell, &earlier_artifact_dir)?;
+                        let earlier_verification_logs = retained_verification_logs(
+                            cell,
+                            &earlier_artifact_dir,
+                            earlier_verification.get("verdict").and_then(JsonValue::as_str),
+                        )?
+                        .paths();
                         let expected_result = match cell.mode.as_str() {
                             "verify" => ObservedResult::DeterminismFailure,
                             "replay" => ObservedResult::ReplayFailure,
@@ -7280,7 +7265,6 @@ fn summarize(
                             "result": earlier_result.as_str(),
                             "verification": earlier_verification,
                             "verification_logs": earlier_verification_logs,
-                            "normalized_ptrace_golden": earlier_normalized_ptrace_golden,
                             "evidence_errors": Vec::<String>::new(),
                             "runner_seen": runner.seen,
                             "runner_ok": runner.ok,
@@ -7313,8 +7297,7 @@ fn summarize(
                 "result_row_valid": row_valid,
                 "result": result,
                 "verification": verification,
-                "verification_logs": verification_logs,
-                "normalized_ptrace_golden": normalized_ptrace_golden,
+                "verification_logs": verification_logs.paths(),
                 "evidence_errors": evidence_errors,
                 "runner_seen": runner.seen,
                 "runner_ok": runner.ok,
@@ -13926,8 +13909,18 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("retained result-row evidence crossed between repetitions".into());
     }
 
-    if !retained_verification_logs(&sample_a, &sample_artifact_dir)?.is_empty() {
-        return Err("missing verify-log directory produced retained logs".into());
+    // A missing verify-log directory retains nothing under every verdict, and
+    // nothing completes a terminal verdict.
+    for verdict in [Some("matched"), Some("diverged"), Some("no_result"), None] {
+        let logs = retained_verification_logs(&sample_a, &sample_artifact_dir, verdict)?;
+        if logs != RetainedVerificationLogs::default() {
+            return Err("missing verify-log directory produced retained logs".into());
+        }
+        if logs.complete_for(verdict) {
+            return Err(format!(
+                "no retained verify log completed a {verdict:?} verify result"
+            ));
+        }
     }
     let verification_path = verification_report_path(&sample_artifact_dir);
     let verification_directory = verification_path
@@ -13940,56 +13933,86 @@ fn self_test(root: &Path) -> Result<(), String> {
     let run2_log = verify_log_directory.join("run2_log_fixture.log");
     fs::write(&run1_log, "run one\n")
         .map_err(|e| format!("cannot write run1 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("retained verify-log evidence accepted a missing run2 capture".into());
+    // Run 1's golden log alone is exactly what `hermit run --keep-logs` retains
+    // after a match (https://github.com/rrnewton/hermit/issues/3301). It
+    // completes no other verdict, and outside a match the lone capture is
+    // refused as it always was.
+    let golden_only =
+        retained_verification_logs(&sample_a, &sample_artifact_dir, Some("matched"))?;
+    if golden_only.run1.as_deref() != Some(run1_log.to_string_lossy().as_ref())
+        || golden_only.run2.is_some()
+        || !golden_only.complete_for(Some("matched"))
+    {
+        return Err("a matched verify result's lone nonempty run1 golden log was refused".into());
+    }
+    if golden_only.complete_for(Some("diverged")) {
+        return Err("a lone run1 capture completed a diverged verify result".into());
+    }
+    for verdict in [Some("diverged"), Some("no_result"), None] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err(format!(
+                "retained verify-log evidence accepted a missing run2 capture for a {verdict:?} verify result"
+            ));
+        }
     }
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot write run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir)?.len() != 2 {
+    let pair = retained_verification_logs(&sample_a, &sample_artifact_dir, Some("diverged"))?;
+    if pair.paths()
+        != [
+            run1_log.to_string_lossy().into_owned(),
+            run2_log.to_string_lossy().into_owned(),
+        ]
+        || !pair.complete_for(Some("diverged"))
+    {
         return Err("one nonempty run1/run2 verify-log pair was refused".into());
     }
+    // A match that still holds run 2's log did not retain the golden log alone.
+    if retained_verification_logs(&sample_a, &sample_artifact_dir, Some("matched"))?
+        .complete_for(Some("matched"))
+    {
+        return Err("a matched verify result that retained a run2 log was accepted".into());
+    }
+    // Run 2's log without run 1's is refused under every verdict, a match
+    // included.
+    fs::remove_file(&run1_log)
+        .map_err(|e| format!("cannot remove run1 verify-log fixture: {e}"))?;
+    for verdict in [Some("matched"), Some("diverged"), Some("no_result"), None] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err(format!(
+                "a lone run2 capture was accepted for a {verdict:?} verify result"
+            ));
+        }
+    }
+    fs::write(&run1_log, "run one\n")
+        .map_err(|e| format!("cannot restore run1 verify-log fixture: {e}"))?;
     let duplicate_run1 = verify_log_directory.join("run1_log_duplicate.log");
     fs::write(&duplicate_run1, "duplicate\n")
         .map_err(|e| format!("cannot write duplicate run1 fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("duplicate retained run1 verify-log capture was accepted".into());
+    for verdict in [Some("matched"), Some("diverged")] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err("duplicate retained run1 verify-log capture was accepted".into());
+        }
     }
     fs::remove_file(&duplicate_run1)
         .map_err(|e| format!("cannot remove duplicate run1 fixture: {e}"))?;
     fs::write(&run2_log, "").map_err(|e| format!("cannot empty run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("empty retained run2 verify-log capture was accepted".into());
+    for verdict in [Some("matched"), Some("diverged")] {
+        if retained_verification_logs(&sample_a, &sample_artifact_dir, verdict).is_ok() {
+            return Err("empty retained run2 verify-log capture was accepted".into());
+        }
     }
+    // An empty golden log is refused for a match too.
+    fs::remove_file(&run2_log)
+        .map_err(|e| format!("cannot remove run2 verify-log fixture: {e}"))?;
+    fs::write(&run1_log, "").map_err(|e| format!("cannot empty run1 verify-log fixture: {e}"))?;
+    if retained_verification_logs(&sample_a, &sample_artifact_dir, Some("matched")).is_ok() {
+        return Err("an empty matched run1 golden log was accepted".into());
+    }
+    fs::write(&run1_log, "run one\n")
+        .map_err(|e| format!("cannot restore run1 verify-log fixture: {e}"))?;
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot restore run2 verify-log fixture: {e}"))?;
-
-    let golden_status = verify_log_directory.join("normalized-ptrace-golden.status");
-    let golden_log = verify_log_directory.join("normalized-ptrace-golden.log");
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_some() {
-        return Err("absent normalized ptrace golden produced an artifact".into());
-    }
-    fs::write(&golden_log, "canonical INFO\n")
-        .map_err(|e| format!("cannot write normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("normalized ptrace golden without status was accepted".into());
-    }
-    fs::remove_file(&golden_log)
-        .map_err(|e| format!("cannot remove normalized golden fixture: {e}"))?;
-    fs::write(&golden_status, "0\n")
-        .map_err(|e| format!("cannot write normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("normalized ptrace golden status without output was accepted".into());
-    }
-    fs::write(&golden_log, "canonical INFO\n")
-        .map_err(|e| format!("cannot restore normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_none() {
-        return Err("complete normalized ptrace golden output/status pair was refused".into());
-    }
-    fs::write(&golden_status, "not-a-status\n")
-        .map_err(|e| format!("cannot mutate normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
-        return Err("nonnumeric normalized ptrace golden status was accepted".into());
-    }
 
     fs::write(&verification_path, "{")
         .map_err(|e| format!("cannot write malformed verification fixture: {e}"))?;
@@ -14011,7 +14034,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
     );
     Ok(())
 }
@@ -15113,7 +15136,7 @@ mod pressure_sample_tests {
     }
 
     #[test]
-    fn summary_requires_retained_canonical_captures_and_golden_before_confirmed_failure() {
+    fn summary_requires_both_retained_captures_before_confirmed_failure() {
         let root = Path::new(file!())
             .canonicalize()
             .unwrap()
@@ -15190,18 +15213,15 @@ mod pressure_sample_tests {
             fs::create_dir_all(&logs).unwrap();
             let run1 = logs.join("run1_log_fixture.log");
             let run2 = logs.join("run2_log_fixture.log");
-            let golden = logs.join("normalized-ptrace-golden.log");
             fs::write(&run1, "INFO first\n").unwrap();
             fs::write(&run2, "INFO second\n").unwrap();
-            fs::write(&golden, "INFO normalized\n").unwrap();
-            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
             fs::write(
                 verification_report_path(&artifact),
                 inner.verification_report.as_ref().unwrap(),
             )
             .unwrap();
             if first_paths.is_none() {
-                first_paths = Some((run1, golden));
+                first_paths = Some((run1, run2));
             }
             let mut row = history_row("verify", "FAIL", 1, vec![inner.clone()]);
             row.run_id = run_id;
@@ -15258,13 +15278,25 @@ mod pressure_sample_tests {
             complete["repeated_cells"][0]["classification"],
             "confirmed-failing"
         );
-        let (run1, golden) = first_paths.unwrap();
-        for missing in [&run1, &golden] {
+        // A divergence retains both runs' logs; losing either one refuses the
+        // repetition with the exact text `scorecard.rs` imports on.
+        let (run1, run2) = first_paths.unwrap();
+        for missing in [&run1, &run2] {
             let saved = fs::read(missing).unwrap();
             fs::remove_file(missing).unwrap();
             let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
             assert!(error.contains("no trustworthy result"), "{error}");
             let incomplete = read();
+            assert!(
+                incomplete["rows"][0]["evidence_errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|error| error == DIVERGED_VERIFY_LOGS_INCOMPLETE),
+                "{}: {}",
+                missing.display(),
+                incomplete["rows"][0]["evidence_errors"]
+            );
             assert_eq!(
                 incomplete["repeated_cells"][0]["classification"],
                 "incomplete",
@@ -15342,7 +15374,7 @@ mod pressure_sample_tests {
         fs::write(&retained_report_path, original_report).unwrap();
         fs::write(&first_row_path, original_row).unwrap();
 
-        // Keep every original missing-capture/golden/history control above. Now
+        // Keep every original missing-capture/history control above. Now
         // retain incidental environmental text on the actual ten typed rows,
         // then make one producer record contradict their independently valid
         // comparison. The same summary path must keep product accounting and
@@ -15383,7 +15415,7 @@ mod pressure_sample_tests {
             assert_eq!(rejected["rows"][0]["result"], "infrastructure-error");
             assert!(rejected["rows"][0]["evidence_errors"].to_string().contains("disagrees with pressure consistency check determinism-failure"));
             fs::write(path, valid_row).unwrap();
-            for missing in [&run1, &golden] {
+            for missing in [&run1, &run2] {
                 let saved = fs::read(missing).unwrap();
                 fs::remove_file(missing).unwrap();
                 assert!(summarize(&root, &results, false, Some(&evidence), true).is_err());
@@ -15449,8 +15481,8 @@ mod pressure_sample_tests {
     }
 
     /// Retain `PROMOTION_REPETITIONS` diverged ptrace verify repetitions of
-    /// `selected`, each with its captures, golden and verification report, the
-    /// evidence a confirmed failure needs.
+    /// `selected`, each with both runs' captures and its verification report,
+    /// the evidence a confirmed failure needs.
     fn plant_diverged_verify_series(
         results: &Path,
         selected: &TrackedCell,
@@ -15482,8 +15514,6 @@ mod pressure_sample_tests {
             fs::create_dir_all(&logs).unwrap();
             fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
             fs::write(logs.join("run2_log_fixture.log"), "INFO second\n").unwrap();
-            fs::write(logs.join("normalized-ptrace-golden.log"), "INFO normalized\n").unwrap();
-            fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
             fs::write(
                 verification_report_path(&artifact),
                 inner.verification_report.as_ref().unwrap(),
@@ -15877,9 +15907,11 @@ mod pressure_sample_tests {
     /// candidate is compared, through `summarize`, by the log-diff of the
     /// binary the cells ran, as unequalized credit. A panic in the post-pass,
     /// or an output that cannot be written, changes neither the summary nor
-    /// the result, and a panic leaves no earlier records behind. A cell whose
-    /// row is valid but whose retained evidence the summary refused is
-    /// unavailable with that reason and is not compared.
+    /// the result, and a panic leaves no earlier records behind. Each matched
+    /// cell retains only its run-1 golden log, as `hermit run --keep-logs` does
+    /// after a match. A cell whose row is valid but whose retained evidence
+    /// the summary refused -- a match that kept run 2's log too, or lost its
+    /// golden log -- is unavailable with that reason and is not compared.
     #[test]
     fn series_parity_post_pass_measures_only_the_verify_cells_summarize_accepted() {
         let root = checkout_root();
@@ -15986,7 +16018,7 @@ mod pressure_sample_tests {
         };
         let mut evidence = BTreeMap::new();
         let mut rows = Vec::new();
-        let mut run2_logs = BTreeMap::new();
+        let mut run_logs = BTreeMap::new();
         for id in &metadata.cells {
             let reference = id.backend == parity::PARITY_REFERENCE_BACKEND;
             let slug = cell_run_slug(id, Some(1));
@@ -16001,13 +16033,17 @@ mod pressure_sample_tests {
                 "INFO detcore a\nINFO detcore b\nINFO detcore {}\n",
                 if reference { "c" } else { "x" }
             );
+            // A match retains only run 1's golden log: `hermit run --keep-logs`
+            // deletes run 2's verified duplicate
+            // (https://github.com/rrnewton/hermit/issues/3301).
             fs::write(logs.join("run1_log_fixture.log"), &log).unwrap();
-            fs::write(logs.join("run2_log_fixture.log"), &log).unwrap();
-            run2_logs.insert(id.backend.clone(), logs.join("run2_log_fixture.log"));
-            if reference {
-                fs::write(logs.join("normalized-ptrace-golden.log"), &log).unwrap();
-                fs::write(logs.join("normalized-ptrace-golden.status"), "0\n").unwrap();
-            }
+            run_logs.insert(
+                id.backend.clone(),
+                (
+                    logs.join("run1_log_fixture.log"),
+                    logs.join("run2_log_fixture.log"),
+                ),
+            );
             let mut inner = comparison_attempt("verify", 0);
             inner.argv = vec![
                 hermit.to_string_lossy().into_owned(),
@@ -16063,6 +16099,22 @@ mod pressure_sample_tests {
 
         summarize(&root, &results, false, Some(&evidence), true).unwrap();
         let summary = fs::read(&summary_path).unwrap();
+        // Both matched cells pass on their golden log alone, and the summary
+        // names only that log.
+        let accepted: JsonValue = serde_json::from_slice(&summary).unwrap();
+        let accepted_rows = accepted["rows"].as_array().unwrap();
+        assert_eq!(accepted_rows.len(), metadata.cells.len(), "{accepted}");
+        for row in accepted_rows {
+            let backend = row["cell"]["backend"].as_str().unwrap();
+            assert_eq!(row["result"], "pass", "{row}");
+            assert_eq!(row["evidence_errors"], json!([]), "{row}");
+            assert_eq!(
+                row["verification_logs"],
+                json!([run_logs[backend].0.to_string_lossy()]),
+                "{row}"
+            );
+            assert!(row.get("normalized_ptrace_golden").is_none(), "{row}");
+        }
         let records = read_parity_records(&parity_path);
         let measured = parity_record(&records, &cell);
         assert_eq!(measured.verdict, parity::ParityVerdict::Diverged, "{measured:?}");
@@ -16142,25 +16194,34 @@ mod pressure_sample_tests {
         );
 
         // A valid row whose retained evidence the summary refused is not
-        // compared: its cell is unavailable with the summary's reason.
-        fs::remove_file(&run2_logs[cell.backend.as_str()]).unwrap();
-        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
-        assert!(error.contains("produced no trustworthy result"), "{error}");
-        let records = read_parity_records(&parity_path);
-        let refused = parity_record(&records, &cell);
-        assert_eq!(refused.verdict, parity::ParityVerdict::Unavailable, "{refused:?}");
-        let reason = refused.reason.as_deref().unwrap_or_default();
-        assert!(
-            reason.contains(&format!(
-                "the {} candidate verify cell of {}: result row rejected by the series summary: ",
-                cell.backend, cell.test_id
-            )) && reason.contains(
-                "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
-            ),
-            "{refused:?}"
-        );
-        refused.validate().unwrap();
-        assert_eq!(log_diff_calls(), 2);
+        // compared: its cell is unavailable with the summary's reason. A match
+        // that kept run 2's log beside its golden log is refused, and so is
+        // one that lost its golden log.
+        let (candidate_run1, candidate_run2) = &run_logs[cell.backend.as_str()];
+        let golden = fs::read(candidate_run1).unwrap();
+        for retained_run2 in [true, false] {
+            if retained_run2 {
+                fs::write(candidate_run2, &golden).unwrap();
+            } else {
+                fs::remove_file(candidate_run2).unwrap();
+                fs::remove_file(candidate_run1).unwrap();
+            }
+            let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+            assert!(error.contains("produced no trustworthy result"), "{error}");
+            let records = read_parity_records(&parity_path);
+            let refused = parity_record(&records, &cell);
+            assert_eq!(refused.verdict, parity::ParityVerdict::Unavailable, "{refused:?}");
+            let reason = refused.reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains(&format!(
+                    "the {} candidate verify cell of {}: result row rejected by the series summary: ",
+                    cell.backend, cell.test_id
+                )) && reason.contains(MATCHED_VERIFY_LOGS_NOT_GOLDEN_ONLY),
+                "run2 retained: {retained_run2}: {refused:?}"
+            );
+            refused.validate().unwrap();
+            assert_eq!(log_diff_calls(), 2);
+        }
         cleanup.remove().unwrap();
     }
 
