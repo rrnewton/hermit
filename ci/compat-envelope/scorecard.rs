@@ -27873,22 +27873,55 @@ mod post_verdict_transaction_tests {
         fixture.publish().unwrap();
         let comparable = serde_json::to_value(fixture.cells().cells).unwrap();
         fixture.restore();
-        // This is the complete selected custom population of the real
-        // manifest/selected plan: the three unmatched identities from full
-        // run1897, plus the two io-uring-fallback custom cells that
-        // 2be6440ddd6 added when it carried the DBT strict parity matrix into
-        // manifest verify cells.
+        // The expected population is every custom row of the selected plan
+        // that derive() reads: the fixture's committed copy of
+        // ci/expected-e2e-plan.json. The plan owns that list, and gate.manifest
+        // already requires it to equal the manifests' selection. A hand copy
+        // here, first the three rows from full run1897, had to follow two plan
+        // changes: 34462d7af renamed a bucket, and 2be6440ddd6e added the two
+        // io-uring-fallback rows without updating the copy, which kept this
+        // test red until 63e2e3cb5. This reads the file with its own untyped
+        // parse and its own filter, so it shares neither ExpectedPlan's
+        // deserializer nor selected_partition's filter with the code under
+        // test. Five is the population since 2be6440ddd6e; the floor keeps an
+        // empty or truncated plan from passing vacuously. Lower it only when
+        // a custom row is deliberately removed from the plan.
+        const CUSTOM_FLOOR: usize = 5;
+        let plan: JsonValue = serde_json::from_slice(
+            &fs::read(fixture.root.join("ci/expected-e2e-plan.json")).unwrap(),
+        )
+        .unwrap();
+        let declared = plan["cells"]
+            .as_array()
+            .expect("the selected plan has a cells array")
+            .iter()
+            .filter(|cell| cell["mode"] == "custom")
+            .map(|cell| {
+                let field = |key: &str| {
+                    cell[key]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("plan row without a string {key}: {cell}"))
+                        .to_owned()
+                };
+                CellId {
+                    lane: field("lane"),
+                    category: field("category"),
+                    test: field("test"),
+                    mode: field("mode"),
+                    backend: field("backend"),
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            declared.len() >= CUSTOM_FLOOR,
+            "the selected plan declares {} custom rows, fewer than {CUSTOM_FLOOR}",
+            declared.len()
+        );
+        let custom_count = declared.len();
         let selected = derive(&fixture.root).unwrap().selected_custom;
-        assert_eq!(selected.len(), 5);
         assert_eq!(
-            selected.iter().map(display_id).collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                "portable/c-programs/c-programs/environment-and-workdir/custom@ptrace".into(),
-                "portable/c-programs/c-programs/io-uring-fallback/custom@dbt".into(),
-                "portable/c-programs/c-programs/io-uring-fallback/custom@ptrace".into(),
-                "portable/system-utils/system-utils/clock-determinism/custom@liteinst".into(),
-                "portable/system-utils/system-utils/clock-determinism/custom@ptrace".into(),
-            ])
+            selected, declared,
+            "derive() must select exactly the plan's custom rows"
         );
         let mut rows = vec![fixture.row.clone()];
         let mut events = Vec::new();
@@ -27976,7 +28009,8 @@ mod post_verdict_transaction_tests {
                 .unwrap()
                 .receipts
                 .len(),
-            5
+            custom_count,
+            "one passing attempt per declared custom row"
         );
 
         // Refuse absence, ambiguity, altered classifications and malformed
@@ -28057,8 +28091,8 @@ mod post_verdict_transaction_tests {
             retain_selected_custom_results(&tracked, &selected, &retried, &retry_events).unwrap();
         // One receipt and one event per selected cell, plus the failed first
         // attempt of the retried cell.
-        assert_eq!(receipts.receipts.len(), 6);
-        assert_eq!(receipts.event_ids.len(), 6);
+        assert_eq!(receipts.receipts.len(), custom_count + 1);
+        assert_eq!(receipts.event_ids.len(), custom_count + 1);
         assert_eq!(
             receipts
                 .receipts
@@ -28083,8 +28117,8 @@ mod post_verdict_transaction_tests {
             retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
         // The folded event covers both attempts of the retried cell, so it has
         // one receipt more than it has events.
-        assert_eq!(receipts.receipts.len(), 6);
-        assert_eq!(receipts.event_ids.len(), 5);
+        assert_eq!(receipts.receipts.len(), custom_count + 1);
+        assert_eq!(receipts.event_ids.len(), custom_count);
         folded[0].series.last_run_index = None;
         let implicit =
             retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
