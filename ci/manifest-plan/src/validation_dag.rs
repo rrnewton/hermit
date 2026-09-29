@@ -241,17 +241,21 @@ struct Profile {
 // before. full, portable and hosted-portable then gained check.e9patch_corpus
 // when the e9patch corpus left tests/backend-parity (slice S13 of
 // https://github.com/rrnewton/hermit/issues/3301): 272/273, 259/260 and
-// 250/250 before.
+// 250/250 before. full, portable and hosted-portable then each lost one step
+// when check.backend_parity_suites and its _on_host twin were retired with
+// tests/backend-parity (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 273/274, 260/261 and
+// 251/251 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 273,
-        selected_steps: 274,
+        direct_steps: 272,
+        selected_steps: 273,
     },
     Profile {
         label: "portable",
-        direct_steps: 260,
-        selected_steps: 261,
+        direct_steps: 259,
+        selected_steps: 260,
     },
     Profile {
         label: "quick",
@@ -270,8 +274,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 251,
-        selected_steps: 251,
+        direct_steps: 250,
+        selected_steps: 250,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1824,15 +1828,16 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_manifest_gate_width_contract(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    // 1609 since check.e9patch_corpus was added when the e9patch corpus left
-    // tests/backend-parity; 1606 until test.dbt_parity and
-    // test.dbt_parity_on_host were retired (both in slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301); 1605 since
+    // 1607 since check.backend_parity_suites and its _on_host twin were
+    // retired with tests/backend-parity; 1609 since check.e9patch_corpus was
+    // added when the e9patch corpus left tests/backend-parity; 1606 until
+    // test.dbt_parity and test.dbt_parity_on_host were retired (all in slice
+    // S13 of https://github.com/rrnewton/hermit/issues/3301); 1605 since
     // check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes.
-    if cfg.steps.len() != 1609 {
+    if cfg.steps.len() != 1607 {
         return Err(format!(
-            "superset has {} steps, expected 1609",
+            "superset has {} steps, expected 1607",
             cfg.steps.len()
         ));
     }
@@ -3369,11 +3374,12 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 251 since check.e9patch_corpus was added when the e9patch corpus
-        // left tests/backend-parity; 250 since test.dbt_parity_on_host was
-        // retired; 251 before (both in slice S13 of
+        // 250 since check.backend_parity_suites_on_host was retired with
+        // tests/backend-parity; 251 since check.e9patch_corpus was added when
+        // the e9patch corpus left tests/backend-parity; 250 since
+        // test.dbt_parity_on_host was retired; 251 before (all in slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(selected.steps.len(), 251);
+        assert_eq!(selected.steps.len(), 250);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3424,15 +3430,16 @@ sys.exit(37)
             "build.e2e_artifact_on_host".into(),
             "build.liteinst_runtime_release_on_host".into(),
             "build.workspace_on_host".into(),
-            "check.backend_parity_suites_on_host".into(),
             "compatprep.fixtures_on_host".into(),
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
-        // 212 since test.dbt_parity_on_host was retired with its pinned twin
-        // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
-        assert_eq!(new_variants.len(), 212);
+        // 211 since check.backend_parity_suites_on_host was retired with
+        // tests/backend-parity; 212 since test.dbt_parity_on_host was retired
+        // with its pinned twin (both in slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301).
+        assert_eq!(new_variants.len(), 211);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -3530,11 +3537,12 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 250 = the 251 hosted-portable direct steps since
-            // check.e9patch_corpus was added in slice S13 of
+            // 249 = the 250 hosted-portable direct steps since
+            // check.backend_parity_suites_on_host was retired with
+            // tests/backend-parity in slice S13 of
             // https://github.com/rrnewton/hermit/issues/3301, minus the one
             // planted loss.
-            error.contains("hosted-portable label has 250 direct steps"),
+            error.contains("hosted-portable label has 249 direct steps"),
             "{error}"
         );
     }
