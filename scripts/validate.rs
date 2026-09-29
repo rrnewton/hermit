@@ -9425,6 +9425,7 @@ const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
         "cli",
         &[
             "privileged-test.cli_kvm",
+            "privileged-test.pmu_cli_cases",
             "test.cli",
             "test.isolated_dbt_workdir",
         ],
@@ -25610,6 +25611,7 @@ mod shared_consumer_tests {
         for tag in [
             "test.cli",
             "privileged-test.cli_kvm",
+            "privileged-test.pmu_cli_cases",
             "test.isolated_dbt_workdir",
         ] {
             let mut missing = full.steps.clone();
@@ -25633,6 +25635,7 @@ mod shared_consumer_tests {
                 vec![
                     "privileged-build.privileged_tests",
                     "privileged-test.cli_kvm",
+                    "privileged-test.pmu_cli_cases",
                     "test.cli",
                     "test.isolated_dbt_workdir",
                 ],

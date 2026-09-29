@@ -122,6 +122,8 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-cpuid.faulting",
     "privileged-pmu.preemption",
     "privileged-test.pmu_buck_chaos_cases",
+    "privileged-test.pmu_ptrace_completion_cases",
+    "privileged-test.pmu_cli_cases",
     "privileged-test.cli_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
@@ -169,8 +171,8 @@ struct Profile {
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 270,
-        selected_steps: 271,
+        direct_steps: 272,
+        selected_steps: 273,
     },
     Profile {
         label: "portable",
@@ -1235,9 +1237,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 106 {
+    if expected.len() != 108 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 106",
+            "structured result producer registry has {} entries, expected 108",
             expected.len()
         ));
     }
@@ -1246,9 +1248,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .copied()
         .collect::<BTreeMap<_, _>>();
-    if expected_counts.len() != 38 {
+    if expected_counts.len() != 40 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 38",
+            "Nextest expected-count registry has {} entries, expected 40",
             expected_counts.len()
         ));
     }
@@ -1372,7 +1374,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [67, 33, 2, 2, 2] {
+    if actual_group_counts != [69, 33, 2, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1685,9 +1687,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1606 {
+    if cfg.steps.len() != 1608 {
         return Err(format!(
-            "superset has {} steps, expected 1606",
+            "superset has {} steps, expected 1608",
             cfg.steps.len()
         ));
     }
@@ -1780,6 +1782,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         ]);
         if binary == "cli" {
             expected.insert("test.isolated_dbt_workdir".into(), 1);
+            expected.insert("privileged-test.pmu_cli_cases".into(), 1);
         }
         let actual = cfg
             .steps
