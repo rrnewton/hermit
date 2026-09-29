@@ -27,8 +27,8 @@
     {
       "disposition": "special-driver",
       "path": "tests/backend-parity/run_matrix.py",
-      "runner": "make validate-kvm/validate-dbt and the nightly Buck shadow driver scripts/build-buck-release.rs",
-      "why": "tests/backend-parity/run_matrix.py is owned by make validate-kvm/validate-dbt and the nightly Buck shadow driver scripts/build-buck-release.rs: run_matrix.py expands its executable case catalog across backend-specific capability checks, build flags, and expected results, then writes live observations to the outer dev-hermit scorecard. It stays a driver because those cross-backend comparisons cannot be represented as one program observation. The validation DAG stopped running it when test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301; its 28 DBT cases are DBT verify cells of the c-programs and system-utils manifests."
+      "runner": "make validate-kvm/validate-dbt",
+      "why": "tests/backend-parity/run_matrix.py is owned by make validate-kvm/validate-dbt: run_matrix.py expands its executable case catalog across backend-specific capability checks, build flags, and expected results, then writes live observations to the outer dev-hermit scorecard. It stays a driver because those cross-backend comparisons cannot be represented as one program observation. The validation DAG stopped running it when test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301; its 28 DBT cases are DBT verify cells of the c-programs and system-utils manifests."
     },
     {
       "disposition": "special-driver",
