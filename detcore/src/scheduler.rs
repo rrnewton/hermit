@@ -160,6 +160,10 @@ pub enum SchedResponse {
 pub enum SchedValue {
     /// The action timed out while waiting on the scheduler.
     TimeOut,
+    /// A signal ended a futex wait (`SchedResponse::Signaled`), as distinct from a
+    /// wakeup or from the `EINTR` value some non-signal early returns carry
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    Signaled,
     // TODO(T137799529) make this more strongly typed, an enum for different scenarios:
     Value(u64),
 }
@@ -215,6 +219,20 @@ pub struct FutexWaiter {
     dettid: DetTid,
     response: Ivar<SchedResponse>,
     bitset: u32,
+    /// Kernel sigset of the signals that end this wait, computed from the guest's
+    /// mask and dispositions when it began. `None` on a backend that does not report
+    /// them: a scheduler-sent signal then wakes the waiter whatever its disposition,
+    /// and a cross-task signal does not.
+    interrupting_signals: Option<u64>,
+}
+
+/// The one-bit kernel sigset for a 1-based signal number, or 0 when out of range.
+fn kernel_signal_bit(raw_signal: i32) -> u64 {
+    if (1..=64).contains(&raw_signal) {
+        1_u64 << (raw_signal - 1)
+    } else {
+        0
+    }
 }
 
 /// Render an already-sorted thread list for a diagnostic, or `none`.
@@ -2727,6 +2745,7 @@ impl Scheduler {
         futexid: FutexID,
         maybe_timeout: Option<LogicalTime>,
         bitset: u32,
+        interrupting_signals: Option<u64>,
     ) {
         let nxt = self
             .next_turns
@@ -2737,6 +2756,7 @@ impl Scheduler {
             dettid: *dettid,
             response: nxt.resp.clone(),
             bitset,
+            interrupting_signals,
         });
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
@@ -3431,6 +3451,17 @@ impl Scheduler {
                 // sooner, but for now we leave their priorities alone.
             }
             ThreadStatus::NotRunning => {
+                if let Some(interrupting) = self.parked_futex_interrupting_signals(dettid)
+                    && interrupting & kernel_signal_bit(signal as i32) == 0
+                {
+                    // Blocked, ignored, or default-ignored for this waiter: the signal
+                    // stays pending in the kernel and the wait keeps its deadline.
+                    debug!(
+                        "[dtid {}] signal {} does not interrupt its futex wait; leaving it parked.",
+                        dettid, signal
+                    );
+                    return;
+                }
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(
                     ResourceID::InboundSignal(SigWrapper::from(signal)),
@@ -3509,14 +3540,29 @@ impl Scheduler {
     /// a `FUTEX_WAKE` or its timeout already requeued is not: that outcome was
     /// committed first, so the wait completes with it and the kernel delivers the
     /// pending signal when the syscall returns, as Linux does after a wakeup.
+    #[cfg(test)]
     fn is_parked_futex_waiter(&self, dettid: DetTid) -> bool {
-        let parked = self.next_turns.get(&dettid).is_some_and(is_futex_request);
-        parked
-            && self
-                .blocked
-                .futex_waiters
-                .values()
-                .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == dettid))
+        self.parked_futex_waiter(dettid).is_some()
+    }
+
+    fn parked_futex_waiter(&self, dettid: DetTid) -> Option<&FutexWaiter> {
+        if !self.next_turns.get(&dettid).is_some_and(is_futex_request) {
+            return None;
+        }
+        self.blocked
+            .futex_waiters
+            .values()
+            .find_map(|waiters| waiters.iter().find(|waiter| waiter.dettid == dettid))
+    }
+
+    /// The signals that end a parked precise-mode futex waiter's wait, when its
+    /// backend reported them. Only such a waiter is woken for a cross-task signal,
+    /// and only for one of these; any other signal stays pending in the kernel and
+    /// the wait keeps its wakeup and its original deadline
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    fn parked_futex_interrupting_signals(&self, dettid: DetTid) -> Option<u64> {
+        self.parked_futex_waiter(dettid)
+            .and_then(|waiter| waiter.interrupting_signals)
     }
 
     /// Record an unambiguous cross-task signal that was physically queued while
@@ -3527,7 +3573,9 @@ impl Scheduler {
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
         if self.waitid_signal_request(dettid).is_some()
             || self.restartable_internal_io_signals(dettid).is_some()
-            || self.is_parked_futex_waiter(dettid)
+            || self
+                .parked_futex_interrupting_signals(dettid)
+                .is_some_and(|signals| signals & kernel_signal_bit(signal.raw()) != 0)
         {
             let signals = self.pending_cross_task_signals.entry(dettid).or_default();
             if !signals.contains(&signal) {
@@ -5302,6 +5350,7 @@ impl Scheduler {
     fn drain_pending_cross_task_signals(&mut self) {
         let pending = std::mem::take(&mut self.pending_cross_task_signals);
         for (dettid, mut signals) in pending {
+            let futex_interrupting_signals = self.parked_futex_interrupting_signals(dettid);
             match self.waitid_signal_request(dettid) {
                 Some(WaitidSignalRequest::Parked) => {
                     // Decide run-queue residency HERE, by asking the queue, and
@@ -5345,7 +5394,7 @@ impl Scheduler {
                     };
                     next_turn.req = Ivar::full(Ok(resources));
                 }
-                None if self.is_parked_futex_waiter(dettid) => {
+                None if let Some(interrupting) = futex_interrupting_signals => {
                     // A precise-mode futex waiter sleeps in `futex_waiters`, outside
                     // the run queue, so nothing else would ever let the physically
                     // pending signal interrupt it
@@ -5356,6 +5405,12 @@ impl Scheduler {
                     // wait's restart errno, and the kernel then applies the guest's
                     // disposition. `WaitidSignals` is the one-resource form for a
                     // signal set, and later batches merge into it before it runs.
+                    // Only signals that end the wait were admitted, and a waiter
+                    // left with none stays parked.
+                    signals.retain(|signal| interrupting & kernel_signal_bit(signal.raw()) != 0);
+                    if signals.is_empty() {
+                        continue;
+                    }
                     signals.sort_by_key(SigWrapper::raw);
                     signals.dedup();
                     let mut resources = Resources::new(dettid);
@@ -5926,6 +5981,7 @@ mod test {
             dettid: DetTid::from_raw(dettid),
             response: Ivar::new(),
             bitset,
+            interrupting_signals: None,
         }
     }
 
@@ -6738,8 +6794,8 @@ mod test {
             sched.runqueue_push_back(anchor);
             register_known_thread(&mut sched, lower);
             register_known_thread(&mut sched, higher);
-            sched.sleep_futex_waiter(&lower, lower_futex, None, u32::MAX);
-            sched.sleep_futex_waiter(&higher, higher_futex, None, u32::MAX);
+            sched.sleep_futex_waiter(&lower, lower_futex, None, u32::MAX, None);
+            sched.sleep_futex_waiter(&higher, higher_futex, None, u32::MAX, None);
 
             assert_eq!(sched.wake_futex_waiters_after_exit(&request), vec![1, 1]);
 
@@ -7829,7 +7885,8 @@ mod test {
         let target = DetTid::from_raw(100);
         register_known_thread(&mut scheduler, target);
         let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
-        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX);
+        let interrupting = usr_signals();
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(interrupting));
         assert!(scheduler.is_parked_futex_waiter(target));
         assert!(!scheduler.run_queue.contains_tid(target));
 
@@ -7855,6 +7912,71 @@ mod test {
         assert_eq!(scheduler.wake_futex_waiters(target, futex, 1, u32::MAX), 0);
     }
 
+    fn usr_signals() -> u64 {
+        kernel_signal_bit(libc::SIGUSR1) | kernel_signal_bit(libc::SIGUSR2)
+    }
+
+    /// A cross-task signal the waiter blocks, ignores, or ignores by default leaves
+    /// a precise-mode futex waiter parked with its original deadline, alongside one
+    /// that does interrupt it (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn non_interrupting_signal_leaves_a_parked_futex_waiter_parked() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        let deadline = LogicalTime::from_nanos(300_000_000);
+        scheduler.sleep_futex_waiter(
+            &target,
+            futex,
+            Some(deadline),
+            u32::MAX,
+            Some(kernel_signal_bit(libc::SIGUSR1)),
+        );
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGWINCH));
+        scheduler.drain_pending_cross_task_signals();
+        scheduler.wake_signaled_guest(target, Signal::SIGUSR2);
+        scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.is_parked_futex_waiter(target));
+        assert!(!scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+        assert_eq!(
+            scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+            vec![(deadline, TimedEvent::ThreadEvt(target))]
+        );
+
+        // The one signal that interrupts the wait still ends it.
+        scheduler.wake_signaled_guest(target, Signal::SIGUSR1);
+        assert!(!scheduler.is_parked_futex_waiter(target));
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)]
+        );
+    }
+
+    /// A backend that does not report the guest's signal state keeps the base
+    /// behavior: no cross-task wakeup for a parked futex waiter.
+    #[test]
+    fn unreported_signal_state_keeps_futex_waiter_parked_for_cross_task_signals() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, None);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.is_parked_futex_waiter(target));
+        assert!(!scheduler.run_queue.contains_tid(target));
+    }
+
     /// A futex waiter that a wake already requeued completes as woken; the signal
     /// does not rewrite its request.
     #[test]
@@ -7864,7 +7986,7 @@ mod test {
         let waker = DetTid::from_raw(101);
         register_known_thread(&mut scheduler, target);
         let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
-        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX);
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(usr_signals()));
         assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
         assert!(!scheduler.is_parked_futex_waiter(target));
 
