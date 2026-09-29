@@ -2760,7 +2760,20 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
         .map_err(|e| format!("cannot send rows to the series writer: {e}"))?;
     let status = child
         .wait()
-        .map_err(|e| format!("series append did not terminate readably: {e}"))?;
+        .map_err(|e| format!("series append did not terminate readably: {e}"));
+    // The series' parity rows go beside its cells whatever became of them:
+    // parity is measured after determinism and never decides the emit.
+    eprintln!(
+        "pressure-test: {}",
+        append_series_parity(
+            &script,
+            Path::new(&parent),
+            results,
+            &run_id,
+            &metadata.hermit_sha
+        )
+    );
+    let status = status?;
     if !status.success() {
         // A nonzero status keeps every rejected cell visible to the caller.
         // append-cells can still have retained independent valid rows, so do
@@ -2775,6 +2788,119 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
         collected.len()
     );
     Ok(())
+}
+
+/// Send one series' parity rows -- [`parity::node_ledger_sources`] over the
+/// `parity.status.json` and `parity.jsonl` its post-pass left in `results`,
+/// filed under the pressure-test lane and node -- to `series.py
+/// append-parity` with `--producer pressure-test`, as validate sends its
+/// run's. The outcome is one line and never an error: a refused output, a
+/// writer that predates `append-parity` or one that refuses the rows is
+/// named, with the rows left where they are.
+/// <https://github.com/rrnewton/hermit/issues/3301>
+fn append_series_parity(
+    script: &Path,
+    parent: &Path,
+    results: &Path,
+    run_id: &str,
+    tree: &str,
+) -> String {
+    let rows = match parity::node_ledger_sources(
+        results,
+        parity::PRESSURE_TEST_LEDGER_LANE,
+        parity::PRESSURE_TEST_LEDGER_NODE,
+        None,
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            return format!(
+                "parity: ERROR: no parity rows appended; the post-pass outputs in {} were \
+                 refused: {error}",
+                results.display()
+            );
+        }
+    };
+    if rows.is_empty() {
+        return format!(
+            "parity: no parity post-pass output in {}; nothing appended",
+            results.display()
+        );
+    }
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for row in &rows {
+        *counts.entry(row.verdict.as_str()).or_default() += 1;
+    }
+    let counts = counts
+        .iter()
+        .map(|(verdict, count)| format!("{verdict} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let left = |why: &str| {
+        format!(
+            "parity: {why}; {} rows left in {} ({counts})",
+            rows.len(),
+            results.display()
+        )
+    };
+    match fs::read(script) {
+        Ok(bytes)
+            if bytes
+                .windows(b"append-parity".len())
+                .any(|w| w == b"append-parity") => {}
+        Ok(_) => return left("the series writer has no append-parity"),
+        Err(error) => return left(&format!("cannot read {}: {error}", script.display())),
+    }
+    let mut input = Vec::new();
+    for row in &rows {
+        if let Err(error) = serde_json::to_writer(&mut input, row) {
+            return left(&format!("cannot encode a parity row: {error}"));
+        }
+        input.push(b'\n');
+    }
+    let mut child = match Command::new("python3")
+        .arg(script)
+        .arg("append-parity")
+        .arg("--parent")
+        .arg(parent)
+        .arg("--producer")
+        .arg(parity::ParityProducer::PressureTest.as_str())
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--tree")
+        .arg(tree)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return left(&format!("cannot run {}: {error}", script.display())),
+    };
+    let sent = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(&input))
+        .unwrap_or_else(|| Err(std::io::Error::other("no writable stdin")));
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => return left(&format!("cannot wait for {}: {error}", script.display())),
+    };
+    if let Err(error) = sent {
+        return left(&format!("cannot send rows to append-parity: {error}"));
+    }
+    if !output.status.success() {
+        return left(&format!(
+            "ERROR: append-parity refused them ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    format!(
+        "parity: appended {} row(s) from {} ({counts}): {}",
+        rows.len(),
+        results.display(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    )
 }
 
 fn default_result_root(root: &Path) -> Result<PathBuf, String> {
@@ -16493,5 +16619,231 @@ mod cpu_observation_reader_tests {
                 .is_none()
         );
         cleanup.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod series_parity_append_tests {
+    //! The pressure-test parity append of
+    //! <https://github.com/rrnewton/hermit/issues/3301>: a series' post-pass
+    //! outputs reach `series.py append-parity` as `pressure-test` rows, and no
+    //! outcome of it is an error.
+    use super::*;
+
+    const TREE: &str = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
+    const RUN: &str = "pressure-parity-fixture";
+
+    /// RUN 1953's first portable record, with this fixture's run id.
+    fn diverged_record() -> String {
+        r#"{"schema":1,"test_id":"c-programs/aio-refusal","backend":"kvm","verdict":"diverged","inputs_equalized":false,"reason":null,"credit":null,"unequalized_credit":0.11320754716981132,"first_divergent_record":13,"left_len":106,"right_len":106,"matched_prefix":12,"first_difference":{"field":"token 12: `Ok(93824992251904)` vs `Ok(2117632)`","syscall":2,"scheduler_turn":1,"virtual_nanoseconds":1790651878158833000,"reference_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(93824992251904)","candidate_message":"INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #<NUM>: brk(NULL) = Ok(2117632)"},"reference_log":"ref.detlog","candidate_log":"run1_log","run_id":"RUN","hermit_sha":"TREE"}"#
+            .replace("RUN", RUN)
+            .replace("TREE", TREE)
+    }
+
+    const WRITER: &str = r#"import json, pathlib, sys
+# fixture for series.py append-parity
+parent = pathlib.Path(sys.argv[sys.argv.index("--parent") + 1])
+parent.joinpath("captured.json").write_text(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}))
+print("fixture parity append accepted")
+"#;
+
+    struct Fixture {
+        root: SelfTestDirectory,
+    }
+
+    impl Fixture {
+        /// A series result directory whose post-pass failed after measuring
+        /// one of its two cells, and a writer at `series.py`.
+        fn new(label: &str, writer: &str) -> Self {
+            let path = env::temp_dir().join(format!(
+                "hermit-pressure-self-test-parity-append-{}-{label}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            for dir in [path.join("parent"), path.join("results")] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(path.join("series.py"), writer).unwrap();
+            let status = json!({
+                "schema": 2, "state": "failed", "run_id": RUN, "hermit_sha": TREE,
+                "hermit_bin": "/src/hermit", "hermit_bin_sha256": null,
+                "records": "/results/parity.jsonl", "cells": 2,
+                "scope": ["c-programs/aio-refusal@kvm", "c-programs/cpuid-probe@liteinst"],
+                "summary": null, "error": "log-diff timed out",
+            });
+            fs::write(
+                path.join("results").join(parity::PARITY_STATUS_JSON),
+                status.to_string(),
+            )
+            .unwrap();
+            fs::write(
+                path.join("results").join(parity::PARITY_JSONL),
+                diverged_record() + "\n",
+            )
+            .unwrap();
+            Fixture {
+                root: SelfTestDirectory::new(path),
+            }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.root.path.join(name)
+        }
+
+        fn append(&self) -> String {
+            append_series_parity(
+                &self.path("series.py"),
+                &self.path("parent"),
+                &self.path("results"),
+                RUN,
+                TREE,
+            )
+        }
+
+        fn captured(&self) -> Option<JsonValue> {
+            fs::read(self.path("parent/captured.json"))
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_series_post_pass_reaches_append_parity_as_pressure_test_rows() {
+        let fixture = Fixture::new("rows", WRITER);
+        assert_eq!(
+            fixture.append(),
+            format!(
+                "parity: appended 2 row(s) from {} (diverged 1, record-missing 1): \
+                 fixture parity append accepted",
+                fixture.path("results").display()
+            )
+        );
+        let captured = fixture.captured().expect("append-parity was called");
+        let argv = captured["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(argv[0], "append-parity");
+        let parent = fixture.path("parent").display().to_string();
+        for pair in [
+            ["--parent", parent.as_str()],
+            ["--producer", "pressure-test"],
+            ["--run-id", RUN],
+            ["--tree", TREE],
+        ] {
+            assert!(
+                argv.windows(2).any(|window| window == pair),
+                "{pair:?} missing from {argv:?}"
+            );
+        }
+        let stdin = captured["stdin"].as_str().unwrap();
+        let rows = stdin
+            .lines()
+            .map(|line| serde_json::from_str::<JsonValue>(line).unwrap())
+            .collect::<Vec<_>>();
+        let seen = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["cell"].as_str().unwrap(),
+                    row["verdict"].as_str().unwrap(),
+                    row["source"]["lane"].as_str().unwrap(),
+                    row["source"]["node"].as_str().unwrap(),
+                    row["source"]["post_pass_state"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "c-programs/aio-refusal@kvm",
+                    "diverged",
+                    "pressure-test",
+                    "post-pass",
+                    "failed"
+                ),
+                (
+                    "c-programs/cpuid-probe@liteinst",
+                    "record-missing",
+                    "pressure-test",
+                    "post-pass",
+                    "failed"
+                ),
+            ]
+        );
+        assert_eq!(
+            rows[1]["reason"],
+            "parity post-pass failed: log-diff timed out"
+        );
+        // The record reaches the writer byte-for-byte as the post-pass wrote it.
+        assert!(
+            stdin
+                .lines()
+                .next()
+                .unwrap()
+                .contains(&format!(r#""record":{}"#, diverged_record())),
+            "{stdin}"
+        );
+    }
+
+    #[test]
+    fn a_writer_without_append_parity_is_named_and_leaves_the_rows() {
+        let legacy = WRITER.replace("# fixture for series.py append-parity\n", "");
+        let fixture = Fixture::new("legacy", &legacy);
+        assert_eq!(
+            fixture.append(),
+            format!(
+                "parity: the series writer has no append-parity; 2 rows left in {} \
+                 (diverged 1, record-missing 1)",
+                fixture.path("results").display()
+            )
+        );
+        assert!(
+            fixture.captured().is_none(),
+            "a legacy writer is never called"
+        );
+    }
+
+    #[test]
+    fn a_series_without_post_pass_output_appends_nothing() {
+        let fixture = Fixture::new("absent", WRITER);
+        fs::remove_file(fixture.path("results").join(parity::PARITY_STATUS_JSON)).unwrap();
+        fs::remove_file(fixture.path("results").join(parity::PARITY_JSONL)).unwrap();
+        assert_eq!(
+            fixture.append(),
+            format!(
+                "parity: no parity post-pass output in {}; nothing appended",
+                fixture.path("results").display()
+            )
+        );
+        assert!(fixture.captured().is_none());
+    }
+
+    #[test]
+    fn refused_outputs_and_a_refusing_writer_are_lines_not_failures() {
+        let refusing = WRITER.replace(
+            "print(\"fixture parity append accepted\")",
+            "sys.exit(\"fixture refusal\")",
+        );
+        let fixture = Fixture::new("refusing", &refusing);
+        let line = fixture.append();
+        assert!(
+            line.starts_with(
+                "parity: ERROR: append-parity refused them (exit status: 1): fixture refusal; \
+                 2 rows left in "
+            ),
+            "{line}"
+        );
+        // Records with no status beside them cannot be attributed.
+        fs::remove_file(fixture.path("results").join(parity::PARITY_STATUS_JSON)).unwrap();
+        let line = fixture.append();
+        assert!(
+            line.starts_with("parity: ERROR: no parity rows appended; the post-pass outputs in ")
+                && line.contains("has no parity.status.json beside it"),
+            "{line}"
+        );
     }
 }
