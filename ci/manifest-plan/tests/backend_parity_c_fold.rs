@@ -18,9 +18,10 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 900 cells, 895 portable and 5
-//!    privileged, with per-(lane, backend, mode) counts equal to the pre-fold
-//!    plan's plus exactly the cells slice S13 added.
+//! 2. The committed CI plan selects 900 cells, with per-(lane, backend, mode)
+//!    counts equal to the pre-fold plan's plus exactly the cells slice S13
+//!    added (895 portable and 5 privileged), after applying the later lane
+//!    moves listed in `LATER_LANE_MOVES` (now 893 portable and 7 privileged).
 //! 3. The committed compatibility cell table has 5984 rows with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified.
@@ -99,6 +100,33 @@ const S13_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[
     ("portable", "ptrace", "custom", 1),
     ("portable", "ptrace", "verify", 13),
     ("privileged", "dbt", "verify", 1),
+];
+
+/// Cells that later changes moved between lanes after the fold, as
+/// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
+/// changes which lane runs it, so the total and the per-(backend, mode) counts
+/// stay those of the pre-fold plan plus `S13_PLAN_ADDITIONS`.
+///
+/// - `system-utils/sysfs-sanitized-prefixes` needs host hwmon sensors, which
+///   GitHub-hosted runners lack; hosted run
+///   <https://github.com/rrnewton/hermit/actions/runs/36485831200> failed it
+///   with "hwmon has no readable sanitized leaf". Its two verify cells moved
+///   from the portable lane to the privileged lane.
+const LATER_LANE_MOVES: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "system-utils/sysfs-sanitized-prefixes",
+        "kvm",
+        "verify",
+        "portable",
+        "privileged",
+    ),
+    (
+        "system-utils/sysfs-sanitized-prefixes",
+        "ptrace",
+        "verify",
+        "portable",
+        "privileged",
+    ),
 ];
 
 /// Pre-fold `ci/compat-envelope/cells.json` rows per (backend, mode, status).
@@ -383,10 +411,51 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let plan = read_json("ci/expected-e2e-plan.json");
     let cells = plan["cells"].as_array().unwrap();
     let lane = |name: &str| cells.iter().filter(|c| field(c, "lane") == name).count();
+    let moved_out = |name: &str| {
+        LATER_LANE_MOVES
+            .iter()
+            .filter(|&&(_, _, _, from, _)| from == name)
+            .count()
+    };
+    let moved_in = |name: &str| {
+        LATER_LANE_MOVES
+            .iter()
+            .filter(|&&(_, _, _, _, to)| to == name)
+            .count()
+    };
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
-        (900, 895, 5)
+        (
+            900,
+            895 - moved_out("portable") + moved_in("portable"),
+            5 - moved_out("privileged") + moved_in("privileged"),
+        )
     );
+    assert_eq!(
+        (lane("portable"), lane("privileged")),
+        (893, 7),
+        "the lane moves above are the only ones since the fold"
+    );
+    // Every documented move is present in the committed plan exactly once, in
+    // its destination lane, and absent from its source lane.
+    for &(test, backend, mode, from, to) in LATER_LANE_MOVES {
+        let matching = |lane_name: &str| {
+            cells
+                .iter()
+                .filter(|c| {
+                    field(c, "test") == test
+                        && field(c, "backend") == backend
+                        && field(c, "mode") == mode
+                        && field(c, "lane") == lane_name
+                })
+                .count()
+        };
+        assert_eq!(
+            (matching(from), matching(to)),
+            (0, 1),
+            "{test} {mode}/{backend}: {from} -> {to}"
+        );
+    }
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for cell in cells {
         let key = (
@@ -399,12 +468,22 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let mut expected = PLAN_COUNTS
         .iter()
         .map(|&(lane, backend, mode, n)| ((lane.into(), backend.into(), mode.into()), n))
-        .collect::<BTreeMap<(String, String, String), _>>();
+        .collect::<BTreeMap<(String, String, String), usize>>();
     for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
             .or_default() += n;
     }
+    for &(_, backend, mode, from, to) in LATER_LANE_MOVES {
+        let source = expected
+            .get_mut(&(from.into(), backend.into(), mode.into()))
+            .unwrap_or_else(|| panic!("no pre-fold {from} {mode}/{backend} cell to move"));
+        *source -= 1;
+        *expected
+            .entry((to.into(), backend.into(), mode.into()))
+            .or_default() += 1;
+    }
+    expected.retain(|_, n| *n > 0);
     assert_eq!(counts, expected);
     // The folded cells now belong to c-programs: 437 portable c-programs cells
     // and 276 portable plus 3 privileged backend-parity-c cells before the fold,
