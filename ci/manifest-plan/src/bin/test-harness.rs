@@ -1507,7 +1507,9 @@ fn portable_shard_step<'a>(
         .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
 }
 
-const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3780;
+// 3900 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
+// 300) in https://github.com/rrnewton/hermit/issues/3381.
+const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3900;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
 const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
 const PORTABLE_CHECKS_OVERHEAD_SECONDS: u64 = 600;
@@ -4379,7 +4381,7 @@ sys.exit(1 if failed else 0)
             .unwrap_err();
         assert!(
             error.contains(
-                "portable preflight job 600s must cover its 3780s constructed DAG critical path plus at least 420s"
+                "portable preflight job 600s must cover its 3900s constructed DAG critical path plus at least 420s"
             ),
             "{error}"
         );
