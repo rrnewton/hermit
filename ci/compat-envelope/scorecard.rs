@@ -13978,6 +13978,25 @@ fn snapshot_pipe_diagnostic(pipe: &impl AsRawFd) -> String {
     )
 }
 
+// Read where a timed-out child is waiting before it is killed, so a report can
+// tell a blocked open (for example wchan=wait_for_partner on a FIFO) from a
+// child that is still running (state=R).
+fn snapshot_child_wait_diagnostic(pid: u32) -> String {
+    let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("unavailable: {error}"))
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, fields)| fields.split_whitespace().next())
+                .map(str::to_owned)
+                .ok_or_else(|| "unavailable: malformed stat".to_string())
+        })
+        .unwrap_or_else(|error| error);
+    let wchan = fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .map(|wchan| wchan.trim().to_owned())
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    format!("state={state}; wchan={wchan}")
+}
+
 fn self_test() -> Result<(), String> {
     let (summary_paths, retained) = parse_update_observations_args(
         [
@@ -16966,8 +16985,8 @@ fn self_test() -> Result<(), String> {
     // Exercise the actual split: the source clone has the complete catalogue,
     // while its separate ledger retains ALL existing observations. Copying the
     // bulk history into both would test the obsolete layout and spend each
-    // bounded child interval decoding it twice. No history assertion or input
-    // is removed, and the real five-second snapshot controls remain unchanged.
+    // child command decoding it twice. No history assertion or input is
+    // removed.
     let fixture_cells =
         load_catalogue(&result_command_root)?.ok_or("result-command fixture has no catalogue")?;
     let fixture_derived = derive(&result_command_root)?;
@@ -17273,10 +17292,11 @@ fn self_test() -> Result<(), String> {
     HeldScorecardSeriesSnapshot::open(&empty_snapshot_path, &empty_snapshot_sha)
         .map_err(|error| format!("valid empty combined snapshot was refused: {error}"))?;
 
-    // Use the real command in a separately bounded child: a blocking FIFO open
-    // must fail this control without stranding the self-test's writer lock.
-    let run_snapshot_command = |path: &Path, sha: &str| -> Result<std::process::Output, String> {
-        let mut child = Command::new(&executable)
+    // Every snapshot control runs the real command in a child process with the
+    // same operands; only the waiting policy below differs between them.
+    let snapshot_command = |path: &Path, sha: &str| {
+        let mut command = Command::new(&executable);
+        command
             .arg("project-and-observe-results")
             .arg("--snapshot")
             .arg(path)
@@ -17288,36 +17308,26 @@ fn self_test() -> Result<(), String> {
             .arg(&fixture_head)
             .arg("--refreshed-at")
             .arg("fixture-refresh")
-            .current_dir(&result_command_root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("cannot start snapshot command control: {error}"))?;
+            .current_dir(&result_command_root);
+        command
+    };
+    // Work controls wait for the command to finish, with no wall-clock deadline,
+    // like run_result_command and the other result-command controls. Their
+    // assertions are about output and written evidence, not speed. A five-second
+    // deadline here killed a correct transition control in a CPU-throttled
+    // validate (https://github.com/rrnewton/hermit/issues/3363). The validate
+    // node's wall-time and CPU caps still bound a real hang.
+    let slowest_snapshot_work = std::cell::Cell::new(Duration::ZERO);
+    let run_snapshot_work = |path: &Path, sha: &str| -> Result<std::process::Output, String> {
         let started = Instant::now();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                status => {
-                    let killed = child.kill();
-                    let reaped = child.wait();
-                    let stdout = child.stdout.as_ref().map(snapshot_pipe_diagnostic);
-                    let stderr = child.stderr.as_ref().map(snapshot_pipe_diagnostic);
-                    return Err(format!(
-                        "snapshot command control {} did not complete: {status:?}; kill={killed:?}; reap={reaped:?}; pid={}; elapsed={:.3}s; stdout={stdout:?}; stderr={stderr:?}",
-                        path.display(),
-                        child.id(),
-                        started.elapsed().as_secs_f64()
-                    ));
-                }
-            }
-        }
-        child
-            .wait_with_output()
-            .map_err(|error| format!("cannot read snapshot command control output: {error}"))
+        let output = snapshot_command(path, sha).output().map_err(|error| {
+            format!(
+                "cannot run snapshot command control {}: {error}",
+                path.display()
+            )
+        })?;
+        slowest_snapshot_work.set(slowest_snapshot_work.get().max(started.elapsed()));
+        Ok(output)
     };
     let fifo_snapshot_path = snapshot_root.join("snapshot.fifo");
     let fifo_name = std::ffi::CString::new(fifo_snapshot_path.as_os_str().as_encoded_bytes())
@@ -17329,7 +17339,47 @@ fn self_test() -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
-    let fifo_output = run_snapshot_command(&fifo_snapshot_path, &empty_snapshot_sha)?;
+    // Only the FIFO control has a deadline, because the failure it guards
+    // against is an open that blocks forever. A blocking FIFO open must fail
+    // this control without stranding the self-test's writer lock. The deadline
+    // is sized to catch a hang, not to measure speed. The refusal path is a
+    // prefix of every work control's path: startup, the writer-lock check, and
+    // the snapshot open.
+    const SNAPSHOT_FIFO_HANG_BOUND: Duration = Duration::from_secs(30);
+    let mut fifo_child = snapshot_command(&fifo_snapshot_path, &empty_snapshot_sha)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start snapshot FIFO control: {error}"))?;
+    let fifo_started = Instant::now();
+    let fifo_deadline = fifo_started + SNAPSHOT_FIFO_HANG_BOUND;
+    loop {
+        match fifo_child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < fifo_deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            status => {
+                // Read where the child is waiting before it is killed.
+                let process = snapshot_child_wait_diagnostic(fifo_child.id());
+                let killed = fifo_child.kill();
+                let reaped = fifo_child.wait();
+                let stdout = fifo_child.stdout.as_ref().map(snapshot_pipe_diagnostic);
+                let stderr = fifo_child.stderr.as_ref().map(snapshot_pipe_diagnostic);
+                return Err(format!(
+                    "snapshot FIFO control {} did not complete within its {}s hang bound: {status:?}; {process}; kill={killed:?}; reap={reaped:?}; pid={}; elapsed={:.3}s; stdout={stdout:?}; stderr={stderr:?}",
+                    fifo_snapshot_path.display(),
+                    SNAPSHOT_FIFO_HANG_BOUND.as_secs(),
+                    fifo_child.id(),
+                    fifo_started.elapsed().as_secs_f64()
+                ));
+            }
+        }
+    }
+    let fifo_elapsed = fifo_started.elapsed();
+    let fifo_output = fifo_child
+        .wait_with_output()
+        .map_err(|error| format!("cannot read snapshot FIFO control output: {error}"))?;
     if fifo_output.status.code() != Some(2)
         || !String::from_utf8_lossy(&fifo_output.stderr).contains("not a regular file")
         || read_history_files(&result_command_root)? != combined_baseline
@@ -17340,6 +17390,11 @@ fn self_test() -> Result<(), String> {
             String::from_utf8_lossy(&fifo_output.stderr)
         ));
     }
+    println!(
+        "scorecard self-test: snapshot FIFO refused in {:.3}s, within its {}s hang bound",
+        fifo_elapsed.as_secs_f64(),
+        SNAPSHOT_FIFO_HANG_BOUND.as_secs()
+    );
     // This succeeds only if the refused command released the actual writer
     // lock and an empty relative parent is resolved as the current directory.
     let bare_snapshot_path = Path::new("snapshot.json");
@@ -17347,7 +17402,7 @@ fn self_test() -> Result<(), String> {
         &result_command_root.join(bare_snapshot_path),
         &empty_snapshot_value,
     )?;
-    let bare_output = run_snapshot_command(bare_snapshot_path, &bare_snapshot_sha)?;
+    let bare_output = run_snapshot_work(bare_snapshot_path, &bare_snapshot_sha)?;
     let bare_written: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     if !bare_output.status.success()
         || !has_current_replay(&bare_written)
@@ -20299,7 +20354,7 @@ fn self_test() -> Result<(), String> {
         };
         let invoke = || {
             if combined {
-                run_snapshot_command(&empty_snapshot_path, &empty_snapshot_sha)
+                run_snapshot_work(&empty_snapshot_path, &empty_snapshot_sha)
             } else {
                 run_result_command("observe-results", None)
             }
@@ -20409,6 +20464,10 @@ fn self_test() -> Result<(), String> {
             "scorecard self-test: {command} CLI no-comparison baseline refused; location-only transition not a regression"
         );
     }
+    println!(
+        "scorecard self-test: project-and-observe-results work controls completed without a deadline; slowest {:.3}s",
+        slowest_snapshot_work.get().as_secs_f64()
+    );
     fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
     restore_generated()?;
 
