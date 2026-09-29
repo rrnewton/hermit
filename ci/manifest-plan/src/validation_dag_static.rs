@@ -292,7 +292,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // against 523; no other selected crate gains or loses a test):
     // nextest_binaries::tests::
     //   scratch_repository_tests_ignore_inherited_git_location_variables.
-    ("test.regular_crates", 710),
+    // Moving the tool self-tests out of gate.manifest (d7138e26, under
+    // https://github.com/rrnewton/hermit/issues/3381) adds two
+    // hermit-manifest-plan tests and retains all 710 prior identities
+    // (`cargo nextest list --profile ci -p hermit-manifest-plan` measured 526
+    // against 524; no other selected crate gains or loses a test):
+    // validation_dag::tests::tool_self_test_guard_refuses_each_planted_drift;
+    // cli_help: test_harness_selftest_refuses_anything_but_one_known_name.
+    ("test.regular_crates", 712),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -393,7 +400,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 710),
+    ("test.regular_crates_on_host", 712),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
