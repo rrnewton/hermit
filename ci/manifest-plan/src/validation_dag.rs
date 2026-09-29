@@ -374,16 +374,20 @@ struct Profile {
 // check.dbt_runtime_abi became check.dbt_runtime_abi_on_host: 256/256 before.
 // full, portable and hosted-portable then gained check.script_unit_tests, split
 // out of check.lint_checks: 273/274, 260/261 and 254/254 before.
+// full, portable and hosted-portable then gained check.e9patch_corpus when the
+// e9patch corpus left tests/backend-parity (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 274/275, 261/262 and
+// 255/255 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 274,
-        selected_steps: 275,
+        direct_steps: 275,
+        selected_steps: 276,
     },
     Profile {
         label: "portable",
-        direct_steps: 261,
-        selected_steps: 262,
+        direct_steps: 262,
+        selected_steps: 263,
     },
     Profile {
         label: "quick",
@@ -402,8 +406,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 255,
-        selected_steps: 255,
+        direct_steps: 256,
+        selected_steps: 256,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -2233,10 +2237,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // build.host_hermit_link, the hosted check.dbt_runtime_abi_on_host and the
     // e9patch lane's e9patchcompatprep.release_resources. 1616 since
     // check.script_unit_tests took the rust-script unit tests out of
-    // check.lint_checks.
-    if cfg.steps.len() != 1616 {
+    // check.lint_checks; +1 for check.e9patch_corpus when the e9patch corpus
+    // left tests/backend-parity (also slice S13).
+    if cfg.steps.len() != 1617 {
         return Err(format!(
-            "superset has {} steps, expected 1616",
+            "superset has {} steps, expected 1617",
             cfg.steps.len()
         ));
     }
@@ -3781,16 +3786,18 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 255 since check.script_unit_tests left check.lint_checks;
+        // 256 since check.e9patch_corpus was added when the e9patch corpus
+        // left tests/backend-parity (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301); 255 since
+        // check.script_unit_tests left check.lint_checks;
         // 254 since the one-build change of 2026-09-30 retired the hosted
         // copies of build.runtime_release and build.liteinst_runtime_release
         // (check.dbt_runtime_abi became check.dbt_runtime_abi_on_host);
         // 256 since selftest.scorecard_commands split from selftest.scorecard;
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
-        // test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 255);
+        // test.dbt_parity_on_host was retired (slice S13); 251 before.
+        assert_eq!(selected.steps.len(), 256);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3951,14 +3958,16 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 254 = the 255 hosted-portable direct steps since
-            // check.script_unit_tests left check.lint_checks (254 after the
+            // 255 = the 256 hosted-portable direct steps since
+            // check.e9patch_corpus was added in slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301 (255 since
+            // check.script_unit_tests left check.lint_checks, 254 after the
             // one-build change of 2026-09-30; 256 before it, since the five
             // selftest.<name> nodes left gate.manifest and
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 254 direct steps"),
+            error.contains("hosted-portable label has 255 direct steps"),
             "{error}"
         );
     }
