@@ -66,6 +66,12 @@ use crate::stress_series::HostCapabilityVerdict;
 #[cfg(test)]
 use crate::timeouts::CALIBRATED_CI_CELL_COUNT;
 #[cfg(test)]
+use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
+#[cfg(test)]
+use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
+#[cfg(test)]
+use crate::timeouts::DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 #[cfg(test)]
 use crate::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
@@ -270,6 +276,23 @@ pub struct ModeRecipe {
     #[serde(default)]
     pub slow_reason: BTreeMap<String, String>,
     pub expected_guest_exit: Option<ExpectedGuestExit>,
+    /// The exact guest stdout a verify cell requires, per enabled backend.
+    ///
+    /// A matched verify comparison proves the two runs agree with each other;
+    /// it cannot notice that both printed the same wrong bytes. Naming the
+    /// bytes here makes the cell also require both compared runs' stdout to
+    /// equal them, so declaring the same bytes for two backends of one test
+    /// makes those backends agree with each other as well.
+    #[serde(default)]
+    pub expected_stdout: BTreeMap<String, String>,
+    /// Text a verify cell's guest stdout must contain, per enabled backend.
+    ///
+    /// For output that is repeatable within one host but not byte-stable
+    /// across hosts (addresses, timing deltas), the exact bytes cannot be
+    /// declared. The cell can still require the success marker the guest
+    /// prints, so two runs that agree on output lacking it do not pass.
+    #[serde(default)]
+    pub expected_stdout_contains: BTreeMap<String, String>,
 }
 
 /// The one nonzero guest disposition a verify cell requires.
@@ -353,6 +376,166 @@ fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
         .then(|| cell.test.modes.get(&cell.id.mode))
         .flatten()
         .and_then(|recipe| recipe.expected_guest_exit.clone())
+}
+
+/// The exact stdout a selected verify cell requires, if its backend declares one.
+fn cell_expected_stdout(cell: &SelectedCell) -> Option<String> {
+    (cell.id.mode == "verify")
+        .then(|| cell.test.modes.get(&cell.id.mode))
+        .flatten()
+        .and_then(|recipe| {
+            cell.id
+                .backend
+                .as_ref()
+                .and_then(|backend| recipe.expected_stdout.get(backend).cloned())
+        })
+}
+
+/// The stdout text a selected verify cell must contain, if its backend declares one.
+fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
+    (cell.id.mode == "verify")
+        .then(|| cell.test.modes.get(&cell.id.mode))
+        .flatten()
+        .and_then(|recipe| {
+            cell.id
+                .backend
+                .as_ref()
+                .and_then(|backend| recipe.expected_stdout_contains.get(backend).cloned())
+        })
+}
+
+/// A per-backend stdout assertion is verify-only and keyed by enabled backends.
+///
+/// A key for a disabled backend would be an assertion that ordinary runs never
+/// execute, so it is refused rather than kept as a silent, unchecked claim.
+fn validate_verify_stdout_table(
+    id: &str,
+    mode: &str,
+    key: &str,
+    table: &BTreeMap<String, String>,
+    enabled: &BTreeSet<&str>,
+) -> Result<(), String> {
+    if table.is_empty() {
+        return Ok(());
+    }
+    if mode != "verify" {
+        return Err(format!("{id}: {key} is supported only by verify mode"));
+    }
+    for backend in table.keys() {
+        if !enabled.contains(backend.as_str()) {
+            return Err(format!(
+                "{id}: verify {key} names backend {backend} outside backends_enabled"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `expected_stdout` is a verify-only assertion keyed by enabled backends.
+pub fn validate_expected_stdout(
+    id: &str,
+    mode: &str,
+    expected: &BTreeMap<String, String>,
+    enabled: &BTreeSet<&str>,
+) -> Result<(), String> {
+    validate_verify_stdout_table(id, mode, "expected_stdout", expected, enabled)
+}
+
+/// `expected_stdout_contains` is verify-only, keyed by enabled backends, and
+/// names non-empty text: every stream contains the empty string, so an empty
+/// declaration would read as an assertion while checking nothing.
+pub fn validate_expected_stdout_contains(
+    id: &str,
+    mode: &str,
+    contains: &BTreeMap<String, String>,
+    enabled: &BTreeSet<&str>,
+) -> Result<(), String> {
+    validate_verify_stdout_table(id, mode, "expected_stdout_contains", contains, enabled)?;
+    if let Some(backend) = contains
+        .iter()
+        .find_map(|(backend, text)| text.is_empty().then_some(backend))
+    {
+        return Err(format!(
+            "{id}: verify expected_stdout_contains.{backend} must not be empty"
+        ));
+    }
+    Ok(())
+}
+
+/// Why a verify report does not satisfy a declared `expected_stdout`.
+#[derive(Debug, Eq, PartialEq)]
+enum ExpectedStdoutError {
+    /// The report has no per-run outputs, so the assertion cannot be decided.
+    Unevidenced(String),
+    /// A compared run printed different bytes.
+    Mismatch(String),
+}
+
+/// Compare both runs a verify report compared with the declared stdout bytes.
+///
+/// The report carries each run's stdout digest and length, so the check needs
+/// no captured stream: a run whose stdout differs in any byte fails. A report
+/// without per-run outputs cannot satisfy the assertion and is never a pass.
+fn check_expected_stdout(
+    expected: &str,
+    report: &VerificationReport,
+) -> Result<(), ExpectedStdoutError> {
+    let outputs = report.compared_outputs.as_ref().ok_or_else(|| {
+        ExpectedStdoutError::Unevidenced(
+            "verification report omitted compared_outputs, so the declared expected_stdout cannot be checked".into(),
+        )
+    })?;
+    let expected_sha256 = hex_digest(expected.as_bytes());
+    let expected_bytes = expected.len() as u64;
+    for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
+        if output.stdout_sha256 != expected_sha256 || output.stdout_bytes != expected_bytes {
+            return Err(ExpectedStdoutError::Mismatch(format!(
+                "verify {run} run stdout ({} bytes, sha256 {}) differs from the declared expected_stdout ({expected_bytes} bytes, sha256 {expected_sha256})",
+                output.stdout_bytes, output.stdout_sha256
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Require the captured verify stdout to contain the declared text.
+///
+/// The report describes both compared runs' stdout only by digest and length,
+/// so the captured stream is evidence for both runs only when it equals both of
+/// them; only then is the text searched for. A capture that is not those bytes,
+/// or a report without per-run outputs, decides nothing and is never a pass.
+fn check_expected_stdout_contains(
+    text: &str,
+    captured: &[u8],
+    report: &VerificationReport,
+) -> Result<(), ExpectedStdoutError> {
+    let outputs = report.compared_outputs.as_ref().ok_or_else(|| {
+        ExpectedStdoutError::Unevidenced(
+            "verification report omitted compared_outputs, so the declared expected_stdout_contains cannot be checked".into(),
+        )
+    })?;
+    let captured_sha256 = hex_digest(captured);
+    let captured_bytes = captured.len() as u64;
+    for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
+        if output.stdout_sha256 != captured_sha256 || output.stdout_bytes != captured_bytes {
+            return Err(ExpectedStdoutError::Unevidenced(format!(
+                "captured verify stdout ({captured_bytes} bytes, sha256 {captured_sha256}) is not the {run} compared run's stdout ({} bytes, sha256 {}), so the declared expected_stdout_contains cannot be checked",
+                output.stdout_bytes, output.stdout_sha256
+            )));
+        }
+    }
+    let needle = text.as_bytes();
+    if needle.is_empty()
+        || captured
+            .windows(needle.len())
+            .any(|window| window == needle)
+    {
+        Ok(())
+    } else {
+        Err(ExpectedStdoutError::Mismatch(format!(
+            "verify stdout ({captured_bytes} bytes, sha256 {captured_sha256}) does not contain the declared expected_stdout_contains text {text:?}"
+        )))
+    }
 }
 
 pub fn validate_expected_guest_exit(
@@ -1051,6 +1234,8 @@ fn validate_mode_with_cpu(
         ));
     }
     validate_expected_guest_exit(id, mode, recipe.expected_guest_exit.as_ref())?;
+    validate_expected_stdout(id, mode, &recipe.expected_stdout, &enabled)?;
+    validate_expected_stdout_contains(id, mode, &recipe.expected_stdout_contains, &enabled)?;
     Ok(())
 }
 
@@ -1127,6 +1312,12 @@ pub struct CellRunSpec {
     pub cell_dir: PathBuf,
     /// The exact nonzero guest disposition this attempt requires, if any.
     pub expected_guest_exit: Option<ExpectedGuestExit>,
+    /// The exact stdout both compared verify runs must print, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stdout: Option<String>,
+    /// Text the captured verify stdout must contain, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stdout_contains: Option<String>,
     #[serde(skip)]
     attempt: String,
     #[serde(skip)]
@@ -2547,6 +2738,8 @@ pub fn build_spec(
         sabre_path_evidence,
         cell_dir: dir,
         expected_guest_exit: cell_expected_guest_exit(cell),
+        expected_stdout: cell_expected_stdout(cell),
+        expected_stdout_contains: cell_expected_stdout_contains(cell),
         attempt: attempt.into(),
         fixed_workdir_source,
         normalize_ptrace_golden: context.keep_logs,
@@ -2918,6 +3111,54 @@ fn execute_spec_until(
                         } else if let Err(error) = report.require_canonical_match() {
                             outcome = "FAIL".into();
                             reason = Some(error);
+                        } else if let Some(Err(error)) = spec
+                            .expected_stdout
+                            .as_deref()
+                            .filter(|_| output.timeout.is_none())
+                            .map(|expected| check_expected_stdout(expected, &report))
+                        {
+                            // Two runs agreeing on the wrong bytes is still a
+                            // failure when the cell names the exact bytes.
+                            match error {
+                                ExpectedStdoutError::Unevidenced(error) => {
+                                    outcome = "ERROR".into();
+                                    error_kind =
+                                        Some("incomplete-verification-evidence".into());
+                                    reason = Some(error);
+                                }
+                                ExpectedStdoutError::Mismatch(error) => {
+                                    outcome = "FAIL".into();
+                                    reason = Some(error);
+                                }
+                            }
+                        } else if let Some(Err(error)) = spec
+                            .expected_stdout_contains
+                            .as_deref()
+                            .filter(|_| output.timeout.is_none())
+                            .map(|text| match fs::read(&stdout_path) {
+                                Ok(captured) => {
+                                    check_expected_stdout_contains(text, &captured, &report)
+                                }
+                                Err(error) => Err(ExpectedStdoutError::Unevidenced(format!(
+                                    "cannot read captured verify stdout {}: {error}, so the declared expected_stdout_contains cannot be checked",
+                                    stdout_path.display()
+                                ))),
+                            })
+                        {
+                            // Agreeing runs that omit the guest's success
+                            // marker are still a failure.
+                            match error {
+                                ExpectedStdoutError::Unevidenced(error) => {
+                                    outcome = "ERROR".into();
+                                    error_kind =
+                                        Some("incomplete-verification-evidence".into());
+                                    reason = Some(error);
+                                }
+                                ExpectedStdoutError::Mismatch(error) => {
+                                    outcome = "FAIL".into();
+                                    reason = Some(error);
+                                }
+                            }
                         } else if let Some(expected) = spec
                             .expected_guest_exit
                             .as_ref()
@@ -6017,10 +6258,40 @@ mod tests {
                 + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
                 + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
                 + 3 // the exact RNG identities asserted above
+                + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
         );
+        // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
+        // DBT verify cells that were enabled with ci:false and enabled one new
+        // ci:false DBT verify cell; the timeouts module names them.
+        let dbt_verify = |population: &[SelectedCell], test: &str| {
+            population.iter().any(|cell| {
+                cell.id.test == test
+                    && cell.id.mode == "verify"
+                    && cell.id.backend.as_deref() == Some("dbt")
+            })
+        };
+        for test in DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS {
+            assert!(
+                dbt_verify(&required, test),
+                "{test} verify/dbt is not required"
+            );
+        }
+        for test in DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS {
+            assert!(
+                dbt_verify(&enabled, test),
+                "{test} verify/dbt is not enabled"
+            );
+            assert!(
+                !dbt_verify(&required, test),
+                "{test} verify/dbt is required"
+            );
+        }
         assert_eq!(
             enabled.len() - required.len(),
-            NON_CI_CELL_COUNT - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT,
+            NON_CI_CELL_COUNT
+                - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
+                - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
+                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len(),
             "the current manifest census records every enabled ci:false cell"
         );
 
@@ -6164,6 +6435,8 @@ mod tests {
             sabre_path_evidence: None,
             cell_dir: root.clone(),
             expected_guest_exit: None,
+            expected_stdout: None,
+            expected_stdout_contains: None,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -6877,6 +7150,8 @@ mod tests {
             sabre_path_evidence: None,
             cell_dir: root.join(label),
             expected_guest_exit: None,
+            expected_stdout: None,
+            expected_stdout_contains: None,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -9647,7 +9922,9 @@ exit "$(cat "$PWD/exit-status")"
             .collect::<Vec<_>>();
         // Pin the selected population and per-backend split, and check every
         // candidate's arguments.
-        assert_eq!(candidates.len(), 173);
+        // S13 of https://github.com/rrnewton/hermit/issues/3301 enabled dbt on
+        // pid-probe, which adds the one portable dbt candidate.
+        assert_eq!(candidates.len(), 174);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -9656,7 +9933,7 @@ exit "$(cat "$PWD/exit-status")"
         }
         assert_eq!(
             by_backend,
-            BTreeMap::from([("kvm", 75), ("liteinst", 97), ("sabre", 1)])
+            BTreeMap::from([("dbt", 1), ("kvm", 75), ("liteinst", 97), ("sabre", 1)])
         );
         assert!(
             candidates
@@ -9685,7 +9962,7 @@ exit "$(cat "$PWD/exit-status")"
         }
     }
 
-    /// The 173 candidates pinned above (kvm 75, liteinst 97, sabre 1) used to
+    /// The kvm, liteinst and sabre candidates pinned above (75, 97 and 1) used to
     /// add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
@@ -9815,6 +10092,8 @@ exit "$(cat "$PWD/exit-status")"
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
+            expected_stdout: None,
+            expected_stdout_contains: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -9861,6 +10140,8 @@ exit "$(cat "$PWD/exit-status")"
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
+            expected_stdout: None,
+            expected_stdout_contains: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -10275,6 +10556,8 @@ exit "$(cat "$PWD/exit-status")"
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: Some(expected),
+            expected_stdout: None,
+            expected_stdout_contains: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,
@@ -10598,6 +10881,399 @@ cp "{}" "$verdict"
         assert_eq!(cell_expected_guest_exit(&ptrace_cell("verify")), None);
     }
 
+    /// A canonical matched report whose two runs printed `first` and
+    /// `second` on stdout.
+    fn stdout_report(first: &str, second: &str) -> VerificationReport {
+        let mut report = canonical_verification_report();
+        let outputs = report.compared_outputs.as_mut().unwrap();
+        outputs.left.stdout_sha256 = hex_digest(first.as_bytes());
+        outputs.left.stdout_bytes = first.len() as u64;
+        outputs.right.stdout_sha256 = hex_digest(second.as_bytes());
+        outputs.right.stdout_bytes = second.len() as u64;
+        report
+    }
+
+    fn attempt_with_expected_stdout(
+        expected: &str,
+        report: VerificationReport,
+        ending: &str,
+    ) -> AttemptResult {
+        attempt_with_stdout_assertions(Some(expected), None, report, "", ending)
+    }
+
+    /// Run a fake Hermit that writes `report` as its verdict and prints
+    /// `captured` on stdout, against a dbt verify spec declaring `exact`
+    /// and/or `contains`.
+    fn attempt_with_stdout_assertions(
+        exact: Option<&str>,
+        contains: Option<&str>,
+        report: VerificationReport,
+        captured: &str,
+        ending: &str,
+    ) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-expected-stdout-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/expected-stdout".into(),
+                mode: "verify".into(),
+                backend: Some("dbt".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf %s \"$1\" > \"$2\"; printf %s \"$3\"; {ending}"),
+                "sh".into(),
+                serde_json::to_string(&report).unwrap(),
+                verdict.to_string_lossy().into_owned(),
+                captured.into(),
+            ],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 5,
+            verdict_path: Some(verdict),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: dir.clone(),
+            expected_guest_exit: None,
+            expected_stdout: exact.map(str::to_string),
+            expected_stdout_contains: contains.map(str::to_string),
+            attempt: "1".into(),
+            fixed_workdir_source: dir.join("workdir/1"),
+            normalize_ptrace_golden: false,
+        };
+        let result = execute_spec(&spec).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    /// Two runs that agree with each other on the wrong bytes are a failure
+    /// when the cell names the exact bytes.
+    #[test]
+    fn expected_stdout_passes_only_when_both_runs_print_it() {
+        let golden = "hello world\n";
+        let matched = attempt_with_expected_stdout(golden, stdout_report(golden, golden), "exit 0");
+        assert_eq!(matched.outcome, "PASS", "{:?}", matched.reason);
+
+        let golden_sha = hex_digest(golden.as_bytes());
+        let other = "hello_world\n";
+        let other_sha = hex_digest(other.as_bytes());
+        let agreed_wrong =
+            attempt_with_expected_stdout(golden, stdout_report(other, other), "exit 0");
+        assert_eq!(agreed_wrong.outcome, "FAIL", "{:?}", agreed_wrong.reason);
+        assert_eq!(agreed_wrong.error_kind, None);
+        assert_eq!(
+            agreed_wrong.reason,
+            Some(format!(
+                "verify first run stdout (12 bytes, sha256 {other_sha}) differs from the declared expected_stdout (12 bytes, sha256 {golden_sha})"
+            ))
+        );
+
+        // A matched report whose two runs printed different bytes never
+        // reaches the stdout check: the report reader refuses it first, and
+        // the cell has no verdict rather than a pass.
+        for report in [stdout_report(other, golden), stdout_report(golden, other)] {
+            let result = attempt_with_expected_stdout(golden, report, "exit 0");
+            assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+        }
+
+        // An empty declaration is a real assertion, not an absent one.
+        let empty = attempt_with_expected_stdout("", stdout_report("x", "x"), "exit 0");
+        assert_eq!(empty.outcome, "FAIL", "{:?}", empty.reason);
+        let silent = attempt_with_expected_stdout("", stdout_report("", ""), "exit 0");
+        assert_eq!(silent.outcome, "PASS", "{:?}", silent.reason);
+    }
+
+    /// A report that omits the compared outputs cannot show the declared
+    /// bytes. The report reader already refuses such a report, and the check
+    /// itself also refuses to decide rather than pass.
+    #[test]
+    fn expected_stdout_without_compared_outputs_is_never_a_pass() {
+        let mut report = stdout_report("ok\n", "ok\n");
+        report.compared_outputs = None;
+        assert_eq!(
+            check_expected_stdout("ok\n", &report),
+            Err(ExpectedStdoutError::Unevidenced(
+                "verification report omitted compared_outputs, so the declared expected_stdout cannot be checked".into()
+            ))
+        );
+        let result = attempt_with_expected_stdout("ok\n", report, "exit 0");
+        assert_eq!(result.outcome, "ERROR", "{:?}", result.reason);
+        assert_eq!(
+            result.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+    }
+
+    /// Each compared run is checked on its own, so a second run that alone
+    /// printed the wrong bytes is named.
+    #[test]
+    fn expected_stdout_names_the_run_that_differs() {
+        let good = stdout_report("ok\n", "ok\n");
+        assert_eq!(check_expected_stdout("ok\n", &good), Ok(()));
+        let second = stdout_report("ok\n", "no\n");
+        let Err(ExpectedStdoutError::Mismatch(error)) = check_expected_stdout("ok\n", &second)
+        else {
+            panic!("second-run difference was not a mismatch");
+        };
+        assert!(
+            error.starts_with("verify second run stdout (3 bytes"),
+            "{error}"
+        );
+        // Equal length is not enough; the digest decides.
+        let first = stdout_report("no\n", "ok\n");
+        let Err(ExpectedStdoutError::Mismatch(error)) = check_expected_stdout("ok\n", &first)
+        else {
+            panic!("first-run difference was not a mismatch");
+        };
+        assert!(
+            error.starts_with("verify first run stdout (3 bytes"),
+            "{error}"
+        );
+    }
+
+    /// Matching bytes never rescue a diverged comparison or a failed Hermit
+    /// status: the stdout check is one more requirement, not a substitute.
+    #[test]
+    fn expected_stdout_cannot_pass_a_diverged_comparison_or_failed_status() {
+        let mut diverged = stdout_report("ok\n", "ok\n");
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_record = Some(3);
+        let result = attempt_with_expected_stdout("ok\n", diverged, "exit 0");
+        assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(
+                "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+            )
+        );
+
+        let failed = attempt_with_expected_stdout("ok\n", stdout_report("ok\n", "ok\n"), "exit 3");
+        assert_eq!(failed.outcome, "FAIL", "{:?}", failed.reason);
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("verify exited with status 3")
+        );
+    }
+
+    /// Only a verify cell reads its backend's declaration, and only its own
+    /// backend's entry.
+    #[test]
+    fn only_a_verify_cell_reads_its_own_backends_expected_stdout() {
+        let mut verify = ptrace_cell("verify");
+        verify.test.modes.get_mut("verify").unwrap().expected_stdout = BTreeMap::from([
+            ("ptrace".into(), "p\n".into()),
+            ("dbt".into(), "d\n".into()),
+        ]);
+        assert_eq!(cell_expected_stdout(&verify).as_deref(), Some("p\n"));
+        verify.id.backend = Some("dbt".into());
+        assert_eq!(cell_expected_stdout(&verify).as_deref(), Some("d\n"));
+        verify.id.backend = Some("kvm".into());
+        assert_eq!(cell_expected_stdout(&verify), None);
+        for mode in ["chaos", "replay", "naked"] {
+            let mut other = ptrace_cell(mode);
+            other.test.modes.get_mut(mode).unwrap().expected_stdout =
+                BTreeMap::from([("ptrace".into(), "p\n".into())]);
+            assert_eq!(cell_expected_stdout(&other), None, "{mode}");
+        }
+        assert_eq!(cell_expected_stdout(&ptrace_cell("verify")), None);
+    }
+
+    #[test]
+    fn expected_stdout_declarations_are_verify_only_and_name_enabled_backends() {
+        let enabled = BTreeSet::from(["ptrace", "dbt"]);
+        let declared = BTreeMap::from([("dbt".to_string(), "ok\n".to_string())]);
+        assert_eq!(
+            validate_expected_stdout("b/t", "verify", &declared, &enabled),
+            Ok(())
+        );
+        assert_eq!(
+            validate_expected_stdout("b/t", "chaos", &BTreeMap::new(), &enabled),
+            Ok(())
+        );
+        assert_eq!(
+            validate_expected_stdout("b/t", "chaos", &declared, &enabled),
+            Err("b/t: expected_stdout is supported only by verify mode".into())
+        );
+        let outside = BTreeMap::from([("kvm".to_string(), "ok\n".to_string())]);
+        assert_eq!(
+            validate_expected_stdout("b/t", "verify", &outside, &enabled),
+            Err("b/t: verify expected_stdout names backend kvm outside backends_enabled".into())
+        );
+    }
+
+    /// Agreeing runs pass a declared marker only when the captured stream
+    /// both is the compared runs' stdout and contains the marker.
+    #[test]
+    fn expected_stdout_contains_requires_the_marker_in_the_compared_stdout() {
+        let printed = "heap 0x555555559000 0x555555559000\n";
+        let passed = attempt_with_stdout_assertions(
+            None,
+            Some("heap "),
+            stdout_report(printed, printed),
+            printed,
+            "exit 0",
+        );
+        assert_eq!(passed.outcome, "PASS", "{:?}", passed.reason);
+
+        let unmarked = "0x555555559000 0x555555559000\n";
+        let unmarked_sha = hex_digest(unmarked.as_bytes());
+        let missing = attempt_with_stdout_assertions(
+            None,
+            Some("heap "),
+            stdout_report(unmarked, unmarked),
+            unmarked,
+            "exit 0",
+        );
+        assert_eq!(missing.outcome, "FAIL", "{:?}", missing.reason);
+        assert_eq!(missing.error_kind, None);
+        assert_eq!(
+            missing.reason,
+            Some(format!(
+                "verify stdout ({} bytes, sha256 {unmarked_sha}) does not contain the declared expected_stdout_contains text \"heap \"",
+                unmarked.len()
+            ))
+        );
+
+        // A capture that is not the compared bytes proves nothing about
+        // them, even when it happens to contain the marker.
+        let foreign = attempt_with_stdout_assertions(
+            None,
+            Some("heap "),
+            stdout_report(unmarked, unmarked),
+            printed,
+            "exit 0",
+        );
+        assert_eq!(foreign.outcome, "ERROR", "{:?}", foreign.reason);
+        assert_eq!(
+            foreign.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert!(
+            foreign
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("captured verify stdout ("),
+            "{:?}",
+            foreign.reason
+        );
+
+        let mut omitted = stdout_report(printed, printed);
+        omitted.compared_outputs = None;
+        assert_eq!(
+            check_expected_stdout_contains("heap ", printed.as_bytes(), &omitted),
+            Err(ExpectedStdoutError::Unevidenced(
+                "verification report omitted compared_outputs, so the declared expected_stdout_contains cannot be checked".into()
+            ))
+        );
+        let second_differs = stdout_report(printed, unmarked);
+        let Err(ExpectedStdoutError::Unevidenced(error)) =
+            check_expected_stdout_contains("heap ", printed.as_bytes(), &second_differs)
+        else {
+            panic!("a capture unlike the second run must be unevidenced");
+        };
+        assert!(
+            error.contains("is not the second compared run's stdout"),
+            "{error}"
+        );
+    }
+
+    /// A marker cannot rescue a diverged comparison or a failed exit.
+    #[test]
+    fn expected_stdout_contains_cannot_pass_a_diverged_or_failed_run() {
+        let printed = "clock matrix success\n";
+        let mut diverged = stdout_report(printed, printed);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_record = Some(3);
+        let result =
+            attempt_with_stdout_assertions(None, Some("success"), diverged, printed, "exit 0");
+        assert_eq!(result.outcome, "FAIL", "{:?}", result.reason);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(
+                "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+            )
+        );
+
+        let failed = attempt_with_stdout_assertions(
+            None,
+            Some("success"),
+            stdout_report(printed, printed),
+            printed,
+            "exit 3",
+        );
+        assert_eq!(failed.outcome, "FAIL", "{:?}", failed.reason);
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("verify exited with status 3")
+        );
+    }
+
+    #[test]
+    fn expected_stdout_contains_declarations_are_verify_only_and_non_empty() {
+        let enabled = BTreeSet::from(["ptrace", "dbt"]);
+        let declared = BTreeMap::from([("dbt".to_string(), "heap ".to_string())]);
+        assert_eq!(
+            validate_expected_stdout_contains("b/t", "verify", &declared, &enabled),
+            Ok(())
+        );
+        assert_eq!(
+            validate_expected_stdout_contains("b/t", "replay", &declared, &enabled),
+            Err("b/t: expected_stdout_contains is supported only by verify mode".into())
+        );
+        let outside = BTreeMap::from([("sabre".to_string(), "heap ".to_string())]);
+        assert_eq!(
+            validate_expected_stdout_contains("b/t", "verify", &outside, &enabled),
+            Err(
+                "b/t: verify expected_stdout_contains names backend sabre outside backends_enabled"
+                    .into()
+            )
+        );
+        let empty = BTreeMap::from([("ptrace".to_string(), String::new())]);
+        assert_eq!(
+            validate_expected_stdout_contains("b/t", "verify", &empty, &enabled),
+            Err("b/t: verify expected_stdout_contains.ptrace must not be empty".into())
+        );
+    }
+
+    #[test]
+    fn only_a_verify_cell_reads_its_own_backends_expected_stdout_contains() {
+        let mut cell = ptrace_cell("verify");
+        cell.test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .expected_stdout_contains = BTreeMap::from([("ptrace".into(), "pid=".into())]);
+        assert_eq!(
+            cell_expected_stdout_contains(&cell).as_deref(),
+            Some("pid=")
+        );
+        cell.id.backend = Some("dbt".into());
+        assert_eq!(cell_expected_stdout_contains(&cell), None);
+        let mut chaos = ptrace_cell("chaos");
+        chaos
+            .test
+            .modes
+            .get_mut("chaos")
+            .unwrap()
+            .expected_stdout_contains = BTreeMap::from([("ptrace".into(), "pid=".into())]);
+        assert_eq!(cell_expected_stdout_contains(&chaos), None);
+    }
+
     /// An attempt stopped by the wall backstop is never a pass, even when it
     /// left a matched canonical report of the expected exit and Hermit, on the
     /// backstop's SIGTERM, still exited with that code.
@@ -10741,6 +11417,8 @@ cp "{}" "$verdict"
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
             expected_guest_exit: None,
+            expected_stdout: None,
+            expected_stdout_contains: None,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
             normalize_ptrace_golden: false,

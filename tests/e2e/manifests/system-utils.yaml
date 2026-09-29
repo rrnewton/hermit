@@ -32,13 +32,17 @@ test:
           ptrace: true
           kvm: true
           liteinst: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
           - liteinst
+          - dbt
         backends_disabled:
-          dbt: Enable after the ptrace baseline for direct C guests is trusted
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
+        expected_stdout_contains:
+          ptrace: "clock matrix success\n"
+          dbt: "clock matrix success\n"
       replay:
         ci: false
         backends_enabled: []
@@ -2140,3 +2144,338 @@ test:
           sabre: The exact verify cell already self-asserts the configured width
           liteinst: The exact verify cell already self-asserts the configured width
         ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
+  - id: system-utils/echo-stdout
+    description: echo writes one fixed line to stdout under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    direct:
+      - "/bin/echo"
+      - "hello world"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+        backends_disabled:
+          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
+          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
+          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
+        expected_stdout:
+          ptrace: "hello world\n"
+          dbt: "hello world\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
+        backends_enabled: []
+        backends_disabled:
+          native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+  - id: system-utils/printf-argument-forwarding
+    description: printf receives an argument containing a space as one argv element under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    direct:
+      - "/usr/bin/printf"
+      - "%s|%s\n"
+      - "alpha"
+      - "two words"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+        backends_disabled:
+          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
+          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
+          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
+        expected_stdout:
+          ptrace: "alpha|two words\n"
+          dbt: "alpha|two words\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
+        backends_enabled: []
+        backends_disabled:
+          native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+  - id: system-utils/true-exit-zero
+    description: true exits zero with empty stdout under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    direct:
+      - "/bin/true"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+        backends_disabled:
+          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
+          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
+          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
+        expected_stdout:
+          ptrace: ""
+          dbt: ""
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
+        backends_enabled: []
+        backends_disabled:
+          native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+  - id: system-utils/sh-exit-status
+    description: A shell exit status of 23 reaches Hermit exactly
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    direct:
+      - "/bin/sh"
+      - "-c"
+      - "exit 23"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+        backends_disabled:
+          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
+          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
+          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
+        expected_guest_exit:
+          code: 23
+          reason: The shell exits 23 on purpose so the cell proves each backend reports an exact nonzero guest exit status with empty stdout.
+        expected_stdout:
+          ptrace: ""
+          dbt: ""
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
+        backends_enabled: []
+        backends_disabled:
+          native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+  - id: system-utils/cat-file-read
+    description: cat reads a checked-in text file and copies it to stdout under Hermit
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+    occasional: false
+    direct:
+      - "/bin/cat"
+      - "tests/e2e/system-utils/cat-file-read-input.txt"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - dbt
+        backends_disabled:
+          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
+          sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
+          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
+        expected_stdout:
+          ptrace: "backend parity fixture\n"
+          dbt: "backend parity fixture\n"
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
+        backends_enabled: []
+        backends_disabled:
+          native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification contract
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest

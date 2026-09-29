@@ -253,6 +253,48 @@ process status reports it: the same exit code, or for a signal either death by
 that signal or exit status 128 plus the signal number. Any other ending,
 including a successful one, fails. The key is rejected outside `verify` mode.
 
+A verify cell may also name the exact bytes its guest prints on stdout, per
+enabled backend, with `expected_stdout`:
+
+```yaml
+      verify:
+        expected_stdout:
+          ptrace: "madvise-ok\n"
+          dbt: "madvise-ok\n"
+```
+
+The cell then passes only when, in addition to every check above, both runs
+the report compared printed exactly those bytes: the report's per-run stdout
+length and SHA-256 must equal the declared string's. Two runs agreeing with
+each other on different bytes fail. A report without per-run outputs is an
+incomplete-evidence error, never a pass. The same string declared for two
+backends makes their stdout equal by construction, which the report-only
+parity post-pass cannot enforce. An empty string asserts empty stdout. A key
+must name a backend in `backends_enabled`, and the table is rejected outside
+`verify` mode.
+
+Some output repeats exactly on one host but is not the same across hosts:
+addresses depend on the compiler and C library that built the guest, and
+virtual-time deltas depend on the guest's instruction counts. For such a guest,
+`expected_stdout_contains` names the success marker it prints instead of the
+whole stream:
+
+```yaml
+      verify:
+        expected_stdout_contains:
+          ptrace: "heap "
+          dbt: "heap "
+```
+
+The runner reads the captured stdout of the attempt and uses it only when its
+length and SHA-256 equal both compared runs' stdout; the cell then passes only
+when that stream contains the text. A capture that does not match both runs,
+or a report without per-run outputs, is an incomplete-evidence error. The run
+comparison already requires the two runs to agree, so the marker adds the
+guarantee that what they agreed on is the guest's success output. The text
+must be non-empty, keys must name backends in `backends_enabled`, and the
+table is rejected outside `verify` mode.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;

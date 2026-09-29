@@ -44,7 +44,7 @@ cells:
   - test: c-programs/cpu-virtualization
     backends: [dbt, kvm, liteinst]
   - test: c-programs/cpuid-probe
-    backends: [kvm, liteinst]
+    backends: [dbt, kvm, liteinst]
   - test: c-programs/cwd-roundtrip
     backends: [kvm, liteinst]
   - test: c-programs/dup-shared-offset
@@ -142,7 +142,7 @@ cells:
   - test: c-programs/personality-domain
     backends: [liteinst]
   - test: c-programs/pid-probe
-    backends: [kvm, liteinst, sabre]
+    backends: [dbt, kvm, liteinst, sabre]
   - test: c-programs/pidfd-open-self-pair
     backends: [dbt, kvm, liteinst]
   - test: c-programs/pipe-capacity

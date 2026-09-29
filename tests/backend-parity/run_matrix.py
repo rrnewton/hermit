@@ -433,7 +433,6 @@ class Fixtures:
         if name in self._binaries:
             return self._binaries[name]
 
-        local = SCRIPT_DIR / "fixtures"
         sources: dict[str, tuple[Path, tuple[str, ...]]] = {
             "pthread_lifecycle": (
                 REPOSITORY / "tests/c/pthread_lifecycle.c",
@@ -495,15 +494,15 @@ class Fixtures:
                 ("-D_GNU_SOURCE",),
             ),
             "sigaction_state": (
-                local / "sigaction_state.c",
+                REPOSITORY / "tests/c/sigaction_state.c",
                 ("-D_GNU_SOURCE",),
             ),
             "sigprocmask_state": (
-                local / "sigprocmask_state.c",
+                REPOSITORY / "tests/c/sigprocmask_state.c",
                 ("-D_GNU_SOURCE",),
             ),
             "sigaltstack_state": (
-                local / "sigaltstack_state.c",
+                REPOSITORY / "tests/c/sigaltstack_state.c",
                 ("-D_GNU_SOURCE",),
             ),
         }
@@ -539,7 +538,7 @@ class CatalogFixtures:
 def case_catalog(
     fixtures: Fixtures | CatalogFixtures,
 ) -> dict[str, tuple[list[str], int, bytes | None]]:
-    fixture_input = SCRIPT_DIR / "fixtures/input.txt"
+    fixture_input = REPOSITORY / "tests/e2e/system-utils/cat-file-read-input.txt"
     return {
         "hello_stdout": (["/bin/echo", "hello world"], 0, b"hello world\n"),
         "argument_forwarding": (

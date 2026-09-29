@@ -161,7 +161,6 @@
     "c-programs/hello-signals::naked",
     "c-programs/hello-signals::replay",
     "c-programs/io-uring-fallback::chaos",
-    "c-programs/io-uring-fallback::custom",
     "c-programs/io-uring-fallback::naked",
     "c-programs/io-uring-fallback::replay",
     "c-programs/io-uring-ring-determinism::chaos",

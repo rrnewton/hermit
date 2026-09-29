@@ -774,7 +774,10 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
             restored += 1;
         }
     }
-    assert_eq!(restored, 279, "276 portable and 3 privileged folded cells");
+    // 276 portable and 3 privileged folded cells, plus the DBT verify cells slice
+    // S13 (https://github.com/rrnewton/hermit/issues/3301) selected for the folded
+    // tests c-programs/pid-probe (portable) and c-programs/cpuid-probe (privileged).
+    assert_eq!(restored, 281, "277 portable and 4 privileged folded cells");
     serde_json::to_string(&expected).unwrap()
 }
 
@@ -897,10 +900,14 @@ fn generated_plan_populations_preserve_command_policy() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     // The frozen 856-cell population gains precisely these three portable RNG
-    // cells. Preserve raw cardinality as well as the set: duplicates are not cells.
-    assert!(exact_rng_population(&raw_expected, 859));
+    // cells, and slice S13 of https://github.com/rrnewton/hermit/issues/3301 adds
+    // 41 more (26 DBT and 13 ptrace verify cells, and one DBT and one ptrace
+    // custom cell for c-programs/io-uring-fallback) when it moves the retired DBT
+    // backend-parity matrix onto manifest cells. Preserve raw cardinality as well
+    // as the set: duplicates are not cells.
+    assert!(exact_rng_population(&raw_expected, 900));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(expected_cells.len(), 859);
+    assert_eq!(expected_cells.len(), 900);
     let rng = raw_expected
         .iter()
         .enumerate()
@@ -910,13 +917,13 @@ fn generated_plan_populations_preserve_command_policy() {
     assert_eq!(rng.len(), 3);
     let mut renamed = raw_expected.clone();
     renamed[rng[0]].test = "c-programs/wrong-rng-identity".into();
-    assert!(!exact_rng_population(&renamed, 859));
+    assert!(!exact_rng_population(&renamed, 900));
     let mut duplicate = raw_expected.clone();
     duplicate[rng[0]] = duplicate[rng[1]].clone();
-    assert!(!exact_rng_population(&duplicate, 859));
+    assert!(!exact_rng_population(&duplicate, 900));
     let mut missing = raw_expected.clone();
     missing.remove(rng[0]);
-    assert!(!exact_rng_population(&missing, 859));
+    assert!(!exact_rng_population(&missing, 900));
     let pre_fold_json = pre_fold_expected_json(&expected_json);
     let pre_fold_cells = crate::validation_dag::expected_cells_from_json(&pre_fold_json)
         .unwrap()
@@ -924,19 +931,19 @@ fn generated_plan_populations_preserve_command_policy() {
         .map(exact_identity)
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
-    assert_eq!(pre_fold_cells.len(), 859);
+    assert_eq!(pre_fold_cells.len(), 900);
     for (label, tag, retained_command, cell_count) in [
         (
             "full",
             "e2e.manifest_backend_parity_c",
             LAST_LIVE_PORTABLE_PARITY_SELECTOR,
-            859,
+            900,
         ),
         (
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            855,
+            895,
         ),
     ] {
         let live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1039,13 +1046,13 @@ fn generated_plan_populations_preserve_command_policy() {
                 .cloned()
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
-            assert_eq!(expected_relations.len(), if active { 173 } else { 0 });
+            assert_eq!(expected_relations.len(), if active { 174 } else { 0 });
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
                 expected_relations
             );
             if active {
-                for (backend, count) in [("kvm", 75), ("liteinst", 97), ("sabre", 1)] {
+                for (backend, count) in [("kvm", 75), ("liteinst", 97), ("sabre", 1), ("dbt", 1)] {
                     assert_eq!(
                         expected_relations
                             .iter()

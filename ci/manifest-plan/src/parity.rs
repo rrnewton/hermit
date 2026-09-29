@@ -2639,7 +2639,7 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 1444);
+        assert_eq!(parsed.cells.len(), 1496);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -2666,7 +2666,7 @@ mod tests {
                 count.selected_selectable,
             )
         };
-        assert_eq!(row(&counts.all), (1444, 604, 501, 192, 175));
+        assert_eq!(row(&counts.all), (1496, 628, 527, 194, 177));
         let by_backend: Vec<_> = counts
             .by_backend
             .iter()
@@ -2675,10 +2675,10 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (361, 61, 0, 14, 0)),
-                ("kvm", (361, 250, 243, 77, 76)),
-                ("liteinst", (361, 149, 146, 99, 98)),
-                ("sabre", (361, 144, 112, 2, 1)),
+                ("dbt", (374, 85, 26, 16, 2)),
+                ("kvm", (374, 250, 243, 77, 76)),
+                ("liteinst", (374, 149, 146, 99, 98)),
+                ("sabre", (374, 144, 112, 2, 1)),
             ]
         );
     }

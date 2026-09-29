@@ -164,33 +164,9 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/backend-parity/fixtures/input.txt",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "tests/backend-parity/fixtures/input.txt is owned by tests/backend-parity/run_matrix.py: This fixed text payload is input data for backend-parity guest cases; run_matrix.py supplies it to compiled guests and compares backend results, so the data file is not executable."
-    },
-    {
-      "disposition": "guest-fixture",
       "path": "tests/backend-parity/fixtures/mountinfo_device_identity.c",
       "runner": "hermit-cli/tests/kvm_harder.rs",
       "why": "tests/backend-parity/fixtures/mountinfo_device_identity.c is owned by hermit-cli/tests/kvm_harder.rs: The KVM integration suite compiles this focused guest and checks deterministic mountinfo device identities through its backend-specific execution contract; it is not a standalone manifest program."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/backend-parity/fixtures/sigaction_state.c",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "tests/backend-parity/fixtures/sigaction_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaction(2) handler installation and SA_* flag round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/backend-parity/fixtures/sigaltstack_state.c",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "tests/backend-parity/fixtures/sigaltstack_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaltstack(2) alternate signal-stack install/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
-    },
-    {
-      "disposition": "guest-fixture",
-      "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
     },
     {
       "disposition": "support-data",
@@ -470,9 +446,15 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/dbt_wait_accounting.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/dbt_wait_accounting.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Wrapper that runs the --accounting-only mode of dbt_wait_lifecycle.c as its own program so the mode has its own verify cells and exact stdout golden"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/dbt_wait_lifecycle.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbt_wait_lifecycle.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/dbt_wait_lifecycle.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for wait4/waitid accounting and SIGCHLD handler delivery; the manifest selects its ptrace, LiteInst and DBT verify cells with an exact stdout golden"
     },
     {
       "disposition": "manifest-test",
@@ -992,6 +974,18 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/mmap_determinism_heap.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/mmap_determinism_heap.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Wrapper that runs the heap-growth scenario of mmap_determinism.c as its own program so the scenario has its own verify cells and success marker"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/mmap_determinism_shared.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/mmap_determinism_shared.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Wrapper that runs the shared-anonymous-mapping scenario of mmap_determinism.c as its own program so the scenario has its own verify cells and success marker"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/mmap_layout_pointer_order.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/mmap_layout_pointer_order.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1430,6 +1424,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/random_sources_root_only.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/random_sources_root_only.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Wrapper that runs the --root-only mode of random_sources.c as its own program so the root random stream has one exact stdout golden shared by the ptrace and DBT verify cells"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/rcx_canonicalization.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/rcx_canonicalization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1700,6 +1700,18 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/sigaction_state.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/sigaction_state.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for sigaction(2) handler installation and SA_* flag round-tripping, verified with an exact stdout golden"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/sigaltstack_state.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/sigaltstack_state.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for sigaltstack(2) install and query round-tripping, verified with an exact stdout golden"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/sigmask_preemption.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sigmask_preemption.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -1717,10 +1729,10 @@
       "why": "tests/c/signal_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "guest-fixture",
+      "disposition": "manifest-test",
       "path": "tests/c/signal_disposition.c",
-      "runner": "tests/backend-parity/run_matrix.py",
-      "why": "tests/c/signal_disposition.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic signal disposition inheritance (SIG_DFL/SIG_IGN and pending-signal state) as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBT/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/signal_disposition.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for signal disposition inheritance (SIG_DFL, SIG_IGN and pending-signal state), verified with an exact stdout golden"
     },
     {
       "disposition": "manifest-test",
@@ -1739,6 +1751,12 @@
       "path": "tests/c/sigpipe_siginfo.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sigpipe_siginfo.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/sigprocmask_state.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/sigprocmask_state.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for sigprocmask(2) block, unblock and query round-tripping, verified with an exact stdout golden"
     },
     {
       "disposition": "manifest-test",
@@ -3155,6 +3173,12 @@
       "path": "tests/e2e/system-utils/auxv-loader-dump.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/auxv-loader-dump.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/system-utils/cat-file-read-input.txt",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
+      "why": "tests/e2e/system-utils/cat-file-read-input.txt is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: Fixed text input for the system-utils/cat-file-read cell, whose exact stdout golden is this file's content; the data file is not executable."
     },
     {
       "disposition": "manifest-test",

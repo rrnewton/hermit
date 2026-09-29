@@ -71,6 +71,38 @@ pub const IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT: usize = 1;
 pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74bc4bf5c7bf1";
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
+/// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
+/// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
+/// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
+/// 13 tests it declared, and the DBT and ptrace custom cells of
+/// `c-programs/io-uring-fallback`.
+///
+/// Each of the 41 passed twice through `test-harness run` on the
+/// `hermit-strict` binary built from the evidence SHA (binary_sha256
+/// 037ad220fb4928cea94d79b0f77020001cb6140bf1feb3e929e28bfd9fce2560) with the
+/// S13 manifests: once in the repository working directory and once in the
+/// isolated `/test` working directory inside a rootless user and mount
+/// namespace. The largest of the 82 samples took 1537 ms of wall time and
+/// 1062 ms of CPU time, so the ordinary 22 s CPU and 57 s wall bounds cover
+/// them without an override.
+pub const DBT_MATRIX_2026_09_29_EVIDENCE_SHA: &str = "12371d6cbf8a56c69175baea5baeb7507ca7e9cf";
+pub const DBT_MATRIX_2026_09_29_EVIDENCE_COMPLETED_UTC: &str = "2026-09-29T06:09:53Z";
+pub const DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT: usize = 41;
+pub const DBT_MATRIX_2026_09_29_MAX_MEASURED_CPU_MILLIS: u64 = 1062;
+pub const DBT_MATRIX_2026_09_29_MAX_MEASURED_WALL_MILLIS: u64 = 1537;
+/// Three of those DBT verify cells were already enabled with `ci: false` before
+/// S13, so they leave the enabled-but-unselected census.
+pub const DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS: [&str; 3] = [
+    "c-programs/listmount-enosys",
+    "c-programs/process-vm-readv-refusal-probe",
+    "c-programs/process-vm-writev-refusal-probe",
+];
+/// S13 also enabled one DBT verify cell with `ci: false`, so it joins that
+/// census: `c-programs/io-uring-fallback` fails DBT verification because of
+/// <https://github.com/rrnewton/reverie/issues/764>, and its custom DBT cell
+/// carries the matrix case instead.
+pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
+    ["c-programs/io-uring-fallback"];
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1877,6 +1909,25 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(
+            DBT_MATRIX_2026_09_29_EVIDENCE_SHA,
+            "12371d6cbf8a56c69175baea5baeb7507ca7e9cf"
+        );
+        assert_eq!(
+            DBT_MATRIX_2026_09_29_EVIDENCE_COMPLETED_UTC,
+            "2026-09-29T06:09:53Z"
+        );
+        assert_eq!(DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT, 41);
+        const {
+            assert!(
+                DBT_MATRIX_2026_09_29_MAX_MEASURED_CPU_MILLIS
+                    < DEFAULT_TEST_CPU_TIMEOUT_SECONDS * 1000
+            );
+            assert!(
+                DBT_MATRIX_2026_09_29_MAX_MEASURED_WALL_MILLIS
+                    < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
+            );
+        }
         assert_eq!(NON_CI_CELL_COUNT, 173);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()

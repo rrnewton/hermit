@@ -4028,11 +4028,12 @@ sys.exit(1 if failed else 0)
         }
         // 15 until e2e.manifest_backend_parity_c was folded into
         // e2e.manifest_c_programs (slice S6 of
-        // https://github.com/rrnewton/hermit/issues/3301); the 192 selected
-        // cells are still each reported once.
+        // https://github.com/rrnewton/hermit/issues/3301); the selected cells
+        // are still each reported once. Slice S13 added the DBT parity cells of
+        // c-programs/cpuid-probe and c-programs/pid-probe, taking 192 to 194.
         assert_eq!(nodes, 14);
         let lines = reported.values().map(Vec::len).sum::<usize>();
-        assert_eq!((selection.len(), lines), (192, 192));
+        assert_eq!((selection.len(), lines), (194, 194));
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
             .iter()
@@ -4051,7 +4052,7 @@ sys.exit(1 if failed else 0)
             .collect::<Vec<_>>();
         assert_eq!(
             (applicable.len(), explicitly.len(), unreported.len()),
-            (604, 600, 4),
+            (628, 624, 4),
             "{unreported:?}"
         );
     }

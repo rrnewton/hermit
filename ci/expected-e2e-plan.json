@@ -6021,6 +6021,296 @@
         "cpuid-faulting"
       ],
       "test": "c-programs/cpuid-probe"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-mmap-exec"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-wait-accounting"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-wait-accounting"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-wait-lifecycle"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/madvise-determinism"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-determinism"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-determinism-heap"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-determinism-heap"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-determinism-shared"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-determinism-shared"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pid-probe"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/process-vm-readv-refusal-probe"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/process-vm-writev-refusal-probe"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/random-sources-root-only"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/random-sources-root-only"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/scheduler-policy-queries"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigaction-state"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigaction-state"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigaltstack-state"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigaltstack-state"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/signal-disposition"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/signal-disposition"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigprocmask-state"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigprocmask-state"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syscall-file-io"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syscall-file-metadata"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/cat-file-read"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/cat-file-read"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/echo-stdout"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/echo-stdout"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/printf-argument-forwarding"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/printf-argument-forwarding"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/sh-exit-status"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/sh-exit-status"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/true-exit-zero"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/true-exit-zero"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "privileged",
+      "mode": "verify",
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "c-programs/cpuid-probe"
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "custom",
+      "test": "c-programs/io-uring-fallback"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "custom",
+      "test": "c-programs/io-uring-fallback"
     }
   ],
   "schema": 1

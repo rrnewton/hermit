@@ -1268,6 +1268,8 @@ fn validate_mode_with_cpu(
             "rcb_time",
             "rcb_time_disabled_reason",
             "expected_guest_exit",
+            "expected_stdout",
+            "expected_stdout_contains",
         ]),
         _ => {}
     }
@@ -1460,6 +1462,44 @@ fn validate_mode_with_cpu(
             if args.iter().any(|argument| argument.contains('\0')) {
                 die(format!(
                     "{id}: modes.{mode}.guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
+                ));
+            }
+        }
+    }
+    if let Some(expected_stdout) = spec.get("expected_stdout") {
+        let expected_stdout = expected_stdout.as_table().unwrap_or_else(|| {
+            die(format!(
+                "{id}: modes.{mode}.expected_stdout must be a table"
+            ))
+        });
+        for (backend, text) in expected_stdout {
+            if !enabled_names.contains(backend.as_str()) {
+                die(format!(
+                    "{id}: modes.{mode}.expected_stdout.{backend} names a backend outside backends_enabled"
+                ));
+            }
+            if text.as_str().is_none() {
+                die(format!(
+                    "{id}: modes.{mode}.expected_stdout.{backend} must be a string"
+                ));
+            }
+        }
+    }
+    if let Some(contains) = spec.get("expected_stdout_contains") {
+        let contains = contains.as_table().unwrap_or_else(|| {
+            die(format!(
+                "{id}: modes.{mode}.expected_stdout_contains must be a table"
+            ))
+        });
+        for (backend, text) in contains {
+            if !enabled_names.contains(backend.as_str()) {
+                die(format!(
+                    "{id}: modes.{mode}.expected_stdout_contains.{backend} names a backend outside backends_enabled"
+                ));
+            }
+            if text.as_str().is_none_or(str::is_empty) {
+                die(format!(
+                    "{id}: modes.{mode}.expected_stdout_contains.{backend} must be a non-empty string"
                 ));
             }
         }
@@ -2452,6 +2492,156 @@ liteinst = "unsupported"
             "verify",
             90,
             &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    fn expected_stdout_mode(expected_stdout: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = false
+ci_disabled_reason = "fixture cell: ptrace only, other backends unmeasured here"
+backends_enabled = ["ptrace"]
+expected_stdout = {expected_stdout}
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#
+        ))
+    }
+
+    #[test]
+    fn accepts_verify_expected_stdout_for_an_enabled_backend() {
+        for text in [r#"{ ptrace = "ok\n" }"#, r#"{ ptrace = "" }"#] {
+            validate_mode(
+                "bucket/test",
+                "bucket",
+                "portable",
+                "verify",
+                90,
+                &expected_stdout_mode(text),
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected_stdout.dbt names a backend outside backends_enabled")]
+    fn rejects_expected_stdout_for_a_disabled_backend() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &expected_stdout_mode(r#"{ dbt = "ok\n" }"#),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected_stdout.ptrace must be a string")]
+    fn rejects_non_string_expected_stdout() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &expected_stdout_mode("{ ptrace = 7 }"),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket/test.modes.chaos: unknown keys: [\"expected_stdout\"]")]
+    fn rejects_expected_stdout_outside_verify() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "chaos",
+            90,
+            &expected_stdout_mode(r#"{ ptrace = "ok\n" }"#),
+            &mut Vec::new(),
+        );
+    }
+
+    fn expected_stdout_contains_mode(contains: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = false
+ci_disabled_reason = "fixture cell: ptrace only, other backends unmeasured here"
+backends_enabled = ["ptrace"]
+expected_stdout_contains = {contains}
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#
+        ))
+    }
+
+    #[test]
+    fn accepts_verify_expected_stdout_contains_for_an_enabled_backend() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &expected_stdout_contains_mode(r#"{ ptrace = "heap " }"#),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "expected_stdout_contains.dbt names a backend outside backends_enabled"
+    )]
+    fn rejects_expected_stdout_contains_for_a_disabled_backend() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &expected_stdout_contains_mode(r#"{ dbt = "heap " }"#),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected_stdout_contains.ptrace must be a non-empty string")]
+    fn rejects_empty_expected_stdout_contains() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &expected_stdout_contains_mode(r#"{ ptrace = "" }"#),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "bucket/test.modes.replay: unknown keys: [\"expected_stdout_contains\"]"
+    )]
+    fn rejects_expected_stdout_contains_outside_verify() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "replay",
+            90,
+            &expected_stdout_contains_mode(r#"{ ptrace = "heap " }"#),
             &mut Vec::new(),
         );
     }

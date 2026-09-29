@@ -241,7 +241,31 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // e8007f971a7 adds relative_artifacts_and_hermit_paths_are_still_measured
     // and ad21724d5f6 adds only_a_program_name_without_a_slash_is_left_for_path;
     // both retain all 664 prior identities (`cargo nextest list` measured 666).
-    ("test.regular_crates", 676),
+    // 7ce5e3b6bc6 counts ten backend-parity-c fold tests (measured 676).
+    // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 adds 18
+    // hermit-manifest-plan tests and retains all 676 prior identities
+    // (`cargo nextest list --profile ci -p hermit-manifest-plan` measured 490
+    // at 5d07fdfcd76 and 508 with this change; no other selected crate changed):
+    // runner.rs lib:
+    //   expected_stdout_cannot_pass_a_diverged_comparison_or_failed_status,
+    //   expected_stdout_contains_cannot_pass_a_diverged_or_failed_run,
+    //   expected_stdout_contains_declarations_are_verify_only_and_non_empty,
+    //   expected_stdout_contains_requires_the_marker_in_the_compared_stdout,
+    //   expected_stdout_declarations_are_verify_only_and_name_enabled_backends,
+    //   expected_stdout_names_the_run_that_differs,
+    //   expected_stdout_passes_only_when_both_runs_print_it,
+    //   expected_stdout_without_compared_outputs_is_never_a_pass,
+    //   only_a_verify_cell_reads_its_own_backends_expected_stdout,
+    //   only_a_verify_cell_reads_its_own_backends_expected_stdout_contains;
+    // main.rs bin: accepts_verify_expected_stdout_contains_for_an_enabled_backend,
+    //   accepts_verify_expected_stdout_for_an_enabled_backend,
+    //   rejects_empty_expected_stdout_contains,
+    //   rejects_expected_stdout_contains_for_a_disabled_backend,
+    //   rejects_expected_stdout_contains_outside_verify,
+    //   rejects_expected_stdout_for_a_disabled_backend,
+    //   rejects_expected_stdout_outside_verify,
+    //   rejects_non_string_expected_stdout.
+    ("test.regular_crates", 694),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -337,7 +361,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 676),
+    ("test.regular_crates_on_host", 694),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

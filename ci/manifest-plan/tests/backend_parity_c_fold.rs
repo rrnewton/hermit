@@ -18,11 +18,12 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan still selects 859 cells, 855 portable and 4
+//! 2. The committed CI plan selects 900 cells, 895 portable and 5
 //!    privileged, with per-(lane, backend, mode) counts equal to the pre-fold
-//!    plan's.
-//! 3. The committed compatibility cell table still has 5776 rows with
-//!    per-(backend, mode, status) counts equal to the pre-fold table's.
+//!    plan's plus exactly the cells slice S13 added.
+//! 3. The committed compatibility cell table has 5984 rows with
+//!    per-(backend, mode, status) counts equal to the pre-fold table's plus
+//!    exactly the rows slice S13 added or reclassified.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -31,7 +32,10 @@
 //! 3f66a249b30fada86b81e722b8e5439ac0789f8e, the last commit that declared
 //! backend-parity-c; the plan, the cell table and both manifests are
 //! byte-identical at the two commits. A later change that moves a count has to
-//! change this file and say why.
+//! change this file and say why. Slice S13 of the same issue is the one such
+//! change so far: it moved the retired DBT backend-parity matrix onto manifest
+//! cells, and its counts are listed separately below so the pre-fold snapshot
+//! stays byte-for-byte what was measured.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -72,6 +76,26 @@ const PLAN_COUNTS: &[(&str, &str, &str, usize)] = &[
     ("privileged", "ptrace", "verify", 1),
 ];
 
+/// Plan cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301>
+/// added when it replaced `tests/backend-parity/run_matrix.py --backend dbt`
+/// with manifest cells. Each of the 27 matrix cases that passed on DBT now has
+/// a CI-selected DBT cell. 26 are verify cells: 25 portable, and
+/// `c-programs/cpuid-probe`, whose test is in the privileged lane. The
+/// remaining case, `c-programs/io-uring-fallback`, fails DBT verification
+/// because of <https://github.com/rrnewton/reverie/issues/764>, so its DBT
+/// verify cell stays enabled but unselected (red). A custom-mode cell carries
+/// the matrix's plain `--strict` run on DBT instead, and the ptrace custom cell
+/// that the matrix-symmetry rule requires comes with it. The 13 tests S13
+/// declared for matrix cases that had no manifest test also carry a ptrace
+/// verify cell against the same expected stdout. Nothing else moved.
+const S13_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[
+    ("portable", "dbt", "custom", 1),
+    ("portable", "dbt", "verify", 25),
+    ("portable", "ptrace", "custom", 1),
+    ("portable", "ptrace", "verify", 13),
+    ("privileged", "dbt", "verify", 1),
+];
+
 /// Pre-fold `ci/compat-envelope/cells.json` rows per (backend, mode, status).
 const CELL_COUNTS: &[(&str, &str, &str, usize)] = &[
     ("dbt", "chaos", "not-applicable", 361),
@@ -103,6 +127,36 @@ const CELL_COUNTS: &[(&str, &str, &str, usize)] = &[
     ("sabre", "verify", "green", 112),
     ("sabre", "verify", "not-applicable", 217),
     ("sabre", "verify", "red", 32),
+];
+
+/// Rows slice S13 changed in `ci/compat-envelope/cells.json`, per (backend,
+/// mode, status). The 13 tests it declared add 16 rows each (208). The DBT
+/// verify rows are 26 newly selected cells (13 from the new tests, 10 existing
+/// tests whose DBT verify was disabled and so not applicable, and 3 whose DBT
+/// verify was enabled but not selected and so red), plus
+/// `c-programs/io-uring-fallback`, whose DBT verify moved from disabled (not
+/// applicable) to enabled but unselected (red). Each new test's ptrace verify
+/// row is selected; its other rows are not applicable. The table has no rows
+/// for custom mode, so the two io-uring-fallback custom cells do not appear.
+const S13_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("dbt", "chaos", "not-applicable", 13),
+    ("dbt", "replay", "not-applicable", 13),
+    ("dbt", "verify", "green", 26),
+    ("dbt", "verify", "not-applicable", -11),
+    ("dbt", "verify", "red", -2),
+    ("kvm", "chaos", "not-applicable", 13),
+    ("kvm", "replay", "not-applicable", 13),
+    ("kvm", "verify", "not-applicable", 13),
+    ("liteinst", "chaos", "not-applicable", 13),
+    ("liteinst", "replay", "not-applicable", 13),
+    ("liteinst", "verify", "not-applicable", 13),
+    ("native", "naked", "not-applicable", 13),
+    ("ptrace", "chaos", "not-applicable", 13),
+    ("ptrace", "replay", "not-applicable", 13),
+    ("ptrace", "verify", "green", 13),
+    ("sabre", "chaos", "not-applicable", 13),
+    ("sabre", "replay", "not-applicable", 13),
+    ("sabre", "verify", "not-applicable", 13),
 ];
 
 fn repo_root() -> PathBuf {
@@ -326,7 +380,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     let lane = |name: &str| cells.iter().filter(|c| field(c, "lane") == name).count();
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
-        (859, 855, 4)
+        (900, 895, 5)
     );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for cell in cells {
@@ -337,13 +391,19 @@ fn the_committed_plan_keeps_its_cell_counts() {
         );
         *counts.entry(key).or_default() += 1;
     }
-    let expected = PLAN_COUNTS
+    let mut expected = PLAN_COUNTS
         .iter()
         .map(|&(lane, backend, mode, n)| ((lane.into(), backend.into(), mode.into()), n))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<BTreeMap<(String, String, String), _>>();
+    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS {
+        *expected
+            .entry((lane.into(), backend.into(), mode.into()))
+            .or_default() += n;
+    }
     assert_eq!(counts, expected);
     // The folded cells now belong to c-programs: 437 portable c-programs cells
-    // and 276 portable plus 3 privileged backend-parity-c cells before the fold.
+    // and 276 portable plus 3 privileged backend-parity-c cells before the fold,
+    // plus the 29 portable and 1 privileged c-programs cells S13 added.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -362,8 +422,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         by_bucket,
         BTreeMap::from([
-            (("portable".into(), "c-programs".into()), 437 + 276),
-            (("privileged".into(), "c-programs".into()), 3),
+            (("portable".into(), "c-programs".into()), 437 + 276 + 29),
+            (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
     );
 }
@@ -372,7 +432,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
 fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
-    assert_eq!(rows.len(), 5776);
+    assert_eq!(rows.len(), 5776 + 208);
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
         assert_ne!(field(row, "category"), RETIRED_BUCKET, "{row}");
@@ -387,10 +447,19 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         );
         *counts.entry(key).or_default() += 1;
     }
-    let expected = CELL_COUNTS
+    let mut expected = CELL_COUNTS
         .iter()
         .map(|&(backend, mode, status, n)| ((backend.into(), mode.into(), status.into()), n))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<BTreeMap<(String, String, String), usize>>();
+    for &(backend, mode, status, delta) in S13_CELL_DELTAS {
+        let count = expected
+            .entry((backend.into(), mode.into(), status.into()))
+            .or_default();
+        *count = count
+            .checked_add_signed(delta)
+            .unwrap_or_else(|| panic!("S13 delta {delta} underflows {backend}/{mode}/{status}"));
+    }
+    expected.retain(|_, count| *count != 0);
     assert_eq!(counts, expected);
 }
 
