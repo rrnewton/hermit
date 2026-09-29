@@ -4198,9 +4198,7 @@ fn run_cell_inner(
     let timeouts = cell_timeouts(context, cell)?;
     let preparation_deadline =
         execution_deadline_after_preparation(started, timeouts.wall_seconds)?;
-    let binary_before = fs::read(&context.hermit_bin)
-        .ok()
-        .map(|bytes| hex_digest(&bytes));
+    let binary_before = file_digest(&context.hermit_bin);
     let (guest, preparation_cpu_usage_usec) = prepare_test_until(
         context,
         cell,
@@ -4510,9 +4508,7 @@ fn run_cell_inner(
         .map(|attempt| attempt.shell_command.clone())
         .unwrap_or_default();
     let test_sha = test_digest(&context.root, &cell.test)?;
-    let binary_sha = fs::read(&context.hermit_bin)
-        .ok()
-        .map(|bytes| hex_digest(&bytes));
+    let binary_sha = file_digest(&context.hermit_bin);
     if binary_before.is_some() && binary_before != binary_sha {
         outcome = "ERROR".into();
         error_kind = Some("infrastructure".into());
@@ -4622,9 +4618,7 @@ pub fn infrastructure_error_result(
         hermit_sha: context.source_sha.clone(),
         binary_build_sha: context.binary_build_sha.clone(),
         source_tree_dirty: context.source_dirty,
-        binary_sha256: fs::read(&context.hermit_bin)
-            .ok()
-            .map(|bytes| hex_digest(&bytes)),
+        binary_sha256: file_digest(&context.hermit_bin),
         test_sha256: test_digest(&context.root, &cell.test).unwrap_or_default(),
         test: cell.id.test.clone(),
         category: cell.category.clone(),
@@ -5296,6 +5290,17 @@ fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
 fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+/// The SHA-256 of the file at `path`, or `None` when it cannot be read.
+/// It streams the file rather than reading it whole: every cell hashes the
+/// Hermit binary three times, and a debug Hermit is about 450 MB, so
+/// `fs::read` held that much per concurrently running cell.
+fn file_digest(path: &Path) -> Option<String> {
+    let mut digest = Sha256::new();
+    std::io::copy(&mut fs::File::open(path).ok()?, &mut digest).ok()?;
+    Some(format!("{:x}", digest.finalize()))
+}
+
 fn xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -5469,6 +5474,22 @@ mod tests {
             failed.contains("exited 1") && failed.contains("refusing to guess"),
             "the refusal must name the exit status, got: {failed}",
         );
+    }
+
+    /// The streamed binary digest is the digest of the whole file, across
+    /// many read buffers, and an unreadable path has none, as `fs::read`
+    /// gave before.
+    #[test]
+    fn file_digest_matches_a_whole_file_digest() {
+        let root = std::env::temp_dir().join(format!("file-digest-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("binary");
+        let bytes = (0..300_000u32).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(file_digest(&path), Some(hex_digest(&bytes)));
+        assert_eq!(file_digest(&root.join("missing")), None);
+        assert_eq!(file_digest(&root), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
