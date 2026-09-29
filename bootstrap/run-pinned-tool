@@ -39,33 +39,45 @@ target_dir=$cache_root/target/$tool-$revision
 binary=$target_dir/release/$tool
 
 if [[ ! -x $binary ]]; then
-  command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
-  command -v rustup >/dev/null || { echo "rustup is required" >&2; exit 1; }
+  # The cache checkout and its build are named by path. Git exports GIT_DIR,
+  # GIT_WORK_TREE and GIT_INDEX_FILE to hooks and `git rebase --exec` steps, and
+  # they override `git -C`: under an inherited GIT_DIR the `git init`, `fetch`
+  # and `checkout --detach` below would act on the caller's repository instead
+  # (https://github.com/rrnewton/hermit/issues/3362). The subshell drops them for
+  # the cache-miss work only; the tool itself still runs with the caller's
+  # environment.
+  (
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+      GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 
-  mkdir -p "$cache_root/source" "$cache_root/target"
-  if [[ ! -d $source_dir/.git ]]; then
-    mkdir -p "$source_dir"
-    git -C "$source_dir" init
-    git -C "$source_dir" remote add origin "$repository"
-  fi
-  git -C "$source_dir" fetch --depth 1 origin "$revision"
-  git -C "$source_dir" checkout --detach FETCH_HEAD
-  actual_revision=$(git -C "$source_dir" rev-parse HEAD)
-  if [[ $actual_revision != "$revision" ]]; then
-    echo "expected $tool revision $revision, got $actual_revision" >&2
-    exit 1
-  fi
+    command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+    command -v rustup >/dev/null || { echo "rustup is required" >&2; exit 1; }
 
-  if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1; then
-    rustup toolchain install "$toolchain" --profile minimal
-  fi
+    mkdir -p "$cache_root/source" "$cache_root/target"
+    if [[ ! -d $source_dir/.git ]]; then
+      mkdir -p "$source_dir"
+      git -C "$source_dir" init
+      git -C "$source_dir" remote add origin "$repository"
+    fi
+    git -C "$source_dir" fetch --depth 1 origin "$revision"
+    git -C "$source_dir" checkout --detach FETCH_HEAD
+    actual_revision=$(git -C "$source_dir" rev-parse HEAD)
+    if [[ $actual_revision != "$revision" ]]; then
+      echo "expected $tool revision $revision, got $actual_revision" >&2
+      exit 1
+    fi
 
-  CARGO_TARGET_DIR=$target_dir \
-    rustup run "$toolchain" cargo build \
-      --locked \
-      --release \
-      --manifest-path "$source_dir/Cargo.toml" \
-      --bin "$tool"
+    if ! rustup run "$toolchain" rustc --version >/dev/null 2>&1; then
+      rustup toolchain install "$toolchain" --profile minimal
+    fi
+
+    CARGO_TARGET_DIR=$target_dir \
+      rustup run "$toolchain" cargo build \
+        --locked \
+        --release \
+        --manifest-path "$source_dir/Cargo.toml" \
+        --bin "$tool"
+  )
 fi
 
 exec "$binary" "$@"
