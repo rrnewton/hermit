@@ -3122,19 +3122,13 @@ report.write_bytes((root/'verification.json').read_bytes())
             "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest";
         const SELECT: &str = "parity/alpha@dbt,parity/alpha@kvm,parity/alpha@liteinst,\
                               parity/beta@kvm,parity/beta@liteinst";
-        let real_root = || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap()
-        };
         if let Some(fixture) = std::env::var_os(CHILD) {
             let fixture = PathBuf::from(fixture);
             let out = PathBuf::from(std::env::var_os(OUT).unwrap());
             let manifests = ManifestSet::load(&fixture).unwrap();
             let code = if let Some(cells) = std::env::var_os(COMPARE) {
                 super::parity_compare(
-                    &real_root(),
+                    &fixture,
                     &manifests,
                     &super::ParityCompareRequest {
                         artifacts: out.clone(),
@@ -3163,7 +3157,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 ];
                 let args = parse(values.into_iter());
                 validate_args("run", &args);
-                super::run(&real_root(), &manifests, &args)
+                super::run(&fixture, &manifests, &args)
             };
             fs::write(out.join("exit"), format!("{code:?}")).unwrap();
             return;
@@ -3177,6 +3171,41 @@ report.write_bytes((root/'verification.json').read_bytes())
         let _ = fs::remove_dir_all(&fixture);
         let manifests = fixture.join("tests/e2e/manifests");
         fs::create_dir_all(&manifests).unwrap();
+        // The fixture is the checkout every child runs the harness in: a git
+        // repository with one empty commit, so each child's provenance probe
+        // (`git rev-parse HEAD`, `git status`) has no tracked file to stat.
+        // Run in the real checkout, `git status` stats every tracked file,
+        // agent-utils' included, once per child. `maintenance.auto=false`
+        // stops the commit from leaving a detached `git maintenance run
+        // --auto` behind, holding a lock inside the fixture that this test
+        // removes at the end.
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "maintenance.auto=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&fixture)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
         fs::write(
             manifests.join("defaults.yaml"),
             "schema: 3\ntimeout_seconds: 10\ncpu_timeout_seconds: 5\n",
@@ -3258,37 +3287,46 @@ report.write_bytes((root/'verification.json').read_bytes())
         // parity/beta's liteinst cell fails determinism unless it has `pass`,
         // and `mutated` changes every candidate's second detcore message.
         let hermit = fixture.join("hermit");
+        // This fake starts about 150 times per test run, so it imports only
+        // `os`. `-IS` skips the site-packages scan at every start, the
+        // `--help` and version probes exit before any import, and each
+        // invocation record is written as the literal line `json.dumps`
+        // produces for it: the cell directory names are ASCII slugs with no
+        // quote or backslash. Importing json and pathlib cost more than the
+        // rest of the script. The log-diff stand-in starts with `-IS` too.
         fs::write(
             &hermit,
-            r#"#!/usr/bin/python3
-import json,os,pathlib,sys
-root=pathlib.Path(__file__).resolve().parent
+            r#"#!/usr/bin/python3 -IS
+import sys
 a=sys.argv[1:]
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
 if 'run' in a:a=a[a.index('run'):]
 if not a or a[0] not in ('run','log-diff'):sys.exit(0)
-def record(value):
- with (root/'invocations').open('a') as f:f.write(json.dumps(value)+'\n')
+import os
+root=os.path.dirname(os.path.realpath(__file__))
+def record(line):
+ with open(os.path.join(root,'invocations'),'a') as f:f.write(line+'\n')
 if a[0]=='log-diff':
  if len(a)==2:
-  record({'kind':'normalize'});sys.stdout.buffer.write(pathlib.Path(a[1]).read_bytes());sys.exit(0)
- record({'kind':'compare'})
- os.execv(sys.executable,[sys.executable,str(root/'fake-parity-log-diff.py')]+a)
+  record('{"kind": "normalize"}');sys.stdout.buffer.write(open(a[1],'rb').read());sys.exit(0)
+ record('{"kind": "compare"}')
+ os.execv(sys.executable,[sys.executable,'-IS',os.path.join(root,'fake-parity-log-diff.py')]+a)
 backend=a[a.index('--backend')+1]
-report=pathlib.Path(a[a.index('--verify-json')+1])
-cell=report.parent.name
-record({'kind':'run','cell':cell})
-scenario=(root/'scenario').read_text().split()
+report=a[a.index('--verify-json')+1]
+cell=os.path.basename(os.path.dirname(report))
+record('{"kind": "run", "cell": "%s"}'%cell)
+scenario=open(os.path.join(root,'scenario')).read().split()
 assert '--verify-strict' in a and '--verify' in a,a
 if '--verify-log-dir' in a:
- logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
- logdir.mkdir(parents=True,exist_ok=True)
+ logdir=a[a.index('--verify-log-dir')+1]
+ os.makedirs(logdir,exist_ok=True)
  mutated='mutated' in scenario and backend!='ptrace'
  read='read 4 on '+backend if mutated else 'read 3'
- (logdir/'run1_log_fixture.log').write_text('INFO detcore: open\nINFO detcore: '+read+'\nINFO detcore: exit 0\n')
+ with open(os.path.join(logdir,'run1_log_fixture.log'),'w') as f:f.write('INFO detcore: open\nINFO detcore: '+read+'\nINFO detcore: exit 0\n')
 failed=cell.startswith('parity-beta-verify-liteinst') and 'pass' not in scenario
-report.write_bytes((root/('verification-diverged.json' if failed else 'verification-matched.json')).read_bytes())
+data=open(os.path.join(root,'verification-diverged.json' if failed else 'verification-matched.json'),'rb').read()
+with open(report,'wb') as f:f.write(data)
 sys.exit(1 if failed else 0)
 "#,
         )

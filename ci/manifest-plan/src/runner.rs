@@ -5295,8 +5295,12 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
-    file.write_all(b"\n").map_err(|e| e.to_string())?;
+    // Serialize the row in memory and append it, newline included, in one
+    // write. Serializing straight into the unbuffered file made one write(2)
+    // per JSON token, about 2,000 for each row.
+    let mut row = serde_json::to_vec(result).map_err(|e| e.to_string())?;
+    row.push(b'\n');
+    file.write_all(&row).map_err(|e| e.to_string())?;
     // The bucket runner publishes each completed cell before printing its
     // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
     // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
