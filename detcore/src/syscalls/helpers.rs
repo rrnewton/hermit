@@ -1614,8 +1614,9 @@ where
 /// blockable signal is blocked for the rest of the wait, so later probes cannot be
 /// stopped by one and every signal that arrives stays pending in the kernel, where
 /// `/proc` reports it. Each turn classifies the pending set against the guest's
-/// saved mask and dispositions. The guest's mask is restored before returning, so a
-/// pending interrupting signal is delivered as the call returns its restart errno.
+/// mask and dispositions, and an interrupting signal ends the wait with the call's
+/// restart errno (see `KernelSignalWait::interrupted`). The guest's mask is
+/// restored before returning, so the signal is delivered as the call returns.
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
     guest: &mut G,
     call0: C,
@@ -1635,9 +1636,10 @@ where
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let _ = resource_request(guest, rsrc.clone()).await;
-        match signals.pending_interruption(call0.kernel_restart_errno()) {
-            Ok(None) => {}
-            Ok(Some(errno)) => {
+        match signals.interrupted() {
+            Ok(false) => {}
+            Ok(true) => {
+                let errno = call0.kernel_restart_errno();
                 tracing::trace!(
                     "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
                     call.display(&guest.memory()),
@@ -1692,15 +1694,17 @@ where
                 break timeout_result.map_err(|e| e.into());
             }
             tracing::trace!(
-                "Retry #{} for syscall, {} from timeout: {}",
+                "Retry #{} for syscall due to result {:?}, {} from timeout: {}",
                 rsrc.poll_attempt,
+                syscall_result,
                 timeout - new_time,
                 call.display(&guest.memory())
             );
         } else {
             tracing::trace!(
-                "Retry #{} for syscall: {}",
+                "Retry #{} for syscall due to result {:?}: {}",
                 rsrc.poll_attempt,
+                syscall_result,
                 call.display(&guest.memory())
             );
         }
@@ -1724,19 +1728,21 @@ where
 /// The first probe runs under the guest's own mask. If it would block, `block`
 /// blocks every blockable signal for the rest of the wait, so later probes cannot
 /// be stopped by one and every signal that arrives stays pending in the kernel,
-/// where `/proc` reports it. `pending_interruption` classifies the pending set
-/// against the guest's saved mask and dispositions each turn, and `restore` puts
-/// the guest's mask back before the call returns, so a pending interrupting
-/// signal is delivered as the call returns its restart errno.
+/// where `/proc` reports it. `interrupted` classifies the pending set against the
+/// guest's mask and dispositions each turn, and `restore` puts the guest's mask
+/// back before the call returns, so a pending interrupting signal is delivered as
+/// the call returns its restart errno.
 ///
 /// Probes use a plain `inject`, never `inject_with_retry`: a signal that stops the
 /// guest around a probe is dequeued from the kernel and held by the backend, and a
-/// retry that is stopped again would replace it. Before the mask is set such a
-/// signal arrived before the wait blocked; afterwards only an unblockable one can
-/// stop the probe. Either way the caller restarts the call (`ERESTARTNOINTR`)
-/// after the backend delivers it. A stop after the probe ran replaces its result,
-/// so a probe that consumed something (an edge-triggered event, a dequeued
-/// signal) loses it; that remains a known gap.
+/// retry that is stopped again would replace it. Before the mask is set only a
+/// signal that arrived after the turn's `/proc` read can do that; afterwards only
+/// an unblockable one can. Either way the caller restarts the call
+/// (`ERESTARTNOINTR`) after the backend delivers it. Injecting the mask change
+/// itself is stopped the same way, which is why a signal found pending before the
+/// mask is set ends the wait without another probe. A stop after the probe ran
+/// replaces its result, so a probe that consumed something (an edge-triggered
+/// event, a dequeued signal) loses it; that remains a known gap.
 pub(crate) struct KernelSignalWait {
     pid: reverie::Pid,
     tid: reverie::Pid,
@@ -1766,30 +1772,24 @@ impl KernelSignalWait {
         self.saved_mask.is_some()
     }
 
-    /// The errno that ends the wait for a pending interrupting signal, if any. Before
-    /// the wait has blocked, the signal is delivered first and the call then runs
-    /// again, as if it had arrived just before the call; afterwards the call returns
-    /// its kernel `restart_errno`.
-    pub(crate) fn pending_interruption(
-        &self,
-        restart_errno: Errno,
-    ) -> Result<Option<Errno>, Errno> {
+    /// Whether a signal that would end the wait natively is pending, in which case
+    /// the caller returns the call's restart errno. The guest thread has been
+    /// stopped inside the call since it was intercepted, so such a signal arrived
+    /// while the call was waiting, and Linux returns the restart errno for that.
+    /// Linux would still report sources that were ready when the call began, which
+    /// this check puts behind the signal, as the scheduler's `Signaled` path did.
+    pub(crate) fn interrupted(&self) -> Result<bool, Errno> {
         let state = read_kernel_signal_state(self.pid, self.tid)?;
         let guest_mask = self.saved_mask.unwrap_or(state.blocked);
         let interrupting = state.pending_interrupting(guest_mask) & !self.consumed;
-        if interrupting == 0 {
-            return Ok(None);
+        if interrupting != 0 {
+            tracing::trace!(
+                "[tid {}] pending signals {:#x} interrupt a blocking wait",
+                self.tid,
+                interrupting
+            );
         }
-        tracing::trace!(
-            "[tid {}] pending signals {:#x} interrupt a blocking wait",
-            self.tid,
-            interrupting
-        );
-        Ok(Some(if self.is_blocking() {
-            restart_errno
-        } else {
-            Errno::ERESTARTNOINTR
-        }))
+        Ok(interrupting != 0)
     }
 
     /// Block every blockable signal for the rest of the wait. `scratch` is a guest
