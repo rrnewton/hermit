@@ -25,7 +25,6 @@ cppc_feedback_determinism	none-recorded	No reason was recorded when this binary 
 cpuidle_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 dbt_copied_tty	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 dentry_state_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-external_signal_interrupt	measured-green-pending-registration	Measured 2026-09-28 on hermit@fdd8f55a8e plus the https://github.com/rrnewton/hermit/issues/3146 fix: 10 tests, 10 pass, 19s (ptrace and liteinst). Green; belongs in the DAG pending a memory sample for its hint block.
 flock_exclusion	fails-today-defect-filed	Measured 2026-08-26 on hermit@a787a547ea: 24 tests, 23 pass, 1 FAIL in 6.4s. contended_blocking_upgrade_is_fail_closed_under_strict observes Some(125) where it requires Some(1). Product defect, task a_guest_that_exits. Registering before the fix would make this a standing red.
 frontier_app_benchmarks	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 full_summary_futex_order	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 1 test, 1 pass, 0.3s. Green and effectively free; belongs in the DAG pending a memory sample for its hint block.
