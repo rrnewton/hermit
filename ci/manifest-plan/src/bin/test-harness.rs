@@ -509,7 +509,7 @@ fn build_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
 /// closed to serial execution.
 ///
 /// Since 2026-09-29 the five tool self-tests run as their own `selftest.<name>`
-/// DAG nodes (https://github.com/rrnewton/hermit/issues/3381), so `validate`
+/// DAG nodes (<https://github.com/rrnewton/hermit/issues/3381>), so `validate`
 /// schedules only `generate-test-footprints --check` here and this width no
 /// longer changes what the gate spends. The history above explains the value
 /// and is kept for the audits that may be added back.

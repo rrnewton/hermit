@@ -6,7 +6,7 @@
 //! repository acts on the caller's repository instead. In a scratch fixture
 //! that means `git init` rewrites the caller's `core.bare` and a fixture commit
 //! moves the caller's HEAD. That is what happened in
-//! https://github.com/rrnewton/hermit/issues/3362, when a rebase step ran this
+//! <https://github.com/rrnewton/hermit/issues/3362>, when a rebase step ran this
 //! crate's tests.
 //!
 //! Only the location variables are removed. `GIT_CONFIG_COUNT` and its
