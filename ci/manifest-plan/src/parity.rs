@@ -38,14 +38,17 @@
 //! <https://github.com/rrnewton/hermit/issues/3301>.
 //!
 //! Equal inputs. The ptrace and candidate cells of one test run from
-//! different cell directories, so today their guests see different HOME,
-//! fixture and program paths, and those paths alone make ptrace diverge from
-//! ptrace. Every [`ParityRecord`] therefore says whether the two runs were
-//! given equal inputs, and credit from a comparison whose inputs were not
-//! equalized is reported apart from clean credit (see
-//! [`ParityRecord::unequalized_credit`]). A backend that cannot be given the
-//! reference's inputs at all reports [`ParityVerdict::InputsNotEqualized`]
-//! instead of credit.
+//! different cell directories, and handing their guests those host paths
+//! gives them different HOME, fixture and program paths, which alone make
+//! ptrace diverge from ptrace. The runner therefore binds each verify cell's
+//! input directories to the same guest paths below
+//! [`crate::runner::EQUALIZED_INPUT_ROOT`] and names only those paths to the
+//! guest. Every [`ParityRecord`] says whether the two runs were given equal
+//! inputs, decided from how both were launched ([`inputs_equalized`]), and
+//! credit from a comparison whose inputs were not equalized is reported apart
+//! from clean credit (see [`ParityRecord::unequalized_credit`]). A backend
+//! that cannot be given the reference's inputs at all reports
+//! [`ParityVerdict::InputsNotEqualized`] instead of credit.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -74,6 +77,7 @@ use crate::ci_selection::CiSelection;
 use crate::logdiff_report::LogDiffReport;
 use crate::logdiff_report::LogDiffVerdict;
 use crate::runner::CellResult;
+use crate::runner::EQUALIZED_INPUTS;
 use crate::runner::ManifestSet;
 use crate::runner::ModeRecipe;
 use crate::runner::Population;
@@ -471,9 +475,12 @@ pub struct ParityRecord {
     pub backend: ParityBackend,
     pub verdict: ParityVerdict,
     /// Whether the ptrace and candidate runs were given the same input paths
-    /// (HOME, XDG_CONFIG_HOME, the fixture directory and the program path).
-    /// False for every row until the runner equalizes them (slice S8 of
-    /// <https://github.com/rrnewton/hermit/issues/3301>).
+    /// (HOME, XDG_CONFIG_HOME, the fixture directory and the program path),
+    /// as [`inputs_equalized`] decides from how both were launched. False
+    /// when either side was not launched with the runner's equalized inputs,
+    /// and for every row decided before a comparison was chosen: a missing
+    /// operand, or operands that cannot be shown to share a `HERMIT_EPOCH`
+    /// (the epoch is one of the inputs).
     pub inputs_equalized: bool,
     /// Why an unmeasured verdict was reached. Absent for measured verdicts.
     pub reason: Option<String>,
@@ -1226,11 +1233,6 @@ pub const PARITY_STEP_WALL_FLOOR: Duration = Duration::from_secs(600);
 /// enclosing step's bound.
 pub const PARITY_STEP_EXIT_MARGIN: Duration = Duration::from_secs(60);
 
-/// Whether the ptrace and candidate runs were launched with equal guest
-/// inputs. No runner equalizes them yet (slice S8 of
-/// <https://github.com/rrnewton/hermit/issues/3301>), so every measurement is
-/// reported as `unequalized_credit`.
-const INPUTS_EQUALIZED: bool = false;
 const VERIFY_LOG_DIR_FLAG: &str = "--verify-log-dir";
 /// The first verification run's retained log: the same file the ptrace golden
 /// normalization reads.
@@ -1637,8 +1639,10 @@ pub struct PostPassReport {
 }
 
 impl PostPassReport {
-    /// One line of honest accounting: every verdict count, and the mean credit
-    /// over the measured cells only.
+    /// One line of honest accounting: every verdict count, the mean clean
+    /// credit over the cells measured with equal inputs, and apart from it the
+    /// mean credit over the cells measured with unequal inputs. Neither mean
+    /// counts an unmeasured cell.
     pub fn summary_line(&self) -> String {
         let count = |verdict| {
             self.records
@@ -1646,20 +1650,32 @@ impl PostPassReport {
                 .filter(|record| record.verdict == verdict)
                 .count()
         };
-        let measured = self
-            .records
-            .iter()
-            .filter_map(ParityRecord::measured_credit)
-            .collect::<Vec<_>>();
-        let mean = if measured.is_empty() {
-            "none measured".to_string()
-        } else {
-            format!(
-                "mean credit {:.4} over {} measured (inputs not equalized)",
-                measured.iter().sum::<f64>() / measured.len() as f64,
-                measured.len()
-            )
+        let mean = |credits: Vec<f64>, inputs: &str| {
+            if credits.is_empty() {
+                format!("none measured with {inputs} inputs")
+            } else {
+                format!(
+                    "mean credit {:.4} over {} measured with {inputs} inputs",
+                    credits.iter().sum::<f64>() / credits.len() as f64,
+                    credits.len()
+                )
+            }
         };
+        let clean = mean(
+            self.records
+                .iter()
+                .filter_map(|record| record.credit)
+                .collect(),
+            "equal",
+        );
+        let unequalized = mean(
+            self.records
+                .iter()
+                .filter_map(|record| record.unequalized_credit)
+                .collect(),
+            "unequal",
+        );
+        let mean = format!("{clean}; {unequalized}");
         format!(
             "parity: {} cell(s) -> {}: matched {}, diverged {}, reference-missing {}, \
              candidate-missing {}, unavailable {}, inputs-not-equalized {}; {mean}; \
@@ -1677,9 +1693,9 @@ impl PostPassReport {
     }
 }
 
-/// The guest-visible inputs of the ptrace reference run, as launched. Kept
-/// beside each golden so a later equalized comparison (slice S8) can check it
-/// gave the candidate the same inputs.
+/// The guest-visible inputs of one verify run, as launched: read from its
+/// result row, and kept beside each ptrace golden. [`inputs_equalized`]
+/// compares the reference's with the candidate's.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParityGuestInputs {
@@ -1719,6 +1735,72 @@ impl ParityGuestInputs {
         }
         inputs
     }
+
+    /// Whether the run was launched with the runner's equalized inputs: each
+    /// directory in [`EQUALIZED_INPUTS`] bound exactly once at its guest
+    /// path, the guest environment naming that path, and a recorded
+    /// `HERMIT_EPOCH`.
+    pub fn is_equalized(&self) -> bool {
+        self.epoch.is_some()
+            && EQUALIZED_INPUTS.iter().all(|input| {
+                self.guest_env.get(input.env).map(String::as_str) == Some(input.guest_path)
+                    && self
+                        .mounts
+                        .iter()
+                        .filter(|mount| bind_target(mount) == Some(input.guest_path))
+                        .count()
+                        == 1
+            })
+    }
+
+    /// The inputs as the guest sees them. A `--bind=SOURCE:TARGET` is seen
+    /// only at its target, so its host source is dropped; every other field,
+    /// `--mount=` arguments included, is kept as launched.
+    fn guest_view(&self) -> Self {
+        let mut view = self.clone();
+        for mount in &mut view.mounts {
+            if let Some(target) = bind_target(mount) {
+                *mount = format!("--bind=:{target}");
+            }
+        }
+        view
+    }
+}
+
+/// The guest target of a `--bind=` argument, parsed as hermit parses it
+/// (reverie-process `Bind`: the text after the first `:`, or the source when
+/// there is none). `None` for any other argument.
+fn bind_target(mount: &str) -> Option<&str> {
+    let bind = mount.strip_prefix("--bind=")?;
+    Some(bind.split_once(':').map_or(bind, |(_, target)| target))
+}
+
+/// Whether the ptrace reference and the candidate were given equal guest
+/// inputs.
+///
+/// True only when the runner's equalization applied on both sides
+/// ([`ParityGuestInputs::is_equalized`]) and the two guests were launched
+/// with the same view: the same argv, guest environment, working directory,
+/// mounts and bind targets, and `HERMIT_EPOCH`. Only the host sources of the
+/// binds may differ; they are the two cell directories.
+///
+/// It compares launches, not directory contents. Both cells' fixture
+/// directories are made by the same preparation from the same sources (under
+/// `--prebuilt`, copies of one build), and a comparison of them would not
+/// catch a nondeterministic build anyway. A guest that reads
+/// `/proc/self/mountinfo` can still see each bind's host source there.
+///
+/// The epoch is part of the view rather than something the runner rewrites
+/// per cell: one harness process gives every cell it runs the same
+/// `HERMIT_EPOCH`, and the pressure test samples one epoch per series and
+/// passes it to each harness process
+/// ([`crate::runner::run_epoch_from_env`]). Equal epochs are therefore the
+/// normal case, and operands whose epochs differ or are unrecorded are
+/// reported as unavailable before they are compared.
+pub fn inputs_equalized(reference: &ParityGuestInputs, candidate: &ParityGuestInputs) -> bool {
+    reference.is_equalized()
+        && candidate.is_equalized()
+        && reference.guest_view() == candidate.guest_view()
 }
 
 /// The sidecar written next to each ptrace golden.
@@ -1778,8 +1860,8 @@ struct Operand {
     log: PathBuf,
     sha256: String,
     bytes: u64,
-    /// `HERMIT_EPOCH` of the hermit process that wrote the log.
-    epoch: Option<String>,
+    /// How the run that wrote the log was launched, `HERMIT_EPOCH` included.
+    inputs: ParityGuestInputs,
 }
 
 /// Why one side of a cell cannot be compared.
@@ -1794,6 +1876,8 @@ struct Comparison {
     cell: ParityCellId,
     reference: Operand,
     candidate: Operand,
+    /// [`inputs_equalized`] of the two operands' launches.
+    inputs_equalized: bool,
 }
 
 /// Write `parity.jsonl` for `scope` from the verify rows of one harness
@@ -1828,9 +1912,9 @@ pub fn post_pass(
         run_id: config.run_id.clone(),
         hermit_sha: config.hermit_sha.clone(),
         hermit_bin: path_text(&config.hermit_bin),
-        hermit_bin_sha256: hashed(&config.hermit_bin, None)
+        hermit_bin_sha256: file_sha256(&config.hermit_bin)
             .ok()
-            .map(|operand| operand.sha256),
+            .map(|(_, sha256, _)| sha256),
         records: path_text(&config.output),
         cells: scope.len(),
         summary: None,
@@ -1915,10 +1999,12 @@ fn measure(
     for (index, cell) in scope.iter().enumerate() {
         let unmeasured =
             |verdict, reason: &str, reference: Option<&Path>, candidate: Option<&Path>| {
+                // Decided before a comparison is chosen, so the inputs are not
+                // shown to be equal.
                 ParityRecord::unmeasured(
                     cell,
                     verdict,
-                    INPUTS_EQUALIZED,
+                    false,
                     reason,
                     reference.map(path_text).as_deref(),
                     candidate.map(path_text).as_deref(),
@@ -1968,7 +2054,7 @@ fn measure(
             ParityVerdict::CandidateMissing,
         )
         .and_then(|(row, log)| {
-            hashed(&log, row.env.get("HERMIT_EPOCH").cloned()).map_err(|reason| Unusable {
+            hashed(&log, ParityGuestInputs::from_result(&row)).map_err(|reason| Unusable {
                 verdict: ParityVerdict::CandidateMissing,
                 reason,
                 log: None,
@@ -1976,12 +2062,14 @@ fn measure(
         });
         let record = match (&*reference, candidate) {
             (Ok(reference), Ok(candidate))
-                if reference.epoch == candidate.epoch && reference.epoch.is_some() =>
+                if reference.inputs.epoch == candidate.inputs.epoch
+                    && reference.inputs.epoch.is_some() =>
             {
                 comparisons.push(Comparison {
                     index,
                     cell: cell.clone(),
                     reference: reference.clone(),
+                    inputs_equalized: inputs_equalized(&reference.inputs, &candidate.inputs),
                     candidate,
                 });
                 continue;
@@ -1990,7 +2078,8 @@ fn measure(
                 let shown = |epoch: &Option<String>| {
                     epoch.clone().unwrap_or_else(|| "unrecorded".to_string())
                 };
-                let reason = if reference.epoch.is_some() && candidate.epoch.is_some() {
+                let reason = if reference.inputs.epoch.is_some() && candidate.inputs.epoch.is_some()
+                {
                     "the operands ran with different HERMIT_EPOCH values"
                 } else {
                     "the operands cannot be shown to share a HERMIT_EPOCH"
@@ -1999,9 +2088,9 @@ fn measure(
                     ParityVerdict::Unavailable,
                     &format!(
                         "{reason}: {PARITY_REFERENCE_BACKEND} reference {}, {} candidate {}",
-                        shown(&reference.epoch),
+                        shown(&reference.inputs.epoch),
                         cell.backend,
-                        shown(&candidate.epoch)
+                        shown(&candidate.inputs.epoch)
                     ),
                     Some(&reference.log),
                     Some(&candidate.log),
@@ -2069,7 +2158,7 @@ fn measure(
                 Err(error) => ParityRecord::unmeasured(
                     &comparison.cell,
                     ParityVerdict::Unavailable,
-                    INPUTS_EQUALIZED,
+                    comparison.inputs_equalized,
                     &format!("the comparison could not be recorded: {error}"),
                     Some(&path_text(&comparison.reference.log)),
                     Some(&path_text(&comparison.candidate.log)),
@@ -2324,7 +2413,7 @@ fn reference_golden(
             })?;
         }
         let guest_inputs = ParityGuestInputs::from_result(&row);
-        let operand = hashed(&golden, guest_inputs.epoch.clone())?;
+        let operand = hashed(&golden, guest_inputs.clone())?;
         let guest_inputs_sha256 =
             sha256_hex(&serde_json::to_vec(&guest_inputs).map_err(|error| error.to_string())?);
         let sidecar = ParityGoldenSidecar {
@@ -2352,11 +2441,15 @@ fn reference_golden(
     write().map_err(|error| unavailable(format!("cannot write the {role} golden: {error}")))
 }
 
+/// A golden already written from `row`, if its sidecar still describes it:
+/// the same run, attempt and artifact directory, the golden's recorded hash,
+/// and the launch `row` records.
 fn existing_golden(golden: &Path, sidecar_path: &Path, row: &CellResult) -> Option<Operand> {
     let sidecar: ParityGoldenSidecar =
         serde_json::from_slice(&fs::read(sidecar_path).ok()?).ok()?;
-    let operand = hashed(golden, sidecar.guest_inputs.epoch.clone()).ok()?;
+    let operand = hashed(golden, ParityGuestInputs::from_result(row)).ok()?;
     (sidecar.schema == PARITY_GOLDEN_SIDECAR_SCHEMA
+        && sidecar.guest_inputs == operand.inputs
         && sidecar.test_id == row.test
         && sidecar.run_id == row.run_id
         && sidecar.attempt == row.attempt
@@ -2380,7 +2473,7 @@ fn compare(
         ParityRecord::unmeasured(
             cell,
             ParityVerdict::Unavailable,
-            INPUTS_EQUALIZED,
+            comparison.inputs_equalized,
             &reason,
             Some(&reference_log),
             Some(&candidate_log),
@@ -2499,7 +2592,7 @@ fn compare(
     ParityRecord::from_comparison(
         cell,
         &report,
-        INPUTS_EQUALIZED,
+        comparison.inputs_equalized,
         &reference_log,
         &candidate_log,
         &config.run_id,
@@ -2554,7 +2647,20 @@ fn run_bounded(
     Ok((status, stderr))
 }
 
-fn hashed(path: &Path, epoch: Option<String>) -> Result<Operand, String> {
+/// One side of a comparison: the log at `path`, hashed now, and how the run
+/// that wrote it was launched.
+fn hashed(path: &Path, inputs: ParityGuestInputs) -> Result<Operand, String> {
+    let (log, sha256, bytes) = file_sha256(path)?;
+    Ok(Operand {
+        log,
+        sha256,
+        bytes,
+        inputs,
+    })
+}
+
+/// The absolute path, SHA-256 and length of the file at `path`.
+fn file_sha256(path: &Path) -> Result<(PathBuf, String, u64), String> {
     let path = &independent_of_cwd(path)?;
     let mut file =
         fs::File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -2571,12 +2677,7 @@ fn hashed(path: &Path, epoch: Option<String>) -> Result<Operand, String> {
         digest.update(&buffer[..read]);
         bytes += read as u64;
     }
-    Ok(Operand {
-        log: path.to_path_buf(),
-        sha256: hex(&digest.finalize()),
-        bytes,
-        epoch,
-    })
+    Ok((path.to_path_buf(), hex(&digest.finalize()), bytes))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -3798,6 +3899,31 @@ mod tests {
         }
     }
 
+    /// `row` as the runner launches an equalized verify cell: each input
+    /// directory of its cell directory bound at its guest path, and the guest
+    /// environment naming that path. Inserted before `--keep-logs`, so the
+    /// retained-log directory stays the fourth argument from the end.
+    fn equalize(mut row: CellResult) -> CellResult {
+        let at = row
+            .argv
+            .iter()
+            .position(|arg| arg == "--keep-logs" || arg == "--")
+            .unwrap();
+        let mut launch = Vec::new();
+        for input in EQUALIZED_INPUTS {
+            launch.push(format!(
+                "--bind={}/{}:{}",
+                row.artifact_dir, input.cell_subdir, input.guest_path
+            ));
+            launch.extend([
+                "--env".to_string(),
+                format!("{}={}", input.env, input.guest_path),
+            ]);
+        }
+        row.argv.splice(at..at, launch);
+        row
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             if !std::thread::panicking() {
@@ -4085,11 +4211,226 @@ mod tests {
         for part in [
             "9 cell(s)",
             "matched 1, diverged 1, reference-missing 1, candidate-missing 3, unavailable 2, inputs-not-equalized 1",
-            "over 2 measured (inputs not equalized)",
+            "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
             "2 log-diff comparison(s), 0 guest runs",
         ] {
             assert!(summary.contains(part), "{part:?} not in {summary}");
         }
+    }
+
+    /// The launch of an equalized verify cell in `cell_dir`, as
+    /// [`ParityGuestInputs::from_result`] reads it.
+    fn equalized_launch(cell_dir: &str) -> ParityGuestInputs {
+        let mut guest_env = BTreeMap::from([
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("E2E_TMPDIR".to_string(), "/tmp/test".to_string()),
+        ]);
+        let mut mounts = vec![format!("--bind={cell_dir}/workdir/1:/tmp/test")];
+        for input in EQUALIZED_INPUTS {
+            guest_env.insert(input.env.to_string(), input.guest_path.to_string());
+            mounts.push(format!(
+                "--bind={cell_dir}/{}:{}",
+                input.cell_subdir, input.guest_path
+            ));
+        }
+        ParityGuestInputs {
+            guest_argv: vec!["/tmp/e2e/fixtures/program".into(), "multi".into()],
+            guest_env,
+            workdir: Some("/tmp/test".into()),
+            mounts,
+            epoch: Some(EPOCH.into()),
+        }
+    }
+
+    /// Inputs are equal only when the runner's equalization applied on both
+    /// sides and the guests were launched with one view; the host sources of
+    /// the binds are the only thing allowed to differ.
+    #[test]
+    fn equal_inputs_need_equalization_on_both_sides_and_one_guest_view() {
+        let reference = equalized_launch("/r/c-programs-mmap-determinism-verify-ptrace");
+        let candidate = equalized_launch("/r/c-programs-mmap-determinism-verify-kvm");
+        assert!(reference.is_equalized() && candidate.is_equalized());
+        assert_ne!(reference, candidate, "the bind sources differ");
+        assert!(inputs_equalized(&reference, &candidate));
+        assert!(inputs_equalized(&candidate, &reference));
+        assert!(inputs_equalized(&reference, &reference));
+
+        let unequal = |label: &str, change: &dyn Fn(&mut ParityGuestInputs)| {
+            let mut changed = candidate.clone();
+            change(&mut changed);
+            assert!(
+                !inputs_equalized(&reference, &changed),
+                "{label}: {changed:?}"
+            );
+            assert!(
+                !inputs_equalized(&changed, &reference),
+                "{label}, reversed: {changed:?}"
+            );
+        };
+        // A change to only one side makes the views differ; the same change to
+        // both leaves one view, which is still not the runner's equalization.
+        let not_equalized = |label: &str, change: &dyn Fn(&mut ParityGuestInputs)| {
+            unequal(label, change);
+            let (mut left, mut right) = (reference.clone(), candidate.clone());
+            change(&mut left);
+            change(&mut right);
+            assert!(!left.is_equalized(), "{label}: {left:?}");
+            assert!(!inputs_equalized(&left, &right), "{label}, both sides");
+        };
+        for input in EQUALIZED_INPUTS {
+            not_equalized(&format!("{} not bound", input.cell_subdir), &|inputs| {
+                inputs
+                    .mounts
+                    .retain(|mount| bind_target(mount) != Some(input.guest_path));
+            });
+            not_equalized(&format!("{} bound twice", input.cell_subdir), &|inputs| {
+                inputs
+                    .mounts
+                    .push(format!("--bind=/elsewhere:{}", input.guest_path));
+            });
+            not_equalized(&format!("{} named by a host path", input.env), &|inputs| {
+                inputs.guest_env.insert(
+                    input.env.to_string(),
+                    format!("/r/shared/{}", input.cell_subdir),
+                );
+            });
+            not_equalized(&format!("{} unset", input.env), &|inputs| {
+                inputs.guest_env.remove(input.env);
+            });
+        }
+        unequal("a host program path", &|inputs| {
+            inputs.guest_argv[0] = "/r/kvm/fixtures/program".into();
+        });
+        unequal("another guest argument", &|inputs| {
+            inputs.guest_argv[1] = "single".into();
+        });
+        unequal("another working directory", &|inputs| {
+            inputs.workdir = Some("/test".into());
+        });
+        unequal("another guest variable", &|inputs| {
+            inputs.guest_env.insert("TZ".into(), "UTC".into());
+        });
+        unequal("another bind target", &|inputs| {
+            inputs.mounts[0] = "--bind=/r/kvm/workdir/1:/tmp/elsewhere".into();
+        });
+        unequal("an extra bind", &|inputs| {
+            inputs.mounts.push("--bind=/tmp/extra".into());
+        });
+        unequal("a --mount with another source", &|inputs| {
+            inputs
+                .mounts
+                .push("--mount=type=bind,source=/r/kvm/data,target=/data".into());
+        });
+        unequal("another epoch", &|inputs| {
+            inputs.epoch = Some("2001-01-01T00:00:00+00:00".into());
+        });
+
+        // A --mount is compared verbatim, so one with the same source on both
+        // sides is part of an equal view.
+        let mount = "--mount=type=tmpfs,target=/test".to_string();
+        let (mut with_mount, mut other_with_mount) = (reference.clone(), candidate.clone());
+        with_mount.mounts.push(mount.clone());
+        other_with_mount.mounts.push(mount);
+        assert!(inputs_equalized(&with_mount, &other_with_mount));
+
+        // Unrecorded epochs cannot be shown equal, even on both sides.
+        let (mut left, mut right) = (reference.clone(), candidate.clone());
+        left.epoch = None;
+        right.epoch = None;
+        assert!(!left.is_equalized());
+        assert!(!inputs_equalized(&left, &right));
+
+        // A launch from before the runner equalized inputs: host paths, no
+        // binds below /tmp/e2e.
+        let fixture = Fixture::new("equal-inputs-view");
+        let pre = ParityGuestInputs::from_result(&fixture.row("fx/one", "kvm", 1, "PASS", None));
+        assert!(!pre.is_equalized());
+        assert!(!inputs_equalized(&pre, &pre));
+        let equalized = ParityGuestInputs::from_result(&equalize(
+            fixture.row("fx/one", "kvm", 1, "PASS", None),
+        ));
+        assert!(equalized.is_equalized(), "{equalized:?}");
+        assert!(!inputs_equalized(&pre, &equalized));
+    }
+
+    /// A comparison whose two runs were both launched with the runner's
+    /// equalized inputs earns clean credit; one where either side was not
+    /// keeps its measurement in `unequalized_credit`; dbt is never measured.
+    #[test]
+    fn equalized_launches_earn_clean_credit_and_no_others_do() {
+        let fixture = Fixture::new("equalized");
+        let rows = vec![
+            equalize(fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE))),
+            equalize(fixture.row("fx/one", "kvm", 1, "PASS", Some(REFERENCE))),
+            equalize(fixture.row("fx/one", "liteinst", 1, "PASS", Some(DIVERGENT))),
+            // A candidate launched without the equalized inputs.
+            fixture.row("fx/one", "sabre", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/one", "dbt", 1, "PASS", Some(REFERENCE)),
+            // A reference launched without them.
+            fixture.row("fx/two", "ptrace", 1, "PASS", Some(REFERENCE)),
+            equalize(fixture.row("fx/two", "kvm", 1, "PASS", Some(REFERENCE))),
+        ];
+        let scope = BTreeSet::from([
+            parity_cell("fx/one", ParityBackend::Kvm),
+            parity_cell("fx/one", ParityBackend::Liteinst),
+            parity_cell("fx/one", ParityBackend::Sabre),
+            parity_cell("fx/one", ParityBackend::Dbt),
+            parity_cell("fx/two", ParityBackend::Kvm),
+        ]);
+        let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
+        let record = |test: &str, backend| {
+            report
+                .records
+                .iter()
+                .find(|record| record.test_id == test && record.backend == backend)
+                .unwrap()
+        };
+        for record in &report.records {
+            record.validate().unwrap();
+        }
+
+        let matched = record("fx/one", ParityBackend::Kvm);
+        assert_eq!(matched.verdict, ParityVerdict::Matched, "{matched:?}");
+        assert!(matched.inputs_equalized);
+        assert_eq!(
+            (matched.credit, matched.unequalized_credit),
+            (Some(1.0), None)
+        );
+
+        let diverged = record("fx/one", ParityBackend::Liteinst);
+        assert_eq!(diverged.verdict, ParityVerdict::Diverged, "{diverged:?}");
+        assert!(diverged.inputs_equalized);
+        assert_eq!(
+            (diverged.credit, diverged.unequalized_credit),
+            (credit(1, 3, 3), None)
+        );
+
+        for unequal in [
+            record("fx/one", ParityBackend::Sabre),
+            record("fx/two", ParityBackend::Kvm),
+        ] {
+            assert_eq!(unequal.verdict, ParityVerdict::Matched, "{unequal:?}");
+            assert!(!unequal.inputs_equalized, "{unequal:?}");
+            assert_eq!(
+                (unequal.credit, unequal.unequalized_credit),
+                (None, Some(1.0)),
+                "{unequal:?}"
+            );
+        }
+
+        let dbt = record("fx/one", ParityBackend::Dbt);
+        assert_eq!(dbt.verdict, ParityVerdict::InputsNotEqualized);
+        assert!(!dbt.inputs_equalized);
+        assert_eq!(dbt.measured_credit(), None);
+
+        let summary = report.summary_line();
+        assert!(
+            summary.contains(
+                "mean credit 0.6667 over 2 measured with equal inputs; mean credit 1.0000 \
+                 over 2 measured with unequal inputs"
+            ),
+            "{summary}"
+        );
     }
 
     /// A comparison the post-pass cannot trust is unavailable, never a
@@ -4228,7 +4569,17 @@ mod tests {
         let reused = verdict();
         assert_eq!(reused.verdict, ParityVerdict::Matched, "{reused:?}");
 
-        let (golden, _) = golden_paths(&fixture.artifacts(), "fx/one").unwrap();
+        // A sidecar that records another launch than the row's is not the
+        // golden of that row.
+        let (golden, sidecar_path) = golden_paths(&fixture.artifacts(), "fx/one").unwrap();
+        let recorded = fs::read(&sidecar_path).unwrap();
+        let mut sidecar: ParityGoldenSidecar = serde_json::from_slice(&recorded).unwrap();
+        sidecar.guest_inputs.workdir = Some("/elsewhere".into());
+        fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        assert_eq!(verdict().verdict, ParityVerdict::ReferenceMissing);
+        fs::write(&sidecar_path, &recorded).unwrap();
+        assert_eq!(verdict().verdict, ParityVerdict::Matched);
+
         fs::write(&golden, DIVERGENT).unwrap();
         let refused = verdict();
         assert_eq!(

@@ -3497,6 +3497,13 @@ sys.exit(1 if failed else 0)
             "{five_stdout}"
         );
         assert!(
+            five_stdout.contains(
+                "mean credit 1.0000 over 3 measured with equal inputs; none measured with \
+                 unequal inputs"
+            ),
+            "{five_stdout}"
+        );
+        assert!(
             mutated_stdout.contains("3 log-diff comparison(s), 0 guest runs"),
             "{mutated_stdout}"
         );
@@ -3529,18 +3536,28 @@ sys.exit(1 if failed else 0)
                 "parity/beta@liteinst=Unavailable",
             ]
         );
-        for record in five_records.iter().chain(&mutated_records) {
-            record.validate().unwrap();
-            assert!(!record.inputs_equalized);
-            assert_eq!(record.credit, None);
+        // The harness launched every kvm and liteinst verify cell, and their
+        // ptrace reference, with the equalized guest inputs, so each measured
+        // comparison is clean credit. dbt cannot be given them, and a cell
+        // refused before comparing is not shown to have them.
+        for records in [&five_records, &mutated_records] {
+            for (index, record) in records.iter().enumerate() {
+                record.validate().unwrap();
+                let measured = (1..4).contains(&index);
+                assert_eq!(record.inputs_equalized, measured, "{record:?}");
+                assert_eq!(record.unequalized_credit, None, "{record:?}");
+                if !measured {
+                    assert_eq!(record.credit, None, "{record:?}");
+                }
+            }
         }
         for record in &five_records[1..4] {
-            assert_eq!(record.unequalized_credit, Some(1.0), "{record:?}");
+            assert_eq!(record.credit, Some(1.0), "{record:?}");
         }
         for record in &mutated_records[1..4] {
             assert_eq!(record.matched_prefix, Some(1), "{record:?}");
             assert_eq!(record.first_divergent_record, Some(2), "{record:?}");
-            assert_eq!(record.unequalized_credit, Some(1.0 / 3.0), "{record:?}");
+            assert_eq!(record.credit, Some(1.0 / 3.0), "{record:?}");
             let difference = record.first_difference.as_ref().unwrap();
             assert_eq!(
                 difference.reference_message.as_deref(),

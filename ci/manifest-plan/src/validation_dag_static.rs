@@ -262,13 +262,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // backend_parity_c_fold:
     //   every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check,
     //   the_privileged_c_programs_description_names_every_selected_cell.
-    // Slice S8 of https://github.com/rrnewton/hermit/issues/3301 adds 2
+    // Slice S8 of https://github.com/rrnewton/hermit/issues/3301 adds 4
     // hermit-manifest-plan lib tests and retains all 697 prior identities
-    // (`cargo nextest list --profile ci -p hermit-manifest-plan` measured 513
+    // (`cargo nextest list --profile ci -p hermit-manifest-plan` measured 515
     // against 511; no other selected crate changed):
+    // parity.rs: equal_inputs_need_equalization_on_both_sides_and_one_guest_view,
+    //   equalized_launches_earn_clean_credit_and_no_others_do;
     // runner.rs: file_digest_matches_a_whole_file_digest,
     //   verify_cells_give_every_bindable_backend_the_same_guest_inputs.
-    ("test.regular_crates", 699),
+    ("test.regular_crates", 701),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -369,7 +371,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 699),
+    ("test.regular_crates_on_host", 701),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
