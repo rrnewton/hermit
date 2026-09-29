@@ -132,7 +132,7 @@
   ],
   "release_shards": [
     {
-      "slug": "dbt-parity",
+      "slug": "dbt-runtime-abi",
       "needs": "dbt",
       "nodes": [
         "check.dbt_runtime_abi"
