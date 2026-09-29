@@ -1211,27 +1211,58 @@ fn waitid_polls_until_child_exit_and_supports_wnohang() {
 #[test]
 fn wait4_argument_errors_match_linux_and_preserve_children() {
     det_test_fn_sequential_without_pmu(|| {
-        fn wait4_error(pid: libc::pid_t, options: libc::c_int, expected: libc::c_int) {
-            let mut status = 0;
+        // The pid argument is a full register so callers can set its high
+        // word; Linux reads only the low 32 bits of this `int` parameter.
+        fn wait4_error(pid: libc::c_long, options: libc::c_int, expected: libc::c_int) {
+            const STATUS_SENTINEL: libc::c_int = 0x5a5a_5a5a;
+            let mut status = STATUS_SENTINEL;
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe {
+                std::ptr::write_bytes(
+                    (&mut usage as *mut libc::rusage).cast::<u8>(),
+                    0x5a,
+                    std::mem::size_of::<libc::rusage>(),
+                )
+            };
             let result = unsafe {
                 libc::syscall(
                     libc::SYS_wait4,
                     pid,
                     &mut status,
                     options,
-                    std::ptr::null_mut::<libc::rusage>(),
+                    &mut usage as *mut libc::rusage,
                 )
             };
             assert_eq!(
                 result, -1,
-                "wait4({pid}, {options:#x}) unexpectedly succeeded"
+                "wait4({pid:#x}, {options:#x}) unexpectedly succeeded"
             );
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(expected),
-                "wait4({pid}, {options:#x}) returned the wrong errno"
+                "wait4({pid:#x}, {options:#x}) returned the wrong errno"
+            );
+            // Linux copies status and rusage only when wait4 returns a child,
+            // so every failure leaves both outputs untouched.
+            assert_eq!(
+                status, STATUS_SENTINEL,
+                "wait4({pid:#x}, {options:#x}) wrote the status output"
+            );
+            let usage_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&usage as *const libc::rusage).cast::<u8>(),
+                    std::mem::size_of::<libc::rusage>(),
+                )
+            };
+            assert!(
+                usage_bytes.iter().all(|&byte| byte == 0x5a),
+                "wait4({pid:#x}, {options:#x}) wrote the rusage output"
             );
         }
+        const INT_MIN: libc::c_long = libc::pid_t::MIN as libc::c_long;
+        // Nonzero high words whose low 32 bits are INT_MIN and -1.
+        const HIGH_WORD_INT_MIN: libc::c_long = 0x0000_0001_8000_0000;
+        const HIGH_WORD_MINUS_ONE: libc::c_long = 0x0000_0001_ffff_ffff;
 
         fn spawn_exiting_child(exit_status: libc::c_int) -> libc::pid_t {
             let child = unsafe { libc::fork() };
@@ -1264,8 +1295,10 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
             assert_eq!(libc::WEXITSTATUS(status), exit_status);
         }
 
-        wait4_error(libc::pid_t::MIN, 0, libc::ESRCH);
-        wait4_error(libc::pid_t::MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(INT_MIN, 0, libc::ESRCH);
+        wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(HIGH_WORD_INT_MIN, 0, libc::ESRCH);
+        wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
 
         let mut release_pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(release_pipe.as_mut_ptr()) }, 0);
@@ -1280,7 +1313,7 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
             }
         }
         unsafe { libc::close(release_pipe[0]) };
-        wait4_error(libc::pid_t::MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
         let byte = 1_u8;
         assert_eq!(
             unsafe { libc::write(release_pipe[1], (&byte as *const u8).cast(), 1) },
@@ -1290,23 +1323,21 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
         reap_child(running_child, 31);
 
         let zombie_wnohang = spawn_exiting_child(41);
-        wait4_error(libc::pid_t::MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(INT_MIN, libc::WNOHANG, libc::ESRCH);
+        wait4_error(HIGH_WORD_INT_MIN, libc::WNOHANG, libc::ESRCH);
         reap_child(zombie_wnohang, 41);
 
         let zombie_blocking = spawn_exiting_child(42);
-        wait4_error(libc::pid_t::MIN, 0, libc::ESRCH);
+        wait4_error(INT_MIN, 0, libc::ESRCH);
         reap_child(zombie_blocking, 42);
 
         let zombie_untraced = spawn_exiting_child(51);
-        wait4_error(
-            libc::pid_t::MIN,
-            libc::WUNTRACED | libc::WNOHANG,
-            libc::ESRCH,
-        );
+        wait4_error(INT_MIN, libc::WUNTRACED | libc::WNOHANG, libc::ESRCH);
         reap_child(zombie_untraced, 51);
 
         let invalid_options_child = spawn_exiting_child(61);
-        wait4_error(libc::pid_t::MIN, 0x10, libc::EINVAL);
+        wait4_error(INT_MIN, 0x10, libc::EINVAL);
+        wait4_error(HIGH_WORD_INT_MIN, 0x10, libc::EINVAL);
         wait4_error(-1, 0x10, libc::EINVAL);
         reap_child(invalid_options_child, 61);
 
@@ -1318,6 +1349,7 @@ fn wait4_argument_errors_match_linux_and_preserve_children() {
                 libc::EINVAL
             };
             wait4_error(-1, option, expected);
+            wait4_error(HIGH_WORD_MINUS_ONE, option, expected);
         }
     });
 }
