@@ -46,3 +46,24 @@ string; the other six pin exact stdout. All remain freestanding
 
 Regenerate identical sources with the parent workspace generator at
 `experiments/e9patch_ptrace_corpus_parity_20260731/src/gen_corpus.sh`.
+
+## Running
+
+The driver is manual. It needs a Hermit built with the `e9patch` cargo feature
+and a built e9tool/e9patch pair, and no validation lane has either, so CI never
+runs these guests. Run it locally:
+
+```bash
+cargo build -p hermit --features e9patch
+HERMIT_E9TOOL=<path>/e9tool HERMIT_E9PATCH_BACKEND=<path>/e9patch \
+    python3 tests/e9patch/e9patch_corpus.py \
+    --hermit target/debug/hermit --require-backend
+```
+
+Without `--require-backend` a missing prerequisite reports `BLOCKED` and exits
+0. `--check` validates the corpus contract without prerequisites.
+
+The validation node `check.e9patch_corpus` runs
+`python3 tests/e9patch/test_e9patch_corpus.py`. It checks the driver's typed
+build-info and engagement readers, its private `--tmp` commands and the
+`--check` corpus contract without running Hermit.
