@@ -4870,13 +4870,40 @@ const REVIEWED_DBT_MATRIX_FLAGS: [&str; 5] = [
     "--no-parent-scorecard",
 ];
 
+/// The `run_matrix.py --exclude-case` suffix that only the hosted-portable
+/// twin carries, derived from the generator's own list.
+///
+/// GitHub-hosted runners lack CPUID faulting, so `test.dbt_parity_on_host`
+/// omits `cpuid_policy`
+/// (<https://github.com/rrnewton/hermit/actions/runs/36485831200>). The local
+/// `test.dbt_parity` keeps every case, and so does this driver: it runs its
+/// candidates on a local host, never on a GitHub-hosted runner.
+fn hosted_only_dbt_matrix_case_exclusions() -> String {
+    hermit_manifest_plan::validation_dag::HOSTED_DBT_PARITY_EXCLUDED_CASES
+        .iter()
+        .map(|case| format!(" --exclude-case {case}"))
+        .collect()
+}
+
 /// The host twin must run exactly the pinned twin's payload under the same
 /// envelope, and differ in environment only by the pinned-root `/test` request.
-/// Returns the host twin's matrix flags.
+/// The one permitted command difference is the hosted-only case-exclusion
+/// suffix, which must end the host twin's command exactly once and must not
+/// reach the pinned twin. Returns the host twin's matrix flags without that
+/// suffix, so a local shadow run executes every backend-parity case.
 fn require_host_dbt_matrix_counterpart(pinned: &Step, host: &Step) -> Result<Vec<String>, String> {
     require_official_dbt_matrix_envelope(host)?;
-    let flags = host
+    let exclusions = hosted_only_dbt_matrix_case_exclusions();
+    let payload = host
         .cmd
+        .strip_suffix(exclusions.as_str())
+        .ok_or_else(|| {
+            format!(
+                "official test.dbt_parity_on_host no longer ends with exactly the hosted-only case exclusion `{}`",
+                exclusions.trim_start()
+            )
+        })?;
+    let flags = payload
         .strip_prefix(HOST_DBT_MATRIX_PRELUDE)
         .and_then(|rest| rest.strip_prefix(HOST_DBT_MATRIX_RUNNER))
         .map(|flags| flags.split(' ').map(str::to_owned).collect::<Vec<_>>())
@@ -4887,7 +4914,7 @@ fn require_host_dbt_matrix_counterpart(pinned: &Step, host: &Step) -> Result<Vec
         })?;
     if !pinned
         .cmd
-        .ends_with(&format!(" bash {}", shell_words::quote(&host.cmd)))
+        .ends_with(&format!(" bash {}", shell_words::quote(payload)))
         || host.timeout != pinned.timeout
         || host.cpu_timeout != pinned.cpu_timeout
     {
@@ -8187,6 +8214,9 @@ mod tests {
 
         // Candidates run on the host, so the matrix flags and environment come
         // from the host twin; the pinned twin keeps its per-run /test request.
+        // The host twin is the hosted-portable node, which alone omits the
+        // cases GitHub-hosted runners cannot run; the derived flags drop that
+        // suffix, so a local shadow run still executes cpuid_policy.
         let steps = hermit_manifest_plan::validation_dag::generate(&root)
             .unwrap()
             .steps;
@@ -8235,9 +8265,67 @@ mod tests {
                 "{name}"
             );
         }
+        let exclusions = hosted_only_dbt_matrix_case_exclusions();
+        assert_eq!(exclusions, " --exclude-case cpuid_policy");
+        assert!(host.cmd.ends_with(&exclusions));
+        assert!(
+            !official.cmd.contains("--exclude-case"),
+            "the pinned twin must run every case"
+        );
+        assert!(
+            !derived
+                .matrix_flags
+                .iter()
+                .any(|flag| flag == "--exclude-case" || flag == "cpuid_policy"),
+            "a local shadow run must not inherit the hosted-only exclusion"
+        );
+        let payload_len = host.cmd.len() - exclusions.len();
         let mut appended = host.clone();
-        appended.cmd.push_str(" --verify");
+        appended.cmd.insert_str(payload_len, " --verify");
         assert!(refused(&official, &appended).contains("reviewed strict DBT matrix command"));
+        let mut narrowed = host.clone();
+        narrowed
+            .cmd
+            .insert_str(payload_len, " --exclude-case heap_growth");
+        assert!(refused(&official, &narrowed).contains("reviewed strict DBT matrix command"));
+        for (name, cmd, expected) in [
+            (
+                "dropped exclusion",
+                host.cmd[..payload_len].to_owned(),
+                "hosted-only case exclusion `--exclude-case cpuid_policy`",
+            ),
+            (
+                "trailing flag",
+                format!("{} --verify", host.cmd),
+                "hosted-only case exclusion",
+            ),
+            (
+                "other case excluded",
+                host.cmd.replacen("cpuid_policy", "heap_growth", 1),
+                "hosted-only case exclusion",
+            ),
+            (
+                "repeated exclusion",
+                format!("{}{exclusions}", host.cmd),
+                "reviewed strict DBT matrix command",
+            ),
+        ] {
+            let mut drifted = host.clone();
+            drifted.cmd = cmd;
+            assert_ne!(drifted.cmd, host.cmd, "{name}");
+            let error = refused(&official, &drifted);
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        // The pinned twin wraps the unnarrowed payload: were it to wrap the
+        // hosted command, the local pinned-root run would lose cpuid_policy.
+        let mut narrowed_pinned = official.clone();
+        narrowed_pinned.cmd = narrowed_pinned.cmd.replacen(
+            &shell_words::quote(&host.cmd[..payload_len]).into_owned(),
+            &shell_words::quote(&host.cmd).into_owned(),
+            1,
+        );
+        assert_ne!(narrowed_pinned.cmd, official.cmd);
+        assert!(refused(&narrowed_pinned, &host).contains("share one payload"));
         let mut lengthened = host.clone();
         lengthened.timeout += 1;
         assert!(refused(&official, &lengthened).contains("resource envelope drifted"));
