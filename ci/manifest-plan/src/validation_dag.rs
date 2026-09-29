@@ -294,16 +294,20 @@ struct Profile {
 // before. full, portable, quick, super and hosted-portable then gained the five
 // selftest.* nodes (the quick/super variants for quick and super) split out of
 // gate.manifest: 272/273, 259/260, 15/16, 145/146 and 250/250 before.
+// full, portable and hosted-portable then gained check.e9patch_corpus when the
+// e9patch corpus left tests/backend-parity (slice S13 of
+// https://github.com/rrnewton/hermit/issues/3301): 277/278, 264/265 and
+// 255/255 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 277,
-        selected_steps: 278,
+        direct_steps: 278,
+        selected_steps: 279,
     },
     Profile {
         label: "portable",
-        direct_steps: 264,
-        selected_steps: 265,
+        direct_steps: 265,
+        selected_steps: 266,
     },
     Profile {
         label: "quick",
@@ -322,8 +326,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 255,
-        selected_steps: 255,
+        direct_steps: 256,
+        selected_steps: 256,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1963,10 +1967,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
     // since check.canonical_adapter_accept was added; +3 for the privileged
     // system-utils nodes; +10 for the five selftest.* nodes and their
-    // quick/super variants.
-    if cfg.steps.len() != 1618 {
+    // quick/super variants; +1 for check.e9patch_corpus when the e9patch
+    // corpus left tests/backend-parity (also slice S13).
+    if cfg.steps.len() != 1619 {
         return Err(format!(
-            "superset has {} steps, expected 1618",
+            "superset has {} steps, expected 1619",
             cfg.steps.len()
         ));
     }
@@ -3503,11 +3508,13 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 255 since the five selftest.<name> nodes left gate.manifest
+        // 256 since check.e9patch_corpus was added when the e9patch corpus
+        // left tests/backend-parity (slice S13 of
+        // https://github.com/rrnewton/hermit/issues/3301); 255 since the five
+        // selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
-        // test.dbt_parity_on_host was retired (slice S13 of
-        // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 255);
+        // test.dbt_parity_on_host was retired (slice S13); 251 before.
+        assert_eq!(selected.steps.len(), 256);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3664,11 +3671,13 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 254 = the 255 hosted-portable direct steps since the five
-            // selftest.<name> nodes left gate.manifest
-            // (https://github.com/rrnewton/hermit/issues/3381), minus the one
+            // 255 = the 256 hosted-portable direct steps since
+            // check.e9patch_corpus was added in slice S13 of
+            // https://github.com/rrnewton/hermit/issues/3301 (255 since the
+            // five selftest.<name> nodes left gate.manifest,
+            // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 254 direct steps"),
+            error.contains("hosted-portable label has 255 direct steps"),
             "{error}"
         );
     }

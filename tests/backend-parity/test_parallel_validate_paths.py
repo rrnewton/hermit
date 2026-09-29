@@ -21,6 +21,9 @@ HERE = Path(__file__).resolve().parent
 # The identity-fixture mutation harness moved to tests/c with its fixtures when
 # the backend-parity-c bucket was folded into c-programs.
 FIXTURE_MUTATION = HERE.parent / "c" / "fixture_mutation.py"
+# The e9patch corpus driver moved to tests/e9patch (slice S13 of
+# https://github.com/rrnewton/hermit/issues/3301).
+E9PATCH_CORPUS = HERE.parent / "e9patch" / "e9patch_corpus.py"
 
 
 def load(name: str, filename: str | Path):
@@ -115,7 +118,7 @@ class BackendParityTemporaryPathTest(unittest.TestCase):
 
     def test_old_host_tmp_overwrites_and_all_commands_accept_private_roots(self) -> None:
         run_matrix = load("parallel_run_matrix", "run_matrix.py")
-        e9patch = load("parallel_e9patch_corpus", "e9patch_corpus.py")
+        e9patch = load("parallel_e9patch_corpus", E9PATCH_CORPUS)
         mutation = load("parallel_fixture_mutation", FIXTURE_MUTATION)
 
         with tempfile.TemporaryDirectory() as raw:
