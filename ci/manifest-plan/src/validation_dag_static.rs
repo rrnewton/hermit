@@ -241,7 +241,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // e8007f971a7 adds relative_artifacts_and_hermit_paths_are_still_measured
     // and ad21724d5f6 adds only_a_program_name_without_a_slash_is_left_for_path;
     // both retain all 664 prior identities (`cargo nextest list` measured 666).
-    ("test.regular_crates", 666),
+    ("test.regular_crates", 676),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -319,7 +319,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 666),
+    ("test.regular_crates_on_host", 676),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
