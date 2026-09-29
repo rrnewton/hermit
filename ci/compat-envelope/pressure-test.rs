@@ -1075,6 +1075,28 @@ fn fresh_checkout_git() -> Command {
     command
 }
 
+/// Materialize the fresh checkout and make it the only repository this
+/// process acts on from here on.
+///
+/// Everything a clean-source `run` does after this point names the generated
+/// checkout: the plan's `scorecard.rs check` child and its HEAD and
+/// `HEAD:detcore` reads, the source-dirtiness bit it records, the typed DAG's
+/// cells (which run with the checkout as their working directory), and
+/// summarize's HEAD reads. The source was read for the last time before
+/// preparation. An inherited `GIT_DIR`, `GIT_WORK_TREE` or `GIT_INDEX_FILE`
+/// naming the source would redirect every one of those reads, and every
+/// child's, back to the source, so the variables are removed from this
+/// process once the checkout exists. No other thread exists yet. The
+/// exploratory dirty-source mode never calls this: it runs in the source,
+/// which is the caller's repository.
+fn enter_fresh_checkout(source: &Path, sha: &str) -> Result<FreshCheckout, String> {
+    let fresh = FreshCheckout::prepare(source, sha)?;
+    for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+        env::remove_var(name);
+    }
+    Ok(fresh)
+}
+
 fn clone_local_without_hardlinks(source: &Path, destination: &Path) -> Result<(), String> {
     command_ok(
         fresh_checkout_git()
@@ -2145,7 +2167,7 @@ fn run() -> Result<(), String> {
                 );
                 None
             } else {
-                let fresh = FreshCheckout::prepare(&root, &sha)?;
+                let fresh = enter_fresh_checkout(&root, &sha)?;
                 println!("Fresh checkout: {}", fresh.path.display());
                 Some(fresh)
             };
@@ -9408,8 +9430,16 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// naming the source, the clone refused to start
 /// (https://github.com/rrnewton/hermit/issues/3362). The source's state is
 /// compared before any preparation error is reported, so a run that both
-/// damages the source and fails names the damage. The self-test process runs
-/// no other thread, so it may set and clear the variables here.
+/// damages the source and fails names the damage.
+///
+/// The case goes through `enter_fresh_checkout`, the entry `run` uses, and
+/// then performs the reads a clean-source run makes of the generated checkout
+/// (`write_plan`'s source-dirtiness bit and HEAD read, and summarize's HEAD
+/// read) before this test clears anything itself. The source's HEAD is first
+/// moved past the prepared commit and an untracked file is planted in it, so a
+/// read that followed an inherited location back to the source would see
+/// another HEAD or a dirty tree. The self-test process runs no other thread,
+/// so it may set and clear the variables here.
 fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
     let git_dir = source.join(".git");
     let git_dir_text = git_dir.to_string_lossy().into_owned();
@@ -9422,20 +9452,57 @@ fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Resu
             ("GIT_INDEX_FILE", &index_text),
         ],
     ];
+    command_ok(
+        fresh_checkout_git().current_dir(source).args([
+            "-c",
+            "user.email=pressure-fixture@example.invalid",
+            "-c",
+            "user.name=pressure fixture",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "move the source past the prepared commit",
+        ]),
+        "advance the inherited-location source fixture",
+    )?;
+    let advanced = git_output_from(fresh_checkout_git(), source, &["rev-parse", "HEAD"])?;
+    if advanced == sha {
+        return Err(
+            "inherited-location source fixture did not advance past the prepared commit".into(),
+        );
+    }
+    let planted = source.join("inherited-location-source-only");
     for inherited in cases {
         let names = inherited
             .iter()
             .map(|(name, _)| *name)
             .collect::<Vec<_>>()
             .join(" and ");
+        fs::write(&planted, "present only in the source\n")
+            .map_err(|e| format!("cannot plant {}: {e}", planted.display()))?;
         let before = repository_location_state(&git_dir)?;
         for (name, value) in inherited {
             env::set_var(name, value);
         }
-        let prepared = FreshCheckout::prepare(source, sha);
+        let prepared = enter_fresh_checkout(source, sha);
+        let leaked = GIT_REPOSITORY_LOCATION_VARIABLES
+            .into_iter()
+            .filter(|name| env::var_os(name).is_some())
+            .collect::<Vec<_>>();
+        let reads = prepared.as_ref().ok().map(|fresh| {
+            (
+                worktree_dirty(&fresh.path),
+                git_output(&fresh.path, &["rev-parse", "HEAD"]),
+            )
+        });
         for name in GIT_REPOSITORY_LOCATION_VARIABLES {
             env::remove_var(name);
         }
+        let unplanted = fs::remove_file(&planted)
+            .map_err(|e| format!("cannot remove {}: {e}", planted.display()));
         let after = repository_location_state(&git_dir)?;
         let changed = before
             .keys()
@@ -9465,12 +9532,25 @@ fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Resu
                 ));
             }
         };
-        let observed = git_output(&fresh.path, &["rev-parse", "HEAD"]);
         let cleanup = fresh.cleanup();
+        unplanted?;
+        if !leaked.is_empty() {
+            return Err(format!(
+                "entering the generated checkout under an inherited {names} left {} set",
+                leaked.join(", ")
+            ));
+        }
+        let (dirty, observed) =
+            reads.ok_or("generated checkout reads did not run after a successful entry")?;
         let observed = observed?;
         if observed != sha {
             return Err(format!(
-                "generated checkout under an inherited {names} resolved to {observed}, expected {sha}"
+                "generated checkout HEAD read under an inherited {names} resolved to {observed}, expected {sha}"
+            ));
+        }
+        if dirty? {
+            return Err(format!(
+                "generated checkout dirtiness read under an inherited {names} reported the source's dirt"
             ));
         }
         cleanup?;
