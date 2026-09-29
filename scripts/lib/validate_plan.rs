@@ -411,12 +411,20 @@ mod tests {
             .and_then(Path::parent)
             .expect("validate_plan.rs lives under scripts/lib");
         let nodes = preflight_nodes(root).unwrap();
+        // Each cap is the committed, measured one; see the node descriptions.
+        // setup.manifest_plan: 300 s wall since fe11e3855, 1.5 x the 187 s at
+        // which its pinned-root clone was killed against the old 180 s cap
+        // (https://github.com/rrnewton/hermit/issues/3381).
+        // gate.manifest: 120 CPU-s since d7138e26e moved the five tool
+        // self-tests into their own selftest.* nodes; the slimmed gate
+        // measured 2.53-2.74 CPU-s at load average 215-233. Its 900 s wall
+        // is unchanged.
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
             ("build.rust_scripts".to_string(), 900, 7200, Some(6_442_450_944)),
-            ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
-            ("gate.manifest".to_string(), 900, 900, Some(5_368_709_120)),
+            ("setup.manifest_plan".to_string(), 300, 7200, Some(2_147_483_648)),
+            ("gate.manifest".to_string(), 900, 120, Some(5_368_709_120)),
         ];
         let check = |candidate: &[Step]| {
             let observed = candidate
@@ -435,26 +443,42 @@ mod tests {
 
         assert_eq!(check(&nodes), Ok(()));
 
+        // The gate's earlier CPU caps (300, 600, then 900 until d7138e26e)
+        // were sized for the self-tests that used to run inside it. Restoring
+        // any of them would silently hand the slimmed gate that budget again.
+        for old_cpu_cap in [300, 600, 900] {
+            let mut widened_gate = nodes.clone();
+            widened_gate
+                .iter_mut()
+                .find(|step| step.tag() == "gate.manifest")
+                .expect("gate.manifest exists")
+                .cpu_timeout = old_cpu_cap;
+            assert!(
+                check(&widened_gate).is_err(),
+                "restoring gate.manifest's pre-d7138e26e {old_cpu_cap}-second CPU cap must fail"
+            );
+        }
+
         let mut lowered_gate = nodes.clone();
         lowered_gate
             .iter_mut()
             .find(|step| step.tag() == "gate.manifest")
             .expect("gate.manifest exists")
-            .cpu_timeout = 300;
+            .cpu_timeout = 60;
         assert!(
             check(&lowered_gate).is_err(),
-            "restoring the measured audit's inadequate 300-second CPU cap must fail"
+            "lowering gate.manifest's measured 120-second CPU cap must fail"
         );
 
-        let mut old_gate_cap = nodes.clone();
-        old_gate_cap
+        let mut old_plan_wall = nodes.clone();
+        old_plan_wall
             .iter_mut()
-            .find(|step| step.tag() == "gate.manifest")
-            .expect("gate.manifest exists")
-            .cpu_timeout = 600;
+            .find(|step| step.tag() == "setup.manifest_plan")
+            .expect("setup.manifest_plan exists")
+            .timeout = 180;
         assert!(
-            check(&old_gate_cap).is_err(),
-            "restoring the 600-second CPU cap that killed three 2026-09-28 runs must fail"
+            check(&old_plan_wall).is_err(),
+            "restoring the 180-second setup.manifest_plan wall cap that killed a 187-second run must fail"
         );
 
         let mut widened_neighbor = nodes;
