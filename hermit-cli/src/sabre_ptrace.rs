@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+use std::ops::Range;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -133,6 +134,10 @@ struct MappingCache {
     entries: HashMap<(AddressSpaceId, usize), MappingClassification>,
     /// Which address space each tracee currently runs in.
     spaces: HashMap<Pid, AddressSpaceId>,
+    /// Spaces `space_of` invented for a tracee that reached a stop before its
+    /// parent's clone/fork/vfork event placed it. Such a space can stand in
+    /// for an mm that other tracees know under a different id.
+    provisional: HashSet<AddressSpaceId>,
     next: u64,
 }
 
@@ -141,6 +146,7 @@ impl MappingCache {
         Self {
             entries: HashMap::new(),
             spaces: HashMap::from([(root, AddressSpaceId(0))]),
+            provisional: HashSet::new(),
             next: 1,
         }
     }
@@ -153,11 +159,14 @@ impl MappingCache {
 
     /// The address space `pid` runs in. An unknown tracee gets a fresh space:
     /// we have never cached anything for it, so it can hold nothing stale.
+    /// That space is PROVISIONAL until the parent's event places the tracee,
+    /// because the tracee may really share its parent's mm.
     fn space_of(&mut self, pid: Pid) -> AddressSpaceId {
         if let Some(id) = self.spaces.get(&pid) {
             return *id;
         }
         let id = self.fresh();
+        self.provisional.insert(id);
         self.spaces.insert(pid, id);
         id
     }
@@ -177,6 +186,28 @@ impl MappingCache {
     fn invalidate_address_space(&mut self, pid: Pid) {
         let space = self.space_of(pid);
         self.entries.retain(|(cached, _), _| *cached != space);
+    }
+
+    /// Apply one completed mutator's `eviction` to the address space `pid`
+    /// runs in, including entries cached while a SIBLING was executing.
+    ///
+    /// A tracee in a provisional space reached this stop before its parent's
+    /// clone event placed it, so the mm it really mutated may be known to the
+    /// cache under another id that no range here would reach. Drop the whole
+    /// cache then. That is never less than the whole-space eviction every
+    /// mutator used to perform.
+    fn evict(&mut self, pid: Pid, eviction: &Eviction) {
+        let space = self.space_of(pid);
+        if self.provisional.contains(&space) {
+            self.entries.clear();
+            return;
+        }
+        match eviction {
+            Eviction::WholeSpace => self.entries.retain(|(cached, _), _| *cached != space),
+            Eviction::Ranges(ranges) => self.entries.retain(|(cached, page), _| {
+                *cached != space || !ranges.iter().any(|range| range.contains(page))
+            }),
+        }
     }
 
     /// `child` shares `parent`'s address space (CLONE_VM / vfork).
@@ -206,6 +237,7 @@ impl MappingCache {
         };
         if !self.spaces.values().any(|other| *other == space) {
             self.entries.retain(|(cached, _), _| *cached != space);
+            self.provisional.remove(&space);
         }
     }
 
@@ -621,15 +653,18 @@ impl Supervisor {
             }
             libc::PTRACE_SYSCALL_INFO_EXIT => {
                 // A cached verdict describes the mapping that occupied that page
-                // when it was classified. mmap/munmap/mremap/mprotect/brk can
-                // replace or re-permission that page in-process, so a page
+                // when it was classified. mmap/munmap/mremap/mprotect/brk/shmat
+                // can replace or re-permission that page in-process, so a page
                 // previously classified as trusted can come to host a
-                // completely different raw-syscall site. Drop the whole
-                // ADDRESS SPACE this tracee runs in whenever it mutates that
-                // space; the next site there is reclassified against live
-                // /proc/<pid>/maps. Whole-space is coarse but correct --
-                // per-page would be an optimisation, not a correctness
-                // requirement.
+                // completely different raw-syscall site. Whenever this tracee
+                // mutates its ADDRESS SPACE, drop the cached pages the
+                // mutation can have changed: its exact page range where the
+                // kernel confines the change to one, otherwise the whole space
+                // (see `mutation_eviction`). The next site there is
+                // reclassified against live /proc/<pid>/maps. Evicting the
+                // whole space on EVERY mutation made each later site re-read
+                // and re-parse that file, which was most of this supervisor's
+                // CPU: https://github.com/rrnewton/hermit/issues/3378.
                 let exit_regs = ptrace::getregs(pid)?;
                 if let Some(response) = self.states.entry(pid).or_default().pending_bootstrap.take()
                 {
@@ -644,11 +679,12 @@ impl Supervisor {
                     return self.resume(pid, None);
                 }
                 if mutates_address_space(exit_regs.orig_rax) {
-                    // Evict the whole ADDRESS SPACE, not just this thread's
-                    // entries: CLONE_VM siblings share one mm, so a sibling
-                    // would otherwise keep serving a pre-mutation verdict for
-                    // the very page this syscall just replaced.
-                    self.mapping_cache.invalidate_address_space(pid);
+                    // Evict from the whole ADDRESS SPACE, not just this
+                    // thread's entries: CLONE_VM siblings share one mm, so a
+                    // sibling would otherwise keep serving a pre-mutation
+                    // verdict for the very page this syscall just replaced.
+                    self.mapping_cache
+                        .evict(pid, &mutation_eviction(&exit_regs));
                 }
                 if let Some(pending) = self.states.entry(pid).or_default().pending_patch.take() {
                     let mut regs = exit_regs;
@@ -717,7 +753,7 @@ impl Supervisor {
         pid: Pid,
         address: usize,
     ) -> Result<MappingClassification, Error> {
-        let page = address & !4095usize;
+        let page = address & !(PAGE_SIZE - 1);
         if let Some(classification) = self.mapping_cache.get(pid, page) {
             return Ok(classification.clone());
         }
@@ -873,7 +909,8 @@ fn mapping_diagnostic(maps: &str, address: usize) -> Option<MappingDiagnostic> {
 
 /// Syscalls that can replace, move, unmap or re-permission a page in the
 /// tracee's address space. A cached page classification is only valid until one
-/// of these runs, so observing any of them invalidates that tracee's cache.
+/// of these runs, so observing any of them evicts the cached pages it can have
+/// changed (`mutation_eviction`).
 const ADDRESS_SPACE_MUTATORS: [u64; 6] = [
     libc::SYS_mmap as u64,
     libc::SYS_munmap as u64,
@@ -888,6 +925,125 @@ const ADDRESS_SPACE_MUTATORS: [u64; 6] = [
 /// invalidated -- after the mapping change has actually taken effect.
 fn mutates_address_space(nr: u64) -> bool {
     ADDRESS_SPACE_MUTATORS.contains(&nr)
+}
+
+/// Size of the pages the mapping cache is keyed by.
+const PAGE_SIZE: usize = 4096;
+
+/// The smallest hugetlb page size on x86-64. The only other one, 1 GiB, is a
+/// multiple of it. A hugetlb vma always starts on a boundary of its own page
+/// size, so a range that contains no multiple of this cannot start one.
+const MIN_HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+
+/// Which cached pages one completed address-space mutator can have changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Eviction {
+    /// Only the pages that start inside one of these page-aligned ranges.
+    Ranges(Vec<Range<usize>>),
+    /// Every page of the address space.
+    WholeSpace,
+}
+
+/// `[addr, addr + len)` widened to whole pages, the way the kernel rounds the
+/// length of every call `mutation_eviction` gives a range for. `None` when the
+/// end overflows.
+fn page_range(addr: u64, len: u64) -> Option<Range<usize>> {
+    let start = usize::try_from(addr).ok()?;
+    let end = start
+        .checked_add(usize::try_from(len).ok()?)?
+        .checked_next_multiple_of(PAGE_SIZE)?;
+    Some(start & !(PAGE_SIZE - 1)..end)
+}
+
+/// True when `range` contains a multiple of `MIN_HUGE_PAGE_SIZE`, the only
+/// place a hugetlb vma can start. An overflow counts as containing one.
+fn contains_huge_page_boundary(range: &Range<usize>) -> bool {
+    range
+        .start
+        .checked_next_multiple_of(MIN_HUGE_PAGE_SIZE)
+        .is_none_or(|boundary| boundary < range.end)
+}
+
+/// Which cached pages a completed address-space mutator can have changed, read
+/// from the registers at its syscall-exit stop: `orig_rax` is the syscall,
+/// `rax` its result, and its arguments are still in rdi, rsi, rdx, r10 and r8.
+///
+/// Ranges are returned only where the kernel confines a SUCCESSFUL call to
+/// pages that its arguments and result determine, each rounded out to whole
+/// pages:
+///
+///   * munmap and mprotect change nothing outside `[addr, addr + len)`;
+///   * mmap changes only the new mapping `[result, result + len)`. With
+///     MAP_FIXED that includes unmapping whatever was there, which the kernel
+///     does for exactly that range, splitting any vma that straddles an edge;
+///   * mremap changes only its old range `[old_addr, old_addr + old_len)` and
+///     its new range `[result, result + new_len)`, whether it resizes in place
+///     or moves: MREMAP_MAYMOVE, MREMAP_FIXED and MREMAP_DONTUNMAP (which
+///     leaves the old range mapped). MREMAP_FIXED first unmaps the requested
+///     destination `[new_addr, new_addr + new_len)`, so that range goes too;
+///     it is the new range unless a driver's get_unmapped_area disregards
+///     MAP_FIXED.
+///
+/// Everything else evicts the whole space, as every mutator used to:
+///
+///   * a failed call, because mmap with MAP_FIXED unmaps before it can fail,
+///     and mprotect can fail after changing part of its range;
+///   * brk and shmat, whose extent is not in their registers, and any other
+///     syscall number;
+///   * anything that may be a hugetlb mapping, which the kernel sizes in huge
+///     pages rather than base pages: mmap with MAP_HUGETLB, an mmap result on
+///     a huge-page boundary (a hugetlbfs file needs no flag, but its mappings
+///     always start on one), and an mremap range that contains a huge-page
+///     boundary (every hugetlb vma starts on one). The kernel refuses to split
+///     a hugetlb vma off such a boundary, so munmap, mprotect and MAP_FIXED
+///     fail rather than reach past their range;
+///   * mprotect with PROT_GROWSDOWN or PROT_GROWSUP, which extends the change
+///     to the edge of the vma;
+///   * mremap with an old length of 0, which duplicates a shared mapping;
+///   * a range whose end overflows.
+fn mutation_eviction(regs: &libc::user_regs_struct) -> Eviction {
+    // The kernel reports failure as -errno, in [-4095, -1].
+    if (-4095..0).contains(&(regs.rax as i64)) {
+        return Eviction::WholeSpace;
+    }
+    let ranges = match regs.orig_rax as libc::c_long {
+        libc::SYS_mmap => {
+            let hugetlb_flag = (regs.r10 & libc::MAP_HUGETLB as u64) != 0;
+            let on_huge_page_boundary = regs.rax.is_multiple_of(MIN_HUGE_PAGE_SIZE as u64);
+            if hugetlb_flag || on_huge_page_boundary {
+                None
+            } else {
+                page_range(regs.rax, regs.rsi).map(|mapped| vec![mapped])
+            }
+        }
+        libc::SYS_munmap => page_range(regs.rdi, regs.rsi).map(|unmapped| vec![unmapped]),
+        // pkey_mprotect is the same kernel function with the same range
+        // arguments. ADDRESS_SPACE_MUTATORS does not list it, so today the
+        // supervisor never asks about it; protection is not part of a verdict.
+        libc::SYS_mprotect | libc::SYS_pkey_mprotect => {
+            let grows = (libc::PROT_GROWSDOWN | libc::PROT_GROWSUP) as u64;
+            if (regs.rdx & grows) != 0 {
+                None
+            } else {
+                page_range(regs.rdi, regs.rsi).map(|protected| vec![protected])
+            }
+        }
+        libc::SYS_mremap if regs.rsi != 0 => {
+            let new = page_range(regs.rax, regs.rdx);
+            let requested = page_range(regs.r8, regs.rdx);
+            let fixed = (regs.r10 & libc::MREMAP_FIXED as u64) != 0;
+            let mut ranges = vec![page_range(regs.rdi, regs.rsi), new.clone()];
+            if fixed && requested != new {
+                ranges.push(requested);
+            }
+            ranges
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .filter(|ranges| !ranges.iter().any(contains_huge_page_boundary))
+        }
+        _ => None,
+    };
+    ranges.map_or(Eviction::WholeSpace, Eviction::Ranges)
 }
 
 /// Whether two tasks share one address space.
@@ -1948,5 +2104,441 @@ mod tests {
                 "syscall {nr} cannot change a mapping and must not invalidate the cache"
             );
         }
+    }
+
+    // Range-precise eviction (https://github.com/rrnewton/hermit/issues/3378).
+
+    /// Registers at the syscall-exit stop of `nr` returning `result`, with the
+    /// arguments still in rdi, rsi, rdx and r10 as the x86-64 ABI leaves them.
+    fn exit_regs(nr: libc::c_long, args: [u64; 4], result: i64) -> libc::user_regs_struct {
+        // SAFETY: user_regs_struct is plain integers, so all-zero is a value.
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.orig_rax = nr as u64;
+        regs.rdi = args[0];
+        regs.rsi = args[1];
+        regs.rdx = args[2];
+        regs.r10 = args[3];
+        regs.rax = result as u64;
+        regs
+    }
+
+    fn ranges(ranges: &[Range<usize>]) -> Eviction {
+        Eviction::Ranges(ranges.to_vec())
+    }
+
+    /// The eviction of the single range `[start, end)`. A one-element array of
+    /// ranges is what clippy::single_range_in_vec_init refuses.
+    fn one_range(start: usize, end: usize) -> Eviction {
+        let range = start..end;
+        Eviction::Ranges(vec![range])
+    }
+
+    /// A page inside the mutated range is evicted and a page outside it is
+    /// kept, including the neighbours on both sides. The length is rounded up
+    /// to a whole page, as the kernel does, so a partial last page goes too.
+    #[test]
+    fn a_range_eviction_drops_pages_in_range_and_keeps_the_rest() {
+        let pid = Pid::from_raw(100);
+        let mut cache = MappingCache::new(pid);
+        for page in [0xf000, 0x10000, 0x11000, 0x12000] {
+            cache.insert(pid, page, trusted());
+        }
+
+        let munmap = exit_regs(libc::SYS_munmap, [0x10000, 0x1800, 0, 0], 0);
+        let eviction = mutation_eviction(&munmap);
+        assert_eq!(eviction, one_range(0x10000, 0x12000));
+        cache.evict(pid, &eviction);
+
+        assert!(cache.get(pid, 0x10000).is_none(), "first page in range");
+        assert!(
+            cache.get(pid, 0x11000).is_none(),
+            "the partial last page is unmapped too"
+        );
+        assert!(
+            cache.get(pid, 0xf000).is_some(),
+            "the page before the range"
+        );
+        assert!(
+            cache.get(pid, 0x12000).is_some(),
+            "the page after the range"
+        );
+    }
+
+    /// mmap names the new mapping by its RESULT, including MAP_FIXED over
+    /// pages that were already mapped, which the kernel unmaps for exactly
+    /// that range; mprotect names its arguments.
+    #[test]
+    fn mmap_and_mprotect_ranges() {
+        let fixed = (libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
+        let prot = (libc::PROT_READ | libc::PROT_EXEC) as u64;
+        assert_eq!(
+            mutation_eviction(&exit_regs(
+                libc::SYS_mmap,
+                [0x30000, 0x2000, prot, fixed],
+                0x30000
+            )),
+            one_range(0x30000, 0x32000),
+            "MAP_FIXED over existing pages"
+        );
+        assert_eq!(
+            mutation_eviction(&exit_regs(
+                libc::SYS_mmap,
+                [0, 0x2001, prot, libc::MAP_PRIVATE as u64],
+                0x7f00_0000_1000
+            )),
+            one_range(0x7f00_0000_1000, 0x7f00_0000_4000),
+            "a kernel-chosen address, length rounded up"
+        );
+        for nr in [libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+            assert_eq!(
+                mutation_eviction(&exit_regs(nr, [0x40000, 0x1000, prot, 0], 0)),
+                one_range(0x40000, 0x41000),
+                "syscall {nr}"
+            );
+        }
+    }
+
+    /// A zero-length mprotect succeeds without touching anything.
+    #[test]
+    fn a_zero_length_mprotect_evicts_nothing() {
+        let pid = Pid::from_raw(100);
+        let mut cache = MappingCache::new(pid);
+        cache.insert(pid, 0x40000, trusted());
+        let prot = libc::PROT_READ as u64;
+        let eviction = mutation_eviction(&exit_regs(libc::SYS_mprotect, [0x40000, 0, prot, 0], 0));
+        assert_eq!(eviction, one_range(0x40000, 0x40000));
+        cache.evict(pid, &eviction);
+        assert!(cache.get(pid, 0x40000).is_some());
+    }
+
+    /// mremap changes both its old and its new range, whether it resizes in
+    /// place or moves, and whichever of MREMAP_MAYMOVE, MREMAP_FIXED and
+    /// MREMAP_DONTUNMAP it was given. Both ranges must be evicted and a page
+    /// between or beyond them kept. MREMAP_FIXED also unmaps the destination
+    /// it names in r8, which is evicted as well when it is not the result.
+    #[test]
+    fn mremap_evicts_both_its_old_and_its_new_range() {
+        let maymove = libc::MREMAP_MAYMOVE as u64;
+        let fixed = (libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as u64;
+        let dontunmap = (libc::MREMAP_MAYMOVE | libc::MREMAP_DONTUNMAP) as u64;
+        for (flags, new_len) in [(maymove, 0x3000), (fixed, 0x3000), (dontunmap, 0x2000)] {
+            let mut regs = exit_regs(libc::SYS_mremap, [0x20000, 0x2000, new_len, flags], 0x40000);
+            regs.r8 = 0x40000;
+            let eviction = mutation_eviction(&regs);
+            let new_end = 0x40000 + new_len as usize;
+            assert_eq!(
+                eviction,
+                ranges(&[0x20000..0x22000, 0x40000..new_end]),
+                "flags {flags:#x}"
+            );
+
+            let pid = Pid::from_raw(100);
+            let mut cache = MappingCache::new(pid);
+            for page in [
+                0x1f000, 0x20000, 0x21000, 0x22000, 0x40000, 0x41000, new_end,
+            ] {
+                cache.insert(pid, page, trusted());
+            }
+            cache.evict(pid, &eviction);
+            for page in [0x20000, 0x21000, 0x40000, 0x41000] {
+                assert!(cache.get(pid, page).is_none(), "{page:#x} was remapped");
+            }
+            for page in [0x1f000, 0x22000, new_end] {
+                assert!(cache.get(pid, page).is_some(), "{page:#x} was not");
+            }
+        }
+
+        let mut elsewhere = exit_regs(libc::SYS_mremap, [0x20000, 0x2000, 0x3000, fixed], 0x40000);
+        elsewhere.r8 = 0x60000;
+        let eviction = mutation_eviction(&elsewhere);
+        assert_eq!(
+            eviction,
+            ranges(&[0x20000..0x22000, 0x40000..0x43000, 0x60000..0x63000]),
+            "MREMAP_FIXED unmapped r8 even though the move went elsewhere"
+        );
+        let pid = Pid::from_raw(100);
+        let mut cache = MappingCache::new(pid);
+        for page in [0x5f000, 0x60000, 0x62000, 0x63000] {
+            cache.insert(pid, page, trusted());
+        }
+        cache.evict(pid, &eviction);
+        for page in [0x60000, 0x62000] {
+            assert!(cache.get(pid, page).is_none(), "{page:#x} was unmapped");
+        }
+        for page in [0x5f000, 0x63000] {
+            assert!(cache.get(pid, page).is_some(), "{page:#x} was not");
+        }
+
+        assert_eq!(
+            mutation_eviction(&exit_regs(
+                libc::SYS_mremap,
+                [0x20000, 0x2000, 0x4000, 0],
+                0x20000
+            )),
+            ranges(&[0x20000..0x22000, 0x20000..0x24000]),
+            "growth in place"
+        );
+    }
+
+    /// A failed call can still have changed part of its range, or more than
+    /// it names, so every error evicts every page of the space -- but only of
+    /// that space.
+    #[test]
+    fn a_failed_mutator_evicts_the_whole_space() {
+        let prot = libc::PROT_READ as u64;
+        let fixed = libc::MAP_FIXED as u64;
+        let calls = [
+            (libc::SYS_mmap, [0x10000, 0x1000, prot, fixed]),
+            (libc::SYS_munmap, [0x10000, 0x1000, 0, 0]),
+            (libc::SYS_mprotect, [0x10000, 0x1000, prot, 0]),
+            (libc::SYS_mremap, [0x10000, 0x1000, 0x1000, 0]),
+            (libc::SYS_brk, [0x10000, 0, 0, 0]),
+            (libc::SYS_shmat, [1, 0x10000, 0, 0]),
+        ];
+        let errors = [-4095, -(libc::ENOMEM as i64), -(libc::EINVAL as i64), -1];
+        for (nr, args) in calls {
+            for error in errors {
+                let eviction = mutation_eviction(&exit_regs(nr, args, error));
+                assert_eq!(eviction, Eviction::WholeSpace, "syscall {nr} -> {error}");
+
+                let a = Pid::from_raw(100);
+                let b = Pid::from_raw(101);
+                let unrelated = Pid::from_raw(200);
+                let mut cache = MappingCache::new(a);
+                cache.share_address_space(a, b);
+                cache.new_address_space(unrelated);
+                cache.insert(b, 0x10000, trusted());
+                cache.insert(b, 0x900000, trusted());
+                cache.insert(unrelated, 0x10000, trusted());
+                cache.evict(a, &eviction);
+                assert!(cache.get(b, 0x10000).is_none(), "the named page");
+                assert!(cache.get(b, 0x900000).is_none(), "a page far outside it");
+                assert!(
+                    cache.get(unrelated, 0x10000).is_some(),
+                    "another address space"
+                );
+            }
+        }
+    }
+
+    /// brk and shmat do not name their extent in their registers, so they keep
+    /// the whole-space eviction, as does any number not handled explicitly.
+    #[test]
+    fn calls_without_a_provable_range_evict_the_whole_space() {
+        for (nr, args, result) in [
+            (libc::SYS_brk, [0x60_0000, 0, 0, 0], 0x60_0000),
+            (libc::SYS_shmat, [3, 0, 0, 0], 0x7f00_0000_1000),
+            (libc::SYS_getpid, [0, 0, 0, 0], 100),
+        ] {
+            assert_eq!(
+                mutation_eviction(&exit_regs(nr, args, result)),
+                Eviction::WholeSpace,
+                "syscall {nr}"
+            );
+        }
+        assert_eq!(
+            mutation_eviction(&exit_regs(
+                libc::SYS_mremap,
+                [0x20000, 0, 0x2000, libc::MREMAP_MAYMOVE as u64],
+                0x40000
+            )),
+            Eviction::WholeSpace,
+            "an old length of 0 duplicates a shared mapping"
+        );
+    }
+
+    /// A hugetlb mapping is sized in huge pages, so wherever one may be
+    /// involved the base-page range is not trusted and the whole space goes.
+    #[test]
+    fn possible_hugetlb_mappings_evict_the_whole_space() {
+        const HUGE: u64 = MIN_HUGE_PAGE_SIZE as u64;
+        let prot = libc::PROT_READ as u64;
+        let private = libc::MAP_PRIVATE as u64;
+        let huge_flag = private | libc::MAP_ANONYMOUS as u64 | libc::MAP_HUGETLB as u64;
+        let mmap = |flags: u64, result: u64| {
+            mutation_eviction(&exit_regs(
+                libc::SYS_mmap,
+                [0, 0x1000, prot, flags],
+                result as i64,
+            ))
+        };
+        assert_eq!(
+            mmap(huge_flag, 3 * HUGE + 0x1000),
+            Eviction::WholeSpace,
+            "MAP_HUGETLB"
+        );
+        assert_eq!(
+            mmap(private, 3 * HUGE),
+            Eviction::WholeSpace,
+            "a hugetlbfs file needs no flag but always lands on a huge-page boundary"
+        );
+        assert_eq!(
+            mmap(private, 1 << 30),
+            Eviction::WholeSpace,
+            "a 1 GiB boundary"
+        );
+        assert_eq!(
+            mmap(private, 3 * HUGE + 0x1000),
+            one_range(0x60_1000, 0x60_2000),
+            "one page past a boundary cannot be hugetlb"
+        );
+
+        let mremap = |old: u64, old_len: u64, new_len: u64, result: u64| {
+            mutation_eviction(&exit_regs(
+                libc::SYS_mremap,
+                [old, old_len, new_len, libc::MREMAP_MAYMOVE as u64],
+                result as i64,
+            ))
+        };
+        assert_eq!(
+            mremap(HUGE, 0x1000, 0x1000, 0x7f00_0000_1000),
+            Eviction::WholeSpace,
+            "an old range starting on a boundary"
+        );
+        assert_eq!(
+            mremap(HUGE - 0x1000, 0x2000, 0x1000, 0x7f00_0000_1000),
+            Eviction::WholeSpace,
+            "an old range containing a boundary"
+        );
+        assert_eq!(
+            mremap(0x1000, 0x1000, 0x2000, 5 * HUGE - 0x1000),
+            Eviction::WholeSpace,
+            "a new range containing a boundary"
+        );
+        assert_eq!(
+            mremap(HUGE - 0x2000, 0x2000, 0x1000, 0x7f00_0000_1000),
+            ranges(&[0x1f_e000..0x20_0000, 0x7f00_0000_1000..0x7f00_0000_2000]),
+            "an old range ending exactly at a boundary does not contain it"
+        );
+    }
+
+    /// PROT_GROWSDOWN and PROT_GROWSUP extend mprotect to the edge of the vma,
+    /// which the registers do not name.
+    #[test]
+    fn growing_mprotect_evicts_the_whole_space() {
+        for grows in [libc::PROT_GROWSDOWN, libc::PROT_GROWSUP] {
+            let prot = (libc::PROT_READ | grows) as u64;
+            assert_eq!(
+                mutation_eviction(&exit_regs(
+                    libc::SYS_mprotect,
+                    [0x40000, 0x1000, prot, 0],
+                    0
+                )),
+                Eviction::WholeSpace,
+                "prot {prot:#x}"
+            );
+        }
+    }
+
+    /// A range whose end does not fit in the address width is not trusted.
+    #[test]
+    fn an_overflowing_range_evicts_the_whole_space() {
+        assert_eq!(
+            mutation_eviction(&exit_regs(
+                libc::SYS_munmap,
+                [u64::MAX - 0xfff, 0x2000, 0, 0],
+                0
+            )),
+            Eviction::WholeSpace
+        );
+        assert_eq!(
+            mutation_eviction(&exit_regs(
+                libc::SYS_mprotect,
+                [u64::MAX - 0xfff, 0x800, 0, 0],
+                0
+            )),
+            Eviction::WholeSpace,
+            "rounding the end up to a page overflows"
+        );
+    }
+
+    /// A sibling THREAD sharing the mm loses its cached verdict for a page in
+    /// the mutated range, even though a different thread made the call.
+    #[test]
+    fn a_sibling_thread_sees_a_range_eviction() {
+        let a = Pid::from_raw(100);
+        let b = Pid::from_raw(101);
+        let mut cache = MappingCache::new(a);
+        cache.share_address_space(a, b);
+        cache.insert(b, 0x10000, trusted());
+        cache.insert(b, 0x20000, trusted());
+
+        let prot = libc::PROT_READ as u64;
+        let mprotect = exit_regs(libc::SYS_mprotect, [0x10000, 0x1000, prot, 0], 0);
+        cache.evict(a, &mutation_eviction(&mprotect));
+
+        assert!(
+            cache.get(b, 0x10000).is_none(),
+            "in range, cached by the sibling"
+        );
+        assert!(cache.get(b, 0x20000).is_some(), "out of range");
+    }
+
+    /// The same through a real CLONE_VM child that is NOT a thread, placed by
+    /// the kernel oracle, in both directions: either sharer's mutation evicts
+    /// the other's cached page in range.
+    #[test]
+    fn a_clone_vm_child_sees_a_range_eviction() {
+        with_child(true, |parent, child| {
+            let mut cache = MappingCache::new(parent);
+            cache.admit_child(parent, child, mm_sharing(parent, child));
+            let munmap = |addr| exit_regs(libc::SYS_munmap, [addr, 0x1000, 0, 0], 0);
+
+            cache.insert(child, 0x10000, trusted());
+            cache.insert(child, 0x20000, trusted());
+            cache.evict(parent, &mutation_eviction(&munmap(0x10000)));
+            assert!(cache.get(child, 0x10000).is_none(), "parent's mutation");
+            assert!(cache.get(child, 0x20000).is_some(), "out of range");
+
+            cache.insert(parent, 0x30000, trusted());
+            cache.evict(child, &mutation_eviction(&munmap(0x30000)));
+            assert!(cache.get(parent, 0x30000).is_none(), "child's mutation");
+            assert!(cache.get(parent, 0x20000).is_some(), "out of range");
+        });
+    }
+
+    /// A range eviction stays inside the mutated address space: another mm
+    /// maps something else at the same address and keeps its verdict.
+    #[test]
+    fn a_range_eviction_leaves_an_unrelated_address_space_alone() {
+        let a = Pid::from_raw(100);
+        let unrelated = Pid::from_raw(200);
+        let mut cache = MappingCache::new(a);
+        cache.new_address_space(unrelated);
+        cache.insert(a, 0x10000, trusted());
+        cache.insert(unrelated, 0x10000, trusted());
+
+        let munmap = exit_regs(libc::SYS_munmap, [0x10000, 0x1000, 0, 0], 0);
+        cache.evict(a, &mutation_eviction(&munmap));
+
+        assert!(cache.get(a, 0x10000).is_none());
+        assert!(cache.get(unrelated, 0x10000).is_some());
+    }
+
+    /// A tracee that stops before its parent's clone event has placed it runs
+    /// in a provisional space that may stand for its parent's mm under another
+    /// id. Its mutation cannot be aimed, so it drops the whole cache; once the
+    /// event places it, its ranges apply to the real space again.
+    #[test]
+    fn a_mutation_before_admission_drops_every_cached_page() {
+        let parent = Pid::from_raw(100);
+        let early = Pid::from_raw(101);
+        let mut cache = MappingCache::new(parent);
+        cache.insert(parent, 0x10000, trusted());
+        cache.insert(parent, 0x20000, trusted());
+
+        let munmap = exit_regs(libc::SYS_munmap, [0x10000, 0x1000, 0, 0], 0);
+        cache.evict(early, &mutation_eviction(&munmap));
+        assert!(
+            cache.entries.is_empty(),
+            "an unplaced tracee may share the parent's mm, so nothing may survive"
+        );
+
+        cache.admit_child(parent, early, MmSharing::Shared);
+        cache.insert(parent, 0x10000, trusted());
+        cache.insert(parent, 0x20000, trusted());
+        cache.evict(early, &mutation_eviction(&munmap));
+        assert!(cache.get(parent, 0x10000).is_none(), "placed: in range");
+        assert!(cache.get(parent, 0x20000).is_some(), "placed: out of range");
     }
 }
