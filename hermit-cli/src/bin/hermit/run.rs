@@ -596,9 +596,14 @@ pub struct RunOpts {
     #[clap(long = "print-verify-logs", alias = "verify-logs", requires = "verify")]
     print_verify_logs: bool,
 
-    /// Retain both captured verification logs after either a match or a
-    /// divergence. Logs are written under --verify-log-dir when provided;
-    /// otherwise under $XDG_STATE_HOME/hermit/verify-logs (normally
+    /// Retain the captured verification logs after the comparison. After a
+    /// match, only the first run's log is kept, as the golden log; the second
+    /// run's log, which compared equal to it under the selected comparison
+    /// policy, is deleted. After a divergence, a no-result, or an error, both
+    /// logs are kept, or only the first run's when verification stopped before
+    /// a second run.
+    /// Logs are written under --verify-log-dir when provided; otherwise under
+    /// $XDG_STATE_HOME/hermit/verify-logs (normally
     /// ~/.local/state/hermit/verify-logs). The final paths are printed.
     #[clap(long, requires = "verify")]
     keep_logs: bool,
@@ -2996,8 +3001,8 @@ impl RunOpts {
     /// Backend::Kvm`, so plain KVM verification bypassed internal-log comparison
     /// entirely and `--verify-strict` could not reach the canonical comparator on
     /// that backend at all. The special case was not narrowed, it was removed:
-    /// every backend now retains both logs and picks its comparator here from
-    /// `verify_verbose`/`verify_strict` only.
+    /// every backend now compares both captured logs and picks its comparator
+    /// here from `verify_verbose`/`verify_strict` only.
     ///
     /// Removing a branch leaves nothing behind to notice its return, so
     /// `comparator_choice_does_not_depend_on_the_backend` pins the absence
@@ -3034,6 +3039,8 @@ impl RunOpts {
             diagnostic_full_trace: self.verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
             keep_logs: self.keep_logs,
+            // `verify` sets this when a skid overshoot overrides the match.
+            match_overridden: false,
             failed_log_retention: (!self.keep_logs).then(default_failed_verify_log_retention),
             record_envelope: RecordEnvelope::all_records_v1(),
             // Read from the LIVE config, not a constant: `--no-virtualize-time`
@@ -4616,7 +4623,7 @@ impl RunOpts {
         // verified" on a run that the same command with hashing enabled
         // reports as diverged. Claiming
         // determinism there was the defect, so the sentence now names its limit.
-        let comparison_options = self.verification_comparison_options();
+        let mut comparison_options = self.verification_comparison_options();
         let success_message = if !comparison_options.compare_io_buffers {
             // The "Determinism verified" marker is RETAINED verbatim and the
             // qualification appended after it. That is not politeness: ~110
@@ -4647,6 +4654,11 @@ impl RunOpts {
                 Some(out1.status),
             )?;
         }
+        // A skid overshoot makes this verification an infrastructure error
+        // below, whatever the comparison finds, so a log match is not the
+        // verdict. `--keep-logs` then retains both logs, as every other error
+        // path does, instead of the single golden log kept after a match.
+        comparison_options.match_overridden = skid_overshoots > 0;
         let mut outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
