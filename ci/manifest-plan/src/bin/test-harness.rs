@@ -42,6 +42,8 @@ use hermit_manifest_plan::stress_series::HostCapability;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD;
+use hermit_manifest_plan::validation_dag::TOOL_SELF_TESTS;
+use hermit_manifest_plan::validation_dag::ToolSelfTest;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
@@ -69,6 +71,7 @@ Commands:
   audit-compile                    Compile selected C test programs
   run                              Execute selected cells
   parity compare                   Measure parity cells from a finished run's retained logs
+  selftest <NAME>                  Run one repository tool's self-test
 
 Selection options:
   --lane <portable|privileged>
@@ -240,6 +243,10 @@ fn print_command_help(command: &str) -> bool {
         ),
         "parity" => {
             println!("{PARITY_HELP}");
+            return true;
+        }
+        "selftest" => {
+            println!("{}", selftest_help());
             return true;
         }
         _ => return false,
@@ -500,6 +507,12 @@ fn build_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
 /// contention. An unaffected prebuilt gate retains the existing two-worker
 /// default; unavailable prebuilt scripts and malformed explicit values fail
 /// closed to serial execution.
+///
+/// Since 2026-09-29 the five tool self-tests run as their own `selftest.<name>`
+/// DAG nodes (https://github.com/rrnewton/hermit/issues/3381), so `validate`
+/// schedules only `generate-test-footprints --check` here and this width no
+/// longer changes what the gate spends. The history above explains the value
+/// and is kept for the audits that may be added back.
 fn validation_audit_worker_capacity(
     prebuilt_rust_scripts: bool,
     configured_jobs: Option<&str>,
@@ -644,6 +657,9 @@ fn main() -> ExitCode {
         run_manifest_plan(&root);
         return parity_compare(&root, &manifests, &request);
     }
+    if command == "selftest" {
+        return run_tool_self_test(&values);
+    }
     if command == "expected-plan" && !values.is_empty() {
         fail("expected-plan accepts no options");
     }
@@ -690,15 +706,13 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error));
     audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
     audit_determinism_stress_evidence(root);
-    // These self-contained audits read the same checked-out tree but keep all
-    // generated state in their own temporary directories. The validation DAG
-    // supplies immutable prebuilt rust-script binaries and the admitted
-    // CARGO_BUILD_JOBS width to each child. The ordinary DAG gate explicitly
-    // selects a serial top-level schedule so its combined CPU remains bounded
-    // by the unchanged gate cap; variants without that declaration retain the
-    // existing two-worker schedule. Publish each completed child immediately
-    // so a later timeout retains its diagnostics; the final status summary
-    // keeps the original order.
+    // Only the generated-footprint check remains here: it compares committed
+    // generated metadata with its source, which is what this gate owns. The
+    // repository tools' own self-tests (TOOL_SELF_TESTS) are not preconditions
+    // of any product node, so each runs as its own `selftest.<name>` leaf node
+    // through `test-harness selftest <name>`; nothing depends on those nodes,
+    // and a failure still makes the validation red. Publish the child's output
+    // on completion so a timeout retains its diagnostics.
     let audit_jobs = validation_audit_worker_capacity(
         std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1"),
         std::env::var(VALIDATE_AUDIT_JOBS_ENV).ok().as_deref(),
@@ -706,31 +720,10 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     .configured();
     run_audits_parallel(
         root,
-        &[
-            (
-                root.join("target/debug/generate-test-footprints"),
-                vec!["--check"],
-            ),
-            (root.join("tests/manifest-cli.rs"), vec!["self-test"]),
-            // The DBT budget wrapper gates roughly twenty portable nodes and
-            // fails CLOSED on a pin it is not calibrated for. Nothing else
-            // notices: a truncated node reads like a fast one. This asserts end
-            // to end that the wrapper still REACHES its wrapped command at the
-            // recorded pin.
-            (root.join("ci/run-with-reverie-dbt-budget-test.sh"), vec![]),
-            (
-                root.join("ci/compat-envelope/scorecard.rs"),
-                vec!["self-test-and-check"],
-            ),
-            (
-                root.join("ci/compat-envelope/pressure-test.rs"),
-                vec!["self-test"],
-            ),
-            // The removed shell front door accumulated plan/scheduler/receipt
-            // guards that now belong to the Rust validate driver. Exercise
-            // those brackets without executing the validation DAG.
-            (root.join("scripts/validate.rs"), vec!["--self-test"]),
-        ],
+        &[(
+            root.join("target/debug/generate-test-footprints"),
+            vec!["--check"],
+        )],
         audit_jobs,
     );
     audit_cli_brackets(root);
@@ -739,6 +732,59 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
         "PASS: {} YAML manifests, {} required cells",
         manifests.documents.len(),
         cells
+    );
+    ExitCode::SUCCESS
+}
+
+fn selftest_help() -> String {
+    let mut help = String::from(
+        "Usage: test-harness selftest <NAME>\n\n\
+         Run one repository tool's self-test from the repository root. The\n\
+         validation DAG runs each as its own selftest.<NAME> node.\n\nNames:",
+    );
+    for tool in TOOL_SELF_TESTS {
+        help.push_str(&format!(
+            "\n  {:<32} {}",
+            tool.name,
+            tool_self_test_command(tool)
+        ));
+    }
+    help.push_str("\n\nOptions:\n  -h, --help                       Print this help");
+    help
+}
+
+fn tool_self_test_command(tool: &ToolSelfTest) -> String {
+    std::iter::once(tool.program)
+        .chain(tool.args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_tool_self_test(values: &[String]) -> ExitCode {
+    let names = TOOL_SELF_TESTS
+        .iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let [name] = values else {
+        fail(format!("selftest takes exactly one name, one of: {names}"));
+    };
+    let tool = TOOL_SELF_TESTS
+        .iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| {
+            fail(format!(
+                "unknown self-test {name}; expected one of: {names}"
+            ))
+        });
+    let root = root();
+    let started = std::time::Instant::now();
+    run_audit(&root, &root.join(tool.program), tool.args);
+    println!(
+        "test-harness: self-test {} passed: {}; elapsed={:.3}s",
+        tool.name,
+        tool_self_test_command(tool),
+        started.elapsed().as_secs_f64()
     );
     ExitCode::SUCCESS
 }

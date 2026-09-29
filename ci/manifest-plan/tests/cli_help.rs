@@ -133,6 +133,7 @@ fn every_test_harness_subcommand_has_conventional_help() {
         "audit-compile",
         "run",
         "parity",
+        "selftest",
     ];
 
     let non_repo = non_repository_dir("subcommand-help");
@@ -246,6 +247,7 @@ fn execution_subcommand_help_names_every_environment_read() {
         "audit-test-binary-registration",
         "audit-test-footprints",
         "audit-ci",
+        "selftest",
     ] {
         let output = run(harness, &[command, "--help"]);
         assert!(output.status.success(), "{output:?}");
@@ -380,6 +382,40 @@ fn test_harness_refuses_the_removed_parity_reference_flag() {
         assert!(output.status.success(), "{help:?}: {output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(!stdout.contains("parity-reference"), "{help:?}: {stdout}");
+    }
+    std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
+}
+
+/// `selftest` runs exactly one named tool self-test. A missing, extra, or
+/// unknown name is refused before any tool runs, so a typo in a DAG command
+/// cannot turn into a vacuous pass.
+#[test]
+fn test_harness_selftest_refuses_anything_but_one_known_name() {
+    const NAMES: &str = "scorecard, pressure_test, validate_rs, manifest_cli, dbt_budget";
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    let directory = non_repository_dir("selftest-refusals");
+    for (arguments, refusal) in [
+        (
+            vec!["selftest"],
+            format!("test-harness: selftest takes exactly one name, one of: {NAMES}\n"),
+        ),
+        (
+            vec!["selftest", "scorecard", "manifest_cli"],
+            format!("test-harness: selftest takes exactly one name, one of: {NAMES}\n"),
+        ),
+        (
+            vec!["selftest", "scorecards"],
+            format!("test-harness: unknown self-test scorecards; expected one of: {NAMES}\n"),
+        ),
+    ] {
+        let output = run_from(harness, &arguments, Some(&directory));
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            refusal,
+            "{arguments:?}"
+        );
     }
     std::fs::remove_dir_all(&directory).expect("remove non-repository working directory");
 }

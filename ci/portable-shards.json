@@ -32,7 +32,12 @@
     "check.check_outcome_consumers",
     "check.lint_checks",
     "check.script_sigpipe",
-    "lint.rustfmt"
+    "lint.rustfmt",
+    "selftest.scorecard",
+    "selftest.pressure_test",
+    "selftest.validate_rs",
+    "selftest.manifest_cli",
+    "selftest.dbt_budget"
   ],
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",

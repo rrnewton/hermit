@@ -255,9 +255,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # gate.manifest runs the scorecard self-test, whose comparison control
-          # reads HEAD^. A depth-one checkout makes that committed check
-          # unanswerable even though its selected command is otherwise unchanged.
+          # The scorecard self-test, whose comparison control reads HEAD^, ran
+          # inside gate.manifest until 2026-09-29; it is now the checks job's
+          # selftest.scorecard node, which has full history. Depth two is kept
+          # because no audit proves that no other preflight node reads HEAD^.
           fetch-depth: 2
       # The constructed preflight starts with pre.submodules, which verifies
       # every recorded submodule without repairing it. Materialize that exact
@@ -307,16 +308,6 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
-      # The scorecard self-test retains its complete historical corpus in the
-      # existing public ledger. Prepare only its pinned objects outside this
-      # source checkout; the test itself refuses missing data and never fetches.
-      - name: Prepare pinned scorecard self-test corpus
-        timeout-minutes: 3
-        shell: bash
-        run: |
-          set -euo pipefail
-          corpus_root="$(./ci/prepare-scorecard-self-test-corpus.sh "$RUNNER_TEMP")"
-          printf 'DEV_HERMIT_TEST_LEDGER_ROOT=%s\n' "$corpus_root" >> "$GITHUB_ENV"
       - name: Run preflight nodes
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -408,12 +399,11 @@ jobs:
           tar -xzf "$MANIFEST_PLAN_TARBALL"
           rm -f "$MANIFEST_PLAN_TARBALL"
           ./ci/prepare-rust-scripts.sh --check
-      # check.lint_checks runs every rust-script test suite, including the
-      # scorecard self-test that gate.manifest already ran in preflight. That
-      # test reads the pinned ledger corpus and never fetches, and GITHUB_ENV
-      # does not cross jobs, so this job prepares its own copy. Run 36485831200
-      # omitted it here: the corpus test failed and 14 unrelated scorecard
-      # tests failed behind it on the poisoned fixture lock.
+      # selftest.scorecard and check.lint_checks (which runs every rust-script
+      # test suite) both read the pinned ledger corpus and never fetch, so this
+      # job prepares it. Run 36485831200 omitted it here: the corpus test failed
+      # and 14 unrelated scorecard tests failed behind it on the poisoned
+      # fixture lock.
       - name: Prepare pinned scorecard self-test corpus
         timeout-minutes: 3
         shell: bash

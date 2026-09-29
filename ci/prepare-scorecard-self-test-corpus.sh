@@ -8,9 +8,10 @@
 # corpus in the existing public ledger (SELF_TEST_CORPUS). The test refuses
 # missing data and never fetches, so every hosted job that runs the self-test
 # must prepare these objects first and export DEV_HERMIT_TEST_LEDGER_ROOT.
-# Both `gate.manifest` (preflight job) and `check.lint_checks` (checks job, via
-# scripts/run-script-tests.sh) run it. Run 36485831200 prepared the corpus only
-# in preflight, so the checks job failed the corpus test there.
+# Hosted, `selftest.scorecard` and `check.lint_checks` (via
+# scripts/run-script-tests.sh) both run it in the checks job. Run 36485831200
+# prepared the corpus only in the preflight job, whose gate.manifest ran the
+# self-test until 2026-09-29, so the checks job failed the corpus test there.
 #
 # The script creates a fresh directory under PARENT_DIR, fetches only the pinned
 # commit's tree and the two pinned blobs, and prints the directory on stdout only

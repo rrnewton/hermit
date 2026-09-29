@@ -68,6 +68,59 @@ const OUTCOME_CONSUMERS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:
 const CANONICAL_ADAPTER_ACCEPT_TAG: &str = "check.canonical_adapter_accept";
 const CANONICAL_ADAPTER_ACCEPT_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
+
+/// The group of every tool self-test node: `selftest.<name>`.
+pub const TOOL_SELF_TEST_GROUP: &str = "selftest";
+const TOOL_SELF_TEST_GROUP_PREFIX: &str = "selftest.";
+
+/// One repository tool's self-test, run by `test-harness selftest <name>`.
+pub struct ToolSelfTest {
+    /// The `selftest` argument and the job of its `selftest.<name>` node.
+    pub name: &'static str,
+    /// The program, relative to the repository root.
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+}
+
+/// The tool self-tests the validation DAG runs as `selftest.<name>` leaf nodes.
+/// They test the repository's own tooling, not a precondition of any product
+/// node, so no node depends on them; each still turns the validation red when
+/// it fails. `assert_tool_self_test_nodes` requires exactly one node per entry
+/// in every profile that runs `gate.manifest`'s local audits.
+pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
+    ToolSelfTest {
+        name: "scorecard",
+        program: "ci/compat-envelope/scorecard.rs",
+        args: &["self-test-and-check"],
+    },
+    ToolSelfTest {
+        name: "pressure_test",
+        program: "ci/compat-envelope/pressure-test.rs",
+        args: &["self-test"],
+    },
+    // The removed shell front door accumulated plan/scheduler/receipt guards
+    // that now belong to the Rust validate driver. Exercise those brackets
+    // without executing the validation DAG.
+    ToolSelfTest {
+        name: "validate_rs",
+        program: "scripts/validate.rs",
+        args: &["--self-test"],
+    },
+    ToolSelfTest {
+        name: "manifest_cli",
+        program: "tests/manifest-cli.rs",
+        args: &["self-test"],
+    },
+    // The DBT budget wrapper gates roughly twenty portable nodes and fails
+    // CLOSED on a pin it is not calibrated for. Nothing else notices: a
+    // truncated node reads like a fast one. This asserts end to end that the
+    // wrapper still REACHES its wrapped command at the recorded pin.
+    ToolSelfTest {
+        name: "dbt_budget",
+        program: "ci/run-with-reverie-dbt-budget-test.sh",
+        args: &[],
+    },
+];
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
 const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
@@ -238,27 +291,29 @@ struct Profile {
 // parent-only accept arm split out of check.lint_checks: 270/271 before.
 // full then gained one more step, and privileged and hosted-privileged one
 // each, for the privileged system-utils nodes: 271/272, 11/19 and 12/12
-// before.
+// before. full, portable, quick, super and hosted-portable then gained the five
+// selftest.* nodes (the quick/super variants for quick and super) split out of
+// gate.manifest: 272/273, 259/260, 15/16, 145/146 and 250/250 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 272,
-        selected_steps: 273,
+        direct_steps: 277,
+        selected_steps: 278,
     },
     Profile {
         label: "portable",
-        direct_steps: 259,
-        selected_steps: 260,
+        direct_steps: 264,
+        selected_steps: 265,
     },
     Profile {
         label: "quick",
-        direct_steps: 15,
-        selected_steps: 16,
+        direct_steps: 20,
+        selected_steps: 21,
     },
     Profile {
         label: "super",
-        direct_steps: 145,
-        selected_steps: 146,
+        direct_steps: 150,
+        selected_steps: 151,
     },
     Profile {
         label: "privileged",
@@ -267,8 +322,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 250,
-        selected_steps: 250,
+        direct_steps: 255,
+        selected_steps: 255,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -949,7 +1004,9 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
 // These six shared ancestors need separate immutable IDs because quick/super
 // use the measured 1200-second Rust-script CPU budget, while the other profiles
 // keep the established 7200-second cold-build budget. This is generation, not
-// a runtime rewrite of the selected graph.
+// a runtime rewrite of the selected graph. Each `selftest.<name>` node also
+// gets a variant (`is_quick_super_variant`): it depends on gate.manifest, so
+// without one a quick/super selection would pull the ordinary producers too.
 const QUICK_SUPER_VARIANTS: &[&str] = &[
     "build.rust_scripts",
     "build.rust_scripts_in_pinned_root",
@@ -963,11 +1020,18 @@ fn quick_super_variant(tag: &str) -> String {
     format!("quick-super-{tag}")
 }
 
+fn is_quick_super_variant(tag: &str) -> bool {
+    QUICK_SUPER_VARIANTS.contains(&tag)
+        || tag
+            .strip_prefix(TOOL_SELF_TEST_GROUP_PREFIX)
+            .is_some_and(|name| TOOL_SELF_TESTS.iter().any(|tool| tool.name == name))
+}
+
 fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
     let is_quick_super = |label: &str| matches!(label, "quick" | "super");
     let mut variants = Vec::new();
     for step in &mut cfg.steps {
-        if QUICK_SUPER_VARIANTS.contains(&step.tag().as_str()) {
+        if is_quick_super_variant(&step.tag()) {
             let mut variant = step.clone();
             variant.group = format!("quick-super-{}", variant.group);
             variant.labels.retain(|label| is_quick_super(label));
@@ -990,7 +1054,7 @@ fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
     for step in &mut cfg.steps {
         if !step.labels.is_empty() && step.labels.iter().all(|label| is_quick_super(label)) {
             for dependency in &mut step.deps {
-                if QUICK_SUPER_VARIANTS.contains(&dependency.as_str()) {
+                if is_quick_super_variant(dependency) {
                     *dependency = quick_super_variant(dependency);
                 }
             }
@@ -1748,6 +1812,79 @@ fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Every tool self-test runs as one leaf node in each profile that runs the
+/// ordinary or quick/super manifest gate, after that gate, with its exact
+/// command. Nothing may depend on these nodes: they test repository tooling,
+/// and a product node waiting on them would put them back on its critical path.
+fn assert_tool_self_test_nodes(cfg: &DagConfig) -> Result<(), String> {
+    let mut expected = BTreeSet::new();
+    for tool in TOOL_SELF_TESTS {
+        let command = format!(
+            "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest {}",
+            tool.name
+        );
+        for (tag, labels, gate) in [
+            (
+                format!("{TOOL_SELF_TEST_GROUP_PREFIX}{}", tool.name),
+                &["full", HOSTED_PORTABLE_LABEL, "portable"][..],
+                "gate.manifest",
+            ),
+            (
+                quick_super_variant(&format!("{TOOL_SELF_TEST_GROUP_PREFIX}{}", tool.name)),
+                &["quick", "super"][..],
+                "quick-super-gate.manifest",
+            ),
+        ] {
+            let step = cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("committed DAG lost tool self-test node {tag}"))?;
+            if step.cmd != command
+                || step.labels != labels
+                || step.deps != {
+                    let mut deps = [gate, "pre.reverie_pin"];
+                    deps.sort_unstable();
+                    deps
+                }
+                || step.timeout <= 0
+                || step.cpu_timeout <= 0
+            {
+                return Err(format!(
+                    "{tag} must run exactly `test-harness selftest {}` after {gate} in {labels:?} with positive caps: {step:?}",
+                    tool.name
+                ));
+            }
+            expected.insert(tag);
+        }
+    }
+    let actual = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            step.group == TOOL_SELF_TEST_GROUP
+                || step.group == quick_super_variant(TOOL_SELF_TEST_GROUP)
+        })
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "tool self-test nodes {actual:?} differ from TOOL_SELF_TESTS {expected:?}"
+        ));
+    }
+    if let Some((step, dependency)) = cfg.steps.iter().find_map(|step| {
+        step.deps
+            .iter()
+            .find(|dependency| expected.contains(*dependency))
+            .map(|dependency| (step.tag(), dependency))
+    }) {
+        return Err(format!(
+            "{step} depends on tool self-test {dependency}; self-tests must stay off every product node's critical path"
+        ));
+    }
+    Ok(())
+}
+
 fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
     let by_tag = cfg
         .steps
@@ -1819,15 +1956,17 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_dagrun_preparation_placement(cfg)?;
     assert_manifest_gate_width_contract(cfg)?;
+    assert_tool_self_test_nodes(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
     // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
     // since check.canonical_adapter_accept was added; +3 for the privileged
-    // system-utils nodes.
-    if cfg.steps.len() != 1608 {
+    // system-utils nodes; +10 for the five selftest.* nodes and their
+    // quick/super variants.
+    if cfg.steps.len() != 1618 {
         return Err(format!(
-            "superset has {} steps, expected 1608",
+            "superset has {} steps, expected 1618",
             cfg.steps.len()
         ));
     }
@@ -3364,9 +3503,11 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
-        // 250 since test.dbt_parity_on_host was retired (slice S13 of
+        // 255 since the five selftest.<name> nodes left gate.manifest
+        // (https://github.com/rrnewton/hermit/issues/3381); 250 since
+        // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301); 251 before.
-        assert_eq!(selected.steps.len(), 250);
+        assert_eq!(selected.steps.len(), 255);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -3523,10 +3664,11 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
-            // 249 = the 250 hosted-portable direct steps since slice S13 of
-            // https://github.com/rrnewton/hermit/issues/3301, minus the one
+            // 254 = the 255 hosted-portable direct steps since the five
+            // selftest.<name> nodes left gate.manifest
+            // (https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 249 direct steps"),
+            error.contains("hosted-portable label has 254 direct steps"),
             "{error}"
         );
     }
@@ -3864,6 +4006,75 @@ sys.exit(37)
     }
 
     #[test]
+    fn tool_self_test_guard_refuses_each_planted_drift() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_tool_self_test_nodes(&committed).unwrap();
+        let step_mut = |cfg: &mut DagConfig, tag: &str| -> usize {
+            cfg.steps.iter().position(|step| step.tag() == tag).unwrap()
+        };
+        let refused = |mutate: &dyn Fn(&mut DagConfig), expected: &[&str]| {
+            let mut planted = committed.clone();
+            mutate(&mut planted);
+            let error = assert_tool_self_test_nodes(&planted).unwrap_err();
+            for fragment in expected {
+                assert!(
+                    error.contains(fragment),
+                    "{fragment:?} missing from {error}"
+                );
+            }
+        };
+        // A product node that waits on a self-test puts it back on the
+        // critical path, which is the defect this layout removed.
+        refused(
+            &|cfg| {
+                let index = step_mut(cfg, "build.workspace");
+                cfg.steps[index].deps.push("selftest.scorecard".into());
+            },
+            &[
+                "build.workspace depends on tool self-test selftest.scorecard",
+                "critical path",
+            ],
+        );
+        refused(
+            &|cfg| {
+                let index = step_mut(cfg, "selftest.pressure_test");
+                cfg.steps.remove(index);
+            },
+            &["lost tool self-test node selftest.pressure_test"],
+        );
+        refused(
+            &|cfg| {
+                let index = step_mut(cfg, "selftest.validate_rs");
+                cfg.steps[index].labels.retain(|label| label != "portable");
+            },
+            &["selftest.validate_rs must run exactly"],
+        );
+        refused(
+            &|cfg| {
+                let index = step_mut(cfg, "quick-super-selftest.dbt_budget");
+                cfg.steps[index].cmd = "true".into();
+            },
+            &["quick-super-selftest.dbt_budget must run exactly"],
+        );
+        refused(
+            &|cfg| {
+                let index = step_mut(cfg, "selftest.scorecard");
+                cfg.steps[index].cpu_timeout = 0;
+            },
+            &["selftest.scorecard must run exactly", "positive caps"],
+        );
+        refused(
+            &|cfg| {
+                let index = step_mut(cfg, "selftest.manifest_cli");
+                let mut extra = cfg.steps[index].clone();
+                extra.job = "bogus".into();
+                cfg.steps.push(extra);
+            },
+            &["selftest.bogus", "differ from TOOL_SELF_TESTS"],
+        );
+    }
+
+    #[test]
     fn manifest_gate_carries_a_one_core_admission_over_inherited_build_width() {
         use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
@@ -3923,8 +4134,8 @@ sys.exit(37)
                     .contains(tag)
             );
 
-            // The local gates were killed at the old 600-second CPU cap; the
-            // hosted-privileged variant keeps it. Swapping either value fails.
+            // The local gates carry MANIFEST_GATE_CPU_SECONDS; the
+            // hosted-privileged variant keeps 600. Swapping either value fails.
             let mut recapped = committed.clone();
             recapped
                 .steps
