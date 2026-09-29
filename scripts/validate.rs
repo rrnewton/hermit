@@ -6262,7 +6262,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
     {
         Some(("portable", "c-programs")) => Some("--jobs"),
-        Some(("portable", "system-utils")) => Some(""),
+        Some(("portable" | "privileged", "system-utils")) => Some(""),
         _ => None,
     };
     if step.cmdtype != dagrun::model::CmdType::Unknown
@@ -27017,7 +27017,7 @@ mod raw_census_publication_tests {
                 .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
             {
                 Some(("portable", "c-programs")) => Some("--jobs"),
-                Some(("portable", "system-utils")) => Some(""),
+                Some(("portable" | "privileged", "system-utils")) => Some(""),
                 _ => None,
             };
             assert_eq!(step.jobs_flag.as_deref(), expected_flag, "{}", step.tag());

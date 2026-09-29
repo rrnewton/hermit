@@ -226,12 +226,13 @@ struct Profile {
 // full, portable and hosted-portable each lost one step when test.dbt_parity
 // and its _on_host twin were retired (slice S13 of
 // https://github.com/rrnewton/hermit/issues/3301): 271/272, 260/261 and
-// 251/251 before.
+// 251/251 before. full then regained one step, and privileged and
+// hosted-privileged one each, for the privileged system-utils nodes.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 270,
-        selected_steps: 271,
+        direct_steps: 271,
+        selected_steps: 272,
     },
     Profile {
         label: "portable",
@@ -250,8 +251,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: "privileged",
-        direct_steps: 11,
-        selected_steps: 19,
+        direct_steps: 12,
+        selected_steps: 20,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -260,8 +261,8 @@ const PROFILES: [Profile; 7] = [
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
-        direct_steps: 12,
-        selected_steps: 12,
+        direct_steps: 13,
+        selected_steps: 13,
     },
 ];
 
@@ -1302,9 +1303,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         }
     }
-    if expected.len() != 104 {
+    if expected.len() != 107 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 104",
+            "structured result producer registry has {} entries, expected 107",
             expected.len()
         ));
     }
@@ -1439,7 +1440,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .into_iter()
         .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
         .collect::<Vec<_>>();
-    if actual_group_counts != [69, 31, 2, 2] {
+    if actual_group_counts != [69, 34, 2, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -1810,10 +1811,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
     // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
-    // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
-    if cfg.steps.len() != 1604 {
+    // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); +3 for
+    // the privileged system-utils nodes.
+    if cfg.steps.len() != 1607 {
         return Err(format!(
-            "superset has {} steps, expected 1604",
+            "superset has {} steps, expected 1607",
             cfg.steps.len()
         ));
     }
@@ -2168,6 +2170,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 "privileged-only-cpuid.faulting_on_host",
                 "privileged-only-e2e.manifest_applications_on_host",
                 "privileged-only-e2e.manifest_c_programs_on_host",
+                "privileged-only-e2e.manifest_system_utils_on_host",
                 "privileged-only-pmu.preemption_on_host",
                 "privileged-only-test.cli_kvm_on_host",
                 "privileged-only-test.pmu_buck_chaos_cases_on_host",
@@ -2198,6 +2201,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 ("privileged-build.manifest_guests_on_host", 7200),
                 ("privileged-only-e2e.manifest_applications_on_host", 7200),
                 ("privileged-only-e2e.manifest_c_programs_on_host", 7200),
+                ("privileged-only-e2e.manifest_system_utils_on_host", 7200),
                 ("privileged-only-test.cli_kvm_on_host", 7200),
             ]
             .into_iter()
