@@ -200,7 +200,70 @@ fn the_retired_id_map_is_the_prefix_rename_plus_the_documented_collision() {
             retirement.reason.contains(old) && retirement.reason.contains(new),
             "the retirement reason must document {old} -> {new}"
         );
+        assert!(
+            retirement.collisions[*old].contains(new),
+            "the listed collision {old} must name its successor {new}"
+        );
     }
+    assert_eq!(
+        retirement.collisions.keys().collect::<BTreeSet<_>>(),
+        collisions.keys().collect::<BTreeSet<_>>(),
+        "the production map lists exactly the documented collisions"
+    );
+}
+
+/// The rename rule is enforced by the production parser, not only by the test
+/// above: a retired id pointed at an unrelated live test is refused even though
+/// that test is live and no other retired id maps to it, and the one real
+/// collision is refused if it is not listed.
+#[test]
+fn the_production_parser_refuses_a_retired_id_mapped_onto_an_unrelated_live_test() {
+    let path = repo_root().join(hermit_manifest_plan::retired_ids::RETIRED_IDS_FILE);
+    let committed = std::fs::read_to_string(&path).unwrap();
+    RetiredIds::parse(&committed).unwrap();
+
+    let manifests = manifests();
+    let unrelated = "c-programs/add-key-enosys";
+    assert!(
+        manifests.programs.contains_key(unrelated),
+        "{unrelated} is live"
+    );
+    assert!(
+        retired_ids()
+            .retirement(RETIRED_BUCKET)
+            .unwrap()
+            .ids
+            .values()
+            .all(|new| new != unrelated),
+        "{unrelated} is not already a successor, so only the rename rule can refuse it"
+    );
+    let rename = "\"backend-parity-c/aio-refusal\": \"c-programs/aio-refusal\"";
+    assert_eq!(committed.matches(rename).count(), 1);
+    let misdirected = committed.replace(
+        rename,
+        &format!("\"backend-parity-c/aio-refusal\": \"{unrelated}\""),
+    );
+    let error = RetiredIds::parse(&misdirected).unwrap_err();
+    assert!(
+        error.contains(
+            "successor \"c-programs/add-key-enosys\" of \"backend-parity-c/aio-refusal\" is neither the prefix rename c-programs/aio-refusal nor a listed collision"
+        ),
+        "{error}"
+    );
+
+    let mut unlisted: JsonValue = serde_json::from_str(&committed).unwrap();
+    let removed = unlisted["retirements"][0]["collisions"]
+        .as_object_mut()
+        .unwrap()
+        .remove(COLLISION_RENAMES[0].0);
+    assert!(removed.is_some());
+    let error = RetiredIds::parse(&unlisted.to_string()).unwrap_err();
+    assert!(
+        error.contains(
+            "is neither the prefix rename c-programs/pidfd-open-self nor a listed collision"
+        ),
+        "{error}"
+    );
 }
 
 #[test]
