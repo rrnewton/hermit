@@ -329,7 +329,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands)
     // retain all 843 prior identities (`cargo nextest list --profile ci`
     // measured 845; https://github.com/rrnewton/hermit/issues/3360).
-    ("test.detcore_unit", 845),
+    // Three device-and-inode identity tests (tool_global::tests::
+    // det_inodes_do_not_depend_on_raw_inode_coincidences and
+    // syscalls::namespace::tests::stdio_identity_requires_the_same_device and
+    // anonymous_object_devices_match_fresh_objects) retain all 845 prior
+    // identities (`cargo nextest list --profile ci` measured 848;
+    // https://github.com/rrnewton/hermit/issues/3307).
+    ("test.detcore_unit", 848),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -379,7 +385,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 845),
+    ("test.detcore_unit_on_host", 848),
     // Host variants select the same proc regressions and retain prior identities.
     ("test.hermit_integration_on_host", 173),
     ("test.hermit_unit_on_host", 758),

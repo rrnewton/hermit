@@ -9,10 +9,15 @@
 //! Deterministic views of kernel namespace metadata.
 
 use std::ffi::OsStr;
+use std::fs::File;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixDatagram;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Error;
@@ -31,6 +36,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
 use crate::types::DetInode;
+use crate::types::RawFileId;
 use crate::types::RawInode;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -184,14 +190,66 @@ fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> 
     None
 }
 
+/// Raw devices of the kernel-internal filesystems that back every anonymous
+/// pipe (pipefs) and every socket (sockfs).
+#[derive(Clone, Copy, Debug)]
+struct AnonymousObjectDevices {
+    pipe: u64,
+    socket: u64,
+}
+
+/// Probe the pipefs and sockfs devices from the tracer.
+///
+/// A `pipe:[N]` or `socket:[N]` link names only an inode, and the determinized
+/// inode pool is keyed on device and inode together
+/// (<https://github.com/rrnewton/hermit/issues/3307>). Linux has exactly one
+/// pipefs mount and one sockfs mount, shared by every mount, network and user
+/// namespace, so a pipe and a socket created here report the same devices as
+/// every guest pipe and socket, and as an `fstat` of one of the guest's own
+/// descriptors. Only successes are cached.
+fn anonymous_object_devices() -> Result<AnonymousObjectDevices, Error> {
+    static DEVICES: OnceLock<AnonymousObjectDevices> = OnceLock::new();
+    if let Some(devices) = DEVICES.get() {
+        return Ok(*devices);
+    }
+    let probe_error = |what: &str, error: std::io::Error| {
+        Error::Tool(anyhow::anyhow!(
+            "failed to probe the {what} device for a /proc/<pid>/fd link: {error}"
+        ))
+    };
+    let (reader, _writer) = std::io::pipe().map_err(|error| probe_error("pipefs", error))?;
+    let pipe = File::from(OwnedFd::from(reader))
+        .metadata()
+        .map_err(|error| probe_error("pipefs", error))?
+        .dev();
+    let socket = UnixDatagram::unbound().map_err(|error| probe_error("sockfs", error))?;
+    let socket = File::from(OwnedFd::from(socket))
+        .metadata()
+        .map_err(|error| probe_error("sockfs", error))?
+        .dev();
+    Ok(*DEVICES.get_or_init(|| AnonymousObjectDevices { pipe, socket }))
+}
+
+impl AnonymousProcFdIdentity {
+    /// The raw identity of the object this link names.
+    fn raw_file_id(&self, devices: AnonymousObjectDevices) -> RawFileId {
+        let device = match self.kind {
+            "pipe" => devices.pipe,
+            "socket" => devices.socket,
+            kind => unreachable!("anonymous_proc_fd_identity never yields kind {kind:?}"),
+        };
+        RawFileId::new(device, self.raw_inode)
+    }
+}
+
 /// Match a raw identity against cached current-process inherited-stdio identities.
 /// Callers exclude ordinary replacement objects before filling this array.
 ///
 /// Iterating in fd order deliberately matches the last-insert-wins behavior of
-/// the maps sanitizer's `stdio_by_raw_inode` table when stdio descriptors alias.
+/// the maps sanitizer's `stdio_by_raw_file` table when stdio descriptors alias.
 fn deterministic_stdio_inode_for_raw(
-    raw_inode: RawInode,
-    stdio_raw_inodes: &[Option<RawInode>; 3],
+    raw_inode: RawFileId,
+    stdio_raw_inodes: &[Option<RawFileId>; 3],
 ) -> Option<DetInode> {
     let mut matched = None;
     for (fd, cached) in stdio_raw_inodes.iter().enumerate() {
@@ -232,14 +290,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state()
                 .with_detfd(fd, |detfd| {
                     deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                    detfd.stat().map(|stat| stat.inode)
+                    detfd.stat().map(|stat| stat.raw_file_id())
                 })
                 .ok()
                 .flatten();
         }
-        let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
+        let raw_file = identity.raw_file_id(anonymous_object_devices()?);
+        let inode = match deterministic_stdio_inode_for_raw(raw_file, &stdio_raw_inodes) {
             Some(inode) => inode,
-            None => determinize_inode(guest, identity.raw_inode).await.0,
+            None => determinize_inode(guest, raw_file).await.0,
         };
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
@@ -314,7 +373,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .flatten();
             let inode = match inode_override {
                 Some(inode) => inode,
-                None => determinize_inode(guest, stat.st_ino).await.0,
+                None => {
+                    determinize_inode(guest, RawFileId::new(stat.st_dev, stat.st_ino))
+                        .await
+                        .0
+                }
             };
             format!("{kind}:[{inode}]").into_bytes()
         } else {
@@ -655,17 +718,64 @@ mod tests {
 
     #[test]
     fn stdio_identity_requires_a_raw_inode_match_and_preserves_alias_precedence() {
-        let stdio = [Some(11), Some(22), Some(33)];
+        let id = |inode| RawFileId::new(0x7, inode);
+        let stdio = [Some(id(11)), Some(id(22)), Some(id(33))];
         assert_eq!(
-            deterministic_stdio_inode_for_raw(22, &stdio),
+            deterministic_stdio_inode_for_raw(id(22), &stdio),
             Some(DetInode::mint(1001))
         );
-        assert_eq!(deterministic_stdio_inode_for_raw(44, &stdio), None);
+        assert_eq!(deterministic_stdio_inode_for_raw(id(44), &stdio), None);
 
-        let aliased = [None, Some(55), Some(55)];
+        let aliased = [None, Some(id(55)), Some(id(55))];
         assert_eq!(
-            deterministic_stdio_inode_for_raw(55, &aliased),
+            deterministic_stdio_inode_for_raw(id(55), &aliased),
             Some(DetInode::mint(1002))
+        );
+    }
+
+    /// Regression test for <https://github.com/rrnewton/hermit/issues/3307>:
+    /// an object on another filesystem that happens to share a stdio raw inode
+    /// number is not stdio. `/dev/null` is inode 3 on devtmpfs, and the third
+    /// file created on a fresh tmpfs is inode 3 too.
+    #[test]
+    fn stdio_identity_requires_the_same_device() {
+        let stdio = [Some(RawFileId::new(0x7, 3)), None, None];
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(RawFileId::new(0x7, 3), &stdio),
+            Some(DetInode::mint(1000))
+        );
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(RawFileId::new(0x2f, 3), &stdio),
+            None
+        );
+    }
+
+    /// pipefs and sockfs are distinct kernel-internal filesystems, and every
+    /// pipe (and every socket) reports the one device of its filesystem, which
+    /// is what lets an other-process `pipe:[N]` link be keyed like an `fstat`
+    /// of the same pipe.
+    #[test]
+    fn anonymous_object_devices_match_fresh_objects() {
+        let devices = anonymous_object_devices().expect("probe pipefs and sockfs");
+        assert_ne!(devices.pipe, devices.socket);
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let pipe = File::from(OwnedFd::from(reader)).metadata().unwrap();
+        assert_eq!(pipe.dev(), devices.pipe);
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        let socket = File::from(OwnedFd::from(left)).metadata().unwrap();
+        assert_eq!(socket.dev(), devices.socket);
+
+        let link = anonymous_proc_fd_identity(format!("pipe:[{}]", pipe.ino()).as_bytes())
+            .expect("pipe link");
+        assert_eq!(
+            link.raw_file_id(devices),
+            RawFileId::new(pipe.dev(), pipe.ino())
+        );
+        let link = anonymous_proc_fd_identity(format!("socket:[{}]", socket.ino()).as_bytes())
+            .expect("socket link");
+        assert_eq!(
+            link.raw_file_id(devices),
+            RawFileId::new(socket.dev(), socket.ino())
         );
     }
 

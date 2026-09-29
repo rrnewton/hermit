@@ -1324,10 +1324,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                 })?;
             let raw_inode = match cached_stat {
-                Some(stat) => stat.inode,
+                Some(stat) => stat.raw_file_id(),
                 None => {
                     let stat = self.inject_fstat(guest, target_fd).await?;
-                    stat.st_ino
+                    RawFileId::new(stat.st_dev, stat.st_ino)
                 }
             };
             let virtual_inode = match inode_override {
@@ -1431,22 +1431,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
             // reports for that fd, which is the fixed `deterministic_stdio_inode`
-            // value rather than a pooled one. Matching is by raw inode, read
-            // from the cached stat only: injecting an fstat here would add
-            // syscalls to every maps read and perturb the very traces this
-            // change is meant to keep consistent.
-            let mut stdio_by_raw_inode: BTreeMap<u64, DetInode> = BTreeMap::new();
+            // value rather than a pooled one. Matching is by raw device and
+            // inode, read from the cached stat only: injecting an fstat here
+            // would add syscalls to every maps read and perturb the very
+            // traces this change is meant to keep consistent.
+            //
+            // The inode alone is not enough: an unrelated file on another
+            // filesystem can share the stdio inode number (a fresh tmpfs
+            // numbers its files 2, 3, ...; `/dev/null` is inode 3 on
+            // devtmpfs), and it would then be rendered with the stdio inode
+            // in the runs where the host numbers happened to coincide
+            // (https://github.com/rrnewton/hermit/issues/3307).
+            let mut stdio_by_raw_file: BTreeMap<RawFileId, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let cached = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| {
                         let inode = deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                        detfd.stat().map(|stat| (stat.inode, inode))
+                        detfd.stat().map(|stat| (stat.raw_file_id(), inode))
                     })
                     .ok()
                     .flatten();
                 if let Some((raw, det)) = cached {
-                    stdio_by_raw_inode.insert(raw, det);
+                    stdio_by_raw_file.insert(raw, det);
                 }
             }
             let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)
@@ -1454,9 +1461,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .filter_map(crate::procfs::mapping_header_identity)
                 .collect();
             for (raw_dev, raw_inode) in raw_pairs {
-                let det_inode = match stdio_by_raw_inode.get(&raw_inode) {
+                let raw_file = RawFileId::new(raw_dev, raw_inode);
+                let det_inode = match stdio_by_raw_file.get(&raw_file) {
                     Some(inode) => *inode,
-                    None => determinize_inode(guest, raw_inode).await.0,
+                    None => determinize_inode(guest, raw_file).await.0,
                 };
                 let det_dev = determinize_device(guest, raw_dev).await;
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
@@ -1975,7 +1983,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 (
                     detfd.ty(),
                     detfd.resource(),
-                    detfd.stat().map(|stat| stat.inode),
+                    detfd.stat().map(|stat| stat.raw_file_id()),
                 )
             })?;
 
@@ -2002,9 +2010,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        // `out_inode` is the fd's cached HOST inode, so it must be
+        // `out_inode` is the fd's cached HOST identity, so it must be
         // determinized before naming a resource. It is deliberately left raw
-        // for the `touch_file` call below, which takes a `RawInode`.
+        // for the `touch_file` call below, which takes a `RawFileId`.
         let out_resource = match out_resource {
             Some(resource) => Some(resource),
             None => match out_inode {
@@ -2058,7 +2066,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.is_nonblocking(),
                 detfd.open_file_id(),
                 detfd.resource(),
-                detfd.stat().map(|x| x.inode),
+                detfd.stat().map(|x| x.raw_file_id()),
             )
         })?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
@@ -2158,7 +2166,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+            (
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.raw_file_id()),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2276,7 +2287,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.is_nonblocking(),
                 detfd.open_file_id(),
                 detfd.resource(),
-                detfd.stat().map(|x| x.inode),
+                detfd.stat().map(|x| x.raw_file_id()),
             )
         })?;
 
@@ -2601,7 +2612,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+            (
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.raw_file_id()),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2661,7 +2675,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+            (
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.raw_file_id()),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2810,7 +2827,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     as u64;
                 (inode, LogicalTime::from_nanos(nanos))
             }
-            None => determinize_inode(guest, stat.inode).await,
+            // Key on the raw device as well as the raw inode, read before
+            // `stat.dev` is overwritten below: inode numbers repeat across
+            // filesystems (https://github.com/rrnewton/hermit/issues/3307).
+            None => determinize_inode(guest, stat.raw_file_id()).await,
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
 
@@ -4364,6 +4384,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    /// The raw device of the filesystem an open descriptor refers to.
+    ///
+    /// Directory entries carry only an inode number; they belong to the
+    /// directory's filesystem, which is also the device `stat` reports for each
+    /// entry, so the directory's device is what keys their deterministic
+    /// inodes. Uses the descriptor's cached stat when there is one and injects
+    /// an `fstat` otherwise.
+    async fn raw_device_of_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<u64, Error> {
+        let cached = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.dev))?;
+        match cached {
+            Some(device) => Ok(device),
+            None => Ok(self.inject_fstat(guest, fd).await?.st_dev),
+        }
+    }
+
     /// getdents system call.
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
@@ -4375,6 +4416,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let dirent = call.dirent().ok_or(Errno::EFAULT)?;
+        let fd = call.fd() as RawFd;
 
         let nb = self.record_or_replay(guest, call).await?;
         if nb == 0 {
@@ -4390,8 +4432,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let mut dents = unsafe { deserialize_dirents(&dents_bytes) };
         dents.sort();
+        let device = self.raw_device_of_fd(guest, fd).await?;
         for dent in &mut dents {
-            let (d_ino, _) = determinize_inode(guest, dent.ino).await;
+            let (d_ino, _) = determinize_inode(guest, RawFileId::new(device, dent.ino)).await;
             dent.ino = d_ino.as_raw();
         }
 
@@ -4415,6 +4458,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let dirent = call.dirent().ok_or(Errno::EFAULT)?;
+        let fd = call.fd() as RawFd;
 
         let nb = self.record_or_replay(guest, call).await?;
         if nb == 0 {
@@ -4430,8 +4474,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let mut dents = unsafe { deserialize_dirents64(&dents_bytes) };
         dents.sort();
+        let device = self.raw_device_of_fd(guest, fd).await?;
         for dent in &mut dents {
-            let (d_ino, _) = determinize_inode(guest, dent.ino).await;
+            let (d_ino, _) = determinize_inode(guest, RawFileId::new(device, dent.ino)).await;
             dent.ino = d_ino.as_raw();
         }
 
