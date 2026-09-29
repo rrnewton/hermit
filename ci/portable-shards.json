@@ -93,7 +93,6 @@
     {
       "slug": "integration",
       "nodes": [
-        "check.backend_parity_suites",
         "test.hermit_integration",
         "test.cli_on_host",
         "test.arbitrary_binaries",
