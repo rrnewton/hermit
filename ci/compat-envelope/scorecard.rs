@@ -17,6 +17,7 @@
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -50,10 +51,13 @@ use hermit_manifest_plan::logdiff_report::LogDiffReport;
 use hermit_manifest_plan::logdiff_report::LogDiffVerdict;
 use hermit_manifest_plan::logdiff_report::RecordEnvelopePolicy;
 use hermit_manifest_plan::parity::LedgerVerdict;
+use hermit_manifest_plan::parity::PARITY_CELLS_PATH;
 use hermit_manifest_plan::parity::ParityBackend;
 use hermit_manifest_plan::parity::ParityLedgerRow;
 use hermit_manifest_plan::parity::ParityProducer;
 use hermit_manifest_plan::parity::UnavailableClass;
+use hermit_manifest_plan::parity::UtcInstant;
+use hermit_manifest_plan::parity::parse_utc_timestamp;
 use hermit_manifest_plan::parity::unavailable_class;
 use hermit_manifest_plan::retired_ids::RetiredIds;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
@@ -600,9 +604,18 @@ impl ObservationProvenance {
 /// where the stored value disagrees. So it is a cache that cannot lie rather
 /// than a second source of truth that can drift from the first.
 ///
-/// The vocabulary is deliberately IDENTICAL to `ci-hub/series/series.py`'s
-/// `measurement_state`, so the scorecard and the series store cannot describe
-/// the same cell with different words.
+/// The WORDS are the ones `ci-hub/series/series.py`'s `measurement_state`
+/// uses, but the DEFINITIONS NO LONGER AGREE on one kind of evidence: a
+/// retired ptrace-rerun `parity-failure`. As of dev-hermit ca0cf3785e3f,
+/// series.py projects `("parity-failure", "product_failure")` to the outcome
+/// `diverged` (series.py:4678), and its `measurement_state` (series.py:720)
+/// calls a row with that outcome diverged. [`derive_measurement`] does not
+/// count a parity failure as a determinism divergence
+/// (<https://github.com/rrnewton/hermit/issues/3301>), so a cell whose only
+/// failures are parity failures is `measured-and-passed` or
+/// `measured-no-verdict` here and `diverged` there. On every other kind of
+/// evidence the two agree. Until series.py changes, do not treat its state
+/// as a second copy of this one.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MeasurementState {
@@ -4690,6 +4703,68 @@ fn read_parity_store(ledger: &Path) -> Result<ParityStoreInput, String> {
     Ok(input)
 }
 
+/// The cells a Hermit commit's [`PARITY_CELLS_PATH`] selects, as
+/// `(canonical test id, backend)`: what a complete parity run at that commit
+/// owes one row each.
+type CommittedParityCells = BTreeSet<(String, ParityBackend)>;
+
+/// The part of [`PARITY_CELLS_PATH`] the summary reads. It tolerates the
+/// file's other fields, so an older or newer commit's file still yields its
+/// selection; a backend this tool cannot name is refused instead of dropped.
+#[derive(Deserialize)]
+struct CommittedParityCellsFile {
+    cells: Vec<CommittedParityCell>,
+}
+
+#[derive(Deserialize)]
+struct CommittedParityCell {
+    test_id: String,
+    backend: ParityBackend,
+    selected: bool,
+}
+
+/// The selected cells of one [`PARITY_CELLS_PATH`] text, with retired ids
+/// joined to their successors the way parity rows are.
+fn committed_parity_cells(text: &str) -> Result<CommittedParityCells, String> {
+    let file: CommittedParityCellsFile = serde_json::from_str(text)
+        .map_err(|error| format!("{PARITY_CELLS_PATH} is not a readable cell list: {error}"))?;
+    let mut selected = CommittedParityCells::new();
+    for cell in file.cells.into_iter().filter(|cell| cell.selected) {
+        let canonical = retired_ids().resolve(&cell.test_id).to_string();
+        if !selected.insert((canonical.clone(), cell.backend)) {
+            return Err(format!(
+                "{PARITY_CELLS_PATH} selects {canonical}@{} twice",
+                cell.backend
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+/// [`committed_parity_cells`] as of `sha` in the checkout at `root`.
+/// `Ok(None)` when this checkout cannot read [`PARITY_CELLS_PATH`] at that
+/// commit (it does not have the commit, or the commit has no such file), so
+/// the run's coverage is unknown rather than guessed.
+fn committed_parity_cells_at(
+    root: &Path,
+    sha: &str,
+) -> Result<Option<CommittedParityCells>, String> {
+    let object = format!("{sha}:{PARITY_CELLS_PATH}");
+    let output = Command::new("git")
+        .arg("--no-replace-objects")
+        .args(["show", &object])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run git show {object}: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| format!("{object} is not UTF-8"))?;
+    committed_parity_cells(&text)
+        .map(Some)
+        .map_err(|error| format!("{object}: {error}"))
+}
+
 /// One cell of one run in the parity summary.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ParityCellSummary {
@@ -4797,6 +4872,25 @@ impl ParityCellSummary {
     fn rank(&self) -> u8 {
         self.kind.map_or(0, |verdict| 1 + verdict as u8)
     }
+
+    /// Which of two reports of one cell is more adverse (`Less` = `self`):
+    /// the lower [`Self::rank`], then the lower credit, then the lower
+    /// serialized report. The last step only orders reports that agree on
+    /// both, so the kept report never depends on which row was read first.
+    fn adversity_cmp(&self, other: &Self) -> Ordering {
+        self.rank()
+            .cmp(&other.rank())
+            .then_with(|| {
+                self.credit
+                    .unwrap_or(0.0)
+                    .total_cmp(&other.credit.unwrap_or(0.0))
+            })
+            .then_with(|| {
+                serde_json::to_string(self)
+                    .unwrap_or_default()
+                    .cmp(&serde_json::to_string(other).unwrap_or_default())
+            })
+    }
 }
 
 /// The most common first divergence among a tally's diverged cells.
@@ -4818,6 +4912,16 @@ struct ParityDivergenceGroup {
 /// `measured = matched + diverged`. `mean_credit` divides the credit sum by
 /// the credited (measured) cells; `floor_credit` divides it by every selected
 /// cell, so an unmeasured, missing or refused cell counts as zero.
+///
+/// The pooled means mix clean credit (equal inputs) with unequalized credit
+/// only under a marker that says so, and `clean_mean_credit` and
+/// `unequalized_mean_credit` keep the two apart the way the post-pass's own
+/// summary line does, so an unequalized credit never reads as a clean one.
+///
+/// `committed` is how many cells of this set the run's own commit selects in
+/// [`PARITY_CELLS_PATH`], `committed_selected` how many of those the run
+/// reported, and `outside_committed` how many it reported that the selection
+/// does not name. All three are `None` when that selection is unknown.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ParityTally {
     selected: usize,
@@ -4832,8 +4936,15 @@ struct ParityTally {
     clean_credited: usize,
     unequalized_credited: usize,
     credit_sum: f64,
+    clean_credit_sum: f64,
+    unequalized_credit_sum: f64,
     mean_credit: Option<f64>,
+    clean_mean_credit: Option<f64>,
+    unequalized_mean_credit: Option<f64>,
     floor_credit: Option<f64>,
+    committed: Option<usize>,
+    committed_selected: Option<usize>,
+    outside_committed: Option<usize>,
     first_divergence: Option<ParityDivergenceGroup>,
 }
 
@@ -4855,8 +4966,15 @@ impl ParityTally {
             clean_credited: 0,
             unequalized_credited: 0,
             credit_sum: 0.0,
+            clean_credit_sum: 0.0,
+            unequalized_credit_sum: 0.0,
             mean_credit: None,
+            clean_mean_credit: None,
+            unequalized_mean_credit: None,
             floor_credit: None,
+            committed: None,
+            committed_selected: None,
+            outside_committed: None,
             first_divergence: None,
         };
         let mut groups: BTreeMap<
@@ -4895,13 +5013,19 @@ impl ParityTally {
                 tally.credit_sum += credit;
                 if cell.credit_basis == Some("clean") {
                     tally.clean_credited += 1;
+                    tally.clean_credit_sum += credit;
                 } else {
                     tally.unequalized_credited += 1;
+                    tally.unequalized_credit_sum += credit;
                 }
             }
         }
-        tally.mean_credit = (tally.credited > 0).then(|| tally.credit_sum / tally.credited as f64);
-        tally.floor_credit = (tally.selected > 0).then(|| tally.credit_sum / tally.selected as f64);
+        let mean = |sum: f64, count: usize| (count > 0).then(|| sum / count as f64);
+        tally.mean_credit = mean(tally.credit_sum, tally.credited);
+        tally.clean_mean_credit = mean(tally.clean_credit_sum, tally.clean_credited);
+        tally.unequalized_mean_credit =
+            mean(tally.unequalized_credit_sum, tally.unequalized_credited);
+        tally.floor_credit = mean(tally.credit_sum, tally.selected);
         let mut best: Option<(
             &(Option<usize>, Option<u64>, Option<String>),
             &Vec<&ParityCellSummary>,
@@ -4927,9 +5051,93 @@ impl ParityTally {
         tally
     }
 
+    /// Fill the coverage fields from the run's committed selection, counting
+    /// only `backend`'s cells when one is given. Unknown coverage stays `None`.
+    fn cover(
+        mut self,
+        committed: Option<&CommittedParityCells>,
+        backend: Option<ParityBackend>,
+        cells: &[ParityCellSummary],
+    ) -> Self {
+        let Some(committed) = committed else {
+            return self;
+        };
+        let in_scope = |candidate: ParityBackend| backend.is_none_or(|backend| backend == candidate);
+        let reported = cells
+            .iter()
+            .filter(|cell| in_scope(cell.backend))
+            .collect::<Vec<_>>();
+        let owed_and_reported = reported
+            .iter()
+            .filter(|cell| committed.contains(&(cell.test_id.clone(), cell.backend)))
+            .count();
+        self.committed = Some(
+            committed
+                .iter()
+                .filter(|(_, candidate)| in_scope(*candidate))
+                .count(),
+        );
+        self.committed_selected = Some(owed_and_reported);
+        self.outside_committed = Some(reported.len() - owed_and_reported);
+        self
+    }
+
+    /// True when the run reported every cell its commit's selection owes.
+    fn complete(&self) -> bool {
+        matches!(
+            (self.committed, self.committed_selected),
+            (Some(owed), Some(reported)) if reported == owed
+        )
+    }
+
+    /// `selected W of C committed`, marked `(partial)` when the run reported
+    /// fewer cells than its commit's selection owes, or `committed selection
+    /// unknown`.
+    fn coverage(&self) -> String {
+        match (
+            self.committed,
+            self.committed_selected,
+            self.outside_committed,
+        ) {
+            (Some(owed), Some(reported), Some(outside)) => {
+                let partial = if reported < owed { " (partial)" } else { "" };
+                let outside = if outside > 0 {
+                    format!("; {outside} outside the committed selection")
+                } else {
+                    String::new()
+                };
+                format!("selected {reported} of {owed} committed{partial}{outside}")
+            }
+            _ => "committed selection unknown".to_string(),
+        }
+    }
+
+    /// Which inputs the credited cells were measured with, never pooling an
+    /// unequalized credit into a clean one without saying so.
+    fn credit_inputs(&self) -> String {
+        let credit =
+            |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
+        if self.credited == 0 {
+            "—".to_string()
+        } else if self.clean_credited == 0 {
+            "not equalized".to_string()
+        } else if self.unequalized_credited == 0 {
+            "equalized".to_string()
+        } else {
+            format!(
+                "equalized for {} of {} (mean {} equal; {} unequal)",
+                self.clean_credited,
+                self.credited,
+                credit(self.clean_mean_credit),
+                credit(self.unequalized_mean_credit)
+            )
+        }
+    }
+
     /// The one-line parity summary, for example
-    /// `parity: 0/12 matched; measured 12; unavailable 0; record-missing 0;
-    /// mean credit (measured) 0.101; floor credit (selected) 0.101`.
+    /// `parity: 0/12 matched; selected 12 of 12 committed; measured 12;
+    /// unavailable 0; record-missing 0; mean credit (measured) 0.101; floor
+    /// credit (selected) 0.101`.
     fn line(&self) -> String {
         let credit =
             |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
@@ -4947,16 +5155,22 @@ impl ParityTally {
             " [inputs not equalized]".to_string()
         } else if self.unequalized_credited > 0 {
             format!(
-                " [inputs equalized for {} of {} credited]",
-                self.clean_credited, self.credited
+                " [inputs equalized for {} of {} credited: mean {} over {} with equal inputs; mean {} over {} with unequal inputs]",
+                self.clean_credited,
+                self.credited,
+                credit(self.clean_mean_credit),
+                self.clean_credited,
+                credit(self.unequalized_mean_credit),
+                self.unequalized_credited
             )
         } else {
             String::new()
         };
         format!(
-            "parity: {}/{} matched; measured {}; unavailable {}; record-missing {}{refused}; mean credit (measured) {}{over}; floor credit (selected) {}{inputs}",
+            "parity: {}/{} matched; {}; measured {}; unavailable {}; record-missing {}{refused}; mean credit (measured) {}{over}; floor credit (selected) {}{inputs}",
             self.matched,
             self.selected,
+            self.coverage(),
             self.measured,
             self.unavailable,
             self.record_missing,
@@ -4971,10 +5185,24 @@ impl ParityTally {
 struct ParityRunSummary {
     producer: ParityProducer,
     run_id: String,
+    /// The one Hermit commit every admitted row of the run names; `None`
+    /// when no row was admitted or the rows name more than one.
     hermit_sha: Option<String>,
+    /// Every Hermit commit the run's valid rows named, when they named more
+    /// than one; none of those rows is admitted.
+    conflicting_hermit_shas: Vec<String>,
     depth: Option<SourceDepth>,
     emitted_at: Option<String>,
+    /// `emitted_at` as parsed, which orders runs; the text is kept verbatim.
+    #[serde(skip)]
+    emitted_instant: Option<UtcInstant>,
     line: String,
+    /// Why the run's committed selection is unknown, when it is.
+    committed_unknown: Option<String>,
+    /// Cells the run's commit selects that the run reported no row for.
+    committed_cells_without_row: Vec<String>,
+    /// Cells the run reported that its commit's selection does not name.
+    cells_outside_committed: Vec<String>,
     per_backend: BTreeMap<ParityBackend, ParityTally>,
     total: ParityTally,
     cells: Vec<ParityCellSummary>,
@@ -5051,10 +5279,13 @@ struct ParitySummary {
     refused_rows: usize,
     /// Rows of a cell a run had already reported; the most adverse was kept.
     duplicate_rows: usize,
+    /// Every refusal, in (shard, line, message) order.
     refusals: Vec<ParityRefusal>,
     legacy_rerun: LegacyRerunSummary,
     /// Retired ptrace-rerun evidence that is NOT history: counted by reason.
     legacy_dropped: BTreeMap<String, usize>,
+    /// The same, counted by distinct cell (`<canonical test id>@<backend>`).
+    legacy_dropped_cells: BTreeMap<String, usize>,
 }
 
 /// The `(producer, run_id, test_id, backend)` of a line that failed to parse
@@ -5077,13 +5308,15 @@ fn attribute_refused_parity_row(
 #[derive(Default)]
 struct ParityRunAccumulator {
     hermit_sha: Option<String>,
-    emitted_at: Option<String>,
+    conflicting_hermit_shas: Vec<String>,
+    /// The latest `emitted_at` among the admitted rows, parsed and verbatim.
+    emitted_at: Option<(UtcInstant, String)>,
     cells: BTreeMap<(String, ParityBackend), ParityCellSummary>,
 }
 
 impl ParityRunAccumulator {
-    /// Keep the most adverse report of a cell: the lower rank, then the lower
-    /// credit, then the first seen. Returns true when `cell` was a duplicate.
+    /// Keep the most adverse report of a cell ([`ParityCellSummary::adversity_cmp`]).
+    /// Returns true when `cell` was a duplicate.
     fn offer(&mut self, cell: ParityCellSummary) -> bool {
         let key = (cell.test_id.clone(), cell.backend);
         match self.cells.get(&key) {
@@ -5092,10 +5325,7 @@ impl ParityRunAccumulator {
                 false
             }
             Some(kept) => {
-                let replace = cell.rank() < kept.rank()
-                    || (cell.rank() == kept.rank()
-                        && cell.credit.unwrap_or(0.0) < kept.credit.unwrap_or(0.0));
-                if replace {
+                if cell.adversity_cmp(kept) == Ordering::Less {
                     self.cells.insert(key, cell);
                 }
                 true
@@ -5111,42 +5341,76 @@ impl ParityRunAccumulator {
 /// message goes to stderr and into `refusals` -- and, when its run and cell
 /// can still be read, it stays in that run's denominator as `refused` with no
 /// credit. Nothing is clamped or repaired.
+///
+/// A run's admission is decided from all of its rows at once: when its valid
+/// rows name more than one Hermit commit, every one of them is refused and
+/// the run names each commit, because no row can say which is genuine. With
+/// the lines read in (shard, line) order and duplicates settled by
+/// [`ParityCellSummary::adversity_cmp`], the summary does not depend on the
+/// order the store was listed or the rows were written in.
+///
+/// `committed_of` reads the parity selection a Hermit commit committed to
+/// ([`committed_parity_cells_at`]); each run is measured against its own
+/// commit's selection, so a partial run is marked partial and headlines only
+/// when no complete run exists.
 fn summarize_parity(
     input: &ParityStoreInput,
     tracked: &TrackedCells,
     depth_of: &dyn Fn(&str) -> Option<SourceDepth>,
+    committed_of: &dyn Fn(&str) -> Result<Option<CommittedParityCells>, String>,
 ) -> ParitySummary {
     let mut refusals = input.refusals.clone();
     let mut refused_rows = 0usize;
     let mut duplicate_rows = 0usize;
+    let mut lines = input.lines.iter().collect::<Vec<_>>();
+    lines.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    let parsed = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str::<ParityLedgerRow>(&line.text)
+                .map_err(|error| format!("not a parity-ledger/v1 row: {error}"))
+                .and_then(|row| row.validate().map(|()| row))
+                .and_then(|row| {
+                    parse_utc_timestamp(&row.emitted_at)
+                        .map(|instant| (row, instant))
+                        .map_err(|error| format!("emitted_at: {error}"))
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut run_shas: BTreeMap<(ParityProducer, String), BTreeSet<String>> = BTreeMap::new();
+    for (row, _) in parsed.iter().flatten() {
+        run_shas
+            .entry((row.producer, row.run_id.clone()))
+            .or_default()
+            .insert(row.hermit_sha.clone());
+    }
     let mut runs: BTreeMap<(ParityProducer, String), ParityRunAccumulator> = BTreeMap::new();
-    for line in &input.lines {
-        let parsed = serde_json::from_str::<ParityLedgerRow>(&line.text)
-            .map_err(|error| format!("not a parity-ledger/v1 row: {error}"))
-            .and_then(|row| row.validate().map(|()| row));
-        let parsed = parsed.and_then(|row| {
-            let run = runs.entry((row.producer, row.run_id.clone())).or_default();
-            match run.hermit_sha.as_deref() {
-                Some(sha) if sha != row.hermit_sha => Err(format!(
-                    "parity ledger row {} ({} run {}): hermit_sha {} differs from the run's {sha}",
-                    row.cell, row.producer, row.run_id, row.hermit_sha
-                )),
-                _ => Ok(row),
+    for (line, parsed) in lines.into_iter().zip(parsed) {
+        let admitted = parsed.and_then(|(row, instant)| {
+            let shas = &run_shas[&(row.producer, row.run_id.clone())];
+            if shas.len() > 1 {
+                return Err(format!(
+                    "parity ledger row {} ({} run {}): the run's rows name {} Hermit commits ({}), so none of its rows is admitted",
+                    row.cell,
+                    row.producer,
+                    row.run_id,
+                    shas.len(),
+                    shas.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+                ));
             }
+            Ok((row, instant))
         });
-        match parsed {
-            Ok(row) => {
+        match admitted {
+            Ok((row, instant)) => {
                 let canonical = retired_ids().resolve(&row.test_id).to_string();
-                let run = runs
-                    .get_mut(&(row.producer, row.run_id.clone()))
-                    .expect("the run was entered above");
-                run.hermit_sha.get_or_insert_with(|| row.hermit_sha.clone());
+                let run = runs.entry((row.producer, row.run_id.clone())).or_default();
+                run.hermit_sha = Some(row.hermit_sha.clone());
                 if run
                     .emitted_at
                     .as_ref()
-                    .is_none_or(|latest| row.emitted_at > *latest)
+                    .is_none_or(|(kept, text)| (instant, &row.emitted_at) > (*kept, text))
                 {
-                    run.emitted_at = Some(row.emitted_at.clone());
+                    run.emitted_at = Some((instant, row.emitted_at.clone()));
                 }
                 duplicate_rows +=
                     usize::from(run.offer(ParityCellSummary::from_row(&row, &canonical)));
@@ -5158,7 +5422,6 @@ fn summarize_parity(
                     line: Some(line.line),
                     message,
                 };
-                eprintln!("parity: refused {}", refusal.located());
                 if let Some((producer, run_id, test_id, backend)) =
                     attribute_refused_parity_row(&line.text)
                 {
@@ -5175,7 +5438,13 @@ fn summarize_parity(
             }
         }
     }
-    for refusal in &input.refusals {
+    for (key, run) in &mut runs {
+        if let Some(shas) = run_shas.get(key).filter(|shas| shas.len() > 1) {
+            run.conflicting_hermit_shas = shas.iter().cloned().collect();
+        }
+    }
+    refusals.sort_by(|a, b| (&a.path, a.line, &a.message).cmp(&(&b.path, b.line, &b.message)));
+    for refusal in &refusals {
         eprintln!("parity: refused {}", refusal.located());
     }
 
@@ -5183,35 +5452,90 @@ fn summarize_parity(
     for ((producer, run_id), run) in runs {
         let depth = run.hermit_sha.as_deref().and_then(depth_of);
         let cells = run.cells.into_values().collect::<Vec<_>>();
+        let (committed, committed_unknown) = match run.hermit_sha.as_deref() {
+            Some(sha) => match committed_of(sha) {
+                Ok(Some(committed)) => (Some(committed), None),
+                Ok(None) => (
+                    None,
+                    Some(format!(
+                        "this checkout cannot read {PARITY_CELLS_PATH} at {sha}"
+                    )),
+                ),
+                Err(error) => {
+                    eprintln!(
+                        "parity: {producer} run {run_id}: committed selection unknown: {error}"
+                    );
+                    (None, Some(error))
+                }
+            },
+            None if !run.conflicting_hermit_shas.is_empty() => (
+                None,
+                Some("the run's rows name more than one Hermit commit".to_string()),
+            ),
+            None => (
+                None,
+                Some("no admitted row names the run's Hermit commit".to_string()),
+            ),
+        };
         let per_backend = ParityBackend::ALL
             .into_iter()
             .map(|backend| {
                 (
                     backend,
-                    ParityTally::over(cells.iter().filter(|cell| cell.backend == backend)),
+                    ParityTally::over(cells.iter().filter(|cell| cell.backend == backend)).cover(
+                        committed.as_ref(),
+                        Some(backend),
+                        &cells,
+                    ),
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let total = ParityTally::over(&cells);
+        let total = ParityTally::over(&cells).cover(committed.as_ref(), None, &cells);
+        let reported = cells
+            .iter()
+            .map(|cell| (cell.test_id.clone(), cell.backend))
+            .collect::<BTreeSet<_>>();
+        let name = |(test, backend): &(String, ParityBackend)| format!("{test}@{backend}");
+        let (committed_cells_without_row, cells_outside_committed) = match &committed {
+            Some(committed) => (
+                committed.difference(&reported).map(name).collect(),
+                reported.difference(committed).map(name).collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         summaries.push(ParityRunSummary {
             producer,
             run_id,
             hermit_sha: run.hermit_sha,
+            conflicting_hermit_shas: run.conflicting_hermit_shas,
             depth,
-            emitted_at: run.emitted_at,
+            emitted_at: run.emitted_at.as_ref().map(|(_, text)| text.clone()),
+            emitted_instant: run.emitted_at.map(|(instant, _)| instant),
             line: total.line(),
+            committed_unknown,
+            committed_cells_without_row,
+            cells_outside_committed,
             per_backend,
             total,
             cells,
         });
     }
-    // The headline of a producer is its run at the deepest Hermit commit this
-    // checkout can place, then the latest emission, then the run id.
+    // The headline of a producer is its run that reported every cell its own
+    // commit's selection owes; a partial run headlines only when no complete
+    // run exists, the most complete first. Then the deepest Hermit commit
+    // this checkout can place, the latest emission, and the run id.
     let headline_key = |run: &ParityRunSummary| {
+        let complete = run.total.complete();
         (
+            complete,
+            if complete {
+                0
+            } else {
+                run.total.committed_selected.unwrap_or(0)
+            },
             run.depth.is_some(),
             run.depth.map(|depth| (depth.commits, depth.first_parent)),
-            run.emitted_at.clone(),
+            run.emitted_instant,
             run.run_id.clone(),
         )
     };
@@ -5251,7 +5575,8 @@ fn summarize_parity(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let (legacy_rerun, legacy_dropped) = legacy_rerun_history(tracked, &current);
+    let (legacy_rerun, legacy_dropped, legacy_dropped_cells) =
+        legacy_rerun_history(tracked, &current);
     ParitySummary {
         schema: PARITY_SUMMARY_SCHEMA,
         generated_from: ParityGeneratedFrom {
@@ -5271,6 +5596,7 @@ fn summarize_parity(
         refusals,
         legacy_rerun,
         legacy_dropped,
+        legacy_dropped_cells,
     }
 }
 
@@ -5285,12 +5611,26 @@ fn summarize_parity(
 /// else is dropped and counted by reason: an unverified comparison under its
 /// admission slug, a `parity-failure` observation that kept no comparison
 /// (`no-retained-comparison`), and receipts retired with their catalogue cell
-/// (`retired-from-catalogue`). History never enters a parity count or credit.
+/// (`retired-from-catalogue`). Each reason is counted twice: by piece of
+/// evidence and by distinct cell, so a count of observations is never read as
+/// a count of cells. History never enters a parity count or credit.
 fn legacy_rerun_history(
     tracked: &TrackedCells,
     current: &BTreeMap<String, &'static str>,
-) -> (LegacyRerunSummary, BTreeMap<String, usize>) {
+) -> (
+    LegacyRerunSummary,
+    BTreeMap<String, usize>,
+    BTreeMap<String, usize>,
+) {
     let mut dropped: BTreeMap<String, usize> = BTreeMap::new();
+    let mut dropped_cells: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut count_drop = |reason: &str, cell: &str| {
+        *dropped.entry(reason.to_string()).or_default() += 1;
+        dropped_cells
+            .entry(reason.to_string())
+            .or_default()
+            .insert(cell.to_string());
+    };
     let mut latest: BTreeMap<String, Vec<(&RecordedBackendParityComparison, &TrackedCell)>> =
         BTreeMap::new();
     for cell in &tracked.cells {
@@ -5303,7 +5643,7 @@ fn legacy_rerun_history(
             if observation.backend_parity_comparisons.is_empty()
                 && observation.results.contains(&ObservedResult::ParityFailure)
             {
-                *dropped.entry("no-retained-comparison".into()).or_default() += 1;
+                count_drop("no-retained-comparison", &key);
             }
             for comparison in &observation.backend_parity_comparisons {
                 match backend_parity_admission(comparison, &cell.id.backend) {
@@ -5311,17 +5651,27 @@ fn legacy_rerun_history(
                         .entry(key.clone())
                         .or_default()
                         .push((comparison, cell)),
-                    Err((slug, _)) => *dropped.entry(slug.into()).or_default() += 1,
+                    Err((slug, _)) => count_drop(slug, &key),
                 }
             }
         }
     }
     if let Some(bindings) = comparison_attempt_bindings(tracked) {
-        let retired = bindings.retired_backend_parity_comparisons.len();
-        if retired > 0 {
-            *dropped.entry("retired-from-catalogue".into()).or_default() += retired;
+        for retired in &bindings.retired_backend_parity_comparisons {
+            count_drop(
+                "retired-from-catalogue",
+                &format!(
+                    "{}@{}",
+                    retired_ids().resolve(&retired.cell.test),
+                    retired.cell.backend
+                ),
+            );
         }
     }
+    let dropped_cells = dropped_cells
+        .into_iter()
+        .map(|(reason, cells)| (reason, cells.len()))
+        .collect::<BTreeMap<_, _>>();
     let mut superseded = 0usize;
     let mut entries = Vec::new();
     for (key, candidates) in latest {
@@ -5392,20 +5742,26 @@ fn legacy_rerun_history(
             entries,
         },
         dropped,
+        dropped_cells,
     )
 }
 
 /// The parity summary of `tracked` with no store: what a ledger without a
 /// `parity/` directory reports, and all a catalogue-only tree can report.
 fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
-    summarize_parity(&ParityStoreInput::default(), tracked, &|_| None)
+    summarize_parity(&ParityStoreInput::default(), tracked, &|_| None, &|_| Ok(None))
 }
 
 /// Read the ledger's parity store and summarize it beside `tracked`.
 fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySummary, String> {
     let ledger = ledger_root(root, false)?;
     let input = read_parity_store(&ledger)?;
-    let mut summary = summarize_parity(&input, tracked, &|sha| repo_depth_at(root, sha));
+    let mut summary = summarize_parity(
+        &input,
+        tracked,
+        &|sha| repo_depth_at(root, sha),
+        &|sha| committed_parity_cells_at(root, sha),
+    );
     summary.generated_from.tool_hermit_commit = git_head(root).ok();
     Ok(summary)
 }
@@ -5427,9 +5783,23 @@ fn markdown_cell(text: &str) -> String {
 fn render_parity_tally_row(label: &str, tally: &ParityTally) -> String {
     let credit =
         |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
+    let selected = match (
+        tally.committed,
+        tally.committed_selected,
+        tally.outside_committed,
+    ) {
+        (Some(owed), Some(reported), Some(outside)) => {
+            let outside = if outside > 0 {
+                format!(" +{outside} outside")
+            } else {
+                String::new()
+            };
+            format!("{reported} of {owed}{outside}")
+        }
+        _ => tally.selected.to_string(),
+    };
     format!(
-        "| {label} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-        tally.selected,
+        "| {label} | {selected} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
         tally.measured,
         tally.matched,
         tally.diverged,
@@ -5438,6 +5808,7 @@ fn render_parity_tally_row(label: &str, tally: &ParityTally) -> String {
         tally.refused,
         credit(tally.mean_credit),
         credit(tally.floor_credit),
+        markdown_cell(&tally.credit_inputs()),
     )
 }
 
@@ -5454,8 +5825,11 @@ runs a ptrace rerun any more (https://github.com/rrnewton/hermit/issues/3301).\n
 A measured cell earns credit in [0, 1]: its matched prefix of compared records over the longer log, and \
 1 only for a full match. **Mean credit** divides the credit sum by the measured (matched plus diverged) \
 cells; **floor credit** divides it by every selected cell, so an unavailable, record-missing or refused \
-cell counts as 0. The `{LEGACY_RERUN_LABEL}` history at the end is the retired ptrace rerun's last \
-verdicts; it is not current parity and enters no count here.\n\n"
+cell counts as 0. **Selected** reads `W of C` when the run's own Hermit commit's `{PARITY_CELLS_PATH}` \
+is known: the run reported W of the C cells that selection owes, and a run that reported fewer is marked \
+partial. Mean credit pools clean credit (inputs equalized) with unequalized credit only under a marker that \
+says so; **Credit inputs** shows which it is. The `{LEGACY_RERUN_LABEL}` history at the end is the retired \
+ptrace rerun's last verdicts; it is not current parity and enters no count here.\n\n"
     );
     if !summary.store_present {
         out.push_str(&format!(
@@ -5468,24 +5842,72 @@ verdicts; it is not current parity and enters no count here.\n\n"
         ));
     }
     for run in &summary.producers {
-        let sha = run
-            .hermit_sha
-            .as_deref()
-            .map_or("unknown commit".to_string(), |sha| {
-                format!("`{}`", &sha[..sha.len().min(12)])
-            });
+        let short = |sha: &str| format!("`{}`", &sha[..sha.len().min(12)]);
+        let sha = match run.hermit_sha.as_deref() {
+            Some(sha) => format!("at {}", short(sha)),
+            None if !run.conflicting_hermit_shas.is_empty() => format!(
+                "at conflicting commits {}",
+                run.conflicting_hermit_shas
+                    .iter()
+                    .map(|sha| short(sha))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => "at unknown commit".to_string(),
+        };
+        let partial = match (run.total.committed, run.total.committed_selected) {
+            (Some(owed), Some(reported)) if reported < owed => {
+                format!(" (partial: selected {reported} of {owed} committed)")
+            }
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "\n### {} run `{}` at {sha}\n\n`{}`\n\n\
-| Candidate backend | Selected | Measured | Matched | Diverged | Unavailable | Record-missing | Refused | Mean credit (measured) | Floor credit (selected) |\n\
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+            "\n### {} run `{}` {sha}{partial}\n\n`{}`\n\n\
+| Candidate backend | Selected | Measured | Matched | Diverged | Unavailable | Record-missing | Refused | Mean credit (measured) | Floor credit (selected) | Credit inputs |\n\
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
             run.producer, run.run_id, run.line
         ));
+        // A backend the run reported, or one its commit's selection owes
+        // cells although the run reported none of them.
+        let shown = |tally: &ParityTally| tally.selected > 0 || tally.committed.unwrap_or(0) > 0;
         for (backend, tally) in &run.per_backend {
-            if tally.selected > 0 {
+            if shown(tally) {
                 out.push_str(&render_parity_tally_row(&format!("`{backend}`"), tally));
             }
         }
         out.push_str(&render_parity_tally_row("**TOTAL**", &run.total));
+        if let Some(why) = &run.committed_unknown {
+            out.push_str(&format!(
+                "\nThe committed parity selection of this run is unknown ({}), so whether it reported every cell it owed is not known.\n",
+                markdown_cell(why)
+            ));
+        }
+        for (cells, what) in [
+            (
+                &run.committed_cells_without_row,
+                "cell(s) its commit selects have no row in this run",
+            ),
+            (
+                &run.cells_outside_committed,
+                "cell(s) this run reported are not in its commit's selection",
+            ),
+        ] {
+            if cells.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n{} {what}:", cells.len()));
+            for cell in cells.iter().take(PARITY_REFUSALS_SHOWN) {
+                out.push_str(&format!(" `{cell}`,"));
+            }
+            out.pop();
+            if cells.len() > PARITY_REFUSALS_SHOWN {
+                out.push_str(&format!(
+                    " and {} more (all are in `{LEDGER_PARITY_SUMMARY}`)",
+                    cells.len() - PARITY_REFUSALS_SHOWN
+                ));
+            }
+            out.push_str(".\n");
+        }
         out.push_str("\nUnavailable cells by reason:\n\n| Candidate backend |");
         for class in UnavailableClass::ALL {
             out.push_str(&format!(" `{class}` |"));
@@ -5498,7 +5920,7 @@ verdicts; it is not current parity and enters no count here.\n\n"
         for (label, tally) in run
             .per_backend
             .iter()
-            .filter(|(_, tally)| tally.selected > 0)
+            .filter(|(_, tally)| shown(tally))
             .map(|(backend, tally)| (format!("`{backend}`"), tally))
             .chain(std::iter::once(("**TOTAL**".to_string(), &run.total)))
         {
@@ -5577,7 +5999,9 @@ verdicts; it is not current parity and enters no count here.\n\n"
     if summary.runs.len() > summary.producers.len() {
         out.push_str(
             "\n### Runs in the parity store\n\n\
-The headline run of each producer is the one at the deepest Hermit commit this checkout can place, then the latest emission.\n\n\
+The headline run of each producer is the one that reported every cell its own Hermit commit's selection owes; \
+a partial run headlines only when no complete run exists, the most complete first. Then the deepest Hermit \
+commit this checkout can place, then the latest emission.\n\n\
 | Producer | Run | Hermit commit | Headline | Parity |\n\
 | --- | --- | --- | --- | --- |\n",
         );
@@ -5635,7 +6059,12 @@ The `Determinism` column is the cell's own measurement, which parity never chang
     if !summary.legacy_dropped.is_empty() {
         out.push_str("\nRetired rerun evidence not kept as history, by reason:");
         for (reason, count) in &summary.legacy_dropped {
-            out.push_str(&format!(" `{reason}` {count};"));
+            let cells = summary
+                .legacy_dropped_cells
+                .get(reason)
+                .copied()
+                .unwrap_or_default();
+            out.push_str(&format!(" `{reason}` {count} on {cells} cell(s);"));
         }
         out.pop();
         out.push_str(".\n");
@@ -32303,9 +32732,26 @@ mod parity_summary_tests {
         }
     }
 
+    /// The summary of `rows` in one shard, with no commit's parity selection
+    /// readable, so every run's coverage is unknown.
     fn summarize_rows(rows: &[ParityLedgerRow], tracked: &TrackedCells) -> ParitySummary {
         let lines = rows.iter().map(line).collect::<Vec<_>>();
-        summarize_parity(&store(&lines), tracked, &|_| None)
+        summarize_parity(&store(&lines), tracked, &|_| None, &|_| Ok(None))
+    }
+
+    /// A committed selection naming exactly `cells`.
+    fn committed(cells: &[(&str, ParityBackend)]) -> CommittedParityCells {
+        cells
+            .iter()
+            .map(|(test, backend)| (test.to_string(), *backend))
+            .collect()
+    }
+
+    /// The committed selection of `rows`' own cells.
+    fn committed_of_rows(rows: &[ParityLedgerRow]) -> CommittedParityCells {
+        rows.iter()
+            .map(|row| (retired_ids().resolve(&row.test_id).to_string(), row.backend))
+            .collect()
     }
 
     fn only_run(summary: &ParitySummary) -> &ParityRunSummary {
@@ -32344,13 +32790,15 @@ mod parity_summary_tests {
         let run = only_run(&summary);
         assert_eq!(
             run.line,
-            "parity: 0/12 matched; measured 12; unavailable 0; record-missing 0; \
-             mean credit (measured) 0.117; floor credit (selected) 0.117 [inputs not equalized]"
+            "parity: 0/12 matched; committed selection unknown; measured 12; unavailable 0; \
+             record-missing 0; mean credit (measured) 0.117; floor credit (selected) 0.117 \
+             [inputs not equalized]"
         );
         assert_eq!(
             run.per_backend[&KVM].line(),
-            "parity: 0/4 matched; measured 4; unavailable 0; record-missing 0; \
-             mean credit (measured) 0.100; floor credit (selected) 0.100 [inputs not equalized]"
+            "parity: 0/4 matched; committed selection unknown; measured 4; unavailable 0; \
+             record-missing 0; mean credit (measured) 0.100; floor credit (selected) 0.100 \
+             [inputs not equalized]"
         );
         assert_eq!(run.per_backend[&DBT].selected, 0);
         assert_eq!(run.per_backend[&DBT].floor_credit, None);
@@ -32359,24 +32807,33 @@ mod parity_summary_tests {
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
-            "\n`parity: 0/12 matched; measured 12; unavailable 0; record-missing 0; \
-             mean credit (measured) 0.117; floor credit (selected) 0.117 [inputs not equalized]`\n",
+            "\n`parity: 0/12 matched; committed selection unknown; measured 12; unavailable 0; \
+             record-missing 0; mean credit (measured) 0.117; floor credit (selected) 0.117 \
+             [inputs not equalized]`\n",
         );
         assert_contains(
             &rendered,
-            "| `kvm` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.100 | 0.100 |\n",
+            "| `kvm` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `liteinst` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.050 | 0.050 |\n",
+            "| `liteinst` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.050 | 0.050 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `sabre` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.200 | 0.200 |\n",
+            "| `sabre` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0.200 | 0.200 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| **TOTAL** | 12 | 12 | 0 | 12 | 0 | 0 | 0 | 0.117 | 0.117 |\n",
+            "| **TOTAL** | 12 | 12 | 0 | 12 | 0 | 0 | 0 | 0.117 | 0.117 | not equalized |\n",
+        );
+        assert_contains(
+            &rendered,
+            &format!(
+                "\nThe committed parity selection of this run is unknown (this checkout cannot \
+                 read {PARITY_CELLS_PATH} at {SHA}), so whether it reported every cell it owed \
+                 is not known.\n"
+            ),
         );
         assert!(!rendered.contains("| `dbt` |"), "{rendered}");
         // kvm's four cells share one first divergence; liteinst's split 2/2.
@@ -32410,8 +32867,9 @@ mod parity_summary_tests {
         let run = only_run(&summary);
         assert_eq!(
             run.line,
-            "parity: 0/12 matched; measured 9; unavailable 0; record-missing 3; \
-             mean credit (measured) 0.117; floor credit (selected) 0.088 [inputs not equalized]"
+            "parity: 0/12 matched; committed selection unknown; measured 9; unavailable 0; \
+             record-missing 3; mean credit (measured) 0.117; floor credit (selected) 0.088 \
+             [inputs not equalized]"
         );
         let all_diverged = summarize_rows(&twelve_diverged(), &no_cells());
         assert!(run.total.floor_credit < only_run(&all_diverged).total.floor_credit);
@@ -32422,19 +32880,19 @@ mod parity_summary_tests {
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
-            "| `kvm` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.100 | 0.075 |\n",
+            "| `kvm` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.100 | 0.075 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `liteinst` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.050 | 0.038 |\n",
+            "| `liteinst` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.050 | 0.038 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `sabre` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.200 | 0.150 |\n",
+            "| `sabre` | 4 | 3 | 0 | 3 | 0 | 1 | 0 | 0.200 | 0.150 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| **TOTAL** | 12 | 9 | 0 | 9 | 0 | 3 | 0 | 0.117 | 0.088 |\n",
+            "| **TOTAL** | 12 | 9 | 0 | 9 | 0 | 3 | 0 | 0.117 | 0.088 | not equalized |\n",
         );
         assert_contains(
             &rendered,
@@ -32473,8 +32931,9 @@ mod parity_summary_tests {
         }
         assert_eq!(
             run.line,
-            "parity: 0/2 matched; measured 1; unavailable 1; record-missing 0; \
-             mean credit (measured) 0.100; floor credit (selected) 0.050 [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; measured 1; unavailable 1; \
+             record-missing 0; mean credit (measured) 0.100; floor credit (selected) 0.050 \
+             [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(
@@ -32653,6 +33112,13 @@ mod parity_summary_tests {
             ])
         );
         assert_eq!(
+            summary.legacy_dropped_cells,
+            BTreeMap::from([
+                ("log-verdict-not-matched-or-diverged".to_string(), 1),
+                ("no-retained-comparison".to_string(), 1),
+            ])
+        );
+        assert_eq!(
             (legacy.matched, legacy.diverged, legacy.superseded),
             (1, 1, 1)
         );
@@ -32682,7 +33148,8 @@ mod parity_summary_tests {
         assert_contains(
             &rendered,
             "Retired rerun evidence not kept as history, by reason: \
-             `log-verdict-not-matched-or-diverged` 1; `no-retained-comparison` 1.\n",
+             `log-verdict-not-matched-or-diverged` 1 on 1 cell(s); \
+             `no-retained-comparison` 1 on 1 cell(s).\n",
         );
 
         // With a store, the counts are the store's alone, and the history
@@ -32782,14 +33249,15 @@ mod parity_summary_tests {
         );
         assert_eq!(
             run.line,
-            "parity: 0/2 matched; measured 1; unavailable 0; record-missing 0; refused 1; \
-             mean credit (measured) 0.100; floor credit (selected) 0.050 [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; measured 1; unavailable 0; \
+             record-missing 0; refused 1; mean credit (measured) 0.100; floor credit (selected) \
+             0.050 [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(&rendered, "### Refused parity rows");
         assert_contains(
             &rendered,
-            "| **TOTAL** | 2 | 1 | 0 | 1 | 0 | 0 | 1 | 0.100 | 0.050 |\n",
+            "| **TOTAL** | 2 | 1 | 0 | 1 | 0 | 0 | 1 | 0.100 | 0.050 | not equalized |\n",
         );
     }
 
@@ -32811,28 +33279,29 @@ mod parity_summary_tests {
             b"\n",
             &mut Sha256::new(),
         );
-        let summary = summarize_parity(&input, &no_cells(), &|_| None);
+        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| Ok(None));
         let messages = summary
             .refusals
             .iter()
             .map(ParityRefusal::located)
             .collect::<Vec<_>>();
+        // In (shard, line) order, whatever order the reader produced them in.
         assert_eq!(messages.len(), 3, "{messages:#?}");
         assert_eq!(
             messages[0],
-            "parity/hermit/devbig014/2026-10.jsonl:1: blank line in a parity shard"
-        );
-        assert_eq!(
-            messages[1],
             format!(
                 "{SHARD}:1: parity ledger row c-programs/golden-1@kvm (validate run {RUN}): \
                  parity record c-programs/golden-1@kvm: a match must be full credit, got Some(0.5)"
             )
         );
         assert!(
-            messages[2].starts_with(&format!("{SHARD}:2: not a parity-ledger/v1 row: ")),
+            messages[1].starts_with(&format!("{SHARD}:2: not a parity-ledger/v1 row: ")),
             "{}",
-            messages[2]
+            messages[1]
+        );
+        assert_eq!(
+            messages[2],
+            "parity/hermit/devbig014/2026-10.jsonl:1: blank line in a parity shard"
         );
         assert_eq!(summary.refused_rows, 2);
         let run = only_run(&summary);
@@ -32842,10 +33311,16 @@ mod parity_summary_tests {
             (run.total.matched, run.total.measured, run.total.refused),
             (0, 0, 1)
         );
+        // No row was admitted, so no row names the run's commit.
+        assert_eq!(run.hermit_sha, None);
+        assert_eq!(
+            run.committed_unknown.as_deref(),
+            Some("no admitted row names the run's Hermit commit")
+        );
         assert_eq!(
             run.line,
-            "parity: 0/1 matched; measured 0; unavailable 0; record-missing 0; refused 1; \
-             mean credit (measured) n/a; floor credit (selected) 0.000"
+            "parity: 0/1 matched; committed selection unknown; measured 0; unavailable 0; \
+             record-missing 0; refused 1; mean credit (measured) n/a; floor credit (selected) 0.000"
         );
     }
 
@@ -32941,20 +33416,32 @@ mod parity_summary_tests {
             ]
         );
         let run = &summary.producers[0];
+        // Credited: golden-1@kvm 1.0 and golden-2@kvm 0.3 with equal inputs
+        // (mean 0.650); golden-1@liteinst 0.5 and golden-1@sabre 1.0 without
+        // (mean 0.750). Pooled: 2.8 over 4 measured, and over 9 selected.
         assert_eq!(
             run.line,
-            "parity: 2/9 matched; measured 4; unavailable 3; record-missing 1; refused 1; \
-             mean credit (measured) 0.700; floor credit (selected) 0.311 \
-             [inputs equalized for 2 of 4 credited]"
+            "parity: 2/9 matched; committed selection unknown; measured 4; unavailable 3; \
+             record-missing 1; refused 1; mean credit (measured) 0.700; floor credit (selected) \
+             0.311 [inputs equalized for 2 of 4 credited: mean 0.650 over 2 with equal inputs; \
+             mean 0.750 over 2 with unequal inputs]"
+        );
+        assert_eq!(
+            (
+                run.total.clean_mean_credit.map(|v| format!("{v:.3}")),
+                run.total.unequalized_mean_credit.map(|v| format!("{v:.3}"))
+            ),
+            (Some("0.650".into()), Some("0.750".into()))
         );
         assert_eq!(cell(run, "c-programs/golden-2@kvm").credit, Some(0.3));
         let rendered = render_parity_section(&summary);
         for expected in [
-            "| `dbt` | 1 | 0 | 0 | 0 | 1 | 0 | 0 | n/a | 0.000 |\n",
-            "| `kvm` | 4 | 2 | 1 | 1 | 1 | 1 | 0 | 0.650 | 0.325 |\n",
-            "| `liteinst` | 3 | 1 | 0 | 1 | 1 | 0 | 1 | 0.500 | 0.167 |\n",
-            "| `sabre` | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 1.000 | 1.000 |\n",
-            "| **TOTAL** | 9 | 4 | 2 | 2 | 3 | 1 | 1 | 0.700 | 0.311 |\n",
+            "| `dbt` | 1 | 0 | 0 | 0 | 1 | 0 | 0 | n/a | 0.000 | — |\n",
+            "| `kvm` | 4 | 2 | 1 | 1 | 1 | 1 | 0 | 0.650 | 0.325 | equalized |\n",
+            "| `liteinst` | 3 | 1 | 0 | 1 | 1 | 0 | 1 | 0.500 | 0.167 | not equalized |\n",
+            "| `sabre` | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 1.000 | 1.000 | not equalized |\n",
+            "| **TOTAL** | 9 | 4 | 2 | 2 | 3 | 1 | 1 | 0.700 | 0.311 | \
+             equalized for 2 of 4 (mean 0.650 equal; 0.750 unequal) |\n",
             // determinism-fail, host-inapplicable, operand-ended,
             // log-not-retained, inputs-not-equalized, reference-missing,
             // candidate-missing, other.
@@ -32990,6 +33477,647 @@ mod parity_summary_tests {
             1
         );
         assert_eq!(value["legacy_dropped"], serde_json::json!({}));
+        assert_eq!(value["legacy_dropped_cells"], serde_json::json!({}));
+    }
+
+    /// `row` as another node of the same run reported it.
+    fn from_node(mut row: ParityLedgerRow, node: &str) -> ParityLedgerRow {
+        row.source.node = node.into();
+        row.event_id = parity_event_id(
+            row.producer,
+            &row.run_id,
+            &row.cell,
+            &row.source.lane,
+            node,
+        );
+        row
+    }
+
+    /// `row` as run `run_id` at Hermit commit `sha` emitted it at `emitted_at`.
+    fn rerun(
+        mut row: ParityLedgerRow,
+        run_id: &str,
+        sha: &str,
+        emitted_at: &str,
+    ) -> ParityLedgerRow {
+        row.run_id = run_id.into();
+        row.hermit_sha = sha.into();
+        row.emitted_at = emitted_at.into();
+        if let Some(record) = row.record.as_mut() {
+            record.run_id = run_id.into();
+            record.hermit_sha = sha.into();
+        }
+        row.event_id = parity_event_id(
+            row.producer,
+            run_id,
+            &row.cell,
+            &row.source.lane,
+            &row.source.node,
+        );
+        row
+    }
+
+    /// A store of `shards`, added in the order given.
+    fn store_of(shards: &[(&str, Vec<ParityLedgerRow>)]) -> ParityStoreInput {
+        let mut input = ParityStoreInput {
+            present: true,
+            ..ParityStoreInput::default()
+        };
+        let mut digest = Sha256::new();
+        for (path, rows) in shards {
+            let text = rows
+                .iter()
+                .map(|row| format!("{}\n", line(row)))
+                .collect::<String>();
+            input.add_shard((*path).to_string(), text.as_bytes(), &mut digest);
+        }
+        input.store_sha256 = Some(format!("{:x}", digest.finalize()));
+        input
+    }
+
+    /// `(selected, measured, matched, diverged, unavailable, record-missing,
+    /// refused)` of `tally`.
+    fn counts(tally: &ParityTally) -> (usize, usize, usize, usize, usize, usize, usize) {
+        (
+            tally.selected,
+            tally.measured,
+            tally.matched,
+            tally.diverged,
+            tally.unavailable,
+            tally.record_missing,
+            tally.refused,
+        )
+    }
+
+    #[test]
+    fn the_more_adverse_of_two_reports_of_a_cell_is_kept_in_either_order() {
+        const OTHER: &str = "manifest_c_programs_on_host";
+        let timed_out = "the kvm candidate verify cell of c-programs/golden-1 timed out";
+        let full = || row(matched(&golden(1), KVM, 80, true));
+        let mut contradicted = row(matched(&golden(1), KVM, 40, false));
+        contradicted.verdict = LedgerVerdict::Diverged;
+        // A full match beside a more adverse report of the same cell from
+        // another node: (more adverse, kept verdict, kept credit, counts).
+        let cases = [
+            (
+                from_node(row(diverged(&golden(1), KVM, 10, 100, 11, 12, true)), OTHER),
+                "diverged",
+                Some(0.1),
+                (1, 1, 0, 1, 0, 0, 0),
+            ),
+            (
+                from_node(missing(&golden(1), KVM), OTHER),
+                "record-missing",
+                None,
+                (1, 0, 0, 0, 0, 1, 0),
+            ),
+            (
+                from_node(contradicted, OTHER),
+                "refused",
+                None,
+                (1, 0, 0, 0, 0, 0, 1),
+            ),
+            (
+                from_node(
+                    row(unmeasured(
+                        &golden(1),
+                        KVM,
+                        ParityVerdict::Unavailable,
+                        timed_out,
+                    )),
+                    OTHER,
+                ),
+                "unavailable",
+                None,
+                (1, 0, 0, 0, 1, 0, 0),
+            ),
+        ];
+        for (adverse, verdict, credit, expected) in cases {
+            for rows in [[full(), adverse.clone()], [adverse.clone(), full()]] {
+                let order = rows.iter().map(|row| row.verdict).collect::<Vec<_>>();
+                let summary = summarize_rows(&rows, &no_cells());
+                assert_eq!(summary.duplicate_rows, 1, "{order:?}");
+                assert_eq!(
+                    summary.refused_rows,
+                    usize::from(verdict == "refused"),
+                    "{order:?}"
+                );
+                let run = only_run(&summary);
+                let kept = cell(run, "c-programs/golden-1@kvm");
+                assert_eq!((kept.verdict, kept.credit), (verdict, credit), "{order:?}");
+                assert_eq!(counts(&run.total), expected, "{order:?}");
+                assert_eq!(
+                    run.total.floor_credit,
+                    Some(credit.unwrap_or(0.0)),
+                    "{order:?}"
+                );
+            }
+        }
+        // Equal rank and equal credit: the kept report is still the same in
+        // either order, the lower serialized one (record 11 before record 13).
+        let early = from_node(row(diverged(&golden(1), KVM, 10, 100, 11, 12, true)), OTHER);
+        let late = row(diverged(&golden(1), KVM, 10, 100, 13, 12, true));
+        for rows in [[early.clone(), late.clone()], [late, early]] {
+            let summary = summarize_rows(&rows, &no_cells());
+            assert_eq!(summary.duplicate_rows, 1);
+            let kept = cell(only_run(&summary), "c-programs/golden-1@kvm");
+            assert_eq!(
+                (kept.first_divergent_record, kept.node.as_deref()),
+                (Some(11), Some(OTHER))
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_comparison_with_matched_logs_but_different_output_is_diverged() {
+        let mut different = comparison("kvm", LogDiffVerdict::Matched, None, 2000);
+        different.candidate_stdout_sha256 = digest("other stdout");
+        different.result = ObservedResult::ParityFailure;
+        // Admitted: the logs matched, and the different stdout implies the
+        // parity failure the comparison records.
+        assert_eq!(backend_parity_admission(&different, "kvm"), Ok(()));
+        let cells = tracked(vec![tracked_cell(
+            &golden(1),
+            "kvm",
+            vec![observation(&["parity-failure"], &[different])],
+        )]);
+        let summary = parity_summary_without_store(&cells);
+        let legacy = &summary.legacy_rerun;
+        assert_eq!(legacy.entries.len(), 1, "{legacy:#?}");
+        assert_eq!(legacy.entries[0].verdict, "diverged");
+        assert_eq!((legacy.matched, legacy.diverged), (0, 1));
+        assert_eq!(
+            legacy.line,
+            "legacy-rerun (retired ptrace rerun, last at abcdef012345): 0 matched / 1 diverged"
+        );
+        assert_contains(
+            &render_parity_section(&summary),
+            "| `c-programs/golden-1@kvm` | legacy-rerun | diverged | 50 | — | `abcdef012345` |",
+        );
+    }
+
+    #[test]
+    fn dropped_legacy_evidence_is_counted_by_observation_and_by_distinct_cell() {
+        let lost = || observation(&["parity-failure"], &[]);
+        // Four observations kept no comparison: two of one cell, and one each
+        // under a retired id and its successor, which are one cell.
+        let cells = tracked(vec![
+            tracked_cell(&golden(1), "kvm", vec![lost(), lost()]),
+            tracked_cell("backend-parity-c/pidfd-open-self", "kvm", vec![lost()]),
+            tracked_cell("c-programs/pidfd-open-self-pair", "kvm", vec![lost()]),
+        ]);
+        let summary = parity_summary_without_store(&cells);
+        assert_eq!(
+            summary.legacy_dropped,
+            BTreeMap::from([("no-retained-comparison".to_string(), 4)])
+        );
+        assert_eq!(
+            summary.legacy_dropped_cells,
+            BTreeMap::from([("no-retained-comparison".to_string(), 2)])
+        );
+        assert_contains(
+            &render_parity_section(&summary),
+            "Retired rerun evidence not kept as history, by reason: \
+             `no-retained-comparison` 4 on 2 cell(s).\n",
+        );
+    }
+
+    #[test]
+    fn the_summary_does_not_depend_on_shard_or_line_order() {
+        const OTHER: &str = "manifest_c_programs_on_host";
+        let at = |row: ParityLedgerRow, emitted_at: &str| {
+            let (run_id, sha) = (row.run_id.clone(), row.hermit_sha.clone());
+            rerun(row, &run_id, &sha, emitted_at)
+        };
+        let mut rows = vec![
+            // A match and a divergence of one cell: the divergence is kept.
+            at(row(matched(&golden(1), KVM, 80, true)), "2026-09-29T04:10:00Z"),
+            from_node(
+                at(
+                    row(diverged(&golden(1), KVM, 10, 100, 11, 12, true)),
+                    "2026-09-29T04:12:00Z",
+                ),
+                OTHER,
+            ),
+            // Two reports that agree on rank and credit.
+            at(
+                row(diverged(&golden(2), KVM, 30, 100, 33, 4, true)),
+                "2026-09-29T04:11:00Z",
+            ),
+            from_node(
+                at(
+                    row(diverged(&golden(2), KVM, 30, 100, 31, 4, true)),
+                    "2026-09-29T04:10:00Z",
+                ),
+                OTHER,
+            ),
+            row(diverged(&golden(1), LITEINST, 5, 100, 6, 9, false)),
+            missing(&golden(1), SABRE),
+            row(unmeasured(
+                &golden(1),
+                DBT,
+                ParityVerdict::InputsNotEqualized,
+                "dbt runs a rewritten program",
+            )),
+            rerun(
+                row(matched(&golden(1), KVM, 80, true)),
+                "validate-older-run",
+                SHA,
+                "2026-09-28T01:00:00Z",
+            ),
+        ];
+        rows.push(envelope(
+            ParityProducer::PressureTest,
+            "pressure-run",
+            "2026-09-29T05:00:00Z",
+            &golden(1),
+            KVM,
+            LedgerVerdict::Diverged,
+            None,
+            origin(LedgerPostPassState::Complete, "post-pass"),
+            Some(ParityRecord {
+                run_id: "pressure-run".into(),
+                ..diverged(&golden(1), KVM, 25, 100, 26, 3, true)
+            }),
+        ));
+        let selection = committed_of_rows(&rows);
+        let (early, late) = (
+            "parity/hermit/devbig013/2026-09.jsonl",
+            "parity/hermit/devbig014/2026-09.jsonl",
+        );
+        let half = rows.len() / 2;
+        let reversed = rows.iter().rev().cloned().collect::<Vec<_>>();
+        let layouts = [
+            vec![
+                (early, rows[..half].to_vec()),
+                (late, rows[half..].to_vec()),
+            ],
+            vec![
+                (late, reversed[..half].to_vec()),
+                (early, reversed[half..].to_vec()),
+            ],
+            vec![
+                (early, rows.iter().step_by(2).cloned().collect()),
+                (late, rows.iter().skip(1).step_by(2).cloned().collect()),
+            ],
+        ];
+        let rendered = layouts
+            .iter()
+            .map(|layout| {
+                let mut summary = summarize_parity(&store_of(layout), &no_cells(), &|_| None, &|sha| {
+                    Ok((sha == SHA).then(|| selection.clone()))
+                });
+                assert_eq!((summary.refused_rows, summary.duplicate_rows), (0, 2));
+                let run = &summary.producers[0];
+                assert_eq!(run.run_id, RUN);
+                assert_eq!(run.emitted_at.as_deref(), Some("2026-09-29T04:12:00Z"));
+                let kept = cell(run, "c-programs/golden-1@kvm");
+                assert_eq!((kept.verdict, kept.credit), ("diverged", Some(0.1)));
+                let tie = cell(run, "c-programs/golden-2@kvm");
+                assert_eq!(
+                    (tie.first_divergent_record, tie.node.as_deref()),
+                    (Some(31), Some(OTHER))
+                );
+                // The store digest covers the shard layout, which differs by
+                // construction; nothing else may.
+                summary.generated_from.store_sha256 = None;
+                (
+                    encoded_parity_summary(&summary).unwrap().unwrap(),
+                    render_parity_section(&summary),
+                )
+            })
+            .collect::<Vec<_>>();
+        for other in &rendered[1..] {
+            assert_eq!(
+                String::from_utf8_lossy(&other.0),
+                String::from_utf8_lossy(&rendered[0].0)
+            );
+            assert_eq!(other.1, rendered[0].1);
+        }
+    }
+
+    #[test]
+    fn a_run_whose_rows_name_two_commits_is_refused_whole_wherever_the_stray_row_sits() {
+        const STRAY: &str = "6be37a833df89f7836c2aa5dbe47a95569aada62";
+        let stray = rerun(
+            row(diverged(&golden(9), KVM, 10, 100, 11, 12, false)),
+            RUN,
+            STRAY,
+            "2026-09-29T04:10:00Z",
+        );
+        let conflict = format!(
+            "the run's rows name 2 Hermit commits ({SHA}, {STRAY}), so none of its rows is admitted"
+        );
+        let mut seen = Vec::new();
+        for stray_shard in [
+            "parity/hermit/devbig013/2026-09.jsonl",
+            "parity/hermit/devbig015/2026-09.jsonl",
+        ] {
+            let input = store_of(&[
+                (SHARD, twelve_diverged()),
+                (stray_shard, vec![stray.clone()]),
+            ]);
+            let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| Ok(None));
+            assert_eq!(summary.refused_rows, 13, "{stray_shard}");
+            let run = only_run(&summary);
+            assert_eq!(run.hermit_sha, None);
+            assert_eq!(run.conflicting_hermit_shas, [SHA, STRAY]);
+            assert_eq!(
+                run.committed_unknown.as_deref(),
+                Some("the run's rows name more than one Hermit commit")
+            );
+            assert_eq!(
+                run.line,
+                "parity: 0/13 matched; committed selection unknown; measured 0; unavailable 0; \
+                 record-missing 0; refused 13; mean credit (measured) n/a; floor credit \
+                 (selected) 0.000"
+            );
+            let messages = summary
+                .refusals
+                .iter()
+                .map(|refusal| refusal.message.clone())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(messages.len(), 13);
+            for message in &messages {
+                assert!(message.ends_with(&conflict), "{message}");
+            }
+            assert_contains(
+                &render_parity_section(&summary),
+                "### validate run `validate-golden-run` at conflicting commits `0123456789ab`, \
+                 `6be37a833df8`\n",
+            );
+            seen.push((serde_json::to_string(&summary.producers).unwrap(), messages));
+        }
+        assert_eq!(seen[0], seen[1]);
+    }
+
+    #[test]
+    fn a_partial_run_never_headlines_over_a_complete_one() {
+        const DEEPER: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        let complete = (1..=3)
+            .map(|n| row(diverged(&golden(n), KVM, 10, 100, 11, 12, false)))
+            .collect::<Vec<_>>();
+        let selection = committed_of_rows(&complete);
+        let depth_of = |sha: &str| {
+            Some(if sha == DEEPER {
+                SourceDepth {
+                    commits: 20,
+                    first_parent: 10,
+                }
+            } else {
+                SourceDepth {
+                    commits: 10,
+                    first_parent: 5,
+                }
+            })
+        };
+        let committed_of = |sha: &str| Ok((sha == SHA || sha == DEEPER).then(|| selection.clone()));
+        let summarize = |extra: ParityLedgerRow| {
+            let mut rows = complete.clone();
+            rows.push(extra);
+            let lines = rows.iter().map(line).collect::<Vec<_>>();
+            summarize_parity(&store(&lines), &no_cells(), &depth_of, &committed_of)
+        };
+        let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; measured 3; \
+                             unavailable 0; record-missing 0; mean credit (measured) 0.100; \
+                             floor credit (selected) 0.100 [inputs not equalized]";
+        let partial_line = "parity: 1/1 matched; selected 1 of 3 committed (partial); measured 1; \
+                            unavailable 0; record-missing 0; mean credit (measured) 1.000; \
+                            floor credit (selected) 1.000 [inputs not equalized]";
+        // A later partial run at the same commit, and a partial run at a
+        // deeper commit.
+        for (run_id, sha, emitted_at) in [
+            ("validate-later-partial", SHA, "2026-09-29T05:00:00Z"),
+            ("validate-deeper-partial", DEEPER, "2026-09-29T04:30:00Z"),
+        ] {
+            let summary = summarize(rerun(
+                row(matched(&golden(1), KVM, 80, false)),
+                run_id,
+                sha,
+                emitted_at,
+            ));
+            let run = only_run(&summary);
+            assert_eq!((run.run_id.as_str(), run.line.as_str()), (RUN, complete_line));
+            let brief = summary
+                .runs
+                .iter()
+                .find(|brief| brief.run_id == run_id)
+                .unwrap();
+            assert_eq!((brief.headline, brief.line.as_str()), (false, partial_line));
+            let rendered = render_parity_section(&summary);
+            assert_contains(
+                &rendered,
+                "\n### validate run `validate-golden-run` at `0123456789ab`\n",
+            );
+            assert_contains(
+                &rendered,
+                &format!("| validate | `{run_id}` | `{}` | no | `{partial_line}` |\n", &sha[..12]),
+            );
+        }
+        // A malformed emission time is refused by the row validator, so it
+        // can never order a run.
+        let summary = summarize(rerun(
+            row(matched(&golden(1), KVM, 80, false)),
+            "validate-malformed-time",
+            SHA,
+            "zzzz not a time",
+        ));
+        assert_eq!(summary.refused_rows, 1);
+        assert_eq!(
+            summary.refusals[0].message,
+            "parity ledger row c-programs/golden-1@kvm (validate run validate-malformed-time): \
+             emitted_at is not an RFC 3339 UTC time: \"zzzz not a time\" has no digits at bytes 0..4"
+        );
+        assert_eq!(only_run(&summary).run_id, RUN);
+        // Two complete runs at one commit are ordered by instant, not by
+        // text: as text, `...:00.5Z` sorts before `...:00Z`.
+        let whole = complete
+            .iter()
+            .map(|row| rerun(row.clone(), "validate-whole-second", SHA, "2026-09-29T04:10:00Z"))
+            .collect::<Vec<_>>();
+        let half = complete
+            .iter()
+            .zip(["2026-09-29T04:10:00Z", "2026-09-29T04:10:00.5Z", "2026-09-29T04:10:00.25Z"])
+            .map(|(row, at)| rerun(row.clone(), "validate-half-second", SHA, at))
+            .collect::<Vec<_>>();
+        let lines = whole.iter().chain(&half).map(line).collect::<Vec<_>>();
+        let summary = summarize_parity(&store(&lines), &no_cells(), &depth_of, &committed_of);
+        let run = only_run(&summary);
+        assert_eq!(run.run_id, "validate-half-second");
+        assert_eq!(run.emitted_at.as_deref(), Some("2026-09-29T04:10:00.5Z"));
+    }
+
+    #[test]
+    fn each_run_is_measured_against_its_own_commits_selection() {
+        let rows = [
+            row(diverged(&golden(1), KVM, 10, 100, 11, 12, false)),
+            row(diverged(&golden(2), KVM, 10, 100, 11, 12, false)),
+            row(diverged(&golden(9), LITEINST, 5, 100, 6, 9, false)),
+        ];
+        let selection = committed(&[
+            (&golden(1), KVM),
+            (&golden(2), KVM),
+            (&golden(3), KVM),
+            (&golden(1), SABRE),
+        ]);
+        let lines = rows.iter().map(line).collect::<Vec<_>>();
+        let summary = summarize_parity(&store(&lines), &no_cells(), &|_| None, &|sha| {
+            Ok((sha == SHA).then(|| selection.clone()))
+        });
+        let run = only_run(&summary);
+        assert_eq!(
+            run.line,
+            "parity: 0/3 matched; selected 2 of 4 committed (partial); 1 outside the committed \
+             selection; measured 3; unavailable 0; record-missing 0; mean credit (measured) 0.083; \
+             floor credit (selected) 0.083 [inputs not equalized]"
+        );
+        assert_eq!(
+            run.committed_cells_without_row,
+            ["c-programs/golden-1@sabre", "c-programs/golden-3@kvm"]
+        );
+        assert_eq!(run.cells_outside_committed, ["c-programs/golden-9@liteinst"]);
+        assert_eq!(
+            (
+                run.per_backend[&SABRE].committed,
+                run.per_backend[&SABRE].committed_selected
+            ),
+            (Some(1), Some(0))
+        );
+        let rendered = render_parity_section(&summary);
+        for expected in [
+            "\n### validate run `validate-golden-run` at `0123456789ab` (partial: selected 2 of 4 \
+             committed)\n",
+            "| `kvm` | 2 of 3 | 2 | 0 | 2 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
+            "| `liteinst` | 0 of 0 +1 outside | 1 | 0 | 1 | 0 | 0 | 0 | 0.050 | 0.050 | not \
+             equalized |\n",
+            // Owed a cell, reported none: still shown.
+            "| `sabre` | 0 of 1 | 0 | 0 | 0 | 0 | 0 | 0 | n/a | n/a | — |\n",
+            "| **TOTAL** | 2 of 4 +1 outside | 3 | 0 | 3 | 0 | 0 | 0 | 0.083 | 0.083 | not \
+             equalized |\n",
+            "\n2 cell(s) its commit selects have no row in this run: `c-programs/golden-1@sabre`, \
+             `c-programs/golden-3@kvm`.\n",
+            "\n1 cell(s) this run reported are not in its commit's selection: \
+             `c-programs/golden-9@liteinst`.\n",
+        ] {
+            assert_contains(&rendered, expected);
+        }
+        assert!(!rendered.contains("| `dbt` |"), "{rendered}");
+
+        // A long list names the first 20 and counts the rest.
+        let owed = (1..=31).map(|n| (golden(n), KVM)).collect::<CommittedParityCells>();
+        let summary = summarize_parity(
+            &store(&[line(&rows[0])]),
+            &no_cells(),
+            &|_| None,
+            &|_| Ok(Some(owed.clone())),
+        );
+        let run = only_run(&summary);
+        assert_eq!(run.committed_cells_without_row.len(), 30);
+        let rendered = render_parity_section(&summary);
+        assert_contains(
+            &rendered,
+            "\n30 cell(s) its commit selects have no row in this run: `c-programs/golden-10@kvm`,",
+        );
+        assert_contains(
+            &rendered,
+            " and 10 more (all are in `scorecard/parity.json`).\n",
+        );
+    }
+
+    #[test]
+    fn a_committed_selection_joins_retired_ids_and_refuses_a_double_or_unknown_cell() {
+        let file = |cells: JsonValue| serde_json::json!({ "schema": 1, "cells": cells }).to_string();
+        let selection = committed_parity_cells(&file(serde_json::json!([
+            {"test_id": golden(1), "backend": "kvm", "selected": true, "category": "c-programs"},
+            {"test_id": golden(2), "backend": "kvm", "selected": false},
+            {"test_id": "backend-parity-c/pidfd-open-self", "backend": "liteinst", "selected": true},
+        ])))
+        .unwrap();
+        assert_eq!(
+            selection,
+            committed(&[
+                (&golden(1), KVM),
+                ("c-programs/pidfd-open-self-pair", LITEINST)
+            ])
+        );
+        assert_eq!(
+            committed_parity_cells(&file(serde_json::json!([
+                {"test_id": "backend-parity-c/pidfd-open-self", "backend": "kvm", "selected": true},
+                {"test_id": "c-programs/pidfd-open-self-pair", "backend": "kvm", "selected": true},
+            ]))),
+            Err(format!(
+                "{PARITY_CELLS_PATH} selects c-programs/pidfd-open-self-pair@kvm twice"
+            ))
+        );
+        for text in [
+            file(serde_json::json!([
+                {"test_id": golden(1), "backend": "qemu", "selected": true}
+            ])),
+            file(serde_json::json!([{"test_id": golden(1), "backend": "kvm"}])),
+            "{not json".to_string(),
+        ] {
+            let error = committed_parity_cells(&text).unwrap_err();
+            assert!(
+                error.starts_with(&format!("{PARITY_CELLS_PATH} is not a readable cell list: ")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commits_selection_is_read_at_that_commit_or_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = fixture_git().args(args).current_dir(root).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(root.join("README"), "no selection yet").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "before the selection"]);
+        let without = git(&["rev-parse", "HEAD"]);
+        let path = root.join(PARITY_CELLS_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::json!({
+                "cells": [{"test_id": golden(1), "backend": "kvm", "selected": true}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "select one cell"]);
+        let good = git(&["rev-parse", "HEAD"]);
+        fs::write(&path, "{not json").unwrap();
+        git(&["commit", "-qam", "break the selection"]);
+        let broken = git(&["rev-parse", "HEAD"]);
+
+        assert_eq!(
+            committed_parity_cells_at(root, &good),
+            Ok(Some(committed(&[(&golden(1), KVM)])))
+        );
+        // The commit has no selection file, or this checkout lacks the commit.
+        assert_eq!(committed_parity_cells_at(root, &without), Ok(None));
+        assert_eq!(
+            committed_parity_cells_at(root, "89abcdef0123456789abcdef0123456789abcdef"),
+            Ok(None)
+        );
+        let error = committed_parity_cells_at(root, &broken).unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "{broken}:{PARITY_CELLS_PATH}: {PARITY_CELLS_PATH} is not a readable cell list: "
+            )),
+            "{error}"
+        );
     }
 
     /// Minimal inputs whose determinism rendering is known.
@@ -33092,18 +34220,31 @@ mod parity_summary_tests {
                 .present
         );
 
-        let summary = summarize_parity(&input, &no_cells(), &|_| None);
+        // The run's own commit's selection, as provenance.json records it.
+        let fixture_sha = "d3a0a4ae3d168565595ae4157b25ab8efbb1861a";
+        let committed_cells =
+            committed_parity_cells(&fs::read_to_string(dir.join("committed-cells.json")).unwrap())
+                .unwrap();
+        assert_eq!(committed_cells.len(), 192);
+        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|sha| {
+            Ok((sha == fixture_sha).then(|| committed_cells.clone()))
+        });
         assert_eq!((summary.refused_rows, summary.duplicate_rows), (0, 0));
         let run = only_run(&summary);
         assert_eq!(
             run.run_id,
             "validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da"
         );
+        assert_eq!(run.hermit_sha.as_deref(), Some(fixture_sha));
         assert_eq!(
             run.line,
-            "parity: 0/192 matched; measured 175; unavailable 17; record-missing 0; \
-             mean credit (measured) 0.052; floor credit (selected) 0.047 [inputs not equalized]"
+            "parity: 0/192 matched; selected 192 of 192 committed; measured 175; unavailable 17; \
+             record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 \
+             [inputs not equalized]"
         );
+        assert!(run.committed_cells_without_row.is_empty());
+        assert!(run.cells_outside_committed.is_empty());
+        assert_eq!(run.committed_unknown, None);
         let lines = run
             .per_backend
             .iter()
@@ -33112,14 +34253,18 @@ mod parity_summary_tests {
         assert_eq!(
             lines,
             [
-                "dbt: parity: 0/14 matched; measured 0; unavailable 14; record-missing 0; \
-                 mean credit (measured) n/a; floor credit (selected) 0.000",
-                "kvm: parity: 0/77 matched; measured 76; unavailable 1; record-missing 0; \
-                 mean credit (measured) 0.101; floor credit (selected) 0.100 [inputs not equalized]",
-                "liteinst: parity: 0/99 matched; measured 98; unavailable 1; record-missing 0; \
-                 mean credit (measured) 0.014; floor credit (selected) 0.014 [inputs not equalized]",
-                "sabre: parity: 0/2 matched; measured 1; unavailable 1; record-missing 0; \
-                 mean credit (measured) 0.020; floor credit (selected) 0.010 [inputs not equalized]",
+                "dbt: parity: 0/14 matched; selected 14 of 14 committed; measured 0; \
+                 unavailable 14; record-missing 0; mean credit (measured) n/a; \
+                 floor credit (selected) 0.000",
+                "kvm: parity: 0/77 matched; selected 77 of 77 committed; measured 76; \
+                 unavailable 1; record-missing 0; mean credit (measured) 0.101; \
+                 floor credit (selected) 0.100 [inputs not equalized]",
+                "liteinst: parity: 0/99 matched; selected 99 of 99 committed; measured 98; \
+                 unavailable 1; record-missing 0; mean credit (measured) 0.014; \
+                 floor credit (selected) 0.014 [inputs not equalized]",
+                "sabre: parity: 0/2 matched; selected 2 of 2 committed; measured 1; \
+                 unavailable 1; record-missing 0; mean credit (measured) 0.020; \
+                 floor credit (selected) 0.010 [inputs not equalized]",
             ]
         );
         assert_eq!(

@@ -12,9 +12,13 @@
       "producer": "validate",
       "run_id": "validate-coord-s17-d3a0a4ae3d16-1790649970094317174-3328074-da07a1da",
       "hermit_sha": "d3a0a4ae3d168565595ae4157b25ab8efbb1861a",
+      "conflicting_hermit_shas": [],
       "depth": null,
       "emitted_at": "2026-09-29T04:10:00Z",
-      "line": "parity: 0/192 matched; measured 175; unavailable 17; record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 [inputs not equalized]",
+      "line": "parity: 0/192 matched; selected 192 of 192 committed; measured 175; unavailable 17; record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 [inputs not equalized]",
+      "committed_unknown": null,
+      "committed_cells_without_row": [],
+      "cells_outside_committed": [],
       "per_backend": {
         "dbt": {
           "selected": 14,
@@ -38,8 +42,15 @@
           "clean_credited": 0,
           "unequalized_credited": 0,
           "credit_sum": 0.0,
+          "clean_credit_sum": 0.0,
+          "unequalized_credit_sum": 0.0,
           "mean_credit": null,
+          "clean_mean_credit": null,
+          "unequalized_mean_credit": null,
           "floor_credit": 0.0,
+          "committed": 14,
+          "committed_selected": 14,
+          "outside_committed": 0,
           "first_divergence": null
         },
         "kvm": {
@@ -64,8 +75,15 @@
           "clean_credited": 0,
           "unequalized_credited": 76,
           "credit_sum": 7.67797381224769,
+          "clean_credit_sum": 0.0,
+          "unequalized_credit_sum": 7.67797381224769,
           "mean_credit": 0.1010259712137854,
+          "clean_mean_credit": null,
+          "unequalized_mean_credit": 0.1010259712137854,
           "floor_credit": 0.09971394561360637,
+          "committed": 77,
+          "committed_selected": 77,
+          "outside_committed": 0,
           "first_divergence": {
             "first_divergent_record": 13,
             "syscall": 2,
@@ -99,8 +117,15 @@
           "clean_credited": 0,
           "unequalized_credited": 98,
           "credit_sum": 1.3745858969112323,
+          "clean_credit_sum": 0.0,
+          "unequalized_credit_sum": 1.3745858969112323,
           "mean_credit": 0.01402638670317584,
+          "clean_mean_credit": null,
+          "unequalized_mean_credit": 0.01402638670317584,
           "floor_credit": 0.013884706029406387,
+          "committed": 99,
+          "committed_selected": 99,
+          "outside_committed": 0,
           "first_divergence": {
             "first_divergent_record": 16,
             "syscall": 3,
@@ -134,8 +159,15 @@
           "clean_credited": 0,
           "unequalized_credited": 1,
           "credit_sum": 0.02,
+          "clean_credit_sum": 0.0,
+          "unequalized_credit_sum": 0.02,
           "mean_credit": 0.02,
+          "clean_mean_credit": null,
+          "unequalized_mean_credit": 0.02,
           "floor_credit": 0.01,
+          "committed": 2,
+          "committed_selected": 2,
+          "outside_committed": 0,
           "first_divergence": {
             "first_divergent_record": 3,
             "syscall": null,
@@ -170,8 +202,15 @@
         "clean_credited": 0,
         "unequalized_credited": 175,
         "credit_sum": 9.072559709158929,
+        "clean_credit_sum": 0.0,
+        "unequalized_credit_sum": 9.072559709158929,
         "mean_credit": 0.051843198338051025,
+        "clean_mean_credit": null,
+        "unequalized_mean_credit": 0.051843198338051025,
         "floor_credit": 0.04725291515186942,
+        "committed": 192,
+        "committed_selected": 192,
+        "outside_committed": 0,
         "first_divergence": {
           "first_divergent_record": 16,
           "syscall": 3,
@@ -4227,7 +4266,7 @@
       "depth": null,
       "emitted_at": "2026-09-29T04:10:00Z",
       "headline": true,
-      "line": "parity: 0/192 matched; measured 175; unavailable 17; record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 [inputs not equalized]"
+      "line": "parity: 0/192 matched; selected 192 of 192 committed; measured 175; unavailable 17; record-missing 0; mean credit (measured) 0.052; floor credit (selected) 0.047 [inputs not equalized]"
     }
   ],
   "refused_rows": 0,
@@ -4242,5 +4281,6 @@
     "superseded": 0,
     "entries": []
   },
-  "legacy_dropped": {}
+  "legacy_dropped": {},
+  "legacy_dropped_cells": {}
 }
