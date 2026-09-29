@@ -896,10 +896,15 @@ fn filter_detcore<'a>(v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
 /// Two consequences make this the message worth recording. First, both paths
 /// end with the same final scheduler message, so the *last* scheduler line does
 /// not say which path a run took; only whether this kick appeared does. Second,
-/// whether it appears is decided by host timing — the ptrace supervisor may not
-/// yet have reaped a physical process exit when the check runs — so a pair of
-/// runs of the same guest can differ here while agreeing on every committed
-/// scheduling decision.
+/// whether it appears used to be decided by host timing -- the SaBRe ptrace
+/// supervisor might not yet have reaped a physical process exit when the check
+/// ran, and a dead thread's second exit hook could queue a removal after it --
+/// so a pair of runs of the same guest could differ here while agreeing on every
+/// committed scheduling decision. The scheduler now logs it once per logical
+/// empty state, before and regardless of that wait
+/// (https://github.com/rrnewton/hermit/issues/3360,
+/// https://github.com/rrnewton/hermit/issues/3223), so a pair whose counts
+/// differ points at a scheduler defect rather than at the host.
 ///
 /// Kept as a constant so the string sits beside the code that reads it; grep
 /// for this text to find the producing `info!`.

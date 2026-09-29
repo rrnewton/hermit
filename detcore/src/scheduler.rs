@@ -625,6 +625,24 @@ pub struct Scheduler {
     /// poison the scheduler mutex on the way out.
     terminal_deadlock: Option<String>,
 
+    /// The scheduler turn at which `step2d_handle_empty_queue` last logged
+    /// "zero threads left anywhere, fizzling.", while that empty state lasts.
+    ///
+    /// The line reports a logical transition: every thread is dead or gone and
+    /// nothing waits. Once logged, the daemon may pass through the empty-queue
+    /// step again before it can exit, and how many extra passes it makes is
+    /// host timing. It waits for a SaBRe supervisor to report a final wait
+    /// status (`pending_physical_process_exits`), and it drains a removal that
+    /// a dead thread's second, reactive exit hook queued
+    /// (`pending_run_queue_removals`). Neither is a thread. This records that
+    /// the current empty state was already reported, so those passes add no
+    /// line. It is cleared as soon as the step sees a thread or a waiter again,
+    /// and a committed turn makes the recorded turn stale.
+    ///
+    /// See https://github.com/rrnewton/hermit/issues/3360 and
+    /// https://github.com/rrnewton/hermit/issues/3223.
+    empty_queue_kick_turn: Option<u64>,
+
     // A fatal backend result ends this run; it is never a guest response.
     // The event and run-queue transition share the grant/commit mutex. Every
     // callback and daemon wait clones its own subscriber, unlike an Ivar.
@@ -1237,7 +1255,8 @@ async fn sched_loop_inner(
 
         // If there are NO threads left in the system, then we're truly done:
         {
-            let sched = sched.lock().unwrap();
+            let mut sched = sched.lock().unwrap();
+            sched.at_loop_point(SchedLoopPoint::LoopTop);
             if sched.backend_failed() {
                 return;
             }
@@ -1288,6 +1307,29 @@ async fn sched_loop_inner(
             observed_turn = true;
         }
     }
+}
+
+/// A place in the daemon loop, inside one of its scheduler-lock holds, where a
+/// test can land a host-timed backend report. Production builds compile
+/// [`Scheduler::at_loop_point`] to nothing.
+///
+/// Two reports reach the scheduler from backend threads at host-chosen times
+/// near the end of a run: the SaBRe ptrace supervisor's
+/// `complete_physical_process_exit` when the kernel delivers a process's final
+/// wait status, and a dead thread's second, reactive `logically_kill_thread`
+/// from its exit hook. Each can take the scheduler lock between any two of the
+/// daemon's lock holds. These points sit before the top-of-loop exit check and
+/// on both sides of the empty-queue step's decision, the two decisions that
+/// read that state, so a test can land a report at each point in turn, with no
+/// sleeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchedLoopPoint {
+    /// In the top-of-loop exit check's lock hold, before it reads any state.
+    LoopTop,
+    /// In the empty-queue step's lock hold, before it reads any state.
+    BeforeEmptyQueue,
+    /// In the empty-queue step's lock hold, after it has decided.
+    AfterEmptyQueue,
 }
 
 /// Not an error, but simply a turn that cannot do productive work.
@@ -1726,6 +1768,7 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
+            empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
@@ -3942,7 +3985,28 @@ impl Scheduler {
         self.terminal_deadlock.take()
     }
 
+    /// Test seam: see [`SchedLoopPoint`].
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn at_loop_point(&mut self, _point: SchedLoopPoint) {}
+
+    /// Test seam: run the current thread's installed loop probe, if any.
+    #[cfg(test)]
+    fn at_loop_point(&mut self, point: SchedLoopPoint) {
+        test::fire_loop_probe(point, self);
+    }
+
     fn step2d_handle_empty_queue(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) -> Result<(), SkipTurn> {
+        self.at_loop_point(SchedLoopPoint::BeforeEmptyQueue);
+        let decision = self.step2d_decide_empty_queue(global_time);
+        self.at_loop_point(SchedLoopPoint::AfterEmptyQueue);
+        decision
+    }
+
+    fn step2d_decide_empty_queue(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
@@ -3954,19 +4018,36 @@ impl Scheduler {
         let futex_empty = self.blocked.no_futex_waiters();
 
         if self.run_queue.is_empty() {
-            if !self.pending_physical_process_exits.is_empty() {
-                // The SaBRe plugin has run the child process's logical exit hook, but the ptrace
-                // supervisor has not received its final wait status. Fast-forwarding the next
-                // timer here can fire a parent's timeout before the child becomes waitable.
-                trace!(
-                    "waiting for physical process exits before empty-queue timer fast-forward: {:?}",
-                    self.pending_physical_process_exits
-                );
-                std::thread::yield_now();
-                return Err(SkipTurn);
-            }
-            // When the run queue is empty, we sometimes need to give things a kick.
-            if futex_empty && timed_empty && external_waits_empty && rt_sigsuspend_empty {
+            let logically_empty =
+                futex_empty && timed_empty && external_waits_empty && rt_sigsuspend_empty;
+            // Report the empty state from logical state alone, BEFORE the
+            // physical-exit wait below and once per empty state. Both halves are
+            // what make the line a function of Detcore scheduling.
+            //
+            // Before the physical-exit wait: that wait holds the loop for the
+            // ptrace supervisor's final wait status, which arrives at a
+            // host-chosen moment. When the report sat after the wait, it was
+            // logged only if the status had landed before this step ran, and
+            // otherwise the loop exited without it -- zero or one lines for the
+            // same logical execution
+            // (https://github.com/rrnewton/hermit/issues/3360).
+            //
+            // Once per empty state: the loop can reach this step again before it
+            // exits, while it waits for that status or drains a removal queued
+            // by a dead thread's second, reactive exit hook. How many times it
+            // does is host timing, and neither thing it waits for is a thread,
+            // so the state it reports has not changed
+            // (https://github.com/rrnewton/hermit/issues/3223). See
+            // `empty_queue_kick_turn`.
+            //
+            // The branch's control flow is unchanged: the wait still gates the
+            // deadlock report and the timer fast-forward, and every path below
+            // still skips this turn. Only where and how often the line is
+            // logged changed; the guest cannot observe either.
+            if !logically_empty {
+                self.empty_queue_kick_turn = None;
+            } else if self.empty_queue_kick_turn != Some(self.turn) {
+                self.empty_queue_kick_turn = Some(self.turn);
                 // `info!`, and that level is load-bearing. Restored from `trace!`
                 // by owner ruling after 08ff51a33e demoted it.
                 //
@@ -4013,6 +4094,20 @@ impl Scheduler {
                         record_suffix
                     );
                 }
+            }
+            if !self.pending_physical_process_exits.is_empty() {
+                // The SaBRe plugin has run the child process's logical exit hook, but the ptrace
+                // supervisor has not received its final wait status. Fast-forwarding the next
+                // timer here can fire a parent's timeout before the child becomes waitable.
+                trace!(
+                    "waiting for physical process exits before empty-queue timer fast-forward: {:?}",
+                    self.pending_physical_process_exits
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
+            // When the run queue is empty, we sometimes need to give things a kick.
+            if logically_empty {
                 return Err(SkipTurn);
             } else if timed_empty && external_waits_empty && (!futex_empty || !rt_sigsuspend_empty)
             {
@@ -4086,6 +4181,9 @@ impl Scheduler {
                 }
                 return Err(SkipTurn);
             }
+        } else {
+            // A queued thread ends any empty state.
+            self.empty_queue_kick_turn = None;
         }
         Ok(())
     }
@@ -9038,6 +9136,305 @@ mod test {
         assert!(scheduler.pending_physical_process_exits.is_empty());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    type LoopProbe = Box<dyn FnMut(SchedLoopPoint, &mut Scheduler)>;
+
+    thread_local! {
+        static LOOP_PROBE: std::cell::RefCell<Option<LoopProbe>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by [`Scheduler::at_loop_point`] in test builds. The probe is
+    /// thread-local, so only a daemon loop polled on the installing test's own
+    /// thread (a current-thread runtime) reaches it.
+    pub(super) fn fire_loop_probe(point: SchedLoopPoint, sched: &mut Scheduler) {
+        // Taken out while it runs, so the probe may use the scheduler freely.
+        let Some(mut probe) = LOOP_PROBE.with(|slot| slot.borrow_mut().take()) else {
+            return;
+        };
+        probe(point, sched);
+        LOOP_PROBE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(probe);
+            }
+        });
+    }
+
+    /// Uninstalls the loop probe when the test ends, including by panic.
+    struct LoopProbeGuard;
+
+    impl LoopProbeGuard {
+        fn install(probe: LoopProbe) -> Self {
+            LOOP_PROBE.with(|slot| *slot.borrow_mut() = Some(probe));
+            LoopProbeGuard
+        }
+    }
+
+    impl Drop for LoopProbeGuard {
+        fn drop(&mut self) {
+            LOOP_PROBE.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    /// Records, in order, the text of every INFO event from
+    /// `detcore::scheduler`: the stream the L2 verify comparator reads.
+    #[derive(Clone, Default)]
+    struct SchedulerInfoLog(Arc<Mutex<Vec<String>>>);
+
+    struct MessageText(Option<String>);
+
+    impl tracing::field::Visit for MessageText {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for SchedulerInfoLog {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == Level::INFO
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if !event.metadata().target().starts_with("detcore::scheduler") {
+                return;
+            }
+            let mut text = MessageText(None);
+            event.record(&mut text);
+            if let Some(text) = text.0 {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// What one daemon run to shutdown shows: its scheduler INFO lines, in
+    /// order, and the logical state it leaves.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ShutdownObservation {
+        scheduler_info: Vec<String>,
+        turn: u64,
+        global_time: LogicalTime,
+    }
+
+    const FIZZLE: &str = "zero threads left anywhere, fizzling.";
+    const SCHED_LOOP_EXIT: &str = "[scheduler] run queue empty, exiting sched_loop.";
+
+    /// Run the real daemon loop, `sched_loop`, from the state `setup` builds
+    /// until it exits. When the loop reaches `landing` -- (pass number, point)
+    /// -- run `report` there, inside that lock hold, as a backend thread that
+    /// took the scheduler lock at that moment would. Returns the observation
+    /// and whether `report` ran.
+    async fn run_daemon_to_shutdown(
+        config: &Config,
+        setup: impl FnOnce(&mut Scheduler),
+        landing: Option<(u64, SchedLoopPoint)>,
+        report: impl FnOnce(&mut Scheduler) + 'static,
+    ) -> (ShutdownObservation, bool) {
+        let log = SchedulerInfoLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.clone());
+        let sched = Arc::new(Mutex::new(Scheduler::new(config)));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(config)));
+        {
+            let mut s = sched.lock().unwrap();
+            setup(&mut s);
+            s.started_up.try_put(());
+        }
+
+        let landed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let probe: LoopProbe = {
+            let landed = landed.clone();
+            let mut report = Some(report);
+            let mut pass = 0u64;
+            Box::new(move |point, s| {
+                if point == SchedLoopPoint::LoopTop {
+                    pass += 1;
+                    // A hang guard, not a timing assumption: every schedule
+                    // here exits by its third pass.
+                    assert!(pass <= 8, "the daemon loop did not exit in 8 passes");
+                }
+                if landing == Some((pass, point))
+                    && let Some(report) = report.take()
+                {
+                    report(s);
+                    landed.set(true);
+                }
+            })
+        };
+        let _probe = LoopProbeGuard::install(probe);
+        sched_loop(sched.clone(), global_time.clone()).await;
+
+        let s = sched.lock().unwrap();
+        assert!(s.run_queue.is_empty());
+        assert!(s.pending_run_queue_removals.is_empty());
+        assert!(s.pending_physical_process_exits.is_empty());
+        let observation = ShutdownObservation {
+            scheduler_info: log.0.lock().unwrap().clone(),
+            turn: s.turn,
+            global_time: global_time.lock().unwrap().as_nanos(),
+        };
+        (observation, landed.get())
+    }
+
+    /// Each point a host-timed report can land in the daemon's last two passes:
+    /// the pass that drains the last thread's removal, and the pass after it.
+    const SHUTDOWN_LANDINGS: [(u64, SchedLoopPoint); 6] = [
+        (1, SchedLoopPoint::LoopTop),
+        (1, SchedLoopPoint::BeforeEmptyQueue),
+        (1, SchedLoopPoint::AfterEmptyQueue),
+        (2, SchedLoopPoint::LoopTop),
+        (2, SchedLoopPoint::BeforeEmptyQueue),
+        (2, SchedLoopPoint::AfterEmptyQueue),
+    ];
+
+    /// Every run must match the first exactly, and the first must report the
+    /// empty state once, as its last line before the loop exits.
+    fn assert_one_shutdown_log(runs: &[(Option<(u64, SchedLoopPoint)>, ShutdownObservation)]) {
+        let fizzles = |observation: &ShutdownObservation| {
+            observation
+                .scheduler_info
+                .iter()
+                .filter(|line| line.contains(FIZZLE))
+                .count()
+        };
+        // Every landing's count, so a failure shows the whole pattern.
+        let counts = runs
+            .iter()
+            .map(|(landing, observation)| (*landing, fizzles(observation)))
+            .collect::<Vec<_>>();
+        let (first, canonical) = &runs[0];
+        assert_eq!(
+            fizzles(canonical),
+            1,
+            "landing at {first:?} must log the empty state once; fizzle lines per landing: \
+             {counts:?}; {canonical:#?}"
+        );
+        let tail = &canonical.scheduler_info[canonical.scheduler_info.len() - 2..];
+        assert!(
+            tail[0].contains(FIZZLE) && tail[1] == SCHED_LOOP_EXIT,
+            "the empty state must be reported just before the loop exits: {canonical:#?}"
+        );
+        for (landing, observation) in &runs[1..] {
+            assert_eq!(
+                observation, canonical,
+                "a report landing at {landing:?} instead of {first:?} changed the scheduler's \
+                 INFO log or logical state; fizzle lines per landing: {counts:?}"
+            );
+        }
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3360: on SaBRe the last
+    /// thread's logical exit opens a physical-exit barrier, and the ptrace
+    /// supervisor closes it when the kernel's final wait status arrives -- a
+    /// host-timed moment. Before the fix the empty-queue step logged its
+    /// "fizzling" line only when that status had already landed by the time the
+    /// step ran, so the line appeared zero or one times depending on the host.
+    /// Land it at every point of the last two passes; the scheduler's INFO log
+    /// and state must not change.
+    #[tokio::test]
+    async fn sabre_last_exit_logs_one_fizzle_wherever_the_final_wait_status_lands() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let root = DetTid::from_raw(3);
+        let mut runs = Vec::new();
+        for landing in SHUTDOWN_LANDINGS {
+            let (observation, landed) = run_daemon_to_shutdown(
+                &config,
+                |s| {
+                    s.thread_tree.add_child(root, root, true);
+                    register_known_thread(s, root);
+                    // step6 re-enqueued the thread after its committed
+                    // `exit_group` turn; then its exit hook ran.
+                    s.runqueue_push_back(root);
+                    s.logically_kill_thread(&root, &root, MmId::initial(root));
+                    assert_eq!(s.pending_physical_process_exits, BTreeSet::from([root]));
+                },
+                Some(landing),
+                move |s| assert!(s.complete_physical_process_exit(root)),
+            )
+            .await;
+            assert!(landed, "the final wait status never landed at {landing:?}");
+            runs.push((Some(landing), observation));
+        }
+        assert_one_shutdown_log(&runs);
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3223, the same defect on
+    /// ptrace: a worker's `exit_group` logically kills its parked sibling at
+    /// once, and the kernel's physical kill later runs the sibling's exit hook,
+    /// which calls `logically_kill_thread` again. The second call finds nothing
+    /// to remove but still queues a removal, which the daemon must drain
+    /// before it may exit. Before the fix, if that arrived after the empty-queue
+    /// step had logged its line, the drain pass logged it a second time. Land
+    /// it at every reachable point, and after the loop has exited (`None`); the
+    /// scheduler's INFO log and state must not change.
+    #[tokio::test]
+    async fn redundant_exit_hook_after_exit_group_logs_one_fizzle_wherever_it_lands() {
+        let config = Config::default();
+        assert!(!config.backend_reports_physical_process_exits);
+        let leader = DetTid::from_raw(3);
+        let worker = DetTid::from_raw(4);
+        // With no physical-exit barrier the loop exits at the top of pass 2,
+        // before pass 2's empty-queue step, so those two points are unreachable.
+        let landings = SHUTDOWN_LANDINGS[..4]
+            .iter()
+            .copied()
+            .map(Some)
+            .chain([None]);
+        let mut runs = Vec::new();
+        for landing in landings {
+            let (observation, landed) = run_daemon_to_shutdown(
+                &config,
+                |s| {
+                    s.thread_tree.add_child(leader, leader, true);
+                    s.thread_tree.add_child(leader, worker, false);
+                    register_known_thread(s, leader);
+                    register_known_thread(s, worker);
+                    // step6 re-enqueued the worker after its committed
+                    // `exit_group` turn. The leader is parked, not queued.
+                    s.runqueue_push_back(worker);
+                    // After granting the exit, `finish_resource_response`
+                    // logically kills the sibling; then the worker's own exit
+                    // hook kills the worker.
+                    s.logically_kill_thread(&leader, &leader, MmId::initial(leader));
+                    s.logically_kill_thread(&worker, &leader, MmId::initial(leader));
+                },
+                landing,
+                // The kernel's kill of the leader runs its exit hook.
+                move |s| s.logically_kill_thread(&leader, &leader, MmId::initial(leader)),
+            )
+            .await;
+            assert_eq!(
+                landed,
+                landing.is_some(),
+                "the redundant exit hook landed wrongly for {landing:?}"
+            );
+            runs.push((landing, observation));
+        }
+        assert_one_shutdown_log(&runs);
     }
 
     /// Build an `HbRuntime` from a JSON happens-before spec for testing.
