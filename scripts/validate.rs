@@ -15070,9 +15070,13 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
         ] {
             let argument = format!("        --env {name} \\\n");
             assert_eq!(source.matches(&argument).count(), 1);
-            std::fs::write(
+            // Not std::fs::write: `run` executes this copy next, and a sibling
+            // test thread that spawns while a write descriptor is open lets its
+            // child hold that descriptor, so the exec fails with ETXTBSY.
+            exec_safe_fs::write_executable(
                 copied_scripts.join("run-split-validate.sh"),
                 source.replace(&argument, ""),
+                0o755,
             )
             .unwrap();
             let mut broken = split_args.clone();
