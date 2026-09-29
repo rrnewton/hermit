@@ -2218,7 +2218,7 @@ impl AcceptedRecovery {
     }
     /// Publish receipt data only after the live owner completed every terminal
     /// gate, then verify the retained files and root again before returning.
-    pub fn finish(&mut self, value: Value) -> io::Result<()> {
+    pub fn finish(&mut self, value: Value) -> io::Result<AcceptedPublication> {
         if self.finished {
             return Err(io::Error::other("accepted terminal receipt repeated"));
         }
@@ -2246,17 +2246,41 @@ impl AcceptedRecovery {
             bytes: bytes.len(),
             sha256: *detcore::Digest::new(bytes),
         };
+        let root = self.root.identity()?;
         self.append(serde_json::to_value(CompletedReceipt {
             schema: 1,
             stage: "accepted_terminal".into(),
             label: self.label.clone(),
-            root: self.root.identity()?,
+            root,
             stdout: log(1, &stdout),
             stderr: log(2, &stderr),
             observed,
         })?)?;
-        validate_accepted_receipt(&self.root, &self.label, self.artifact.as_ref().unwrap())
-            .map(|_| ())
+        let readback =
+            validate_accepted_receipt(&self.root, &self.label, self.artifact.as_ref().unwrap())?;
+        // This value cannot be reconstructed from later-readable receipt bytes.
+        // Every original write/sync/name/readback operation above must succeed.
+        Ok(AcceptedPublication {
+            run: readback.run,
+            root,
+        })
+    }
+}
+/// Completion of the original receipt writer, not merely a later file read.
+/// Only AcceptedRecovery::finish can construct this process-held value.
+#[derive(Debug)]
+pub struct AcceptedPublication {
+    run: [u8; 16],
+    root: crate::unix_guard_package::RecoveryDirectoryIdentity,
+}
+impl AcceptedPublication {
+    /// Original accepted run authenticated by the successful writer.
+    pub fn run(&self) -> [u8; 16] {
+        self.run
+    }
+    /// Retained recovery root authenticated by the successful writer.
+    pub fn root(&self) -> &crate::unix_guard_package::RecoveryDirectoryIdentity {
+        &self.root
     }
 }
 /// Strict readback summary. This is evidence read from files, never a native
@@ -2269,6 +2293,11 @@ pub struct AcceptedReceiptReadback {
     pub counts: [usize; 3],
     /// Every original typed BPF identifier.
     pub original_ids: Vec<(u32, u32)>,
+    /// Original object-close time, authenticated against the service transcript
+    /// and both absence passes. Readback evidence only, never a renewed window.
+    pub closed_ns: u64,
+    /// Original final actor observation, authenticated within close + one second.
+    pub terminal_observed_ns: u64,
 }
 /// Independently read one exact three-file accepted population through the
 /// authenticated root. Failure, partial, duplicate and extra rows refuse.
@@ -2369,6 +2398,8 @@ pub fn validate_accepted_receipt(
     Ok(AcceptedReceiptReadback {
         run: terminal.observed.run,
         counts: terminal.observed.counts,
+        closed_ns: terminal.observed.readback.request.closed_ns,
+        terminal_observed_ns: terminal.observed.terminal_observed_ns,
         original_ids: terminal.observed.original_ids,
     })
 }

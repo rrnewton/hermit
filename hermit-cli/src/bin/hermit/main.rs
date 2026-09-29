@@ -16,6 +16,8 @@
 
 use core::arch::global_asm;
 
+#[path = "../../accepted_completion.rs"]
+mod accepted_completion;
 mod accepted_service;
 mod analyze;
 mod backends;
@@ -500,6 +502,10 @@ fn main() {
     if accepted_service::readback_requested() {
         accepted_service::run_readback(startup_stdin());
     }
+    if let Err(error) = accepted_completion::initialize() {
+        eprintln!("private accepted completion startup failed: {error}");
+        ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT).raise_or_exit();
+    }
     // ⚠️ BEFORE ANYTHING THAT CAN FORK. The stderr diagnostic deadline is a total
     // for the INVOCATION, and the origin every hermit process measures from is a
     // shared mapping that children inherit across fork. A mapping made after the
@@ -550,6 +556,11 @@ fn main() {
     // replace the guest's status; a consumer observes the absent/no-result
     // manifest and fails closed independently of the public CLI channel.
     let evidence_error = evidence.and_then(|session| session.finish(result.as_ref()).err());
+    // Observe original successful aggregate publications even when the primary
+    // result is an expected refusal. A failed observer cannot replace it.
+    if let Err(error) = accepted_completion::finish_invocation() {
+        eprintln!("private accepted completion withheld: {error}");
+    }
     let status = result.unwrap_or_else(|error| {
         let status = ExitStatus::Exited(failure_exit_code(&error));
         display_error(error);

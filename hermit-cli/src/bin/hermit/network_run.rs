@@ -182,6 +182,9 @@ struct GuestCompletion<'a> {
     value: RunValue,
     guard: &'a GuardDrainEvidence,
 }
+/// A completed guard decision may carry an authenticated policy refusal.
+/// Certification/internal publication errors cannot construct this wrapper.
+struct PublishedGuestResult(Result<RunValue, Error>);
 impl<'a> GuestCompletion<'a> {
     fn certify(value: RunValue, guard: &'a GuardDrainEvidence) -> Result<Self, Error> {
         if guard.birth.is_none()
@@ -199,11 +202,15 @@ impl<'a> GuestCompletion<'a> {
         }
         Ok(Self { value, guard })
     }
-    fn publish(self) -> Result<RunValue, Error> {
+    fn publish(self) -> Result<PublishedGuestResult, Error> {
         match self.guard.provisional.outcome {
-            GuardOutcome::Running => Ok(self.value),
-            GuardOutcome::Policy(evidence) => Err(Error::new(PolicyRefusal)
-                .context(format!("network disabled by Unix policy: {evidence:?}"))),
+            GuardOutcome::Running => Ok(PublishedGuestResult(Ok(self.value))),
+            GuardOutcome::Policy(evidence) => {
+                Ok(PublishedGuestResult(Err(Error::new(PolicyRefusal)
+                    .context(format!(
+                        "network disabled by Unix policy: {evidence:?}"
+                    )))))
+            }
             outcome => Err(Error::msg(format!(
                 "Unix guard final state refuses successful publication: {outcome:?}"
             ))),
@@ -884,6 +891,9 @@ fn run_owned(
     if FAILED.with(|slot| slot.borrow().is_some()) {
         return Err(refusal("earlier invocation retains unresolved ownership"));
     }
+    // Every owned run is an aggregate, including guard-only runs. Register
+    // before fallible preparation; early return leaves original custody pending.
+    let publication = super::accepted_completion::begin_aggregate()?;
     check_recovery_routing(roots, accepted_root, use_guard, use_accepted)?;
     hermit::unix_guard_terminal::prepare_command_parent()?;
     // All fallible package/log preparation precedes launching either service.
@@ -1036,6 +1046,7 @@ fn run_owned(
                 })
             },
             &mut |mut resource, control, mut guard_owner| {
+                super::accepted_completion::close_in_child();
                 let mut runtime_owner = None;
                 let mut alarm = None;
                 let result = arm_container_init_guards()
@@ -1177,7 +1188,18 @@ fn run_owned(
         (None, None) => None,
         (None, Some(_)) => unreachable!("accepted-only startup cannot launch a guard"),
     };
-    finalize_owned(container_result, guard, accepted, primary, failed_backing)
+    // A missing required owner is not an accepted-only completion. Leave the
+    // original registration pending even if the remaining owner's drain works.
+    let publication = ((!use_guard || guard.is_some()) && (!use_accepted || accepted.is_some()))
+        .then_some(publication);
+    finalize_owned(
+        container_result,
+        guard,
+        accepted,
+        primary,
+        failed_backing,
+        publication,
+    )
 }
 
 /// The exact child terminal precedes both service drains: the provider lifetime
@@ -1191,6 +1213,7 @@ fn finalize_owned(
     mut accepted: Option<AcceptedStartup>,
     mut primary: Option<Error>,
     mut failed_backing: Option<Box<dyn Any>>,
+    mut publication: Option<super::accepted_completion::Attempt>,
 ) -> Result<RunValue, Error> {
     let deadline = Instant::now() + TERMINAL;
     let mut child_cleanup = None;
@@ -1304,6 +1327,7 @@ fn finalize_owned(
     };
     // Drain both even if one fails. Never let an error skip the other original
     // owner's cleanup, or publish on the strength of just one certificate.
+    let mut accepted_publication = None;
     let accepted_result = accepted.as_mut().map_or(Ok(()), |startup| {
         let proof = match startup
             .owner
@@ -1320,12 +1344,21 @@ fn finalize_owned(
                 return Err(Error::new(error).context("accepted exact terminal cleanup"));
             }
         };
-        startup.receipts.finish(proof).map_err(Error::from)
+        accepted_publication = Some(startup.receipts.finish(proof)?);
+        Ok(())
     });
+    // No confirmation is possible until both original subpublications and
+    // the applicable final certification have completed.
+    let confirm = || {
+        publication.as_mut().map_or(Ok(()), |attempt| {
+            attempt.confirm(accepted_publication).map_err(Error::from)
+        })
+    };
     let drain = match guard.as_mut() {
         None => accepted_result,
         Some(context) => match context.owner.drain(deadline) {
             Ok(proof) => {
+                let mut policy_certified = true;
                 let emitted = emit(
                     &mut context.evidence,
                     proof_json(proof, child_pid, child_status),
@@ -1333,7 +1366,9 @@ fn finalize_owned(
                 .map_err(Error::from);
                 if emitted.is_ok() {
                     outcome = outcome.classify_missing_abort(missing_abort, |candidate| {
-                        candidate.certify(context.incarnation, proof)
+                        let result = candidate.certify(context.incarnation, proof);
+                        policy_certified = result.is_ok();
+                        result
                     });
                 }
                 let drain = combine_terminal_results(accepted_result, emitted);
@@ -1341,9 +1376,13 @@ fn finalize_owned(
                     // Keep the borrowed certificate inside its successful drain
                     // branch. Failed cleanup must read the owner's current
                     // recovery units, after drain has attempted every terminal.
-                    return outcome.publish(Ok(()), |value| {
-                        GuestCompletion::certify(value, proof)?.publish()
-                    });
+                    return publish_aggregate(
+                        outcome,
+                        Ok(()),
+                        policy_certified,
+                        |value| GuestCompletion::certify(value, proof)?.publish(),
+                        confirm,
+                    );
                 }
                 drain
             }
@@ -1369,9 +1408,46 @@ fn finalize_owned(
             accepted,
             failed_backing.take(),
         );
-        return outcome.publish(drain, |_| unreachable!("failed drain cannot publish"));
+        return publish_aggregate(
+            outcome,
+            drain,
+            true,
+            |_| unreachable!("failed drain cannot publish"),
+            confirm,
+        );
     }
-    outcome.publish(Ok(()), Ok)
+    publish_aggregate(
+        outcome,
+        Ok(()),
+        true,
+        |value| Ok(PublishedGuestResult(Ok(value))),
+        confirm,
+    )
+}
+
+/// Observe only AFTER the original aggregate publication/certification returns.
+/// An existing primary failure and a genuine policy decision keep their type;
+/// neither can turn a failed drain/certificate into a confirmed aggregate.
+fn publish_aggregate(
+    outcome: UnpublishedChildResult,
+    drain: Result<(), Error>,
+    policy_certified: bool,
+    certify: impl FnOnce(RunValue) -> Result<PublishedGuestResult, Error>,
+    confirm: impl FnOnce() -> Result<(), Error>,
+) -> Result<RunValue, Error> {
+    let drained = drain.is_ok();
+    let mut decision_completed = outcome.0.is_err();
+    let result = outcome.publish(drain, |value| {
+        let decision = certify(value)?;
+        decision_completed = true;
+        decision.0
+    });
+    if drained && policy_certified && decision_completed {
+        // Reuse the unchanged primary-preserving selector for observer error.
+        UnpublishedChildResult(result).publish(confirm(), Ok)
+    } else {
+        result
+    }
 }
 
 /// No wire result can certify policy. Preserve actual deadline/signal/crash
@@ -1426,6 +1502,159 @@ mod tests {
     }
 
     #[test]
+    fn original_guard_emit_sync_failure_withholds_aggregate_ack_and_preserves_122() {
+        use std::io::Read;
+        use std::io::Seek;
+        use std::os::fd::FromRawFd;
+
+        use super::super::accepted_completion;
+
+        for fail_sync in [true, false] {
+            let mut channel = accepted_completion::FixtureChannel::new().unwrap();
+            channel.install_publisher_premise();
+            let mut attempt = accepted_completion::begin_aggregate().unwrap();
+            // Exercise the ACTUAL guard producer and its write-before-sync
+            // tail. This serializer payload is not a native guard receipt.
+            let value = serde_json::json!({
+                "schema": 1, "stage": "terminal", "producer_only_premise": true
+            });
+            let (drain, bytes) = if fail_sync {
+                let mut fds = [-1; 2];
+                assert_eq!(
+                    unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+                    0
+                );
+                let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+                let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+                let result = emit(&mut writer, value.clone());
+                assert_eq!(
+                    result.as_ref().unwrap_err().raw_os_error(),
+                    Some(libc::EINVAL)
+                );
+                drop(writer);
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).unwrap();
+                (result.map_err(Error::from), bytes)
+            } else {
+                let mut file = tempfile::tempfile().unwrap();
+                let result = emit(&mut file, value.clone());
+                result.as_ref().unwrap();
+                file.rewind().unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                (result.map_err(Error::from), bytes)
+            };
+            assert!(bytes.ends_with(b"\n"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                value
+            );
+            let original = bytes.clone();
+            let result = publish_aggregate(
+                UnpublishedChildResult(Err(
+                    Error::new(PolicyRefusal).context("original expected refusal")
+                )),
+                drain,
+                true,
+                |_| panic!("a primary refusal does not publish guest data"),
+                || attempt.confirm(None).map_err(Error::from),
+            );
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some());
+            assert_eq!(super::super::failure_exit_code(&error), 122);
+            assert_eq!(error.to_string(), "original expected refusal");
+            assert_eq!(
+                accepted_completion::finish_invocation().is_err(),
+                fail_sync,
+                "complete readable guard bytes cannot clear original emit failure",
+            );
+            assert_eq!(
+                channel
+                    .confirm(
+                        1,
+                        &std::collections::BTreeSet::new(),
+                        None,
+                        Instant::now() + TERMINAL,
+                    )
+                    .is_err(),
+                fail_sync,
+                "the actual fixture receiver requires original aggregate completion",
+            );
+            assert_eq!(bytes, original);
+        }
+    }
+
+    #[test]
+    fn aggregate_ack_follows_final_certification_and_completed_policy_decision() {
+        use std::cell::Cell;
+        for disposition in 0..4 {
+            let stage = Cell::new(0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish_aggregate(
+                    UnpublishedChildResult(Ok(RunValue::Run(ExitStatus::SUCCESS, None))),
+                    Ok(()),
+                    true,
+                    |value| {
+                        assert_eq!(stage.replace(1), 0);
+                        match disposition {
+                            0 => Ok(PublishedGuestResult(Ok(value))),
+                            1 => Ok(PublishedGuestResult(Err(Error::new(PolicyRefusal)))),
+                            2 => Err(Error::msg("original final certification failed")),
+                            3 => panic!("unwind before original final certification returned"),
+                            _ => unreachable!(),
+                        }
+                    },
+                    || {
+                        assert_eq!(stage.replace(2), 1, "confirm must follow final publication");
+                        Ok(())
+                    },
+                )
+            }));
+            match disposition {
+                0 => assert!(result.unwrap().unwrap().status().success()),
+                1 => assert_eq!(
+                    super::super::failure_exit_code(&result.unwrap().unwrap_err()),
+                    122
+                ),
+                2 => assert_eq!(
+                    result.unwrap().unwrap_err().to_string(),
+                    "original final certification failed"
+                ),
+                3 => assert!(result.is_err()),
+                _ => unreachable!(),
+            }
+            assert_eq!(stage.get(), if disposition < 2 { 2 } else { 1 });
+        }
+        let error = publish_aggregate(
+            UnpublishedChildResult(Err(Error::new(PolicyRefusal))),
+            Ok(()),
+            false,
+            |_| unreachable!("primary failure remains private"),
+            || panic!("failed missing-result policy certification cannot acknowledge"),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some());
+        assert_eq!(super::super::failure_exit_code(&error), 122);
+    }
+
+    #[test]
+    fn original_accepted_publication_error_preserves_typed_primary_122() {
+        let original = Error::new(PolicyRefusal).context("network outbound mismatch");
+        let drain = combine_terminal_results(
+            Err(Error::from(std::io::Error::from_raw_os_error(libc::EBADF))),
+            Ok(()),
+        );
+        let error = UnpublishedChildResult(Err(original))
+            .publish(drain, |_| {
+                panic!("failed publication cannot certify a result")
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some());
+        assert_eq!(super::super::failure_exit_code(&error), 122);
+        assert_eq!(error.to_string(), "network outbound mismatch");
+    }
+
+    #[test]
     fn combined_terminal_failure_withholds_success_and_retains_both_errors() {
         for (accepted, guard, expected) in [
             (
@@ -1469,7 +1698,7 @@ mod tests {
             &mut |_| Ok(()),
             &mut |_| -> (Wire, ()) { unsafe { libc::_exit(124) } },
         );
-        let error = finalize_owned(Some(started), None, None, None, None).unwrap_err();
+        let error = finalize_owned(Some(started), None, None, None, None, None).unwrap_err();
         assert!(
             error
                 .downcast_ref::<super::super::container::RunTimeoutMarker>()
@@ -1656,7 +1885,7 @@ mod tests {
                     (Err(SerializableError::from(error)), ())
                 },
             );
-            let error = finalize_owned(Some(started), None, None, None, None).unwrap_err();
+            let error = finalize_owned(Some(started), None, None, None, None, None).unwrap_err();
             assert_eq!(error.downcast_ref::<PolicyRefusal>().is_some(), typed);
             assert_eq!(
                 super::super::failure_exit_code(&error),
@@ -1673,7 +1902,7 @@ mod tests {
             &mut |_| -> (Wire, ()) { (Ok(RunValue::Run(ExitStatus::Exited(122), None)), ()) },
         );
         assert_eq!(
-            finalize_owned(Some(started), None, None, None, None)
+            finalize_owned(Some(started), None, None, None, None, None)
                 .unwrap()
                 .into_status()
                 .unwrap(),
@@ -1719,7 +1948,7 @@ mod tests {
                     let primary =
                         prior.then(|| Error::new(std::io::Error::from_raw_os_error(libc::EIO)));
                     let error =
-                        finalize_owned(Some(started), None, None, primary, None).unwrap_err();
+                        finalize_owned(Some(started), None, None, primary, None, None).unwrap_err();
                     assert_eq!(
                         error.downcast_ref::<PolicyRefusal>().is_some(),
                         !prior && kind == hermit::FailureKind::PolicyRefusal
@@ -1785,7 +2014,7 @@ mod tests {
                     )
                 },
             );
-            let error = finalize_owned(Some(started), None, None, None, None).unwrap_err();
+            let error = finalize_owned(Some(started), None, None, None, None, None).unwrap_err();
             assert!(
                 error.downcast_ref::<PolicyRefusal>().is_none(),
                 "case {case}: {error:#}"
