@@ -1,12 +1,17 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 //! Shared compiler/control child supervision. Numeric process-group signals
 //! require the exact unreaped child; final group readback never authorizes one.
-use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use serde_json::Value;
+use serde_json::json;
 
 /// Establish ownership before spawning a compiler or control. Nested wrappers
 /// may exit without waiting for their own children. Reaping below is restricted
@@ -162,6 +167,48 @@ fn stat_group(raw: &[u8]) -> Result<u32> {
         .parse::<u32>()?)
 }
 
+fn census_group(raw: &[u8]) -> Result<Option<u32>> {
+    // do_task_stat leaves precisely ppid=0, pgid=-1, sid=-1 when
+    // lock_task_sighand loses to removal of its sampled task. Non-leader exec
+    // can transfer that task's PID and group membership to a live replacement
+    // before clearing the old task's sighand. None is therefore an INCONCLUSIVE
+    // snapshot, never proof that the current candidate PID has no group.
+    // Authenticated terminal-child reads still use the strict positive parser.
+    let mut fields = stat_fields(raw)?.split_whitespace();
+    let _state = fields.next(); // Sampled before sighand locking, not authority.
+    if (fields.next(), fields.next(), fields.next()) == (Some("0"), Some("-1"), Some("-1")) {
+        return Ok(None);
+    }
+    stat_group(raw).map(Some)
+}
+
+fn resolve_census_group(
+    pid: u32,
+    mut read_current: impl FnMut() -> std::io::Result<Vec<u8>>,
+) -> Result<Option<u32>> {
+    // At most one follow-up path lookup. An old-task sentinel does not bind
+    // the PID's current task after exec takeover. A repeated ambiguity fails
+    // closed under the caller's original bounds; no new deadline or sleep.
+    for _ in 0..2 {
+        let raw = match read_current() {
+            Ok(raw) => raw,
+            Err(error) if vanished_census_task(&error) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read census candidate {pid} stat"));
+            }
+        };
+        if let Some(group) = census_group(&raw).with_context(|| {
+            format!(
+                "parse census candidate {pid} stat (first 1024 bytes): {:?}",
+                &raw[..raw.len().min(1024)]
+            )
+        })? {
+            return Ok(Some(group));
+        }
+    }
+    anyhow::bail!("census candidate {pid} still has an inconclusive removed-task snapshot")
+}
+
 fn terminal_stat_identity(raw: &[u8], parent: u32, group: u32) -> Result<(&str, u64)> {
     let fields: Vec<_> = stat_fields(raw)?.split_whitespace().collect();
     ensure!(fields.len() > 19, "short descendant stat");
@@ -179,15 +226,9 @@ fn group_members(group: u32) -> Result<Vec<u32>> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let raw = match fs::read(entry.path().join("stat")) {
-            Ok(raw) => raw,
-            Err(error) if vanished_census_task(&error) => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("read census candidate {pid} stat"));
-            }
-        };
-        let actual = stat_group(&raw)?;
-        if actual == group {
+        let path = entry.path().join("stat");
+        let actual = resolve_census_group(pid, || fs::read(&path))?;
+        if actual == Some(group) {
             members.push(pid);
         }
     }
@@ -262,11 +303,25 @@ pub(super) fn only_terminal_leader(group: u32, members: &[u32], terminal: bool) 
 }
 
 pub(super) fn supervise(
+    child: OwnedChild,
+    started: Instant,
+    stdout: &Path,
+    stderr: &Path,
+    limits: Limits,
+) -> Value {
+    supervise_with_pre_kill_census(child, started, stdout, stderr, limits, group_members)
+}
+
+// Only the pre-kill observation is parameterized for its negative control.
+// Production always uses the actual census above; every wait, signal, reap,
+// cleanup observation and bound below remains the real owned operation.
+fn supervise_with_pre_kill_census(
     mut child: OwnedChild,
     started: Instant,
     stdout: &Path,
     stderr: &Path,
     limits: Limits,
+    pre_kill_census: impl FnOnce(u32) -> Result<Vec<u32>>,
 ) -> Value {
     let pid = child.child.id();
     let mut status = None;
@@ -300,7 +355,7 @@ pub(super) fn supervise(
     }
     // Retain the old success condition: leader exit with a live descendant
     // is a failure even when later owned cleanup successfully kills it.
-    let before_members = group_members(pid);
+    let before_members = pre_kill_census(pid);
     let natural_terminal_group = before_members
         .as_ref()
         .is_ok_and(|members| only_terminal_leader(pid, members, observed_terminal));
@@ -399,6 +454,9 @@ pub(super) fn supervise(
         && !timed_out
         && !log_overflow
         && natural_terminal_group
+        // A stale/missed census cannot promote a descendant observed only
+        // after the cleanup signal into naturally completed work.
+        && cleanup_descendants.is_empty()
         && cleanup_complete
         && cleanup_errors.is_empty();
     json!({
@@ -423,11 +481,14 @@ pub(super) fn supervise(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::process::Command;
+    use std::process::Stdio;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -518,7 +579,10 @@ mod tests {
         ] {
             let raw = stat_fixture(comm, &fields);
             assert_eq!(stat_group(&raw).unwrap(), 73);
-            assert_eq!(terminal_stat_identity(&raw, 91, 73).unwrap(), ("Z", u64::MAX));
+            assert_eq!(
+                terminal_stat_identity(&raw, 91, 73).unwrap(),
+                ("Z", u64::MAX)
+            );
         }
     }
 
@@ -534,15 +598,23 @@ mod tests {
         valid[2] = "73";
         valid[19] = "12345";
         for (index, malformed) in [
-            (1, "parent"), (1, "-1"), (1, "4294967296"),
-            (2, "group"), (2, "-1"), (2, "4294967296"),
-            (19, "birth"), (19, "-1"), (19, "18446744073709551616"),
+            (1, "parent"),
+            (1, "-1"),
+            (1, "4294967296"),
+            (2, "group"),
+            (2, "-1"),
+            (2, "4294967296"),
+            (19, "birth"),
+            (19, "-1"),
+            (19, "18446744073709551616"),
         ] {
             let mut fields = valid.clone();
             fields[index] = malformed;
             let raw = stat_fixture(b"\xff ) (", &fields);
             assert!(terminal_stat_identity(&raw, 91, 73).is_err());
-            if index == 2 { assert!(stat_group(&raw).is_err()); }
+            if index == 2 {
+                assert!(stat_group(&raw).is_err());
+            }
         }
         for count in 0..20 {
             assert!(terminal_stat_identity(&stat_fixture(b"x", &valid[..count]), 91, 73).is_err());
@@ -554,6 +626,108 @@ mod tests {
         malformed.push(0xff);
         assert!(stat_group(&malformed).is_err());
         assert!(terminal_stat_identity(&malformed, 91, 73).is_err());
+    }
+
+    #[test]
+    fn census_accepts_only_exact_removed_task_group_sentinel() {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "X";
+        fields[1] = "0";
+        fields[2] = "-1";
+        fields[3] = "-1";
+        fields[19] = "12345";
+        let removed = stat_fixture(b"removed task", &fields);
+        assert_eq!(census_group(&removed).unwrap(), None);
+        // A census sentinel never authenticates a retained terminal child.
+        assert!(stat_group(&removed).is_err());
+        assert!(terminal_stat_identity(&removed, 91, 73).is_err());
+        // State is sampled before sighand locking; it is not removal authority.
+        for state in ["R", "S", "Z"] {
+            fields[0] = state;
+            assert_eq!(
+                census_group(&stat_fixture(b"removed", &fields)).unwrap(),
+                None
+            );
+        }
+        for (index, malformed) in [
+            (1, "91"),
+            (1, "-1"),
+            (1, "parent"),
+            (2, "-2"),
+            (2, "group"),
+            (3, "73"),
+            (3, "-2"),
+        ] {
+            let mut wrong = fields.clone();
+            wrong[index] = malformed;
+            assert!(census_group(&stat_fixture(b"not removed", &wrong)).is_err());
+        }
+        fields[1] = "91";
+        fields[2] = "73";
+        fields[3] = "73";
+        assert_eq!(
+            census_group(&stat_fixture(b"owned", &fields)).unwrap(),
+            Some(73)
+        );
+    }
+
+    #[test]
+    fn census_sentinel_rechecks_same_candidate_before_claiming_absence() {
+        // Controlled proc observations, not a native de_thread race receipt.
+        // Exercise the exact resolver used by group_members and its natural
+        // success decision, including the old-task/live-PID exec transition.
+        let mut fields = vec!["0"; 20];
+        fields[0] = "X";
+        fields[2] = "-1";
+        fields[3] = "-1";
+        let stale = stat_fixture(b"old leader", &fields);
+        fields[0] = "R";
+        fields[1] = "91";
+        fields[2] = "73";
+        fields[3] = "73";
+        let live = stat_fixture(b"exec replacement", &fields);
+        let mut reads = std::collections::VecDeque::from([Ok(stale.clone()), Ok(live)]);
+        let group = resolve_census_group(123, || reads.pop_front().unwrap()).unwrap();
+        assert_eq!(
+            group,
+            Some(73),
+            "same PID can still name a live in-group task"
+        );
+        assert!(
+            reads.is_empty(),
+            "resolve the current PID, not only its old task"
+        );
+        let mut members = vec![73];
+        if group == Some(73) {
+            members.push(123);
+        }
+        assert!(!only_terminal_leader(73, &members, true));
+
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            let mut reads = std::collections::VecDeque::from([
+                Ok(stale.clone()),
+                Err(std::io::Error::from_raw_os_error(errno)),
+            ]);
+            assert_eq!(
+                resolve_census_group(123, || reads.pop_front().unwrap()).unwrap(),
+                None
+            );
+            assert!(reads.is_empty());
+        }
+        let mut reads = std::collections::VecDeque::from([Ok(stale.clone()), Ok(stale.clone())]);
+        assert!(resolve_census_group(123, || reads.pop_front().unwrap()).is_err());
+        assert!(
+            reads.is_empty(),
+            "two observations, no retry-until-success loop"
+        );
+        for errno in [libc::EPERM, libc::EIO, libc::EINTR] {
+            let mut reads = std::collections::VecDeque::from([
+                Ok(stale.clone()),
+                Err(std::io::Error::from_raw_os_error(errno)),
+            ]);
+            assert!(resolve_census_group(123, || reads.pop_front().unwrap()).is_err());
+            assert!(reads.is_empty());
+        }
     }
 
     #[test]
@@ -696,6 +870,59 @@ mod tests {
     }
 
     #[test]
+    fn missed_live_descendant_census_cannot_override_actual_cleanup_reap() {
+        let started = Instant::now();
+        let (child, path) = fixture(
+            "import os, time\nr,w = os.pipe()\npid = os.fork()\nif pid == 0:\n os.close(r)\n os.write(w, b'r')\n time.sleep(30)\n os._exit(0)\nos.close(w)\nassert os.read(r, 1) == b'r'\nos._exit(0)\n",
+        );
+        let leader = child.child.id();
+        terminal(&child);
+        let result = supervise_with_pre_kill_census(
+            child,
+            started,
+            &path.join("stdout"),
+            &path.join("stderr"),
+            Limits {
+                wall: Duration::from_secs(60),
+                logs: 4 * 1024 * 1024,
+                cleanup: Duration::from_secs(2),
+            },
+            |actual| {
+                assert_eq!(actual, leader);
+                // Controlled incomplete observation, NOT a native exec-race
+                // receipt. No wait/signal/terminal authority is fabricated.
+                assert_eq!(group_members(actual).unwrap().len(), 2);
+                Ok(vec![leader])
+            },
+        );
+        fs::write(
+            path.join("result.json"),
+            serde_json::to_vec_pretty(&result).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["raw_status"], 0);
+        assert_eq!(result["group_members_before_kill"], json!([leader]));
+        assert_eq!(
+            result["natural_terminal_group"], true,
+            "controlled stale census alone"
+        );
+        assert_eq!(result["naturally_reaped_descendants"], json!([]));
+        let reaped = result["cleanup_reaped_descendants"].as_array().unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0]["raw_wait_status"], libc::SIGKILL);
+        assert_eq!(reaped[0]["waitid_code"], libc::CLD_KILLED);
+        assert_eq!(reaped[0]["waitid_status"], libc::SIGKILL);
+        assert_eq!(result["owned_group_kill_before_reap"], true);
+        assert_eq!(result["cleanup_complete"], true);
+        assert_eq!(result["cleanup_errors"], json!([]));
+        assert_eq!(result["final_group_absent"], true);
+        assert_eq!(
+            result["passed"], false,
+            "actual post-signal reap vetoes natural success"
+        );
+    }
+
+    #[test]
     fn only_census_disappearance_errors_are_classified_as_vanished() {
         for errno in [libc::ENOENT, libc::ESRCH] {
             assert!(vanished_census_task(&std::io::Error::from_raw_os_error(
@@ -720,7 +947,10 @@ mod tests {
 
     #[test]
     fn proc_stat_opened_before_exact_reap_returns_esrch_after_reap() {
-        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::io::Read;
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::io::Write;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut command = Command::new("/bin/sh");
         command
