@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "description": "Retired E2E manifest test ids. Each key is an id that no manifest declares any more; its value names the live id that now carries the same program and cells. This file is the only way a historical id resolves: history readers (ci/compat-envelope/scorecard.rs and the dev-hermit series, census and website readers) map a retired id through it so an old-id row and a new-id row join into one cell history. Every value must be a live id, no key may be live, and no two keys may share a value.",
+  "description": "Retired E2E manifest test ids. Each key is an id that no manifest declares any more; its value names the live id that now carries the same program and cells. This file is the only way a historical id resolves: history readers (ci/compat-envelope/scorecard.rs and the dev-hermit series, census and website readers) map a retired id through it so an old-id row and a new-id row join into one cell history. Every value must be a live id, no key may be live, and no two keys may share a value. Every value keeps its key's test name under the successor bucket unless the key is listed in that retirement's collisions, which says why the plain rename could not be used.",
   "retirements": [
     {
       "retired_bucket": "backend-parity-c",
@@ -112,6 +112,9 @@
         "backend-parity-c/utimensat-determinism": "c-programs/utimensat-determinism",
         "backend-parity-c/vectored-file-io": "c-programs/vectored-file-io",
         "backend-parity-c/vectored-io": "c-programs/vectored-io"
+      },
+      "collisions": {
+        "backend-parity-c/pidfd-open-self": "c-programs/pidfd-open-self already names a different program, tests/c/pidfd_open_self.c, so the moved test and its fixture took the -pair suffix (c-programs/pidfd-open-self-pair, tests/c/pidfd_open_self_pair.c) instead of overwriting it."
       }
     }
   ]
