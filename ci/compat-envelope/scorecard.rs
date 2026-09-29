@@ -3579,13 +3579,13 @@ fn run() -> Result<(), String> {
         }
         "self-test" => {
             no_more(&mut args)?;
-            forget_inherited_repository_location();
-            self_test()?;
+            without_inherited_repository_location(self_test)?;
         }
         "self-test-and-check" => {
             no_more(&mut args)?;
-            forget_inherited_repository_location();
-            self_test()?;
+            without_inherited_repository_location(self_test)?;
+            // The check reads the caller's repository, with the caller's
+            // GIT_INDEX_FILE and other location variables back in place.
             let derived = check_tracked_with_lock(&root)?;
             println!("{}", tracked_current_summary(&derived));
         }
@@ -14072,14 +14072,47 @@ const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
     "GIT_PREFIX",
 ];
 
-/// Forget Git's repository-location variables for the rest of this process.
+/// Run `body` without Git's repository-location variables, then restore the
+/// values this process inherited.
 ///
-/// The self-test and the unit tests build scratch repositories and ledgers,
-/// name each one by directory, and then run this tool's own git helpers on
-/// them. Git exports these variables to hooks and `git rebase --exec` steps,
-/// so inherited ones would point the fixtures' `git init`, commits and ledger
-/// writes at the caller's repository
-/// (https://github.com/rrnewton/hermit/issues/3362).
+/// The self-test builds scratch repositories and ledgers, names each one by
+/// directory, and then runs this tool's own git helpers on them. Git exports
+/// these variables to hooks and `git rebase --exec` steps, so inherited ones
+/// would point the fixtures' `git init`, commits and ledger writes at the
+/// caller's repository (https://github.com/rrnewton/hermit/issues/3362).
+/// Commands that act on the caller's repository run after the restore.
+fn without_inherited_repository_location<T>(body: impl FnOnce() -> T) -> T {
+    without_variables(&GIT_REPOSITORY_LOCATION_VARIABLES, body)
+}
+
+/// Run `body` with `names` removed from the environment, then restore the
+/// values that were set before.
+fn without_variables<T>(names: &[&'static str], body: impl FnOnce() -> T) -> T {
+    let previous: Vec<(&str, std::ffi::OsString)> = names
+        .iter()
+        .filter_map(|name| env::var_os(name).map(|value| (*name, value)))
+        .collect();
+    for name in names {
+        env::remove_var(name);
+    }
+    let result = body();
+    for (name, value) in previous {
+        env::set_var(name, value);
+    }
+    result
+}
+
+/// Forget Git's repository-location variables for the rest of this test
+/// process, for the same reason as `without_inherited_repository_location`:
+/// the unit tests run this tool's own git helpers on their fixtures.
+///
+/// This happens at the first `fixture_git` call, not before the first test.
+/// libtest runs tests on several threads, so under an inherited `GIT_DIR` a
+/// test that runs a helper which follows the caller's environment, without
+/// building a fixture first, sees the variables or not depending on
+/// scheduling. Every fixture test is unaffected: it forgets them before its
+/// fixture exists.
+#[cfg(test)]
 fn forget_inherited_repository_location() {
     static FORGET: std::sync::Once = std::sync::Once::new();
     FORGET.call_once(|| {
@@ -14100,6 +14133,26 @@ fn fixture_git() -> Command {
         command.env_remove(name);
     }
     command
+}
+
+#[cfg(test)]
+mod without_variables_tests {
+    use super::*;
+
+    #[test]
+    fn removed_variables_are_restored_after_the_body() {
+        // Names no other code reads: setting a Git location variable here
+        // would steer every concurrently running fixture test.
+        const SET: &str = "HERMIT_SCORECARD_WITHOUT_VARIABLES_SET";
+        const UNSET: &str = "HERMIT_SCORECARD_WITHOUT_VARIABLES_UNSET";
+        env::set_var(SET, "inherited value");
+        env::remove_var(UNSET);
+        let seen = without_variables(&[SET, UNSET], || (env::var_os(SET), env::var_os(UNSET)));
+        let after = (env::var_os(SET), env::var_os(UNSET));
+        env::remove_var(SET);
+        assert_eq!(seen, (None, None), "the body must not see the variables");
+        assert_eq!(after, (Some("inherited value".into()), None));
+    }
 }
 
 fn self_test() -> Result<(), String> {

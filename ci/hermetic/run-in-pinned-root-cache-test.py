@@ -74,8 +74,14 @@ class CargoCacheMounts(unittest.TestCase):
         )
         fake.chmod(0o755)
 
-    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output", proc_locks_runtime=None, calibration=False):
-        env = repository_neutral_env()
+    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output", proc_locks_runtime=None, calibration=False, git_location=None):
+        # The wrapper gets this process's environment, as it does in
+        # production, so an inherited Git location variable reaches it.
+        # `git_location` replaces those variables with exactly the given ones.
+        env = os.environ.copy()
+        if git_location is not None:
+            env = repository_neutral_env()
+            env.update(git_location)
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
         forwarded = ["--nextest-calibration"] if calibration else []
@@ -697,6 +703,113 @@ class CargoCacheMounts(unittest.TestCase):
                                       git(repo, "ls-files", "--stage", "-z"),
                                       git(repo, "show", "HEAD:payload")), identities[str(repo)])
 
+    def test_inherited_git_location_variables_leave_the_mounts_unchanged(self):
+        # https://github.com/rrnewton/hermit/issues/3362: a `git rebase --exec`
+        # step or a hook runs this wrapper with GIT_DIR, GIT_WORK_TREE or
+        # GIT_INDEX_FILE naming some other repository. The wrapper names --src
+        # and each submodule explicitly, so every case must produce the podman
+        # invocation and private config copies of a run without them, and must
+        # leave the named repository untouched.
+        git_bin = shutil.which("git")
+        self.assertIsNotNone(git_bin)
+        git_env = repository_neutral_env()
+        git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_OPTIONAL_LOCKS="0")
+
+        def git(root, *args, location=None):
+            result = subprocess.run(
+                [git_bin, "-c", "protocol.file.allow=always", "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", "-C", str(root), *args],
+                env={**git_env, **(location or {})}, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout
+
+        def seed(name):
+            root = self.root / name
+            root.mkdir()
+            git(root, "init", "-q")
+            (root / "payload").write_text(name + "\n")
+            git(root, "add", "payload")
+            git(root, "commit", "-qm", "fixture")
+            return root
+
+        # A linked-worktree root with a nested submodule reaches every git
+        # lookup the wrapper makes: the root gitfile and common directory, the
+        # recursive submodule walk, and each submodule's own metadata.
+        leaf = seed("location-leaf")
+        child = seed("location-child")
+        git(child, "submodule", "add", "-q", str(leaf), "nested leaf")
+        git(child, "commit", "-qam", "nested fixture")
+        product = seed("location-product")
+        git(product, "submodule", "add", "-q", str(child), "third-party/child")
+        git(product, "commit", "-qam", "product fixture")
+        source = self.root / "location-source"
+        git(product, "worktree", "add", "-q", "--detach", str(source))
+        git(source, "submodule", "update", "--init", "--recursive")
+        metadata = [Path(git(repo, "rev-parse", "--path-format=absolute", option).decode().strip())
+                    for repo in (source, source / "third-party/child",
+                                 source / "third-party/child/nested leaf")
+                    for option in ("--git-dir", "--git-common-dir")]
+
+        # The repository the variables name: a linked worktree, as in the
+        # incident, whose gitdir is not called `.git`.
+        other = seed("location-other")
+        other_linked = self.root / "location-other-linked"
+        git(other, "worktree", "add", "-q", "--detach", str(other_linked))
+        other_git_dir = Path(git(other_linked, "rev-parse", "--absolute-git-dir").decode().strip())
+        values = {"GIT_DIR": other_git_dir, "GIT_WORK_TREE": other_linked,
+                  "GIT_INDEX_FILE": other_git_dir / "index"}
+        controls = {"GIT_DIR": ("rev-parse", "--absolute-git-dir"),
+                    "GIT_WORK_TREE": ("rev-parse", "--show-toplevel"),
+                    "GIT_INDEX_FILE": ("rev-parse", "--git-path", "index")}
+
+        def other_state():
+            files = sorted(path for path in (other / ".git").rglob("*") if path.is_file())
+            return {str(path): path.read_bytes() for path in [*files, other_linked / ".git"]}
+
+        def podman_run(label, location):
+            output = self.root / f"location-output-{label}"
+            real_output = os.path.realpath(output)
+            self.capture.unlink(missing_ok=True)
+            result, calls = self.invoke(source=source, output=str(output), git_location=location)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(calls), 2)
+
+            # Only the output directory and the mktemp suffixes may differ.
+            def normalize(text):
+                return re.sub(r"/git-(root-)?configs\.[^/,]+", r"/git-\1configs.*",
+                              text.replace(real_output, "<output>"))
+
+            copies = {normalize(str(path)): path.read_bytes()
+                      for path in sorted(Path(real_output).glob("git-*configs.*/**/*"))
+                      if path.is_file()}
+            return [normalize(arg) for arg in calls[1]], copies
+
+        baseline_argv, baseline_copies = podman_run("none", {})
+        mount_sources = [dict(field.split("=", 1) for field in baseline_argv[i + 1].split(","))["source"]
+                         for i, arg in enumerate(baseline_argv) if arg == "--mount"]
+        for directory in metadata:
+            self.assertIn(str(directory), mount_sources, "the baseline must mount every metadata directory")
+        self.assertEqual(sum("/git-root-configs.*/" in path for path in mount_sources), 1)
+        self.assertEqual(sum("/git-configs.*/" in path for path in mount_sources), 2)
+        self.assertEqual(len(baseline_copies), 3)
+        before = other_state()
+        for names in (("GIT_DIR",), ("GIT_WORK_TREE",), ("GIT_INDEX_FILE",),
+                      ("GIT_WORK_TREE", "GIT_INDEX_FILE")):
+            with self.subTest(inherited=names):
+                location = {name: str(values[name]) for name in names}
+                for name in names:
+                    # Control: the variable really redirects `git -C <src>`,
+                    # so an equal result below is not vacuous.
+                    steered = git(source, *controls[name], location={name: location[name]})
+                    self.assertEqual(Path(steered.decode().strip()).resolve(), values[name].resolve(),
+                                     f"control: {name} did not steer an unisolated git")
+                argv, copies = podman_run("+".join(names), location)
+                self.assertEqual(argv, baseline_argv)
+                self.assertEqual(copies, baseline_copies)
+                self.assertEqual(other_state(), before)
+
 
 
 # The git repository-location variables the regression below exports into a
@@ -725,7 +838,9 @@ class InheritedGitLocation(unittest.TestCase):
     variable, or the GIT_WORK_TREE and GIT_INDEX_FILE pair that hooks get
     together, pointing into a throwaway repository. It then requires both that
     the child passed and that the throwaway is byte-identical afterwards. The
-    variables go to the child only.
+    variables go to the child only. The child's fixture git commands drop
+    them, but `invoke` passes them on to the wrapper, so each case also runs
+    the wrapper's own git lookups under them.
     """
 
     CHILD_TESTS = (

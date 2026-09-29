@@ -54,6 +54,12 @@ fn checked_output(command: &mut Command) -> String {
 /// `cargo build`, so an inherited `GIT_DIR` would point the fixture's
 /// `git init` and commits at the caller's repository
 /// (https://github.com/rrnewton/hermit/issues/3362).
+///
+/// The removal is process-wide and happens once, at the first call. Every
+/// test in this binary makes that call first, through `initialized_repo`, so
+/// no test here runs git with the inherited variables, whatever order libtest
+/// schedules them in. A new test that runs git without `initialized_repo`
+/// would not have that guarantee.
 fn without_inherited_repository_location() {
     static REMOVE: std::sync::Once = std::sync::Once::new();
     REMOVE.call_once(|| {

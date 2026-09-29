@@ -7613,6 +7613,13 @@ mod tests {
     /// forgets them for the rest of the test process, so this tool's own
     /// `git` helper, which the tests then run on the fixture, resolves the
     /// fixture by directory too.
+    ///
+    /// That happens at the first call, not before the first test. libtest
+    /// runs tests on several threads, so under an inherited `GIT_DIR` a test
+    /// that runs a helper which follows the caller's environment, without
+    /// building a fixture first, sees the variables or not depending on
+    /// scheduling. Every fixture test is unaffected: it forgets them before
+    /// its fixture exists.
     fn fixture_git() -> Command {
         const LOCATION: [&str; 8] = [
             "GIT_DIR",

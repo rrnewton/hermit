@@ -190,11 +190,29 @@ if "$nextest_calibration"; then
     fi
 fi
 
+# Every git command below reads the repository named by --src or one of its
+# submodules, or edits a private config copy named by --file. Git exports
+# GIT_DIR to each `git rebase --exec` step, and GIT_DIR, GIT_WORK_TREE and
+# GIT_INDEX_FILE to hooks, and each one overrides `git -C`: an inherited one
+# made this wrapper mount another repository's metadata as the guest's, drop
+# the submodule metadata mounts, or exit because `git submodule` found no
+# working tree (https://github.com/rrnewton/hermit/issues/3362). Run them
+# without the repository-location variables. GIT_CONFIG_COUNT and its
+# companions are kept; they carry this host's url.insteadOf rewrites.
+src_git() {
+    (
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+            GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+            GIT_NAMESPACE GIT_PREFIX
+        exec git "$@"
+    )
+}
+
 cargo_mount=(); cargo_home_in=/build/.cargo
 git_mounts=()
 if [[ -f "$src/.git" ]]; then
-    git_common_dir=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir)
-    root_git_dir=$(git -C "$src" rev-parse --path-format=absolute --git-dir)
+    git_common_dir=$(src_git -C "$src" rev-parse --path-format=absolute --git-common-dir)
+    root_git_dir=$(src_git -C "$src" rev-parse --path-format=absolute --git-dir)
     raw_root_git_dir=$(sed -n "s/^gitdir: //p" "$src/.git")
     guest_root_git_dir=$(realpath -m "/src/$raw_root_git_dir")
     if [[ $raw_root_git_dir == /* ]]; then
@@ -233,7 +251,7 @@ if [[ -f "$src/.git" ]]; then
         [[ -f $config_source ]] || continue
         config_copy="$root_config_dir/$config_name"
         cp -- "$config_source" "$config_copy"
-        git config --file "$config_copy" core.worktree /src
+        src_git config --file "$config_copy" core.worktree /src
         git_mounts+=(--mount "type=bind,source=$config_copy,destination=$config_destination,ro=true")
     done
 fi
@@ -243,13 +261,13 @@ if [[ -e "$src/.git" ]]; then
     # alias instead of /src/<path>, which the strict submodule verifier refuses.
     # Keep objects and indexes read-only; overlay only private config copies.
     git_config_root=""
-    submodule_paths=$(git -C "$src" submodule foreach --quiet --recursive 'printf "%s\n" "$displaypath"')
+    submodule_paths=$(src_git -C "$src" submodule foreach --quiet --recursive 'printf "%s\n" "$displaypath"')
     while IFS= read -r submodule_path; do
         [[ -n $submodule_path ]] || continue
         submodule_root="$src/$submodule_path"
         [[ -f "$submodule_root/.git" ]] || continue
-        submodule_git_dir=$(git -C "$submodule_root" rev-parse --path-format=absolute --git-dir)
-        submodule_common_dir=$(git -C "$submodule_root" rev-parse --path-format=absolute --git-common-dir)
+        submodule_git_dir=$(src_git -C "$submodule_root" rev-parse --path-format=absolute --git-dir)
+        submodule_common_dir=$(src_git -C "$submodule_root" rev-parse --path-format=absolute --git-common-dir)
         raw_git_dir=$(sed -n "s/^gitdir: //p" "$submodule_root/.git")
         if [[ $raw_git_dir == /* ]]; then
             guest_git_dir=$raw_git_dir
@@ -289,7 +307,7 @@ if [[ -e "$src/.git" ]]; then
             [[ -f $config_source ]] || continue
             config_copy="$git_config_root/$submodule_path/$config_name"
             cp -- "$config_source" "$config_copy"
-            git config --file "$config_copy" core.worktree "/src/$submodule_path"
+            src_git config --file "$config_copy" core.worktree "/src/$submodule_path"
             git_mounts+=(--mount "type=bind,source=$config_copy,destination=$config_destination,ro=true")
         done
     done <<< "$submodule_paths"
