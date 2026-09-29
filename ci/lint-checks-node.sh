@@ -186,11 +186,23 @@ esac
 # than the false main-red it was fixing, and it landed one day after this node was
 # created precisely so those checkers would be gated by construction.
 #
-# So: run the whole target. scripts/test_validate_stop_paths.py now skips only the
-# arm it cannot evaluate, passes everything else, and announces the skip on stderr
-# with a machine-readable prefix. If the target SUCCEEDED but something announced
-# itself unevaluated, the run as a whole is a no_result: everything that could be
-# checked was checked and passed, and something could not be checked.
+# So: run the whole target. If the target SUCCEEDED but something announced itself
+# unevaluated on a line starting with the machine-readable prefix, the run as a
+# whole is a no_result: everything that could be checked was checked and passed,
+# and something could not be checked.
+#
+# The canonical adapter accept arm is NO LONGER one of those announcements. This
+# node runs in lanes with no dev-hermit parent (hosted-portable on every GitHub
+# runner), and an arm that can never be evaluated in a lane made this node a
+# permanent no_result there, which the hosted gate reads as red: that was
+# https://github.com/rrnewton/hermit/actions/runs/36550265580. The target now runs
+# scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm, which
+# prints that the arm is NOT COVERED by this run and where it is. The arm is its
+# own DAG node, check.canonical_adapter_accept, labelled `full` only -- the lane
+# whose checkouts sit under the parent -- where a missing parent is still exit 75
+# and a failure is still a failure. The exclude mode itself refuses unless that
+# node is present, is the only owner of the arm, is `full`-only, and runs the
+# script directly rather than through make.
 #
 # Any real failure still propagates unchanged -- a nonzero from make is a failure,
 # never a no_result, because a no_result must not be able to swallow a red.

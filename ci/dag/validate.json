@@ -619,6 +619,40 @@
     },
     {
       "group": "check",
+      "job": "canonical_adapter_accept",
+      "desc": "Canonical ledger adapter contract, accept arm, against the real dev-hermit parent adapter (needs the parent: local full lane only)",
+      "description": "The accept arm of the canonical ledger adapter contract drives the REAL dev-hermit parent adapter (ci-hub/ledger/validate_rows.py in the dev-hermit PARENT repository; this repository has no ci-hub/ directory), so it can be evaluated only from a checkout nested under that parent. That is a host capability in the same sense as /dev/kvm, and this node is labelled `full` ONLY because local `scripts/validate.rs full` is the one lane whose checkouts sit under the parent: the hosted-portable and portable lanes check out bare Hermit on GitHub runners, and the privileged, hosted-privileged and super lanes use actions/checkout into the runner workspace. Until 2026-09-29 the arm ran inside check.lint_checks, which is also labelled hosted-portable, so every hosted run of that node could only report NO RESULT (exit 75) for it and the hosted workflow was red with every checker passing: https://github.com/rrnewton/hermit/actions/runs/36550265580 and https://github.com/rrnewton/hermit/actions/runs/36532203200. `make lint-checks` now runs the stop-path file with --exclude-canonical-adapter-accept-arm and prints that the arm is NOT COVERED by that run and that this node covers it; that exclude mode fails unless this node exists, is the only command that runs the arm, carries exactly the `full` label, and invokes the script directly. The command is a direct python3 invocation, not a make recipe, because make collapses a recipe's exit 75 into its own error and would turn a missing parent into a failure. Outcomes: 0 when the real adapter accepted one production-shaped schema-5 write into its stop-test spool and left the retired raw shadow and the published ledger untouched; 75 (no_result, with a NO-RESULT-CASE line) when no parent adapter is on any ancestor directory; any other nonzero is a failure. The arm runs `scripts/validate.rs full` once in stop-test mode with an early exit, through the prebuilt rust-script shim, so it depends on build.rust_scripts like check.lint_checks.",
+      "labels": [
+        "full"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only",
+      "result_manifests": [],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 600,
+      "cpu_timeout": 1200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 30.0,
+        "rss_baseline_bytes": 268435456,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "check.canonical_adapter_accept"
+    },
+    {
+      "group": "check",
       "job": "script_sigpipe",
       "desc": "Standalone scripts exit cleanly on downstream SIGPIPE, and every rust-script has a prepared binary",
       "description": "Compilation moved to build.rust_scripts on 2026-08-31. This node retains the independent SIGPIPE behavior check and audits that every tracked rust-script entrypoint keeps the freshness-preserving shebang, initializes the shared prelude, and has one matching executable in the producer manifest. Under the graph it uses --check and cannot compile; a standalone invocation builds first so the checker remains independently runnable.",

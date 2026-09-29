@@ -127,6 +127,129 @@ def find_parent_adapter() -> Path | None:
         if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file():
             return candidate
     return None
+
+
+# WHERE THE ACCEPT ARM RUNS, AND WHY IT IS ITS OWN NODE.
+#
+# The accept arm needs the dev-hermit parent adapter, the way a KVM test needs
+# /dev/kvm. A bare Hermit checkout on a GitHub runner has no parent, so every run
+# of check.lint_checks there reported NO RESULT (exit 75) and the hosted
+# workflow was permanently red. Measured on
+# https://github.com/rrnewton/hermit/actions/runs/36532203200 at 6be37a833df8:
+# the node ran 624s, every checker passed, and this one arm was the sole reason
+# the job failed.
+#
+# The arm is therefore owned by one validation DAG node, carried ONLY by the
+# lanes that run from a checkout nested under the parent. `make lint-checks`
+# runs this file with EXCLUDE_ACCEPT_ARM_FLAG, which prints that the arm is not
+# covered by this run and names the node that does cover it. That run is not
+# allowed to name a node that does not exist: check_accept_arm_ownership() reads
+# the committed DAG and fails the run unless exactly one node owns the arm, with
+# exactly the parent-lane labels. So deleting the owner, adding a second owner,
+# or scheduling the owner on a parentless lane each turns check.lint_checks red
+# in every lane, including the hosted one.
+#
+# The owner still reports parent absence as a no_result (exit 75), never as a
+# pass. The rule in NoParentAdapter's docstring is unchanged.
+ACCEPT_ARM_NODE = "check.canonical_adapter_accept"
+ACCEPT_ARM_ONLY_FLAG = "--canonical-adapter-accept-arm-only"
+EXCLUDE_ACCEPT_ARM_FLAG = "--exclude-canonical-adapter-accept-arm"
+ACCEPT_ARM_COMMAND = f"python3 ./scripts/test_validate_stop_paths.py {ACCEPT_ARM_ONLY_FLAG}"
+# `full` is local `scripts/validate.rs full`, run from a validation checkout
+# nested under the dev-hermit parent. Every other label names either a GitHub
+# lane that checks out bare Hermit (`hosted-portable`, `portable`,
+# `hosted-privileged`, `privileged`) or a focused profile. Adding a label here
+# is a claim that its lane has the parent; make that claim only with a run that
+# shows the accept arm passing on that lane.
+ACCEPT_ARM_LANE_LABELS = ("full",)
+DAG = ROOT / "ci" / "dag" / "validate.json"
+
+
+def accept_arm_owners(dag: dict) -> list[dict]:
+    """Every DAG step whose command runs the accept arm."""
+    return [step for step in dag["steps"] if ACCEPT_ARM_ONLY_FLAG in step.get("cmd", "")]
+
+
+def check_accept_arm_ownership(dag: dict) -> str:
+    """Return the owning node's tag, or raise if the arm is not owned correctly."""
+    owners = accept_arm_owners(dag)
+    tags = [f"{step['group']}.{step['job']}" for step in owners]
+    if tags != [ACCEPT_ARM_NODE]:
+        raise AssertionError(
+            f"the canonical adapter accept arm must be run by exactly one DAG node, "
+            f"{ACCEPT_ARM_NODE}; ci/dag/validate.json has {tags or 'none'}. "
+            f"`make lint-checks` excludes the arm on the understanding that this "
+            f"node runs it."
+        )
+    owner = owners[0]
+    if ACCEPT_ARM_COMMAND not in owner["cmd"]:
+        raise AssertionError(
+            f"{ACCEPT_ARM_NODE} must invoke `{ACCEPT_ARM_COMMAND}` directly, not "
+            f"through make (make turns exit 75 into its own error); "
+            f"its command is {owner['cmd']!r}"
+        )
+    labels = sorted(owner.get("labels", []))
+    if labels != sorted(ACCEPT_ARM_LANE_LABELS):
+        raise AssertionError(
+            f"{ACCEPT_ARM_NODE} must carry exactly the parent-lane labels "
+            f"{list(ACCEPT_ARM_LANE_LABELS)}; it carries {labels}. A lane without "
+            f"the dev-hermit parent can only report NO RESULT for this arm, and a "
+            f"lane with the parent that drops the node stops testing it."
+        )
+    return ACCEPT_ARM_NODE
+
+
+def run_accept_arm_ownership_contract() -> str:
+    """Check the committed DAG, and prove the check rejects each broken shape."""
+    committed = json.loads(DAG.read_text())
+    owner = check_accept_arm_ownership(committed)
+
+    def mutated(change: Callable[[list[dict]], None]) -> dict:
+        dag = json.loads(json.dumps(committed))
+        change(dag["steps"])
+        return dag
+
+    def is_owner(step: dict) -> bool:
+        return ACCEPT_ARM_ONLY_FLAG in step.get("cmd", "")
+
+    def drop_owner(steps: list[dict]) -> None:
+        steps[:] = [step for step in steps if not is_owner(step)]
+
+    def add_hosted_label(steps: list[dict]) -> None:
+        next(step for step in steps if is_owner(step))["labels"].append("hosted-portable")
+
+    def drop_full_label(steps: list[dict]) -> None:
+        owner_step = next(step for step in steps if is_owner(step))
+        owner_step["labels"] = [label for label in owner_step["labels"] if label != "full"]
+
+    def second_owner(steps: list[dict]) -> None:
+        lint = next(
+            step for step in steps if (step["group"], step["job"]) == ("check", "lint_checks")
+        )
+        lint["cmd"] += f" && {ACCEPT_ARM_COMMAND}"
+
+    def through_make(steps: list[dict]) -> None:
+        owner_step = next(step for step in steps if is_owner(step))
+        owner_step["cmd"] = owner_step["cmd"].replace(
+            ACCEPT_ARM_COMMAND, f"make lint-parent-checks # {ACCEPT_ARM_ONLY_FLAG}"
+        )
+
+    for name, change, expected in (
+        ("owner deleted", drop_owner, "has none"),
+        ("owner scheduled on the hosted lane", add_hosted_label, "exactly the parent-lane labels"),
+        ("owner dropped from local validate", drop_full_label, "exactly the parent-lane labels"),
+        ("a second owner", second_owner, "check.lint_checks"),
+        ("owner run through make", through_make, "not through make"),
+    ):
+        try:
+            check_accept_arm_ownership(mutated(change))
+        except AssertionError as exc:
+            assert expected in str(exc), (name, str(exc))
+        else:
+            raise AssertionError(f"accept-arm ownership check accepted: {name}")
+    return owner
+
+
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
 OUTER_VALIDATE_ENV = (
@@ -851,15 +974,22 @@ def main(argv: list[str] | None = None) -> None:
             "and re-entrancy reason are classified together"
         )
         return
-    if args:
+    if args not in ([], [ACCEPT_ARM_ONLY_FLAG], [EXCLUDE_ACCEPT_ARM_FLAG]):
         raise SystemExit(
-            "usage: test_validate_stop_paths.py [--final-status-self-test]"
+            "usage: test_validate_stop_paths.py "
+            f"[--final-status-self-test | {ACCEPT_ARM_ONLY_FLAG} | {EXCLUDE_ACCEPT_ARM_FLAG}]"
         )
 
     # Every child this file spawns is a fixture, not a nested validation. The
     # re-entrancy guard runs before the stop-test seam, so inheriting the outer
     # run's marker would prevent the fixture from observing any stop path.
     os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
+
+    if args == [ACCEPT_ARM_ONLY_FLAG]:
+        run_accept_arm_only()
+        return
+    exclude_accept_arm = args == [EXCLUDE_ACCEPT_ARM_FLAG]
+    accept_arm_owner = run_accept_arm_ownership_contract() if exclude_accept_arm else None
 
     run_final_validate_status_contract()
     check_stop_test_env_does_not_inherit_outer_validate()
@@ -880,10 +1010,11 @@ def main(argv: list[str] | None = None) -> None:
     # refuse=True arm plants its own adapter and never needed a parent. Claiming
     # they ran was false, and abandoning them cost real coverage for a precondition
     # that affects exactly one arm of one case.
-    try:
-        run_canonical_adapter_contract(refuse=False)
-    except NoParentAdapter as exc:
-        unevaluated.append(f"canonical adapter contract, accept arm: {exc}")
+    if not exclude_accept_arm:
+        try:
+            run_canonical_adapter_contract(refuse=False)
+        except NoParentAdapter as exc:
+            unevaluated.append(f"canonical adapter contract, accept arm: {exc}")
     run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
@@ -917,10 +1048,34 @@ def main(argv: list[str] | None = None) -> None:
             "Run from a checkout nested under the dev-hermit parent to evaluate them.",
             file=sys.stderr,
         )
+    if accept_arm_owner is not None:
+        # Plain text, deliberately NOT the no-result marker: the arm is outside
+        # this run's scope, not an evaluation this run attempted and could not
+        # finish. It is not reported as passed either -- the summary below says
+        # REFUSE arm only.
+        print(
+            "NOT COVERED BY THIS RUN: canonical adapter contract, accept arm. "
+            "It needs the dev-hermit parent adapter (ci-hub/ledger/validate_rows.py "
+            "in the dev-hermit PARENT repository), which a bare Hermit checkout, "
+            "including every GitHub-hosted runner, does not have. It is covered by "
+            f"validation DAG node {accept_arm_owner}, scheduled only in lane(s) "
+            f"{', '.join(ACCEPT_ARM_LANE_LABELS)} (local `scripts/validate.rs full` "
+            "from a checkout nested under the dev-hermit parent). Run it directly with "
+            f"`{ACCEPT_ARM_COMMAND}`."
+        )
     signals_ran = not any(item.startswith("signal stop paths") for item in unevaluated)
     adapter_unevaluated = any(
         item.startswith("canonical adapter") for item in unevaluated
     )
+    if accept_arm_owner is not None:
+        adapter_summary = (
+            f"canonical adapter REFUSE arm only (accept arm is {accept_arm_owner}'s, "
+            "and that node is present in the committed DAG); "
+        )
+    elif adapter_unevaluated:
+        adapter_summary = "canonical adapter REFUSE arm only (accept arm not evaluable here); "
+    else:
+        adapter_summary = "canonical adapter accept/refuse bracketed; "
     print(
         "PASS: "
         + (
@@ -929,12 +1084,36 @@ def main(argv: list[str] | None = None) -> None:
             if signals_ran
             else "signal stop paths NOT EVALUATED (validate declined to start); "
         )
-        + (
-            "canonical adapter REFUSE arm only (accept arm not evaluable here); "
-            if adapter_unevaluated
-            else "canonical adapter accept/refuse bracketed; "
-        )
+        + adapter_summary
         + "cleanup is signal-atomic"
+    )
+
+
+def run_accept_arm_only() -> None:
+    """The body of ACCEPT_ARM_NODE: the accept arm alone, against the real parent.
+
+    Exit 0 only when the real parent adapter accepted the write. Parent absence
+    exits NO_RESULT_EXIT_CODE directly: this mode runs as a DAG node command, not
+    as a make recipe, so the exit status can carry the no_result itself.
+    """
+    try:
+        run_canonical_adapter_contract(refuse=False)
+    except NoParentAdapter as exc:
+        sys.stdout.flush()
+        print(f"{NO_RESULT_MARKER} canonical adapter contract, accept arm: {exc}", file=sys.stderr)
+        print(
+            f"NO RESULT (exit {NO_RESULT_EXIT_CODE}): the accept arm was not evaluated. "
+            "Run from a checkout nested under the dev-hermit parent.",
+            file=sys.stderr,
+        )
+        raise SystemExit(NO_RESULT_EXIT_CODE) from None
+    leaked = [path for path in TEST_ROOTS if path.exists()]
+    assert not leaked, f"stop-path test residue: {leaked}"
+    print(
+        "PASS: canonical adapter accept arm: the dev-hermit parent adapter under "
+        f"{find_parent_adapter()} accepted one production-shaped schema-5 write into "
+        "its stop-test spool and left the retired raw shadow and the published "
+        "ledger untouched"
     )
 
 

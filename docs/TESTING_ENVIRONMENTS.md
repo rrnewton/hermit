@@ -174,6 +174,19 @@ Runs after a push to `integration` or by `workflow_dispatch`. It asks
 GitHub-managed portable runners have **no usable PMU and no CPUID faulting**, so the
 detcore and hermit integration suites are deliberately excluded here.
 
+They also have **no dev-hermit parent repository**: the checkout is bare Hermit.
+One checker needs that parent, the way a KVM test needs `/dev/kvm`: the accept
+arm of the canonical ledger adapter contract in
+`scripts/test_validate_stop_paths.py`, which drives the parent's real
+`ci-hub/ledger/validate_rows.py`. It is not run in this tier and is not counted
+as passed here. `check.lint_checks` runs that file with
+`--exclude-canonical-adapter-accept-arm`, which prints `NOT COVERED BY THIS RUN`
+and names the node that does cover it: `check.canonical_adapter_accept`,
+labelled `full` only, so it runs in local `scripts/validate.rs full` from a
+checkout nested under the parent. From a checkout without the parent that node
+reports NO RESULT (exit 75), never a pass. `make lint-parent-checks` runs the
+same arm by hand.
+
 ### `privileged` — capability runner (`[Linux, X64, hermit, pmu]`)
 
 Runs only by `workflow_dispatch`.

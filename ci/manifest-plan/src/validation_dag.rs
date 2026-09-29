@@ -59,6 +59,14 @@ pub fn admitted_pin_command(tag: &str, floor: Option<&str>) -> Result<Option<Str
     }
 }
 const OUTCOME_CONSUMERS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/check-outcome-consumers-node.sh"#;
+/// The accept arm of the canonical ledger adapter contract needs the dev-hermit
+/// parent adapter, so it runs as its own node in the `full` lane only (the lane
+/// whose checkouts are nested under the parent) and as a direct python3 command,
+/// because make would turn its exit 75 (no_result) into a failure.
+/// scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
+/// checks the same ownership from the committed JSON at run time.
+const CANONICAL_ADAPTER_ACCEPT_TAG: &str = "check.canonical_adapter_accept";
+const CANONICAL_ADAPTER_ACCEPT_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
@@ -169,12 +177,13 @@ struct Profile {
 // full, portable and hosted-portable each lost one step when test.dbt_parity
 // and its _on_host twin were retired (slice S13 of
 // https://github.com/rrnewton/hermit/issues/3301): 271/272, 260/261 and
-// 251/251 before.
+// 251/251 before. full then gained check.canonical_adapter_accept, the
+// parent-only accept arm split out of check.lint_checks: 270/271 before.
 const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
-        direct_steps: 270,
-        selected_steps: 271,
+        direct_steps: 271,
+        selected_steps: 272,
     },
     Profile {
         label: "portable",
@@ -1751,10 +1760,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
     // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
-    // (slice S13 of https://github.com/rrnewton/hermit/issues/3301).
-    if cfg.steps.len() != 1604 {
+    // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
+    // since check.canonical_adapter_accept was added.
+    if cfg.steps.len() != 1605 {
         return Err(format!(
-            "superset has {} steps, expected 1604",
+            "superset has {} steps, expected 1605",
             cfg.steps.len()
         ));
     }
@@ -1824,6 +1834,29 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         return Err(
             "check.check_outcome_consumers must retain its no-result classification wrapper".into(),
         );
+    }
+    let accept_owners = cfg
+        .steps
+        .iter()
+        .filter(|step| step.cmd.contains("--canonical-adapter-accept-arm-only"))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if accept_owners != [CANONICAL_ADAPTER_ACCEPT_TAG] {
+        return Err(format!(
+            "the canonical adapter accept arm must be run by exactly {CANONICAL_ADAPTER_ACCEPT_TAG}; found {accept_owners:?}"
+        ));
+    }
+    let accept = step(CANONICAL_ADAPTER_ACCEPT_TAG)?;
+    if accept.cmd != CANONICAL_ADAPTER_ACCEPT_COMMAND {
+        return Err(format!(
+            "{CANONICAL_ADAPTER_ACCEPT_TAG} must run the accept arm directly, not through make, so its exit 75 stays a no_result"
+        ));
+    }
+    if accept.labels != ["full"] {
+        return Err(format!(
+            "{CANONICAL_ADAPTER_ACCEPT_TAG} needs the dev-hermit parent and must be labelled exactly [\"full\"]; it has {:?}",
+            accept.labels
+        ));
     }
     let builder = step("privileged-build.privileged_tests")?;
     for (binary, portable, privileged) in [
@@ -3659,6 +3692,47 @@ sys.exit(37)
         let error = assert_invariants(&bypassed, &cells).unwrap_err();
         assert!(
             error.contains("no-result classification wrapper"),
+            "{error}"
+        );
+
+        fn accept_step(cfg: &mut DagConfig) -> &mut Step {
+            cfg.steps
+                .iter_mut()
+                .find(|step| step.tag() == CANONICAL_ADAPTER_ACCEPT_TAG)
+                .unwrap()
+        }
+        let base = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let mut hosted = base.clone();
+        accept_step(&mut hosted)
+            .labels
+            .push(HOSTED_PORTABLE_LABEL.into());
+        let error = assert_invariants(&hosted, &cells).unwrap_err();
+        assert!(error.contains("labelled exactly"), "{error}");
+
+        let mut unscheduled = base.clone();
+        accept_step(&mut unscheduled).labels.clear();
+        let error = assert_invariants(&unscheduled, &cells).unwrap_err();
+        assert!(error.contains("labelled exactly"), "{error}");
+
+        let mut through_make = base.clone();
+        accept_step(&mut through_make).cmd = CANONICAL_ADAPTER_ACCEPT_COMMAND.replace(
+            "python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only",
+            "make lint-parent-checks # --canonical-adapter-accept-arm-only",
+        );
+        let error = assert_invariants(&through_make, &cells).unwrap_err();
+        assert!(error.contains("not through make"), "{error}");
+
+        let mut doubled = base;
+        doubled
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "check.lint_checks")
+            .unwrap()
+            .cmd
+            .push_str(" && python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only");
+        let error = assert_invariants(&doubled, &cells).unwrap_err();
+        assert!(
+            error.contains("exactly check.canonical_adapter_accept"),
             "{error}"
         );
     }

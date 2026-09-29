@@ -43,7 +43,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
-	validate-self-test validate-timeout-layers-test lint \
+	validate-self-test validate-timeout-layers-test lint lint-parent-checks \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -154,7 +154,19 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # a checker added to lint-checks is exercised by local validation automatically, whereas the previous
 # arrangement required someone to also hand-write a DAG node and six of the ten
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
-lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
+lint: lint-checks lint-cargo lint-parent-checks ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
+
+# The one checker that needs the dev-hermit PARENT repository: the accept arm of the
+# canonical ledger adapter contract drives the parent's real ci-hub/ledger/validate_rows.py.
+# A bare Hermit checkout -- every GitHub-hosted runner, or a detached worktree under
+# /tmp -- has no parent, so the arm is scheduled as its own DAG node,
+# check.canonical_adapter_accept, in the `full` lane only (local validation, whose
+# checkouts are nested under the parent). lint-checks runs everything else in that
+# file and prints that the arm is not covered there. Run from a parentless checkout,
+# this target exits 75 (NO RESULT) and make reports that as `Error 75`: the arm was
+# not evaluated, which is neither a pass nor a lint failure.
+lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI node check.canonical_adapter_accept, full lane only)
+	python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only
 
 # The full stop-path checker is safe to run inside validation: it clears the outer
 # HERMIT_VALIDATE_ACTIVE marker before launching fixtures, and every full-validate
@@ -172,7 +184,7 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	python3 ./scripts/test_check_outcome_adapter_authority.py
 	./scripts/test-authority-obtained-once.sh
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
-	python3 ./scripts/test_validate_stop_paths.py
+	python3 ./scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
