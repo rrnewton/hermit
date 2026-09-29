@@ -77,6 +77,7 @@ use crate::scheduler::AdmitSide;
 use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::ExecReconnect;
+use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
@@ -1765,6 +1766,22 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
+            GlobalRequest::SigchldEligibility(request) => {
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                R::SigchldEligibility(match request {
+                    SigchldEligibilityRequest::Mark { thread, process } => {
+                        sched.mark_sigchld_eligible(thread, process);
+                        false
+                    }
+                    SigchldEligibilityRequest::Take { thread, pending } => {
+                        sched.sigchld_eligible(thread, pending)
+                    }
+                    SigchldEligibilityRequest::Flush { thread } => {
+                        sched.flush_sigchld_eligibility(thread);
+                        false
+                    }
+                })
+            }
             GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -2533,7 +2550,7 @@ impl GlobalState {
                 return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
             };
             match action {
-                FutexAction::WaitRequest(maybe_timeout, interrupting_signals) => {
+                FutexAction::WaitRequest(maybe_timeout, signal_watch) => {
                     if sched.child_tid_was_cleared(futexid, init_read) {
                         trace!(
                             "[detcore, dtid {}] late wait on cleared child-TID futex {:?}",
@@ -2552,13 +2569,7 @@ impl GlobalState {
                         sched.fail_parked(dettid, error);
                         return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
                     }
-                    sched.sleep_futex_waiter(
-                        &dettid,
-                        futexid,
-                        maybe_timeout,
-                        mask,
-                        interrupting_signals,
-                    );
+                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask, signal_watch);
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
@@ -3159,6 +3170,9 @@ pub enum GlobalRequest {
     NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
+    /// Record or query `SIGCHLD` eligibility for gated waits; see
+    /// [`SigchldEligibilityRequest`].
+    SigchldEligibility(SigchldEligibilityRequest),
     /// Scheduler-owned lifecycle state for a direct child process.
     ExactChildWaitState(DetPid, DetPid),
 
@@ -3242,6 +3256,7 @@ pub enum GlobalResponse {
     ResolveKillTargets(Vec<DetTid>),
     NotifySignalPending(()),
     ThreadIsLive(bool),
+    SigchldEligibility(bool),
     ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
@@ -3746,14 +3761,35 @@ where
     }
 }
 
+/// What a guest turn tells or asks the scheduler about a `SIGCHLD` that a gated
+/// wait may count (https://github.com/rrnewton/hermit/issues/3146). See the
+/// `SIGCHLD` eligibility section of `Scheduler` for why only a deterministic send
+/// makes one eligible.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum SigchldEligibilityRequest {
+    /// A send in this turn succeeded: on `process`'s shared queue, or on
+    /// `thread`'s private queue when `process` is `None`.
+    Mark {
+        thread: DetTid,
+        process: Option<DetPid>,
+    },
+    /// A gated wait of `thread` can be interrupted by `SIGCHLD`; `pending` says
+    /// whether the kernel reports one pending. Answers whether it counts.
+    Take { thread: DetTid, pending: bool },
+    /// `thread` set `SIGCHLD` to `SIG_IGN` or `SIG_DFL` in this turn, which
+    /// discards every pending `SIGCHLD` of its process.
+    Flush { thread: DetTid },
+}
+
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
     /// Check in before a FUTEX_WAIT, including an optional timeout and, on a backend
-    /// that reports the kernel's signal state, the set of signals that interrupt the
-    /// wait. With `None`, as before, a scheduler-sent signal wakes the waiter and a
-    /// cross-task signal does not.
-    WaitRequest(Option<LogicalTime>, Option<u64>),
+    /// that reports the kernel's signal state, the waiter's mask and where the
+    /// scheduler reads its dispositions when it commits a wake. With `None`, as
+    /// before, a scheduler-sent signal wakes the waiter and a cross-task signal
+    /// does not.
+    WaitRequest(Option<LogicalTime>, Option<FutexSignalWatch>),
     /// Check in after a FUTEX_WAIT
     WaitFinished,
     /// Check in before a FUTEX_WAKE, parameterized by the number of threads woken.
@@ -4187,6 +4223,21 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIsLive(live) => live,
+        _ => unreachable!(),
+    }
+}
+
+/// Record or query `SIGCHLD` eligibility for gated waits
+/// (https://github.com/rrnewton/hermit/issues/3146). Only a `Take` answer is
+/// meaningful; `Mark` and `Flush` answer `false`.
+pub async fn sigchld_eligibility<G, T>(guest: &mut G, request: SigchldEligibilityRequest) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::SigchldEligibility(request)).await;
+    match response.1 {
+        GlobalResponse::SigchldEligibility(eligible) => eligible,
         _ => unreachable!(),
     }
 }
