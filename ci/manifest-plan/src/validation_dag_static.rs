@@ -279,7 +279,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     //   ptrace_given_kvm_inputs_matches_its_own_on_ioctl_fioclex,
     //   ptrace_given_liteinst_inputs_matches_its_own_on_mmap_determinism,
     //   ptrace_given_sabre_inputs_matches_its_own_on_epoll_determinism.
-    ("test.regular_crates", 707),
+    // The hosted-routing series adds two hermit-manifest-plan tests and
+    // retains all 707 prior identities (`cargo nextest list` measured 709):
+    // validation_dag::tests::
+    //   hosted_portable_omits_the_excluded_backends_everywhere_and_locally_keeps_them;
+    // test-harness bin:
+    //   committed_hosted_portable_harness_commands_exclude_each_backend_once.
+    ("test.regular_crates", 709),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -380,7 +386,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 707),
+    ("test.regular_crates_on_host", 709),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
