@@ -90,6 +90,10 @@ pub enum InvocationRole {
         attempt_index: String,
         backend: RequiredNullable<String>,
     },
+    /// Read-only history: the runner no longer launches this process (its
+    /// ptrace golden-log normalization was removed for
+    /// <https://github.com/rrnewton/hermit/issues/3301>), but results written
+    /// before then still record it, and they must keep parsing and validating.
     PtraceNormalization {
         execution_ordinal: u64,
     },
