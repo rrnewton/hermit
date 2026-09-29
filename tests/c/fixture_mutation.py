@@ -57,6 +57,17 @@ Two run modes:
     (e.g. KVM without /dev/kvm) is SKIPPED with a reported reason -- never a
     silent pass -- unless --require-backend makes the skip fatal.
 
+Native mode also runs a CPU-placement leg: every fixture's clean contract must
+still hold on a host that lets it use exactly one CPU, and not its lowest one.
+Validation hosts do restrict CPUs this way. The dev-hermit launcher keeps cells
+off the CPUs the host PMU drivers are bound to, CPU 0 among them
+(https://github.com/rrnewton/hermit/issues/3265), and a fixture that pinned
+itself to CPU 0 failed there while passing everywhere else. An unprivileged
+harness cannot create the cgroup cpuset that causes this, so the leg links the
+fixture with fixture_cpuset_shim.c, which applies the kernel's cpuset rule to
+sched_setaffinity, and first proves with that file's control program that the
+rule refuses a CPU the kernel itself would have accepted.
+
 Adding a family member is one registry entry below: source path + field names.
 No bespoke verification code travels with the fixture.
 
@@ -70,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import os
 import re
 import shutil
@@ -85,6 +97,10 @@ FIXTURES_DIR = SCRIPT_DIR
 REPOSITORY_ROOT = SCRIPT_DIR.parent.parent
 # The shared contract header every family member includes.
 PROBE_HEADER = "parity_probe.h"
+# Link-time cpuset for the CPU-placement leg. It does not include PROBE_HEADER,
+# so it is not a family member.
+CPUSET_SHIM = "fixture_cpuset_shim.c"
+CPUSET_SHIM_FLAGS = ("-Wl,--wrap=sched_setaffinity",)
 
 # The golden reference backend. "Parity" is defined against this.
 GOLDEN_BACKEND = "ptrace"
@@ -426,8 +442,15 @@ def split_stderr(raw: bytes) -> tuple[bytes, bytes]:
 
 
 def _run(
-    command: list[str], env: dict[str, str], timeout: int, capture_log: bool = False
+    command: list[str],
+    env: dict[str, str],
+    timeout: int,
+    capture_log: bool = False,
+    cpus: frozenset[int] | None = None,
 ) -> Observation | None:
+    # `cpus` restricts the child's inherited affinity before exec. On its own
+    # that is not a cpuset (the child may widen it again); the placement leg
+    # pairs it with fixture_cpuset_shim.c, which treats it as one.
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -435,6 +458,7 @@ def _run(
         env=env,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
+        preexec_fn=None if cpus is None else (lambda: os.sched_setaffinity(0, cpus)),
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
@@ -451,13 +475,18 @@ def _run(
     return Observation(process.returncode, stdout, guest_stderr, info_log)
 
 
-def observe_native(binary: Path, mutate: str | None) -> Observation | None:
+def observe_native(
+    binary: Path,
+    mutate: str | None,
+    cpus: frozenset[int] | None = None,
+    args: tuple[str, ...] = (),
+) -> Observation | None:
     """Run the compiled fixture directly, optionally planting a mutation."""
     env = dict(os.environ)
     env.pop("HERMIT_PARITY_MUTATE", None)
     if mutate is not None:
         env["HERMIT_PARITY_MUTATE"] = mutate
-    return _run([str(binary)], env, NATIVE_TIMEOUT_S)
+    return _run([str(binary), *args], env, NATIVE_TIMEOUT_S, cpus=cpus)
 
 
 def _hermit_command(
@@ -704,6 +733,103 @@ def check_ioctl_fionread_getfl_failure(
             "ioctl_fionread [native] failed second F_GETFL was not preserved as a failed check "
             f"({observation.summary() if observation else 'timeout'})"
         )
+
+
+# ---------------------------------------------------------------------------
+# CPU-placement leg
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Placement:
+    """The one CPU the placement leg allows, and a CPU it forbids.
+
+    ``forbidden`` is in this harness's own affinity mask, so the kernel would
+    accept a request for it: only the shim can refuse it.
+    """
+
+    allowed: frozenset[int]
+    forbidden: int
+
+
+def choose_placement() -> tuple[Placement | None, str]:
+    """Allow only the highest CPU this process may use; forbid the lowest.
+
+    The lowest is CPU 0 wherever CPU 0 is available, and allowing a single CPU
+    rules out every other fixed CPU number a fixture could ask for as well.
+    """
+    mine = os.sched_getaffinity(0)
+    if len(mine) < 2:
+        return None, (
+            f"this process may use only CPU(s) {sorted(mine)}; the leg needs two, "
+            f"one to allow and one to forbid"
+        )
+    return Placement(frozenset({max(mine)}), min(mine)), ""
+
+
+def check_cpuset_shim(report: Report, placement: Placement, workdir: Path) -> bool:
+    """Negative control: the shim refuses a CPU the kernel would accept.
+
+    Also asks for the allowed CPU, so a shim that refuses everything is caught
+    here rather than showing up as a red in every fixture. Returns whether the
+    control passed; the fixture legs are not run on an unproven shim.
+    """
+    (allowed,) = placement.allowed
+    control = FixtureSpec(
+        source=CPUSET_SHIM,
+        fields=(),
+        cflags=("-DFIXTURE_CPUSET_SHIM_CONTROL", *CPUSET_SHIM_FLAGS),
+    )
+    observation = observe_native(
+        compile_fixture(control, workdir / "cpuset-shim-control"),
+        mutate=None,
+        cpus=placement.allowed,
+        args=(str(placement.forbidden), str(allowed)),
+    )
+    expected = (
+        f"cpuset-shim-control cpu{placement.forbidden} rc=-1 errno={errno.EINVAL}\n"
+        f"cpuset-shim-control cpu{allowed} rc=0 errno=0\n"
+    ).encode()
+    label = (
+        f"cpuset shim [native]: refuses CPU {placement.forbidden} and accepts "
+        f"CPU {allowed} when started on CPU {allowed}"
+    )
+    if observation is not None and observation.exit_status == 0 and observation.stdout == expected:
+        report.ok(label)
+        return True
+    report.fail(
+        f"{label}: FAILED ({observation.summary() if observation else 'timeout'}; "
+        f"expected stdout {expected.decode()!r})"
+    )
+    return False
+
+
+def run_native_placement(
+    report: Report, name: str, spec: FixtureSpec, placement: Placement, workdir: Path
+) -> None:
+    """The fixture's clean contract must hold with only ``placement.allowed``.
+
+    Only the clean direction runs here. Whether a field is load-bearing does not
+    depend on which CPUs the host allows, and run_native already proves it.
+    """
+    (allowed,) = placement.allowed
+    variant = dataclasses.replace(
+        spec, cflags=spec.cflags + (str(FIXTURES_DIR / CPUSET_SHIM), *CPUSET_SHIM_FLAGS)
+    )
+    clean = observe_native(
+        compile_fixture(variant, workdir / f"{name}-placement"),
+        mutate=None,
+        cpus=placement.allowed,
+    )
+    label = f"{name} [native, only CPU {allowed} allowed]"
+    if clean is None:
+        report.fail(f"{label}: clean run timed out")
+    elif clean.exit_status != 0:
+        report.fail(f"{label}: clean contract FAILED ({clean.summary()})")
+    elif not clean.stdout.strip():
+        report.fail(f"{label}: clean run emitted no identity line")
+    else:
+        report.ok(f"{label}: clean contract holds ({clean.summary()})")
 
 
 def run_hermit(
@@ -1020,12 +1146,22 @@ def main(argv: list[str]) -> int:
     workdir = Path(tempfile.mkdtemp(prefix="fixture-mutation-"))
     examined: list[Path] = []
     try:
+        placement, no_placement = choose_placement()
+        if placement is None:
+            report.skip(f"cpuset shim [native]: {no_placement}")
+        elif not check_cpuset_shim(report, placement, workdir):
+            no_placement = "the cpuset shim control failed above"
+            placement = None
         for name in selected:
             spec = FIXTURES[name]
             examined.append(spec.source_path())
             check_declared_fields(report, name, spec)
             binary = compile_fixture(spec, workdir / name)
             run_native(report, name, binary, spec)
+            if placement is None:
+                report.skip(f"{name} [native, CPU placement]: {no_placement}")
+            else:
+                run_native_placement(report, name, spec, placement, workdir)
             if name == "ioctl_fionread":
                 check_ioctl_fionread_getfl_failure(
                     report, spec, workdir / f"{name}-getfl-failure"

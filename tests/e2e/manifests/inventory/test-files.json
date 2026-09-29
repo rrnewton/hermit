@@ -548,6 +548,12 @@
     },
     {
       "disposition": "suite-helper",
+      "path": "tests/c/fixture_cpuset_shim.c",
+      "runner": "tests/c/fixture_mutation.py",
+      "why": "tests/c/fixture_cpuset_shim.c is owned by tests/c/fixture_mutation.py: It is linked into each identity fixture with -Wl,--wrap=sched_setaffinity for the harness's CPU-placement leg, where it applies the kernel's cpuset rule so a fixture that asks for a CPU outside the one it was started on gets EINVAL, as it would inside a validation host's cpuset (https://github.com/rrnewton/hermit/issues/3265). Built with -DFIXTURE_CPUSET_SHIM_CONTROL it is that leg's control program. It is never run on its own and is not a manifest guest."
+    },
+    {
+      "disposition": "suite-helper",
       "path": "tests/c/fixture_mutation.py",
       "runner": "ci/dag/validate.json check.backend_parity_mutation",
       "why": "tests/c/fixture_mutation.py is owned by ci/dag/validate.json check.backend_parity_mutation: This is the shared mutation harness for the identity-fixture family (moved from tests/backend-parity/parity_mutation.py when backend-parity-c was folded into c-programs): it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
