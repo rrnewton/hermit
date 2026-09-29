@@ -40,6 +40,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::record_retry_event;
@@ -48,6 +49,7 @@ use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::robust_list;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigchldEligibilityRequest;
 use crate::tool_global::await_exact_child_physical_exit;
 use crate::tool_global::cancel_exec;
 use crate::tool_global::child_tid_clear_address;
@@ -59,6 +61,7 @@ use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_child_tid_address;
+use crate::tool_global::sigchld_eligibility;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::wait_for_child_lifecycle;
@@ -728,6 +731,65 @@ pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSigna
     let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
     let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
     KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// Whether the scheduler tracks which pending `SIGCHLD`s a gated wait may count.
+/// This must match the scheduler's own condition (`Scheduler::sigchld_eligibility`).
+pub(crate) fn sigchld_eligibility_is_tracked<T, G>(guest: &G) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let config = guest.config();
+    config.sequentialize_threads && config.backend_supports_blocked_wait_signal_interruption
+}
+
+/// The part of a gated wait's `pending` set that may interrupt it, given the
+/// signals that could (`interrupting`): `pending` without a `SIGCHLD` that the
+/// scheduler has not made eligible
+/// (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// The kernel posts `SIGCHLD` to a parent when a child exits, at a moment set by
+/// host timing, so `/proc` can report one that the schedule has not reached yet.
+/// The scheduler makes a `SIGCHLD` eligible at its own ordering points: a guest
+/// send in the sender's turn, its own `ChildExit` send at a granted
+/// `exit_group`'s time, and the logical death of a child that had no
+/// `ChildExit` send. Only those count here. The rest stay pending in the kernel
+/// and are delivered when the wait ends.
+///
+/// The scheduler is asked whenever `SIGCHLD` could interrupt the wait, pending or
+/// not, so whether the question is asked depends only on the guest's mask and
+/// dispositions, never on when the host posted the signal. See the `SIGCHLD`
+/// eligibility section of `Scheduler` for why the answer is deterministic.
+pub(crate) async fn eligible_pending_signals<G, T>(
+    guest: &mut G,
+    pending: KernelSigset,
+    interrupting: KernelSigset,
+) -> KernelSigset
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let sigchld = kernel_sigset_bit(libc::SIGCHLD);
+    if interrupting & sigchld == 0 || !sigchld_eligibility_is_tracked(guest) {
+        return pending;
+    }
+    let thread = guest.thread_state().dettid;
+    let request = SigchldEligibilityRequest::Take {
+        thread,
+        pending: pending & sigchld != 0,
+    };
+    if sigchld_eligibility(guest, request).await {
+        pending
+    } else {
+        if pending & sigchld != 0 {
+            trace!(
+                "[detcore, dtid {}] a pending SIGCHLD is not eligible yet; it does not interrupt the wait",
+                thread
+            );
+        }
+        pending & !sigchld
+    }
 }
 
 pub(super) fn blocked_signal_mask() -> KernelSigset {
@@ -1435,43 +1497,60 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let maybe_timeout_lt = self
                         .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
                         .await?;
-                    // On a backend whose kernel reports the guest's signal state, the
-                    // wait names the signals that end it, so a blocked, ignored, or
-                    // default-ignored one leaves it parked until its wakeup or its
-                    // original deadline. As in Linux, one already pending when the
-                    // value matches ends the wait at once with the futex's restart
-                    // errno (https://github.com/rrnewton/hermit/issues/3146).
+                    // On a backend whose kernel reports the guest's signal state, a
+                    // blocked, ignored, or default-ignored signal leaves the wait
+                    // parked until its wakeup or its original deadline. As in Linux,
+                    // one already pending when the value matches ends the wait at once
+                    // with the futex's restart errno; a `SIGCHLD` counts only once the
+                    // scheduler made it eligible (`eligible_pending_signals`).
+                    //
+                    // The scheduler is given only the mask, which only this thread can
+                    // change and so cannot change while it is parked. A sibling can
+                    // change the dispositions at any time, so the scheduler reads them
+                    // when it commits a wake, not here
+                    // (https://github.com/rrnewton/hermit/issues/3146).
                     let signal_interruption = guest
                         .config()
                         .backend_supports_blocked_wait_signal_interruption;
-                    let interrupting_signals = if signal_interruption {
+                    let signal_watch = if signal_interruption {
                         let state = read_kernel_signal_state(guest.pid(), guest.tid())
                             .map_err(Error::Errno)?;
-                        if state.pending_interrupting(state.blocked) != 0 {
+                        let interrupting = state.interrupting(state.blocked);
+                        let pending = eligible_pending_signals(
+                            guest,
+                            state.pending_interrupting(state.blocked),
+                            interrupting,
+                        )
+                        .await;
+                        if pending != 0 {
                             let errno = call.kernel_restart_errno();
                             trace!(
                                 "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
-                                &dettid,
-                                state.pending_interrupting(state.blocked),
-                                errno
+                                &dettid, pending, errno
                             );
                             return Err(Error::Errno(errno));
                         }
-                        Some(state.interrupting(state.blocked))
+                        Some(FutexSignalWatch {
+                            unblocked: !state.blocked
+                                & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                            pid: guest.pid().as_raw(),
+                            tid: guest.tid().as_raw(),
+                        })
                     } else {
                         None
                     };
                     let ans = futex_action(
                         guest,
-                        FutexAction::WaitRequest(maybe_timeout_lt, interrupting_signals),
+                        FutexAction::WaitRequest(maybe_timeout_lt, signal_watch),
                         &futexid,
                         init_val,
                         bitset,
                     )
                     .await;
                     let res = if signal_interruption && ans == Some(SchedValue::Signaled) {
-                        // The scheduler ended the wait for one of the signals named
-                        // above, so the wait was interrupted, not woken. Report the
+                        // The scheduler ended the wait for a signal that interrupted
+                        // it under the dispositions the kernel held when the wake was
+                        // committed, so the wait was interrupted, not woken. Report the
                         // futex's kernel restart errno and let the kernel apply the
                         // guest's disposition on resume.
                         let errno = call.kernel_restart_errno();

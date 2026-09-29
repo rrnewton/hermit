@@ -39,6 +39,7 @@ use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
+use crate::syscalls::threads::eligible_pending_signals;
 use crate::syscalls::threads::read_kernel_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
 use crate::syscalls::threads::wait_signal_disposition;
@@ -1636,7 +1637,7 @@ where
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let _ = resource_request(guest, rsrc.clone()).await;
-        match signals.interrupted() {
+        match signals.interrupted(guest).await {
             Ok(false) => {}
             Ok(true) => {
                 let errno = call0.kernel_restart_errno();
@@ -1778,10 +1779,18 @@ impl KernelSignalWait {
     /// while the call was waiting, and Linux returns the restart errno for that.
     /// Linux would still report sources that were ready when the call began, which
     /// this check puts behind the signal, as the scheduler's `Signaled` path did.
-    pub(crate) fn interrupted(&self) -> Result<bool, Errno> {
+    /// A `SIGCHLD` counts only once the scheduler made it eligible
+    /// (`eligible_pending_signals`).
+    pub(crate) async fn interrupted<T, G>(&self, guest: &mut G) -> Result<bool, Errno>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
         let state = read_kernel_signal_state(self.pid, self.tid)?;
         let guest_mask = self.saved_mask.unwrap_or(state.blocked);
-        let interrupting = state.pending_interrupting(guest_mask) & !self.consumed;
+        let could_interrupt = state.interrupting(guest_mask) & !self.consumed;
+        let interrupting =
+            eligible_pending_signals(guest, state.pending & could_interrupt, could_interrupt).await;
         if interrupting != 0 {
             tracing::trace!(
                 "[tid {}] pending signals {:#x} interrupt a blocking wait",
