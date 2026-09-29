@@ -3849,22 +3849,24 @@ where
     }
 }
 
-/// Placeholder identity that writes through an inherited stdio descriptor
-/// (resource `ContainerStdin`/`ContainerStdout`/`ContainerStderr`) pass to
-/// [`touch_file`] instead of that descriptor's cached host identity. The global
-/// scheduler recognizes it and leaves the inode pool alone.
+/// Placeholder identity that writes through a descriptor derived from the
+/// inherited stdio (resource `ContainerStdin`/`ContainerStdout`/
+/// `ContainerStderr`: fds 0 to 2, their duplicates, and descriptors opened
+/// through /dev/stdout or /proc/self/fd/N) pass to [`touch_file`] instead of
+/// that descriptor's cached host identity. The global scheduler recognizes it
+/// and leaves the inode pool alone.
 ///
-/// Those descriptors carry a placeholder stat, the TRACER's own fd-0 `fstat`
-/// (`setup_stdio`), which depends only on how hermit was invoked. Touching it
-/// minted a deterministic inode on the device holding hermit's stdin and, with
-/// one inode counter per device
+/// Those descriptors cache the identity of wherever hermit's caller pointed
+/// stdio. Touching it minted a deterministic inode on that object's device
+/// and, with one inode counter per device
 /// (https://github.com/rrnewton/hermit/issues/2897), shifted every later inode
 /// on that device; a new device also took a slot and shifted every later
-/// device. Guest-visible inode numbers then depended on where the caller's
-/// stdin came from, which `--verify` cannot see because both of its runs share
-/// one tracer. `fstat` of those descriptors already reports
-/// `deterministic_stdio_inode` and the epoch mtime without consulting the pool,
-/// so nothing reads the mtime such a touch recorded.
+/// device. Guest-visible inode numbers then depended on how hermit was
+/// invoked, which `--verify` cannot see because both of its runs share one
+/// tracer and one set of stdio objects. `fstat` of those descriptors reports
+/// the fixed stdio inode and the epoch mtime without consulting the pool
+/// (`deterministic_stdio_inode_for_resource`), so nothing reads the mtime such
+/// a touch recorded.
 ///
 /// The device value is not a Linux `dev_t` (the kernel's is 32 bits), and
 /// differs from the pipefs/sockfs probe-failure sentinels in `namespace.rs`.

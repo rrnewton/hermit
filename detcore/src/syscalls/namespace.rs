@@ -144,6 +144,28 @@ fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
     }
 }
 
+/// The descriptor an absolute path names through a descriptor magic link, and
+/// the optional numeric proc subject whose table it is in: /dev/stdin,
+/// /dev/stdout and /dev/stderr (links to /proc/self/fd/0 to 2) and every
+/// spelling [`proc_fd_target`] accepts.
+///
+/// Lexical, like [`proc_fd_target`]: a relative spelling, or a directory
+/// symlink other than these, is not recognized.
+pub(super) fn descriptor_link_target(path: &Path) -> Option<(Option<u32>, i32)> {
+    if let [dev, stream] = normalized_absolute_parts(path)?.as_slice() {
+        if *dev == "dev" {
+            let fd = match stream.to_str()? {
+                "stdin" => libc::STDIN_FILENO,
+                "stdout" => libc::STDOUT_FILENO,
+                "stderr" => libc::STDERR_FILENO,
+                _ => return None,
+            };
+            return Some((None, fd));
+        }
+    }
+    proc_fd_target(path)
+}
+
 // TODO-HUMAN-REVIEW(PR-1079): Review numeric virtual-self proc-fd path rewriting.
 fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
     let (Some(subject), fd) = proc_fd_target(path)? else {
@@ -614,6 +636,26 @@ mod tests {
             ("/dev/fd/3", (None, 3)),
         ] {
             assert_eq!(proc_fd_target(Path::new(path)), Some(expected), "{path}");
+        }
+    }
+
+    #[test]
+    fn recognizes_descriptor_links_including_the_standard_stream_names() {
+        for (path, expected) in [
+            ("/dev/stdin", Some((None, 0))),
+            ("/dev/stdout", Some((None, 1))),
+            ("/dev//./stderr", Some((None, 2))),
+            ("/dev/fd/3", Some((None, 3))),
+            ("/proc/self/fd/1", Some((None, 1))),
+            ("/proc/thread-self/fd/0", Some((None, 0))),
+            ("/proc/123/fd/2", Some((Some(123), 2))),
+            ("/dev/stdio", None),
+            ("/dev/null", None),
+            ("/dev/stdout/x", None),
+            ("dev/stdout", None),
+            ("/tmp/stdout", None),
+        ] {
+            assert_eq!(descriptor_link_target(Path::new(path)), expected, "{path}");
         }
     }
 

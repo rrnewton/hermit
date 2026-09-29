@@ -31,22 +31,35 @@
 //! the shell's maps before `stat`ing `/proc/<pid>/exe` resolves the maps
 //! identity first; the second test checks that both orders agree.
 //!
-//! Hermit gives the guest's inherited stdio descriptors a placeholder host
-//! identity: the tracer's own fd-0 `fstat`. A write to stdout used to bump the
-//! virtual mtime of that identity, which minted a deterministic inode on the
-//! device holding hermit's stdin. With one counter per device that shifted
-//! every later inode on that device, so the guest's inode numbers depended on
-//! where the person running hermit redirected stdin from. The third test runs
-//! the same guest with byte-identical stdin from two filesystems.
+//! Hermit's own stdin, stdout and stderr are the guest's inherited stdio
+//! objects, and they are wherever the person running hermit pointed them: a
+//! terminal, a file, a pipe, /dev/null. With one counter per device, a
+//! deterministic inode minted for one of them took a slot if its device was
+//! new, or a counter value if not, and so shifted the inodes of unrelated files
+//! with how hermit was invoked. That happened whenever the guest reached the
+//! object through a descriptor other than `fstat` of fds 0 to 2: opening or
+//! `stat`ing `/dev/stdout`, `/proc/self/fd/1` or `/dev/fd/3`, `fstat` or
+//! fdinfo of a duplicate above fd 2, `statx` with `AT_EMPTY_PATH`, and the
+//! virtual-mtime bump of a write. Those routes now report the fixed stdio
+//! inodes (1000 + fd, or the stream's for a descriptor above fd 2) without
+//! consulting the inode pool. The object's own path still goes through the
+//! pool, so it gets the same inode whether or not it is also hermit's stdio.
+//! The third test runs the same guest with byte-identical stdin from two
+//! filesystems, and the guest reads that file by its own path. The fourth and
+//! fifth reach hermit's stdout, then its stdin, through each descriptor route
+//! with the stream on /dev/null, on a regular file and on a pipe, and require
+//! identical output.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 
 const GUEST_SCRIPT: &str = r#"
 set -eu
@@ -105,15 +118,47 @@ for source in "$@"; do
 done
 "#;
 
-fn run_guest(script: &str, extra_options: &[&str], args: &[&std::ffi::OsStr]) -> String {
-    run_guest_with_stdin(script, extra_options, args, None)
+/// Where hermit's own standard input comes from.
+#[derive(Clone, Copy, Debug)]
+enum HermitStdin<'a> {
+    Null,
+    File(&'a Path),
+    /// These bytes, then end of file. They must fit in the pipe buffer: they
+    /// are written before hermit's output is read.
+    Pipe(&'a [u8]),
 }
 
-fn run_guest_with_stdin(
+/// Where hermit's own standard output goes.
+#[derive(Clone, Copy, Debug)]
+enum HermitStdout<'a> {
+    /// Captured and returned.
+    Pipe,
+    Null,
+    /// Appended to, and created if missing. Append mode keeps every write at
+    /// the end whichever open file description makes it: the guest reopens
+    /// its stdout through /dev/stdout, and a duplicate of fd 1 shares fd 1's
+    /// offset, which a write through the reopened description does not move.
+    File(&'a Path),
+}
+
+fn run_guest(script: &str, extra_options: &[&str], args: &[&std::ffi::OsStr]) -> String {
+    run_guest_with_stdio(
+        script,
+        extra_options,
+        args,
+        HermitStdin::Null,
+        HermitStdout::Pipe,
+    )
+}
+
+/// Runs `script` under hermit and returns hermit's stdout if it is
+/// [`HermitStdout::Pipe`], or the empty string.
+fn run_guest_with_stdio(
     script: &str,
     extra_options: &[&str],
     args: &[&std::ffi::OsStr],
-    stdin: Option<&Path>,
+    stdin: HermitStdin,
+    stdout: HermitStdout,
 ) -> String {
     let mut command = Command::new(hermit_test::hermit_binary());
     command.args(["run", "--base-env=minimal"]);
@@ -122,15 +167,40 @@ fn run_guest_with_stdin(
     command.args(args);
     hermit_test::configure_guest_execution(&mut command);
     // After `configure_guest_execution`, which may rebuild the command.
-    if let Some(stdin) = stdin {
-        let file = fs::File::open(stdin)
-            .unwrap_or_else(|error| panic!("failed to open stdin {}: {error}", stdin.display()));
-        command.stdin(file);
-    }
-    let rendered = format!("{command:?} < {stdin:?}");
-    let output = command
-        .output()
+    command.stdin(match stdin {
+        HermitStdin::Null => Stdio::null(),
+        HermitStdin::File(path) => fs::File::open(path)
+            .unwrap_or_else(|error| panic!("failed to open stdin {}: {error}", path.display()))
+            .into(),
+        HermitStdin::Pipe(_) => Stdio::piped(),
+    });
+    command.stdout(match stdout {
+        HermitStdout::Pipe => Stdio::piped(),
+        HermitStdout::Null => Stdio::null(),
+        HermitStdout::File(path) => fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|error| panic!("failed to open stdout {}: {error}", path.display()))
+            .into(),
+    });
+    command.stderr(Stdio::piped());
+    let rendered = format!("{command:?} < {stdin:?} > {stdout:?}");
+    let mut child = command
+        .spawn()
         .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    if let HermitStdin::Pipe(bytes) = stdin {
+        // Dropping the pipe at the end of this block closes it.
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(bytes)
+            .unwrap_or_else(|error| panic!("failed to write the stdin of {rendered}: {error}"));
+    }
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to wait for {rendered}: {error}"));
     assert!(
         output.status.success(),
         "{rendered} failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -289,11 +359,12 @@ impl Drop for RemoveOnDrop {
 #[test]
 fn guest_inodes_do_not_depend_on_where_hermit_stdin_comes_from() {
     // Stdin from a root-filesystem file, and the stat targets on that same
-    // device, so a mint caused by stdin would shift them.
+    // device, so a mint caused by stdin would shift them. Not /etc/group:
+    // hermit mounts its own synthesized copy there, on another device.
     let root_stdin = Path::new("/etc/passwd");
     let targets = [
         Path::new("/etc"),
-        Path::new("/etc/group"),
+        Path::new("/etc/shells"),
         Path::new("/bin/sh"),
     ];
     let root_dev = fs::metadata(root_stdin)
@@ -326,10 +397,19 @@ fn guest_inodes_do_not_depend_on_where_hermit_stdin_comes_from() {
     );
 
     let args: Vec<&std::ffi::OsStr> = targets.iter().map(|path| path.as_os_str()).collect();
-    let from_root = run_guest_with_stdin(STDIO_THEN_STAT_SCRIPT, &[], &args, Some(root_stdin));
-    let from_other = run_guest_with_stdin(STDIO_THEN_STAT_SCRIPT, &[], &args, Some(&other_stdin.0));
+    let from_stdin = |stdin: &Path| {
+        run_guest_with_stdio(
+            STDIO_THEN_STAT_SCRIPT,
+            &[],
+            &args,
+            HermitStdin::File(stdin),
+            HermitStdout::Pipe,
+        )
+    };
+    let from_root = from_stdin(root_stdin);
+    let from_other = from_stdin(&other_stdin.0);
     assert!(
-        from_root.starts_with("written-to-stdout\n") && from_root.contains(" /etc/group\n"),
+        from_root.starts_with("written-to-stdout\n") && from_root.contains(" /etc/shells\n"),
         "the guest omitted its output:\n{from_root}"
     );
     assert_eq!(
@@ -339,5 +419,262 @@ fn guest_inodes_do_not_depend_on_where_hermit_stdin_comes_from() {
          (root filesystem {} vs {}, byte-identical contents)",
         root_stdin.display(),
         other_stdin.0.display()
+    );
+}
+
+/// Reaches hermit's stdout (`fd` 1) or stdin (`fd` 0) through every
+/// descriptor route other than `fstat` of that descriptor, and after each step
+/// stats files on the devices a leaked mint would shift. Appends everything to
+/// the file named by the first argument; the remaining arguments are the files
+/// to stat. A route's line is `<route>: <inode>`.
+///
+/// Every `stat` of a link runs in a process whose own descriptor it names:
+/// only those routes report the fixed inode, and a link into another process's
+/// table (`/proc/<parent>/fd/1`) resolves through the inode pool. Never names
+/// /dev/null by its own path, which is not a descriptor route and legitimately
+/// reports a different inode from the stream when the stream is /dev/null.
+const STDIO_ALIASES_SCRIPT: &str = r#"
+set -eu
+out=$1
+fd=$2
+shift 2
+if [ "$fd" = 1 ]; then stream=stdout; else stream=stdin; fi
+after() { step=$1; shift; stat -c "$step: %i %n" "$@" >> "$out"; }
+if [ "$fd" = 1 ]; then
+    # Open through links; each write bumps the object's virtual mtime. `>>`,
+    # because `>` would truncate a regular file under fd 1.
+    echo open-dev-stdout >> /dev/stdout
+    after open-dev-stdout "$@"
+    echo open-proc-self-fd-1 >> /proc/self/fd/1
+    after open-proc-self-fd-1 "$@"
+    exec 3>&1
+    echo write-fd-3 >&3
+    after write-fd-3 "$@"
+else
+    cat /dev/stdin > "$out.copy"
+    after open-dev-stdin "$@"
+    cat /proc/self/fd/0 >> "$out.copy"
+    after open-proc-self-fd-0 "$@"
+    exec 3<&0
+    # coreutils stats `-` with statx(0, "", AT_EMPTY_PATH).
+    stat -L -c 'statx-empty-path-fd-0: %i' - >> "$out"
+    after statx-empty-path-fd-0 "$@"
+fi
+# From here fd 3 duplicates the stream. glibc's stat() is newfstatat, and its
+# fstat() is fstat.
+/usr/bin/perl -MPOSIX -e '
+    my ($out, $fd, $stream) = @ARGV;
+    open(my $report, ">>", $out) or die "$out: $!";
+    for my $route (
+        ["stat-dev-$stream", "/dev/$stream"],
+        ["stat-proc-self-fd-$fd", "/proc/self/fd/$fd"],
+        ["stat-proc-pid-fd-$fd", "/proc/$$/fd/$fd"],
+        ["stat-dev-fd-3", "/dev/fd/3"],
+        ["stat-proc-thread-self-fd-3", "/proc/thread-self/fd/3"],
+    ) {
+        my @s = stat($route->[1]) or die "stat $route->[1]: $!";
+        print $report "$route->[0]: $s[1]\n";
+    }
+    my @s = POSIX::fstat(3) or die "fstat 3: $!";
+    print $report "fstat-fd-3: $s[1]\n";
+    open(my $reopened, $fd ? ">>" : "<", "/dev/$stream") or die "open /dev/$stream: $!";
+    my @t = stat($reopened) or die "fstat of /dev/$stream: $!";
+    print $report "open-dev-$stream-then-fstat: $t[1]\n";
+' "$out" "$fd" "$stream"
+after perl-routes "$@"
+# coreutils `stat -L` is statx.
+stat -L -c 'statx-dev-fd-3: %i' /dev/fd/3 >> "$out"
+after statx-dev-fd-3 "$@"
+grep '^ino:' /proc/self/fdinfo/3 >> "$out"
+after fdinfo-3 "$@"
+"#;
+
+/// The report [`STDIO_ALIASES_SCRIPT`] writes for descriptor `fd` when hermit's
+/// stdio is set up by `run`, which receives the report path.
+fn stdio_alias_report(
+    scratch: &ScratchDir,
+    label: &str,
+    fd: u8,
+    probe: &Path,
+    run: impl FnOnce(&[&std::ffi::OsStr]),
+) -> String {
+    let report = scratch.0.join(format!("report-{label}"));
+    let fd = fd.to_string();
+    let args = [
+        report.as_os_str(),
+        std::ffi::OsStr::new(&fd),
+        std::ffi::OsStr::new("/proc/self/status"),
+        std::ffi::OsStr::new("/dev/zero"),
+        std::ffi::OsStr::new("/etc/group"),
+        std::ffi::OsStr::new("/etc/shells"),
+        probe.as_os_str(),
+    ];
+    run(&args);
+    let report_text = fs::read_to_string(&report)
+        .unwrap_or_else(|error| panic!("the guest wrote no report {}: {error}", report.display()));
+    // The probe's host path differs between test processes; its inode is what
+    // is compared.
+    report_text.replace(&probe.display().to_string(), "PROBE")
+}
+
+/// Requires `reports` (label, report) to be identical, and each to give hermit's
+/// stdio object the fixed inode `expected` through every route in `routes`.
+fn assert_stdio_alias_reports_agree(
+    stream: &str,
+    reports: &[(&str, String)],
+    routes: &[&str],
+    expected: u64,
+) {
+    let (first_label, first) = &reports[0];
+    for (label, report) in &reports[1..] {
+        assert_eq!(
+            first, report,
+            "the guest's inodes changed with where hermit's {stream} went ({first_label} vs \
+             {label}); the first differing step localizes the leaking route"
+        );
+    }
+    for (label, report) in reports {
+        for route in routes {
+            assert!(
+                report.contains(&format!("\n{route}: {expected}\n")),
+                "{label}: {route} did not report hermit's {stream} as inode {expected}:\n{report}"
+            );
+        }
+        assert!(
+            report.contains(&format!("\nino:\t{expected}\n")),
+            "{label}: fdinfo of a duplicate of hermit's {stream} did not report inode \
+             {expected}:\n{report}"
+        );
+        assert!(
+            report.contains(" PROBE\n"),
+            "{label}: the guest did not stat the probe file:\n{report}"
+        );
+    }
+}
+
+#[test]
+fn guest_inodes_do_not_depend_on_where_hermit_stdout_goes() {
+    assert!(
+        Path::new("/usr/bin/perl").is_file(),
+        "this test fstats a descriptor above 2 with /usr/bin/perl, which is missing"
+    );
+    let scratch = ScratchDir::new("stdout");
+    // Beside hermit's stdout file, so a counter value taken by it would shift
+    // this file's inode.
+    let probe = scratch.0.join("probe");
+    fs::write(&probe, b"probe\n").expect("failed to write the probe file");
+    let stdout_file = scratch.0.join("stdout");
+    let expected_stdout = "open-dev-stdout\nopen-proc-self-fd-1\nwrite-fd-3\n";
+
+    let null = stdio_alias_report(&scratch, "null", 1, &probe, |args| {
+        let stdout = run_guest_with_stdio(
+            STDIO_ALIASES_SCRIPT,
+            &[],
+            args,
+            HermitStdin::Null,
+            HermitStdout::Null,
+        );
+        assert_eq!(stdout, "");
+    });
+    let file = stdio_alias_report(&scratch, "file", 1, &probe, |args| {
+        run_guest_with_stdio(
+            STDIO_ALIASES_SCRIPT,
+            &[],
+            args,
+            HermitStdin::Null,
+            HermitStdout::File(&stdout_file),
+        );
+        assert_eq!(
+            fs::read_to_string(&stdout_file).expect("failed to read hermit's stdout file"),
+            expected_stdout
+        );
+    });
+    let pipe = stdio_alias_report(&scratch, "pipe", 1, &probe, |args| {
+        let stdout = run_guest_with_stdio(
+            STDIO_ALIASES_SCRIPT,
+            &[],
+            args,
+            HermitStdin::Null,
+            HermitStdout::Pipe,
+        );
+        assert_eq!(stdout, expected_stdout);
+    });
+    assert_stdio_alias_reports_agree(
+        "stdout",
+        &[("/dev/null", null), ("regular file", file), ("pipe", pipe)],
+        &[
+            "stat-dev-stdout",
+            "stat-proc-self-fd-1",
+            "stat-proc-pid-fd-1",
+            "stat-dev-fd-3",
+            "stat-proc-thread-self-fd-3",
+            "fstat-fd-3",
+            "open-dev-stdout-then-fstat",
+            "statx-dev-fd-3",
+        ],
+        1001,
+    );
+}
+
+#[test]
+fn guest_inodes_do_not_depend_on_whether_hermit_stdin_is_null_a_file_or_a_pipe() {
+    assert!(
+        Path::new("/usr/bin/perl").is_file(),
+        "this test fstats a descriptor above 2 with /usr/bin/perl, which is missing"
+    );
+    let scratch = ScratchDir::new("stdin-kinds");
+    // Beside hermit's stdin file, so a counter value taken by it would shift
+    // this file's inode.
+    let probe = scratch.0.join("probe");
+    fs::write(&probe, b"probe\n").expect("failed to write the probe file");
+    let contents = b"stdin contents\n";
+    let stdin_file = scratch.0.join("stdin");
+    fs::write(&stdin_file, contents).expect("failed to write hermit's stdin file");
+
+    fn run(stdin: HermitStdin<'_>) -> impl FnOnce(&[&std::ffi::OsStr]) + '_ {
+        move |args| {
+            run_guest_with_stdio(STDIO_ALIASES_SCRIPT, &[], args, stdin, HermitStdout::Pipe);
+        }
+    }
+    let null = stdio_alias_report(&scratch, "null", 0, &probe, run(HermitStdin::Null));
+    let file = stdio_alias_report(
+        &scratch,
+        "file",
+        0,
+        &probe,
+        run(HermitStdin::File(&stdin_file)),
+    );
+    let pipe = stdio_alias_report(
+        &scratch,
+        "pipe",
+        0,
+        &probe,
+        run(HermitStdin::Pipe(contents)),
+    );
+    // Opening /dev/stdin or /proc/self/fd/0 reopens a regular file from its
+    // start, while the first read of a pipe drains it.
+    for (label, copies) in [("null", 0), ("file", 2), ("pipe", 1)] {
+        assert_eq!(
+            fs::read(scratch.0.join(format!("report-{label}.copy")))
+                .expect("the guest wrote no copy of its stdin"),
+            contents.repeat(copies),
+            "{label}: what the guest read through /dev/stdin and /proc/self/fd/0"
+        );
+    }
+    assert_stdio_alias_reports_agree(
+        "stdin",
+        &[("/dev/null", null), ("regular file", file), ("pipe", pipe)],
+        &[
+            "statx-empty-path-fd-0",
+            "stat-dev-stdin",
+            "stat-proc-self-fd-0",
+            "stat-proc-pid-fd-0",
+            "stat-dev-fd-3",
+            "stat-proc-thread-self-fd-3",
+            "fstat-fd-3",
+            "open-dev-stdin-then-fstat",
+            "statx-dev-fd-3",
+        ],
+        1000,
     );
 }

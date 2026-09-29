@@ -266,7 +266,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two matched-prefix/verdict agreement tests retain all 808 prior IDs.
     // Six per-device inode pool tests (https://github.com/rrnewton/hermit/issues/2897)
     // retain all 810 prior identities (`cargo nextest list` measured 816).
-    ("test.detcore_unit", 816),
+    // The descriptor-link recognizer test for the stdio inode routes
+    // (https://github.com/rrnewton/hermit/issues/2897) retains all 816 prior
+    // identities (`cargo nextest list` measured 817).
+    ("test.detcore_unit", 817),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     // 402ba973 adds two clock_determinism tests, retaining all 158 prior IDs:
@@ -276,7 +279,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three inode_device_identity_determinism tests
     // (https://github.com/rrnewton/hermit/issues/2897) retain all 171 prior
     // identities (`cargo nextest list` measured 174).
-    ("test.hermit_integration", 174),
+    // The stdout and stdin descriptor-route tests in
+    // inode_device_identity_determinism retain all 174 prior identities
+    // (`cargo nextest list` measured 176).
+    ("test.hermit_integration", 176),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -303,11 +309,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    // The host node carries the identical selection: 816 (see test.detcore_unit).
-    ("test.detcore_unit_on_host", 816),
+    // The host node carries the identical selection: 817 (see test.detcore_unit).
+    ("test.detcore_unit_on_host", 817),
     // Host variants select the same proc regressions and retain prior identities.
-    // The three inode_device_identity_determinism tests retain all 171 prior identities.
-    ("test.hermit_integration_on_host", 174),
+    // The five inode_device_identity_determinism tests retain all 171 prior identities.
+    ("test.hermit_integration_on_host", 176),
     ("test.hermit_unit_on_host", 757),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 25),

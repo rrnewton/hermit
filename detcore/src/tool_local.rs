@@ -643,48 +643,35 @@ impl FileMetadata {
         closed
     }
 
-    /// set default fds
-    fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
-        // guest stdio can be a pipe, which make things difficult
-        // hence use a dummy stat here.
-        // SAFETY: stating stdin is likely to always be safe
-        let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
-            .unwrap()
-            .into();
-        let stdin = DetFd::new(
-            0,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStdin));
-        let stdout = DetFd::new(
-            1,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStdout));
-        let stderr = DetFd::new(
-            2,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStderr));
-
-        // These descriptors existed before Detcore began observing the guest,
-        // so they may already carry flock state that we cannot query.
-        stdin.mark_flock_mode_unobserved();
-        stdout.mark_flock_mode_unobserved();
-        stderr.mark_flock_mode_unobserved();
-
-        self.add_detfd(stdin);
-        self.add_detfd(stdout);
-        self.add_detfd(stderr);
+    /// Register the inherited stdio descriptors of the root process `pid`.
+    ///
+    /// Each descriptor caches the host identity of the guest's own fd 0, 1 or
+    /// 2 (see [`inherited_stdio_stat`]); it used to cache the tracer's fd-0
+    /// `fstat` for all three. The maps and fd-link sanitizers match stdio
+    /// objects by these identities. The inode pool never sees them: every
+    /// descriptor carrying one of these resources reports a fixed stdio inode
+    /// (`deterministic_stdio_inode_for_resource`), and a write through one
+    /// touches `INHERITED_STDIO_TOUCH_ID` instead.
+    fn setup_stdio(mut self, pid: Pid, owner: DetTid) -> Self {
+        for (fd, device) in [
+            (libc::STDIN_FILENO, Device::ContainerStdin),
+            (libc::STDOUT_FILENO, Device::ContainerStdout),
+            (libc::STDERR_FILENO, Device::ContainerStderr),
+        ] {
+            let detfd = DetFd::new(
+                fd,
+                OFlag::empty(),
+                FdType::Regular,
+                self.allocate_open_file_id(owner, FdType::Regular),
+            )
+            .with_stat(inherited_stdio_stat(pid, fd))
+            .with_resource(ResourceID::Device(device));
+            // These descriptors existed before Detcore began observing the
+            // guest, so they may already carry flock state that we cannot
+            // query.
+            detfd.mark_flock_mode_unobserved();
+            self.add_detfd(detfd);
+        }
 
         self
     }
@@ -844,6 +831,24 @@ impl FileMetadata {
         drop(captured);
         release
     }
+}
+
+/// The host `stat` of inherited descriptor `fd` of process `pid`.
+///
+/// Reads `/proc/<pid>/fd/<fd>`, the guest's own descriptor, because the guest's
+/// stdio is not always the tracer's: the output-capturing paths (`--verify`
+/// among them) hand the guest pipes and a snapshot or `/dev/null` for stdin
+/// while the tracer keeps its own. Detcore already reads the guest's
+/// `/proc/<pid>/fdinfo` from the tracer the same way. Falls back to this
+/// process's own descriptor, the same object for backends that run inside the
+/// guest process, and to no stat when the descriptor is closed there too.
+fn inherited_stdio_stat(pid: Pid, fd: RawFd) -> Option<DetStat> {
+    stat::stat(Path::new(&format!("/proc/{}/fd/{}", pid.as_raw(), fd)))
+        // SAFETY: `fstat` only reads the descriptor table entry; a closed
+        // descriptor is reported as `EBADF`.
+        .or_else(|_| stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }))
+        .ok()
+        .map(DetStat::from)
 }
 
 fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
@@ -1092,8 +1097,9 @@ mod file_metadata_tests {
         );
 
         // Observe real metadata transitions without closing the test process's
-        // stdio. The narrow repair preserves slot identities for inherited
-        // resources and leaves aliases above fd 2 in the ordinary inode pool.
+        // stdio. Inherited resources keep their slot identities, and an alias
+        // above fd 2 reports its stream's fixed inode rather than reaching the
+        // inode pool with the inherited object's host identity.
         use crate::syscalls::deterministic_stdio_inode_for_resource;
 
         let inherited_stat = metadata
@@ -1110,7 +1116,7 @@ mod file_metadata_tests {
                     deterministic_stdio_inode_for_resource(7, detfd.resource())
                 })
                 .unwrap(),
-            None
+            Some(DetInode::mint(1001))
         );
         for fd in 0..=2 {
             metadata.remove_fd(fd);

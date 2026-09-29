@@ -305,8 +305,11 @@ fn pipe_capacity_failure(
 
 /// The identity whose virtual mtime a successful write through `detfd` bumps:
 /// the descriptor's cached host identity, or [`INHERITED_STDIO_TOUCH_ID`] for
-/// an inherited stdio descriptor, whose cached stat is only the tracer's own
-/// fd-0 `fstat` and must not reach the inode pool.
+/// a descriptor derived from the inherited stdio (fds 0 to 2, a duplicate, or
+/// one opened through /dev/stdout or /proc/self/fd/N), whose cached identity
+/// is wherever hermit's caller pointed stdio and must not reach the inode
+/// pool. `fstat` of such a descriptor reports the epoch mtime whatever is
+/// written.
 fn write_touch_identity(detfd: &DetFd) -> Option<RawFileId> {
     match detfd.resource() {
         Some(ResourceID::Device(
@@ -874,6 +877,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 });
                 self.add_fd(guest, fd, call.flags(), fd_type).await?;
+                // Opening /dev/stdout or /proc/self/fd/N follows the link to
+                // the object behind that descriptor. When the descriptor
+                // derives from the inherited stdio, the new one does too: it
+                // reports the stream's fixed inode and its writes touch no
+                // pool inode, as for a duplicate. `O_NOFOLLOW` opens the link
+                // itself (with `O_PATH`) or fails.
+                if !call.flags().contains(OFlag::O_NOFOLLOW) && path.is_absolute() {
+                    if let Some((_, resource)) = self.inherited_stdio_link(guest, &path).await? {
+                        guest
+                            .thread_state()
+                            .with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
+                    }
+                }
                 // Classify the spelling the guest used FIRST. Several kinds are
                 // defined by that spelling and MUST keep it: `/proc/self/...`,
                 // `/proc/thread-self/...` and the mountinfo aliases all resolve
@@ -2869,6 +2885,90 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(stat)
     }
 
+    /// The fixed stdio inode that descriptor `fd` of the calling process
+    /// reports, if it derives from the inherited stdio (see
+    /// [`deterministic_stdio_inode_for_resource`]).
+    fn stdio_inode_of_descriptor<G: Guest<Self>>(&self, guest: &G, fd: RawFd) -> Option<DetInode> {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                deterministic_stdio_inode_for_resource(fd, detfd.resource())
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// The calling process's descriptor that absolute `path` names through a
+    /// descriptor link (/dev/stdout, /dev/fd/N, /proc/self/fd/N, or
+    /// /proc/<pid>/fd/N with the guest's own pid), with its resource, if that
+    /// descriptor derives from the inherited stdio.
+    ///
+    /// The route decides, not the object: the object's own path, or a link in
+    /// another process's table, gets `None` even when it names the same
+    /// object, so that it resolves through the inode pool the same way whether
+    /// or not the object is also hermit's stdio.
+    async fn inherited_stdio_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<Option<(RawFd, ResourceID)>, Error> {
+        let Some((subject, fd)) = super::namespace::descriptor_link_target(path) else {
+            return Ok(None);
+        };
+        let resource = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.resource())
+            .ok()
+            .flatten()
+            .filter(|resource| {
+                deterministic_stdio_inode_for_resource(fd, Some(resource.clone())).is_some()
+            });
+        let Some(resource) = resource else {
+            return Ok(None);
+        };
+        if let Some(subject) = subject {
+            // Only after finding a stdio descriptor, so an ordinary
+            // /proc/<pid>/fd lookup injects nothing.
+            let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+            if current_pid != i64::from(subject) {
+                return Ok(None);
+            }
+        }
+        Ok(Some((fd, resource)))
+    }
+
+    /// The fixed stdio inode of the object a successful `fstatat` or `statx`
+    /// named, if it named it through a descriptor derived from the inherited
+    /// stdio: `dirfd` itself (`AT_EMPTY_PATH` with an empty or null path), or
+    /// a followed absolute descriptor link ([`Self::inherited_stdio_link`]).
+    /// `None` sends the result through the inode pool as usual.
+    async fn stdio_inode_of_stat_route<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: RawFd,
+        path: Option<PathPtr<'_>>,
+        flags: AtFlags,
+    ) -> Result<Option<DetInode>, Error> {
+        // The call succeeded, so a non-null path was readable.
+        let path: Option<PathBuf> = match path {
+            Some(path) => Some(path.read(&guest.memory())?),
+            None => None,
+        };
+        let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
+            return Ok(flags
+                .contains(AtFlags::AT_EMPTY_PATH)
+                .then(|| self.stdio_inode_of_descriptor(guest, dirfd))
+                .flatten());
+        };
+        if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
+            return Ok(None);
+        }
+        Ok(self
+            .inherited_stdio_link(guest, &path)
+            .await?
+            .and_then(|(fd, resource)| deterministic_stdio_inode_for_resource(fd, Some(resource))))
+    }
+
     /// Handles all stat syscalls.
     pub async fn handle_stat_family<G: Guest<Self>>(
         &self,
@@ -2883,14 +2983,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = match call {
-                StatFamily::Fstat(call) => guest
-                    .thread_state()
-                    .with_detfd(call.fd(), |detfd| {
-                        deterministic_stdio_inode_for_resource(call.fd(), detfd.resource())
-                    })
-                    .ok()
-                    .flatten(),
-                _ => None,
+                StatFamily::Fstat(call) => self.stdio_inode_of_descriptor(guest, call.fd()),
+                StatFamily::Fstatat(call) => {
+                    self.stdio_inode_of_stat_route(guest, call.dirfd(), call.path(), call.flags())
+                        .await?
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                StatFamily::Stat(call) => {
+                    self.stdio_inode_of_stat_route(
+                        guest,
+                        libc::AT_FDCWD,
+                        call.path(),
+                        AtFlags::empty(),
+                    )
+                    .await?
+                }
+                // `lstat` reports the link itself, not the descriptor it names.
+                #[cfg(not(target_arch = "aarch64"))]
+                StatFamily::Lstat(_) => None,
             };
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
@@ -2914,9 +3024,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
+            let inode_override = self
+                .stdio_inode_of_stat_route(guest, call.dirfd(), call.path(), call.flags())
+                .await?;
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat, None).await?;
+            let stat = self.determinize_stat(guest, stat, inode_override).await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {

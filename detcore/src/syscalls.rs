@@ -32,7 +32,8 @@ use crate::types::DetInode;
 use crate::types::RawFd;
 
 /// Give inherited standard streams identities that do not depend on backend
-/// loader activity observed before the guest reaches its entry point.
+/// loader activity observed before the guest reaches its entry point. See
+/// [`deterministic_stdio_inode_for_resource`] for which routes report them.
 fn deterministic_stdio_inode(fd: RawFd) -> Option<DetInode> {
     (libc::STDIN_FILENO..=libc::STDERR_FILENO)
         .contains(&fd)
@@ -41,20 +42,38 @@ fn deterministic_stdio_inode(fd: RawFd) -> Option<DetInode> {
         ))
 }
 
-/// Preserve the existing inherited-stdio slot identities, but do not assign one
-/// to an ordinary file or pipe that has replaced that slot. Aliases above fd 2
-/// retain their existing pooled identity; extending the fixed namespace to
-/// aliases requires consistent path-stat behavior too.
+/// The fixed inode that descriptor `fd` reports when it derives from the
+/// guest's inherited standard streams, that is, when it carries the resource
+/// `ContainerStdin`, `ContainerStdout` or `ContainerStderr`.
+///
+/// Those descriptors are fds 0 to 2 as hermit handed them over, their
+/// duplicates, and descriptors opened through a link to one of them
+/// (/dev/stdout, /proc/self/fd/1). Their object is wherever hermit's caller
+/// pointed stdio (a terminal, a file, a pipe, /dev/null). Resolving it through
+/// the inode pool would mint an inode on that object's device, and with one
+/// counter per device (https://github.com/rrnewton/hermit/issues/2897) shift
+/// every later inode there, so unrelated inode numbers would depend on how
+/// hermit was invoked.
+///
+/// Fds 0 to 2 keep their numeric slot's inode, whichever stream they carry
+/// (fd 2 after `2>&1` still reports 1002). A descriptor above fd 2 reports its
+/// stream's inode. An ordinary file or pipe that has replaced fd 0, 1 or 2
+/// carries its own resource and gets `None`.
+///
+/// The object's own path (/dev/null, or the file hermit's stdout was
+/// redirected to) is not a descriptor route: it resolves through the pool, so
+/// it gets the same inode whether or not the object is also hermit's stdio.
 pub(crate) fn deterministic_stdio_inode_for_resource(
     fd: RawFd,
     resource: Option<ResourceID>,
 ) -> Option<DetInode> {
-    match resource {
-        Some(ResourceID::Device(
-            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr,
-        )) => deterministic_stdio_inode(fd),
-        _ => None,
-    }
+    let stream = match resource {
+        Some(ResourceID::Device(Device::ContainerStdin)) => libc::STDIN_FILENO,
+        Some(ResourceID::Device(Device::ContainerStdout)) => libc::STDOUT_FILENO,
+        Some(ResourceID::Device(Device::ContainerStderr)) => libc::STDERR_FILENO,
+        _ => return None,
+    };
+    deterministic_stdio_inode(fd).or_else(|| deterministic_stdio_inode(stream))
 }
 
 #[cfg(test)]
@@ -88,8 +107,31 @@ mod tests {
                     Some(DetInode::mint(1000 + fd as u64))
                 );
             }
+        }
+        // Above fd 2, a duplicate or a descriptor opened through /dev/stdout
+        // reports its stream's inode.
+        for (stream, resource) in [
+            ResourceID::Device(Device::ContainerStdin),
+            ResourceID::Device(Device::ContainerStdout),
+            ResourceID::Device(Device::ContainerStderr),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for fd in [3, 7, 1024] {
+                assert_eq!(
+                    deterministic_stdio_inode_for_resource(fd, Some(resource.clone())),
+                    Some(DetInode::mint(1000 + stream as u64))
+                );
+            }
+        }
+        for fd in [3, 7] {
+            assert_eq!(deterministic_stdio_inode_for_resource(fd, None), None);
             assert_eq!(
-                deterministic_stdio_inode_for_resource(3, Some(resource)),
+                deterministic_stdio_inode_for_resource(
+                    fd,
+                    Some(ResourceID::FileContents(DetInode::mint(1001))),
+                ),
                 None
             );
         }
