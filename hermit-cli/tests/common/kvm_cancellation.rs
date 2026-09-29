@@ -613,8 +613,8 @@ pub(super) fn run(loops: usize, expected: i32) {
         assert_eq!(operand.stdout_sha256, EMPTY_SHA256);
         assert_eq!(operand.stderr_sha256, EMPTY_SHA256);
     }
-    for prefix in ["run1_log_", "run2_log_"] {
-        let matches: Vec<_> = fs::read_dir(&logs)
+    let retained = |prefix: &str| -> Vec<_> {
+        fs::read_dir(&logs)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
@@ -623,14 +623,17 @@ pub(super) fn run(loops: usize, expected: i32) {
                     .to_string_lossy()
                     .starts_with(prefix)
             })
-            .collect();
-        assert_eq!(
-            matches.len(),
-            1,
-            "exactly one retained log for each real run"
-        );
-        let log =
-            String::from_utf8(bounded_read(&matches[0], 16 * MIB)).expect("complete UTF-8 trace");
-        assert_mechanism(&log, loops, timestamp);
-    }
+            .collect()
+    };
+    // After a match `--keep-logs` keeps only run 1's log, the golden copy;
+    // run 2's log, which matched it, is deleted.
+    let golden = retained("run1_log_");
+    assert_eq!(golden.len(), 1, "exactly one retained golden log of the matched run");
+    let log =
+        String::from_utf8(bounded_read(&golden[0], 16 * MIB)).expect("complete UTF-8 trace");
+    assert_mechanism(&log, loops, timestamp);
+    assert!(
+        retained("run2_log_").is_empty(),
+        "a matched verification must not retain run 2's log"
+    );
 }
