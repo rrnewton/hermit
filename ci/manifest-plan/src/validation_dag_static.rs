@@ -2362,7 +2362,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"detcore_time"########,
         desc: r########"Detcore time integration cases (tests_time, serial execution)"########,
-        description: r########"MEASURED 2026-09-28 (task detcore_tests_time_unenrolled_and_inverted): five successful exact-command cgroup samples peaked at 80302080, 76382208, 75063296, 76529664, and 76382208 bytes. The 128-MiB scheduling baseline rounds above the 80302080-byte maximum plus 20%, and the 1-GiB hard cap supplies conservative headroom. Exact -j1 wall times were 3.95, 3.71, 4.08, 3.90, and 3.82 seconds, so est_duration_s rounds the maximum upward to 5 seconds. Sixteen selected cases use a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer; target_timeslice_yields_at_syscall_boundaries_without_pmu explicitly disables max_timeslice. The PMU-dependent cases remain together so validation covers the shipped tests_time binary without silent skips."########,
+        description: r########"MEASURED 2026-09-29 at hermit 905903e0a7ed on devbig014: five serial runs of the node's selection, cargo nextest run -p hermit-detcore --test tests_time -j 1 invoked directly rather than through run-nextest-counted.sh, each in its own systemd-run --user --scope unit, each ran 28 of 28 tests with 0 skipped. Their cgroup memory.peak values were 114012160, 111661056, 111734784, 115081216, and 113618944 bytes. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20% (138097460 bytes), the same relation the previous 128 MiB had to its 80302080-byte maximum, and the 1-GiB hard cap supplies conservative headroom. Exact -j1 wall times were 5.32, 6.12, 5.44, 5.68, and 5.40 seconds, so est_duration_s rounds the maximum upward to 7 seconds. A sixth run of the same form used 7.12 CPU-seconds (cgroup cpu.stat usage_usec) against the 7200-CPU-second cap. The selection is 28 cases: 24 #[test] functions plus the bottom, middle, default, and top variants of tod_gettimeofday_delta. Twenty-six of them construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 21 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, and max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000. proc_stat_btime_is_fixed_for_a_fractional_epoch and target_timeslice_yields_at_syscall_boundaries_without_pmu explicitly disable max_timeslice. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. The PMU- and PKU-dependent cases remain together so validation covers the shipped tests_time binary without silent skips."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -2379,8 +2379,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 5.0,
-            rss_baseline_bytes: Some(134217728),
+            est_duration_s: 7.0,
+            rss_baseline_bytes: Some(268435456),
             hard_mem_max_bytes: Some(1073741824),
             classification: StepClass::CpuBound,
             preferred_inner_jobs: None,
