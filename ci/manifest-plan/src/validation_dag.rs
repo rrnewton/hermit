@@ -1580,10 +1580,11 @@ fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == "gate.manifest")
         .ok_or("committed DAG lost gate.manifest")?;
-    for (tag, wall_seconds) in [
-        ("gate.manifest", 900),
-        ("quick-super-gate.manifest", 900),
-        ("gate.manifest_on_host", 180),
+    let local_cpu_seconds = crate::validation_dag_static::MANIFEST_GATE_CPU_SECONDS;
+    for (tag, wall_seconds, cpu_seconds) in [
+        ("gate.manifest", 900, local_cpu_seconds),
+        ("quick-super-gate.manifest", 900, local_cpu_seconds),
+        ("gate.manifest_on_host", 180, 600),
     ] {
         let step = cfg
             .steps
@@ -1602,10 +1603,10 @@ fn assert_manifest_gate_width_contract(cfg: &DagConfig) -> Result<(), String> {
                 != expected_audit_jobs
             || step.cmd != ordinary.cmd
             || step.timeout != wall_seconds
-            || step.cpu_timeout != 600
+            || step.cpu_timeout != cpu_seconds
         {
             return Err(format!(
-                "{tag} must retain the exact audit command and {wall_seconds}s wall/600s CPU caps while reserving the two-worker width and carrying every smaller admission through CARGO_BUILD_JOBS: {step:?}"
+                "{tag} must retain the exact audit command and {wall_seconds}s wall/{cpu_seconds}s CPU caps while reserving the two-worker width and carrying every smaller admission through CARGO_BUILD_JOBS: {step:?}"
             ));
         }
     }
@@ -3447,6 +3448,25 @@ sys.exit(37)
                 .jobs_env = None;
             assert!(
                 assert_manifest_gate_width_contract(&broken)
+                    .unwrap_err()
+                    .contains(tag)
+            );
+
+            // The local gates were killed at the old 600-second CPU cap; the
+            // hosted-privileged variant keeps it. Swapping either value fails.
+            let mut recapped = committed.clone();
+            recapped
+                .steps
+                .iter_mut()
+                .find(|candidate| candidate.tag() == tag)
+                .unwrap()
+                .cpu_timeout = if tag == "gate.manifest_on_host" {
+                crate::validation_dag_static::MANIFEST_GATE_CPU_SECONDS
+            } else {
+                600
+            };
+            assert!(
+                assert_manifest_gate_width_contract(&recapped)
                     .unwrap_err()
                     .contains(tag)
             );
